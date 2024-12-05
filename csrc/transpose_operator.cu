@@ -18,15 +18,15 @@ namespace vllm
 #define BIG_TILE_SIZE 64
 
   template <typename T, typename Operation>
-  __device__ T performOperation(T a, T b);
+  inline __device__ T performOperation(T a, T b);
 
   template <typename Operation>
-  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other);
+  inline torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other);
 
   struct AddOp
   {
     template <typename T>
-    __device__ static T apply(T a, T b) { return a + b; }
+    inline __device__ static T apply(T a, T b) { return a + b; }
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
       return torch::add(input, other);
@@ -36,7 +36,7 @@ namespace vllm
   struct SubOp
   {
     template <typename T>
-    __device__ static T apply(T a, T b)
+    inline __device__ static T apply(T a, T b)
     {
       return a - b;
     }
@@ -49,7 +49,7 @@ namespace vllm
   struct MulOp
   {
     template <typename T>
-    __device__ static T apply(T a, T b) { return a * b; }
+    inline __device__ static T apply(T a, T b) { return a * b; }
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
       return torch::mul(input, other);
@@ -59,7 +59,7 @@ namespace vllm
   struct DivOp
   {
     template <typename T>
-    __device__ static T apply(T a, T b)
+    inline __device__ static T apply(T a, T b)
     {
       // assert(b == static_cast<T>(0));
       return a / b;
@@ -71,7 +71,7 @@ namespace vllm
   };
 
   template <typename T, typename Operation, bool order_flag>
-  __device__ T performOperation(T a, T b)
+  inline __device__ T performOperation(T a, T b)
   {
     if constexpr (std::is_same_v<Operation, AddOp>)
     {
@@ -110,7 +110,7 @@ namespace vllm
   }
 
   template <typename Operation>
-  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
+  inline torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
   {
     if constexpr (std::is_same_v<Operation, AddOp>)
     {
