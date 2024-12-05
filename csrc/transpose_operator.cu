@@ -21,7 +21,7 @@ namespace vllm
   inline __device__ T performOperation(T a, T b);
 
   template <typename Operation>
-  inline torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other);
+  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other);
 
   struct AddOp
   {
@@ -110,7 +110,7 @@ namespace vllm
   }
 
   template <typename Operation>
-  inline torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
+  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
   {
     if constexpr (std::is_same_v<Operation, AddOp>)
     {
