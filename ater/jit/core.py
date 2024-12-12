@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-09 18:29:49
+# @Last Modified At: 2024-12-12 16:38:05
 # @Description: This is description.
 
 import os
@@ -14,6 +14,7 @@ import sys
 import shutil
 import time
 import importlib
+import functools
 from typing import List, Optional
 from torch.utils import cpp_extension
 import logging
@@ -63,7 +64,7 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = max_jobs
 
 
-def rename_cpp_to_cu(els, dst, recurisve = False):
+def rename_cpp_to_cu(els, dst, recurisve=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
         if name.endswith(".cpp") or name.endswith(".cu"):
@@ -78,13 +79,19 @@ def rename_cpp_to_cu(els, dst, recurisve = False):
             for entry in os.listdir(el):
                 if os.path.isdir(f'{el}/{entry}'):
                     if recurisve:
-                        ret += rename_cpp_to_cu([f'{el}/{entry}'], dst, recurisve)
+                        ret += rename_cpp_to_cu([f'{el}/{entry}'],
+                                                dst, recurisve)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
             do_rename_and_mv(os.path.basename(el),
                              os.path.dirname(el), dst, ret)
     return ret
+
+
+@functools.lru_cache(maxsize=1024)
+def get_module(md_name):
+    return importlib.import_module(f'{__package__}.{md_name}')
 
 
 def compile_ops(
@@ -110,8 +117,7 @@ def compile_ops(
                     if hasattr(ater_, loadName):
                         module = ater_
                 if module is None:
-                    module = importlib.import_module(
-                        f'{__package__}.{md_name}')
+                    module = get_module(md_name)
             except Exception as e:
                 op_dir = f'{bd_dir}/{md_name}'
                 logger.info(f'start build [{md_name}] under {op_dir}')
@@ -152,7 +158,8 @@ def compile_ops(
                     os.makedirs(blob_dir, exist_ok=True)
                     os.system(f'{PYTHON} {blob_gen_cmd.format(blob_dir)}')
 
-                    sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)              
+                    sources += rename_cpp_to_cu([blob_dir],
+                                                src_dir, recurisve=True)
                 extra_include_paths = [
                     f"{CK_DIR}/include",
                     f"{CK_DIR}/library/include",
