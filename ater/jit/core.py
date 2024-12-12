@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-12 16:38:05
+# @Last Modified At: 2024-12-12 23:26:52
 # @Description: This is description.
 
 import os
@@ -160,10 +160,15 @@ def compile_ops(
 
                     sources += rename_cpp_to_cu([blob_dir],
                                                 src_dir, recurisve=True)
+
+                bd_include_dir = f'{op_dir}/build/include'
+                os.makedirs(bd_include_dir, exist_ok=True)
+                rename_cpp_to_cu([f"{ATER_CSRC_DIR}/include"],
+                                 bd_include_dir)
                 extra_include_paths = [
                     f"{CK_DIR}/include",
                     f"{CK_DIR}/library/include",
-                    f"{ATER_CSRC_DIR}/include",
+                    f"{bd_include_dir}",
                 ]+extra_include
 
                 module = cpp_extension.load(
