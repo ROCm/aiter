@@ -510,6 +510,16 @@ void hipb_destroy_extension() {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+std::string getHipblasltKernelName(int solution_index)
+{
+  std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(1);
+  std::vector<int> algoIndex(1);
+  algoIndex[0] = solution_index;
+  CHECK_HIPBLAS_ERROR(
+        hipblaslt_ext::getAlgosFromIndex(hipblaslt_handle, algoIndex, heuristicResult));
+  return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hipb_create_extension", &hipb_create_extension, "create_extension");
   m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension");
@@ -520,4 +530,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",
         py::arg("mat1"), py::arg("mat2"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt);
+  m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }

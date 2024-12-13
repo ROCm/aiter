@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import ater
-from test_common import checkAllclose, perftest
+from ater.test_common import checkAllclose, perftest
 import argparse
 
 num_iters = 100
@@ -41,7 +41,9 @@ def run_torch(input, x_scale, y_scale_dtype=torch.float32):
 
 @perftest()
 def run_ck(input, x_scale, y_scale_dtype=torch.float32):
-    output = torch.empty(input.shape, device="cuda", dtype=torch.int8)
+    # pad stride
+    output = torch.empty_strided(input.shape, (input.shape[1]+128, 1), dtype=torch.int8,
+                         layout=input.layout, device=input.device)
     y_scale = torch.empty(
         input.shape[0], 1, device="cuda", dtype=y_scale_dtype)
     ater.smoothquant_fwd(output,

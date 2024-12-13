@@ -5,7 +5,7 @@ import numpy as np
 import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
-from test_common import checkAllclose, perftest
+from ater.test_common import checkAllclose, perftest
 from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
 from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 from ater.ops.shuffle import shuffle_weight

@@ -1,4 +1,4 @@
-from test_common import checkAllclose, perftest
+from ater.test_common import checkAllclose, perftest
 import torch
 import torch.nn.functional as F
 import numpy as np

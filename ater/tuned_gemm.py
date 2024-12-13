@@ -4,7 +4,7 @@ import functools
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from ater import hipb_create_extension, hipb_mm
+from ater import hipb_create_extension, hipb_mm, getHipblasltKernelName
 from ater import rocb_create_extension, rocb_mm
 from ater import logger
 
@@ -36,8 +36,17 @@ class TunedGemm:
             self.tuned_df = None
 
     def load_best_sols(self):
+        if self.extensions_created is False:
+            rocb_create_extension()
+            hipb_create_extension()
+            self.extensions_created = True
         if self.tune_path is not None and Path(self.tune_path).is_file():
             self.bestsols = pd.read_csv(self.tune_path)
+            if len(self.bestsols) > 0 and 'kernelName' in self.bestsols.columns:
+                hipblasltKernelNames = self.bestsols.apply(
+                    lambda s: getHipblasltKernelName(s.solidx) if s.libtype == 'hipblaslt' else "", axis=1)
+                assert hipblasltKernelNames.equals(
+                    self.bestsols['kernelName']), "error: gradlib tune gemm not match the current environment, need re-tune!!!"
 
     def create_ds(self):
         df: pd.DataFrame = self.bestsols
@@ -125,10 +134,6 @@ class TunedGemm:
         else:
             inp_view = inp
             batched = False
-        if self.extensions_created is False:
-            rocb_create_extension()
-            hipb_create_extension()
-            self.extensions_created = True
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None

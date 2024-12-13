@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import numpy as np
 import ater
 import argparse
-from test_common import checkAllclose, perftest
+from ater.test_common import checkAllclose, perftest
 
 num_iters = 100
 num_warmup = 20

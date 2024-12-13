@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import ater
-from test_common import checkAllclose, perftest
+from ater.test_common import checkAllclose, perftest
 from torch.profiler import profile, record_function, ProfilerActivity
 
 # input shape: torch.Size([4096, 64, 160]) (20480, 1, 128) 
