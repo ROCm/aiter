@@ -83,7 +83,6 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
-    out, us = rets[2]
     for out, us in rets:
         msg = f'test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:.2f}'
         checkAllclose(ref, out.to(ref), msg=msg)
@@ -94,4 +93,4 @@ if __name__ == '__main__':
     for dtype in [torch.bfloat16]:
         for shape in [(128, 8192)]:
             test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
-            test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
+            # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)

@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-04 21:35:47
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-10 14:43:14
+# @Last Modified At: 2024-12-13 20:56:07
 # @Description: This is description.
 
 import os
@@ -20,18 +20,25 @@ MD_NAME = 'module_attention'
                    f'{ATER_CSRC_DIR}/pybind/attention_ck_pybind.cu'],
              md_name=MD_NAME)
 def pa_fwd_naive(
+    # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
+    # [num_blocks, num_kv_heads, head_size/x, block_size, x]
     key_cache: torch.Tensor,
+    # [num_blocks, num_kv_heads, head_size, block_size]
     value_cache: torch.Tensor,
+    # [num_seqs, max_num_blocks_per_seq]
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    # [num_seqs]
+    context_lens: torch.Tensor,
     max_seq_len: int,
-    kv_cache_dtype: str,
     num_kv_heads: int,
-    scale: float,
-    alibi_slopes: Optional[torch.Tensor],
-    k_scale: float,
-    v_scale: float) -> torch.Tensor: ...
+    scale_s: float,
+    scale_k: float,
+    scale_v: float,
+    block_size: int,
+    # [nhead, 2(kv), hdim]
+    kv_qscale: Optional[torch.Tensor]
+) -> torch.Tensor: ...
 
 
 @compile_ops(srcs=[f'{ATER_CSRC_DIR}/py_itfs_cu/asm_pa.cpp',
