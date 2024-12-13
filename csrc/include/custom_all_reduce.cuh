@@ -516,7 +516,6 @@ class CustomAllreduce {
 
   size /= d;
   auto bytes = size * sizeof(typename packed_t<T>::P);
-  std::cout << "size: " << size << " d: " << d << "threads: " << threads << " blocks: " << (size + threads - 1) / threads << std::endl;
   int blocks = std::min(block_limit, (size + threads - 1) / threads);
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
