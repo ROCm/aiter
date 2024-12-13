@@ -20,8 +20,6 @@ class TunedGemm:
         self.tune_path = f'{this_dir}/configs/tuned_gemm.csv'
         self.bestsols = {}
         self.solMap = ['torch', 'hipblaslt', 'rocblas', 'skinny']
-        self.load_best_sols()
-        self.create_ds()
         self.cu_count = torch.cuda.get_device_properties(
             device='cuda').multi_processor_count
 
@@ -36,10 +34,6 @@ class TunedGemm:
             self.tuned_df = None
 
     def load_best_sols(self):
-        if self.extensions_created is False:
-            rocb_create_extension()
-            hipb_create_extension()
-            self.extensions_created = True
         if self.tune_path is not None and Path(self.tune_path).is_file():
             self.bestsols = pd.read_csv(self.tune_path)
             if len(self.bestsols) > 0 and 'kernelName' in self.bestsols.columns:
@@ -128,6 +122,12 @@ class TunedGemm:
         # F.Linear can take a 3 dimensional input. vllm
         # uses this for linear units. However, sampler
         # will use torch.matmul with 2 dimensions only
+        if self.extensions_created == False:
+            rocb_create_extension()
+            hipb_create_extension()
+            self.extensions_created = True
+            self.load_best_sols()
+            self.create_ds()
         if inp.dim() == 3:
             inp_view = inp.view(-1, inp.size(-1))
             batched = True
