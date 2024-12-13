@@ -40,7 +40,7 @@ class TunedGemm:
                 hipblasltKernelNames = self.bestsols.apply(
                     lambda s: getHipblasltKernelName(s.solidx) if s.libtype == 'hipblaslt' else "", axis=1)
                 assert hipblasltKernelNames.equals(
-                    self.bestsols['kernelName']), "error: gradlib tune gemm not match the current environment, need re-tune!!!"
+                    self.bestsols['kernelName'].fillna("")), "error: gradlib tune gemm not match the current environment, need re-tune!!!"
 
     def create_ds(self):
         df: pd.DataFrame = self.bestsols
