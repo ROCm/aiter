@@ -1,6 +1,7 @@
 #include "activation.h"
 #include "attention.h"
 #include "attention_ck.h"
+#include "attention_asm.h"
 #include "cache.h"
 #include "custom_all_reduce.h"
 #include "custom.h"
@@ -107,7 +108,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("layernorm2d_fwd_with_add_dynamicquant", &layernorm2d_with_add_dynamicquant);
       m.def("smoothquant_fwd", &smoothquant_fwd);
       m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
-      m.def("moe_sorting", &moe_sorting_fwd);
+      m.def("moe_sorting_fwd", &moe_sorting_fwd);
       m.def("pa_fwd_naive", &pa_fwd_naive, "pa_fwd_naive",
             py::arg("Q"),
             py::arg("K"),
@@ -130,4 +131,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("transpose_mul", &transpose_mul, "apply for mul with transpose.");
       m.def("transpose_sub", &transpose_sub, "apply for sub with transpose.");
       m.def("transpose_div", &transpose_div, "apply for div with transpose.");
+      m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",
+            py::arg("Q"),
+            py::arg("K"),
+            py::arg("V"),
+            py::arg("block_tables"),
+            py::arg("context_lens"),
+            py::arg("K_QScale") = std::nullopt,
+            py::arg("V_QScale") = std::nullopt);
 }

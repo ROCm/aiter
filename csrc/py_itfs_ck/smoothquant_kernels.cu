@@ -18,6 +18,7 @@ void smoothquant_fwd(torch::Tensor &out,     // [m ,n]
     int n = input.size(-1);
     int m = input.numel() / n;
     int stride = n;
+    int out_stride = out.stride(0);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     smoothquant({
@@ -27,7 +28,7 @@ void smoothquant_fwd(torch::Tensor &out,     // [m ,n]
                  x_scale.data_ptr(), // p_x_scale
                  y_scale.data_ptr(), // p_y
                  out.data_ptr(),     // p_y_scale
-                 m, n, stride},
+                 m, n, stride, out_stride},
                 {stream});
 }
 
