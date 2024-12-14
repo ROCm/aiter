@@ -30,9 +30,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                            const float scale_k,
                            const float scale_v,
                            const int block_size,
-                           const int quant_algo,    // 0: no quant, 1: per-token FP8 quant
-                           std::optional<torch::Tensor> kv_qscale = std::nullopt // [nhead, 2(kv), hdim] used for kvcache dequant
-                                                                                 // above are input
+                           const int quant_algo    // 0: no quant, 1: per-token FP8 quant
 )
 {
     // TORCH_CHECK(scale_k == 1. && scale_v == 1., "only support 1.0 for now")

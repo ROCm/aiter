@@ -28,6 +28,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("scale_k"),
           py::arg("scale_v"),
           py::arg("block_size"),
-          py::arg("quant_algo"),
-          py::arg("kv_qscale") = std::nullopt);
+          py::arg("quant_algo"));
 }
