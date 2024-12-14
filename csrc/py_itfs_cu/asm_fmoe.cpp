@@ -95,7 +95,7 @@ public:
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
     };
 
-    template <typename T, typename T_O>
+    template <typename T, typename T_O, bool switchGxy = false>
     void launch_kernel(torch::Tensor &out,                    // [token_cnt, dim]
                        torch::Tensor &input,                  // [token_cnt, dim] M,K
                        torch::Tensor &w1,                     // [expert, inter_dim, dim] N,K
@@ -120,7 +120,7 @@ public:
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
 
-        int stride_X = dim * I_elemSize;
+        int stride_X = input.stride(0) * input.element_size();
         int stride_GU = dim * I_elemSize;
         int stride_D = hidden_dim * I_elemSize;
         int stride_expert_GU = stride_GU * hidden_dim;
@@ -182,10 +182,20 @@ public:
         int gdy = sub_X_cnt;
         int gdz = 1;
         const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
-                                       gdx, gdy, gdz,
-                                       bdx, 1, 1,
-                                       0, stream, nullptr, (void **)&config));
+        if constexpr (switchGxy)
+        {
+            HIP_CALL(hipModuleLaunchKernel(kernel_func,
+                                           gdy, gdx, gdz,
+                                           bdx, 1, 1,
+                                           0, stream, nullptr, (void **)&config));
+        }
+        else
+        {
+            HIP_CALL(hipModuleLaunchKernel(kernel_func,
+                                           gdx, gdy, gdz,
+                                           bdx, 1, 1,
+                                           0, stream, nullptr, (void **)&config));
+        }
     };
 };
 
@@ -242,4 +252,36 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
                                           fc1_scale,
                                           fc2_scale,
                                           fc2_smooth_scale);
+}
+
+void fmoe_int8_g1u0_a16(torch::Tensor &out,                    // [token_cnt, dim]
+                        torch::Tensor &input,                  // [token_cnt, dim] M,K
+                        torch::Tensor &gate,                   // [expert, inter_dim, dim] N,K
+                        torch::Tensor &down,                   // [expert, dim, inter_dim]
+                        torch::Tensor &sorted_token_ids,       // [max_num_tokens_padded]
+                        torch::Tensor &sorted_weight_buf,      // [max_num_tokens_padded]
+                        torch::Tensor &sorted_expert_ids,      // [max_num_m_blocks]
+                        torch::Tensor &num_tokens_post_padded, // [1]
+                        uint32_t topk,                         //
+                        torch::Tensor &fc1_scale,              // [expert, 1, hidden_dim]
+                        torch::Tensor &fc2_scale,              // [expert, 1, dim]
+                        torch::Tensor &fc1_smooth_scale,       // [expert, 1, hidden_dim]
+                        torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
+)
+{
+    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
+    impl.launch_kernel<uint8_t, uint16_t, true>(out,
+                                                input,
+                                                gate,
+                                                down,
+                                                sorted_token_ids,
+                                                sorted_weight_buf,
+                                                sorted_expert_ids,
+                                                num_tokens_post_padded,
+                                                topk,
+                                                // quant args
+                                                fc1_smooth_scale,
+                                                fc1_scale,
+                                                fc2_scale,
+                                                fc2_smooth_scale);
 }

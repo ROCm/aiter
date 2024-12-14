@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-10 14:11:39
+# @Last Modified At: 2024-12-14 23:24:27
 # @Description: This is description.
 
 import torch
@@ -17,38 +17,56 @@ import pandas as pd
 from ater import logger
 
 
-def perftest(num_iters=100, num_warmup=20):
+def perftest(num_iters=100, num_warmup=20, testGraph=False):
     def decorator(func):
         def wrapper(*args, **kwargs):
+            for _ in range(num_warmup):
+                data = func(*args, **kwargs)
+
             if int(os.environ.get('ATER_LOG_MORE', 0)):
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
-                for _ in range(num_iters+num_warmup):
+                for _ in range(num_iters):
                     start_event.record()
                     data = func(*args, **kwargs)
                     end_event.record()
                     end_event.synchronize()
                     latencies.append(start_event.elapsed_time(end_event))
-                avg = np.mean(latencies[num_warmup:]) * 1000
+                avg = np.mean(latencies) * 1000
                 logger.info(f'avg: {avg} ms/iter from cuda.Event')
+
+            if testGraph:
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    data = func(*args, **kwargs)
+                with tpf.profile(activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
+                                 profile_memory=True,
+                                 with_stack=True,
+                                 with_modules=True,
+                                 ) as prof:
+                    run_iters(num_iters, graph.replay)
+                avg = get_trace_perf(prof, num_iters)
+                logger.info(f'avg: {avg} ms/iter with hipgraph')
             with tpf.profile(activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                              profile_memory=True,
                              with_stack=True,
                              with_modules=True,
-                             record_shapes=True,
+                             #  record_shapes=True,
                              #  on_trace_ready=tpf.tensorboard_trace_handler(
                              #      './ater_logs/'),
-                             schedule=tpf.schedule(wait=1,
-                                                   warmup=num_warmup,
-                                                   active=num_iters),) as prof:
-                for _ in range(1+num_iters+num_warmup):
-                    data = func(*args, **kwargs)
-                    prof.step()
+                             ) as prof:
+                data = run_iters(num_iters, func, *args, **kwargs)
             avg = get_trace_perf(prof, num_iters)
             return data, avg
         return wrapper
     return decorator
+
+
+def run_iters(num_iters, func, *args, **kwargs):
+    for _ in range(num_iters):
+        data = func(*args, **kwargs)
+    return data
 
 
 def get_trace_perf(prof, num_iters):
@@ -60,7 +78,7 @@ def get_trace_perf(prof, num_iters):
     cols = ['key', 'count',
             'cpu_time_total', 'self_cpu_time_total',
             'device_time_total', 'self_device_time_total',
-            'self_device_memory_usage',
+            # 'self_device_memory_usage',
             'device_type',]
     cols = [el for el in df.columns if el in cols]
     df = df[(df.self_cpu_time_total > 0) | (df.self_device_time_total > 0)]

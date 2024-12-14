@@ -144,12 +144,13 @@ def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                  fc2_scale=None,  # [expert, model_dim, 1]
                  fc1_smooth_scale=None,  # [expert, 1, model_dim]
                  fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+                 a16=False,
                  ):
     return asm_moe(hidden_states,
                    w1,
                    w2,
                    topk_weight,
-                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16)
 
 
 @perftest()
@@ -213,18 +214,23 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False):
                                      w2,
                                      topk_weights,
                                      topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
-        print(f'{ref2=}')
+        # print(f'{ref2=}')
 
         # b implement
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
-        print(f'{out_b=}')
+        # print(f'{out_b=}')
+        out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
+                                      fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True)
+        # print(f'{out_c=}')
+        msg = f'asm: {avg_b:.2f} vs fuseQuant: {avg_b2:.2f}'
+        checkAllclose(out_b, out_b2, atol=100, msg=msg)
 
-    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:<8.2f} us, asm_avg: {avg_b:<8.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:<8.2f} us, asm_avg: {avg_b2:<8.2f} us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_c/avg_b2-1:.1%}"
     # checkAllclose(ref1, ref2, rtol=0.05, atol=20)
-    checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+    checkAllclose(ref2, out_b2, rtol=0.01, atol=100, msg=msg)
 
 
 print('test test_fmoe 16 bit')
@@ -232,5 +238,5 @@ for dtype in [torch.float16, torch.bfloat16][1:]:
     for m in [1, 2, 4, 8, 16, 26, 32, 64, 128, 160, 192, 224, 256][-5:-4]:
         for dim in [4096, 8192, 16384, 32768][1:1+1]:
             for hdim in [1024, 2048, 3584, 4096, 8192, 16384, 32768][0:1]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5)
-                # test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
+                # test_fmoe(dtype, m, dim, hdim, 32, 5)
+                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)

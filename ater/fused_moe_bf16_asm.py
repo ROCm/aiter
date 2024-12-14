@@ -31,7 +31,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
                           dtype=moebuf_dtype,
                           device=device)
     ater.moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
-                     num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M)
+                         num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
 
 
@@ -41,6 +41,7 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             fc2_scale=None,  # [expert, model_dim, 1]
             fc1_smooth_scale=None,  # [expert, 1, model_dim]
             fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+            a16=False
             ):
     E, _, model_dim = w1.shape
     M, topk = topk_ids.shape
@@ -51,6 +52,14 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
     if fc1_scale is None:
         ater.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
                   sorted_weights, sorted_expert_ids, num_tokens_post_padded, topk)
+    elif a16:
+        ater.fmoe_int8_g1u0_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
+                                sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                                topk,
+                                fc1_scale,
+                                fc2_scale,
+                                fc1_smooth_scale,
+                                fc2_smooth_scale)
     else:
         a8 = torch.empty((topk * M, model_dim),
                          dtype=torch.int8, device=device)

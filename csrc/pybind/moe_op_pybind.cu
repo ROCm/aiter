@@ -9,5 +9,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "that it is divisible by the block size.");
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
+      m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 }
