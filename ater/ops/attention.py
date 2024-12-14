@@ -30,6 +30,8 @@ def pa_fwd_naive(
     block_tables: torch.Tensor,
     # [num_seqs]
     context_lens: torch.Tensor,
+    k_dequant_scales: torch.Tensor,
+    v_dequant_scales: torch.Tensor,
     max_seq_len: int,
     num_kv_heads: int,
     scale_s: float,

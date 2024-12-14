@@ -22,12 +22,15 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                                              // or[num_batch*seqlen, num_kv_heads, head_size]
                            torch::Tensor &block_tables, // [num_seqs, max_num_blocks_per_seq]
                            torch::Tensor &context_lens,
+                           torch::Tensor &k_dequant_scales,
+                           torch::Tensor &v_dequant_scales,
                            const int max_seq_len,
                            const int num_kv_heads,
                            const float scale_s,
                            const float scale_k,
                            const float scale_v,
                            const int block_size,
+                           const int quant_algo,    // 0: no quant, 1: per-token FP8 quant
                            std::optional<torch::Tensor> kv_qscale = std::nullopt // [nhead, 2(kv), hdim] used for kvcache dequant
                                                                                  // above are input
 )
@@ -51,6 +54,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_t.v_layout = "phds";  // TODO
     naive_t.o_layout = "bhsd";
     naive_t.variation = 2; // decode variation
+    naive_t.quant_algo = quant_algo;
 
     ck_tile::naive_attention_fwd_args naive_a;
     naive_a.q_ptr = Q.data_ptr();
@@ -72,7 +76,8 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_a.nhead_ratio_kv = naive_a.nhead_q / naive_a.nhead_kv; // nhead_q / nhead_kv
     naive_a.page_size = block_size;                              // if paged, the seqlen-kv for each block
 
-    naive_a.kvscale_ptr = kv_qscale ? kv_qscale.value().data_ptr() : nullptr; // [nhead, 2(kv), hdim] used for kvcache dequant
+    naive_a.kscale_ptr = k_dequant_scales.data_ptr();
+    naive_a.vscale_ptr = v_dequant_scales.data_ptr();
     naive_a.max_pages_per_seq = max_num_blocks_per_seq;
 
     ck_tile::stream_config naive_s{};

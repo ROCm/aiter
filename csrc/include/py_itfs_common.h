@@ -19,7 +19,8 @@
     F("fp16", torch::kHalf)              \
     F("bf16", torch::kBFloat16)          \
     F("int32", torch::kInt32)            \
-    F("int8", torch::kInt8)
+    F("int8", torch::kInt8)         \
+    F("fp8", c10::kFloat8_e4m3fnuz)
 
 inline std::string torchDTypeToStr(caffe2::TypeMeta dtype)
 {
