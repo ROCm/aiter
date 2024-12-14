@@ -283,7 +283,7 @@ def run_ater(query,
     )
 
 
-# @perftest()
+@perftest()
 def run_ater_naive(query,
                    key_cache,
                    value_cache,
@@ -314,7 +314,7 @@ def run_ater_naive(query,
             v_scale,
             block_size,
             PA_QUANT
-        ), 1
+        )
 
 
 @perftest()
