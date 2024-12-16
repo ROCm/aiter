@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-12 23:26:52
+# @Last Modified At: 2024-12-16 17:48:12
 # @Description: This is description.
 
 import os
@@ -17,6 +17,7 @@ import importlib
 import functools
 from typing import List, Optional
 from torch.utils import cpp_extension
+from torch.utils.file_baton import FileBaton
 import logging
 PREBUILD_KERNELS = False
 if importlib.util.find_spec('ater_') is not None:
@@ -24,7 +25,7 @@ if importlib.util.find_spec('ater_') is not None:
     PREBUILD_KERNELS = True
 logger = logging.getLogger("ater")
 
-PYTHON = sys.executable
+PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 ATER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 ATER_CSRC_DIR = f'{ATER_ROOT_DIR}/csrc'
@@ -128,26 +129,25 @@ def compile_ops(
                 os.makedirs(src_dir, exist_ok=True)
                 sources = rename_cpp_to_cu(srcs, src_dir)
 
-                flags_cc = ["-O3", "-std=c++17",
-                            "-mllvm", "-enable-post-misched=0",
-                            "-mllvm", "-amdgpu-early-inline-all=true",
-                            "-mllvm", "-amdgpu-function-calls=false",
-                            "-mllvm", "--amdgpu-kernarg-preload-count=16",
-                            "-mllvm", "-amdgpu-coerce-illegal-types=1",
-                            # "-v", "--save-temps",
-                            "-Wno-unused-result",
-                            "-Wno-switch-bool",
-                            "-Wno-vla-cxx-extension",
-                            "-Wno-undefined-func-template",
-                            "-Wno-switch-bool",
-                            ]
+                flags_cc = ["-O3", "-std=c++17"]
                 flags_hip = [
                     "-DUSE_PROF_API=1",
                     "-D__HIP_PLATFORM_HCC__=1",
                     "-D__HIP_PLATFORM_AMD__=1",
                     "-U__HIP_NO_HALF_CONVERSIONS__",
                     "-U__HIP_NO_HALF_OPERATORS__",
-                ] + flags_cc
+
+                    "-mllvm", "-enable-post-misched=0",
+                    "-mllvm", "-amdgpu-early-inline-all=true",
+                    "-mllvm", "-amdgpu-function-calls=false",
+                    "-mllvm", "--amdgpu-kernarg-preload-count=16",
+                    "-mllvm", "-amdgpu-coerce-illegal-types=1",
+                    # "-v", "--save-temps",
+                    "-Wno-unused-result",
+                    "-Wno-switch-bool",
+                    "-Wno-vla-cxx-extension",
+                    "-Wno-undefined-func-template",
+                ]
                 flags_cc += flags_extra_cc
                 flags_hip += flags_extra_hip
                 validate_and_update_archs()
@@ -156,7 +156,14 @@ def compile_ops(
                 if blob_gen_cmd:
                     blob_dir = f"{op_dir}/blob"
                     os.makedirs(blob_dir, exist_ok=True)
-                    os.system(f'{PYTHON} {blob_gen_cmd.format(blob_dir)}')
+                    baton = FileBaton(os.path.join(blob_dir, 'lock'))
+                    if baton.try_acquire():
+                        try:
+                            os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
+                        finally:
+                            baton.release()
+                    else:
+                        baton.wait()
 
                     sources += rename_cpp_to_cu([blob_dir],
                                                 src_dir, recurisve=True)
