@@ -117,7 +117,7 @@ CUDA_DEVICES = [
 ]
 
 # 0: no quant. 1: K:per-token, V:groupped-per-token, FP8
-PA_QUANT = 1
+PA_QUANT = 2
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -146,13 +146,16 @@ def quant_kvcache(
     x          = key.shape[4]
     total_tokens = num_blocks * block_size
 
-    if quant_algo == 1:
+    if quant_algo == 1 or quant_algo == 2:
         group_size = 64 # every [group_size] of seqlen doing a quant
         token_groups = (total_tokens + group_size - 1) // group_size
         k_quant = torch.empty_like(key, dtype=torch.float8_e4m3fnuz)
         k_scale = torch.zeros([num_heads, total_tokens], dtype=torch.float32, device=value.device)
         v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fnuz)
-        v_scale = torch.zeros([num_heads, token_groups], dtype=torch.float32, device=value.device)
+        if quant_algo == 1:
+            v_scale = torch.zeros([num_heads, token_groups], dtype=torch.float32, device=value.device)
+        else :
+            v_scale = torch.zeros([num_heads, total_tokens], dtype=torch.float32, device=value.device)
         for i_token, i_head in itertools.product(range(total_tokens), range(num_heads)):
             i_s = i_token % block_size
             i_b = i_token // block_size
@@ -162,32 +165,42 @@ def quant_kvcache(
             k_scale[i_head, i_token] = per_token_scale_k
             k_quant[i_b, i_head, :, i_s, :] = (k / per_token_scale_k).to(dtype=torch.float8_e4m3fnuz)
 
-        for i_token_group, i_head in itertools.product(range(token_groups), range(num_heads)):
-            cross_group_max = torch.zeros(1, dtype=value.dtype, device=value.device)
-            for i_token_sub in range(group_size):
-                i_token = i_token_group * group_size + i_token_sub
-                if i_token >= total_tokens:
-                    continue
+        if quant_algo == 1:
+            for i_token_group, i_head in itertools.product(range(token_groups), range(num_heads)):
+                cross_group_max = torch.zeros(1, dtype=value.dtype, device=value.device)
+                for i_token_sub in range(group_size):
+                    i_token = i_token_group * group_size + i_token_sub
+                    if i_token >= total_tokens:
+                        continue
+                    i_s = i_token % block_size
+                    i_b = i_token // block_size
+                    v = value[i_b, i_head, :, i_s]
+                    absmax_v = torch.max(input=torch.abs(v))
+                    cross_group_max = torch.max(cross_group_max, absmax_v)
+
+                per_token_group_scale_v = cross_group_max.to(dtype=torch.float32) / torch.finfo(torch.float8_e4m3fnuz).max
+                v_scale[i_head, i_token_group] = per_token_group_scale_v
+
+                for i_token_sub in range(group_size):
+                    i_token = i_token_group * group_size + i_token_sub
+                    if i_token >= total_tokens:
+                        continue
+                    i_s = i_token % block_size
+                    i_b = i_token // block_size
+                    v = value[i_b, i_head, :, i_s]
+                    v_quant[i_b, i_head, :, i_s] = (v / per_token_group_scale_v).to(dtype=torch.float8_e4m3fnuz)
+        else:
+            for i_token, i_head in itertools.product(range(total_tokens), range(num_heads)):
                 i_s = i_token % block_size
                 i_b = i_token // block_size
                 v = value[i_b, i_head, :, i_s]
                 absmax_v = torch.max(input=torch.abs(v))
-                cross_group_max = torch.max(cross_group_max, absmax_v)
-
-            per_token_group_scale_v = cross_group_max.to(dtype=torch.float32) / torch.finfo(torch.float8_e4m3fnuz).max
-            v_scale[i_head, i_token_group] = per_token_group_scale_v
-
-            for i_token_sub in range(group_size):
-                i_token = i_token_group * group_size + i_token_sub
-                if i_token >= total_tokens:
-                    continue
-                i_s = i_token % block_size
-                i_b = i_token // block_size
-                v = value[i_b, i_head, :, i_s]
-                v_quant[i_b, i_head, :, i_s] = (v / per_token_group_scale_v).to(dtype=torch.float8_e4m3fnuz)
+                per_token_scale_v = absmax_v.to(dtype=torch.float32) / torch.finfo(torch.float8_e4m3fnuz).max # NANOO FP8 e4m3, 240
+                v_scale[i_head, i_token] = per_token_scale_v
+                v_quant[i_b, i_head, :, i_s] = (v / per_token_scale_v).to(dtype=torch.float8_e4m3fnuz)
 
         #checkAllclose(key.to(dtype=torch.float32), k_quant.to(dtype=torch.float32) * per_token_scale_k.to(dtype=torch.float32), msg = "k_cache vs k_quant")
-        #checkAllclose(value.to(dtype=torch.float32), v_quant.to(dtype=torch.float32) * per_token_group_scale_v.to(dtype=torch.float32), msg = "v_cache vs v_quant")
+        #checkAllclose(value.to(dtype=torch.float32), v_quant.to(dtype=torch.float32) * per_token_scale_v.to(dtype=torch.float32), msg = "v_cache vs v_quant")
 
         return k_quant, k_scale, v_quant, v_scale
 
@@ -518,7 +531,7 @@ def test_paged_attention(
             v_scale,
             block_size
         )
-    elif PA_QUANT == 1:
+    elif PA_QUANT == 1 or PA_QUANT == 2:
             k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache(key_cache, value_cache,  PA_QUANT)
             out_ater_naive, time_ater_naive = run_ater_naive(
                 query,
