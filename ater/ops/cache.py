@@ -48,6 +48,18 @@ def reshape_and_cache_flash(
     v_scale: float,
 ): ...
 
+@compile_ops(**compile_ops_)
+def reshape_and_cache_with_pertoken_quant(
+    key: Tensor,
+    value: Tensor,
+    key_cache: Tensor,
+    value_cache: Tensor,
+    k_dequant_scales: Tensor,
+    v_dequant_scales: Tensor,
+    slot_mapping: Tensor,
+    kv_cache_dtype: str,
+    asm_layout: bool
+): ...
 
 @compile_ops(**compile_ops_)
 def convert_fp8(

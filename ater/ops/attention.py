@@ -37,7 +37,8 @@ def pa_fwd_naive(
     scale_s: float,
     scale_k: float,
     scale_v: float,
-    block_size: int
+    block_size: int,
+    quant_algo: int
 ) -> torch.Tensor: ...
 
 

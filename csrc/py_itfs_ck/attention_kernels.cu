@@ -22,8 +22,8 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                                              // or[num_batch*seqlen, num_kv_heads, head_size]
                            torch::Tensor &block_tables, // [num_seqs, max_num_blocks_per_seq]
                            torch::Tensor &context_lens,
-                           torch::Tensor &k_dequant_scales,
-                           torch::Tensor &v_dequant_scales,
+                           torch::Tensor &k_dequant_scales, // [num_heads, max_kv_tokens]
+                           torch::Tensor &v_dequant_scales, // [num_heads, max_kv_tokens]
                            const int max_seq_len,
                            const int num_kv_heads,
                            const float scale_s,
@@ -41,6 +41,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     int hdim_q = Q.size(2);
     int hdim_v = V.size(2);
     int max_num_blocks_per_seq = block_tables.size(1);
+    int max_kv_tokens = k_dequant_scales.size(1);
 
     ck_tile::naive_attention_fwd_traits naive_t;
     naive_t.q_type = torchDTypeToStr(Q.dtype());
@@ -77,6 +78,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_a.kscale_ptr = k_dequant_scales.data_ptr();
     naive_a.vscale_ptr = v_dequant_scales.data_ptr();
     naive_a.max_pages_per_seq = max_num_blocks_per_seq;
+    naive_a.max_kv_tokens = max_kv_tokens;
 
     ck_tile::stream_config naive_s{};
 

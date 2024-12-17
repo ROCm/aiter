@@ -116,7 +116,7 @@ CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 ]
 
-# 0: no quant. 1: K:per-token, V:groupped-per-token, FP8
+# 0: no quant. 1: K:per-token, V:groupped-per-token, FP8, 2: K/V per-token(prefer this)
 PA_QUANT = 2
 
 def ref_masked_attention(
