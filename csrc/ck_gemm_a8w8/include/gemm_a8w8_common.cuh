@@ -219,22 +219,22 @@ using DeviceGemmHelper =
         BElementOp,
         CDEElementOp,
         GEMM_SPEC,
-        BLOCK_SIZE,  // Block Size
-        MBLOCK,      // M per Block
-        NBLOCK,      // N per Block
-        KBLOCK,      // K per Block
-        16,          // AK1
-        16,          // BK1
-        WAVE_TILE_M, // M per Xdl
-        WAVE_TILE_N, // N per Xdl
-        WAVE_MAP_M,  // Mxdl per Wave
-        WAVE_MAP_N,  // Nxdl per Wave
+        BLOCK_SIZE,                      // Block Size
+        MBLOCK,                          // M per Block
+        NBLOCK,                          // N per Block
+        KBLOCK,                          // K per Block
+        KBLOCK / ABLOCK_TRANSFER{}.At(0), // AK1
+        16,                              // BK1
+        WAVE_TILE_M,                     // M per Xdl
+        WAVE_TILE_N,                     // N per Xdl
+        WAVE_MAP_M,                      // Mxdl per Wave
+        WAVE_MAP_N,                      // Nxdl per Wave
         ABLOCK_TRANSFER,
         S<1, 0, 2>,
         S<1, 0, 2>,
         2,
-        16,
-        16,
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
         0,
         BBLOCK_TRANSFER,
         S<1, 0, 2>,
@@ -287,22 +287,22 @@ using DeviceGemmHelperMMA =
         BElementOp,
         CDEElementOp2,
         GEMM_SPEC,
-        BLOCK_SIZE,  // Block Size
-        MBLOCK,      // M per Block
-        NBLOCK,      // N per Block
-        KBLOCK,      // K per Block
-        16,          // AK1
-        16,          // BK1
-        WAVE_TILE_M, // M per Xdl
-        WAVE_TILE_N, // N per Xdl
-        WAVE_MAP_M,  // Mxdl per Wave
-        WAVE_MAP_N,  // Nxdl per Wave
+        BLOCK_SIZE,                      // Block Size
+        MBLOCK,                          // M per Block
+        NBLOCK,                          // N per Block
+        KBLOCK,                          // K per Block
+        KBLOCK / ABLOCK_TRANSFER{}.At(0), // AK1
+        16,                              // BK1
+        WAVE_TILE_M,                     // M per Xdl
+        WAVE_TILE_N,                     // N per Xdl
+        WAVE_MAP_M,                      // Mxdl per Wave
+        WAVE_MAP_N,                      // Nxdl per Wave
         ABLOCK_TRANSFER,
         S<1, 0, 2>,
         S<1, 0, 2>,
         2,
-        16,
-        16,
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
         0,
         BBLOCK_TRANSFER,
         S<1, 0, 2>,

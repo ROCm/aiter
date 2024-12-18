@@ -30,16 +30,16 @@ def test_gemm(dtype, m, n, k):
     x_scale = torch.rand([m, 1], dtype=torch.float32).cuda()
     w_scale = torch.rand([1, n], dtype=torch.float32).cuda()
     bias = torch.rand([1, n], dtype=dtype).cuda()
-    tensor_dump(x, 'x')
-    tensor_dump(weight, 'weight')
-    tensor_dump(shuffle_weight(weight), 'weight_shuffled')
-    tensor_dump(x_scale, 'x_scale')
-    tensor_dump(w_scale, 'w_scale')
-    tensor_dump(bias, 'bias')
+    # tensor_dump(x, 'x')
+    # tensor_dump(weight, 'weight')
+    # tensor_dump(shuffle_weight(weight), 'weight_shuffled')
+    # tensor_dump(x_scale, 'x_scale')
+    # tensor_dump(w_scale, 'w_scale')
+    # tensor_dump(bias, 'bias')
 
     (a, *_), avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     (b, *_), avg_b = run_gemm_b(x, weight, x_scale, w_scale, bias, dtype)
-    tensor_dump(a, 'output')
+    # tensor_dump(a, 'output')
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg, rtol=1e-3, atol=1000)

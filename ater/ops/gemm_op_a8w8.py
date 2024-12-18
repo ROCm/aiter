@@ -7,11 +7,10 @@ MD_NAME = "module_gemm_a8w8"
 
 
 @compile_ops(
-    srcs=[
-        f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8",
-    ],
-    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}}",
+    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu",
+        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8.cu",
+        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/include",],
+    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file ater/configs/a8w8_tuned_gemm.csv",
     md_name=MD_NAME,
     fc_name="gemm_a8w8",
 )
@@ -42,3 +41,21 @@ def gemm_a8w8_bias(
     Y = torch.empty(m, n, dtype=dtype, device="cuda")
     gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias)
     return Y
+
+
+@compile_ops(
+    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_tune_pybind.cu",
+          f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8_tune.cu",
+          f"{ATER_CSRC_DIR}/ck_gemm_a8w8/include",],
+    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune",
+    md_name="module_gemm_a8w8_tune",
+    fc_name="gemm_a8w8_tune",
+)
+def gemm_a8w8_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+): ...
