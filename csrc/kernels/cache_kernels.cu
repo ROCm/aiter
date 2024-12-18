@@ -265,7 +265,7 @@ __global__ void reshape_and_cache_flash_kernel(
 }
 
 namespace impl {
-  template<DType, SType>
+  template<typename DType, typename SType>
   __device__ DType type_convert(SType);
 
   template<>
@@ -283,6 +283,10 @@ namespace impl {
     hip_fp8 f8{x};
     return f8.data;
   }
+  template<>
+  __device__ float type_convert<float, float>(float x) {
+    return x;
+  }
 
   template <typename T, typename F>
   __device__ constexpr T wave_reduce(T local, F reduce_f)
@@ -294,7 +298,7 @@ namespace impl {
       {
           int src_lane = __lane_id() ^ (1 << i_stage);
           int32_t v_remote_tmp =
-              __builtin_amdgcn_ds_bpermute(src_lane << 2, bit_cast<int32_t>(v_local));
+              __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
           T v_remote = __builtin_bit_cast(T, v_remote_tmp);
           v_local    = reduce_f(v_local, v_remote);
       }
@@ -315,7 +319,7 @@ namespace impl {
 }
 
 // TODO: this is for kv pertoken quant
-template <typename scalar_t, typename cache_t, typename dequant_scale_t, int wg_size = 256, bool asmLayout=false>
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt, typename dequant_scale_t, int wg_size = 256, bool asmLayout=false>
 __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
@@ -387,6 +391,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
   float v_token_scale = v_max / 240.0;
 
   for(int i_d = 0; i_d < local_dim_elems; i_d++) {
+      int current_d = lane_id + i_d * warpSize;
       k_local_dim[current_d] = k_local_dim[current_d] / k_token_scale;
       v_local_dim[current_d] = v_local_dim[current_d] / v_token_scale;
   }
@@ -417,7 +422,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
           block_idx * num_heads * head_size * block_size +
                        head_idx * head_size * block_size +
                                  x_idx_v * head_size * x +
-                                         head_offset * x +
+                                         i_d * x +
                                                 x_offset_v;
     }
     else
@@ -425,12 +430,12 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
       tgt_value_idx =
           block_idx * num_heads * head_size * block_size +
                        head_idx * head_size * block_size +
-                                head_offset * block_size +
+                                i_d * block_size +
                                               block_offset;
     }
 
-    key_cache[tgt_key_idx] = type_convert<cache_t>(k_local_dim[i_d]);
-    value_cache[tgt_value_idx] = type_convert<cache_t>(v_local_dim[i_d]);
+    key_cache[tgt_key_idx] = impl::type_convert<cache_t>(k_local_dim[i_d]);
+    value_cache[tgt_value_idx] = impl::type_convert<cache_t>(v_local_dim[i_d]);
   }
 }
 }  // namespace vllm
@@ -580,8 +585,20 @@ void reshape_and_cache_with_pertoken_quant(
   using dequant_scale_t = float;  // should align with k_dequant_scales/v_dequant_scales dtype
 
   // TODO: only support kv_cache_dtype is "fp8" or "fp8_e4m3"
-  DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
-                               CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT)
+  if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") { 
+    if (key.dtype() == at::ScalarType::Float) {    
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);     
+    } else if (key.dtype() == at::ScalarType::Half) {               
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(uint16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);  
+    } else if (key.dtype() == at::ScalarType::BFloat16) {           
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__nv_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+    } else {                                                         
+      TORCH_CHECK(false,                                             
+                  "Unsupported input type of kv cache: ", key.dtype());
+    }                                                                
+  } else {                                                           
+    TORCH_CHECK(false, "Unsupported data type of kv cache: ", kv_cache_dtype);  
+  }      
 }
 
 
