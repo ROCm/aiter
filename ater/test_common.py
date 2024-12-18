@@ -75,6 +75,9 @@ def get_trace_perf(prof, num_iters):
         if 'ProfilerStep*' not in el.key:
             df.append(vars(el))
     df = pd.DataFrame(df)
+    for col in df.columns:
+        if 'cuda' in col:
+            df.rename(columns={col: col.replace('cuda', 'device')}, inplace=True)
     cols = ['key', 'count',
             'cpu_time_total', 'self_cpu_time_total',
             'device_time_total', 'self_device_time_total',

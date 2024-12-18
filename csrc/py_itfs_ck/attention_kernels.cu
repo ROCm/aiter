@@ -41,7 +41,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     int hdim_q = Q.size(2);
     int hdim_v = V.size(2);
     int max_num_blocks_per_seq = block_tables.size(1);
-    int max_kv_tokens = k_dequant_scales.size(1);
+    int max_kv_tokens = k_dequant_scales.numel() == 0? 0 : k_dequant_scales.size(1);
 
     ck_tile::naive_attention_fwd_traits naive_t;
     naive_t.q_type = torchDTypeToStr(Q.dtype());
