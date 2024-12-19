@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-14 15:47:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-19 15:25:52
+# @Last Modified At: 2024-12-19 15:33:35
 # @Description: This is description.
 
 import torch
@@ -35,7 +35,7 @@ def call_all_reduce_asm(input: torch.Tensor):
     ca_comm.signal.fill_(0)
     torch.cuda.synchronize()
     dist.barrier()
-    return ca_comm.allswdd_reduce_asm(input)
+    return ca_comm.all_reduce_asm(input)
 
 
 def init_dist_env_asm(world_size, rankID):
