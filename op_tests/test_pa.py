@@ -5,6 +5,7 @@ import torch
 import ater
 from ater import paged_attn as ops
 from ater.test_common import checkAllclose, perftest, tensor_dump, tensor_load
+from test_smoothquant import pertoken_quant
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -205,6 +206,38 @@ def quant_kvcache(
         return k_quant, k_scale, v_quant, v_scale
 
     return torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0)
+
+def quant_kvcache_fp8(
+    key_cache: torch.Tensor,      # [num_blocks, num_heads, head_size // x, block_size, x]
+    value_cache: torch.Tensor,    # [num_blocks, num_heads, head_size, block_size]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_blocks = key_cache.shape[0]
+    num_heads  = key_cache.shape[1]
+    head_dim   = value_cache.shape[2]
+    block_size = value_cache.shape[3]
+    x          = key_cache.shape[4]
+    total_tokens = num_blocks * block_size
+
+    # print(f"{key_cache.shape=}{key_cache.stride()=}")
+    # print(f"{value_cache.shape=}{value_cache.stride()=}")
+
+    key_cache_permute = key_cache.permute(0, 1, 3, 2, 4).reshape(num_blocks, num_heads, block_size, -1)
+    value_cache_permute = value_cache.permute(0, 1, 3, 2).reshape(num_blocks, num_heads, block_size, -1)
+
+    k_quant, k_scale = pertoken_quant(key_cache_permute, torch.float32, quant_dtype=torch.float8_e4m3fnuz)
+    v_quant, v_scale = pertoken_quant(value_cache_permute, torch.float32, quant_dtype=torch.float8_e4m3fnuz)
+    
+    k_quant = k_quant.view(num_blocks, num_heads, block_size, head_dim//x, x).permute(0, 1, 3, 2, 4).contiguous()
+    k_scale = k_scale.permute(1, 0, 2, 3).view(num_heads, total_tokens).contiguous()
+    v_quant = v_quant.view(num_blocks, num_heads, block_size, head_dim).permute(0, 1, 3, 2).contiguous()
+    v_scale = v_scale.permute(1, 0, 2, 3).view(num_heads, total_tokens).contiguous()
+
+    # print(f"{k_quant.shape=}{k_quant.stride()=}")
+    # print(f"{k_scale.shape=}{k_scale.stride()=}")
+    # print(f"{v_quant.shape=}{v_quant.stride()=}")
+    # print(f"{v_scale.shape=}{v_scale.stride()=}")
+
+    return k_quant, k_scale, v_quant, v_scale
 
 # @perftest()
 def run_native(query,
@@ -532,7 +565,9 @@ def test_paged_attention(
             block_size
         )
     elif PA_QUANT == 1 or PA_QUANT == 2:
-            k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache(key_cache, value_cache,  PA_QUANT)
+            # k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache(key_cache, value_cache,  PA_QUANT)
+            k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache_fp8(key_cache, value_cache)
+
             out_ater_naive, time_ater_naive = run_ater_naive(
                 query,
                 k_quant_,

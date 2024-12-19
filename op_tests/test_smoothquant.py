@@ -9,7 +9,7 @@ num_iters = 100
 num_warmup = 20
 
 
-def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None):
+def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype=torch.int8):
     # assume output int8, hidden_states is [m, n] shape and in fp16/bf16
     if x_scale is None:
         hidden_states = hidden_states_input
@@ -23,9 +23,10 @@ def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None):
         keepdim=True
     )
     per_token_scale = per_token_amax.to(dtype=torch.float32) / 127.0
+    per_token_scale[per_token_scale==0] = 1
 
     # quant hidden_states
-    hidden_states = (hidden_states / per_token_scale).to(dtype=torch.int8)
+    hidden_states = (hidden_states / per_token_scale).to(dtype=quant_dtype)
 
     return hidden_states, per_token_scale.to(y_scale_dtype)
     # hidden_states now is int8 will feed to next layer as intput
