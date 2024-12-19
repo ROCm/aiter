@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-14 15:47:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-19 15:33:35
+# @Last Modified At: 2024-12-19 19:36:41
 # @Description: This is description.
 
 import torch
@@ -31,10 +31,7 @@ logger = logging.getLogger("ater")
 def call_all_reduce_asm(input: torch.Tensor):
     tp_grp = get_tp_group()
     ca_comm = tp_grp.ca_comm
-    # TODO check input size <= pre allocated buffer
-    ca_comm.signal.fill_(0)
-    torch.cuda.synchronize()
-    dist.barrier()
+
     return ca_comm.all_reduce_asm(input)
 
 
@@ -53,7 +50,7 @@ def init_dist_env_asm(world_size, rankID):
     ca_comm = tp_grp.ca_comm
 
     # signal
-    signal = torch.zeros(world_size*2,
+    signal = torch.zeros(world_size*64,
                          dtype=torch.int64,
                          device=rankID)
 
