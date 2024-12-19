@@ -1,0 +1,1 @@
+python3 ./ater_logs/run.py ./ater_logs/ ar_asm all
