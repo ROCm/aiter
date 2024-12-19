@@ -312,3 +312,6 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
+    def all_reduce_asm(self, inp: torch.Tensor):
+        return ops.all_reduce_asm(self._ptr, inp, self.buffer, self.signal)

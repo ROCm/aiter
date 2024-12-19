@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-16 17:48:12
+# @Last Modified At: 2024-12-19 14:12:34
 # @Description: This is description.
 
 import os
@@ -15,6 +15,7 @@ import shutil
 import time
 import importlib
 import functools
+import traceback
 from typing import List, Optional
 from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
@@ -95,6 +96,89 @@ def get_module(md_name):
     return importlib.import_module(f'{__package__}.{md_name}')
 
 
+def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, extra_include, extra_ldflags, verbose):
+    startTS = time.perf_counter()
+    try:
+        op_dir = f'{bd_dir}/{md_name}'
+        logger.info(f'start build [{md_name}] under {op_dir}')
+
+        opbd_dir = f'{op_dir}/build'
+        src_dir = f'{op_dir}/build/srcs'
+        os.makedirs(src_dir, exist_ok=True)
+        sources = rename_cpp_to_cu(srcs, src_dir)
+
+        flags_cc = ["-O3", "-std=c++17"]
+        flags_hip = [
+            "-DUSE_PROF_API=1",
+            "-D__HIP_PLATFORM_HCC__=1",
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-U__HIP_NO_HALF_CONVERSIONS__",
+            "-U__HIP_NO_HALF_OPERATORS__",
+
+            "-mllvm", "-enable-post-misched=0",
+            "-mllvm", "-amdgpu-early-inline-all=true",
+            "-mllvm", "-amdgpu-function-calls=false",
+            "-mllvm", "--amdgpu-kernarg-preload-count=16",
+            "-mllvm", "-amdgpu-coerce-illegal-types=1",
+            # "-v", "--save-temps",
+            "-Wno-unused-result",
+            "-Wno-switch-bool",
+            "-Wno-vla-cxx-extension",
+            "-Wno-undefined-func-template",
+        ]
+        flags_cc += flags_extra_cc
+        flags_hip += flags_extra_hip
+        validate_and_update_archs()
+        check_and_set_ninja_worker()
+
+        if blob_gen_cmd:
+            blob_dir = f"{op_dir}/blob"
+            os.makedirs(blob_dir, exist_ok=True)
+            baton = FileBaton(os.path.join(blob_dir, 'lock'))
+            if baton.try_acquire():
+                try:
+                    os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
+                finally:
+                    baton.release()
+            else:
+                baton.wait()
+
+            sources += rename_cpp_to_cu([blob_dir],
+                                        src_dir, recurisve=True)
+
+        bd_include_dir = f'{op_dir}/build/include'
+        os.makedirs(bd_include_dir, exist_ok=True)
+        rename_cpp_to_cu([f"{ATER_CSRC_DIR}/include"],
+                         bd_include_dir)
+        extra_include_paths = [
+            f"{CK_DIR}/include",
+            f"{CK_DIR}/library/include",
+            f"{bd_include_dir}",
+        ]+extra_include
+
+        module = cpp_extension.load(
+            md_name,
+            sources,
+            extra_cflags=flags_cc,
+            extra_cuda_cflags=flags_hip,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=extra_include_paths,
+            build_directory=opbd_dir,
+            verbose=verbose or int(os.getenv("ATER_LOG_MORE", 0)) > 0,
+            with_cuda=True,
+            is_python_module=True,
+        )
+        shutil.copy(f'{opbd_dir}/{md_name}.so', f'{this_dir}')
+    except Exception as e:
+        logger.error('failed build jit [{}]\n-->[History]: {}'.format(
+            md_name,
+            ''.join(traceback.format_exception(*sys.exc_info()))
+        ))
+    logger.info(
+        f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
+    return module
+
+
 def compile_ops(
     srcs: List[str],
     md_name: str,
@@ -120,79 +204,8 @@ def compile_ops(
                 if module is None:
                     module = get_module(md_name)
             except Exception as e:
-                op_dir = f'{bd_dir}/{md_name}'
-                logger.info(f'start build [{md_name}] under {op_dir}')
-
-                startTS = time.perf_counter()
-                opbd_dir = f'{op_dir}/build'
-                src_dir = f'{op_dir}/build/srcs'
-                os.makedirs(src_dir, exist_ok=True)
-                sources = rename_cpp_to_cu(srcs, src_dir)
-
-                flags_cc = ["-O3", "-std=c++17"]
-                flags_hip = [
-                    "-DUSE_PROF_API=1",
-                    "-D__HIP_PLATFORM_HCC__=1",
-                    "-D__HIP_PLATFORM_AMD__=1",
-                    "-U__HIP_NO_HALF_CONVERSIONS__",
-                    "-U__HIP_NO_HALF_OPERATORS__",
-
-                    "-mllvm", "-enable-post-misched=0",
-                    "-mllvm", "-amdgpu-early-inline-all=true",
-                    "-mllvm", "-amdgpu-function-calls=false",
-                    "-mllvm", "--amdgpu-kernarg-preload-count=16",
-                    "-mllvm", "-amdgpu-coerce-illegal-types=1",
-                    # "-v", "--save-temps",
-                    "-Wno-unused-result",
-                    "-Wno-switch-bool",
-                    "-Wno-vla-cxx-extension",
-                    "-Wno-undefined-func-template",
-                ]
-                flags_cc += flags_extra_cc
-                flags_hip += flags_extra_hip
-                validate_and_update_archs()
-                check_and_set_ninja_worker()
-
-                if blob_gen_cmd:
-                    blob_dir = f"{op_dir}/blob"
-                    os.makedirs(blob_dir, exist_ok=True)
-                    baton = FileBaton(os.path.join(blob_dir, 'lock'))
-                    if baton.try_acquire():
-                        try:
-                            os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
-                        finally:
-                            baton.release()
-                    else:
-                        baton.wait()
-
-                    sources += rename_cpp_to_cu([blob_dir],
-                                                src_dir, recurisve=True)
-
-                bd_include_dir = f'{op_dir}/build/include'
-                os.makedirs(bd_include_dir, exist_ok=True)
-                rename_cpp_to_cu([f"{ATER_CSRC_DIR}/include"],
-                                 bd_include_dir)
-                extra_include_paths = [
-                    f"{CK_DIR}/include",
-                    f"{CK_DIR}/library/include",
-                    f"{bd_include_dir}",
-                ]+extra_include
-
-                module = cpp_extension.load(
-                    md_name,
-                    sources,
-                    extra_cflags=flags_cc,
-                    extra_cuda_cflags=flags_hip,
-                    extra_ldflags=extra_ldflags,
-                    extra_include_paths=extra_include_paths,
-                    build_directory=opbd_dir,
-                    verbose=verbose or int(os.getenv("ATER_LOG_MORE", 0)) > 0,
-                    with_cuda=True,
-                    is_python_module=True,
-                )
-                shutil.copy(f'{opbd_dir}/{md_name}.so', f'{this_dir}')
-                logger.info(
-                    f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
+                module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
+                                      blob_gen_cmd, extra_include, extra_ldflags, verbose)
 
             return getattr(module, loadName)(*args, **kwargs)
         return wrapper

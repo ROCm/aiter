@@ -12,6 +12,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("all_reduce_unreg", &all_reduce_unreg,
           "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> "
           "()");
+    m.def("all_reduce_asm", &all_reduce_asm, "");
 
     m.def("dispose", &dispose);
     m.def("meta_size", &meta_size);

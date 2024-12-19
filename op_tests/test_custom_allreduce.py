@@ -6,7 +6,7 @@ import torch.distributed as dist
 from ater.dist.parallel_state import (ensure_model_parallel_initialized,
                                       init_distributed_environment,
                                       set_custom_all_reduce,
-                                      get_tensor_model_parallel_group,
+                                      get_tp_group,
                                       graph_capture,
                                       destroy_model_parallel,
                                       destroy_distributed_environment)
@@ -38,7 +38,7 @@ def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
     # dist.barrier(device_ids=[i for i in range(tp_size)])
 
     # warmup and align all gpu
-    group = get_tensor_model_parallel_group().device_group
+    group = get_tp_group().device_group
     dist.all_reduce(torch.zeros(1).cuda(), group=group)
     torch.cuda.synchronize()
 

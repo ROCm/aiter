@@ -1,4 +1,7 @@
 import torch
+import os
+import logging
+logger = logging.getLogger("ater")
 import importlib.util
 if importlib.util.find_spec('ater_') is not None:
     from ater_ import *
@@ -20,11 +23,6 @@ from .ops.pos_encoding import *
 from .ops.cache import *
 from .ops.rmsnorm import *
 from .ops.communication import *
-import os
-import sys
-import logging
-import multiprocessing
-logger = logging.getLogger("ater")
 
 
 def getLogger():

@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-14 23:24:27
+# @Last Modified At: 2024-12-19 13:53:52
 # @Description: This is description.
 
 import torch
@@ -34,7 +34,7 @@ def perftest(num_iters=100, num_warmup=20, testGraph=False):
                     end_event.synchronize()
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
-                logger.info(f'avg: {avg} ms/iter from cuda.Event')
+                logger.info(f'avg: {avg} us/iter from cuda.Event')
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -47,7 +47,7 @@ def perftest(num_iters=100, num_warmup=20, testGraph=False):
                                  ) as prof:
                     run_iters(num_iters, graph.replay)
                 avg = get_trace_perf(prof, num_iters)
-                logger.info(f'avg: {avg} ms/iter with hipgraph')
+                logger.info(f'avg: {avg} us/iter with hipgraph')
             with tpf.profile(activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                              profile_memory=True,
                              with_stack=True,
@@ -85,7 +85,7 @@ def get_trace_perf(prof, num_iters):
 
     timerList = ['self_cpu_time_total', 'self_device_time_total', ]
     df = df[cols].sort_values(timerList, ignore_index=True)
-    avg_name = '[avg ms/iter]'
+    avg_name = '[avg us/iter]'
     for el in timerList:
         df.at[avg_name, el] = df[el].sum()/num_iters
     if int(os.environ.get('ATER_LOG_MORE', 0)):
