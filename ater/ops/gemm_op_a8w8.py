@@ -91,10 +91,7 @@ def gemm_a8w8_ASM(
         assert bias != None, "Use asm gemm must give bias, please give a \
             bias=torch.zeros(n,dtype=torch.float32,device='cuda')"
         splitK = asm_config['splitK']
-        if splitK > 0:
-            Y = torch.zeros(m, n, dtype=dtype, device="cuda")
-        else:
-            Y = torch.empty(m, n, dtype=dtype, device="cuda")
+        Y = torch.empty(m, n, dtype=dtype, device="cuda")
         return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, bias, splitK=splitK)
     return None
 
