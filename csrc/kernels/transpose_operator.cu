@@ -325,10 +325,13 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   bool order_flag = !input.is_contiguous() ? true : false;
   is_support &= input.dim() == other.dim();
   is_support &= dim == 3;
-  int M = input.size(0), N = input.size(1), K = input.size(2);
+  int M, N, K;
   int stride0, stride1, stride2;
   if (is_support)
   {
+    M = input.size(0);
+    N = input.size(1);
+    K = input.size(2);
     // avoid broadcast
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
