@@ -1,6 +1,6 @@
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
 import torch.nn.functional as F
 
 MD_NAME = "module_custom_all_reduce"
@@ -9,7 +9,9 @@ compile_ops_ = {
     "srcs": [
         f"{ATER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu",
         f"{ATER_CSRC_DIR}/kernels/custom_all_reduce.cu",
+        f'{ATER_CSRC_DIR}/py_itfs_cu/asm_communication.cpp',
     ],
+    'flags_extra_hip': [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
     "md_name": MD_NAME,
 }
 
@@ -25,7 +27,13 @@ def all_reduce_reg(_fa: int, inp: Tensor, out: Tensor): ...
 
 
 @compile_ops(**compile_ops_)
-def all_reduce_unreg(_fa: int, inp: Tensor, reg_buffer: Tensor, out: Tensor): ...
+def all_reduce_unreg(_fa: int, inp: Tensor,
+                     reg_buffer: Tensor, out: Tensor): ...
+
+
+@compile_ops(**compile_ops_)
+def all_reduce_asm(_fa: int, inp: Tensor,
+                   reg_buffer: Tensor, reg_sig: Tensor) -> Tensor: ...
 
 
 @compile_ops(**compile_ops_)

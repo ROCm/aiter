@@ -1,4 +1,7 @@
 import torch
+import os
+import logging
+logger = logging.getLogger("ater")
 import importlib.util
 if importlib.util.find_spec('ater_') is not None:
     from ater_ import *
@@ -19,11 +22,7 @@ from .ops.moe_sorting import *
 from .ops.pos_encoding import *
 from .ops.cache import *
 from .ops.rmsnorm import *
-import os
-import sys
-import logging
-import multiprocessing
-logger = logging.getLogger("ater")
+from .ops.communication import *
 
 
 def getLogger():
@@ -44,5 +43,4 @@ def getLogger():
     return logger
 
 
-if __name__ != "__main__" and multiprocessing.current_process().name == 'MainProcess' and '--multiprocessing-fork'not in sys.argv:
-    logger = getLogger()
+logger = getLogger()

@@ -10,6 +10,8 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
 void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out);
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
                       torch::Tensor &out);
+torch::Tensor all_reduce_asm(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
+                             torch::Tensor &reg_sig);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, torch::Tensor &t,

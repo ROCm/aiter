@@ -16,7 +16,7 @@ import shutil
 
 from setuptools import setup, find_packages
 from packaging.version import parse, Version
-
+from ater.jit import core
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
@@ -51,22 +51,8 @@ FORCE_CXX11_ABI = False
 def get_hip_version():
     return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
 
-
 def rename_cpp_to_cu(pths):
-    ret = []
-    dst = bd_dir
-    for pth in pths:
-        if not os.path.exists(pth):
-            continue
-        for entry in os.listdir(pth):
-            if os.path.isdir(f'{pth}/{entry}'):
-                continue
-            newName = entry
-            if entry.endswith(".cpp") or entry.endswith(".cu"):
-                newName = entry.replace(".cpp", ".cu")
-                ret.append(f'{dst}/{newName}')
-            shutil.copy(f'{pth}/{entry}', f'{dst}/{newName}')
-    return ret
+    return core.rename_cpp_to_cu(pths, bd_dir)
 
 
 def validate_and_update_archs(archs):
@@ -159,7 +145,10 @@ if IS_ROCM:
             os.system(f'{sys.executable} {this_dir}/csrc/ck_gemm_a8w8/gen_instances.py --working_path {ck_gemm_a8w8_dir}')
             generator_flag.append("-DUSE_CK_A8W8")
             renamed_ck_srcs += rename_cpp_to_cu(
-                [f"{this_dir}/csrc/ck_gemm_a8w8", f"{ck_gemm_a8w8_dir}", f"{ck_gemm_a8w8_dir}/impl", f"{ck_gemm_a8w8_dir}/instances"])
+                [f"{this_dir}/csrc/ck_gemm_a8w8/include",
+                f"{this_dir}/csrc/ck_gemm_a8w8/gemm_a8w8.cu",
+                f"{ck_gemm_a8w8_dir}", f"{ck_gemm_a8w8_dir}/impl", 
+                f"{ck_gemm_a8w8_dir}/instances"])
         extra_compile_args = {
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
             "nvcc":

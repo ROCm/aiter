@@ -219,22 +219,22 @@ using DeviceGemmHelper =
         BElementOp,
         CDEElementOp,
         GEMM_SPEC,
-        BLOCK_SIZE,  // Block Size
-        MBLOCK,      // M per Block
-        NBLOCK,      // N per Block
-        KBLOCK,      // K per Block
-        16,          // AK1
-        16,          // BK1
-        WAVE_TILE_M, // M per Xdl
-        WAVE_TILE_N, // N per Xdl
-        WAVE_MAP_M,  // Mxdl per Wave
-        WAVE_MAP_N,  // Nxdl per Wave
+        BLOCK_SIZE,                      // Block Size
+        MBLOCK,                          // M per Block
+        NBLOCK,                          // N per Block
+        KBLOCK,                          // K per Block
+        KBLOCK / ABLOCK_TRANSFER{}.At(0), // AK1
+        16,                              // BK1
+        WAVE_TILE_M,                     // M per Xdl
+        WAVE_TILE_N,                     // N per Xdl
+        WAVE_MAP_M,                      // Mxdl per Wave
+        WAVE_MAP_N,                      // Nxdl per Wave
         ABLOCK_TRANSFER,
         S<1, 0, 2>,
         S<1, 0, 2>,
         2,
-        16,
-        16,
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
         0,
         BBLOCK_TRANSFER,
         S<1, 0, 2>,
@@ -287,22 +287,22 @@ using DeviceGemmHelperMMA =
         BElementOp,
         CDEElementOp2,
         GEMM_SPEC,
-        BLOCK_SIZE,  // Block Size
-        MBLOCK,      // M per Block
-        NBLOCK,      // N per Block
-        KBLOCK,      // K per Block
-        16,          // AK1
-        16,          // BK1
-        WAVE_TILE_M, // M per Xdl
-        WAVE_TILE_N, // N per Xdl
-        WAVE_MAP_M,  // Mxdl per Wave
-        WAVE_MAP_N,  // Nxdl per Wave
+        BLOCK_SIZE,                      // Block Size
+        MBLOCK,                          // M per Block
+        NBLOCK,                          // N per Block
+        KBLOCK,                          // K per Block
+        KBLOCK / ABLOCK_TRANSFER{}.At(0), // AK1
+        16,                              // BK1
+        WAVE_TILE_M,                     // M per Xdl
+        WAVE_TILE_N,                     // N per Xdl
+        WAVE_MAP_M,                      // Mxdl per Wave
+        WAVE_MAP_N,                      // Nxdl per Wave
         ABLOCK_TRANSFER,
         S<1, 0, 2>,
         S<1, 0, 2>,
         2,
-        16,
-        16,
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
+        KBLOCK / ABLOCK_TRANSFER{}.At(0),
         0,
         BBLOCK_TRANSFER,
         S<1, 0, 2>,
@@ -327,7 +327,8 @@ __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::optional<torch::Tensor> bias)
+    std::optional<torch::Tensor> bias,
+    int KBatch)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -360,7 +361,7 @@ __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
         StrideB,
         std::array<ck::index_t, NumDTensor>{0, 0},
         StrideE,
-        1,
+        KBatch,
         a_element_op,
         b_element_op,
         cde_element_op);
@@ -378,7 +379,8 @@ __forceinline__ torch::Tensor gemm_a8w8_mma_impl(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::optional<torch::Tensor> bias)
+    std::optional<torch::Tensor> bias,
+    int KBatch)
 {
     int M = XQ.size(0);
     int N = WQ.size(0);
@@ -412,7 +414,7 @@ __forceinline__ torch::Tensor gemm_a8w8_mma_impl(
         StrideB,
         std::array<ck::index_t, NumDTensor>{0, 0, 0},
         StrideE,
-        1,
+        KBatch,
         a_element_op,
         b_element_op,
         cde_element_op2);

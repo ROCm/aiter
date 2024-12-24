@@ -15,6 +15,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <map>
 #include <unordered_map>
 #include <vector>
+#include "communication_asm.h"
 
 #define CUDACHECK(cmd)                                              \
   do {                                                              \
@@ -439,6 +440,29 @@ class CustomAllreduce {
     buffers_[self] = d_data;
   }
 
+  RankData *get_buffer_RD(cudaStream_t stream, void *input)
+  {
+    RankData *ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive)
+    {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    }
+    else
+    {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " +
+            std::to_string(reinterpret_cast<uint64_t>(input)) +
+            " is not registered!");
+      ptrs = it->second;
+    }
+    return ptrs;
+  }
+
   // note: when registering graph buffers, we intentionally choose to not
   // deduplicate the addresses. That means if the allocator reuses some
   // addresses, they will be registered again. This is to account for the remote
@@ -498,21 +522,7 @@ class CustomAllreduce {
                              std::to_string(kMaxBlocks) + ". Got " +
                              std::to_string(block_limit));
 
-  RankData* ptrs;
-  cudaStreamCaptureStatus status;
-  CUDACHECK(cudaStreamIsCapturing(stream, &status));
-  if (status == cudaStreamCaptureStatusActive) {
-    ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-    graph_unreg_buffers_.push_back(input);
-  } else {
-    auto it = buffers_.find(input);
-    if (it == buffers_.end())
-      throw std::runtime_error(
-          "buffer address " +
-          std::to_string(reinterpret_cast<uint64_t>(input)) +
-          " is not registered!");
-    ptrs = it->second;
-  }
+  RankData *ptrs = get_buffer_RD(stream, input);
 
   size /= d;
   auto bytes = size * sizeof(typename packed_t<T>::P);
@@ -548,6 +558,24 @@ class CustomAllreduce {
   }
 #undef REDUCE_CASE
 #undef KL
+}
+
+torch::Tensor
+allreduce_asm(cudaStream_t stream, void *input, void *sig, int size, torch::Tensor &inp)
+{
+  RankData *input_rd = get_buffer_RD(stream, input);
+  RankData *sig_rd = get_buffer_RD(stream, sig);
+
+  static Kernel_AR impl("allreduce_kernel_func", "all_reduce.co");
+  impl.launch_kernel(input_rd->ptrs,
+                     sig_rd->ptrs,
+                     rank_,
+                     size,
+                     world_size_);
+  auto options = torch::TensorOptions()
+                     .dtype(inp.dtype())
+                     .device(inp.device());
+  return torch::from_blob((void *)(input_rd->ptrs[rank_]), {inp.sizes()}, options);
 }
 
 ~CustomAllreduce() {

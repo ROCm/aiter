@@ -19,8 +19,12 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
 
 
 @perftest()
-def run_gemm_b(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return ater.gemm_a8w8_bias(x, weight, x_scale, w_scale, bias, dtype=dtype)
+def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
+    return ater.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias)
+
+@perftest()
+def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
+    return ater.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
 
 def test_gemm(dtype, m, n, k):
@@ -29,20 +33,28 @@ def test_gemm(dtype, m, n, k):
     weight = torch.randint(-20, 20, (n, k), dtype=torch.int8).cuda()
     x_scale = torch.rand([m, 1], dtype=torch.float32).cuda()
     w_scale = torch.rand([1, n], dtype=torch.float32).cuda()
-    bias = torch.rand([1, n], dtype=dtype).cuda()
-    tensor_dump(x, 'x')
-    tensor_dump(weight, 'weight')
-    tensor_dump(shuffle_weight(weight), 'weight_shuffled')
-    tensor_dump(x_scale, 'x_scale')
-    tensor_dump(w_scale, 'w_scale')
-    tensor_dump(bias, 'bias')
+    bias = torch.rand([1, n], dtype=dtype).cuda() * 10
+    weightshuffle = shuffle_weight(weight,layout=(32,16))
+    bias_f32 = bias.to(torch.float)
+    x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
+    # print(f"{x_pad.shape=}{x_pad.stride()}")
+    # tensor_dump(x, 'x')
+    # tensor_dump(weight, 'weight')
+    # tensor_dump(shuffle_weight(weight), 'weight_shuffled')
+    # tensor_dump(x_scale, 'x_scale')
+    # tensor_dump(w_scale, 'w_scale')
+    # tensor_dump(bias, 'bias')
 
-    (a, *_), avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    (b, *_), avg_b = run_gemm_b(x, weight, x_scale, w_scale, bias, dtype)
-    tensor_dump(a, 'output')
-
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
+    c, avg_c = run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias_f32, dtype)
+    if c is None:
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm : not support, uplift: {avg_a/avg_b-1:<5.1%}"
+    else:
+        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/min(avg_b,avg_c)-1:<5.1%}"
     checkAllclose(a, b, msg=msg, rtol=1e-3, atol=1000)
+    if c != None:
+        checkAllclose(a, c, msg="\033[1A\033[2K"+ msg, rtol=1e-3, atol=1000)
 
 
 for dtype in [torch.bfloat16]:
