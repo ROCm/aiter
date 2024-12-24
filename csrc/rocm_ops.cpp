@@ -48,7 +48,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                float k_scale, float v_scale) -> ()");
 #ifdef USE_CK_A8W8
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
-            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), py::arg("bias") = std::nullopt);
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), 
+            py::arg("bias") = std::nullopt, py::arg("splitK") = 0);
 #endif
       m.def("swap_blocks", &swap_blocks,
             "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");
@@ -130,6 +131,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
+      m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("transpose_add", &transpose_add, "apply for add with transpose.");
       m.def("transpose_mul", &transpose_mul, "apply for mul with transpose.");
       m.def("transpose_sub", &transpose_sub, "apply for sub with transpose.");
@@ -150,4 +152,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("sub_m") = 128, py::arg("sub_n") = 128,
             py::arg("pad_a") = 0, py::arg("pad_b") = 0,
             py::arg("pad_c") = 0, py::arg("splitK") = 0);
+      m.def("all_reduce_asm", &all_reduce_asm, "");
 }

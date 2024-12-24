@@ -4,10 +4,13 @@
 #include "gemm_a8w8_common.cuh"
 #include "gemm_a8w8_manifest.h"
 #include "gemm_a8w8_lookup.h"
+#include <string>
 
 using RowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &, torch::Tensor &, std::optional<torch::Tensor>)>;
+                  torch::Tensor &, torch::Tensor &, 
+                  torch::Tensor &, std::optional<torch::Tensor>,
+                  int)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -42,7 +45,7 @@ RowwiseKernel rowwise_dispatch(int id)
     } }();
 
   TORCH_CHECK(id < lookup.size(),
-              "Kernel id is out of range!");
+              "Kernel id " + std::to_string(id)  +" is out of range!");
   auto it = lookup.find(id);
   // If we found an optimal kernel, use it.
   if (it != lookup.end())
@@ -61,7 +64,8 @@ torch::Tensor gemm_a8w8_tune(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    int kernelId)
+    int kernelId,
+    int splitK)
 {
   TORCH_CHECK(XQ.dtype() == at::ScalarType::Char && XQ.dtype() == WQ.dtype(),
               "Weights and activations should both be int8!");
@@ -72,6 +76,7 @@ torch::Tensor gemm_a8w8_tune(
   int M = XQ.size(0);
   int N = WQ.size(0);
   int K = XQ.size(1);
+  int KBatch = std::pow(2, splitK);
 
   // if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
   // {
@@ -88,7 +93,7 @@ torch::Tensor gemm_a8w8_tune(
   // else 
   if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    rowwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias);
+    rowwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
   }
   else
   {

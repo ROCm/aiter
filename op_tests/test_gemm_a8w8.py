@@ -36,6 +36,8 @@ def test_gemm(dtype, m, n, k):
     bias = torch.rand([1, n], dtype=dtype).cuda() * 10
     weightshuffle = shuffle_weight(weight,layout=(32,16))
     bias_f32 = bias.to(torch.float)
+    x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
+    # print(f"{x_pad.shape=}{x_pad.stride()}")
     # tensor_dump(x, 'x')
     # tensor_dump(weight, 'weight')
     # tensor_dump(shuffle_weight(weight), 'weight_shuffled')
@@ -58,9 +60,9 @@ def test_gemm(dtype, m, n, k):
 for dtype in [torch.bfloat16]:
     # qkv_proj
     for (m, n, k) in [
-        # (1, 1280, 8192),
-        # (32, 1280, 8192),
-        # (64, 1280, 8192),
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
         (128, 1280, 8192),
         (192, 1280, 8192),
         (256, 1280, 8192),
@@ -73,20 +75,20 @@ for dtype in [torch.bfloat16]:
         (16384, 1280, 8192),
     ]:
         test_gemm(dtype, m, n, k)
-    # # attn_out
-    # for (m, n, k) in [
-    #     # (1, 8192, 1024),
-    #     # (32, 8192, 1024),
-    #     # (64, 8192, 1024),
-    #     (128, 8192, 1024),
-    #     (192, 8192, 1024),
-    #     (256, 8192, 1024),
-    #     (320, 8192, 1024),
-    #     (512, 8192, 1024),
-    #     (1024, 8192, 1024),
-    #     (2048, 8192, 1024),
-    #     (4096, 8192, 1024),
-    #     (8192, 8192, 1024),
-    #     (16384, 8192, 1024),
-    # ]:
-    #     test_gemm(dtype, m, n, k)
+    # attn_out
+    for (m, n, k) in [
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]:
+        test_gemm(dtype, m, n, k)

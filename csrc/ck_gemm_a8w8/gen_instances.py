@@ -31,7 +31,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::optional<torch::Tensor> bias)
+    std::optional<torch::Tensor> bias,
+    int KBatch)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
 
@@ -39,7 +40,7 @@ torch::Tensor
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
     int K = WQ.size(1);
-    bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % {k.KPerBLOCK} != 0);
+    bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK} * KBatch) != 0);
     if (pad)
     {{{{
         // pad
@@ -77,7 +78,7 @@ torch::Tensor
                 ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
                 ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
             // Run kernel instance.
-            return gemm_a8w8_mma_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias);
+            return gemm_a8w8_mma_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
         }}}}
         else
         {{{{
@@ -101,7 +102,7 @@ torch::Tensor
                 ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
                 ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
             // Run kernel instance.
-            return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias);
+            return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
         }}}}
 """ 
         INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelper<
@@ -124,7 +125,7 @@ torch::Tensor
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias);
+        return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
 """ 
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
@@ -148,7 +149,8 @@ template torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::optional<torch::Tensor> bias);
+    std::optional<torch::Tensor> bias,
+    int KBatch);
 
 """
         INSTANCE_dBF16_eBF16 = INSTANCE_template.format(
@@ -223,7 +225,8 @@ torch::Tensor
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::optional<torch::Tensor> bias);
+    std::optional<torch::Tensor> bias,
+    int KBatch);
 """
         MAINFEST_end = """
 

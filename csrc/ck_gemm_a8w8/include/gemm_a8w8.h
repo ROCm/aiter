@@ -8,7 +8,8 @@ torch::Tensor gemm_a8w8(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    std::optional<torch::Tensor> bias);
+    std::optional<torch::Tensor> bias,
+    int splitK);
 
 torch::Tensor gemm_a8w8_tune(
     // void gemm_a8w8(
@@ -17,4 +18,5 @@ torch::Tensor gemm_a8w8_tune(
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
     torch::Tensor &Y,
-    int kernelId);
+    int kernelId,
+    int splitK);
