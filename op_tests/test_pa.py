@@ -117,7 +117,7 @@ CUDA_DEVICES = [
     f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
 ]
 
-# 0: no quant. 1: K:per-token, V:groupped-per-token, FP8, 2: K/V per-token(prefer this)
+# 0: no quant. 1: (ignore this), FP8, 2: K/V per-token(prefer this)
 PA_QUANT = 2
 
 def ref_masked_attention(
@@ -134,100 +134,32 @@ def ref_masked_attention(
     out = torch.einsum("hqk,khd->qhd", attn_weights, value)
     return out
 
-# quant single layer kvcache, only for reference purpose
-def quant_kvcache(
-    key: torch.Tensor,      # [num_blocks, num_heads, head_size // x, block_size, x]
-    value: torch.Tensor,    # [num_blocks, num_heads, head_size, block_size]
-    quant_algo: int         # 1: K:per-token, V:groupped-per-token, FP8
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_blocks = key.shape[0]
-    num_heads  = key.shape[1]
-    head_dim   = value.shape[2]
-    block_size = value.shape[3]
-    x          = key.shape[4]
-    total_tokens = num_blocks * block_size
-
-    if quant_algo == 1 or quant_algo == 2:
-        group_size = 64 # every [group_size] of seqlen doing a quant
-        token_groups = (total_tokens + group_size - 1) // group_size
-        k_quant = torch.empty_like(key, dtype=torch.float8_e4m3fnuz)
-        k_scale = torch.zeros([num_heads, total_tokens], dtype=torch.float32, device=value.device)
-        v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fnuz)
-        if quant_algo == 1:
-            v_scale = torch.zeros([num_heads, token_groups], dtype=torch.float32, device=value.device)
-        else :
-            v_scale = torch.zeros([num_heads, total_tokens], dtype=torch.float32, device=value.device)
-        for i_token, i_head in itertools.product(range(total_tokens), range(num_heads)):
-            i_s = i_token % block_size
-            i_b = i_token // block_size
-            k = key[i_b, i_head, :, i_s, :]
-            absmax_k = torch.max(input=torch.abs(k))
-            per_token_scale_k = absmax_k.to(dtype=torch.float32) / torch.finfo(torch.float8_e4m3fnuz).max # NANOO FP8 e4m3, 240
-            k_scale[i_head, i_token] = per_token_scale_k
-            k_quant[i_b, i_head, :, i_s, :] = (k / per_token_scale_k).to(dtype=torch.float8_e4m3fnuz)
-
-        if quant_algo == 1:
-            for i_token_group, i_head in itertools.product(range(token_groups), range(num_heads)):
-                cross_group_max = torch.zeros(1, dtype=value.dtype, device=value.device)
-                for i_token_sub in range(group_size):
-                    i_token = i_token_group * group_size + i_token_sub
-                    if i_token >= total_tokens:
-                        continue
-                    i_s = i_token % block_size
-                    i_b = i_token // block_size
-                    v = value[i_b, i_head, :, i_s]
-                    absmax_v = torch.max(input=torch.abs(v))
-                    cross_group_max = torch.max(cross_group_max, absmax_v)
-
-                per_token_group_scale_v = cross_group_max.to(dtype=torch.float32) / torch.finfo(torch.float8_e4m3fnuz).max
-                v_scale[i_head, i_token_group] = per_token_group_scale_v
-
-                for i_token_sub in range(group_size):
-                    i_token = i_token_group * group_size + i_token_sub
-                    if i_token >= total_tokens:
-                        continue
-                    i_s = i_token % block_size
-                    i_b = i_token // block_size
-                    v = value[i_b, i_head, :, i_s]
-                    v_quant[i_b, i_head, :, i_s] = (v / per_token_group_scale_v).to(dtype=torch.float8_e4m3fnuz)
-        else:
-            for i_token, i_head in itertools.product(range(total_tokens), range(num_heads)):
-                i_s = i_token % block_size
-                i_b = i_token // block_size
-                v = value[i_b, i_head, :, i_s]
-                absmax_v = torch.max(input=torch.abs(v))
-                per_token_scale_v = absmax_v.to(dtype=torch.float32) / torch.finfo(torch.float8_e4m3fnuz).max # NANOO FP8 e4m3, 240
-                v_scale[i_head, i_token] = per_token_scale_v
-                v_quant[i_b, i_head, :, i_s] = (v / per_token_scale_v).to(dtype=torch.float8_e4m3fnuz)
-
-        #checkAllclose(key.to(dtype=torch.float32), k_quant.to(dtype=torch.float32) * per_token_scale_k.to(dtype=torch.float32), msg = "k_cache vs k_quant")
-        #checkAllclose(value.to(dtype=torch.float32), v_quant.to(dtype=torch.float32) * per_token_scale_v.to(dtype=torch.float32), msg = "v_cache vs v_quant")
-
-        return k_quant, k_scale, v_quant, v_scale
-
-    return torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0)
-
-def quant_kvcache_fp8(
+def pertoken_quant_kvcache_symm(
     key_cache: torch.Tensor,      # [num_blocks, num_heads, head_size // x, block_size, x]
     value_cache: torch.Tensor,    # [num_blocks, num_heads, head_size, block_size]
+    quant_dtype: torch.dtype,      # e.g. torch.float8_e4m3fnuz
+    scale_dtype: torch.dtype = torch.float32
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = key_cache.shape[0]
     num_heads  = key_cache.shape[1]
     head_dim   = value_cache.shape[2]
     block_size = value_cache.shape[3]
-    x          = key_cache.shape[4]
+    # x          = key_cache.shape[4]
     total_tokens = num_blocks * block_size
 
     # print(f"{key_cache.shape=}{key_cache.stride()=}")
     # print(f"{value_cache.shape=}{value_cache.stride()=}")
 
-    key_cache_permute = key_cache.permute(0, 1, 3, 2, 4).reshape(num_blocks, num_heads, block_size, -1)
-    value_cache_permute = value_cache.permute(0, 1, 3, 2).reshape(num_blocks, num_heads, block_size, -1)
+    key_cache_permute = key_cache.permute(0, 1, 3, 2, 4).reshape(num_blocks, num_heads, block_size, -1).contiguous()
+    value_cache_permute = value_cache.permute(0, 1, 3, 2).reshape(num_blocks, num_heads, block_size, -1).contiguous()
 
-    k_quant, k_scale = pertoken_quant(key_cache_permute, torch.float32, quant_dtype=torch.float8_e4m3fnuz)
-    v_quant, v_scale = pertoken_quant(value_cache_permute, torch.float32, quant_dtype=torch.float8_e4m3fnuz)
+    k_quant, k_scale = pertoken_quant(key_cache_permute, scale_dtype, quant_dtype=quant_dtype)
+    v_quant, v_scale = pertoken_quant(value_cache_permute, scale_dtype, quant_dtype=quant_dtype)
+
+    # NOTE: quant_x and original x could be different
+    quant_x = 16 // quant_dtype.itemsize
     
-    k_quant = k_quant.view(num_blocks, num_heads, block_size, head_dim//x, x).permute(0, 1, 3, 2, 4).contiguous()
+    k_quant = k_quant.view(num_blocks, num_heads, block_size, head_dim // quant_x, quant_x).permute(0, 1, 3, 2, 4).contiguous()
     k_scale = k_scale.permute(1, 0, 2, 3).view(num_heads, total_tokens).contiguous()
     v_quant = v_quant.view(num_blocks, num_heads, block_size, head_dim).permute(0, 1, 3, 2).contiguous()
     v_scale = v_scale.permute(1, 0, 2, 3).view(num_heads, total_tokens).contiguous()
@@ -236,6 +168,7 @@ def quant_kvcache_fp8(
     # print(f"{k_scale.shape=}{k_scale.stride()=}")
     # print(f"{v_quant.shape=}{v_quant.stride()=}")
     # print(f"{v_scale.shape=}{v_scale.stride()=}")
+    # print(f"key_cache_permute:{key_cache_permute[0, :, :, :]}, k_quant:{k_quant[0, :, :, :, :]}, k_scale:{k_scale[:, 0]}")
 
     return k_quant, k_scale, v_quant, v_scale
 
@@ -344,7 +277,8 @@ def run_ater_naive(query,
                    alibi_slopes,
                    k_scale,
                    v_scale,
-                   block_size):
+                   block_size,
+                   quant_algo = 0):
     return ater.pa_fwd_naive(
             query,
             key_cache,
@@ -359,7 +293,7 @@ def run_ater_naive(query,
             k_scale,
             v_scale,
             block_size,
-            PA_QUANT
+            quant_algo
         )
 
 
@@ -546,36 +480,16 @@ def test_paged_attention(
                   msg=f'golden vs ater_asm:{time_ater_asm}')
     tensor_dump(out_ater, 'out_ater')
 
-    if PA_QUANT == 0:
-        out_ater_naive, time_ater_naive = run_ater_naive(
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            seq_lens,
-            torch.empty((0)),
-            torch.empty((0)),
-            max_seq_len,
-            kv_cache_dtype,
-            num_kv_heads,
-            scale,
-            alibi_slopes,
-            k_scale,
-            v_scale,
-            block_size
-        )
-    elif PA_QUANT == 1 or PA_QUANT == 2:
-            # k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache(key_cache, value_cache,  PA_QUANT)
-            k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache_fp8(key_cache, value_cache)
-
+    if 0:
+        if PA_QUANT == 0:
             out_ater_naive, time_ater_naive = run_ater_naive(
                 query,
-                k_quant_,
-                v_quant_,
+                key_cache,
+                value_cache,
                 block_tables,
                 seq_lens,
-                k_scale_,
-                v_scale_,
+                torch.empty((0)),
+                torch.empty((0)),
                 max_seq_len,
                 kv_cache_dtype,
                 num_kv_heads,
@@ -585,9 +499,58 @@ def test_paged_attention(
                 v_scale,
                 block_size
             )
-    checkAllclose(out_golden, out_ater_naive,
-                  msg=f'golden vs ck_naive:{time_ater_naive}')
-    tensor_dump(out_ater_naive, 'out_ater_naive')
+        elif PA_QUANT == 1 or PA_QUANT == 2:
+                # k_quant_, k_scale_, v_quant_, v_scale_ = quant_kvcache(key_cache, value_cache,  PA_QUANT)
+                k_quant_, k_scale_, v_quant_, v_scale_ = pertoken_quant_kvcache_symm(key_cache, value_cache, quant_dtype=torch.float8_e4m3fnuz)
+                # k_quant_, k_scale_, v_quant_, v_scale_ = pertoken_quant_kvcache_symm(key_cache, value_cache, quant_dtype=torch.int8)
+
+                out_ater_naive, time_ater_naive = run_ater_naive(
+                    query,
+                    k_quant_,
+                    v_quant_,
+                    block_tables,
+                    seq_lens,
+                    k_scale_,
+                    v_scale_,
+                    max_seq_len,
+                    kv_cache_dtype,
+                    num_kv_heads,
+                    scale,
+                    alibi_slopes,
+                    k_scale,
+                    v_scale,
+                    block_size,
+                    PA_QUANT
+                )
+        checkAllclose(out_golden, out_ater_naive,
+                    msg=f'golden vs ck_naive:{time_ater_naive}')
+        tensor_dump(out_ater_naive, 'out_ater_naive')
+    else:
+        for quant_algo_, cache_type_ in [(0, key_cache.dtype), (2, torch.float8_e4m3fnuz), (2, torch.int8) ]:
+            if quant_algo_ == 0:
+                k_quant_, k_scale_, v_quant_, v_scale_ = key_cache, torch.empty((0)), value_cache, torch.empty((0))
+            else:
+                k_quant_, k_scale_, v_quant_, v_scale_ = pertoken_quant_kvcache_symm(key_cache, value_cache, quant_dtype=cache_type_)
+            out_ater_naive, time_ater_naive = run_ater_naive(
+                    query,
+                    k_quant_,
+                    v_quant_,
+                    block_tables,
+                    seq_lens,
+                    k_scale_,
+                    v_scale_,
+                    max_seq_len,
+                    kv_cache_dtype,
+                    num_kv_heads,
+                    scale,
+                    alibi_slopes,
+                    k_scale,
+                    v_scale,
+                    block_size,
+                    quant_algo_
+                )
+            checkAllclose(out_golden, out_ater_naive,
+                    msg=f'golden vs ck_naive(quant:{quant_algo_}, kvcache:{cache_type_}):{time_ater_naive}')
 
     if w8a16:
         # [num_blocks, num_kv_heads, head_size/x, block_size, x]

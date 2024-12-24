@@ -22,7 +22,8 @@ def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype
         dim=-1,
         keepdim=True
     )
-    per_token_scale = per_token_amax.to(dtype=torch.float32) / 127.0
+    per_token_scale = per_token_amax.to(dtype=torch.float32) / (
+                            127.0 if quant_dtype is torch.int8 else torch.finfo(quant_dtype).max)
     per_token_scale[per_token_scale==0] = 1
 
     # quant hidden_states
