@@ -3,6 +3,7 @@ import torch.distributed as dist
 import os
 import ater
 from ater.test_common import checkAllclose, perftest, tensor_dump, tensor_load
+from ater.dist.parallel_state import (graph_capture)
 import sys
 import traceback
 import logging
@@ -26,10 +27,23 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, x, withGraph=False):
 
         ater.init_dist_env_asm(tp_size, gpuID)
 
-        @perftest()
-        def run_ca(x):
-            return ater.call_all_reduce_asm(x)
-        out, us = run_ca(x)
+        if withGraph:
+            @perftest()
+            def run_ca(graph):
+                graph.replay()
+
+            graph = torch.cuda.CUDAGraph()
+            with graph_capture() as gc:
+                with torch.cuda.graph(graph, stream=gc.stream):
+                    out = ater.call_all_reduce_asm(x)
+            out.fill_(0)
+
+            _, us = run_ca(graph)
+        else:
+            @perftest()
+            def run_ca(x):
+                return ater.call_all_reduce_asm(x)
+            out, us = run_ca(x)
         torch.cuda.synchronize()
         print(gpuID, 'finished')
         out = out.cpu()
@@ -73,4 +87,5 @@ if __name__ == '__main__':
     mp.freeze_support()
     for dtype in [torch.bfloat16]:
         for shape in [(128, 8192)]:
-            test_communication(8, shape, dtype, withGraph=True)
+            # test_communication(8, shape, dtype, withGraph=True)
+            test_communication(8, shape, dtype, withGraph=False)

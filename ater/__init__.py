@@ -10,7 +10,7 @@ if importlib.util.find_spec('hipbsolidxgemm_') is not None:
 if importlib.util.find_spec('rocsolidxgemm_') is not None:
     from rocsolidxgemm_ import *
 from .ops.norm import *
-from .ops.smoothquant import *
+from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
 from .ops.transpose_operator import *
 from .ops.activation import *

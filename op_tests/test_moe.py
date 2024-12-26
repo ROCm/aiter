@@ -9,7 +9,7 @@ from ater.test_common import checkAllclose, perftest
 from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
 from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 from ater.ops.shuffle import shuffle_weight
-from test_smoothquant import pertoken_quant
+from ater import pertoken_quant
 
 BLOCK_SIZE_M = 32
 

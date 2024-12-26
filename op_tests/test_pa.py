@@ -5,7 +5,7 @@ import torch
 import ater
 from ater import paged_attn as ops
 from ater.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from test_smoothquant import pertoken_quant
+from ater import pertoken_quant
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {

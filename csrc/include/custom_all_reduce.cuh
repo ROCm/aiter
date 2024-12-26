@@ -129,7 +129,24 @@ template <typename O>
 DINLINE O downcast(array_t<float, O::size> val) {
   if constexpr (std::is_same<typename O::type, float>::value) {
     return val;
-  } else {
+  }
+//   else if constexpr (std::is_same<typename O::type, __hip_bfloat16>::value)
+//   {
+//     O out;
+// #pragma unroll
+//     for (int i = 0; i < O::size; i++)
+//     {
+//       union fcvt {
+//           uint32_t i32;
+//           float f32;
+//       } u;
+//       u.f32 = val.data[i];
+//       out.data[i] = __builtin_bit_cast(__hip_bfloat16, uint16_t(u.i32 >> 16));
+//     }
+//     return out;
+//   }
+  else
+  {
     O out;
 #pragma unroll
     for (int i = 0; i < O::size; i++) {
@@ -575,7 +592,7 @@ allreduce_asm(cudaStream_t stream, void *input, void *sig, int size, torch::Tens
   auto options = torch::TensorOptions()
                      .dtype(inp.dtype())
                      .device(inp.device());
-  return torch::from_blob((void *)(input_rd->ptrs[rank_]), {inp.sizes()}, options);
+  return torch::from_blob(input, {inp.sizes()}, options);
 }
 
 ~CustomAllreduce() {

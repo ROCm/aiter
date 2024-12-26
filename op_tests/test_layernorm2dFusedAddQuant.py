@@ -5,30 +5,6 @@ import ater
 import argparse
 from ater.test_common import checkAllclose, perftest
 
-num_iters = 100
-num_warmup = 20
-
-def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale = None):
-    # assume output int8, hidden_states is [m, n] shape and in fp16/bf16
-    if x_scale is None:
-        hidden_states = hidden_states_input
-    else:
-        # smooth quant
-        hidden_states = hidden_states_input.to(x_scale) * x_scale
-    # [m, 1]
-    per_token_amax, _ = torch.max(
-        input=torch.abs(hidden_states), 
-        dim=-1, 
-        keepdim=True
-    )
-    per_token_scale = per_token_amax.to(dtype=torch.float32) / 127.0
-
-    # quant hidden_states
-    hidden_states = (hidden_states / per_token_scale).to(dtype=torch.int8)
-
-    return hidden_states, per_token_scale.to(y_scale_dtype)
-    # hidden_states now is int8 will feed to next layer as intput
-    # per_token_scale will be used as dequant factor later layer
 
 @perftest()
 def run_torch(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtype = None):
@@ -53,7 +29,7 @@ def run_torch(input, weight, bias, eps, residual=None, x_scale = None, y_scale_d
     if y_scale_dtype is None:
         y_scale = None
     else:
-        output, y_scale = pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
+        output, y_scale = ater.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
     return output, residual_out, y_scale
 
 @perftest()
