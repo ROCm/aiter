@@ -10,7 +10,7 @@ from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
     srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu",
         f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8.cu",
         f"{ATER_CSRC_DIR}/ck_gemm_a8w8/include",],
-    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file ater/configs/a8w8_tuned_gemm.csv",
+    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {ATER_ROOT_DIR}/ater/configs/a8w8_tuned_gemm.csv",
     md_name="module_gemm_a8w8",
     fc_name="gemm_a8w8",
 )

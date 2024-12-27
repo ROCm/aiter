@@ -9,7 +9,17 @@ from ater.test_common import checkAllclose, perftest
 from gemm_a8w8_common import kernelInstance, kernels_list
 import argparse
 
-
+def checkClose(a, b, rtol=1e-3, atol=0.01):
+    isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
+    mask = ~isClose
+    if isClose.all():
+        return True
+    else:
+        percent = (a[mask]).numel()/a.numel()
+        if percent > 0.01:
+            return False
+        else:
+            return True
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     x = F.linear(x.to(torch.float32), weight.to(torch.float32))
@@ -59,8 +69,8 @@ def tune_gemm(m, n, k, useSplitK = False):
         for splitK in range(maxsplitK+1):
             try:
                 (out), avg_t = kernel_instance_test(x, weight, x_scale, w_scale, out, i, splitK)
-                isClosed = torch.isclose(out, ref_out, rtol=1e-3, atol=1000)
-                if isClosed.all():
+                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=0.01)
+                if isClosed:
                     print(f"{str(dim):<20} kernelid:{i:<3d}\t avg: {avg_t:<8.2f} us, {kernel.name}, {splitK=}")
                     if best_time < 0 or avg_t < best_time:
                         best_kernelConfig = (i, splitK)

@@ -31,8 +31,8 @@ def test_gemm(dtype, m, n, k):
     dim = (m, n, k)
     x = torch.randint(-20, 20, (m, k), dtype=torch.int8).cuda()
     weight = torch.randint(-20, 20, (n, k), dtype=torch.int8).cuda()
-    x_scale = torch.rand([m, 1], dtype=torch.float32).cuda()
-    w_scale = torch.rand([1, n], dtype=torch.float32).cuda()
+    x_scale = torch.rand([m, 1], dtype=torch.float32).cuda() + 1e-6
+    w_scale = torch.rand([1, n], dtype=torch.float32).cuda() + 1e-6
     bias = torch.rand([1, n], dtype=dtype).cuda() * 10
     weightshuffle = shuffle_weight(weight,layout=(32,16))
     bias_f32 = bias.to(torch.float)
@@ -52,9 +52,9 @@ def test_gemm(dtype, m, n, k):
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm : not support, uplift: {avg_a/avg_b-1:<5.1%}"
     else:
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/min(avg_b,avg_c)-1:<5.1%}"
-    checkAllclose(a, b, msg=msg, rtol=1e-3, atol=1000)
+    checkAllclose(a, b, msg="a,b: "+msg, rtol=1e-2, atol=0.01)
     if c != None:
-        checkAllclose(a, c, msg="\033[1A\033[2K"+ msg, rtol=1e-3, atol=1000)
+        checkAllclose(a, c, msg="\033[1A\033[2K" + "a,c: "+ msg, rtol=1e-2, atol=0.01)
 
 
 for dtype in [torch.bfloat16]:
