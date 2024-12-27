@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-19 14:12:34
+# @Last Modified At: 2024-12-27 10:33:37
 # @Description: This is description.
 
 import os
@@ -48,6 +48,7 @@ def validate_and_update_archs():
     assert all(
         arch in allowed_archs for arch in archs
     ), f"One of GPU archs of {archs} is invalid or not supported"
+    return archs
 
 
 def check_and_set_ninja_worker():
@@ -128,7 +129,8 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         ]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
-        validate_and_update_archs()
+        archs = validate_and_update_archs()
+        flags_hip += [f"--offload-arch={arch}" for arch in archs]
         check_and_set_ninja_worker()
 
         if blob_gen_cmd:
