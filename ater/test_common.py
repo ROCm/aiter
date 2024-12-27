@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-19 23:22:05
+# @Last Modified At: 2024-12-27 11:34:23
 # @Description: This is description.
 
 import torch
@@ -85,22 +85,33 @@ def get_trace_perf(prof, num_iters):
                         'self_cpu_time_total',
                         'self_device_time_total']].sum()
         if not r.empty:
+            device_type = str(d['device_type'].iat[0]).split('.')[-1]
             r['name'] = name
-            r['device_type'] = d['device_type'].iat[0]
-            r['device_index'] = d['device_index'].iat[0]
+            r['device_type'] = device_type
+            r['device_index'] = str(d['device_index'].iat[0])
+            if device_type == 'CUDA':
+                r['device_time_total'] = r['self_device_time_total']
+                r['host_time_total'] = 0
+            else:
+                r['host_time_total'] = r['self_device_time_total']
+                r['device_time_total'] = 0
+
         rets.append(r)
     df = pd.DataFrame(rets)
-    cols = [el for el in df.columns if el in ['cnt']+cols]
-    df = df[(df.self_cpu_time_total > 0) | (df.self_device_time_total > 0)]
 
-    timerList = ['self_cpu_time_total', 'self_device_time_total', ]
+    cols = ['name', 'host_time_total', 'device_time_total',
+            'device_type', 'device_index',]
+    cols = [el for el in ['cnt']+cols if el in df.columns]
+    df = df[(df.host_time_total > 0) | (df.device_time_total > 0)]
+
+    timerList = ['host_time_total', 'device_time_total', ]
     df = df[cols].sort_values(timerList, ignore_index=True)
     avg_name = '[avg us/iter]'
     for el in timerList:
         df.at[avg_name, el] = df[el].sum()/num_iters
     if int(os.environ.get('ATER_LOG_MORE', 0)):
         logger.info(f'{df}')
-    return df.at[avg_name, 'self_device_time_total']
+    return df.at[avg_name, 'device_time_total']
 
 
 def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
