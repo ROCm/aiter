@@ -90,7 +90,7 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
 
 if __name__ == '__main__':
     freeze_support()
-    for dtype in [torch.bfloat16]:
+    for dtype in [torch.bfloat16, torch.float16]:
         for shape in [(128, 8192)]:
             test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
             # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)

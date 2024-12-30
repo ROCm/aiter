@@ -19,20 +19,6 @@ struct __attribute__((packed)) KernelArgs
 {
     void *ptr_gpu0_data;
     p2 _p0;
-    void *ptr_gpu1_data;
-    p2 _p1;
-    void *ptr_gpu2_data;
-    p2 _p2;
-    void *ptr_gpu3_data;
-    p2 _p3;
-    void *ptr_gpu4_data;
-    p2 _p4;
-    void *ptr_gpu5_data;
-    p2 _p5;
-    void *ptr_gpu6_data;
-    p2 _p6;
-    void *ptr_gpu7_data;
-    p2 _p7;
     void *ptr_gpu0_sig;
     p2 _p8;
     void *ptr_gpu1_sig;
@@ -78,7 +64,7 @@ Kernel_AR::Kernel_AR(const char *name, const char *hsaco)
     HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
 };
 
-void Kernel_AR::launch_kernel(const void *gpu_buf_in[],
+void Kernel_AR::launch_kernel(const void *gpu_buf_in,
                               const void *gpu_sig_in[],
                               uint32_t gpu_id,
                               uint32_t buf_size,
@@ -94,14 +80,7 @@ void Kernel_AR::launch_kernel(const void *gpu_buf_in[],
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_gpu0_data = const_cast<void *>(gpu_buf_in[0]);
-    args.ptr_gpu1_data = const_cast<void *>(gpu_buf_in[1]);
-    args.ptr_gpu2_data = const_cast<void *>(gpu_buf_in[2]);
-    args.ptr_gpu3_data = const_cast<void *>(gpu_buf_in[3]);
-    args.ptr_gpu4_data = const_cast<void *>(gpu_buf_in[4]);
-    args.ptr_gpu5_data = const_cast<void *>(gpu_buf_in[5]);
-    args.ptr_gpu6_data = const_cast<void *>(gpu_buf_in[6]);
-    args.ptr_gpu7_data = const_cast<void *>(gpu_buf_in[7]);
+    args.ptr_gpu0_data = const_cast<void *>(gpu_buf_in);
     args.ptr_gpu0_sig = const_cast<void *>(gpu_sig_in[0]);
     args.ptr_gpu1_sig = const_cast<void *>(gpu_sig_in[1]);
     args.ptr_gpu2_sig = const_cast<void *>(gpu_sig_in[2]);

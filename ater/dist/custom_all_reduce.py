@@ -316,7 +316,7 @@ class CustomAllreduce:
     def all_reduce_asm(self, inp: torch.Tensor):
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return ops.all_reduce_asm(self._ptr, inp, self.buffer, self.signal, True)
+                return ops.all_reduce_asm(self._ptr, inp, self.buffer, self.signal, self._IS_CAPTURING)
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place
@@ -326,4 +326,4 @@ class CustomAllreduce:
             # custom allreduce incurs a cost of cudaMemcpy, which should
             # be small(<=1% of overall latency) compared to the performance
             # gains of using custom kernels
-            return ops.all_reduce_asm(self._ptr, inp, self.buffer, self.signal, False)
+            return ops.all_reduce_asm(self._ptr, inp, self.buffer, self.signal, self._IS_CAPTURING)

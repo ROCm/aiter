@@ -460,23 +460,29 @@ class CustomAllreduce {
   RankData *get_buffer_RD(cudaStream_t stream, void *input)
   {
     RankData *ptrs;
-    cudaStreamCaptureStatus status;
-    CUDACHECK(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive)
+    auto it = buffers_.find(input);
+    if (it != buffers_.end())
     {
-      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-      graph_unreg_buffers_.push_back(input);
+      ptrs = it->second;
     }
     else
     {
-      auto it = buffers_.find(input);
-      if (it == buffers_.end())
+      cudaStreamCaptureStatus status;
+      CUDACHECK(cudaStreamIsCapturing(stream, &status));
+      if (status == cudaStreamCaptureStatusActive)
+      {
+        ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+        graph_unreg_buffers_.push_back(input);
+      }
+      else
+      {
         throw std::runtime_error(
             "buffer address " +
             std::to_string(reinterpret_cast<uint64_t>(input)) +
             " is not registered!");
-      ptrs = it->second;
+      }
     }
+    
     return ptrs;
   }
 
@@ -584,7 +590,7 @@ allreduce_asm(cudaStream_t stream, void *input, void *sig, int size, torch::Tens
   RankData *sig_rd = get_buffer_RD(stream, sig);
 
   static Kernel_AR impl("allreduce_kernel_func", "all_reduce.co");
-  impl.launch_kernel(input_rd->ptrs,
+  impl.launch_kernel(input_rd,
                      sig_rd->ptrs,
                      rank_,
                      size,
