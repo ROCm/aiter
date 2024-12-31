@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-14 15:47:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-19 19:36:41
+# @Last Modified At: 2024-12-31 09:52:13
 # @Description: This is description.
 
 import torch
@@ -35,7 +35,7 @@ def call_all_reduce_asm(input: torch.Tensor):
     return ca_comm.all_reduce_asm(input)
 
 
-def init_dist_env_asm(world_size, rankID):
+def init_dist_env(world_size, rankID):
     logger.info(
         f"RANK: {rankID}/{world_size} init_process_group...")
     set_custom_all_reduce(True)

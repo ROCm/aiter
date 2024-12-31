@@ -25,21 +25,24 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, x, withGraph=False):
         torch.cuda.set_device(device)
         x = x.to(device)
 
-        ater.init_dist_env_asm(tp_size, gpuID)
+        ater.init_dist_env(tp_size, gpuID)
 
         if withGraph:
             @perftest()
             def run_ca(graph):
                 return graph.replay()
 
+            b = torch.empty_like(x)
             graph = torch.cuda.CUDAGraph()
             with graph_capture() as gc:
                 with torch.cuda.graph(graph, stream=gc.stream):
                     # run inplace here, to test accuracy, we need this
-                    b = torch.empty_like(x).copy_(x)
+                    b.copy_(x)
                     out = ater.call_all_reduce_asm(b)
-            out.fill_(0)
             torch.cuda.synchronize()
+            out.fill_(0)
+            b.copy_(x)
+            dist.barrier()
 
             _, us = run_ca(graph)
         else:
