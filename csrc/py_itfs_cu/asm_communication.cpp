@@ -3,18 +3,8 @@
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "communication_asm.h"
+#include "ater_hip_common.h"
 
-struct p3
-{
-    unsigned int _p0;
-    unsigned int _p1;
-    unsigned int _p2;
-};
-struct p2
-{
-    unsigned int _p0;
-    unsigned int _p1;
-};
 struct __attribute__((packed)) KernelArgs
 {
     void *ptr_gpu0_data;
@@ -46,17 +36,6 @@ struct __attribute__((packed)) KernelArgs
     unsigned int loopcnt;
     p3 _p20;
 };
-
-#define HIP_CALL(call)                                                                 \
-    do                                                                                 \
-    {                                                                                  \
-        hipError_t err = call;                                                         \
-        if (err != hipSuccess)                                                         \
-        {                                                                              \
-            printf("[hiperror](%s) fail to call %s\n", hipGetErrorString(err), #call); \
-            exit(0);                                                                   \
-        }                                                                              \
-    } while (0)
 
 Kernel_AR::Kernel_AR(const char *name, const char *hsaco)
 {

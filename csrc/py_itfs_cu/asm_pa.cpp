@@ -2,18 +2,8 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include "ater_hip_common.h"
 
-struct p3
-{
-    unsigned int _p0;
-    unsigned int _p1;
-    unsigned int _p2;
-};
-struct p2
-{
-    unsigned int _p0;
-    unsigned int _p1;
-};
 struct __attribute__((packed)) KernelArgs
 {
     void *ptr_O;
@@ -45,17 +35,6 @@ struct __attribute__((packed)) KernelArgs
     unsigned int KVs;
     p3 _p17;
 };
-
-#define HIP_CALL(call)                                                 \
-    do                                                                 \
-    {                                                                  \
-        hipError_t err = call;                                         \
-        if (err != hipSuccess)                                         \
-        {                                                              \
-            printf("[hiperror](%d) fail to call %s", (int)err, #call); \
-            exit(0);                                                   \
-        }                                                              \
-    } while (0)
 
 const float f_log2E = log2f(expf(1));
 class Kernel

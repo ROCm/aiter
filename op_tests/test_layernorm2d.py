@@ -55,6 +55,26 @@ def run_ck(input, weight, bias, eps, residual=None):
     return output, residual_out
 
 
+@perftest()
+def run_asm(input, weight, bias, eps, residual=None):
+    if residual is None:
+        residual_out = None
+        output = ater.layer_norm(input, weight, bias, eps)
+    else:
+        residual_out = torch.empty_like(input)
+        output = torch.empty_like(input)
+        ater.layernorm2d_with_add_asm(
+            output,
+            input,
+            residual,
+            residual_out,
+            weight,
+            bias,
+            eps
+        )
+    return output, residual_out
+
+
 def test_layernorm2d(dtype, m, n):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
@@ -77,20 +97,23 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     res = torch.randn(dim, dtype=dtype, device="cuda")
     hidden_stats = torch.randn(m, n*8, dtype=dtype, device="cuda")
     q, k, v = torch.split(hidden_stats, [6*n, n, n], dim=1)
-    input = k
+    # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
+    (c, res_c, *_), avg_c = run_asm(input, weight, bias, 1e-5, residual=res)
 
-    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
     checkAllclose(res_a, res_b, msg='res check')
+    checkAllclose(a, c, atol=0.03, msg='asm')
+    checkAllclose(res_a, res_c, atol=0.01, msg='asm res')
 
 
 # for dtype in [torch.float16, torch.bfloat16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d(dtype, m, n)
-test_layernorm2d(torch.float16, 128, 8192)
+test_layernorm2d_fuseAdd(torch.bfloat16, 128, 8192)
 
 
 # print('\nstart fuse add test')

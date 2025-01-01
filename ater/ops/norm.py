@@ -6,12 +6,12 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 16:30:04
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-03 18:43:04
+# @Last Modified At: 2025-01-01 15:24:38
 # @Description: This is description.
 
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
 import torch.nn.functional as F
 
 MD_NAME = "module_norm"
@@ -19,8 +19,10 @@ MD_NAME = "module_norm"
 compile_ops_ = {
     "srcs": [
         f"{ATER_CSRC_DIR}/py_itfs_ck/norm_kernels.cu",
+        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cpp",
         f"{ATER_CSRC_DIR}/pybind/norm_pybind.cu",
     ],
+    "flags_extra_hip": [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
     "extra_include": [f"{CK_DIR}/example/ck_tile/02_layernorm2d"],
     "blob_gen_cmd": f"{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}",
     "md_name": MD_NAME,
@@ -104,3 +106,13 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     weight: Tensor,
 #     bias: Tensor,
 #     epsilon: float):...
+@compile_ops(**compile_ops_)
+def layernorm2d_with_add_asm(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+): ...

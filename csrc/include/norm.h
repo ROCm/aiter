@@ -35,3 +35,12 @@ void layernorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
                                        torch::Tensor &weight,       // [1 ,n]
                                        torch::Tensor &bias,         // [1 ,n]
                                        double epsilon);
+
+// following are asm kernels
+void layernorm2d_with_add_asm(torch::Tensor &out,          // [m ,n]
+                              torch::Tensor &input,        // [m ,n]
+                              torch::Tensor &residual_in,  // [m ,n]
+                              torch::Tensor &residual_out, // [m ,n]
+                              torch::Tensor &weight,       // [1 ,n]
+                              torch::Tensor &bias,         // [1 ,n]
+                              float epsilon);
