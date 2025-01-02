@@ -162,18 +162,18 @@
     },
     "module_norm": {
         "srcs": [
-            "'{}/py_itfs_ck/norm_kernels.cu'.format(ATER_CSRC_DIR)",
-            "'{}/pybind/norm_pybind.cu'.format(ATER_CSRC_DIR)"
+            "f'{ATER_CSRC_DIR}/py_itfs_ck/norm_kernels.cu'",
+            "f'{ATER_CSRC_DIR}/pybind/norm_pybind.cu'"
         ],
         "md_name": "'module_norm'",
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [
-            "'{}/example/ck_tile/02_layernorm2d'.format(CK_DIR)"
+            "f'{CK_DIR}/example/ck_tile/02_layernorm2d'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "'{}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {}'.format(CK_DIR, {})"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
     "module_pos_encoding": {
         "srcs": [
