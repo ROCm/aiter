@@ -11,20 +11,12 @@
 
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, get_argsOfBuild
 import torch.nn.functional as F
 
 MD_NAME = "module_norm"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/py_itfs_ck/norm_kernels.cu",
-        f"{ATER_CSRC_DIR}/pybind/norm_pybind.cu",
-    ],
-    "extra_include": [f"{CK_DIR}/example/ck_tile/02_layernorm2d"],
-    "blob_gen_cmd": f"{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}",
-    "md_name": MD_NAME,
-}
+compile_ops_ = get_argsOfBuild("module_norm")
 
 
 @compile_ops(fc_name="layernorm2d_fwd", **compile_ops_)

@@ -1,18 +1,11 @@
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, get_argsOfBuild
 import torch.nn.functional as F
 
 MD_NAME = "module_cache"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/cache_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/cache_kernels.cu",
-    ],
-    "md_name": MD_NAME,
-}
-
+compile_ops_ = get_argsOfBuild("module_cache")
 
 @compile_ops(**compile_ops_)
 def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor): ...

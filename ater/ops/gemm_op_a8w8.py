@@ -3,17 +3,10 @@ from torch import Tensor
 from typing import List, Optional
 import functools
 import pandas as pd
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR, get_argsOfBuild
 
-
-@compile_ops(
-    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8.cu",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/include",],
-    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {ATER_ROOT_DIR}/ater/configs/a8w8_tuned_gemm.csv",
-    md_name="module_gemm_a8w8",
-    fc_name="gemm_a8w8",
-)
+compile_ops_ = get_argsOfBuild("module_gemm_a8w8")
+@compile_ops(fc_name="gemm_a8w8",**compile_ops_)
 def gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
@@ -24,14 +17,8 @@ def gemm_a8w8(
     splitK = 0
 ): ...
 
-
-@compile_ops(
-    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_asm_pybind.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_gemm_a8w8.cpp"],
-    md_name="module_gemm_a8w8_asm",
-    flags_extra_hip=[f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
-    fc_name="gemm_a8w8_asm",
-)
+compile_ops_ = get_argsOfBuild("module_gemm_a8w8_asm")
+@compile_ops(fc_name="gemm_a8w8_asm",**compile_ops_)
 def gemm_a8w8_asm(
     XQ: Tensor,             # A:[M, K] i8
     WQ: Tensor,             # B:[N, K] i8 -> shuffle layout(32,16)

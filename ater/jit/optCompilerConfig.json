@@ -1,0 +1,236 @@
+{
+    "module_activation": {
+        "srcs": [
+            "'{}/pybind/activation_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/activation_kernels.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_activation'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_attention": {
+        "srcs": [
+            "'{}/py_itfs_ck/attention_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/pybind/attention_ck_pybind.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_attention'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_attention_asm": {
+        "srcs": [
+            "'{}/py_itfs_cu/asm_pa.cpp'.format(ATER_CSRC_DIR)",
+            "'{}/pybind/attention_asm_pybind.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_attention_asm'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DATER_ASM_DIR=\\\\\\\"{}/hsa/\\\\\\\"'.format(ATER_ROOT_DIR)"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_pa": {
+        "srcs": [
+            "'{}/pybind/attention_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/attention.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_pa'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_cache": {
+        "srcs": [
+            "'{}/pybind/cache_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/cache_kernels.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_cache'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_custom_all_reduce": {
+        "srcs": [
+            "'{}/pybind/custom_all_reduce_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/custom_all_reduce.cu'.format(ATER_CSRC_DIR)",
+            "'{}/py_itfs_cu/asm_communication.cpp'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_custom_all_reduce'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DATER_ASM_DIR=\\\\\\\"{}/hsa/\\\\\\\"'.format(ATER_ROOT_DIR)"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_custom": {
+        "srcs": [
+            "'{}/pybind/custom_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/py_itfs_cu/custom.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/custom_kernels.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_custom'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_gemm_a8w8": {
+        "srcs": [
+            "'{}/pybind/gemm_a8w8_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/ck_gemm_a8w8/gemm_a8w8.cu'.format(ATER_CSRC_DIR)",
+            "'{}/ck_gemm_a8w8/include'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_gemm_a8w8'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "'{}/ck_gemm_a8w8/gen_instances.py --working_path {} --tune_file {}/ater/configs/a8w8_tuned_gemm.csv'.format(ATER_CSRC_DIR, {}, ATER_ROOT_DIR)"
+    },
+    "module_gemm_a8w8_asm": {
+        "srcs": [
+            "'{}/pybind/gemm_a8w8_asm_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/py_itfs_cu/asm_gemm_a8w8.cpp'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_gemm_a8w8_asm'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DATER_ASM_DIR=\\\\\\\"{}/hsa/\\\\\\\"'.format(ATER_ROOT_DIR)"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_moe": {
+        "srcs": [
+            "'{}/pybind/moe_op_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/topk_softmax_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/moe_align_block_size_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/py_itfs_cu/asm_fmoe.cpp'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_moe'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DATER_ASM_DIR=\\\\\\\"{}/hsa/\\\\\\\"'.format(ATER_ROOT_DIR)"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_moe_sorting": {
+        "srcs": [
+            "'{}/py_itfs_ck/moe_sorting_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/pybind/moe_sorting_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/example/ck_tile/13_moe_sorting/'.format(CK_DIR)"
+        ],
+        "md_name": "'module_moe_sorting'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "'{}/example/ck_tile/13_moe_sorting/'.format(CK_DIR)"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_norm": {
+        "srcs": [
+            "'{}/py_itfs_ck/norm_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/pybind/norm_pybind.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_norm'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "'{}/example/ck_tile/02_layernorm2d'.format(CK_DIR)"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "'{}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {}'.format(CK_DIR, {})"
+    },
+    "module_pos_encoding": {
+        "srcs": [
+            "'{}/pybind/pos_encoding_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/pos_encoding_kernels.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_pos_encoding'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_rmsnorm": {
+        "srcs": [
+            "'{}/pybind/rmsnorm_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/py_itfs_cu/rmsnorm_pybind.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_rmsnorm'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_smoothquant": {
+        "srcs": [
+            "'{}/py_itfs_ck/smoothquant_kernels.cu'.format(ATER_CSRC_DIR)",
+            "'{}/pybind/smoothquant_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/example/ck_tile/12_smoothquant/instances'.format(CK_DIR)",
+            "'{}/example/ck_tile/14_moe_smoothquant/instances'.format(CK_DIR)"
+        ],
+        "md_name": "'module_smoothquant'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "'{}/example/ck_tile/12_smoothquant'.format(CK_DIR)",
+            "'{}/example/ck_tile/14_moe_smoothquant'.format(CK_DIR)"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_transpose_operator": {
+        "srcs": [
+            "'{}/pybind/transpose_operator_pybind.cu'.format(ATER_CSRC_DIR)",
+            "'{}/include/transpose_operator.h.cu'.format(ATER_CSRC_DIR)",
+            "'{}/kernels/transpose_operator.cu'.format(ATER_CSRC_DIR)"
+        ],
+        "md_name": "'module_transpose_operator'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    }
+}

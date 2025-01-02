@@ -20,6 +20,8 @@ from typing import List, Optional
 from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
+import json
+
 PREBUILD_KERNELS = False
 if importlib.util.find_spec('ater_') is not None:
     import ater_
@@ -212,3 +214,48 @@ def compile_ops(
             return getattr(module, loadName)(*args, **kwargs)
         return wrapper
     return decorator
+
+def get_argsOfBuild(ops_name:str):
+    def convert(d_ops:dict):
+        for k, val in d_ops.items():
+            if isinstance(val, list):
+                for idx, el in enumerate(val):
+                    if isinstance(el, str):
+                        val[idx] = eval(el)
+                d_ops[k] = val
+            elif isinstance(val, str):
+                d_ops[k] = eval(val)
+            else:
+                pass
+        # print(d_ops)
+        return d_ops
+    with open(this_dir+"/optCompilerConfig.json", 'r') as file:
+        data = json.load(file)
+        if isinstance(data, dict):
+            # parse all ops
+            if ops_name == "all":
+                d_all_ops = {"srcs":[],
+                    "flags_extra_cc" : [],
+                    "flags_extra_hip": [],
+                    "extra_include": [],
+                    "blob_gen_cmd": []}
+                # traverse opts
+                for d_ops in data.values():
+                    single_ops = convert(d_ops)
+                    for k in d_all_ops.keys():
+                        if isinstance(single_ops[k], list):
+                            d_all_ops[k] += single_ops[k]
+                        elif isinstance(single_ops[k], str) and single_ops[k]!='':
+                            d_all_ops[k].append(single_ops[k])
+
+                # print(d_all_ops)
+                return d_all_ops
+            
+            compile_ops_ = data.get(ops_name)
+            if compile_ops_ == None:
+                print("Not found this operator in 'optCompilerConfig.json'. ")
+                return
+            else:
+                return convert(compile_ops_)
+        else:
+            print("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")

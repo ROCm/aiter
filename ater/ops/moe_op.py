@@ -1,21 +1,11 @@
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR, get_argsOfBuild
 import torch.nn.functional as F
 
 MD_NAME = "module_moe"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/moe_op_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/topk_softmax_kernels.cu",
-        f"{ATER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp",
-    ],
-    "flags_extra_hip": [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
-    "md_name": MD_NAME,
-}
-
+compile_ops_=get_argsOfBuild("module_moe")
 
 @compile_ops(**compile_ops_)
 def topk_softmax(

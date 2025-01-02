@@ -95,6 +95,7 @@ if IS_ROCM:
     os.system(
         f'{sys.executable} {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
 
+
     cc_flag = []
 
     archs = os.getenv("GPU_ARCHS", "native").split(";")
@@ -121,6 +122,16 @@ if IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
+        all_opts_args_build = core.get_argsOfBuild("all")
+        # remove pybind, because there are already duplicates in rocm_opt
+        new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
+        all_opts_args_build["srcs"] = new_list
+
+        # remove '\' in args
+        for k in all_opts_args_build.keys():
+            for idx in range(len(all_opts_args_build[k])):
+                all_opts_args_build[k][idx] = all_opts_args_build[k][idx].replace('\\', '')
+        
         renamed_sources = rename_cpp_to_cu(
             [
                 f"{this_dir}/csrc",
@@ -128,7 +139,7 @@ if IS_ROCM:
                 f"{this_dir}/csrc/kernels",
                 f"{this_dir}/csrc/py_itfs_ck",
                 f"{this_dir}/csrc/py_itfs_cu",
-            ]
+            ] + all_opts_args_build["srcs"]
         )
         renamed_ck_srcs = rename_cpp_to_cu(
             [  # f'for other kernels'
@@ -137,18 +148,20 @@ if IS_ROCM:
                 f"{ck_dir}/example/ck_tile/13_moe_sorting/",
                 f"{ck_dir}/example/ck_tile/14_moe_smoothquant/instances/",
             ])
-        if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
-            ck_gemm_a8w8_dir = os.path.join(blob_dir, "ck_gemm_a8w8")
-            if os.path.exists(ck_gemm_a8w8_dir):
-                shutil.rmtree(ck_gemm_a8w8_dir)
-            os.mkdir(ck_gemm_a8w8_dir)
-            os.system(f'{sys.executable} {this_dir}/csrc/ck_gemm_a8w8/gen_instances.py --working_path {ck_gemm_a8w8_dir}')
-            generator_flag.append("-DUSE_CK_A8W8")
-            renamed_ck_srcs += rename_cpp_to_cu(
+        os.system(
+            f'{sys.executable} {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
+        ck_gemm_a8w8_dir = os.path.join(blob_dir, "ck_gemm_a8w8")
+        if os.path.exists(ck_gemm_a8w8_dir):
+            shutil.rmtree(ck_gemm_a8w8_dir)
+        os.mkdir(ck_gemm_a8w8_dir)
+        os.system(f'{sys.executable} {this_dir}/csrc/ck_gemm_a8w8/gen_instances.py --working_path {ck_gemm_a8w8_dir}')
+        generator_flag.append("-DUSE_CK_A8W8")
+        renamed_ck_srcs += rename_cpp_to_cu(
                 [f"{this_dir}/csrc/ck_gemm_a8w8/include",
                 f"{this_dir}/csrc/ck_gemm_a8w8/gemm_a8w8.cu",
                 f"{ck_gemm_a8w8_dir}", f"{ck_gemm_a8w8_dir}/impl", 
                 f"{ck_gemm_a8w8_dir}/instances"])
+        generator_flag += all_opts_args_build["flags_extra_cc"] + all_opts_args_build["flags_extra_hip"]
         extra_compile_args = {
             "cxx": ["-O3", "-std=c++17"] + generator_flag,
             "nvcc":
@@ -168,12 +181,8 @@ if IS_ROCM:
         include_dirs = [
             f"{this_dir}/build",
             f"{ck_dir}/include",
-            f"{ck_dir}/library/include",
-            f"{ck_dir}/example/ck_tile/02_layernorm2d",
-            f"{ck_dir}/example/ck_tile/12_smoothquant",
-            f"{ck_dir}/example/ck_tile/13_moe_sorting",
-            f"{ck_dir}/example/ck_tile/14_moe_smoothquant",
-        ]
+            f"{ck_dir}/library/include"
+        ] + all_opts_args_build["extra_include"]
         ext_modules.append(
             CUDAExtension(
                 name=PACKAGE_NAME+'_',
