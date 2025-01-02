@@ -37,84 +37,51 @@ struct __attribute__((packed)) KernelArgs
 };
 
 const float f_log2E = log2f(expf(1));
-class Kernel
+#define QBF16_KVBF16 0
+#define QBF16_KVI8 1
+
+template <int QTYPE>
+void call_kernel(void *args_ptr,
+                 void *arg_size_ptr,
+                 int gdx,
+                 int gdy,
+                 int gdz,
+                 int bdx,
+                 int bdy,
+                 int bdz,
+                 const hipStream_t stream)
 {
-private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
-
-public:
-    Kernel(const char *name, const char *hsaco)
+    if constexpr (QTYPE == QBF16_KVBF16)
     {
-        HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
-        HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-    };
-
-    template <typename T, typename T_O>
-    void launch_kernel(torch::Tensor &O,            //   [num_seqs, num_heads, head_size]
-                       torch::Tensor &Q,            //   [num_seqs, num_heads, head_size]
-                       torch::Tensor &K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
-                       torch::Tensor &V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
-                       torch::Tensor &block_tables, //   [num_seqs, max_num_blocks_per_seq]
-                       torch::Tensor &context_lens, //   [num_seqs]
-                       std::optional<torch::Tensor> K_QScale = std::nullopt,
-                       std::optional<torch::Tensor> V_QScale = std::nullopt)
+        static AterAsmKernel impl("pa_kernel_func", "pa_a16w16.co");
+        impl.launch_kernel({args_ptr,
+                            arg_size_ptr,
+                            gdx,
+                            gdy,
+                            gdz,
+                            bdx,
+                            bdy,
+                            bdz,
+                            stream});
+    }
+    else if constexpr (QTYPE == QBF16_KVI8)
     {
-        int batch = block_tables.size(0);
-        int max_num_blocks = block_tables.size(1);
-        int num_heads = Q.size(1);
-        int head_size = Q.size(2);
-        int num_kv_heads = K.size(1);
-        int block_size = K.size(3);
-        const int gqa_ratio = num_heads / num_kv_heads;
-
-        int dim = head_size;
-        int stride_Q = gqa_ratio * dim * sizeof(uint16_t);
-        int stride_KV_head = block_size * dim * sizeof(T);
-        int stride_KV_blk = stride_KV_head * num_kv_heads;
-        float k_log2e = f_log2E;
-        float k_scalar = sqrt(dim);
-        k_scalar = (float)((double)k_log2e / (double)k_scalar);
-
-        KernelArgs args;
-        size_t arg_size = sizeof(args);
-        args.ptr_O = O.data_ptr();
-        args.ptr_Q = Q.data_ptr();
-        args.ptr_K = K.data_ptr();
-        args.ptr_V = V.data_ptr();
-        args.ptr_BT = block_tables.data_ptr();
-        args.ptr_CL = context_lens.data_ptr();
-        if constexpr (std::is_same<T, uint8_t>::value)
-        {
-            args.ptr_KQ = K_QScale.value().data_ptr();
-            args.ptr_VQ = V_QScale.value().data_ptr();
-        }
-        else
-        {
-            args.ptr_KQ = nullptr;
-            args.ptr_VQ = nullptr;
-        }
-        args.sclg2e = k_scalar;
-        args.mblk = max_num_blocks;
-        args.batch = batch;
-        args.Qs = stride_Q;
-        args.Bs = stride_KV_blk;
-        args.KVs = stride_KV_head;
-
-        void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          &arg_size, HIP_LAUNCH_PARAM_END};
-
-        int bdx = 256;
-        int gdx = 1;
-        int gdy = batch; // sub_X_cnt;
-        int gdz = 1;
-        const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
-                                       gdx, gdy, gdz,
-                                       bdx, 1, 1,
-                                       0, stream, nullptr, (void **)&config));
-    };
-};
+        static AterAsmKernel impl("pa_kernel_func", "pa_a16w8.co");
+        impl.launch_kernel({args_ptr,
+                            arg_size_ptr,
+                            gdx,
+                            gdy,
+                            gdz,
+                            bdx,
+                            bdy,
+                            bdz,
+                            stream});
+    }
+    else
+    {
+        std::cerr << "asm_pa not support this yet" << std::endl;
+    }
+}
 
 torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, head_size]
                      torch::Tensor &K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -125,14 +92,71 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      std::optional<torch::Tensor> V_QScale = std::nullopt)
 {
     torch::Tensor output = torch::empty_like(Q);
-    static Kernel impl("pa_kernel_func", "pa_a16w16.co");
-    impl.launch_kernel<uint16_t, uint16_t>(output,
-                                           Q,
-                                           K,
-                                           V,
-                                           block_tables,
-                                           context_lens,
-                                           K_QScale,
-                                           V_QScale);
+    int batch = block_tables.size(0);
+    int max_num_blocks = block_tables.size(1);
+    int num_heads = Q.size(1);
+    int head_size = Q.size(2);
+    int num_kv_heads = K.size(1);
+    int block_size = K.size(3);
+    const int gqa_ratio = num_heads / num_kv_heads;
+
+    int dim = head_size;
+    int stride_Q = gqa_ratio * dim * Q.itemsize();
+    int stride_KV_head = block_size * dim * K.itemsize();
+    int stride_KV_blk = stride_KV_head * num_kv_heads;
+    float k_log2e = f_log2E;
+    float k_scalar = sqrt(dim);
+    k_scalar = (float)((double)k_log2e / (double)k_scalar);
+
+    KernelArgs args;
+    size_t arg_size = sizeof(args);
+    args.ptr_O = output.data_ptr();
+    args.ptr_Q = Q.data_ptr();
+    args.ptr_K = K.data_ptr();
+    args.ptr_V = V.data_ptr();
+    args.ptr_BT = block_tables.data_ptr();
+    args.ptr_CL = context_lens.data_ptr();
+    if (K_QScale)
+    {
+        args.ptr_KQ = K_QScale.value().data_ptr();
+        args.ptr_VQ = V_QScale.value().data_ptr();
+    }
+    else
+    {
+        args.ptr_KQ = nullptr;
+        args.ptr_VQ = nullptr;
+    }
+    args.sclg2e = k_scalar;
+    args.mblk = max_num_blocks;
+    args.batch = batch;
+    args.Qs = stride_Q;
+    args.Bs = stride_KV_blk;
+    args.KVs = stride_KV_head;
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (K_QScale)
+    {
+        call_kernel<QBF16_KVI8>(&args,
+                                &arg_size,
+                                1,     // gdx
+                                batch, // gdy
+                                1,     // gdz
+                                256,   // bdx: 4 wv64
+                                1,     // bdy
+                                1,     // bdz
+                                stream);
+    }
+    else
+    {
+        call_kernel<QBF16_KVBF16>(&args,
+                                  &arg_size,
+                                  1,     // gdx
+                                  batch, // gdy
+                                  1,     // gdz
+                                  256,   // bdx: 4 wv64
+                                  1,     // bdy
+                                  1,     // bdz
+                                  stream);
+    }
     return output;
 }

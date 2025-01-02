@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-26 15:56:39
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-26 16:41:23
+# @Last Modified At: 2025-01-02 16:39:38
 # @Description: This is description.
 
 import torch
@@ -56,9 +56,9 @@ def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype
         keepdim=True
     )
 
-    if quant_dtype is quant_dtype.is_floating_point:
+    try:
         dtypeMax = torch.finfo(quant_dtype).max
-    else:
+    except:
         dtypeMax = torch.iinfo(quant_dtype).max
 
     per_token_scale = per_token_amax.to(dtype=torch.float32) / dtypeMax

@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-27 11:34:23
+# @Last Modified At: 2025-01-02 16:43:40
 # @Description: This is description.
 
 import torch
@@ -118,12 +118,12 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = ~isClose
     if isClose.all():
-        logger.info(f'{msg}[checkAllclose passed~]')
+        logger.info(f'{msg}[checkAllclose {atol=} {rtol=} passed~]')
     else:
         percent = (a[mask]).numel()/a.numel()
         delta = (a-b)[mask]
         if percent > 0.01:
-            logger.info(f'''{msg}[checkAllclose failed!]
+            logger.info(f'''{msg}[checkAllclose {atol=} {rtol=} failed!]
         a:  {a.shape}
             {a[mask]}
         b:  {b.shape}
@@ -132,9 +132,9 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
             {delta}''')
         else:
             logger.info(
-                f'''{msg}[checkAllclose waring!] a and b results are not all close''')
+                f'''{msg}[checkAllclose {atol=} {rtol=} waring!] a and b results are not all close''')
         logger.info(
-            f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({(a[mask]).numel()} of {a.numel()}) elements {atol=} {rtol=}')
+            f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({(a[mask]).numel()} of {a.numel()}) elements')
 
 
 def tensor_dump(x: torch.tensor, name: str):
