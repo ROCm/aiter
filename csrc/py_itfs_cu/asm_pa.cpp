@@ -37,51 +37,6 @@ struct __attribute__((packed)) KernelArgs
 };
 
 const float f_log2E = log2f(expf(1));
-#define QBF16_KVBF16 0
-#define QBF16_KVI8 1
-
-template <int QTYPE>
-void call_kernel(void *args_ptr,
-                 void *arg_size_ptr,
-                 int gdx,
-                 int gdy,
-                 int gdz,
-                 int bdx,
-                 int bdy,
-                 int bdz,
-                 const hipStream_t stream)
-{
-    if constexpr (QTYPE == QBF16_KVBF16)
-    {
-        static AterAsmKernel impl("pa_kernel_func", "pa_a16w16.co");
-        impl.launch_kernel({args_ptr,
-                            arg_size_ptr,
-                            gdx,
-                            gdy,
-                            gdz,
-                            bdx,
-                            bdy,
-                            bdz,
-                            stream});
-    }
-    else if constexpr (QTYPE == QBF16_KVI8)
-    {
-        static AterAsmKernel impl("pa_kernel_func", "pa_a16w8.co");
-        impl.launch_kernel({args_ptr,
-                            arg_size_ptr,
-                            gdx,
-                            gdy,
-                            gdz,
-                            bdx,
-                            bdy,
-                            bdz,
-                            stream});
-    }
-    else
-    {
-        std::cerr << "asm_pa not support this yet" << std::endl;
-    }
-}
 
 torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, head_size]
                      torch::Tensor &K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
@@ -134,29 +89,21 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     args.KVs = stride_KV_head;
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static AterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
+    static AterAsmKernel impl_a16w8("pa_kernel_func", "pa_a16w8.co");
+    AterAsmKernel *impl_ptr = &impl_a16w16;
+
     if (K_QScale)
-    {
-        call_kernel<QBF16_KVI8>(&args,
-                                &arg_size,
-                                1,     // gdx
-                                batch, // gdy
-                                1,     // gdz
-                                256,   // bdx: 4 wv64
-                                1,     // bdy
-                                1,     // bdz
-                                stream);
-    }
-    else
-    {
-        call_kernel<QBF16_KVBF16>(&args,
-                                  &arg_size,
-                                  1,     // gdx
-                                  batch, // gdy
-                                  1,     // gdz
-                                  256,   // bdx: 4 wv64
-                                  1,     // bdy
-                                  1,     // bdz
-                                  stream);
-    }
+        impl_ptr = &impl_a16w8;
+
+    impl_ptr->launch_kernel({&args,
+                            &arg_size,
+                            1,     // gdx
+                            batch, // gdy
+                            1,     // gdz
+                            256,   // bdx: 4 wv64
+                            1,     // bdy
+                            1,     // bdz
+                            stream});
     return output;
 }

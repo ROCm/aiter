@@ -36,90 +36,6 @@ struct __attribute__((packed)) KernelArgs
     p3 _p18;
 };
 
-class GemmA8W8Kernel
-{
-private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
-
-public:
-    GemmA8W8Kernel(const char *name, const char *hsaco)
-    {
-        HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
-        HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
-    };
-
-    template <typename T_O>
-    void launch_kernel(torch::Tensor &out,     // Out:[M, N] bf16
-                       torch::Tensor &A,       // A:[M, K] i8
-                       torch::Tensor &B,       //  B:[N, K] i8 -> shuffle layout(32,16)
-                       torch::Tensor &A_scale, // A_scale:[M, 1] f32
-                       torch::Tensor &B_scale, // B_scale:[1, N] f32
-                       torch::Tensor &bias,    // bias:[1, N] f32
-                       int sub_m = 128,
-                       int sub_n = 128,
-                       int pad_a = 0,
-                       int pad_b = 0,
-                       int pad_c = 0,
-                       int splitK = 0)
-    {
-        int m = A.size(0);
-        int n = out.size(1);
-        int k = A.size(1);
-        int stride_a = k + pad_a;
-        int stride_b = k + pad_b;
-        int stride_c = n + pad_c;
-        stride_c = stride_c * sizeof(T_O);
-
-        KernelArgs args;
-        size_t arg_size = sizeof(args);
-        args.ptr_c = (void *)out.data_ptr();
-        args.ptr_a = (void *)A.data_ptr();
-        args.ptr_b = (void *)B.data_ptr();
-        args.ptr_sa = (void *)A_scale.data_ptr();
-        args.ptr_sb = (void *)B_scale.data_ptr();
-        args.ptr_bias = (void *)bias.data_ptr();
-        // args.alpha  = alpha;
-        args.m = m;
-        args.n = n;
-        args.k = k;
-        args.lda = stride_a;
-        args.ldb = stride_b;
-        args.ldc = stride_c;
-        args.ks = splitK;
-
-        // std::cout << "m:"            << m          << std::endl;
-        // std::cout << "n:"            << n          << std::endl;
-        // std::cout << "k:"            << k          << std::endl;
-        // std::cout << "pad_a:"        << pad_a      << std::endl;
-        // std::cout << "pad_b:"        << pad_b      << std::endl;
-        // std::cout << "pad_c:"        << pad_c      << std::endl;
-        // std::cout << "sub_m:"        << sub_m      << std::endl;
-        // std::cout << "sub_n:"        << sub_n      << std::endl;
-        // std::cout << "ks:"           << args.ks    << std::endl;
-        // std::cout << "lda:"          << args.lda   << std::endl;
-        // std::cout << "ldb:"          << args.ldb   << std::endl;
-        // std::cout << "ldc:"          << args.ldc   << std::endl;
-
-        void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          &arg_size, HIP_LAUNCH_PARAM_END};
-
-        int bdx = 256;
-        int bdy = 1;
-        int bdz = 1;
-        int gdx = n / sub_n;
-        int gdy = m / sub_m;
-        int gdz = 1;
-        gdy = gdy << splitK; // shift for ksplit
-        const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-        HIP_CALL(hipModuleLaunchKernel(kernel_func,
-                                       gdx, gdy, gdz,
-                                       bdx, bdy, bdz,
-                                       0, stream, nullptr, (void **)&config));
-    };
-};
-
 torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
                             torch::Tensor &B,       // B:[N, K] i8 -> shuffle layout(32,16)
                             torch::Tensor &A_scale, // A_scale:[M, 1] f32
@@ -133,36 +49,51 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
                             std::optional<int> pad_c = 0,
                             std::optional<int> splitK = 0)
 {
-    if (splitK > 0)
-    {
-        static GemmA8W8Kernel splitK_impl("gemm_kernel_func", "gemm_a8w8_m128_splitK.co");
-        splitK_impl.launch_kernel<uint16_t>(out,
-                                            A,
-                                            B,
-                                            A_scale,
-                                            B_scale,
-                                            bias,
-                                            sub_m.value(),
-                                            sub_n.value(),
-                                            pad_a.value(),
-                                            pad_b.value(),
-                                            pad_c.value(),
-                                            splitK.value());
-    }
-    else
-    {
-        static GemmA8W8Kernel noSplitK_impl("gemm_kernel_func", "gemm_a8w8_m128_noSplitK.co");
-        noSplitK_impl.launch_kernel<uint16_t>(out,
-                                              A,
-                                              B,
-                                              A_scale,
-                                              B_scale,
-                                              bias,
-                                              sub_m.value(),
-                                              sub_n.value(),
-                                              pad_a.value(),
-                                              pad_b.value(),
-                                              pad_c.value());
-    }
+    TORCH_CHECK(out.dtype() == torch::ScalarType::BFloat16,
+                "GEMM A8W8 asm only support BFloat16 output now!");
+    int m = A.size(0);
+    int n = out.size(1);
+    int k = A.size(1);
+    int stride_a = k + pad_a.value();
+    int stride_b = k + pad_b.value();
+    int stride_c = n + pad_c.value();
+    stride_c = stride_c * sizeof(uint16_t);
+    int ks = splitK.value();
+
+    KernelArgs args;
+    size_t arg_size = sizeof(args);
+    args.ptr_c = (void *)out.data_ptr();
+    args.ptr_a = (void *)A.data_ptr();
+    args.ptr_b = (void *)B.data_ptr();
+    args.ptr_sa = (void *)A_scale.data_ptr();
+    args.ptr_sb = (void *)B_scale.data_ptr();
+    args.ptr_bias = (void *)bias.data_ptr();
+
+    args.m = m;
+    args.n = n;
+    args.k = k;
+    args.lda = stride_a;
+    args.ldb = stride_b;
+    args.ldc = stride_c;
+    args.ks = ks;
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    static AterAsmKernel splitK_impl("gemm_kernel_func", "gemm_a8w8_m128_splitK.co");
+    static AterAsmKernel noSplitK_impl("gemm_kernel_func", "gemm_a8w8_m128_noSplitK.co");
+    AterAsmKernel *impl_ptr = &noSplitK_impl;
+    if (ks > 0)
+        impl_ptr = &splitK_impl;
+
+    int sub_m_v = sub_m.value();
+    int sub_n_v = sub_n.value();
+    impl_ptr->launch_kernel({&args,
+                             &arg_size,
+                             (n / sub_n_v) << ks,           // gdx
+                             ((m + sub_m_v - 1) / sub_m_v), // gdy
+                             1,                             // gdz
+                             256,                           // bdx: 4 wv64
+                             1,                             // bdy
+                             1,                             // bdz
+                             stream});
     return out;
 }
