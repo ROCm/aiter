@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-27 10:33:37
+# @Last Modified At: 2025-01-03 16:44:37
 # @Description: This is description.
 
 import os
@@ -176,6 +176,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             md_name,
             ''.join(traceback.format_exception(*sys.exc_info()))
         ))
+        sys.exit()
     logger.info(
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module

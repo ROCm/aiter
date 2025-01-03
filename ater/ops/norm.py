@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 16:30:04
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-01 15:24:38
+# @Last Modified At: 2025-01-03 16:53:32
 # @Description: This is description.
 
 from torch import Tensor
@@ -24,7 +24,7 @@ compile_ops_ = {
     ],
     "flags_extra_hip": [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
     "extra_include": [f"{CK_DIR}/example/ck_tile/02_layernorm2d"],
-    "blob_gen_cmd": f"{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}",
+    "blob_gen_cmd": f"{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --disable_16b_welford=True --working_path {{}}",
     "md_name": MD_NAME,
 }
 
@@ -112,6 +112,18 @@ def layernorm2d_with_add_asm(
     input: Tensor,
     residual_in: Tensor,
     residual_out: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+): ...
+@compile_ops(**compile_ops_)
+def layernorm2d_with_add_smoothquant_asm(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    xscale: Tensor,
+    yscale: Tensor,
     weight: Tensor,
     bias: Tensor,
     epsilon: float,

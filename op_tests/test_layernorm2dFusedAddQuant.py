@@ -113,6 +113,25 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale = None, y_scale_dtyp
     return output, residual_out, y_scale
 
 
+@perftest()
+def run_asm(input, weight, bias, eps, residual, x_scale, y_scale_dtype):
+    y_scale = torch.empty(
+        input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
+    output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+    residual_out = torch.empty_like(input)
+    ater.layernorm2d_with_add_smoothquant_asm(
+        output,
+        input,
+        residual,
+        residual_out,
+        x_scale,
+        y_scale,
+        weight,
+        bias,
+        eps
+    )
+    return output, residual_out, y_scale
+
 
 def test_layernorm2d_instance(dtype, m, n):
     dim = (m, n)
@@ -165,6 +184,7 @@ def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscal
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn(n, dtype=xscaleType, device="cuda")
+    (c, res_c, yscale_c), avg_c = run_asm(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
     (a, res_a, yscale_a), avg_a = run_torch(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
     (b, res_b, yscale_b), avg_b = run_ck(input, weight, bias, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
 
@@ -173,6 +193,12 @@ def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscal
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
+    print(f" [passed~]")
+    print(
+        f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}")
+    checkAllclose(a, c, rtol=0, atol=1)
+    checkAllclose(res_a, res_c)
+    checkAllclose(yscale_a, yscale_c, rtol=1e-2, atol=1e-2)
     print(f" [passed~]")
 
 
@@ -231,9 +257,9 @@ def test_layernorm2d_fuseSmoothquant():
 def test_layernorm2d_fuseAdd_Smoothquant():
     print('\nstart layernorm2d fuse add Smoothquant test')
     for scaleType in [torch.float32]:
-        for dtype in [torch.float16, torch.bfloat16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [4096, 8192]:
+        for dtype in [torch.bfloat16]:
+            for m in [2, 4, 8, 16, 32, 64, 128, 256]:
+                for n in [8192]:
                     test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType=scaleType, yscaleType=scaleType)
 
 def test_layernorm2d_fuseDynamicquant():

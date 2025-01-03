@@ -44,3 +44,12 @@ void layernorm2d_with_add_asm(torch::Tensor &out,          // [m ,n]
                               torch::Tensor &weight,       // [1 ,n]
                               torch::Tensor &bias,         // [1 ,n]
                               float epsilon);
+void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
+                                          torch::Tensor &input,        // [m ,n]
+                                          torch::Tensor &residual_in,  // [m ,n]
+                                          torch::Tensor &residual_out, // [m ,n]
+                                          torch::Tensor &xscale,       // [1 ,n]
+                                          torch::Tensor &yscale,       // [m ,1]
+                                          torch::Tensor &weight,       // [1 ,n]
+                                          torch::Tensor &bias,         // [1 ,n]
+                                          float epsilon);
