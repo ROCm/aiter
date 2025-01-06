@@ -23,8 +23,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                        Tensor! value_cache,"
             "                        Tensor! k_dequant_scales,"
             "                        Tensor! v_dequant_scales,"
-            "                        Tensor slot_mapping,"
-            "                        str kv_cache_dtype) -> ()");
+            "                        Tensor slot_mapping) -> ()");
       m.def("convert_fp8", &convert_fp8,
             "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "
             "str kv_cache_dtype) -> ()");

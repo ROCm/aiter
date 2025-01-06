@@ -32,7 +32,7 @@ void reshape_and_cache_with_pertoken_quant(torch::Tensor &key, torch::Tensor &va
                        torch::Tensor &key_cache, torch::Tensor &value_cache,
                        torch::Tensor &k_dequant_scales, torch::Tensor &v_dequant_scales,
                        torch::Tensor &slot_mapping,
-                       const std::string &kv_cache_dtype, const bool asm_layout);
+                       const bool asm_layout);
 
 // Just for unittest
 void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,

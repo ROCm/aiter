@@ -57,7 +57,6 @@ def reshape_and_cache_with_pertoken_quant(
     k_dequant_scales: Tensor,
     v_dequant_scales: Tensor,
     slot_mapping: Tensor,
-    kv_cache_dtype: str,
     asm_layout: bool
 ): ...
 
