@@ -307,12 +307,222 @@ namespace vllm
       }
     }
   }
+
+  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
+  __global__ void add_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
+  {
+    // pad LDS row by dword
+    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
+    constexpr uint32_t element_size = sizeof(_T); // in bytes
+    constexpr uint32_t elements_in_16B = 16 / element_size;
+
+    union BLOCK_16B
+    {
+      _T e[elements_in_16B];
+      __uint128_t ow;
+    };
+
+    // Round up processing to next full tile
+    const uint32_t n_tiles = (N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N;
+    const uint32_t k_tiles = (K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K;
+    const uint32_t nk_tiles = n_tiles * k_tiles;
+    const uint32_t m_tiles = gridDim.x / nk_tiles;
+    const uint32_t m_tile_swizzle = blockIdx.x / nk_tiles / M_SWIZZLE * M_SWIZZLE;
+    /// do m_swizzle when there are enough m_tiles
+    const bool swizzle_m = m_tile_swizzle + M_SWIZZLE <= m_tiles;
+    const uint32_t current_m = swizzle_m ? m_tile_swizzle + blockIdx.x % M_SWIZZLE : blockIdx.x / nk_tiles;
+
+    const uint64_t stride_k = N * sizeof(_T);
+    const uint64_t out_stride_nk = N * K * sizeof(_T);
+
+    const uint32_t current_nk = swizzle_m ? blockIdx.x / M_SWIZZLE % nk_tiles : blockIdx.x % nk_tiles;
+    const uint32_t ti = current_nk / k_tiles;
+    const uint32_t tj = current_nk % k_tiles;
+
+    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
+
+    const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
+    const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
+
+    // use 128bit load&store whenever possible
+    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    {
+      // Copy full tile with large loads
+      constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
+      constexpr uint32_t vmem_per_row_wr = row_bytes_wr / sizeof(__uint128_t);
+      constexpr uint32_t rows_per_wg_wr = _WG / vmem_per_row_wr;
+      constexpr uint32_t wr_per_row = BIG_TILE_SIZE_K / rows_per_wg_wr;
+      // Make sure WG isn't too large
+      static_assert(wr_per_row >= 1);
+
+      const uint8_t *pa = (const uint8_t *)a + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+      const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr;
+      const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+#pragma unroll
+      // for (uint32_t t = 0; t < vmem_per_thread; t++)
+      for (uint32_t t = 0; t < wr_per_row; t++)
+      {
+        uint32_t col = threadIdx.x % vmem_per_row_wr;
+        uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
+        if (col * 8 < current_n_size && row < current_k_size)
+        {
+          uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
+          BLOCK_16B d, f;
+          const __uint128_t *pfa = (const __uint128_t *)(pa + offset);
+          const __uint128_t *pfb = (const __uint128_t *)(pb + offset);
+          f.ow = *pfa;
+          d.ow = *pfb;
+// Transpose tile on read from LDS
+#pragma unroll
+          for (uint32_t i = 0; i < elements_in_16B; i++)
+          {
+            d.e[i] = performOperation<_T, Operation, order_flag>(f.e[i], d.e[i]);
+          }
+          __uint128_t *pfc = (__uint128_t *)(pc + offset);
+          *pfc = d.ow;
+        }
+      }
+    }
+    else
+    {
+      // Copy full tile with large loads
+      constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
+      constexpr uint32_t vmem_per_row_wr = BIG_TILE_SIZE_N;
+      constexpr uint32_t rows_per_wg_wr = _WG / vmem_per_row_wr;
+      constexpr uint32_t wr_per_row = BIG_TILE_SIZE_K / rows_per_wg_wr;
+      const uint8_t *pa = (const uint8_t *)a + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+      const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr;
+      const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+#pragma unroll
+      for (uint32_t t = 0; t < wr_per_row; t++)
+      {
+        uint32_t col = threadIdx.x % vmem_per_row_wr;
+        uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
+        if (col < current_n_size && row < current_k_size)
+        {
+          uint64_t offset = row * stride_k + col * sizeof(_T);
+          const _T *pfa = (const _T *)(pa + offset);
+          const _T *pfb = (const _T *)(pb + offset);
+          _T *pfc = (_T *)(pc + offset);
+          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
+        }
+      }
+    }
+  }
+
+  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
+  __global__ void add_bcast1_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
+  {
+    // pad LDS row by dword
+    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
+    constexpr uint32_t element_size = sizeof(_T); // in bytes
+    constexpr uint32_t elements_in_16B = 16 / element_size;
+
+    union BLOCK_16B
+    {
+      _T e[elements_in_16B];
+      __uint128_t ow;
+    };
+
+    // Round up processing to next full tile
+    const uint32_t n_tiles = (N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N;
+    const uint32_t k_tiles = (K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K;
+    const uint32_t nk_tiles = n_tiles * k_tiles;
+    const uint32_t m_tiles = gridDim.x / nk_tiles;
+    const uint32_t m_tile_swizzle = blockIdx.x / nk_tiles / M_SWIZZLE * M_SWIZZLE;
+    /// do m_swizzle when there are enough m_tiles
+    const bool swizzle_m = m_tile_swizzle + M_SWIZZLE <= m_tiles;
+    const uint32_t current_m = swizzle_m ? m_tile_swizzle + blockIdx.x % M_SWIZZLE : blockIdx.x / nk_tiles;
+
+    const uint64_t stride_k = N * sizeof(_T);
+    const uint64_t out_stride_nk = N * K * sizeof(_T);
+
+    const uint32_t current_nk = swizzle_m ? blockIdx.x / M_SWIZZLE % nk_tiles : blockIdx.x % nk_tiles;
+    const uint32_t ti = current_nk / k_tiles;
+    const uint32_t tj = current_nk % k_tiles;
+
+    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
+
+    const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
+    const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
+
+    // use 128bit load&store whenever possible
+    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    {
+      // Copy full tile with large loads
+      constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
+      constexpr uint32_t vmem_per_row_wr = row_bytes_wr / sizeof(__uint128_t);
+      constexpr uint32_t rows_per_wg_wr = _WG / vmem_per_row_wr;
+      constexpr uint32_t wr_per_row = BIG_TILE_SIZE_K / rows_per_wg_wr;
+      // Make sure WG isn't too large
+      static_assert(wr_per_row >= 1);
+
+      const uint8_t *pa = (const uint8_t *)a + ti * row_bytes_wr + current_m * stride_k;
+      const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+      const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+#pragma unroll
+      // for (uint32_t t = 0; t < vmem_per_thread; t++)
+      for (uint32_t t = 0; t < wr_per_row; t++)
+      {
+        uint32_t col = threadIdx.x % vmem_per_row_wr;
+        uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
+        if (col * 8 < current_n_size && row < current_k_size)
+        {
+          uint64_t offset_a = col * sizeof(__uint128_t);
+          uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
+          BLOCK_16B d, f;
+          const __uint128_t *pfa = (const __uint128_t *)(pa + offset_a);
+          const __uint128_t *pfb = (const __uint128_t *)(pb + offset);
+          f.ow = *pfa;
+          d.ow = *pfb;
+// Transpose tile on read from LDS
+#pragma unroll
+          for (uint32_t i = 0; i < elements_in_16B; i++)
+          {
+            d.e[i] = performOperation<_T, Operation, order_flag>(f.e[i], d.e[i]);
+          }
+          __uint128_t *pfc = (__uint128_t *)(pc + offset);
+          *pfc = d.ow;
+        }
+      }
+    }
+    else
+    {
+      // Copy full tile with large loads
+      constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
+      constexpr uint32_t vmem_per_row_wr = BIG_TILE_SIZE_N;
+      constexpr uint32_t rows_per_wg_wr = _WG / vmem_per_row_wr;
+      constexpr uint32_t wr_per_row = BIG_TILE_SIZE_K / rows_per_wg_wr;
+      const uint8_t *pa = (const uint8_t *)a + ti * row_bytes_wr + current_m * stride_k;
+      const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+      const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
+#pragma unroll
+      for (uint32_t t = 0; t < wr_per_row; t++)
+      {
+        uint32_t col = threadIdx.x % vmem_per_row_wr;
+        uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
+        if (col < current_n_size && row < current_k_size)
+        {
+          uint64_t offset_a = col * sizeof(_T);
+          uint64_t offset = row * stride_k + col * sizeof(_T);
+          const _T *pfa = (const _T *)(pa + offset_a);
+          const _T *pfb = (const _T *)(pb + offset);
+          _T *pfc = (_T *)(pc + offset);
+
+          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
+        }
+      }
+    }
+  }
 }
 
 template <typename Operation>
 torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
+  constexpr uint32_t PATTERN_TRANSPOSE = 1;
+  constexpr uint32_t PATTERN_BROADCAST_0 = 2;
+  constexpr uint32_t PATTERN_BROADCAST_1 = 3;
 
   // if (dim == 3 && (!input.is_contiguous() || !other.is_contiguous()))
   // {
@@ -320,19 +530,21 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   //                    input.stride(0), input.stride(1), input.stride(2),
   //                    other.stride(0), other.stride(1), other.stride(2));
   // }
-  bool is_support = input.is_contiguous() != other.is_contiguous();
   auto tensor_not_conti = input.is_contiguous() ? other : input;
-  bool order_flag = !input.is_contiguous() ? true : false;
-  is_support &= input.dim() == other.dim();
-  is_support &= dim == 3;
+  bool order_flag;
   int M, N, K;
   int stride0, stride1, stride2;
-  if (is_support)
+  int pattern = 0;
+  if (input.is_contiguous() != other.is_contiguous())
   {
+    order_flag = !input.is_contiguous() ? true : false;
+    bool is_support = true;
     M = input.size(0);
     N = input.size(1);
     K = input.size(2);
     // avoid broadcast
+    is_support &= input.dim() == other.dim();
+    is_support &= dim == 3;
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
     is_support &= input.size(2) == other.size(2);
@@ -343,9 +555,36 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     stride0 *= input.element_size();
     stride1 *= input.element_size();
     stride2 *= input.element_size();
+    pattern = is_support ? PATTERN_TRANSPOSE : 0;
+  }
+  else if (input.is_contiguous() && other.is_contiguous())
+  {
+    bool is_support = false;
+    is_support &= input.dim() == other.dim();
+    is_support &= dim == 3;
+    if (!is_support && other.size(0) == 1)
+    {
+      is_support = true;
+      is_support &= input.size(0) > 1;
+      is_support &= other.size(0) == 1;
+      is_support &= input.size(1) == other.size(1);
+      is_support &= input.size(2) == other.size(2);
+      pattern = is_support ? PATTERN_BROADCAST_0 : 0;
+      order_flag = true;
+    }
+
+    if (!is_support && input.size(1) == 1)
+    {
+      is_support = true;
+      is_support &= other.size(1) > 1;
+      is_support &= input.size(0) == other.size(0);
+      is_support &= input.size(2) == other.size(2);
+      pattern = is_support ? PATTERN_BROADCAST_1 : 0;
+      order_flag = true;
+    }
   }
 
-  if (is_support)
+  if (pattern == PATTERN_TRANSPOSE)
   {
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
@@ -378,6 +617,87 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
           input.scalar_type(), "add_tn_big_tile_kernel", [&]
           { vllm::add_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
+    }
+
+    return output;
+  }
+  else if (pattern == PATTERN_BROADCAST_0)
+  {
+    M = input.size(0);
+    N = input.size(1);
+    K = input.size(2);
+    constexpr uint32_t BIG_TILE_SIZE_N = 64;
+    constexpr uint32_t BIG_TILE_SIZE_K = 64;
+    constexpr uint32_t M_SWIZZLE = 8;
+    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+    const dim3 grid_dim(grid_x, 1, 1);
+    const dim3 block_dim(256, 1, 1);
+
+    auto options =
+        torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output =
+        torch::empty(input.sizes(), options);
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (order_flag)
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "add_bcast_big_tile_kernel", [&]
+          { vllm::add_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+    }
+    else
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "add_bcast_big_tile_kernel", [&]
+          { vllm::add_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+    }
+
+    return output;
+  }
+  else if (pattern == PATTERN_BROADCAST_1)
+  {
+    M = other.size(0);
+    N = other.size(1);
+    K = other.size(2);
+    // printf("[M, N, K]:[%d %d %d]\n", M, N, K);
+    constexpr uint32_t BIG_TILE_SIZE_N = 64;
+    constexpr uint32_t BIG_TILE_SIZE_K = 64;
+    constexpr uint32_t M_SWIZZLE = 8;
+    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+    const dim3 grid_dim(grid_x, 1, 1);
+    const dim3 block_dim(256, 1, 1);
+
+    auto options =
+        torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output =
+        torch::empty(other.sizes(), options);
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (order_flag)
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "add_bcast1_big_tile_kernel", [&]
+          { vllm::add_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+    }
+    else
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "add_bcast1_big_tile_kernel", [&]
+          { vllm::add_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
     }
 
     return output;
