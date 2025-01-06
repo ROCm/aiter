@@ -18,9 +18,17 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
     v_scale = None
 
     if quantCfg:
-        key, k_scale = ater.pertoken_quant(key.contiguous(), **quantCfg)
-        k_scale = k_scale.permute(2, 0, 1, 3).view(
-            num_heads, num_tokens).contiguous()
+        k_scale = quantCfg['k_scale']
+        v_scale = quantCfg['v_scale']
+        key, k_scale_ = ater.pertoken_quant(key.contiguous(),
+                                            y_scale_dtype=quantCfg['y_scale_dtype'],
+                                            quant_dtype=quantCfg['quant_dtype'])
+        k_scale_ = k_scale_.permute(0, 1, 3, 2).view(
+            num_tokens, num_heads).contiguous()
+
+        k_scale = k_scale.permute(1, 0).contiguous()
+        k_scale[slot_mapping] = k_scale_
+        k_scale = k_scale.permute(1, 0).contiguous()
 
     k_cache = k_cache.permute(0, 3, 1, 2, 4).contiguous().view(
         -1, num_heads, head_size)
@@ -37,9 +45,15 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
                            head_size//x, x).permute(0, 2, 3, 1, 4)
 
     if quantCfg:
-        value, v_scale = ater.pertoken_quant(value.contiguous(), **quantCfg)
-        v_scale = v_scale.permute(2, 0, 1, 3).view(
-            num_heads, num_tokens).contiguous()
+        value, v_scale_ = ater.pertoken_quant(value.contiguous(),
+                                              y_scale_dtype=quantCfg['y_scale_dtype'],
+                                              quant_dtype=quantCfg['quant_dtype'])
+        v_scale_ = v_scale_.permute(0, 1, 3, 2).view(
+            num_tokens, num_heads).contiguous()
+
+        v_scale = v_scale.permute(1, 0).contiguous()
+        v_scale[slot_mapping] = v_scale_
+        v_scale = v_scale.permute(1, 0).contiguous()
     if asm_layout:
         v_cache = v_cache.permute(0, 2, 4, 1, 3).contiguous().view(
             -1, num_heads, head_size)
@@ -70,10 +84,8 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
 @perftest()
 def run_ater(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}):
     if quantCfg:
-        num_tokens, num_heads, head_size = key.shape
-        k_scale = torch.empty(num_heads, num_tokens,
-                              dtype=quantCfg['y_scale_dtype'], device=key.device)
-        v_scale = torch.empty_like(k_scale)
+        k_scale = quantCfg['k_scale']
+        v_scale = quantCfg['v_scale']
         ater.reshape_and_cache_with_pertoken_quant(
             key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout)
     else:
@@ -85,7 +97,7 @@ def run_ater(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layo
 
 
 def test_reshape_and_cache(ctx_lens: int,
-                           num_seqs: int,
+                           bs: int,
                            num_heads: Tuple[int, int],
                            head_size: int,
                            block_size: int,
@@ -97,6 +109,7 @@ def test_reshape_and_cache(ctx_lens: int,
     qhead, kvhead = num_heads
     # num_blocks = (MAX_TOKEN_SUPPORTED+block_size-1)//block_size
     num_blocks = (ctx_lens+block_size-1)//block_size
+    max_token_num_support = num_blocks*block_size
     x = 16 // DTyoe_KVCache.itemsize
     if asm_layout:
         k_cache_shape = (num_blocks, kvhead, head_size // x, block_size, x)
@@ -109,10 +122,15 @@ def test_reshape_and_cache(ctx_lens: int,
     qkv = torch.randn(
         ctx_lens, qhead+2*kvhead, head_size, dtype=DTyoe_KV, device='cuda')
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
-    dtype = key.dtype
     device = key.device
     k_cache = torch.empty(k_cache_shape, dtype=DTyoe_KVCache, device=device)
     v_cache = torch.empty(v_cache_shape, dtype=DTyoe_KVCache, device=device)
+    if quantCfg:
+        k_scale = torch.empty(kvhead, max_token_num_support,
+                              dtype=quantCfg['y_scale_dtype'], device=key.device)
+        v_scale = torch.empty_like(k_scale)
+        quantCfg['k_scale'] = k_scale
+        quantCfg['v_scale'] = v_scale
     slot_mapping = torch.tensor([i for i in range(ctx_lens)]).cuda()
 
     k_cache_ref = k_cache.clone()
@@ -131,7 +149,7 @@ def test_reshape_and_cache(ctx_lens: int,
     for i, el in enumerate(out_ref):
         if el is None:
             continue
-        print(names[i],el.shape, out_a[i].shape)
+        print(names[i], el.shape, out_a[i].shape)
         checkAllclose(el, out_a[i],
                       msg=f'ref vs ater {us_ref}us vs {us_a}us ')
 
@@ -141,7 +159,7 @@ test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
 print('start quant')
 # test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
 #                        torch.bfloat16, torch.float8_e4m3fnuz, quantCfg={'y_scale_dtype': torch.float,
-#                                                                         'quant_dtype': torch.int8})
+#                                                                         'quant_dtype': torch.float8_e4m3fnuz})
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
                        torch.bfloat16, torch.int8, quantCfg={'y_scale_dtype': torch.float,
                                                              'quant_dtype': torch.int8})

@@ -336,7 +336,8 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const int64_t *__restrict__ slot_mapping,       // [num_tokens]
     const int key_stride, const int value_stride, const int num_heads,
     const int head_size, const int block_size, const int x,
-    const int max_kv_tokens, float dtypeMax)
+    const int num_tokens, const int max_kv_tokens,
+    float dtypeMax)
 {
   const int32_t tokens_per_wg = wg_size / warpSize;
 
@@ -347,7 +348,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
   const int64_t token_idx = static_cast<int64_t>(blockIdx.x * tokens_per_wg + wave_id);
   const int32_t head_idx = blockIdx.y;
 
-  if (token_idx >= max_kv_tokens)
+  if (token_idx >= num_tokens)
   {
     // Padding token that should be ignored.
     return;
@@ -418,8 +419,8 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
   }
 
   // store the scale
-  k_dequant_scales[head_idx * max_kv_tokens + token_idx] = k_token_scale;
-  v_dequant_scales[head_idx * max_kv_tokens + token_idx] = v_token_scale;
+  k_dequant_scales[head_idx * max_kv_tokens + slot_idx] = k_token_scale;
+  v_dequant_scales[head_idx * max_kv_tokens + slot_idx] = v_token_scale;
 
   // now let's store out
 #pragma unroll
@@ -580,7 +581,7 @@ void reshape_and_cache_flash(
           reinterpret_cast<dequant_scale_t *>(k_dequant_scales.data_ptr()),           \
           reinterpret_cast<dequant_scale_t *>(v_dequant_scales.data_ptr()),           \
           slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,                 \
-          num_heads, head_size, block_size, x, max_kv_tokens, dtypeMax);
+          num_heads, head_size, block_size, x, num_tokens, max_kv_tokens, dtypeMax);
 
 void reshape_and_cache_with_pertoken_quant(
     torch::Tensor& key,    // [num_tokens, num_heads, head_size]
