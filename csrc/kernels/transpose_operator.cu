@@ -359,7 +359,6 @@ namespace vllm
       const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr;
       const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
 #pragma unroll
-      // for (uint32_t t = 0; t < vmem_per_thread; t++)
       for (uint32_t t = 0; t < wr_per_row; t++)
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
@@ -461,7 +460,6 @@ namespace vllm
       const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
       const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
 #pragma unroll
-      // for (uint32_t t = 0; t < vmem_per_thread; t++)
       for (uint32_t t = 0; t < wr_per_row; t++)
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
@@ -573,6 +571,17 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
       order_flag = true;
     }
 
+    if (!is_support && input.size(0) == 1)
+    {
+      is_support = true;
+      is_support &= other.size(0) > 1;
+      is_support &= input.size(0) == 1;
+      is_support &= input.size(1) == other.size(1);
+      is_support &= input.size(2) == other.size(2);
+      pattern = is_support ? PATTERN_BROADCAST_0 : 0;
+      order_flag = false;
+    }
+
     if (!is_support && input.size(1) == 1)
     {
       is_support = true;
@@ -581,6 +590,16 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
       is_support &= input.size(2) == other.size(2);
       pattern = is_support ? PATTERN_BROADCAST_1 : 0;
       order_flag = true;
+    }
+
+    if (!is_support && other.size(1) == 1)
+    {
+      is_support = true;
+      is_support &= input.size(1) > 1;
+      is_support &= input.size(0) == other.size(0);
+      is_support &= input.size(2) == other.size(2);
+      pattern = is_support ? PATTERN_BROADCAST_1 : 0;
+      order_flag = false;
     }
   }
 
@@ -623,9 +642,9 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   }
   else if (pattern == PATTERN_BROADCAST_0)
   {
-    M = input.size(0);
-    N = input.size(1);
-    K = input.size(2);
+    M = order_flag ? input.size(0) : other.size(0);
+    N = order_flag ? input.size(1) : other.size(1);
+    K = order_flag ? input.size(2) : other.size(2);
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
     constexpr uint32_t M_SWIZZLE = 8;
@@ -633,10 +652,8 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
 
-    auto options =
-        torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output =
-        torch::empty(input.sizes(), options);
+    auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output = torch::empty({M, N, K}, options);
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
@@ -663,10 +680,9 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   }
   else if (pattern == PATTERN_BROADCAST_1)
   {
-    M = other.size(0);
-    N = other.size(1);
-    K = other.size(2);
-    // printf("[M, N, K]:[%d %d %d]\n", M, N, K);
+    M = order_flag ? other.size(0) : input.size(0);
+    N = order_flag ? other.size(1) : input.size(1);
+    K = order_flag ? other.size(2) : input.size(2);
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
     constexpr uint32_t M_SWIZZLE = 8;
@@ -674,10 +690,8 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
 
-    auto options =
-        torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output =
-        torch::empty(other.sizes(), options);
+    auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output = torch::empty({M, N, K}, options);
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
