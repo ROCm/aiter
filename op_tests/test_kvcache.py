@@ -16,15 +16,17 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
 
     k_scale = None
     v_scale = None
+    key = key.contiguous()
+    value = value.contiguous()
 
     if quantCfg:
         k_scale = quantCfg['k_scale']
         v_scale = quantCfg['v_scale']
-        key, k_scale_ = ater.pertoken_quant(key.contiguous(),
+        key, k_scale_ = ater.pertoken_quant(key,
                                             y_scale_dtype=quantCfg['y_scale_dtype'],
                                             quant_dtype=quantCfg['quant_dtype'])
         k_scale_ = k_scale_.permute(0, 1, 3, 2).view(
-            num_tokens, num_heads).contiguous()
+            num_batch*num_tokens, num_heads).contiguous()
 
         k_scale = k_scale.permute(1, 0).contiguous()
         k_scale[slot_mapping] = k_scale_
@@ -32,24 +34,17 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
 
     k_cache = k_cache.permute(0, 3, 1, 2, 4).contiguous().view(
         -1, num_heads, head_size)
-    for i, batch in enumerate(key):
-        # for K ..............................
-        # [num_tokens, num_heads, head_size]
-        # to
-        # [num_blocks, num_heads, head_size/x, block_size, x]
-        num_tokens = batch.shape[0]
-        slotID = slot_mapping[i]
-        k_cache[slotID:slotID+num_tokens] = batch.contiguous()
+    k_cache[slot_mapping] = key.view(-1, num_heads, head_size)
     k_cache = k_cache.view(num_blocks, block_size,
                            num_heads,
                            head_size//x, x).permute(0, 2, 3, 1, 4)
 
     if quantCfg:
-        value, v_scale_ = ater.pertoken_quant(value.contiguous(),
+        value, v_scale_ = ater.pertoken_quant(value,
                                               y_scale_dtype=quantCfg['y_scale_dtype'],
                                               quant_dtype=quantCfg['quant_dtype'])
         v_scale_ = v_scale_.permute(0, 1, 3, 2).view(
-            num_tokens, num_heads).contiguous()
+            num_batch*num_tokens, num_heads).contiguous()
 
         v_scale = v_scale.permute(1, 0).contiguous()
         v_scale[slot_mapping] = v_scale_
@@ -60,14 +55,7 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
     else:
         v_cache = v_cache.permute(0, 3, 1, 2).contiguous().view(
             -1, num_heads, head_size)
-    for i, batch in enumerate(value):
-        # for V ..............................
-        # [num_tokens, num_heads, head_size]
-        # to
-        # [num_blocks, num_heads, block_size/X, head_size, X]
-        num_tokens = batch.shape[0]
-        slotID = slot_mapping[i]
-        v_cache[slotID:slotID+num_tokens] = batch.contiguous()
+    v_cache[slot_mapping] = value.view(-1, num_heads, head_size)
     if asm_layout:
         v_cache = v_cache.view(num_blocks, block_size//x, x,
                                num_heads,
@@ -107,51 +95,89 @@ def test_reshape_and_cache(ctx_lens: int,
                            ):
     asm_layout = True
     qhead, kvhead = num_heads
-    # num_blocks = (MAX_TOKEN_SUPPORTED+block_size-1)//block_size
-    num_blocks = (ctx_lens+block_size-1)//block_size
+    num_blocks = (MAX_TOKEN_SUPPORTED+block_size-1)//block_size
+    # num_blocks = (ctx_lens+1+block_size-1)//block_size
     max_token_num_support = num_blocks*block_size
     x = 16 // DTyoe_KVCache.itemsize
     if asm_layout:
-        k_cache_shape = (num_blocks, kvhead, head_size // x, block_size, x)
-        v_cache_shape = (num_blocks, kvhead, block_size//x, head_size, x)
+        k_cache_shape = (bs*num_blocks, kvhead, head_size // x, block_size, x)
+        v_cache_shape = (bs*num_blocks, kvhead, block_size//x, head_size, x)
     else:
-        k_cache_shape = (num_blocks, kvhead, head_size // x, block_size, x)
-        v_cache_shape = (num_blocks, kvhead, head_size, block_size)
+        k_cache_shape = (bs*num_blocks, kvhead, head_size // x, block_size, x)
+        v_cache_shape = (bs*num_blocks, kvhead, head_size, block_size)
 
-    # prefill part
+    # ##################################################### prefill part
     qkv = torch.randn(
-        ctx_lens, qhead+2*kvhead, head_size, dtype=DTyoe_KV, device='cuda')
+        bs*ctx_lens, qhead+2*kvhead, head_size, dtype=DTyoe_KV, device='cuda')
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
     device = key.device
     k_cache = torch.empty(k_cache_shape, dtype=DTyoe_KVCache, device=device)
     v_cache = torch.empty(v_cache_shape, dtype=DTyoe_KVCache, device=device)
     if quantCfg:
-        k_scale = torch.empty(kvhead, max_token_num_support,
+        k_scale = torch.empty(kvhead, bs*max_token_num_support,
                               dtype=quantCfg['y_scale_dtype'], device=key.device)
         v_scale = torch.empty_like(k_scale)
-        quantCfg['k_scale'] = k_scale
-        quantCfg['v_scale'] = v_scale
-    slot_mapping = torch.tensor([i for i in range(ctx_lens)]).cuda()
+        quantCfg['k_scale'] = k_scale.clone()
+        quantCfg['v_scale'] = v_scale.clone()
+    slot_mapping = torch.tensor([bsID*max_token_num_support+i for bsID in range(bs)
+                                for i in range(ctx_lens)]).cuda()
 
     k_cache_ref = k_cache.clone()
     v_cache_ref = v_cache.clone()
-    out_ref, us_ref = run_torch(key.view(1, ctx_lens, kvhead, head_size),
-                                value.view(1, ctx_lens, kvhead, head_size),
+    out_ref, us_ref = run_torch(key.view(bs, ctx_lens, kvhead, head_size),
+                                value.view(bs, ctx_lens, kvhead, head_size),
                                 k_cache_ref, v_cache_ref,
                                 slot_mapping, block_size, x, asm_layout, quantCfg)
 
     k_cache_a = k_cache.clone()
     v_cache_a = v_cache.clone()
+    if quantCfg:
+        quantCfg['k_scale'] = k_scale.clone()
+        quantCfg['v_scale'] = v_scale.clone()
     out_a, us_a = run_ater(key, value, k_cache_a, v_cache_a,
                            slot_mapping, block_size, x, asm_layout, quantCfg)
 
+    print(f'prefill part: ref vs ater {us_ref:.2f}us vs {us_a:.2f}us')
     names = ['k_cache', 'v_cache', 'k_scale', 'v_scale']
     for i, el in enumerate(out_ref):
         if el is None:
             continue
-        print(names[i], el.shape, out_a[i].shape)
-        checkAllclose(el, out_a[i],
-                      msg=f'ref vs ater {us_ref}us vs {us_a}us ')
+        checkAllclose(el, out_a[i], msg=f'{names[i]} {el.shape}')
+
+    # ##################################################### decode part
+    qkv = torch.randn(
+        bs, qhead+2*kvhead, head_size, dtype=DTyoe_KV, device='cuda')
+    _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
+
+    if quantCfg:
+        quantCfg['k_scale'] = k_scale.clone()
+        quantCfg['v_scale'] = v_scale.clone()
+    slot_mapping = torch.tensor(
+        [bsID*max_token_num_support+ctx_lens for bsID in range(bs)]).cuda()
+
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    out_ref, us_ref = run_torch(key.view(bs, 1, kvhead, head_size),
+                                value.view(bs, 1, kvhead, head_size),
+                                k_cache_ref, v_cache_ref,
+                                slot_mapping, block_size, x, asm_layout, quantCfg)
+
+    k_cache_a = k_cache.clone()
+    v_cache_a = v_cache.clone()
+    if quantCfg:
+        quantCfg['k_scale'] = k_scale.clone()
+        quantCfg['v_scale'] = v_scale.clone()
+    out_a, us_a = run_ater(key, value, k_cache_a, v_cache_a,
+                           slot_mapping, block_size, x, asm_layout, quantCfg)
+
+    print(f'decode part: ref vs ater {us_ref:.2f}us vs {us_a:.2f}us')
+    names = ['k_cache', 'v_cache', 'k_scale', 'v_scale']
+    for i, el in enumerate(out_ref):
+        if el is None:
+            continue
+        checkAllclose(el, out_a[i], msg=f'{names[i]} {el.shape}')
+    print(
+        f'finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DTyoe_KV=} {DTyoe_KVCache=}')
 
 
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
