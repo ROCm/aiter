@@ -43,13 +43,14 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             fc2_smooth_scale=None,  # [expert, 1, inter_dim]
             a16=False
             ):
-    E, _, model_dim = w1.shape
+    E, inter_dim, model_dim = w1.shape
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
     device = topk_ids.device
     sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_padded, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
                                                                                                     model_dim, dtype)
     if fc1_scale is None:
+        # pure bf16
         ater.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
                   sorted_weights, sorted_expert_ids, num_tokens_post_padded, topk)
     elif a16:
@@ -67,13 +68,21 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
 
         ater.moe_smoothquant_fwd(
             a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
-        ater.fmoe_int8_g1u0(moe_buf, a8, w1, w2, sorted_ids,
-                            sorted_weights, sorted_expert_ids, num_tokens_post_padded,
-                            topk,
-                            a8_scale,
-                            fc1_scale,
-                            fc2_scale,
-                            fc2_smooth_scale)
+
+        if w2.shape[2] == w1.shape[1]:
+            fmoe_func = ater.fmoe_int8_g1u0
+        elif w2.shape[2]*2 == w1.shape[1]:
+            fmoe_func = ater.fmoe_int8_g1u1
+        else:
+            raise ValueError(f"Invalid MoE weight: {w1.shape=} {w2.shape=}")
+
+        fmoe_func(moe_buf, a8, w1, w2, sorted_ids,
+                  sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                  topk,
+                  a8_scale,
+                  fc1_scale,
+                  fc2_scale,
+                  fc2_smooth_scale)
     return moe_buf
 
 

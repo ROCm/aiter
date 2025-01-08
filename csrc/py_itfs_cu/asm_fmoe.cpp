@@ -188,6 +188,7 @@ void fmoe(torch::Tensor &out,                    // [token_cnt, dim]
           uint32_t topk                          //
 )
 {
+    //bf16 g1u0
     static FMoeKernel impl("fmoe_kernel_func", "fmoe.co");
     impl.launch_kernel<uint16_t, uint16_t>(out,
                                            input,
@@ -216,6 +217,38 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
 )
 {
     static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0.co");
+    impl.launch_kernel<uint8_t, uint16_t>(out,
+                                          input,
+                                          gate,
+                                          down,
+                                          sorted_token_ids,
+                                          sorted_weight_buf,
+                                          sorted_expert_ids,
+                                          num_tokens_post_padded,
+                                          topk,
+                                          // quant args
+                                          input_scale,
+                                          fc1_scale,
+                                          fc2_scale,
+                                          fc2_smooth_scale);
+}
+
+void fmoe_int8_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
+                    torch::Tensor &input,                  // [token_cnt, dim] M,K
+                    torch::Tensor &gate,                   // [expert, inter_dim, dim] N,K
+                    torch::Tensor &down,                   // [expert, dim, inter_dim]
+                    torch::Tensor &sorted_token_ids,       // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weight_buf,      // [max_num_tokens_padded]
+                    torch::Tensor &sorted_expert_ids,      // [max_num_m_blocks]
+                    torch::Tensor &num_tokens_post_padded, // [1]
+                    uint32_t topk,                         //
+                    torch::Tensor &input_scale,            // [token_cnt, 1]
+                    torch::Tensor &fc1_scale,              // [expert, 1, hidden_dim]
+                    torch::Tensor &fc2_scale,              // [expert, 1, dim]
+                    torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
+)
+{
+    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u1_subGU_512.co");
     impl.launch_kernel<uint8_t, uint16_t>(out,
                                           input,
                                           gate,
