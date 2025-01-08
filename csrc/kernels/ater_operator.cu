@@ -312,7 +312,6 @@ namespace vllm
   __global__ void add_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
   {
     // pad LDS row by dword
-    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
 
@@ -338,8 +337,6 @@ namespace vllm
     const uint32_t current_nk = swizzle_m ? blockIdx.x / M_SWIZZLE % nk_tiles : blockIdx.x % nk_tiles;
     const uint32_t ti = current_nk / k_tiles;
     const uint32_t tj = current_nk % k_tiles;
-
-    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
 
     const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
@@ -413,7 +410,6 @@ namespace vllm
   __global__ void add_bcast1_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
   {
     // pad LDS row by dword
-    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
 
@@ -439,8 +435,6 @@ namespace vllm
     const uint32_t current_nk = swizzle_m ? blockIdx.x / M_SWIZZLE % nk_tiles : blockIdx.x % nk_tiles;
     const uint32_t ti = current_nk / k_tiles;
     const uint32_t tj = current_nk % k_tiles;
-
-    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
 
     const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
@@ -515,7 +509,7 @@ namespace vllm
 }
 
 template <typename Operation>
-torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
   constexpr uint32_t PATTERN_TRANSPOSE = 1;
@@ -722,22 +716,22 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   }
 }
 
-torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_add(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::AddOp>(input, other);
+  return ater_operation<vllm::AddOp>(input, other);
 }
 
-torch::Tensor transpose_sub(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::SubOp>(input, other);
+  return ater_operation<vllm::SubOp>(input, other);
 }
 
-torch::Tensor transpose_mul(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::MulOp>(input, other);
+  return ater_operation<vllm::MulOp>(input, other);
 }
 
-torch::Tensor transpose_div(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_div(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::DivOp>(input, other);
+  return ater_operation<vllm::DivOp>(input, other);
 }
