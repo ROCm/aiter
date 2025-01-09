@@ -55,7 +55,7 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_m
     for j in range(100):
         #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=torch.float32).to(torch.int32)
         # output = torch.empty_like(tensor1)
-        output = ater.ater_add(tensor0, tensor1)
+        output = ater.add(tensor0, tensor1)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 print(torch.equal(result_con, output))

@@ -4,7 +4,7 @@ import ater
 # import rocmKernels
 
 def my_tensor_add(input, other):
-    return ater.ater_add(input, other)
+    return ater.add(input, other)
 torch.add = my_tensor_add
 
 def benchmark_torch_function(iters: int, function, *args) -> float:
