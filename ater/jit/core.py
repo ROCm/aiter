@@ -190,7 +190,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module
 
-def get_argsOfBuild(ops_name:str):
+def get_args_of_build(ops_name:str):
     d_opt_build_args = {"srcs": [],
         "md_name": "",
         "flags_extra_cc": [],
@@ -255,7 +255,7 @@ def get_argsOfBuild(ops_name:str):
 def compile_ops(ops_name : str, fc_name: Optional[str] = None):
     def decorator(func):
         def wrapper(*args, **kwargs):
-            d_args = get_argsOfBuild(ops_name)
+            d_args = get_args_of_build(ops_name)
             md_name = d_args["md_name"]
             srcs = d_args["srcs"]
             flags_extra_cc = d_args["flags_extra_cc"]
