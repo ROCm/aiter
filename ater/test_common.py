@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-02 16:43:40
+# @Last Modified At: 2025-01-10 23:35:14
 # @Description: This is description.
 
 import torch
@@ -99,9 +99,9 @@ def get_trace_perf(prof, num_iters):
         rets.append(r)
     df = pd.DataFrame(rets)
 
-    cols = ['name', 'host_time_total', 'device_time_total',
+    cols = ['name', 'cnt', 'host_time_total', 'device_time_total',
             'device_type', 'device_index',]
-    cols = [el for el in ['cnt']+cols if el in df.columns]
+    cols = [el for el in cols if el in df.columns]
     df = df[(df.host_time_total > 0) | (df.device_time_total > 0)]
 
     timerList = ['host_time_total', 'device_time_total', ]

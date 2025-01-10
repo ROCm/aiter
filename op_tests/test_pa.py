@@ -575,9 +575,9 @@ def test_paged_attention(
     # msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
     # checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
     print(
-        f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished)\n")
+        f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished\n")
 
 
 for ctx_len in [1, 26, 128, 4097]:
-    test_paged_attention(4097, 128, (8, 1), 128, False, 16,
+    test_paged_attention(ctx_len, 128, (8, 1), 128, False, 16,
                          torch.bfloat16, "auto", 0, "cuda:0")

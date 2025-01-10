@@ -108,28 +108,6 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& reg_buffer,
   _all_reduce(_fa, reg_buffer, out, stream);
 }
 
-torch::Tensor all_reduce_asm(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
-                             torch::Tensor &reg_sig, bool isGraph)
-{
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
-  auto stream = c10::cuda::getCurrentCUDAStream().stream();
-
-  auto input_size = inp.numel() * inp.element_size();
-
-  void *inp_ptr = inp.data_ptr();
-  if (!isGraph)
-  {
-    TORCH_CHECK(input_size <= reg_buffer.numel() * reg_buffer.element_size(),
-                "registered buffer is too small to contain the input", input_size, ">", reg_buffer.numel() * reg_buffer.element_size());
-    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
-                                  input_size, cudaMemcpyDeviceToDevice, stream));
-    inp_ptr = reg_buffer.data_ptr();
-  }
-
-  auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
-  auto ret = fa->allreduce_asm(stream, inp_ptr, reg_sig.data_ptr(), input_size, inp);
-  return ret;
-}
 
 void dispose(fptr_t _fa) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);

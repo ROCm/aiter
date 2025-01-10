@@ -6,10 +6,11 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-14 15:47:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2024-12-31 09:52:13
+# @Last Modified At: 2025-01-10 23:08:48
 # @Description: This is description.
 
 import torch
+from torch import Tensor
 import torch.distributed as dist
 from typing import List, Optional
 from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
@@ -28,16 +29,7 @@ import logging
 logger = logging.getLogger("ater")
 
 
-def call_all_reduce_asm(input: torch.Tensor):
-    tp_grp = get_tp_group()
-    ca_comm = tp_grp.ca_comm
-
-    return ca_comm.all_reduce_asm(input)
-
-
 def init_dist_env(world_size, rankID):
-    logger.info(
-        f"RANK: {rankID}/{world_size} init_process_group...")
     set_custom_all_reduce(True)
     init_distributed_environment(
         world_size=world_size,
@@ -56,6 +48,7 @@ def init_dist_env(world_size, rankID):
 
     ca_comm.signal = signal
     ca_comm.register_buffer(signal)
+    logger.debug(f"RANK: {rankID}/{world_size} init_dist_env...")
 
 
 def destroy_dist_env():
@@ -63,3 +56,36 @@ def destroy_dist_env():
         destroy_model_parallel()
         destroy_distributed_environment()
         torch.cuda.empty_cache()
+
+
+def all_reduce_asm(inp: torch.Tensor):
+    tp_grp = get_tp_group()
+    ca = tp_grp.ca_comm
+
+    if ca._IS_CAPTURING:
+        if torch.cuda.is_current_stream_capturing():
+            return ater.all_reduce_asm_(inp,
+                                        ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING)
+        else:
+            # if warm up, mimic the allocation pattern
+            # since custom allreduce is out-of-place
+            return torch.empty_like(inp)
+    else:
+        # note: outside of cuda graph context,
+        # custom allreduce incurs a cost of cudaMemcpy, which should
+        # be small(<=1% of overall latency) compared to the performance
+        # gains of using custom kernels
+        return ater.all_reduce_asm_(inp,
+                                    ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING)
+
+
+def all_reduce_layernorm(input: Tensor,
+                         residual_in: Tensor,
+                         weight: Tensor,
+                         bias: Tensor,
+                         epsilon: float):
+    tp_grp = get_tp_group()
+    ca = tp_grp.ca_comm
+
+    return ater.all_reduce_layernorm_(input, residual_in, weight, bias, epsilon,
+                                      ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING)

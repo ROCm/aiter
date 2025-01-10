@@ -32,8 +32,20 @@ def all_reduce_unreg(_fa: int, inp: Tensor,
 
 
 @compile_ops(**compile_ops_)
-def all_reduce_asm(_fa: int, inp: Tensor,
-                   reg_buffer: Tensor, reg_sig: Tensor) -> Tensor: ...
+def all_reduce_asm_(inp: Tensor,
+                    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> Tensor: ...
+
+
+@compile_ops(**compile_ops_)
+def all_reduce_layernorm_(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    weight: Tensor,
+    bias: Tensor,
+    epsilon: float,
+    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> Tensor: ...
 
 
 @compile_ops(**compile_ops_)
