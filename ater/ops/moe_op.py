@@ -5,19 +5,8 @@ import torch.nn.functional as F
 
 MD_NAME = "module_moe"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/moe_op_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/topk_softmax_kernels.cu",
-        f"{ATER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp",
-    ],
-    "flags_extra_hip": [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
-    "md_name": MD_NAME,
-}
 
-
-@compile_ops(**compile_ops_)
+@compile_ops("module_moe")
 def topk_softmax(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -27,11 +16,11 @@ def topk_softmax(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_moe")
 def moe_sum(input: Tensor, output: Tensor): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_moe")
 def moe_align_block_size(
     topk_ids: Tensor,
     num_experts: int,
@@ -43,7 +32,7 @@ def moe_align_block_size(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_moe")
 def fmoe(
     out: Tensor,
     input: Tensor,
@@ -57,7 +46,7 @@ def fmoe(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_moe")
 def fmoe_int8_g1u0(
     out: Tensor,
     input: Tensor,
@@ -75,7 +64,7 @@ def fmoe_int8_g1u0(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_moe")
 def fmoe_int8_g1u0_a16(
     out: Tensor,
     input: Tensor,  # bf16

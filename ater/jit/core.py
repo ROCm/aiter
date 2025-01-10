@@ -20,9 +20,11 @@ from typing import List, Optional
 from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
+import json
+
 PREBUILD_KERNELS = False
-if importlib.util.find_spec('ater_') is not None:
-    import ater_
+if os.path.exists(os.path.dirname(os.path.abspath(__file__))+"/ater_.so"):
+    ater_ = importlib.import_module(f'{__package__}.ater_')
     PREBUILD_KERNELS = True
 logger = logging.getLogger("ater")
 
@@ -133,20 +135,27 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
         check_and_set_ninja_worker()
 
-        if blob_gen_cmd:
-            blob_dir = f"{op_dir}/blob"
-            os.makedirs(blob_dir, exist_ok=True)
-            baton = FileBaton(os.path.join(blob_dir, 'lock'))
-            if baton.try_acquire():
-                try:
-                    os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
-                finally:
-                    baton.release()
-            else:
-                baton.wait()
+        def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
+            if blob_gen_cmd:
+                blob_dir = f"{op_dir}/blob"
+                os.makedirs(blob_dir, exist_ok=True)
+                baton = FileBaton(os.path.join(blob_dir, 'lock'))
+                if baton.try_acquire():
+                    try:
+                        os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
+                    finally:
+                        baton.release()
+                else:
+                    baton.wait()
+                sources += rename_cpp_to_cu([blob_dir],
+                                            src_dir, recurisve=True)
+            return sources
 
-            sources += rename_cpp_to_cu([blob_dir],
-                                        src_dir, recurisve=True)
+        if isinstance(blob_gen_cmd, list):
+            for s_blob_gen_cmd in blob_gen_cmd:
+                sources = exec_blob(s_blob_gen_cmd,op_dir, src_dir, sources)
+        else:
+            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         bd_include_dir = f'{op_dir}/build/include'
         os.makedirs(bd_include_dir, exist_ok=True)
@@ -181,20 +190,80 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module
 
+def get_argsOfBuild(ops_name:str):
+    d_opt_build_args = {"srcs": [],
+        "md_name": "",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": None,
+        "extra_include": [],
+        "verbose": False,
+        "blob_gen_cmd": ""
+        }
+    def convert(d_ops:dict):
+        ## judge isASM
+        if d_ops["isASM"].lower() == "true":
+            d_ops["flags_extra_hip"].append("rf'-DATER_ASM_DIR=\\\"{ATER_ROOT_DIR}/hsa/\\\"'")
+        del d_ops["isASM"]
+        for k, val in d_ops.items():
+            if isinstance(val, list):
+                for idx, el in enumerate(val):
+                    if isinstance(el, str):
+                        val[idx] = eval(el)
+                d_ops[k] = val
+            elif isinstance(val, str):
+                d_ops[k] = eval(val)
+            else:
+                pass
+        return d_ops
+    with open(this_dir+"/optCompilerConfig.json", 'r') as file:
+        data = json.load(file)
+        if isinstance(data, dict):
+            # parse all ops
+            if ops_name == "all":
+                d_all_ops = {"srcs":[],
+                    "flags_extra_cc" : [],
+                    "flags_extra_hip": [],
+                    "extra_include": [],
+                    "blob_gen_cmd": []}
+                # traverse opts
+                for ops_name, d_ops in data.items():
+                    ## Cannot contain tune ops
+                    if ops_name.endswith("tune"):
+                        continue
+                    single_ops = convert(d_ops)
+                    for k in d_all_ops.keys():
+                        if isinstance(single_ops[k], list):
+                            d_all_ops[k] += single_ops[k]
+                        elif isinstance(single_ops[k], str) and single_ops[k]!='':
+                            d_all_ops[k].append(single_ops[k])
 
-def compile_ops(
-    srcs: List[str],
-    md_name: str,
-    fc_name: Optional[str] = None,
-    flags_extra_cc: List[str] = [],
-    flags_extra_hip: List[str] = [],
-    extra_ldflags=None,
-    extra_include: List[str] = [],
-    verbose=False,
-    blob_gen_cmd=''
-):
+                # print(d_all_ops)
+                return d_all_ops
+            # no find opt_name in json.
+            elif data.get(ops_name) == None:
+                print("Not found this operator in 'optCompilerConfig.json'. ")
+                return d_opt_build_args
+            # parser single opt
+            else:
+                compile_ops_ = data.get(ops_name)
+                return convert(compile_ops_)
+        else:
+            print("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
+
+
+def compile_ops(ops_name : str, fc_name: Optional[str] = None):
     def decorator(func):
         def wrapper(*args, **kwargs):
+            d_args = get_argsOfBuild(ops_name)
+            md_name = d_args["md_name"]
+            srcs = d_args["srcs"]
+            flags_extra_cc = d_args["flags_extra_cc"]
+            flags_extra_hip = d_args["flags_extra_hip"]
+            blob_gen_cmd = d_args["blob_gen_cmd"]
+            extra_include = d_args["extra_include"]
+            extra_ldflags = d_args["extra_ldflags"]
+            verbose = d_args["verbose"]
             loadName = fc_name
             if fc_name is None:
                 loadName = func.__name__
