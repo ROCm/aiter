@@ -43,12 +43,14 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      torch::Tensor &V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
                      torch::Tensor &block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor &context_lens, //   [num_seqs]
-                     std::optional<torch::Tensor> K_QScale = std::nullopt,
-                     std::optional<torch::Tensor> V_QScale = std::nullopt)
+                     int max_num_blocks,
+                     std::optional<torch::Tensor>& K_QScale,
+                     std::optional<torch::Tensor>& V_QScale,
+                     std::optional<torch::Tensor>& out_)
 {
-    torch::Tensor output = torch::empty_like(Q);
-    int batch = block_tables.size(0);
-    int max_num_blocks = block_tables.size(1);
+    torch::Tensor output = out_.value_or(torch::empty_like(Q));
+    int batch = context_lens.size(0);
+    // int max_num_blocks = block_tables.size(1);
     int num_heads = Q.size(1);
     int head_size = Q.size(2);
     int num_kv_heads = K.size(1);
