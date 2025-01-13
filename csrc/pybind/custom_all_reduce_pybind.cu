@@ -15,6 +15,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "()");
       m.def("all_reduce_asm_", &all_reduce_asm, "");
       m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");
+      m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant");
 
       m.def("dispose", &dispose);
       m.def("meta_size", &meta_size);
