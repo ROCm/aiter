@@ -5,24 +5,16 @@ import torch.nn.functional as F
 
 MD_NAME = "module_cache"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/cache_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/cache_kernels.cu",
-    ],
-    "md_name": MD_NAME,
-}
 
-
-@compile_ops(**compile_ops_)
+@compile_ops("module_cache")
 def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_cache")
 def copy_blocks(key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_cache")
 def reshape_and_cache(
     key: Tensor,
     value: Tensor,
@@ -36,7 +28,7 @@ def reshape_and_cache(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_cache")
 def reshape_and_cache_flash(
     key: Tensor,
     value: Tensor,
@@ -48,7 +40,7 @@ def reshape_and_cache_flash(
     v_scale: float,
 ): ...
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_cache")
 def reshape_and_cache_with_pertoken_quant(
     key: Tensor,
     value: Tensor,
@@ -60,7 +52,7 @@ def reshape_and_cache_with_pertoken_quant(
     asm_layout: bool
 ): ...
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_cache")
 def convert_fp8(
     dst_cache: Tensor, src_cache: Tensor, scale: float, kv_cache_dtype: str
 ): ...

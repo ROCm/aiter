@@ -121,66 +121,19 @@ if IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
-        renamed_sources = rename_cpp_to_cu(
-            [
-                f"{this_dir}/csrc",
-                f"{this_dir}/csrc/include",
-                f"{this_dir}/csrc/kernels",
-                f"{this_dir}/csrc/py_itfs_ck",
-                f"{this_dir}/csrc/py_itfs_cu",
-            ]
-        )
-        renamed_ck_srcs = rename_cpp_to_cu(
-            [  # f'for other kernels'
-                f"{blob_dir}",
-                f"{ck_dir}/example/ck_tile/12_smoothquant/instances/",
-                f"{ck_dir}/example/ck_tile/13_moe_sorting/",
-                f"{ck_dir}/example/ck_tile/14_moe_smoothquant/instances/",
-            ])
-        if int(os.environ.get("USE_CK_A8W8", 0)) == 1:
-            ck_gemm_a8w8_dir = os.path.join(blob_dir, "ck_gemm_a8w8")
-            if os.path.exists(ck_gemm_a8w8_dir):
-                shutil.rmtree(ck_gemm_a8w8_dir)
-            os.mkdir(ck_gemm_a8w8_dir)
-            os.system(f'{sys.executable} {this_dir}/csrc/ck_gemm_a8w8/gen_instances.py --working_path {ck_gemm_a8w8_dir}')
-            generator_flag.append("-DUSE_CK_A8W8")
-            renamed_ck_srcs += rename_cpp_to_cu(
-                [f"{this_dir}/csrc/ck_gemm_a8w8/include",
-                f"{this_dir}/csrc/ck_gemm_a8w8/gemm_a8w8.cu",
-                f"{ck_gemm_a8w8_dir}", f"{ck_gemm_a8w8_dir}/impl", 
-                f"{ck_gemm_a8w8_dir}/instances"])
-        extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17"] + generator_flag,
-            "nvcc":
-                [
-                    "-O3", "-std=c++17",
-                    "-DUSE_PROF_API=1",
-                    "-DENABLE_FP8",
-                    "-D__HIP_PLATFORM_HCC__=1",
-                    "-D__HIP_PLATFORM_AMD__=1",
-                    "-U__HIP_NO_HALF_CONVERSIONS__",
-                    "-U__HIP_NO_HALF_OPERATORS__",
-            ]
-                + generator_flag
-                + cc_flag,
-        }
+        all_opts_args_build = core.get_args_of_build("all")
+        # remove pybind, because there are already duplicates in rocm_opt
+        new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
+        all_opts_args_build["srcs"] = new_list
 
-        include_dirs = [
-            f"{this_dir}/build",
-            f"{ck_dir}/include",
-            f"{ck_dir}/library/include",
-            f"{ck_dir}/example/ck_tile/02_layernorm2d",
-            f"{ck_dir}/example/ck_tile/12_smoothquant",
-            f"{ck_dir}/example/ck_tile/13_moe_sorting",
-            f"{ck_dir}/example/ck_tile/14_moe_smoothquant",
-        ]
-        ext_modules.append(
-            CUDAExtension(
-                name=PACKAGE_NAME+'_',
-                sources=renamed_sources+renamed_ck_srcs,
-                extra_compile_args=extra_compile_args,
-                include_dirs=include_dirs,
-            )
+        core.build_module(md_name = "ater_", 
+                    srcs = all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
+                    flags_extra_cc = all_opts_args_build["flags_extra_cc"],
+                    flags_extra_hip = all_opts_args_build["flags_extra_hip"],
+                    blob_gen_cmd = all_opts_args_build["blob_gen_cmd"],
+                    extra_include = all_opts_args_build["extra_include"],
+                    extra_ldflags = None,
+                    verbose = False,
         )
 
     # ########## gradlib for tuned GEMM start here
