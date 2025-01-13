@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-10 23:35:14
+# @Last Modified At: 2025-01-13 10:27:10
 # @Description: This is description.
 
 import torch
@@ -137,9 +137,9 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
             f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({(a[mask]).numel()} of {a.numel()}) elements')
 
 
-def tensor_dump(x: torch.tensor, name: str):
+def tensor_dump(x: torch.tensor, name: str, dir='./'):
     x_cpu = x.cpu().view(torch.uint8)
-    filename = f'{name}.bin'
+    filename = f'{dir}/{name}.bin'
     x_cpu.numpy().tofile(filename)
     logger.info(f'saving {filename} {x.shape}, {x.dtype}')
 

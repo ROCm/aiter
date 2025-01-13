@@ -11,6 +11,13 @@ import logging
 import multiprocessing as mp
 logger = logging.getLogger("ater")
 
+Norm = 0
+DUMP = 1
+VERIFY = 2
+# debug_mode = DUMP
+# debug_mode = VERIFY
+debug_mode = DUMP
+
 
 def run_commun_fwd(tp_size, pp_size,  gpuID, x, withGraph=False):
     try:
@@ -164,6 +171,14 @@ def test_all_reduce_layernorm(tp_size, shape, dtype,  withGraph=False):
         checkAllclose(ref_res, residual_out, msg='residual out')
         checkAllclose(ref_out, out, msg='norm out')
         break
+    if debug_mode == DUMP:
+        for i, el in enumerate(xs):
+            tensor_dump(el, f'input{i}')
+        tensor_dump(res_in, f'res_in')
+        tensor_dump(weight, f'weight')
+        tensor_dump(bias, f'bias')
+        tensor_dump(ref_res, f'res_out')
+        tensor_dump(ref_out, f'output')
 
 
 if __name__ == '__main__':
