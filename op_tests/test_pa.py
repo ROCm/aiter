@@ -62,7 +62,7 @@ def kv_cache_factory(
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
     scale = head_size**-0.5
-    x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
+    x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     key_caches: List[torch.Tensor] = []
     for _ in range(num_layers):
@@ -322,6 +322,7 @@ def run_ater_asm(query,
                  num_kv_heads,
                  scale,
                  alibi_slopes,
+                 max_num_blocks,
                  k_scale=None,
                  v_scale=None):
     return ater.pa_fwd_asm(
@@ -330,6 +331,7 @@ def run_ater_asm(query,
         value_cache,
         block_tables,
         seq_lens,
+        max_num_blocks,
         k_scale,
         v_scale
     )
@@ -476,7 +478,7 @@ def test_paged_attention(
     checkAllclose(out_golden, out_ater,
                   msg=f'golden vs ater_shomy:{time_ater}')
     tensor_dump(out_ater, 'out_ater')
-
+    
     out_ater_asm, time_ater_asm = run_ater_asm(
         query,
         key_cache,
@@ -487,8 +489,10 @@ def test_paged_attention(
         kv_cache_dtype,
         num_kv_heads,
         scale,
-        alibi_slopes
+        alibi_slopes,
+        max_num_blocks_per_seq
     )
+
     checkAllclose(out_golden, out_ater_asm,
                   msg=f'golden vs ater_asm:{time_ater_asm}')
     tensor_dump(out_ater, 'out_ater')
@@ -518,9 +522,9 @@ def test_paged_attention(
             block_size,
             quant_algo_
         )
-        checkAllclose(out_golden, out_ater_naive,
+        checkAllclose(out_ater_asm, out_ater_naive,
                       msg=f'golden vs ck_naive(quant:{quant_algo_}, kvcache:{cache_type_}):{time_ater_naive}')
-
+  
         if cache_type_ == torch.int8:
             out_ater_asm, time_ater_asm = run_ater_asm(
                 query,
@@ -533,12 +537,12 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
+                max_num_blocks_per_seq,
                 k_scale_,
                 v_scale_,
             )
             checkAllclose(out_golden, out_ater_asm,
                           msg=f'golden vs ater_asm(quant:{quant_algo_}, kvcache:{cache_type_}):{time_ater_asm}')
-
     if debug_mode == DUMP:
         dump_input(query,
                    key_cache,
@@ -574,10 +578,10 @@ def test_paged_attention(
     # atol, rtol = 1e-2, 1e-2
     # msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
     # checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
-    print(
-        f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished)\n")
+    # print(
+    #     f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished)\n")
 
 
 for ctx_len in [1, 26, 128, 4097]:
-    test_paged_attention(4097, 128, (8, 1), 128, False, 16,
+    test_paged_attention(ctx_len, 128, (8, 1), 128, False, 16,
                          torch.bfloat16, "auto", 0, "cuda:0")
