@@ -12,6 +12,7 @@
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "py_itfs_common.h"
 #include "ck_tile/ref/naive_attention.hpp"
 
@@ -30,11 +31,15 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                            const float scale_k,
                            const float scale_v,
                            const int block_size,
-                           const int quant_algo    // 0: no quant, 1: per-token FP8 quant
+                           const int quant_algo,    // 0: no quant, 1: per-token FP8 quant
+                           std::optional<torch::Tensor> &out_
 )
 {
-    // TORCH_CHECK(scale_k == 1. && scale_v == 1., "only support 1.0 for now")
-    torch::Tensor out = torch::empty_like(Q);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(block_tables.dtype() == torch::kInt32, "block_tables must be int32");
+    TORCH_CHECK(context_lens.dtype() == torch::kInt32, "context_lens must be int32");
+    torch::Tensor out = out_.value_or(torch::empty_like(Q));
     int batch = Q.size(0);
     int nhead = Q.size(1);
     int nhead_k = V.size(1);
@@ -80,7 +85,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     naive_a.max_pages_per_seq = max_num_blocks_per_seq;
     naive_a.max_kv_tokens = max_kv_tokens;
 
-    ck_tile::stream_config naive_s{};
+    ck_tile::stream_config naive_s{stream};
 
     naive_attention_fwd(naive_t, naive_a, naive_s);
     return out;

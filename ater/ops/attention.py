@@ -36,7 +36,8 @@ def pa_fwd_naive(
     scale_k: float,
     scale_v: float,
     block_size: int,
-    quant_algo: int
+    quant_algo: int,
+    out: Optional[torch.Tensor] = None
 ) -> torch.Tensor: ...
 
 
@@ -46,7 +47,12 @@ def pa_fwd_asm(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor) -> torch.Tensor: ...
+    context_lens: torch.Tensor,
+    max_num_blocks: int,
+    K_QScale: Optional[torch.Tensor],
+    V_QScale: Optional[torch.Tensor],
+    out_: Optional[torch.Tensor] = None
+) -> torch.Tensor: ...
 
 
 MD_NAME = "module_pa"

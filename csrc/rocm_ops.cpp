@@ -129,7 +129,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("scale_k"),
             py::arg("scale_v"),
             py::arg("block_size"),
-            py::arg("quant_algo"));
+            py::arg("quant_algo"),
+            py::arg("out_") = std::nullopt);
       // ck staff end
 
 
@@ -146,8 +147,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("V"),
             py::arg("block_tables"),
             py::arg("context_lens"),
+            py::arg("max_num_blocks"),
             py::arg("K_QScale") = std::nullopt,
-            py::arg("V_QScale") = std::nullopt);
+            py::arg("V_QScale") = std::nullopt,
+            py::arg("out_") = std::nullopt);
       m.def("gemm_a8w8_asm", &gemm_a8w8_asm,
             "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)",
             py::arg("XQ"), py::arg("WQ"),

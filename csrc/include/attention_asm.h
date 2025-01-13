@@ -7,5 +7,7 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      torch::Tensor &V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
                      torch::Tensor &block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor &context_lens, //   [num_seqs]
-                     std::optional<torch::Tensor> K_QScale = std::nullopt,
-                     std::optional<torch::Tensor> V_QScale = std::nullopt);
+                     int max_num_blocks,
+                     std::optional<torch::Tensor>& K_QScale,
+                     std::optional<torch::Tensor>& V_QScale,
+                     std::optional<torch::Tensor>& out_);
