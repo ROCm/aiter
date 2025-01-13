@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-12-14 15:47:26
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-10 23:08:48
+# @Last Modified At: 2025-01-13 14:27:04
 # @Description: This is description.
 
 import torch
@@ -79,7 +79,7 @@ def all_reduce_asm(inp: torch.Tensor):
                                     ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING)
 
 
-def all_reduce_layernorm(input: Tensor,
+def all_reduce_rmsnorm(input: Tensor,
                          residual_in: Tensor,
                          weight: Tensor,
                          bias: Tensor,
@@ -87,5 +87,5 @@ def all_reduce_layernorm(input: Tensor,
     tp_grp = get_tp_group()
     ca = tp_grp.ca_comm
 
-    return ater.all_reduce_layernorm_(input, residual_in, weight, bias, epsilon,
+    return ater.all_reduce_rmsnorm_(input, residual_in, weight, bias, epsilon,
                                       ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING)

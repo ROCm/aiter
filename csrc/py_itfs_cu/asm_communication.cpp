@@ -106,7 +106,7 @@ torch::Tensor all_reduce_asm(torch::Tensor &input,
     return torch::from_blob(inp_ptr, {input.sizes()}, options);
 }
 
-std::tuple<torch::Tensor, torch::Tensor> all_reduce_layernorm(torch::Tensor &input,       // [m ,n]
+std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
                                                               torch::Tensor &residual_in, // [m ,n]
                                                               torch::Tensor &weight,      // [1 ,n]
                                                               torch::Tensor &bias,        // [1 ,n]
@@ -230,7 +230,7 @@ std::tuple<torch::Tensor, torch::Tensor> all_reduce_layernorm(torch::Tensor &inp
     args.tgs = TGs;
     args.loopcnt = 0;
 
-    static AterAsmKernel impl("allreduce_layernorm_N8192_kernel", "allreduce_layernorm_N8192.co");
+    static AterAsmKernel impl("allreduce_rmsnorm_N8192_kernel", "allreduce_rmsnorm_N8192.co");
 
     impl.launch_kernel({&args,
                         &arg_size,

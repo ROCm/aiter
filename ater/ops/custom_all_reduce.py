@@ -28,7 +28,7 @@ def all_reduce_asm_(inp: Tensor,
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_layernorm_(
+def all_reduce_rmsnorm_(
     out: Tensor,
     input: Tensor,
     residual_in: Tensor,
