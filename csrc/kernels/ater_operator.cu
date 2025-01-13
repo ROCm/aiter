@@ -506,6 +506,31 @@ namespace vllm
       }
     }
   }
+
+  template <class _T, int _vec>
+  __global__ void operator_bcast_elwise_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int M, const int N, const int K)
+  {
+    uint64_t idx = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) * _vec;
+    if (idx < (uint64_t)M * N * K)
+    {
+      uint32_t i = idx / (N * K);
+      uint32_t j = (idx % (N * K) / K) % N;
+      uint32_t k = idx % (N * K) % K;
+
+      uint64_t offset_b = (uint64_t)j * K + k;
+      uint64_t offset_ac = (uint64_t)j * K + k + (uint64_t)i * N * K;
+
+      const _T *pa = (const _T *)a;
+      const _T *pb = (const _T *)b;
+      _T *pc = (_T *)c;
+#pragma unroll
+      for (uint32_t v = 0; v < _vec; v++)
+      {
+        pc[offset_ac] = pa[offset_ac] + pb[offset_b++];
+        offset_ac++;
+      }
+    }
+  }
 }
 
 template <typename Operation>
@@ -639,35 +664,60 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
     M = order_flag ? input.size(0) : other.size(0);
     N = order_flag ? input.size(1) : other.size(1);
     K = order_flag ? input.size(2) : other.size(2);
-    constexpr uint32_t BIG_TILE_SIZE_N = 64;
-    constexpr uint32_t BIG_TILE_SIZE_K = 64;
-    constexpr uint32_t M_SWIZZLE = 8;
-    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-    const dim3 grid_dim(grid_x, 1, 1);
-    const dim3 block_dim(256, 1, 1);
-
     auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
     auto output = torch::empty({M, N, K}, options);
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
     void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    if (order_flag)
+    int elements = M * N * K;
+    if (elements % 8 == 0)
     {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-          { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+      constexpr uint32_t wg = 256;
+      constexpr uint32_t vec = 8;
+      int grid_x = (elements / vec + wg - 1) / wg;
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast_elwise_kernel", [&]
+            { vllm::operator_bcast_elwise_kernel<scalar_t, vec>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast_elwise_kernel", [&]
+            { vllm::operator_bcast_elwise_kernel<scalar_t, vec>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
+      }
     }
     else
     {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-          { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+      constexpr uint32_t BIG_TILE_SIZE_N = 64;
+      constexpr uint32_t BIG_TILE_SIZE_K = 64;
+      constexpr uint32_t M_SWIZZLE = 8;
+      const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(256, 1, 1);
+
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+            { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+            { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+      }
     }
 
     return output;
