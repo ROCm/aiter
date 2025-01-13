@@ -130,7 +130,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("scale_k"),
             py::arg("scale_v"),
             py::arg("block_size"),
-            py::arg("quant_algo"));
+            py::arg("quant_algo"),
+            py::arg("out_") = std::nullopt);
       // ck staff end
 #endif
 
@@ -147,6 +148,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("V"),
             py::arg("block_tables"),
             py::arg("context_lens"),
+            py::arg("max_num_blocks"),
             py::arg("K_QScale") = std::nullopt,
             py::arg("V_QScale") = std::nullopt,
             py::arg("out_") = std::nullopt);

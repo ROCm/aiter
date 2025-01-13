@@ -53,6 +53,7 @@ def pa_fwd_asm(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    max_num_blocks: int,
     K_QScale: Optional[torch.Tensor],
     V_QScale: Optional[torch.Tensor],
     out_: Optional[torch.Tensor] = None
