@@ -5,7 +5,9 @@ from ater.test_common import checkAllclose, perftest
 
 
 @perftest()
-def run_torch(input, weight, bias, eps, residual=None):
+def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
+    if x_bias is not None:
+        input = input + x_bias
     if residual is None:
         residual_out = None
         output = F.layer_norm(
@@ -28,10 +30,10 @@ def run_torch(input, weight, bias, eps, residual=None):
 
 
 @perftest()
-def run_ck(input, weight, bias, eps, residual=None):
+def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     if residual is None:
         residual_out = None
-        output = ater.layer_norm(input, weight, bias, eps)
+        output = ater.layer_norm(input, weight, bias, eps, x_bias)
         # output = torch.empty_like(input)
         # ater.layernorm2d_fwd(
         #     output,
@@ -50,7 +52,8 @@ def run_ck(input, weight, bias, eps, residual=None):
             residual_out,
             weight,
             bias,
-            eps
+            eps,
+            x_bias
         )
     return output, residual_out
 
@@ -92,6 +95,8 @@ def test_layernorm2d(dtype, m, n):
 def test_layernorm2d_fuseAdd(dtype, m, n):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
+    # x_bias = torch.randn(n, dtype=dtype, device="cuda")
+    # x_bias = None
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")

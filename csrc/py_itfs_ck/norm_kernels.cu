@@ -20,7 +20,8 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
                  torch::Tensor &input,  // [m, n]
                  torch::Tensor &weight, // [m, n]
                  torch::Tensor &bias,   // [m, n]
-                 double epsilon)
+                 double epsilon,
+                 std::optional<torch::Tensor> x_bias)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -42,12 +43,14 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
                         dtype_str, // x-scale, used for [1*N] input smooth quant
                         dtype_str, // y-scale, used for [M*1] output for next layer
                         SaveMeanVar,
-                        0, // fused_add
-                        0  // fused_quant
+                        x_bias.has_value() ? 1 : 0, // x_bias
+                        0,                          // fused_add
+                        0                           // fused_quant
                     },
-                    {input.data_ptr(),
-                     nullptr, // p_x_residual
-                     nullptr, // p_x_scale
+                    {input.data_ptr(),                                         // p_x
+                     nullptr,                                                  // p_x_residual
+                     nullptr,                                                  // p_x_scale
+                     x_bias.has_value() ? x_bias.value().data_ptr() : nullptr, // p_x_bias
                      weight.data_ptr(), bias.data_ptr(), out.data_ptr(),
                      nullptr, // p_y_residual
                      nullptr, // p_y_scale
@@ -60,10 +63,11 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
 torch::Tensor layernorm2d(torch::Tensor &input,  // [m, n]
                           torch::Tensor &weight, // [m, n]
                           torch::Tensor &bias,   // [m, n]
-                          double epsilon)
+                          double epsilon,
+                          std::optional<torch::Tensor> x_bias)
 {
     torch::Tensor out = torch::empty_like(input);
-    layernorm2d(out, input, weight, bias, epsilon);
+    layernorm2d(out, input, weight, bias, epsilon, x_bias);
 
     return out;
 }
@@ -74,7 +78,8 @@ void layernorm2d_with_add(torch::Tensor &out,          // [m ,n]
                           torch::Tensor &residual_out, // [m ,n]
                           torch::Tensor &weight,       // [1 ,n]
                           torch::Tensor &bias,         // [1 ,n]
-                          double epsilon)
+                          double epsilon,
+                          std::optional<torch::Tensor> x_bias)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -96,14 +101,16 @@ void layernorm2d_with_add(torch::Tensor &out,          // [m ,n]
                         dtype_str, // x-scale, used for [1*N] input smooth quant
                         dtype_str, // y-scale, used for [M*1] output for next layer
                         SaveMeanVar,
-                        1, // fused_add
-                        0  // fused_quant
+                        x_bias.has_value() ? 1 : 0, // x_bias
+                        1,                          // fused_add
+                        0                           // fused_quant
                     },
-                    {input.data_ptr(),       // p_x
-                     residual_in.data_ptr(), // p_x_residual
-                     nullptr,                // p_x_scale
-                     weight.data_ptr(),      // p_gamma
-                     bias.data_ptr(),        // p_beta
+                    {input.data_ptr(),                                         // p_x
+                     residual_in.data_ptr(),                                   // p_x_residual
+                     nullptr,                                                  // p_x_scale
+                     x_bias.has_value() ? x_bias.value().data_ptr() : nullptr, // p_x_bias
+                     weight.data_ptr(),                                        // p_gamma
+                     bias.data_ptr(),                                          // p_beta
 
                      out.data_ptr(),          // p_y
                      residual_out.data_ptr(), // p_y_residual
@@ -120,7 +127,8 @@ void layernorm2d_with_smoothquant(torch::Tensor &out,    // [m ,n]
                                   torch::Tensor &yscale, // [m ,1]
                                   torch::Tensor &weight, // [1 ,n]
                                   torch::Tensor &bias,   // [1 ,n]
-                                  double epsilon)
+                                  double epsilon,
+                                  std::optional<torch::Tensor> x_bias)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -145,14 +153,16 @@ void layernorm2d_with_smoothquant(torch::Tensor &out,    // [m ,n]
                         xscale_dtype_str, // x-scale, used for [1*N] input smooth quant
                         yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                         SaveMeanVar,
-                        0, // fused_add
-                        1  // fused_quant
+                        x_bias.has_value() ? 1 : 0, // x_bias
+                        0,                          // fused_add
+                        1                           // fused_quant
                     },
-                    {input.data_ptr(),  // p_x
-                     nullptr,           // p_x_residual
-                     xscale.data_ptr(), // p_x_scale
-                     weight.data_ptr(), // p_gamma
-                     bias.data_ptr(),   // p_beta
+                    {input.data_ptr(),                                         // p_x
+                     nullptr,                                                  // p_x_residual
+                     xscale.data_ptr(),                                        // p_x_scale
+                     x_bias.has_value() ? x_bias.value().data_ptr() : nullptr, // p_x_bias
+                     weight.data_ptr(),                                        // p_gamma
+                     bias.data_ptr(),                                          // p_beta
 
                      out.data_ptr(),    // p_y
                      nullptr,           // p_y_residual
@@ -171,7 +181,8 @@ void layernorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
                                       torch::Tensor &yscale,       // [m ,1]
                                       torch::Tensor &weight,       // [1 ,n]
                                       torch::Tensor &bias,         // [1 ,n]
-                                      double epsilon)
+                                      double epsilon,
+                                      std::optional<torch::Tensor> x_bias)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -196,14 +207,16 @@ void layernorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
                         xscale_dtype_str, // x-scale, used for [1*N] input smooth quant
                         yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                         SaveMeanVar,
-                        1, // fused_add
-                        1  // fused_quant
+                        x_bias.has_value() ? 1 : 0, // x_bias
+                        1,                          // fused_add
+                        1                           // fused_quant
                     },
-                    {input.data_ptr(),       // p_x
-                     residual_in.data_ptr(), // p_x_residual
-                     xscale.data_ptr(),      // p_x_scale
-                     weight.data_ptr(),      // p_gamma
-                     bias.data_ptr(),        // p_beta
+                    {input.data_ptr(),                                         // p_x
+                     residual_in.data_ptr(),                                   // p_x_residual
+                     xscale.data_ptr(),                                        // p_x_scale
+                     x_bias.has_value() ? x_bias.value().data_ptr() : nullptr, // p_x_bias
+                     weight.data_ptr(),                                        // p_gamma
+                     bias.data_ptr(),                                          // p_beta
 
                      out.data_ptr(),          // p_y
                      residual_out.data_ptr(), // p_y_residual
@@ -219,7 +232,8 @@ void layernorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
                                    torch::Tensor &yscale, // [m ,1]
                                    torch::Tensor &weight, // [1 ,n]
                                    torch::Tensor &bias,   // [1 ,n]
-                                   double epsilon)
+                                   double epsilon,
+                                   std::optional<torch::Tensor> x_bias)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -243,14 +257,16 @@ void layernorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
                         dtype_str,        // x-scale, used for [1*N] input smooth quant
                         yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                         SaveMeanVar,
-                        0, // fused_add
-                        2  // fused_quant
+                        x_bias.has_value() ? 1 : 0, // x_bias
+                        0,                          // fused_add
+                        2                           // fused_quant
                     },
-                    {input.data_ptr(),  // p_x
-                     nullptr,           // p_x_residual
-                     nullptr,           // p_x_scale
-                     weight.data_ptr(), // p_gamma
-                     bias.data_ptr(),   // p_beta
+                    {input.data_ptr(),                                         // p_x
+                     nullptr,                                                  // p_x_residual
+                     nullptr,                                                  // p_x_scale
+                     x_bias.has_value() ? x_bias.value().data_ptr() : nullptr, // p_x_bias
+                     weight.data_ptr(),                                        // p_gamma
+                     bias.data_ptr(),                                          // p_beta
 
                      out.data_ptr(),    // p_y
                      nullptr,           // p_y_residual
@@ -268,7 +284,8 @@ void layernorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
                                        torch::Tensor &yscale,       // [m ,1]
                                        torch::Tensor &weight,       // [1 ,n]
                                        torch::Tensor &bias,         // [1 ,n]
-                                       double epsilon)
+                                       double epsilon,
+                                       std::optional<torch::Tensor> x_bias)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -292,14 +309,16 @@ void layernorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
                         dtype_str,        // x-scale, used for [1*N] input smooth quant
                         yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                         SaveMeanVar,
-                        1, // fused_add
-                        2  // fused_quant
+                        x_bias.has_value() ? 1 : 0, // x_bias
+                        1,                          // fused_add
+                        2                           // fused_quant
                     },
-                    {input.data_ptr(),       // p_x
-                     residual_in.data_ptr(), // p_x_residual
-                     nullptr,                // p_x_scale
-                     weight.data_ptr(),      // p_gamma
-                     bias.data_ptr(),        // p_beta
+                    {input.data_ptr(),                                         // p_x
+                     residual_in.data_ptr(),                                   // p_x_residual
+                     nullptr,                                                  // p_x_scale
+                     x_bias.has_value() ? x_bias.value().data_ptr() : nullptr, // p_x_bias
+                     weight.data_ptr(),                                        // p_gamma
+                     bias.data_ptr(),                                          // p_beta
 
                      out.data_ptr(),          // p_y
                      residual_out.data_ptr(), // p_y_residual

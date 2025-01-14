@@ -25,6 +25,7 @@ def layer_norm(
     weight: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     eps: float = 1e-5,
+    x_bias: Optional[Tensor] = None,
 ) -> Tensor: ...
 
 
@@ -35,6 +36,7 @@ def layernorm2d_fwd(
     weight: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     eps: float = 1e-5,
+    x_bias: Optional[Tensor] = None,
 ) -> Tensor: ...
 
 
@@ -47,6 +49,7 @@ def layernorm2d_fwd_with_add(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 
 
@@ -59,6 +62,7 @@ def layernorm2d_fwd_with_smoothquant(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 
 
@@ -73,6 +77,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 
 
@@ -83,7 +88,8 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     yscale: Tensor,
 #     weight: Tensor,
 #     bias: Tensor,
-#     epsilon: float):...
+#     epsilon: float,
+#     x_bias: Optional[Tensor] = None,):...
 
 # @compile_ops("module_norm")
 # def layernorm2d_fwd_with_add_dynamicquant(
@@ -94,7 +100,8 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     yscale: Tensor,
 #     weight: Tensor,
 #     bias: Tensor,
-#     epsilon: float):...
+#     epsilon: float,
+#     x_bias: Optional[Tensor] = None,):...
 @compile_ops("module_norm")
 def layernorm2d_with_add_asm(
     out: Tensor,
@@ -104,6 +111,7 @@ def layernorm2d_with_add_asm(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 @compile_ops("module_norm")
 def layernorm2d_with_add_smoothquant_asm(
@@ -116,4 +124,5 @@ def layernorm2d_with_add_smoothquant_asm(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
