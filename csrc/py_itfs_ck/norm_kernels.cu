@@ -1,14 +1,5 @@
-/*
- * Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
- *
- * @Script: norm_kernels.cu
- * @Author: valarLip
- * @Email: lingpeng.jin@amd.com
- * @Create At: 2024-12-02 12:51:48
- * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-02 17:34:35
- * @Description: This is description.
- */
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>

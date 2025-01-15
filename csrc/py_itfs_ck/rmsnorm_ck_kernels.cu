@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "py_itfs_common.h"
@@ -83,10 +85,10 @@ void rmsnorm2d_with_add(torch::Tensor &out,          // [m ,n]
                       1, // fused_add
                       0  // fused_quant
                   },
-                  {input.data_ptr(),       // p_x
-                   residual_in.data_ptr(), // p_x_residual
-                   nullptr,                // p_x_scale
-                   weight.data_ptr(),      // p_gamma
+                  {input.data_ptr(),        // p_x
+                   residual_in.data_ptr(),  // p_x_residual
+                   nullptr,                 // p_x_scale
+                   weight.data_ptr(),       // p_gamma
                    out.data_ptr(),          // p_y
                    residual_out.data_ptr(), // p_y_residual
                    nullptr,                 // p_y_scale

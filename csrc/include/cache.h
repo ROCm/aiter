@@ -1,5 +1,6 @@
 #pragma once
-
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 #include <map>
@@ -29,10 +30,10 @@ void reshape_and_cache_flash(torch::Tensor &key, torch::Tensor &value,
                              const double k_scale, const double v_scale);
 
 void reshape_and_cache_with_pertoken_quant(torch::Tensor &key, torch::Tensor &value,
-                       torch::Tensor &key_cache, torch::Tensor &value_cache,
-                       torch::Tensor &k_dequant_scales, torch::Tensor &v_dequant_scales,
-                       torch::Tensor &slot_mapping,
-                       const bool asm_layout);
+                                           torch::Tensor &key_cache, torch::Tensor &value_cache,
+                                           torch::Tensor &k_dequant_scales, torch::Tensor &v_dequant_scales,
+                                           torch::Tensor &slot_mapping,
+                                           const bool asm_layout);
 
 // Just for unittest
 void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,

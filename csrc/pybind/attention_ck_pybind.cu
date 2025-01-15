@@ -1,14 +1,5 @@
-/*
- * Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
- *
- * @Script: attention_pybind.cu
- * @Author: valarLip
- * @Email: lingpeng.jin@amd.com
- * @Create At: 2024-12-04 21:32:40
- * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-05 15:01:58
- * @Description: This is description.
- */
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "attention_ck.h"
 

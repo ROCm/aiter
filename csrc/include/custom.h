@@ -1,5 +1,6 @@
 #pragma once
-
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 void wvSpltK(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,

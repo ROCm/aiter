@@ -1,5 +1,6 @@
 #pragma once
-
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8

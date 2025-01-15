@@ -1,5 +1,6 @@
 #pragma once
-
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 torch::Tensor all_reduce_asm(torch::Tensor &input,
                              int64_t _ca,
                              torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);

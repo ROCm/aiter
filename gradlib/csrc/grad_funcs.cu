@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below just for gfx908 and not for others
 // // below lines enable hip float to half conversion which are disabled by default in hip_fp16.h
@@ -20,7 +22,7 @@
 #include <ATen/cuda/CUDAEvent.h>
 
 #include <hip/hip_runtime.h>
-//#include <hipblaslt/hipblaslt-ext.hpp>
+// #include <hipblaslt/hipblaslt-ext.hpp>
 #include <hipblaslt/hipblaslt.h>
 
 #include <iostream>
@@ -47,34 +49,35 @@
 // #endif
 
 #ifndef CHECK_HIP_ERROR
-#define CHECK_HIP_ERROR(error)                    \
-    if(error != hipSuccess)                       \
-    {                                             \
-        fprintf(stderr,                           \
-                "Hip error: '%s'(%d) at %s:%d\n", \
-                hipGetErrorString(error),         \
-                error,                            \
-                __FILE__,                         \
-                __LINE__);                        \
-        exit(EXIT_FAILURE);                       \
-    }
+#define CHECK_HIP_ERROR(error)                \
+  if (error != hipSuccess)                    \
+  {                                           \
+    fprintf(stderr,                           \
+            "Hip error: '%s'(%d) at %s:%d\n", \
+            hipGetErrorString(error),         \
+            error,                            \
+            __FILE__,                         \
+            __LINE__);                        \
+    exit(EXIT_FAILURE);                       \
+  }
 #endif
 
 #ifndef CHECK_HIPBLAS_ERROR
-#define CHECK_HIPBLAS_ERROR(error)                    \
-    if(error != HIPBLAS_STATUS_SUCCESS)               \
-    {                                                 \
-        fprintf(stderr,                               \
-                "hipBLAS error: '%s'(%d) at %s:%d\n", \
-                hipblasStatusToString(error),         \
-                error,                                \
-                __FILE__,                             \
-                __LINE__);                            \
-        exit(EXIT_FAILURE);                           \
-    }
+#define CHECK_HIPBLAS_ERROR(error)                \
+  if (error != HIPBLAS_STATUS_SUCCESS)            \
+  {                                               \
+    fprintf(stderr,                               \
+            "hipBLAS error: '%s'(%d) at %s:%d\n", \
+            hipblasStatusToString(error),         \
+            error,                                \
+            __FILE__,                             \
+            __LINE__);                            \
+    exit(EXIT_FAILURE);                           \
+  }
 #endif
 
-namespace {
+namespace
+{
   /*thread_local*/ cudaStream_t weight_stream;
   // BUG: DLM has event and stream on different devices error
   // In multi-GPU scenerio, do names defined in this namespace exist on all devices?
@@ -84,13 +87,14 @@ namespace {
   // hipBLASLt
   hipblasLtHandle_t hipblaslt_handle;
   hipblasLtMatmulPreference_t preference;
-  uint64_t workspace_size = 32*1024*1024;
-  //uint64_t workspace_size = 0;
-  void* d_workspace;
+  uint64_t workspace_size = 32 * 1024 * 1024;
+  // uint64_t workspace_size = 0;
+  void *d_workspace;
   int request_solutions = 1;
   int returnedAlgoCount = 0;
 
-  struct MatMulConfig {
+  struct MatMulConfig
+  {
     hipblasOperation_t op_A;
     hipblasOperation_t op_B;
     int M;
@@ -98,7 +102,8 @@ namespace {
     int K;
     hipblasDatatype_t dtype;
 
-    friend auto operator<(const MatMulConfig& left, const MatMulConfig& right) -> bool {
+    friend auto operator<(const MatMulConfig &left, const MatMulConfig &right) -> bool
+    {
       return std::tie(left.op_A, left.op_B, left.M, left.N, left.K, left.dtype) < std::tie(right.op_A, right.op_B, right.M, right.N, right.K, right.dtype);
     }
   };
@@ -107,8 +112,8 @@ namespace {
   std::map<MatMulConfig, hipblasLtMatmulHeuristicResult_t> heuristic_map;
 
   hipEvent_t start, stop;
-  int bench_iters { 1 };
-  int warmup_iters { 1 };
+  int bench_iters{1};
+  int warmup_iters{1};
 
   bool cout_print = true;
 }
@@ -116,7 +121,7 @@ namespace {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 /**
  * hipBLASLt GEMM call
-*/
+ */
 hipblasStatus_t hipblasLtMatmul_wrapper(
     hipblasLtHandle_t handle,
     hipblasOperation_t op_A,
@@ -134,8 +139,9 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
     hipStream_t &stream)
 {
   // TODO: flag is not supported for hipblasLt yet
-  int flag { 0 };
-  if (dtype == HIPBLAS_R_16F) {
+  int flag{0};
+  if (dtype == HIPBLAS_R_16F)
+  {
     // use fp16 alt impl for MI200
     // https://pytorch.org/docs/stable/notes/numerical_accuracy.html#reduced-precision-fp16-and-bf16-gemms-and-convolutions-on-amd-instinct-mi200-devices
     flag = rocblas_gemm_flags_fp16_alt_impl;
@@ -144,14 +150,20 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
   nvtxRangePushA("hipBLASLt variables creation");
   hipblasLtMatrixLayout_t matA, matB, matC;
   hipblasLtMatmulDesc_t matmul;
-  if (op_A == HIPBLAS_OP_N) {
+  if (op_A == HIPBLAS_OP_N)
+  {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, dtype, m, k, lda));
-  } else {
+  }
+  else
+  {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matA, dtype, k, m, lda));
   }
-  if (op_B == HIPBLAS_OP_N) {
+  if (op_B == HIPBLAS_OP_N)
+  {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, dtype, k, n, ldb));
-  } else {
+  }
+  else
+  {
     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, dtype, n, k, ldb));
   }
   CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, dtype, m, n, ldc));
@@ -163,61 +175,70 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
   nvtxRangePop();
 
   // if heuristic does not exist in the map, do search and push into the map
-  auto gemm_key { MatMulConfig { op_A, op_B, m, n, k, dtype } }; 
-  if (heuristic_map.count(gemm_key) <= 0) {
+  auto gemm_key{MatMulConfig{op_A, op_B, m, n, k, dtype}};
+  if (heuristic_map.count(gemm_key) <= 0)
+  {
     nvtxRangePushA("hipblasLtMatmulAlgoGetHeuristic");
-    if (cout_print) {
-      std::cout << (op_A == HIPBLAS_OP_N ? "N" : "T") << (op_B == HIPBLAS_OP_N ? "N" : "T") 
+    if (cout_print)
+    {
+      std::cout << (op_A == HIPBLAS_OP_N ? "N" : "T") << (op_B == HIPBLAS_OP_N ? "N" : "T")
                 << " (" << m << ", " << n << ", " << k << "), dtype: " << dtype
                 << ", (lda, ldb, ldc): (" << lda << ", " << ldb << ", " << ldc << "), " << std::endl;
     }
     std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(request_solutions);
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulAlgoGetHeuristic(
-      handle, matmul, matA, matB, matC, matC,
-      preference, request_solutions, heuristicResult.data(), &returnedAlgoCount));
-    if((returnedAlgoCount != request_solutions) && cout_print) {
+        handle, matmul, matA, matB, matC, matC,
+        preference, request_solutions, heuristicResult.data(), &returnedAlgoCount));
+    if ((returnedAlgoCount != request_solutions) && cout_print)
+    {
       std::cout << "less solution found! request: " << request_solutions
                 << ", found: " << returnedAlgoCount << std::endl;
     }
 
-    if (returnedAlgoCount == 1) {
+    if (returnedAlgoCount == 1)
+    {
       heuristic_map[gemm_key] = heuristicResult[0];
-    } else {
+    }
+    else
+    {
       // benchmark requested solutions and pick best one
-      int bestIndex { -1 };
-      double bestMs { std::numeric_limits<double>::max() };
-      for (int sol { 0 }; sol < returnedAlgoCount; ++sol) {
+      int bestIndex{-1};
+      double bestMs{std::numeric_limits<double>::max()};
+      for (int sol{0}; sol < returnedAlgoCount; ++sol)
+      {
         // warm up
-        for (int iter { 0 }; iter < warmup_iters; ++iter) {
+        for (int iter{0}; iter < warmup_iters; ++iter)
+        {
           CHECK_HIPBLAS_ERROR(hipblasLtMatmul(handle, matmul,
-              alpha,
-              a, matA,
-              b, matB,
-              beta,
-              c, matC,
-              c, matC, // In case beta != 0, these runs can overwrite the values in c
-                       // since c and d are the same
-                       // TODO: allocates separate d memory for these runs
-              &heuristicResult[sol].algo,
-              d_workspace, workspace_size,
-              stream));
+                                              alpha,
+                                              a, matA,
+                                              b, matB,
+                                              beta,
+                                              c, matC,
+                                              c, matC, // In case beta != 0, these runs can overwrite the values in c
+                                                       // since c and d are the same
+                                                       // TODO: allocates separate d memory for these runs
+                                              &heuristicResult[sol].algo,
+                                              d_workspace, workspace_size,
+                                              stream));
         }
         // performance measuring
         double eventMs;
         CHECK_HIP_ERROR(hipEventRecord(start, stream));
-        for (int iter { 0 }; iter < bench_iters; ++iter) {
+        for (int iter{0}; iter < bench_iters; ++iter)
+        {
           CHECK_HIPBLAS_ERROR(hipblasLtMatmul(handle, matmul,
-              alpha,
-              a, matA,
-              b, matB,
-              beta,
-              c, matC,
-              c, matC, // In case beta != 0, these runs can overwrite the values in c
-                       // since c and d are the same
-                       // TODO: allocates separate d memory for these runs
-              &heuristicResult[sol].algo,
-              d_workspace, workspace_size,
-              stream));
+                                              alpha,
+                                              a, matA,
+                                              b, matB,
+                                              beta,
+                                              c, matC,
+                                              c, matC, // In case beta != 0, these runs can overwrite the values in c
+                                                       // since c and d are the same
+                                                       // TODO: allocates separate d memory for these runs
+                                              &heuristicResult[sol].algo,
+                                              d_workspace, workspace_size,
+                                              stream));
         }
         CHECK_HIP_ERROR(hipEventRecord(stop, stream));
         CHECK_HIP_ERROR(hipEventSynchronize(stop));
@@ -226,17 +247,23 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
         eventMs = double(temp);
         eventMs /= bench_iters;
 
-        if (cout_print) {
+        if (cout_print)
+        {
           std::cout << "    Sol " << sol << ": average time per iter " << std::to_string(eventMs) << " ms";
         }
-        if (bestMs > eventMs) {
+        if (bestMs > eventMs)
+        {
           bestMs = eventMs;
           bestIndex = sol;
-          if (cout_print) {
+          if (cout_print)
+          {
             std::cout << " *" << std::endl;
           }
-        } else {
-          if (cout_print) {
+        }
+        else
+        {
+          if (cout_print)
+          {
             std::cout << std::endl;
           }
         }
@@ -247,15 +274,15 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
   }
 
   hipblasStatus_t status = hipblasLtMatmul(handle, matmul,
-      alpha,
-      a, matA,
-      b, matB,
-      beta,
-      c, matC,
-      c, matC,
-      &heuristic_map[gemm_key].algo,
-      d_workspace, workspace_size,
-      stream);
+                                           alpha,
+                                           a, matA,
+                                           b, matB,
+                                           beta,
+                                           c, matC,
+                                           c, matC,
+                                           &heuristic_map[gemm_key].algo,
+                                           d_workspace, workspace_size,
+                                           stream);
 
   nvtxRangePushA("hipBLASLt variables deletion");
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescDestroy(matmul));
@@ -269,47 +296,57 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 torch::Tensor hipBLASLtMm_(
-    const torch::Tensor& mat1,
-    const torch::Tensor& mat2)
+    const torch::Tensor &mat1,
+    const torch::Tensor &mat2)
 {
-  auto mat1_strides { mat1.strides() };
-  auto mat2_strides { mat2.strides() };
-  auto mat1_sizes { mat1.sizes() };
-  auto mat2_sizes { mat2.sizes() };
+  auto mat1_strides{mat1.strides()};
+  auto mat2_strides{mat2.strides()};
+  auto mat1_sizes{mat1.sizes()};
+  auto mat2_sizes{mat2.sizes()};
   // std::cout << " | mat1 info: size: " << mat1_sizes << " stride: " << mat1_strides << std::endl
   //           << " | mat2 info: size: " << mat2_sizes << " stride: " << mat2_strides << std::endl;
 
   TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
   TORCH_CHECK(
-    mat1.dtype() == mat2.dtype(),
-    "expected mat1 and mat2 to have the same dtype, but got: ", mat1.dtype(), " != ", mat2.dtype()
-  );
+      mat1.dtype() == mat2.dtype(),
+      "expected mat1 and mat2 to have the same dtype, but got: ", mat1.dtype(), " != ", mat2.dtype());
   TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
 
-  auto abcType { mat1.options().dtype() };
-  auto options { at::TensorOptions().dtype(abcType).device(at::kCUDA) };
-  auto result { torch::empty({ mat1_sizes[0], mat2_sizes[1] }, options) };
+  auto abcType{mat1.options().dtype()};
+  auto options{at::TensorOptions().dtype(abcType).device(at::kCUDA)};
+  auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
   // std::cout << " | result info: size: " << result.sizes() << " stride: " << result.strides() << std::endl;
 
   bool transpose_result = true;
   bool transpose_mat1;
   bool transpose_mat2;
-  if ((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0]))) {
+  if ((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0])))
+  {
     transpose_mat2 = false;
-  } else if ((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1]))) {
+  }
+  else if ((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1])))
+  {
     transpose_mat2 = true;
-  } else {
+  }
+  else
+  {
     assert(false && "unusual strides detected, may need to clone a contiguous tensor");
   }
-  if ((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0]))) {
+  if ((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0])))
+  {
     transpose_mat1 = false;
-  } else if ((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1]))) {
+  }
+  else if ((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1])))
+  {
     transpose_mat1 = true;
-  } else {
+  }
+  else
+  {
     assert(false && "unusual strides detected, may need to clone a contiguous tensor");
   }
 
-  if (transpose_result) {
+  if (transpose_result)
+  {
     bool tmp = transpose_mat1;
     transpose_mat1 = !transpose_mat2;
     transpose_mat2 = !tmp;
@@ -323,9 +360,9 @@ torch::Tensor hipBLASLtMm_(
   //           << " | transpose_B: " << (transpose_mat2 ? "true" : "false") << std::endl;
   // std::cout << " | A matrix: size: " << mat1_sizes << " stride: " << mat1_strides << std::endl
   //           << " | B matrix: size: " << mat2_sizes << " stride: " << mat2_strides << std::endl;
-  
-  float one { 1.0f };
-  float zero { 0.0f };
+
+  float one{1.0f};
+  float zero{0.0f};
   int64_t m = mat1_sizes[transpose_result ? 1 : 0];
   int64_t k = mat1_sizes[transpose_result ? 0 : 1];
   int64_t n = mat2_sizes[transpose_result ? 0 : 1];
@@ -335,23 +372,30 @@ torch::Tensor hipBLASLtMm_(
   // std::cout << " | (m, n, k): " << m << ", " << n << ", " << k << std::endl
   //           << " | (lda, ldb, ldc): " << mat1_ld << ", " << mat2_ld << ", " << result_ld << std::endl;
 
-  int flag { 0 };
+  int flag{0};
   hipblasDatatype_t hipblasType;
-  if (abcType == at::kHalf) {
+  if (abcType == at::kHalf)
+  {
     hipblasType = HIPBLAS_R_16F;
-  } else if (abcType == at::kBFloat16) {
+  }
+  else if (abcType == at::kBFloat16)
+  {
     hipblasType = HIPBLAS_R_16B;
-  } else if (abcType == at::kFloat) {
+  }
+  else if (abcType == at::kFloat)
+  {
     hipblasType = HIPBLAS_R_32F;
-  } else {
+  }
+  else
+  {
     assert(false && "Wrong datatype!");
   }
 
-  void *ptrA { static_cast<void *>((transpose_result ? mat2 : mat1).data_ptr()) };
-  void *ptrB { static_cast<void *>((transpose_result ? mat1 : mat2).data_ptr()) };
-  void *ptrC { static_cast<void *>(result.data_ptr()) };
-  
-  auto current_stream { torch::hip::getCurrentHIPStream().stream() };
+  void *ptrA{static_cast<void *>((transpose_result ? mat2 : mat1).data_ptr())};
+  void *ptrB{static_cast<void *>((transpose_result ? mat1 : mat2).data_ptr())};
+  void *ptrC{static_cast<void *>(result.data_ptr())};
+
+  auto current_stream{torch::hip::getCurrentHIPStream().stream()};
 
   CHECK_HIPBLAS_ERROR(hipblasLtMatmul_wrapper(
       hipblaslt_handle,
@@ -382,7 +426,7 @@ void create_extension()
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceCreate(&preference));
   CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceSetAttribute(
       preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_size, sizeof(workspace_size)));
-  
+
   CHECK_HIP_ERROR(hipEventCreate(&start));
   CHECK_HIP_ERROR(hipEventCreate(&stop));
 }
@@ -391,16 +435,16 @@ void create_extension()
 
 void destroy_extension()
 {
-    CHECK_HIP_ERROR(hipStreamDestroy(weight_stream));
-    CHECK_HIP_ERROR(hipEventDestroy(event));
+  CHECK_HIP_ERROR(hipStreamDestroy(weight_stream));
+  CHECK_HIP_ERROR(hipEventDestroy(event));
 
-    // hipBLASLt
-    CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
-    CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
-    CHECK_HIP_ERROR(hipFree(d_workspace));
+  // hipBLASLt
+  CHECK_HIPBLAS_ERROR(hipblasLtDestroy(hipblaslt_handle));
+  CHECK_HIPBLAS_ERROR(hipblasLtMatmulPreferenceDestroy(preference));
+  CHECK_HIP_ERROR(hipFree(d_workspace));
 
-    CHECK_HIP_ERROR(hipEventDestroy(start));
-    CHECK_HIP_ERROR(hipEventDestroy(stop));
+  CHECK_HIP_ERROR(hipEventDestroy(start));
+  CHECK_HIP_ERROR(hipEventDestroy(stop));
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////

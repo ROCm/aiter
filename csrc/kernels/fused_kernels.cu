@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <stdexcept>
@@ -6,18 +8,21 @@
 constexpr int WARP_SIZE = 64;
 
 template <typename T>
-__device__ __forceinline__ T silu(const T& x) {
+__device__ __forceinline__ T silu(const T &x)
+{
   // x * sigmoid(x)
   return (T)(((float)x) / (1.0f + expf((float)-x)));
 }
 
 template <typename T>
-__device__ __forceinline__ T loadnt(T* addr) {
+__device__ __forceinline__ T loadnt(T *addr)
+{
   return __builtin_nontemporal_load(addr);
 }
 
-__device__ __forceinline__ float4 load_ntmprl(const float4* addr) {
-  auto addr_alias = reinterpret_cast<const float*>(addr);
+__device__ __forceinline__ float4 load_ntmprl(const float4 *addr)
+{
+  auto addr_alias = reinterpret_cast<const float *>(addr);
   auto dat0 = loadnt(addr_alias);
   auto dat1 = loadnt(addr_alias + 1);
   auto dat2 = loadnt(addr_alias + 2);
@@ -32,8 +37,9 @@ __device__ __forceinline__ float4 load_ntmprl(const float4* addr) {
 // TBlock fetches entire rows of A, and entire col of B (K dimension); assume
 // N=1 for time being grid is M/A_NUM_ROWS blocks
 template <int NUM_A_ROWS_PER_BLOCK>
-__global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
-                                   const int d) {
+__global__ void LLGemm_Silu_kernel(float4 *af4, __half2 *bf4, _Float16 *c,
+                                   const int d)
+{
   __shared__ float red_smem[NUM_A_ROWS_PER_BLOCK][WARP_SIZE];
   const int row_addr = blockIdx.x * NUM_A_ROWS_PER_BLOCK / 2 * blockDim.x;
   const int row_addr_d = row_addr + d * blockDim.x;
@@ -49,8 +55,8 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
   float4 rowA_elem4[NUM_A_ROWS_PER_BLOCK];
   // float4 colB_elem4;
   __half2 colB_elem4x, colB_elem4y, colB_elem4z, colB_elem4w;
-  float4 sum4;                      //[NUM_A_ROWS_PER_BLOCK];
-  float acc[NUM_A_ROWS_PER_BLOCK];  //= 0.0;
+  float4 sum4;                     //[NUM_A_ROWS_PER_BLOCK];
+  float acc[NUM_A_ROWS_PER_BLOCK]; //= 0.0;
   __half2 acch2;
   __half2 oval;
 
@@ -60,7 +66,8 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
   // rowA_elem4_2 = af4[row_addr_2 + threadid];
   // rowA_elem4_3 = af4[row_addr_3 + threadid];
 #pragma unroll
-  for (int i = 0; i < NUM_A_ROWS_PER_BLOCK / 2; i++) {
+  for (int i = 0; i < NUM_A_ROWS_PER_BLOCK / 2; i++)
+  {
     rowA_elem4[2 * i] = load_ntmprl(&af4[row_addr + i * blockDim.x + threadid]);
     rowA_elem4[2 * i + 1] =
         load_ntmprl(&af4[row_addr_d + i * blockDim.x + threadid]);
@@ -81,10 +88,11 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
   // auto Bf2y = *(Bh2ptr+1);
   // auto Bf2z = *(Bh2ptr+2);
   // auto Bf2w = *(Bh2ptr+3);
-  auto Ah2ptr = reinterpret_cast<__half2*>(&rowA_elem4);
-  __half2* ah2lptr;
+  auto Ah2ptr = reinterpret_cast<__half2 *>(&rowA_elem4);
+  __half2 *ah2lptr;
 #pragma unroll
-  for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
+  for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++)
+  {
     ah2lptr = Ah2ptr + i * 4;
     Af2 = *(ah2lptr);
     acch2 = __hmul2(Af2, colB_elem4x);
@@ -99,9 +107,11 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
   }
 
 #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
+  for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2)
+  {
 #pragma unroll
-    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++) {
+    for (int i = 0; i < NUM_A_ROWS_PER_BLOCK; i++)
+    {
       acc[i] += __shfl_xor(acc[i], mask);
     }
   }
@@ -114,13 +124,15 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
   //   }
   // }
 
-  if (lane < NUM_A_ROWS_PER_BLOCK) {
+  if (lane < NUM_A_ROWS_PER_BLOCK)
+  {
     red_smem[lane][warp] = acc[lane];
   }
 
   // Make sure the data is in shared memory.
   __syncthreads();
-  if (qwarpid < NUM_A_ROWS_PER_BLOCK) {
+  if (qwarpid < NUM_A_ROWS_PER_BLOCK)
+  {
     // if (threadid<64) {
     // #pragma unroll
     // for (int i=0; i<NUM_A_ROWS_PER_BLOCK/2; i++) {
@@ -139,7 +151,8 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
     acc[qwarpid] = qthreadid < num_warps ? red_smem[qwarpid][qthreadid] : 0.f;
     // if (threadid<32) {
 #pragma unroll
-    for (int mask = 16 / 2; mask >= 1; mask /= 2) {
+    for (int mask = 16 / 2; mask >= 1; mask /= 2)
+    {
       // #pragma unroll
       // for (int i=0; i<NUM_A_ROWS_PER_BLOCK/2; i++) {
       //   acc[i+2*qwarpid] += __shfl_xor(acc[i+2*qwarpid], mask);
@@ -152,38 +165,49 @@ __global__ void LLGemm_Silu_kernel(float4* af4, __half2* bf4, _Float16* c,
     //}
     //  __syncthreads();
     // if (threadid < NUM_A_ROWS_PER_BLOCK/2) {
-    if (lane == 0 or lane == 32) {
+    if (lane == 0 or lane == 32)
+    {
       // oval = __float22half2_rn(make_float2(acc[qwarpid],oval2));
       // c[blockIdx.x*NUM_A_ROWS_PER_BLOCK/2+qwarpid/2] = oval;
 
       c[blockIdx.x * NUM_A_ROWS_PER_BLOCK / 2 + qwarpid / 2] =
           silu(acc[qwarpid]) * oval2;
     }
-  }  // threadid<WARP_SIZE
+  } // threadid<WARP_SIZE
 }
 // define the kernel calling code:
 // template <typename T>
-void LLGemm_Silu(void* in_a, void* in_b, void* out_c, const int M, const int K,
-                 cudaStream_t stream, const int rows_per_block = 4) {
-  float4* af4 = reinterpret_cast<float4*>(in_a);
-  auto* bf4 = reinterpret_cast<__half2*>(in_b);
-  auto* c = reinterpret_cast<_Float16*>(out_c);
+void LLGemm_Silu(void *in_a, void *in_b, void *out_c, const int M, const int K,
+                 cudaStream_t stream, const int rows_per_block = 4)
+{
+  float4 *af4 = reinterpret_cast<float4 *>(in_a);
+  auto *bf4 = reinterpret_cast<__half2 *>(in_b);
+  auto *c = reinterpret_cast<_Float16 *>(out_c);
   const int d = M / 2;
   const int NUM_THREADS = K * 2 / 16;
   int NUM_BLOCKS = M / rows_per_block;
-  if (rows_per_block == 2) {
+  if (rows_per_block == 2)
+  {
     LLGemm_Silu_kernel<2>
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);
-  } else if (rows_per_block == 4) {
+  }
+  else if (rows_per_block == 4)
+  {
     LLGemm_Silu_kernel<4>
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);
-  } else if (rows_per_block == 8) {
+  }
+  else if (rows_per_block == 8)
+  {
     LLGemm_Silu_kernel<8>
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);
-  } else if (rows_per_block == 16) {
+  }
+  else if (rows_per_block == 16)
+  {
     LLGemm_Silu_kernel<16>
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);
-  } else {
+  }
+  else
+  {
     NUM_BLOCKS = M / 4;
     LLGemm_Silu_kernel<4>
         <<<NUM_BLOCKS, NUM_THREADS, 0, stream>>>(af4, bf4, c, d);

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "activation.h"
 #include "attention.h"
 #include "attention_ck.h"
@@ -47,7 +49,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                float k_scale, float v_scale) -> ()");
 
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
-            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), 
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"),
             py::arg("bias") = std::nullopt, py::arg("splitK") = 0);
 
       m.def("swap_blocks", &swap_blocks,
@@ -103,8 +105,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("allocate_meta_buffer", &allocate_meta_buffer);
       m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
 
-
-
       // ck staff start
       m.def("layernorm2d_fwd", &layernorm2d);
       m.def("layernorm2d_fwd_with_add", &layernorm2d_with_add);
@@ -132,7 +132,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("quant_algo"),
             py::arg("out_") = std::nullopt);
       // ck staff end
-
 
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
