@@ -11,31 +11,51 @@ if 1:
 
 
 @perftest()
-def run_torch(x, weight, bias=None):
-
-    return F.linear(x, weight, bias)
+def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
+    if x.dtype == torch.float8_e4m3fnuz:
+        if scaleA is None:
+            scaleA = torch.ones(1, dtype=torch.float, device = x.device)
+        if scaleB is None:
+            scaleB = torch.ones(1, dtype=torch.float, device = x.device)
+        
+        return torch._scaled_mm(x,
+                                weight.t(),
+                                out_dtype=otype,
+                                scale_a=scaleA,
+                                scale_b=scaleB,
+                                bias=bias)
+    if scaleA is not None:
+        x = x * scaleA
+    if scaleB is not None:
+        weight = weight * scaleB
+    return F.linear(x, weight, bias).to(otype)
 
 
 @perftest()
-def run_gemm_b(x, weight, bias=None):
-    return tgemm.mm(x, weight, bias)
+def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
+    return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
 
-def test_gemm(dtype, m, n, k, bias=False):
+def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
-    x = torch.randn(m, k, dtype=dtype).cuda()
-    weight = torch.randn(n, k, dtype=dtype).cuda()
+    x = torch.randn(m, k, dtype=otype, device='cuda').to(dtype)
+    weight = torch.rand(n, k, dtype=otype, device='cuda').to(dtype)
     if bias:
-        bias = torch.randn(n, dtype=dtype).cuda()
+        bias = torch.rand(n, dtype=otype, device='cuda')
     else:
         bias=None
-    (a, *_), avg_a = run_torch(x, weight, bias)
-    (b, *_), avg_b = run_gemm_b(x, weight, bias)
+    if scaleA is not None:
+        scaleA = torch.tensor(scaleA, dtype=torch.float, device='cuda')
+    if scaleB is not None:
+        scaleB = torch.tensor(scaleB, dtype=torch.float, device='cuda')
+    (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
+    (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
 
 
+test_gemm(torch.float8_e4m3fnuz, 128, 768, 4096, bias=False, otype=torch.bfloat16, scaleA=0.5, scaleB=0.5)
 test_gemm(torch.bfloat16, 128, 32, 8192)
 # for dtype in [torch.float16, torch.bfloat16]:
 #     # # qkv_proj

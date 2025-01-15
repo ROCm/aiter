@@ -45,8 +45,8 @@ class Gemm:
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
         self.rocb_sols = []
-        self.rtol = 1e-5
-        self.atol = 1
+        self.rtol = 1e-2
+        self.atol = 1e-2
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
@@ -59,12 +59,13 @@ class Gemm:
                                      self.weights.t(),
                                      bias=self.bias,
                                      out_dtype=self.outdtype)
-        print('M N K bias dtype',
+        print('M N K bias dtype outdtype',
               self.m,
               self.n,
               self.k,
               self.bias is not None,
               self.indtype,
+              self.outdtype,
               '>>> Total hipb solutions',
               len(sols),
               flush=True)
@@ -72,8 +73,7 @@ class Gemm:
         self.hipb_sols = sols
 
     def check_gemm_ref(self, libtype, solidx):
-        if str(self.indtype) == 'fp8':
-            # if self.indtype == torch.float8_e4m3fnuz:
+        if self.indtype == torch.float8_e4m3fnuz:
             ref = torch._scaled_mm(self.inp,
                                    self.weights.t(),
                                    scale_a=ONE,
@@ -312,10 +312,9 @@ class GemmTuner:
         else:
             self.tuned_shapes = None
 
-    def add_gemm(self, m, n, k, indtype=None, bias=False):
-        indtype = self.indtype if self.indtype is not None else indtype
+    def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None):
         assert indtype is not None
-        outdtype = self.outdtype if self.outdtype is not None else indtype
+        outdtype = outdtype if outdtype is not None else indtype
         assert outdtype is not None
         if (self.tuned_shapes is None or (self.tuned_shapes[
             (self.tuned_shapes['M'] == m) & (self.tuned_shapes['N'] == n) &
@@ -336,7 +335,7 @@ class GemmTuner:
                                            ignore_index=True)
         else:
             print(f">>>Info: Found Duplicate shape(M:{m},"
-                  " N:{n}, K:{k} bias:{bias}), skipping")
+                  f" N:{n}, K:{k} bias:{bias}), skipping")
 
     def find_best_sols(self):
         df = self.gemm_problems
@@ -344,8 +343,8 @@ class GemmTuner:
             columns=['libtype', 'solidx', 'soltimes', 'kernelName'])
         for i in range(len(df)):
             ds = df.loc[i, :]
-            indtype = self.indtype or ds['dtype']
-            outdtype = self.outdtype or indtype
+            indtype = ds['dtype']
+            outdtype = ds['outdtype']
             gemmobj = Gemm(ds['M'],
                            ds['N'],
                            ds['K'],

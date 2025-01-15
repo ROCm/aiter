@@ -112,7 +112,8 @@ torch::Tensor dTensor;
 std::map<at::ScalarType, hipDataType> dtype_map{
     {at::kHalf, HIP_R_16F},
     {at::kBFloat16, HIP_R_16BF},
-    {at::kFloat, HIP_R_32F}
+    {at::kFloat, HIP_R_32F},
+    {at::kChar, HIP_R_8I}
 #ifdef ENABLE_TORCH_FP8
     ,{at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ}
 #endif
