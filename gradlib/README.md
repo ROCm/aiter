@@ -1,21 +1,29 @@
-                      _ 
-                     | |
-   __ _ _ __ __ _  __| |
-  / _` | '__/ _` |/ _` |
- | (_| | | | (_| | (_| |
-  \__, |_|  \__,_|\__,_|
-   __/ |                
-  |___/       
+```
+                      _ _ _ _     
+   __ _ _ __ __ _  __| | (_) |__  
+  / _` | '__/ _` |/ _` | | | '_ \ 
+ | (_| | | | (_| | (_| | | | |_) |
+  \__, |_|  \__,_|\__,_|_|_|_.__/ 
+  |___/ 
+```
+## What is gradlib
+It is a library of tools form vLLM for optimization and tuning, mainly used for performance tuning of matrix multiplication (GEMM).
 
-grad form vllm
+By gradlib, we can confirm the parameter of GEMMs with best performance in the specific hardware currently in use. As a result, we can **improve the inference speed of the model**.
 
-1. to get gemm shapes to be tuned, replace F.linear by tgemm.mm under ater/tuned_gemm.py, 
-run
+## How to use gradlib
+
+1. to get GEMM shapes to be tuned, replace F.linear by tgemm.mm under ater/tuned_gemm.py,
+   run
+
+   `
     VLLM_TUNE_GEMM=1 python {workload_tests}
 shapes will be captured in ater/configs/untuned_gemm.csv
-
-2. to tune gemms in ater/configs/untuned_gemm.csv,
-run 
+   `
+2. to tune GEMMs in ater/configs/untuned_gemm.csv,
+   run
+   
+   ` 
     python3 gradlib/gradlib/gemm_tuner.py --tuned_file ater/configs/tuned_gemm.csv  --input_file ater/configs/untuned_gemm.csv
-
-3. then run your test as normal~
+   `
+4. then run your test as normal~
