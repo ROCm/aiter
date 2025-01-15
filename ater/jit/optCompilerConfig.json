@@ -197,16 +197,19 @@
     "module_rmsnorm": {
         "srcs": [
             "f'{ATER_CSRC_DIR}/kernels/rmsnorm_kernels.cu'",
+            "f'{ATER_CSRC_DIR}/py_itfs_ck/rmsnorm_ck_kernels.cu'",
             "f'{ATER_CSRC_DIR}/pybind/rmsnorm_pybind.cu'"
         ],
         "md_name": "'module_rmsnorm'",
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d'"
+        ],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
     "module_smoothquant": {
         "srcs": [

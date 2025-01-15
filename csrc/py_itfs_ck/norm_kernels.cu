@@ -18,7 +18,7 @@
 
 void layernorm2d(torch::Tensor &out,    // [m, n]
                  torch::Tensor &input,  // [m, n]
-                 torch::Tensor &weight, // [m, n]
+                 torch::Tensor &weight, // [1, n]
                  torch::Tensor &bias,   // [m, n]
                  double epsilon,
                  std::optional<torch::Tensor> x_bias)
@@ -61,7 +61,7 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
 }
 
 torch::Tensor layernorm2d(torch::Tensor &input,  // [m, n]
-                          torch::Tensor &weight, // [m, n]
+                          torch::Tensor &weight, // [1, n]
                           torch::Tensor &bias,   // [m, n]
                           double epsilon,
                           std::optional<torch::Tensor> x_bias)
