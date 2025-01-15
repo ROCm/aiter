@@ -7,7 +7,7 @@
   |___/ 
 ```
 ## What is gradlib
-It is a library of tools form vLLM for optimization and tuning, mainly used for performance tuning of matrix multiplication (GEMM).
+It is a library of tools derived from vLLM for optimization and tuning, mainly used for performance tuning of matrix multiplication (GEMM).
 
 By gradlib, we can confirm the parameter of GEMMs with best performance in the specific hardware currently in use. As a result, we can **improve the inference speed of the model**.
 
