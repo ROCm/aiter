@@ -347,14 +347,14 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
 
   const int64_t token_idx = static_cast<int64_t>(blockIdx.x * tokens_per_wg + wave_id);
   const int32_t head_idx = blockIdx.y;
+  const int64_t slot_idx = slot_mapping[token_idx];
 
-  if (token_idx >= num_tokens)
+  if (token_idx >= num_tokens || slot_idx < 0)
   {
     // Padding token that should be ignored.
     return;
   }
-
-  const int64_t slot_idx = slot_mapping[token_idx];
+  
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
 

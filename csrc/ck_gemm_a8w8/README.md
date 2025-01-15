@@ -5,8 +5,8 @@
 
 2. Tune gemm a8w8: 
  First add GEMM shapes in `ater/configs/a8w8_untuned_gemm.csv`, then run the following cmd to start tuning, please wait a few minutes as it will build gemm_a8w8_tune via jit:  
-`python3 csrc/ck_gemm_a8w8/gemm_a8w8_tune.py -i ater/configs/a8w8_untuned_gemm.csv -o ater/configs/a8w8_tuned_gemm.csv -k`  
-If you not want to use split K kernels, you can remove the `-k` parameter at the end.
+`python3 csrc/ck_gemm_a8w8/gemm_a8w8_tune.py -i ater/configs/a8w8_untuned_gemm.csv -o ater/configs/a8w8_tuned_gemm.csv`  
+If you want to use split K kernels, you can add the `-k` parameter at the end, notice that should change `bias` to `bias/(2^k)`.
 You can find the results of the tuning in `ater/configs/a8w8_tuned_gemm.csv`.
 
 3. Test the performance, modify the test instance in `op_tests/test_gemm_a8w8.py` and run it, please wait a few minutes as it will build gemm_a8w8 kernels in `ater/configs/a8w8_tuned_gemm.csv` via jit：  
