@@ -5,16 +5,8 @@ import torch.nn.functional as F
 
 MD_NAME = "module_pos_encoding"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/pos_encoding_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/pos_encoding_kernels.cu",
-    ],
-    "md_name": MD_NAME,
-}
 
-
-@compile_ops(**compile_ops_)
+@compile_ops("module_pos_encoding")
 def rotary_embedding(
     positions: Tensor,
     query: Tensor,
@@ -25,7 +17,7 @@ def rotary_embedding(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_pos_encoding")
 def batched_rotary_embedding(
     positions: Tensor,
     query: Tensor,

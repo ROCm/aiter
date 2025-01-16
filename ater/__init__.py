@@ -12,7 +12,7 @@ if importlib.util.find_spec('rocsolidxgemm_') is not None:
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
-from .ops.transpose_operator import *
+from .ops.ater_operator import *
 from .ops.activation import *
 from .ops.attention import *
 from .ops.custom import *

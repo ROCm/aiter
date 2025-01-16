@@ -583,23 +583,6 @@ class CustomAllreduce {
 #undef KL
 }
 
-torch::Tensor
-allreduce_asm(cudaStream_t stream, void *input, void *sig, int size, torch::Tensor &inp)
-{
-  RankData *input_rd = get_buffer_RD(stream, input);
-  RankData *sig_rd = get_buffer_RD(stream, sig);
-
-  static Kernel_AR impl("allreduce_kernel_func", "all_reduce.co");
-  impl.launch_kernel(input_rd,
-                     sig_rd->ptrs,
-                     rank_,
-                     size,
-                     world_size_);
-  auto options = torch::TensorOptions()
-                     .dtype(inp.dtype())
-                     .device(inp.device());
-  return torch::from_blob(input, {inp.sizes()}, options);
-}
 
 ~CustomAllreduce() {
   for (auto [_, ptr] : ipc_handles_) {

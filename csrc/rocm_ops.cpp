@@ -4,6 +4,7 @@
 #include "attention_asm.h"
 #include "cache.h"
 #include "custom_all_reduce.h"
+#include "communication_asm.h"
 #include "custom.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
@@ -11,12 +12,10 @@
 #include "pos_encoding.h"
 #include "rmsnorm.h"
 #include "smoothquant.h"
-#include "transpose_operator.h"
+#include "ater_operator.h"
 #include "asm_gemm_a8w8.h"
 #include <torch/extension.h>
-#ifdef USE_CK_A8W8
 #include "gemm_a8w8.h"
-#endif
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -46,11 +45,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                Tensor? alibi_slopes,"
             "                str kv_cache_dtype,"
             "                float k_scale, float v_scale) -> ()");
-#ifdef USE_CK_A8W8
+
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), 
             py::arg("bias") = std::nullopt, py::arg("splitK") = 0);
-#endif
+
       m.def("swap_blocks", &swap_blocks,
             "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");
       m.def("copy_blocks", &copy_blocks,
@@ -100,12 +99,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
       m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
       m.def("register_graph_buffers", &register_graph_buffers);
-#ifdef USE_ROCM
+
       m.def("allocate_meta_buffer", &allocate_meta_buffer);
       m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
-#endif
 
-#if defined(FIND_CK)
+
+
       // ck staff start
       m.def("layernorm2d_fwd", &layernorm2d);
       m.def("layernorm2d_fwd_with_add", &layernorm2d_with_add);
@@ -130,25 +129,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("scale_k"),
             py::arg("scale_v"),
             py::arg("block_size"),
-            py::arg("quant_algo"));
+            py::arg("quant_algo"),
+            py::arg("out_") = std::nullopt);
       // ck staff end
-#endif
+
 
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
-      m.def("transpose_add", &transpose_add, "apply for add with transpose.");
-      m.def("transpose_mul", &transpose_mul, "apply for mul with transpose.");
-      m.def("transpose_sub", &transpose_sub, "apply for sub with transpose.");
-      m.def("transpose_div", &transpose_div, "apply for div with transpose.");
+      m.def("add", &ater_add, "apply for add with transpose and broadcast.");
+      m.def("mul", &ater_mul, "apply for mul with transpose and broadcast.");
+      m.def("sub", &ater_sub, "apply for sub with transpose and broadcast.");
+      m.def("div", &ater_div, "apply for div with transpose and broadcast.");
       m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",
             py::arg("Q"),
             py::arg("K"),
             py::arg("V"),
             py::arg("block_tables"),
             py::arg("context_lens"),
+            py::arg("max_num_blocks"),
             py::arg("K_QScale") = std::nullopt,
-            py::arg("V_QScale") = std::nullopt);
+            py::arg("V_QScale") = std::nullopt,
+            py::arg("out_") = std::nullopt);
       m.def("gemm_a8w8_asm", &gemm_a8w8_asm,
             "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)",
             py::arg("XQ"), py::arg("WQ"),
@@ -158,6 +160,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("pad_a") = 0, py::arg("pad_b") = 0,
             py::arg("pad_c") = 0, py::arg("splitK") = 0);
       m.def("all_reduce_asm", &all_reduce_asm, "");
+      m.def("layernorm2d_with_add_asm", &layernorm2d_with_add_asm);
+      m.def("layernorm2d_with_add_smoothquant_asm", &layernorm2d_with_add_smoothquant_asm);
 
       m.def("reshape_and_cache_with_pertoken_quant", &reshape_and_cache_with_pertoken_quant,
             "reshape_and_cache_with_pertoken_quant(Tensor key, Tensor value,"

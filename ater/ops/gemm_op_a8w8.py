@@ -6,14 +6,7 @@ import pandas as pd
 from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
 
 
-@compile_ops(
-    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_pybind.cu",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8.cu",
-        f"{ATER_CSRC_DIR}/ck_gemm_a8w8/include",],
-    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {ATER_ROOT_DIR}/ater/configs/a8w8_tuned_gemm.csv",
-    md_name="module_gemm_a8w8",
-    fc_name="gemm_a8w8",
-)
+@compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8")
 def gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
@@ -25,13 +18,7 @@ def gemm_a8w8(
 ): ...
 
 
-@compile_ops(
-    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_asm_pybind.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_gemm_a8w8.cpp"],
-    md_name="module_gemm_a8w8_asm",
-    flags_extra_hip=[f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
-    fc_name="gemm_a8w8_asm",
-)
+@compile_ops("module_gemm_a8w8_asm", fc_name="gemm_a8w8_asm")
 def gemm_a8w8_asm(
     XQ: Tensor,             # A:[M, K] i8
     WQ: Tensor,             # B:[N, K] i8 -> shuffle layout(32,16)
@@ -160,14 +147,7 @@ def gemm_a8w8_CK(
     return gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
-@compile_ops(
-    srcs=[f"{ATER_CSRC_DIR}/pybind/gemm_a8w8_tune_pybind.cu",
-          f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gemm_a8w8_tune.cu",
-          f"{ATER_CSRC_DIR}/ck_gemm_a8w8/include",],
-    blob_gen_cmd =  f"{ATER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune",
-    md_name="module_gemm_a8w8_tune",
-    fc_name="gemm_a8w8_tune",
-)
+@compile_ops("module_gemm_a8w8_tune",fc_name="gemm_a8w8_tune")
 def gemm_a8w8_tune(
     XQ: Tensor,
     WQ: Tensor,

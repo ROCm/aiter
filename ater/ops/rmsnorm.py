@@ -5,16 +5,9 @@ import torch.nn.functional as F
 
 MD_NAME = "module_rmsnorm"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/pybind/rmsnorm_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/rmsnorm_kernels.cu",
-    ],
-    "md_name": MD_NAME,
-}
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_rmsnorm")
 def rms_norm(
     out: Tensor,
     input: Tensor,
@@ -28,7 +21,7 @@ def rms_norm(
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_rmsnorm")
 def fused_add_rms_norm(
     out: Tensor,
     input: Tensor,

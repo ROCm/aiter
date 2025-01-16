@@ -16,40 +16,31 @@ import torch.nn.functional as F
 
 MD_NAME = "module_norm"
 
-compile_ops_ = {
-    "srcs": [
-        f"{ATER_CSRC_DIR}/py_itfs_ck/norm_kernels.cu",
-        f"{ATER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cpp",
-        f"{ATER_CSRC_DIR}/pybind/norm_pybind.cu",
-    ],
-    "flags_extra_hip": [f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
-    "extra_include": [f"{CK_DIR}/example/ck_tile/02_layernorm2d"],
-    "blob_gen_cmd": f"{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --disable_16b_welford=True --working_path {{}}",
-    "md_name": MD_NAME,
-}
 
 
-@compile_ops(fc_name="layernorm2d_fwd", **compile_ops_)
+@compile_ops("module_norm", fc_name="layernorm2d_fwd")
 def layer_norm(
     input: Tensor,
     # normalized_shape: List[int],
     weight: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     eps: float = 1e-5,
+    x_bias: Optional[Tensor] = None,
 ) -> Tensor: ...
 
 
-@compile_ops(fc_name="layernorm2d_fwd", **compile_ops_)
+@compile_ops("module_norm", fc_name="layernorm2d_fwd")
 def layernorm2d_fwd(
     input: Tensor,
     # normalized_shape: List[int],
     weight: Optional[Tensor] = None,
     bias: Optional[Tensor] = None,
     eps: float = 1e-5,
+    x_bias: Optional[Tensor] = None,
 ) -> Tensor: ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_norm")
 def layernorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,
@@ -58,10 +49,11 @@ def layernorm2d_fwd_with_add(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_norm")
 def layernorm2d_fwd_with_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -70,10 +62,11 @@ def layernorm2d_fwd_with_smoothquant(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 
 
-@compile_ops(**compile_ops_)
+@compile_ops("module_norm")
 def layernorm2d_fwd_with_add_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -84,19 +77,21 @@ def layernorm2d_fwd_with_add_smoothquant(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
 
 
-# @compile_ops(**compile_ops_)
+# @compile_ops("module_norm")
 # def layernorm2d_fwd_with_dynamicquant(
 #     out: Tensor,
 #     input: Tensor,
 #     yscale: Tensor,
 #     weight: Tensor,
 #     bias: Tensor,
-#     epsilon: float):...
+#     epsilon: float,
+#     x_bias: Optional[Tensor] = None,):...
 
-# @compile_ops(**compile_ops_)
+# @compile_ops("module_norm")
 # def layernorm2d_fwd_with_add_dynamicquant(
 #     out: Tensor,
 #     input: Tensor,
@@ -105,8 +100,9 @@ def layernorm2d_fwd_with_add_smoothquant(
 #     yscale: Tensor,
 #     weight: Tensor,
 #     bias: Tensor,
-#     epsilon: float):...
-@compile_ops(**compile_ops_)
+#     epsilon: float,
+#     x_bias: Optional[Tensor] = None,):...
+@compile_ops("module_norm")
 def layernorm2d_with_add_asm(
     out: Tensor,
     input: Tensor,
@@ -115,8 +111,9 @@ def layernorm2d_with_add_asm(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...
-@compile_ops(**compile_ops_)
+@compile_ops("module_norm")
 def layernorm2d_with_add_smoothquant_asm(
     out: Tensor,
     input: Tensor,
@@ -127,4 +124,5 @@ def layernorm2d_with_add_smoothquant_asm(
     weight: Tensor,
     bias: Tensor,
     epsilon: float,
+    x_bias: Optional[Tensor] = None,
 ): ...

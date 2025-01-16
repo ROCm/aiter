@@ -10,35 +10,21 @@ from torch.profiler import profile, record_function, ProfilerActivity
 # input shape: torch.Size([4096, 64, 160]) (47360, 1, 296)
 # other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)
 
-# shape = (4096, 64, 160)
-# stride1 = (47360, 1, 296)
-# # stride1 = (20480, 1, 128)
-# stride2 = (10240, 160, 1)
+shape0 = (4096, 64, 160)
+shape1 = (4096, 64, 160)
+stride0 = (47360, 1, 296)
+# stride1 = (20480, 1, 128)
+stride1 = (10240, 160, 1)
 
-# shape0 = (4096, 200, 64)
-# shape1 = (1, 200, 64)
+# shape1 = (4096, 200, 64)
+# shape0 = (1, 200, 64)
 # stride0 = (12800, 64, 1)
 # stride1 = (12800, 64, 1)
 
-# [[144, 1, 160], [144, 4096, 160], []]
-# [[160, 160, 1], [655360, 160, 1], []]
-
-
-shape0 = (144, 1, 160)
-shape1 = (144, 4096, 160)
-stride0 = (160, 160, 1)
-stride1 = (655360, 160, 1)
-
-# shape0 = (2, 1, 32)
-# shape1 = (2, 64, 32)
-# stride0 = (32, 32, 1)
-# stride1 = (64*32, 32, 1)
-
-
-# shape0 = (1, 1, 16)
-# shape1 = (1, 18, 16)
-# stride0 = (16, 16, 1)
-# stride1 = (16*18, 16, 1)
+# shape1 = (144, 1, 160)
+# shape0 = (144, 4096, 160)
+# stride1 = (160, 160, 1)
+# stride0 = (655360, 160, 1)
 
 tensor0 = torch.empty_strided(shape0, stride0, dtype=torch.float16, device='cuda')
 tensor1 = torch.empty_strided(shape1, stride1, dtype=torch.float16, device='cuda')
@@ -69,9 +55,7 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_m
     for j in range(100):
         #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=torch.float32).to(torch.int32)
         # output = torch.empty_like(tensor1)
-        output = ater.transpose_add(tensor0, tensor1)
+        output = ater.add(tensor0, tensor1)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
-print("result_con", result_con)
-print("output", output)
 print(torch.equal(result_con, output))

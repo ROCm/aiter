@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-02 16:43:40
+# @Last Modified At: 2025-01-13 10:27:10
 # @Description: This is description.
 
 import torch
@@ -99,9 +99,9 @@ def get_trace_perf(prof, num_iters):
         rets.append(r)
     df = pd.DataFrame(rets)
 
-    cols = ['name', 'host_time_total', 'device_time_total',
+    cols = ['name', 'cnt', 'host_time_total', 'device_time_total',
             'device_type', 'device_index',]
-    cols = [el for el in ['cnt']+cols if el in df.columns]
+    cols = [el for el in cols if el in df.columns]
     df = df[(df.host_time_total > 0) | (df.device_time_total > 0)]
 
     timerList = ['host_time_total', 'device_time_total', ]
@@ -137,9 +137,9 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
             f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({(a[mask]).numel()} of {a.numel()}) elements')
 
 
-def tensor_dump(x: torch.tensor, name: str):
+def tensor_dump(x: torch.tensor, name: str, dir='./'):
     x_cpu = x.cpu().view(torch.uint8)
-    filename = f'{name}.bin'
+    filename = f'{dir}/{name}.bin'
     x_cpu.numpy().tofile(filename)
     logger.info(f'saving {filename} {x.shape}, {x.dtype}')
 

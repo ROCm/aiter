@@ -16,9 +16,7 @@ from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
 MD_NAME = 'module_attention'
 
 
-@compile_ops(srcs=[f'{ATER_CSRC_DIR}/py_itfs_ck/attention_kernels.cu',
-                   f'{ATER_CSRC_DIR}/pybind/attention_ck_pybind.cu'],
-             md_name=MD_NAME)
+@compile_ops("module_attention")
 def pa_fwd_naive(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
@@ -38,33 +36,29 @@ def pa_fwd_naive(
     scale_k: float,
     scale_v: float,
     block_size: int,
-    quant_algo: int
+    quant_algo: int,
+    out: Optional[torch.Tensor] = None
 ) -> torch.Tensor: ...
 
 
-@compile_ops(srcs=[f'{ATER_CSRC_DIR}/py_itfs_cu/asm_pa.cpp',
-                   f'{ATER_CSRC_DIR}/pybind/attention_asm_pybind.cu'],
-             flags_extra_hip=[f'-DATER_ASM_DIR=\\"{ATER_ROOT_DIR}/hsa/\\"'],
-             md_name=f"{MD_NAME}_asm")
+@compile_ops("module_attention_asm")
 def pa_fwd_asm(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor) -> torch.Tensor: ...
+    context_lens: torch.Tensor,
+    max_num_blocks: int,
+    K_QScale: Optional[torch.Tensor],
+    V_QScale: Optional[torch.Tensor],
+    out_: Optional[torch.Tensor] = None
+) -> torch.Tensor: ...
 
 
 MD_NAME = "module_pa"
 
 
-@compile_ops(
-    srcs=[
-        f"{ATER_CSRC_DIR}/pybind/attention_pybind.cu",
-        f"{ATER_CSRC_DIR}/kernels/attention.cu",
-    ],
-    flags_extra_hip=['-DENABLE_FP8'],
-    md_name=MD_NAME,
-)
+@compile_ops("module_pa")
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sums: torch.Tensor,

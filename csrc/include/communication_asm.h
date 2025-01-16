@@ -1,17 +1,26 @@
 #pragma once
 
-class Kernel_AR
-{
-private:
-    hipModule_t module;
-    hipFunction_t kernel_func;
+torch::Tensor all_reduce_asm(torch::Tensor &input,
+                             int64_t _ca,
+                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);
 
-public:
-    Kernel_AR(const char *name, const char *hsaco);
+std::tuple<torch::Tensor, torch::Tensor>       // out, residual_out
+all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
+                   torch::Tensor &residual_in, // [m ,n]
+                   torch::Tensor &weight,      // [1 ,n]
+                   torch::Tensor &bias,        // [1 ,n]
+                   float epsilon,
+                   // following are fused_allreduce args
+                   int64_t _ca,
+                   torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);
 
-    void launch_kernel(const void *gpu_buf_in,
-                       const void *gpu_sig_in[],
-                       uint32_t gpu_id,
-                       uint32_t buf_size,
-                       uint32_t world_size);
-};
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> // out, residual_out, yscale
+all_reduce_rmsnorm_quant(torch::Tensor &input,          // [m ,n]
+                         torch::Tensor &residual_in,    // [m ,n]
+                         torch::Tensor &xscale,         // [1 ,n]
+                         torch::Tensor &weight,         // [1 ,n]
+                         torch::Tensor &bias,           // [1 ,n]
+                         float epsilon,
+                         // following are fused_allreduce args
+                         int64_t _ca,
+                         torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph);

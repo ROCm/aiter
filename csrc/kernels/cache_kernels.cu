@@ -149,7 +149,7 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
 
 namespace vllm {
 
-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt, bool asmLayout=false>
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt, bool asmLayout=false, typename slot_mapping_t=int64_t>
 __global__ void reshape_and_cache_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
@@ -157,19 +157,19 @@ __global__ void reshape_and_cache_kernel(
                                          // block_size, x]
     cache_t* __restrict__ value_cache,   // [num_blocks, num_heads, head_size,
                                          // block_size]
-    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const slot_mapping_t* __restrict__ slot_mapping,  // [num_tokens]
     const int key_stride, const int value_stride, const int num_heads,
     const int head_size, const int block_size, const int x, const float k_scale,
     const float v_scale) {
   const int64_t token_idx = blockIdx.x;
-  const int64_t slot_idx = slot_mapping[token_idx];
+  const slot_mapping_t slot_idx = slot_mapping[token_idx];
   if (slot_idx < 0) {
     // Padding token that should be ignored.
     return;
   }
 
-  const int64_t block_idx = slot_idx / block_size;
-  const int64_t block_offset = slot_idx % block_size;
+  const int64_t block_idx = static_cast<int64_t>(slot_idx) / block_size;
+  const int64_t block_offset = static_cast<int64_t>(slot_idx) % block_size;
 
   const int n = num_heads * head_size;
   for (int i = threadIdx.x; i < n; i += blockDim.x) {

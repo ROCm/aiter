@@ -169,7 +169,7 @@ namespace vllm
   }
 
   template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
-  __global__ void add_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
+  __global__ void operator_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
   {
     // pad LDS row by dword
     constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
@@ -309,10 +309,9 @@ namespace vllm
   }
 
   template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
-  __global__ void add_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
+  __global__ void operator_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
   {
     // pad LDS row by dword
-    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
 
@@ -339,8 +338,6 @@ namespace vllm
     const uint32_t ti = current_nk / k_tiles;
     const uint32_t tj = current_nk % k_tiles;
 
-    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
-
     const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
 
@@ -359,7 +356,6 @@ namespace vllm
       const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr;
       const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
 #pragma unroll
-      // for (uint32_t t = 0; t < vmem_per_thread; t++)
       for (uint32_t t = 0; t < wr_per_row; t++)
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
@@ -411,10 +407,9 @@ namespace vllm
   }
 
   template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
-  __global__ void add_bcast1_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
+  __global__ void operator_bcast1_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
   {
     // pad LDS row by dword
-    constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
 
@@ -441,8 +436,6 @@ namespace vllm
     const uint32_t ti = current_nk / k_tiles;
     const uint32_t tj = current_nk % k_tiles;
 
-    __shared__ _T sa[BIG_TILE_SIZE_N][BIG_TILE_SIZE_K + LDS_PAD];
-
     const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
 
@@ -461,7 +454,6 @@ namespace vllm
       const uint8_t *pb = (const uint8_t *)b + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
       const uint8_t *pc = (const uint8_t *)c + tj * BIG_TILE_SIZE_K * stride_k + ti * row_bytes_wr + current_m * out_stride_nk;
 #pragma unroll
-      // for (uint32_t t = 0; t < vmem_per_thread; t++)
       for (uint32_t t = 0; t < wr_per_row; t++)
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
@@ -517,7 +509,7 @@ namespace vllm
 }
 
 template <typename Operation>
-torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
   constexpr uint32_t PATTERN_TRANSPOSE = 1;
@@ -573,6 +565,17 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
       order_flag = true;
     }
 
+    if (!is_support && input.size(0) == 1)
+    {
+      is_support = true;
+      is_support &= other.size(0) > 1;
+      is_support &= input.size(0) == 1;
+      is_support &= input.size(1) == other.size(1);
+      is_support &= input.size(2) == other.size(2);
+      pattern = is_support ? PATTERN_BROADCAST_0 : 0;
+      order_flag = false;
+    }
+
     if (!is_support && input.size(1) == 1)
     {
       is_support = true;
@@ -581,6 +584,16 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
       is_support &= input.size(2) == other.size(2);
       pattern = is_support ? PATTERN_BROADCAST_1 : 0;
       order_flag = true;
+    }
+
+    if (!is_support && other.size(1) == 1)
+    {
+      is_support = true;
+      is_support &= input.size(1) > 1;
+      is_support &= input.size(0) == other.size(0);
+      is_support &= input.size(2) == other.size(2);
+      pattern = is_support ? PATTERN_BROADCAST_1 : 0;
+      order_flag = false;
     }
   }
 
@@ -607,15 +620,15 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     if (order_flag)
     {
       VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "add_tn_big_tile_kernel", [&]
-          { vllm::add_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+          input.scalar_type(), "operator_tn_big_tile_kernel", [&]
+          { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
     }
     else
     {
       VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "add_tn_big_tile_kernel", [&]
-          { vllm::add_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+          input.scalar_type(), "operator_tn_big_tile_kernel", [&]
+          { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
     }
 
@@ -623,9 +636,9 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   }
   else if (pattern == PATTERN_BROADCAST_0)
   {
-    M = input.size(0);
-    N = input.size(1);
-    K = input.size(2);
+    M = order_flag ? input.size(0) : other.size(0);
+    N = order_flag ? input.size(1) : other.size(1);
+    K = order_flag ? input.size(2) : other.size(2);
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
     constexpr uint32_t M_SWIZZLE = 8;
@@ -633,10 +646,8 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
 
-    auto options =
-        torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output =
-        torch::empty(input.sizes(), options);
+    auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output = torch::empty({M, N, K}, options);
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
@@ -647,15 +658,15 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     if (order_flag)
     {
       VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "add_bcast_big_tile_kernel", [&]
-          { vllm::add_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+          input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+          { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
     }
     else
     {
       VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "add_bcast_big_tile_kernel", [&]
-          { vllm::add_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+          input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+          { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
     }
 
@@ -663,10 +674,9 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   }
   else if (pattern == PATTERN_BROADCAST_1)
   {
-    M = other.size(0);
-    N = other.size(1);
-    K = other.size(2);
-    // printf("[M, N, K]:[%d %d %d]\n", M, N, K);
+    M = order_flag ? other.size(0) : input.size(0);
+    N = order_flag ? other.size(1) : input.size(1);
+    K = order_flag ? other.size(2) : input.size(2);
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
     constexpr uint32_t M_SWIZZLE = 8;
@@ -674,10 +684,8 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
 
-    auto options =
-        torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output =
-        torch::empty(other.sizes(), options);
+    auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+    auto output = torch::empty({M, N, K}, options);
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
     void *buf_a = reinterpret_cast<void *>(input.data_ptr());
@@ -688,15 +696,15 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
     if (order_flag)
     {
       VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "add_bcast1_big_tile_kernel", [&]
-          { vllm::add_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+          input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+          { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
     }
     else
     {
       VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "add_bcast1_big_tile_kernel", [&]
-          { vllm::add_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+          input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+          { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
     }
 
@@ -708,22 +716,22 @@ torch::Tensor transpose_operation(torch::Tensor &input, torch::Tensor &other)
   }
 }
 
-torch::Tensor transpose_add(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_add(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::AddOp>(input, other);
+  return ater_operation<vllm::AddOp>(input, other);
 }
 
-torch::Tensor transpose_sub(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::SubOp>(input, other);
+  return ater_operation<vllm::SubOp>(input, other);
 }
 
-torch::Tensor transpose_mul(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::MulOp>(input, other);
+  return ater_operation<vllm::MulOp>(input, other);
 }
 
-torch::Tensor transpose_div(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor ater_div(torch::Tensor &input, torch::Tensor &other)
 {
-  return transpose_operation<vllm::DivOp>(input, other);
+  return ater_operation<vllm::DivOp>(input, other);
 }
