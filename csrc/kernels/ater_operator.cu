@@ -507,34 +507,7 @@ namespace vllm
     }
   }
 
-  template <class _T, int _vec>
-  __global__ void operator_bcast_elwise_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int M, const int N, const int K)
-  {
-    uint64_t idx = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x) * _vec;
-    if (idx < (uint64_t)M * N * K)
-    {
-      uint32_t i = idx / (N * K);
-      uint32_t j = (idx % (N * K) / K) % N;
-      uint32_t k = idx % (N * K) % K;
-
-#pragma unroll
-      for (uint t = 0; t < _vec / 8; t++)
-      {
-        uint64_t offset_b = (uint64_t)j * K + t * 8 + k;
-        uint64_t offset_ac = (uint64_t)j * K + t * 8 + k + (uint64_t)i * N * K;
-
-        const _T *pa = (const _T *)a + offset_ac;
-        const _T *pb = (const _T *)b + offset_b;
-        _T *pc = (_T *)c + offset_ac;
-        for (uint32_t v = 0; v < 8; v++)
-        {
-          pc[v] = pa[v] + pb[v];
-        }
-      }
-    }
-  }
-
-  template <class _T, int _rows, int _vec>
+  template <class _T, int _rows, int _vec, typename Operation, bool order_flag>
   __global__ void operator_bcast_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int M, const int N, const int K)
   {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -542,29 +515,7 @@ namespace vllm
     uint32_t k_tiles = K / _vec;
     if (idx < (uint64_t)M * n_tiles * k_tiles)
     {
-      //       // Reindex with tiles
-      // uint64_t tile_idx = idx;
-      //       // Walk tiles horizontally
       uint32_t ti = idx / (k_tiles * n_tiles);
-      //       uint32_t tj = (tile_idx / k_tiles) % n_tiles;
-      //       uint32_t tk = tile_idx % k_tiles;
-      //       // printf("idx:%d [%d %d %d]\n", idx, ti, tj, tk);
-
-      // #pragma unroll
-      //       for (int row = 0; row < _rows; row++)
-      //       {
-      //         uint64_t offset_b = (uint64_t)(tj * _rows + row) * K + tk * _vec;
-      //         uint64_t offset_ac = (uint64_t)(tj * _rows + row) * K + tk * _vec + (uint64_t)ti * N * K;
-
-      //         const _T *pa = (const _T *)a + offset_ac;
-      //         const _T *pb = (const _T *)b + offset_b;
-      //         _T *pc = (_T *)c + offset_ac;
-      //         for (int col = 0; col < _vec; col++)
-      //         {
-      //           pc[col] = pa[col] + pb[col];
-      //         }
-      //       }
-
       uint64_t idx_block = idx % (k_tiles * n_tiles);
       uint32_t tj = (idx_block / k_tiles) % n_tiles;
       uint32_t tk = idx_block % k_tiles;
@@ -577,7 +528,10 @@ namespace vllm
         _T *pc = (_T *)c + offset_ac;
         for (int col = 0; col < _vec; col++)
         {
-          pc[col] = pa[col] + pb[col];
+          const _T *pfa = (const _T *)(pa + col);
+          const _T *pfb = (const _T *)(pb + col);
+          _T *pfc = (_T *)(pc + col);
+          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
         }
       }
     }
@@ -588,6 +542,46 @@ template <typename Operation>
 torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
+
+  if (dim == 2)
+  {
+    bool is_support = true;
+    is_support &= input.dim() == other.dim();
+    is_support &= input.size(0) == other.size(0);
+    is_support &= input.size(1) == other.size(1);
+    is_support &= input.size(1) > 512;
+    is_support &= input.is_contiguous() == other.is_contiguous();
+    is_support &= input.is_contiguous() == true;
+    if (is_support)
+    {
+      int M = 1;
+      int N = input.size(0);
+      int K = input.size(1);
+      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+      auto output = torch::empty({N, K}, options);
+      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+      int elements = N * K;
+      const uint32_t rows = 8;
+      const uint32_t vec = 8;
+      if (N % rows == 0 && K % vec == 0)
+      {
+        constexpr uint32_t wg = 256;
+        int grid_x = (elements / (rows * vec) + wg - 1) / wg;
+        const dim3 grid_dim(grid_x, 1, 1);
+        const dim3 block_dim(wg, 1, 1);
+
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast_tile_kernel", [&]
+            { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
+        return output;
+      }
+    }
+  }
   constexpr uint32_t PATTERN_TRANSPOSE = 1;
   constexpr uint32_t PATTERN_BROADCAST_0 = 2;
   constexpr uint32_t PATTERN_BROADCAST_1 = 3;
@@ -727,33 +721,23 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
     const uint32_t vec = 8;
     if (N % rows == 0 && K % vec == 0)
     {
-      constexpr uint32_t wg = 256;
+      constexpr uint32_t wg = 64;
       int grid_x = (elements / (rows * vec) + wg - 1) / wg;
-      // int grid_x = (elements / vec + wg - 1) / wg;
       const dim3 grid_dim(grid_x, 1, 1);
       const dim3 block_dim(wg, 1, 1);
 
       if (order_flag)
       {
-        // VLLM_DISPATCH_FLOATING_TYPES(
-        //     input.scalar_type(), "operator_bcast_elwise_kernel", [&]
-        //     { vllm::operator_bcast_elwise_kernel<scalar_t, vec>
-        //           <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
-
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "operator_bcast_tile_kernel", [&]
-            { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec>
+            { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
       }
       else
       {
-        // VLLM_DISPATCH_FLOATING_TYPES(
-        //     input.scalar_type(), "operator_bcast_elwise_kernel", [&]
-        //     { vllm::operator_bcast_elwise_kernel<scalar_t, vec>
-        //           <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "operator_bcast_tile_kernel", [&]
-            { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec>
+            { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, false>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
       }
     }
