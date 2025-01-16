@@ -65,12 +65,16 @@ class FMoeKernel
 private:
     hipModule_t module;
     hipFunction_t kernel_func;
+    uint32_t sub_GU = 512;
 
 public:
-    FMoeKernel(const char *name, const char *hsaco)
+    FMoeKernel(const char *name, const char *hsaco, uint32_t sub_GU = 512)
     {
+        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << "GetFunction: " << hsaco;
         HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
+        std::cout << " Success" << std::endl;
+        this->sub_GU = sub_GU;
     };
 
     template <typename T, typename T_O, bool switchGxy = false>
@@ -94,7 +98,7 @@ public:
         int sub_X_cnt = sorted_expert_ids.size(0);
         int eprt = w1.size(0);
         int hidden_dim = w2.size(2);
-        uint32_t sub_GU = 512;
+        uint32_t sub_GU = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
 
@@ -152,6 +156,21 @@ public:
         args.eSMQs = stride_expert_SMTDQN;
         args.topk = topk;
 
+        // std::cout << "args.dim: " << args.dim << std::endl;
+        // std::cout << "args.hidden_dim: " << args.hidden_dim << std::endl;
+        // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
+        // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
+        // std::cout << "args.stride_X: " << args.Xs << std::endl;
+        // std::cout << "args.stride_GU: " << args.GUs << std::endl;
+        // std::cout << "args.stride_D: " << args.Ds << std::endl;
+        // std::cout << "args.stride_O: " << args.Os << std::endl;
+        // std::cout << "args.stride_expert_GU: " << args.eGUs << std::endl;
+        // std::cout << "args.stride_expert_D: " << args.eDs << std::endl;
+        // std::cout << "args.stride_expert_GUDQN: " << args.eGUQs << std::endl;
+        // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
+        // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
+        // std::cout << "args.topk: " << args.topk << std::endl;
+
         void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
                           &arg_size, HIP_LAUNCH_PARAM_END};
 
@@ -188,7 +207,7 @@ void fmoe(torch::Tensor &out,                    // [token_cnt, dim]
           uint32_t topk                          //
 )
 {
-    //bf16 g1u0
+    // bf16 g1u0
     static FMoeKernel impl("fmoe_kernel_func", "fmoe.co");
     impl.launch_kernel<uint16_t, uint16_t>(out,
                                            input,
@@ -216,26 +235,61 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
                     torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
 )
 {
-    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0.co");
-    impl.launch_kernel<uint8_t, uint16_t>(out,
-                                          input,
-                                          gate,
-                                          down,
-                                          sorted_token_ids,
-                                          sorted_weight_buf,
-                                          sorted_expert_ids,
-                                          num_tokens_post_padded,
-                                          topk,
-                                          // quant args
-                                          input_scale,
-                                          fc1_scale,
-                                          fc2_scale,
-                                          fc2_smooth_scale);
+    FMoeKernel *impl_ptr = nullptr;
+    int hidden_dim = down.size(2);
+
+    if (input.dtype() == at::ScalarType::Char)
+    {
+        static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe_int8_g1u0_subGU_512.co", 512);
+        static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe_int8_g1u0_subGU_448.co", 448);
+        static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe_int8_g1u0_subGU_384.co", 384);
+        static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe_int8_g1u0_subGU_320.co", 320);
+        static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe_int8_g1u0_subGU_256.co", 256);
+        static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe_int8_g1u0_subGU_192.co", 192);
+        static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe_int8_g1u0_subGU_128.co", 128);
+
+        if ((hidden_dim % 512) == 0)
+            impl_ptr = &impl_int8_512;
+        else if ((hidden_dim % 448) == 0)
+            impl_ptr = &impl_int8_448;
+        else if ((hidden_dim % 384) == 0)
+            impl_ptr = &impl_int8_384;
+        else if ((hidden_dim % 320) == 0)
+            impl_ptr = &impl_int8_320;
+        else if ((hidden_dim % 256) == 0)
+            impl_ptr = &impl_int8_256;
+        else if ((hidden_dim % 192) == 0)
+            impl_ptr = &impl_int8_192;
+        else if ((hidden_dim % 128) == 0)
+            impl_ptr = &impl_int8_128;
+        else
+            throw std::runtime_error("fmoe_int8_g1u0 Unsupported hidden_dim " + std::to_string(hidden_dim) +
+                                     ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+    }
+    else
+    {
+        throw std::runtime_error("fmoe_int8_g1u0 Input only supput Int8!");
+    }
+
+    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
+                                               input,
+                                               gate,
+                                               down,
+                                               sorted_token_ids,
+                                               sorted_weight_buf,
+                                               sorted_expert_ids,
+                                               num_tokens_post_padded,
+                                               topk,
+                                               // quant args
+                                               input_scale,
+                                               fc1_scale,
+                                               fc2_scale,
+                                               fc2_smooth_scale);
 }
 
 void fmoe_int8_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
                     torch::Tensor &input,                  // [token_cnt, dim] M,K
-                    torch::Tensor &gate,                   // [expert, inter_dim, dim] N,K
+                    torch::Tensor &gate,                   // [expert, inter_dim*2, dim] N,K
                     torch::Tensor &down,                   // [expert, dim, inter_dim]
                     torch::Tensor &sorted_token_ids,       // [max_num_tokens_padded]
                     torch::Tensor &sorted_weight_buf,      // [max_num_tokens_padded]
@@ -248,21 +302,65 @@ void fmoe_int8_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
                     torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
 )
 {
-    static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u1_subGU_512.co");
-    impl.launch_kernel<uint8_t, uint16_t>(out,
-                                          input,
-                                          gate,
-                                          down,
-                                          sorted_token_ids,
-                                          sorted_weight_buf,
-                                          sorted_expert_ids,
-                                          num_tokens_post_padded,
-                                          topk,
-                                          // quant args
-                                          input_scale,
-                                          fc1_scale,
-                                          fc2_scale,
-                                          fc2_smooth_scale);
+    FMoeKernel *impl_ptr = nullptr;
+    int hidden_dim = down.size(2);
+
+    if (input.dtype() == at::ScalarType::Char)
+    {
+        static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
+        static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
+        static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
+        static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
+        static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
+        static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
+        static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
+
+        if ((hidden_dim % 512) == 0)
+            impl_ptr = &impl_int8_512;
+        else if ((hidden_dim % 448) == 0)
+            impl_ptr = &impl_int8_448;
+        else if ((hidden_dim % 384) == 0)
+            impl_ptr = &impl_int8_384;
+        else if ((hidden_dim % 320) == 0)
+            impl_ptr = &impl_int8_320;
+        else if ((hidden_dim % 256) == 0)
+            impl_ptr = &impl_int8_256;
+        else if ((hidden_dim % 192) == 0)
+            impl_ptr = &impl_int8_192;
+        else if ((hidden_dim % 128) == 0)
+            impl_ptr = &impl_int8_128;
+        else
+            throw std::runtime_error("fmoe_int8_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
+                                     ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+    }
+    else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
+    {
+        static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
+        if ((hidden_dim % 256) == 0)
+            impl_ptr = &impl_fp8_256;
+        else
+            throw std::runtime_error("fmoe_int8_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
+                                     ", which should be divisible by 256");
+    }
+    else
+    {
+        throw std::runtime_error("fmoe_int8_g1u1 Input only supput Int8/Fp8!");
+    }
+
+    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
+                                               input,
+                                               gate,
+                                               down,
+                                               sorted_token_ids,
+                                               sorted_weight_buf,
+                                               sorted_expert_ids,
+                                               num_tokens_post_padded,
+                                               topk,
+                                               // quant args
+                                               input_scale,
+                                               fc1_scale,
+                                               fc2_scale,
+                                               fc2_smooth_scale);
 }
 
 void fmoe_int8_g1u0_a16(torch::Tensor &out,                    // [token_cnt, dim]

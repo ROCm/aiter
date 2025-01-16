@@ -62,12 +62,16 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
                                 fc1_smooth_scale,
                                 fc2_smooth_scale)
     else:
-        a8 = torch.empty((topk * M, model_dim),
-                         dtype=torch.int8, device=device)
-        a8_scale = torch.empty((topk * M), dtype=torch.float, device=device)
+        
+        if fc1_smooth_scale is not None:
+            a8 = torch.empty((topk * M, model_dim),
+                            dtype=torch.int8, device=device)
+            a8_scale = torch.empty((topk * M), dtype=torch.float, device=device)
 
-        ater.moe_smoothquant_fwd(
-            a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
+            ater.moe_smoothquant_fwd(
+                a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
+        else:
+            a8, a8_scale = ater.pertoken_quant(hidden_states, torch.float, quant_dtype=w1.dtype)
 
         if w2.shape[2] == w1.shape[1]:
             fmoe_func = ater.fmoe_int8_g1u0
@@ -103,6 +107,14 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
         dtype=dtype,
         device=hidden_states.device,
     )
+    # g1u1(w1 include gate and up)
+    if w2.shape[2]*2 == w1.shape[1]:
+        moeType = "g1u1"
+        inter_dim = w2.shape[2]
+    # g1u0(w1 only include gate)
+    else:
+        moeType = "g1u0"
+        inter_dim = w1.shape[1]
     # gose to quant D_w8a8/w8a8
     if fc1_scale is not None:
         expert = w1.shape[0]
@@ -124,7 +136,11 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
                 sub_tokens = sub_tokens * (
                     fc1_smooth_scale[E_id])
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
-            act_out = F.gelu(act_input)
+            if moeType == "g1u1":
+                gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
+                act_out = F.silu(gate) * up
+            else:
+                act_out = F.gelu(act_input)
             if fc2_smooth_scale is not None:
                 act_out = act_out * (
                     fc2_smooth_scale[E_id])
