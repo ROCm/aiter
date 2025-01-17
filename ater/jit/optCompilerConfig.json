@@ -271,5 +271,19 @@
         "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_quant": {
+        "srcs": [
+            "f'{ATER_CSRC_DIR}/pybind/quant_pybind.cu'",
+            "f'{ATER_CSRC_DIR}/kernels/quant_kernels.cu'"
+        ],
+        "md_name": "'module_quant'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-DENABLE_FP8'"],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }

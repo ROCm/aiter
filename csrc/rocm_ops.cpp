@@ -16,6 +16,7 @@
 #include "asm_gemm_a8w8.h"
 #include <torch/extension.h>
 #include "gemm_a8w8.h"
+#include "quant.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -47,7 +48,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                float k_scale, float v_scale) -> ()");
 
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
-            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), 
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"),
             py::arg("bias") = std::nullopt, py::arg("splitK") = 0);
 
       m.def("swap_blocks", &swap_blocks,
@@ -103,15 +104,35 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("allocate_meta_buffer", &allocate_meta_buffer);
       m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
 
-
-
       // ck staff start
-      m.def("layernorm2d_fwd", &layernorm2d);
-      m.def("layernorm2d_fwd_with_add", &layernorm2d_with_add);
-      m.def("layernorm2d_fwd_with_smoothquant", &layernorm2d_with_smoothquant);
-      m.def("layernorm2d_fwd_with_add_smoothquant", &layernorm2d_with_add_smoothquant);
-      m.def("layernorm2d_fwd_with_dynamicquant", &layernorm2d_with_dynamicquant);
-      m.def("layernorm2d_fwd_with_add_dynamicquant", &layernorm2d_with_add_dynamicquant);
+      m.def("layernorm2d_fwd", &layernorm2d,
+            py::arg("input"), py::arg("weight"), py::arg("bias"),
+            py::arg("epsilon"), py::arg("x_bias") = std::nullopt);
+      m.def("layernorm2d_fwd_with_add", &layernorm2d_with_add,
+            py::arg("out"), py::arg("input"),
+            py::arg("residual_in"), py::arg("residual_out"),
+            py::arg("weight"), py::arg("bias"),
+            py::arg("epsilon"), py::arg("x_bias") = std::nullopt);
+      m.def("layernorm2d_fwd_with_smoothquant", &layernorm2d_with_smoothquant,
+            py::arg("out"), py::arg("input"),
+            py::arg("xscale"), py::arg("yscale"),
+            py::arg("weight"), py::arg("bias"),
+            py::arg("epsilon"), py::arg("x_bias") = std::nullopt);
+      m.def("layernorm2d_fwd_with_add_smoothquant", &layernorm2d_with_add_smoothquant,
+            py::arg("out"), py::arg("input"),
+            py::arg("residual_in"), py::arg("residual_out"),
+            py::arg("xscale"), py::arg("yscale"),
+            py::arg("weight"), py::arg("bias"),
+            py::arg("epsilon"), py::arg("x_bias") = std::nullopt);
+      m.def("layernorm2d_fwd_with_dynamicquant", &layernorm2d_with_dynamicquant,
+            py::arg("out"), py::arg("input"),
+            py::arg("yscale"), py::arg("weight"), py::arg("bias"),
+            py::arg("epsilon"), py::arg("x_bias") = std::nullopt);
+      m.def("layernorm2d_fwd_with_add_dynamicquant", &layernorm2d_with_add_dynamicquant,
+            py::arg("out"), py::arg("input"),
+            py::arg("residual_in"), py::arg("residual_out"),
+            py::arg("yscale"), py::arg("weight"), py::arg("bias"),
+            py::arg("epsilon"), py::arg("x_bias") = std::nullopt);
       m.def("smoothquant_fwd", &smoothquant_fwd);
       m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
       m.def("moe_sorting_fwd", &moe_sorting_fwd);
@@ -133,9 +154,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("out_") = std::nullopt);
       // ck staff end
 
-
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
+      m.def("fmoe_int8_g1u1", &fmoe_int8_g1u1);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("add", &ater_add, "apply for add with transpose and broadcast.");
       m.def("mul", &ater_mul, "apply for mul with transpose and broadcast.");
@@ -174,4 +195,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("convert_fp8", &convert_fp8,
             "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "
             "str kv_cache_dtype) -> ()");
+
+      m.def("static_scaled_fp8_quant", &static_scaled_fp8_quant);
+      m.def("dynamic_scaled_fp8_quant", &dynamic_scaled_fp8_quant);
+      m.def("dynamic_per_token_scaled_fp8_quant", &dynamic_per_token_scaled_fp8_quant,
+            py::arg("out"), py::arg("input"),
+            py::arg("scales"), py::arg("scale_ub") = std::nullopt);
 }

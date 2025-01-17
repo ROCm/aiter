@@ -14,8 +14,6 @@ from torch import Tensor
 from typing import List, Optional
 from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR
 
-MD_NAME = "module_smoothquant"
-
 
 @compile_ops("module_smoothquant")
 def smoothquant_fwd(input: Tensor, out: Tensor,
@@ -54,3 +52,25 @@ def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype
     hidden_states = (hidden_states / per_token_scale).to(dtype=quant_dtype)
 
     return hidden_states, per_token_scale.to(y_scale_dtype)
+
+
+@compile_ops("module_quant")
+def static_scaled_fp8_quant(
+    out: Tensor, input: Tensor, scale: Tensor
+):...
+
+
+@compile_ops("module_quant")
+def dynamic_scaled_fp8_quant(
+    out: Tensor, input: Tensor, scale: Tensor
+):
+    '''
+    function not correct, need to be fixed
+    '''
+    ...
+
+
+@compile_ops("module_quant")
+def dynamic_per_token_scaled_fp8_quant(
+    out: Tensor, input: Tensor, scales: Tensor, scale_ub: Optional[Tensor] = None
+):...
