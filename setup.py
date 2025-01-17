@@ -177,7 +177,7 @@ if IS_ROCM:
                     '-U__CUDA_NO_HALF_CONVERSIONS__',
                     "-ftemplate-depth=1024",
                     '-DLEGACY_HIPBLAS_DIRECT=ON',
-                ] + cc_flag
+                ] + cc_flag + ['-DENABLE_TORCH_FP8'] if hasattr(torch, 'float8_e4m3fnuz') else []
             }))
     # ########## gradlib for tuned GEMM end here
 else:

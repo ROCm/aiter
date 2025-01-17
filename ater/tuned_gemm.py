@@ -39,15 +39,17 @@ class TunedGemm:
             if len(self.bestsols) > 0 and 'kernelName' in self.bestsols.columns:
                 hipblasltKernelNames = self.bestsols.apply(
                     lambda s: getHipblasltKernelName(s.solidx) if s.libtype == 'hipblaslt' else "", axis=1)
+                pd.set_option('display.max_colwidth', 100)
                 assert hipblasltKernelNames.equals(
-                    self.bestsols['kernelName'].fillna("")), "error: gradlib tune gemm not match the current environment, need re-tune!!!"
+                    self.bestsols['kernelName'].fillna("")), "error: gradlib tune gemm not match the current environment, need re-tune!!!\n" + \
+                    f'differece:\n{pd.concat([self.bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != self.bestsols["kernelName"].fillna("")]}'
 
     def create_ds(self):
         df: pd.DataFrame = self.bestsols
         solds = {}
         for i in range(len(df)):
             ds = df.iloc[i]
-            key = (ds['M'], ds['N'], ds['K'], ds['bias'], ds['dtype'])
+            key = (ds['M'], ds['N'], ds['K'], ds['bias'], ds['dtype'], ds['outdtype'])
             if ds['libtype'] == 'hipblaslt':
                 soltype = self.solMap.index(ds['libtype'])
             elif ds['libtype'] == 'rocblas':
@@ -62,18 +64,18 @@ class TunedGemm:
         ]
 
     @functools.lru_cache(maxsize=1024)
-    def query_sol(self, m, n, k, bias, dtype):
+    def query_sol(self, m, n, k, bias, dtype, otype):
         if dtype == torch.float16 and k % 8 == 0:
             if n > 8 and 0 < m <= 4:
                 return 3, 0
             elif n % 4 == 0 and m == 1 and k <= 8192:
                 return 3, 1
-        soltype, solidx = self.solids.get((m, n, k, bias, str(dtype)), (0, 0))
+        soltype, solidx = self.solids.get((m, n, k, bias, str(dtype), str(otype)), (0, 0))
         logger.info(
             f'using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}')
         return soltype, solidx
 
-    def apply_skinny(self, inp, weights, solidx, bias=None, otype=None):
+    def apply_skinny(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         import ater as ops
         if solidx == 0:
             out = torch.empty(inp.shape[0],
@@ -90,18 +92,19 @@ class TunedGemm:
         if bias is not None:
             return out + bias
 
-    def apply_hipb_mm(self, inp, weights, solidx, bias=None, otype=None):
+    def apply_hipb_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         if otype is None:
             otype = inp.dtype
-        return hipb_mm(inp, weights.t(), solidx, bias=bias, out_dtype=otype)
+        return hipb_mm(inp, weights.t(), solidx,bias, otype, scale_a, scale_b, scale_c)
 
-    def apply_rocb_mm(self, inp, weights, solidx, bias=None, otype=None):
+    def apply_rocb_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
+        assert scale_a != None and scale_b != None and scale_c != None, "scale_a, scale_b, scale_c must be None for rocblas"
         out = rocb_mm(inp, weights.t(), solidx)
         if bias is not None:
             out = out + bias
         return out
 
-    def apply_torch_mm(self, inp, weights, solidx, bias=None, otype=None):
+    def apply_torch_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         if (self.save_gemm == 1):
             m, k = inp.shape
             n = weights.shape[0]
@@ -113,12 +116,28 @@ class TunedGemm:
                     'K': [k],
                     'bias': [bias is not None],
                     'dtype': [inp.dtype],
+                    'outdtype': [otype],
                 })
             ]).drop_duplicates()
             self.tuned_df.to_csv(self.untune_path, index=False)
-        return F.linear(inp, weights, bias)
+        if inp.dtype == torch.float8_e4m3fnuz:
+            if scale_a is None:
+                scale_a = torch.ones(1, dtype=torch.float, device = inp.device)
+            if scale_b is None:
+                scale_b = torch.ones(1, dtype=torch.float, device = inp.device)
+            
+            return torch._scaled_mm(inp,
+                                    weights.t(),
+                                    out_dtype=otype,
+                                    scale_a=scale_a,
+                                    scale_b=scale_b,
+                                    bias=bias)
+        out = F.linear(inp, weights, bias)
+        if otype is not None:
+            out = out.to(otype)
+        return out
 
-    def mm(self, inp, weights, bias=None, otype=None):
+    def mm(self, inp, weights, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         # F.Linear can take a 3 dimensional input. vllm
         # uses this for linear units. However, sampler
         # will use torch.matmul with 2 dimensions only
@@ -141,9 +160,10 @@ class TunedGemm:
                                          n=n,
                                          k=k,
                                          bias=use_bias,
-                                         dtype=inp.dtype)
+                                         dtype=inp.dtype,
+                                         otype=otype)
         out = self.solfuncs[soltype](
-            inp_view, weights, solidx, bias=bias, otype=otype)
+            inp_view, weights, solidx, bias, otype, scale_a, scale_b, scale_c)
         if batched:
             out = out.view(inp.shape[0], inp.shape[1], weights.shape[0])
         return out

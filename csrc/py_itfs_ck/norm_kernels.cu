@@ -1,14 +1,5 @@
-/*
- * Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
- *
- * @Script: norm_kernels.cu
- * @Author: valarLip
- * @Email: lingpeng.jin@amd.com
- * @Create At: 2024-12-02 12:51:48
- * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-02 17:34:35
- * @Description: This is description.
- */
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -18,7 +9,7 @@
 
 void layernorm2d(torch::Tensor &out,    // [m, n]
                  torch::Tensor &input,  // [m, n]
-                 torch::Tensor &weight, // [m, n]
+                 torch::Tensor &weight, // [1, n]
                  torch::Tensor &bias,   // [m, n]
                  double epsilon,
                  std::optional<torch::Tensor> x_bias)
@@ -61,7 +52,7 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
 }
 
 torch::Tensor layernorm2d(torch::Tensor &input,  // [m, n]
-                          torch::Tensor &weight, // [m, n]
+                          torch::Tensor &weight, // [1, n]
                           torch::Tensor &bias,   // [m, n]
                           double epsilon,
                           std::optional<torch::Tensor> x_bias)

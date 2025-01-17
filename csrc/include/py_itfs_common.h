@@ -1,14 +1,5 @@
-/*
- * Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
- *
- * @Script: ck_py_itfs_common.cuh
- * @Author: valarLip
- * @Email: lingpeng.jin@amd.com
- * @Create At: 2024-12-02 12:53:20
- * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-02 13:09:15
- * @Description: This is description.
- */
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 #include <torch/all.h>
@@ -19,7 +10,7 @@
     F("fp16", torch::kHalf)              \
     F("bf16", torch::kBFloat16)          \
     F("int32", torch::kInt32)            \
-    F("int8", torch::kInt8)         \
+    F("int8", torch::kInt8)              \
     F("fp8", c10::kFloat8_e4m3fnuz)
 
 inline std::string torchDTypeToStr(caffe2::TypeMeta dtype)

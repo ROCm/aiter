@@ -1,3 +1,18 @@
+'''
+ * Copyright (c) 2024, The vLLM team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ '''
 import argparse
 import json
 import os
@@ -36,7 +51,7 @@ dtypes = {
     'float16': torch.float16,
     'bf16': torch.bfloat16,
     'bfloat16': torch.bfloat16,
-    # 'fp8': torch.float8_e4m3fnuz,
+    'fp8': torch.float8_e4m3fnuz,
 }
 
 
@@ -125,7 +140,9 @@ if __name__ == '__main__':
         if not Path(args.input_file).is_file():
             print(f">>> ERROR: {args.input_file} does not exist.  Exiting")
             exit(1)
-        shapes = pd.read_csv(args.input_file)
+        shapes = pd.read_csv(args.input_file).fillna('')
+        if 'outdtype' not in shapes.columns:
+            shapes['outdtype'] = ''
         for i in range(len(shapes)):
             ds = shapes.iloc[i]
             for bias in [True, False] if args.all_bias else [ds['bias']]:
@@ -133,7 +150,8 @@ if __name__ == '__main__':
                                 ds['N'],
                                 ds['K'],
                                 indtype=get_dtype(ds['dtype']),
-                                bias=bias)
+                                bias=bias,
+                                outdtype=get_dtype(ds['outdtype']))
     else:
         if not args.model_dir:
             print(">>> Warning! NO MODEL SPECIFIED. Tuning for LL2 13B TP1")

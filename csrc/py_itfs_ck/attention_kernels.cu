@@ -1,14 +1,5 @@
-/*
- * Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
- *
- * @Script: attention_kernels.cu
- * @Author: valarLip
- * @Email: lingpeng.jin@amd.com
- * @Create At: 2024-12-04 20:28:50
- * @Last Modified By: valarLip
- * @Last Modified At: 2024-12-05 17:56:48
- * @Description: This is description.
- */
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -16,11 +7,11 @@
 #include "py_itfs_common.h"
 #include "ck_tile/ref/naive_attention.hpp"
 
-torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_size]
-                           torch::Tensor &K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
-                                             // or[num_batch, seqlen, num_kv_heads, head_size]
-                           torch::Tensor &V, //   [num_blocks, num_kv_heads, head_size, block_size]
-                                             // or[num_batch*seqlen, num_kv_heads, head_size]
+torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_heads, head_size]
+                           torch::Tensor &K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
+                                                        // or[num_batch, seqlen, num_kv_heads, head_size]
+                           torch::Tensor &V,            //   [num_blocks, num_kv_heads, head_size, block_size]
+                                                        // or[num_batch*seqlen, num_kv_heads, head_size]
                            torch::Tensor &block_tables, // [num_seqs, max_num_blocks_per_seq]
                            torch::Tensor &context_lens,
                            torch::Tensor &k_dequant_scales, // [num_heads, max_kv_tokens]
@@ -31,9 +22,8 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
                            const float scale_k,
                            const float scale_v,
                            const int block_size,
-                           const int quant_algo,    // 0: no quant, 1: per-token FP8 quant
-                           std::optional<torch::Tensor> &out_
-)
+                           const int quant_algo, // 0: no quant, 1: per-token FP8 quant
+                           std::optional<torch::Tensor> &out_)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -46,7 +36,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_siz
     int hdim_q = Q.size(2);
     int hdim_v = V.size(2);
     int max_num_blocks_per_seq = block_tables.size(1);
-    int max_kv_tokens = k_dequant_scales.numel() == 0? 0 : k_dequant_scales.size(1);
+    int max_kv_tokens = k_dequant_scales.numel() == 0 ? 0 : k_dequant_scales.size(1);
 
     ck_tile::naive_attention_fwd_traits naive_t;
     naive_t.q_type = torchDTypeToStr(Q.dtype());

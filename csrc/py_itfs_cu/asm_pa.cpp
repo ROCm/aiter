@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
@@ -44,9 +46,9 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      torch::Tensor &block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor &context_lens, //   [num_seqs]
                      int max_num_blocks,
-                     std::optional<torch::Tensor>& K_QScale,
-                     std::optional<torch::Tensor>& V_QScale,
-                     std::optional<torch::Tensor>& out_)
+                     std::optional<torch::Tensor> &K_QScale,
+                     std::optional<torch::Tensor> &V_QScale,
+                     std::optional<torch::Tensor> &out_)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch = context_lens.size(0);
@@ -99,13 +101,13 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
         impl_ptr = &impl_a16w8;
 
     impl_ptr->launch_kernel({&args,
-                            &arg_size,
-                            1,     // gdx
-                            batch, // gdy
-                            1,     // gdz
-                            256,   // bdx: 4 wv64
-                            1,     // bdy
-                            1,     // bdz
-                            stream});
+                             &arg_size,
+                             1,     // gdx
+                             batch, // gdy
+                             1,     // gdz
+                             256,   // bdx: 4 wv64
+                             1,     // bdy
+                             1,     // bdz
+                             stream});
     return output;
 }
