@@ -287,7 +287,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
                                                fc2_smooth_scale);
 }
 
-void fmoe_int8_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
+void fmoe_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
                     torch::Tensor &input,                  // [token_cnt, dim] M,K
                     torch::Tensor &gate,                   // [expert, inter_dim*2, dim] N,K
                     torch::Tensor &down,                   // [expert, dim, inter_dim]
@@ -330,7 +330,7 @@ void fmoe_int8_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
         else if ((hidden_dim % 128) == 0)
             impl_ptr = &impl_int8_128;
         else
-            throw std::runtime_error("fmoe_int8_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
+            throw std::runtime_error("fmoe_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
                                      ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
@@ -339,12 +339,12 @@ void fmoe_int8_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
         if ((hidden_dim % 256) == 0)
             impl_ptr = &impl_fp8_256;
         else
-            throw std::runtime_error("fmoe_int8_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
+            throw std::runtime_error("fmoe_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
                                      ", which should be divisible by 256");
     }
     else
     {
-        throw std::runtime_error("fmoe_int8_g1u1 Input only supput Int8/Fp8!");
+        throw std::runtime_error("fmoe_g1u1 Input only supput Int8/Fp8!");
     }
 
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,

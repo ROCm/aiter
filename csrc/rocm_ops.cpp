@@ -17,6 +17,7 @@
 #include <torch/extension.h>
 #include "gemm_a8w8.h"
 #include "quant.h"
+#include "moe_ck.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -156,7 +157,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
-      m.def("fmoe_int8_g1u1", &fmoe_int8_g1u1);
+      m.def("fmoe_g1u1", &fmoe_g1u1);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("add", &ater_add, "apply for add with transpose and broadcast.");
       m.def("mul", &ater_mul, "apply for mul with transpose and broadcast.");
@@ -201,4 +202,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("dynamic_per_token_scaled_fp8_quant", &dynamic_per_token_scaled_fp8_quant,
             py::arg("out"), py::arg("input"),
             py::arg("scales"), py::arg("scale_ub") = std::nullopt);
+      m.def("ck_moe", &ck_moe,
+          py::arg("hidden_states"), py::arg("w1"), py::arg("w2"),
+          py::arg("topk_weights"), py::arg("topk_ids"),
+          py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
+          py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
+          py::arg("block_m") = 32);
 }

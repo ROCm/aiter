@@ -130,19 +130,36 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_moe": {
+    "module_moe_asm": {
         "srcs": [
             "f'{ATER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
             "f'{ATER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{ATER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
             "f'{ATER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp'"
         ],
-        "md_name": "'module_moe'",
+        "md_name": "'module_moe_asm'",
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
         "isASM": "True",
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "module_moe": {
+        "srcs": [
+            "f'{ATER_CSRC_DIR}/pybind/moe_ck_pybind.cu'",
+            "f'{CK_DIR}/example/ck_tile/15_fused_moe/instances'",
+            "f'{ATER_CSRC_DIR}/py_itfs_ck/moe_kernels.cu'"
+        ],
+        "md_name": "'module_moe'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/15_fused_moe'"
+        ],
+        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },

@@ -76,7 +76,7 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
         if w2.shape[2] == w1.shape[1]:
             fmoe_func = ater.fmoe_int8_g1u0
         elif w2.shape[2]*2 == w1.shape[1]:
-            fmoe_func = ater.fmoe_int8_g1u1
+            fmoe_func = ater.fmoe_g1u1
         else:
             raise ValueError(f"Invalid MoE weight: {w1.shape=} {w2.shape=}")
 

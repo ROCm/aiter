@@ -3,10 +3,8 @@ from typing import List, Optional
 from ..jit.core import compile_ops, CK_DIR, ATER_CSRC_DIR, ATER_ROOT_DIR
 import torch.nn.functional as F
 
-MD_NAME = "module_moe"
 
-
-@compile_ops("module_moe")
+@compile_ops("module_moe_asm")
 def topk_softmax(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -16,11 +14,11 @@ def topk_softmax(
 ): ...
 
 
-@compile_ops("module_moe")
+@compile_ops("module_moe_asm")
 def moe_sum(input: Tensor, output: Tensor): ...
 
 
-@compile_ops("module_moe")
+@compile_ops("module_moe_asm")
 def moe_align_block_size(
     topk_ids: Tensor,
     num_experts: int,
@@ -32,7 +30,7 @@ def moe_align_block_size(
 ): ...
 
 
-@compile_ops("module_moe")
+@compile_ops("module_moe_asm")
 def fmoe(
     out: Tensor,
     input: Tensor,
@@ -46,7 +44,7 @@ def fmoe(
 ): ...
 
 
-@compile_ops("module_moe")
+@compile_ops("module_moe_asm")
 def fmoe_int8_g1u0(
     out: Tensor,
     input: Tensor,
@@ -64,8 +62,8 @@ def fmoe_int8_g1u0(
 ): ...
 
 
-@compile_ops("module_moe")
-def fmoe_int8_g1u1(
+@compile_ops("module_moe_asm")
+def fmoe_g1u1(
     out: Tensor,
     input: Tensor,
     gate: Tensor,
@@ -82,7 +80,7 @@ def fmoe_int8_g1u1(
 ): ...
 
 
-@compile_ops("module_moe")
+@compile_ops("module_moe_asm")
 def fmoe_int8_g1u0_a16(
     out: Tensor,
     input: Tensor,  # bf16
@@ -98,3 +96,27 @@ def fmoe_int8_g1u0_a16(
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
 ): ...
+
+
+@compile_ops("module_moe")
+def ck_moe(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    topk_weight: Tensor,
+    topk_ids: Tensor,
+    A: Tensor,
+    B: Tensor,
+    C: Tensor,
+    D: Tensor,
+    E: Tensor,
+    fc1_scale: Optional[Tensor] = None,
+    fc2_scale: Optional[Tensor] = None,
+    fc1_smooth_scale: Optional[Tensor] = None,
+    fc2_smooth_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32
+): 
+    '''
+    Function error
+    '''
+    ...
