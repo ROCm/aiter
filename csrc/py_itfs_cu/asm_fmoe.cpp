@@ -265,12 +265,11 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
         else if ((hidden_dim % 128) == 0)
             impl_ptr = &impl_int8_128;
         else
-            throw std::runtime_error("fmoe_int8_g1u0 Unsupported hidden_dim " + std::to_string(hidden_dim) +
-                                     ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+            TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else
     {
-        throw std::runtime_error("fmoe_int8_g1u0 Input only supput Int8!");
+        TORCH_CHECK(false, __func__, " Input only supput Int8!");
     }
 
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
@@ -289,19 +288,19 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
                                                fc2_smooth_scale);
 }
 
-void fmoe_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
-                    torch::Tensor &input,                  // [token_cnt, dim] M,K
-                    torch::Tensor &gate,                   // [expert, inter_dim*2, dim] N,K
-                    torch::Tensor &down,                   // [expert, dim, inter_dim]
-                    torch::Tensor &sorted_token_ids,       // [max_num_tokens_padded]
-                    torch::Tensor &sorted_weight_buf,      // [max_num_tokens_padded]
-                    torch::Tensor &sorted_expert_ids,      // [max_num_m_blocks]
-                    torch::Tensor &num_tokens_post_padded, // [1]
-                    uint32_t topk,                         //
-                    torch::Tensor &input_scale,            // [token_cnt, 1]
-                    torch::Tensor &fc1_scale,              // [expert, 1, hidden_dim]
-                    torch::Tensor &fc2_scale,              // [expert, 1, dim]
-                    torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
+void fmoe_g1u1(torch::Tensor &out,                                          // [token_cnt, dim]
+               torch::Tensor &input,                                        // [token_cnt, dim] M,K
+               torch::Tensor &gate,                                         // [expert, inter_dim*2, dim] N,K
+               torch::Tensor &down,                                         // [expert, dim, inter_dim]
+               torch::Tensor &sorted_token_ids,                             // [max_num_tokens_padded]
+               torch::Tensor &sorted_weight_buf,                            // [max_num_tokens_padded]
+               torch::Tensor &sorted_expert_ids,                            // [max_num_m_blocks]
+               torch::Tensor &num_tokens_post_padded,                       // [1]
+               uint32_t topk,                                               //
+               torch::Tensor &input_scale,                                  // [token_cnt, 1]
+               torch::Tensor &fc1_scale,                                    // [expert, 1, hidden_dim]
+               torch::Tensor &fc2_scale,                                    // [expert, 1, dim]
+               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt // [expert, 1, hidden_dim]
 )
 {
     FMoeKernel *impl_ptr = nullptr;
@@ -332,22 +331,40 @@ void fmoe_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
         else if ((hidden_dim % 128) == 0)
             impl_ptr = &impl_int8_128;
         else
-            throw std::runtime_error("fmoe_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
-                                     ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+            TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
+        static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
+        static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
+        static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
+        static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
         static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
-        if ((hidden_dim % 256) == 0)
+        static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
+        static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
+        if ((hidden_dim % 512) == 0)
+            impl_ptr = &impl_fp8_512;
+        else if ((hidden_dim % 448) == 0)
+            impl_ptr = &impl_fp8_448;
+        else if ((hidden_dim % 384) == 0)
+            impl_ptr = &impl_fp8_384;
+        else if ((hidden_dim % 320) == 0)
+            impl_ptr = &impl_fp8_320;
+        else if ((hidden_dim % 256) == 0)
             impl_ptr = &impl_fp8_256;
+        else if ((hidden_dim % 192) == 0)
+            impl_ptr = &impl_fp8_192;
+        else if ((hidden_dim % 128) == 0)
+            impl_ptr = &impl_fp8_128;
         else
-            throw std::runtime_error("fmoe_g1u1 Unsupported hidden_dim " + std::to_string(hidden_dim) +
-                                     ", which should be divisible by 256");
+            TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else
     {
-        throw std::runtime_error("fmoe_g1u1 Input only supput Int8/Fp8!");
+        TORCH_CHECK(false, __func__, " Input only supput Int8/Fp8!");
     }
+
+    torch::Tensor fc2_smooth_scale_value = !fc2_smooth_scale ? torch::empty_like(input_scale) : fc2_smooth_scale.value();
 
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
                                                input,
@@ -362,7 +379,7 @@ void fmoe_g1u1(torch::Tensor &out,                    // [token_cnt, dim]
                                                input_scale,
                                                fc1_scale,
                                                fc2_scale,
-                                               fc2_smooth_scale);
+                                               fc2_smooth_scale_value);
 }
 
 void fmoe_int8_g1u0_a16(torch::Tensor &out,                    // [token_cnt, dim]

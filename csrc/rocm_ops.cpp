@@ -159,7 +159,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
-      m.def("fmoe_g1u1", &fmoe_g1u1);
+      m.def("fmoe_g1u1", &fmoe_g1u1,
+            py::arg("out"), py::arg("input"),
+            py::arg("gate"), py::arg("down"),
+            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),
+            py::arg("sorted_expert_ids"), py::arg("num_tokens_post_padded"),
+            py::arg("topk"), py::arg("input_scale"),
+            py::arg("fc1_scale"), py::arg("fc2_scale"),
+            py::arg("fc2_smooth_scale") = std::nullopt);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("add", &ater_add, "apply for add with transpose and broadcast.");
       m.def("mul", &ater_mul, "apply for mul with transpose and broadcast.");
@@ -205,9 +212,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("out"), py::arg("input"),
             py::arg("scales"), py::arg("scale_ub") = std::nullopt);
       m.def("ck_moe", &ck_moe,
-          py::arg("hidden_states"), py::arg("w1"), py::arg("w2"),
-          py::arg("topk_weights"), py::arg("topk_ids"),
-          py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
-          py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
-          py::arg("block_m") = 32);
+            py::arg("hidden_states"), py::arg("w1"), py::arg("w2"),
+            py::arg("topk_weights"), py::arg("topk_ids"),
+            py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
+            py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
+            py::arg("block_m") = 32);
 }
