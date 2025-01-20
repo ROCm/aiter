@@ -46,7 +46,7 @@ private:
 public:
     AterAsmKernel(const char *name, const char *hsaco)
     {
-        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << "GetFunction: " << hsaco;
+        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << hsaco;
         HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;

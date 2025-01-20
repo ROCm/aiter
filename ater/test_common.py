@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-03 15:53:32
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-13 10:27:10
+# @Last Modified At: 2025-01-17 10:02:34
 # @Description: This is description.
 
 import torch
@@ -143,7 +143,7 @@ def tensor_dump(x: torch.tensor, name: str, dir='./'):
     x_cpu.numpy().tofile(filename)
     logger.info(f'saving {filename} {x.shape}, {x.dtype}')
 
-    with open(f'{name}.meta', 'w') as f:
+    with open(f'{dir}/{name}.meta', 'w') as f:
         f.writelines([f'{el}\n' for el in [x.shape, x.dtype]])
 
 

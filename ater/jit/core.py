@@ -6,7 +6,7 @@
 # @Email: lingpeng.jin@amd.com
 # @Create At: 2024-11-29 15:58:57
 # @Last Modified By: valarLip
-# @Last Modified At: 2025-01-03 16:44:37
+# @Last Modified At: 2025-01-14 16:15:31
 # @Description: This is description.
 
 import os
@@ -32,8 +32,8 @@ PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 ATER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 ATER_CSRC_DIR = f'{ATER_ROOT_DIR}/csrc'
-CK_DIR = os.environ.get(
-    "CK_DIR", f"{ATER_ROOT_DIR}/3rdparty/composable_kernel")
+CK_DIR = os.environ.get("CK_DIR",
+                        f"{ATER_ROOT_DIR}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
 # copy ck to build, thus hippify under bd_dir
 shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
@@ -153,7 +153,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         if isinstance(blob_gen_cmd, list):
             for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd,op_dir, src_dir, sources)
+                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
         else:
             sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
@@ -190,20 +190,23 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module
 
-def get_args_of_build(ops_name:str):
+
+def get_args_of_build(ops_name: str):
     d_opt_build_args = {"srcs": [],
-        "md_name": "",
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
-        "extra_ldflags": None,
-        "extra_include": [],
-        "verbose": False,
-        "blob_gen_cmd": ""
-        }
-    def convert(d_ops:dict):
-        ## judge isASM
+                        "md_name": "",
+                        "flags_extra_cc": [],
+                        "flags_extra_hip": [],
+                        "extra_ldflags": None,
+                        "extra_include": [],
+                        "verbose": False,
+                        "blob_gen_cmd": ""
+                        }
+
+    def convert(d_ops: dict):
+        # judge isASM
         if d_ops["isASM"].lower() == "true":
-            d_ops["flags_extra_hip"].append("rf'-DATER_ASM_DIR=\\\"{ATER_ROOT_DIR}/hsa/\\\"'")
+            d_ops["flags_extra_hip"].append(
+                "rf'-DATER_ASM_DIR=\\\"{ATER_ROOT_DIR}/hsa/\\\"'")
         del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):
@@ -221,21 +224,21 @@ def get_args_of_build(ops_name:str):
         if isinstance(data, dict):
             # parse all ops
             if ops_name == "all":
-                d_all_ops = {"srcs":[],
-                    "flags_extra_cc" : [],
-                    "flags_extra_hip": [],
-                    "extra_include": [],
-                    "blob_gen_cmd": []}
+                d_all_ops = {"srcs": [],
+                             "flags_extra_cc": [],
+                             "flags_extra_hip": [],
+                             "extra_include": [],
+                             "blob_gen_cmd": []}
                 # traverse opts
                 for ops_name, d_ops in data.items():
-                    ## Cannot contain tune ops
+                    # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
                             d_all_ops[k] += single_ops[k]
-                        elif isinstance(single_ops[k], str) and single_ops[k]!='':
+                        elif isinstance(single_ops[k], str) and single_ops[k] != '':
                             d_all_ops[k].append(single_ops[k])
 
                 # print(d_all_ops)
@@ -252,7 +255,7 @@ def get_args_of_build(ops_name:str):
             print("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
 
 
-def compile_ops(ops_name : str, fc_name: Optional[str] = None):
+def compile_ops(ops_name: str, fc_name: Optional[str] = None):
     def decorator(func):
         def wrapper(*args, **kwargs):
             d_args = get_args_of_build(ops_name)

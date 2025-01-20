@@ -72,7 +72,7 @@ private:
 public:
     FMoeKernel(const char *name, const char *hsaco, uint32_t sub_GU = 512)
     {
-        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << "GetFunction: " << hsaco;
+        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << hsaco;
         HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;

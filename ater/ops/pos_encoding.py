@@ -7,7 +7,7 @@ MD_NAME = "module_pos_encoding"
 
 
 @compile_ops("module_pos_encoding")
-def rotary_embedding(
+def rotary_embedding_fwd(
     positions: Tensor,
     query: Tensor,
     key: Tensor,

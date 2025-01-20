@@ -234,12 +234,14 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype,  withGraph=False, perTKQuant=
         break
     # if debug_mode == DUMP:
     #     for i, el in enumerate(xs):
-    #         tensor_dump(el, f'input{i}')
-    #     tensor_dump(res_in, f'res_in')
-    #     tensor_dump(weight, f'weight')
-    #     tensor_dump(bias, f'bias')
-    #     tensor_dump(ref_res, f'res_out')
-    #     tensor_dump(ref_out, f'output')
+    #         tensor_dump(el, f'input{i}', dir='./debug')
+    #     tensor_dump(res_in, f'res_in', dir='./debug')
+    #     tensor_dump(weight, f'weight', dir='./debug')
+    #     tensor_dump(bias, f'bias', dir='./debug')
+    #     tensor_dump(xscale, f'xscale', dir='./debug')
+    #     tensor_dump(yscale, f'yscale', dir='./debug')
+    #     tensor_dump(ref_res, f'res_out', dir='./debug')
+    #     tensor_dump(ref_out, f'output', dir='./debug')
     print(
         f'finished test_all_reduce_rmsnorm: {tp_size=}, {shape=}, {dtype=}, {withGraph=}, {perTKQuant=}\n')
 
@@ -257,4 +259,3 @@ if __name__ == '__main__':
             # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False)
             test_all_reduce_rmsnorm(
                 8, shape, dtype, withGraph=False, perTKQuant=True)
-            # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=True)

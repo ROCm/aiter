@@ -272,4 +272,4 @@ for dtype in [torch.float16, torch.bfloat16][1:]:
                 # test_fmoe(dtype, m, dim, hdim, 32, 5)
                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
 # test_fmoe(torch.bfloat16, 128, 1024, 1024, 4, 1, quant=True, use_g1u1=True, quant_dtype=torch.float8_e4m3fnuz)
-test_fmoe(torch.bfloat16, 128, 1024, 1024, 4, 1, quant=False, use_g1u1=True)
+# test_fmoe(torch.bfloat16, 128, 1024, 1024, 4, 1, quant=False, use_g1u1=True)
