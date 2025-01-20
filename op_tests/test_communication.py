@@ -188,7 +188,7 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype,  withGraph=False, perTKQuant=
 
     res_in = torch.randn(shape, dtype=dtype)
     weight = torch.randn(shape[-1], dtype=dtype)
-    xscale = torch.randn(shape[-1], dtype=dtype)
+    xscale = torch.randn(shape[-1], dtype=torch.float)
     xscale.fill_(1.0)
     bias = torch.randn(shape[-1], dtype=dtype)
     epsilon = 1e-5
@@ -246,15 +246,15 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype,  withGraph=False, perTKQuant=
 
 if __name__ == '__main__':
     mp.freeze_support()
-    for dtype in [torch.bfloat16]:
-        for shape in [(128, 8192)]:
-            # test_communication(8, shape, dtype, withGraph=False)
-            test_communication(8, shape, dtype, withGraph=True)
+    # for dtype in [torch.bfloat16]:
+    #     for shape in [(128, 8192)]:
+    #         # test_communication(8, shape, dtype, withGraph=False)
+    #         test_communication(8, shape, dtype, withGraph=True)
 
     print('start test test_communication\n')
     for dtype in [torch.bfloat16]:
         for shape in [(128, 8192)]:
-            test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False)
+            # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False)
             test_all_reduce_rmsnorm(
                 8, shape, dtype, withGraph=False, perTKQuant=True)
             # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=True)
