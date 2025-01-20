@@ -521,213 +521,316 @@ namespace vllm
       }
     }
   }
+
+  template <class _T, int _rows, int _vec, typename Operation, bool order_flag>
+  __global__ void operator_bcast_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int M, const int N, const int K)
+  {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n_tiles = N / _rows;
+    uint32_t k_tiles = K / _vec;
+    if (idx < (uint64_t)M * n_tiles * k_tiles)
+    {
+      uint32_t ti = idx / (k_tiles * n_tiles);
+      uint64_t idx_block = idx % (k_tiles * n_tiles);
+      uint32_t tj = (idx_block / k_tiles) % n_tiles;
+      uint32_t tk = idx_block % k_tiles;
+      for (int row = 0; row < _rows; row++)
+      {
+        uint64_t offset_b = (uint64_t)(tj + row * n_tiles) * K + tk * _vec;
+        uint64_t offset_ac = (uint64_t)(tj + row * n_tiles) * K + tk * _vec + (uint64_t)ti * N * K;
+        const _T *pa = (const _T *)a + offset_ac;
+        const _T *pb = (const _T *)b + offset_b;
+        _T *pc = (_T *)c + offset_ac;
+        for (int col = 0; col < _vec; col++)
+        {
+          const _T *pfa = (const _T *)(pa + col);
+          const _T *pfb = (const _T *)(pb + col);
+          _T *pfc = (_T *)(pc + col);
+          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
+        }
+      }
+    }
+  }
 }
 
 template <typename Operation>
 torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
-  constexpr uint32_t PATTERN_TRANSPOSE = 1;
-  constexpr uint32_t PATTERN_BROADCAST_0 = 2;
-  constexpr uint32_t PATTERN_BROADCAST_1 = 3;
 
-  // if (dim == 3 && (!input.is_contiguous() || !other.is_contiguous()))
-  // {
-  //   Operation::print(input.size(0), input.size(1), input.size(2),
-  //                    input.stride(0), input.stride(1), input.stride(2),
-  //                    other.stride(0), other.stride(1), other.stride(2));
-  // }
-  auto tensor_not_conti = input.is_contiguous() ? other : input;
-  bool order_flag;
-  int M, N, K;
-  int stride0, stride1, stride2;
-  int pattern = 0;
-  if (input.is_contiguous() != other.is_contiguous())
+  if (dim == 2)
   {
-    order_flag = !input.is_contiguous() ? true : false;
     bool is_support = true;
-    M = input.size(0);
-    N = input.size(1);
-    K = input.size(2);
-    // avoid broadcast
     is_support &= input.dim() == other.dim();
-    is_support &= dim == 3;
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
-    is_support &= input.size(2) == other.size(2);
-    stride0 = tensor_not_conti.stride(0);
-    stride1 = tensor_not_conti.stride(1);
-    stride2 = tensor_not_conti.stride(2);
-    is_support &= stride1 == 1;
-    stride0 *= input.element_size();
-    stride1 *= input.element_size();
-    stride2 *= input.element_size();
-    pattern = is_support ? PATTERN_TRANSPOSE : 0;
-  }
-  else if (input.is_contiguous() && other.is_contiguous())
-  {
-    bool is_support = false;
-    is_support &= input.dim() == other.dim();
-    is_support &= dim == 3;
-    if (!is_support && other.size(0) == 1)
+    is_support &= input.size(1) > 512;
+    is_support &= input.is_contiguous() == other.is_contiguous();
+    is_support &= input.is_contiguous() == true;
+    int M = 1;
+    int N = input.size(0);
+    int K = input.size(1);
+    const uint32_t rows = 8;
+    const uint32_t vec = 16 / sizeof(input.dtype());
+    is_support &= N % rows == 0;
+    is_support &= K % vec == 0;
+    if (is_support)
     {
-      is_support = true;
-      is_support &= input.size(0) > 1;
-      is_support &= other.size(0) == 1;
+      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+      auto output = torch::empty({N, K}, options);
+      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+      int elements = N * K;
+
+      constexpr uint32_t wg = 256;
+      int grid_x = (elements / (rows * vec) + wg - 1) / wg;
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+
+      VLLM_DISPATCH_FLOATING_TYPES(
+          input.scalar_type(), "operator_bcast_tile_kernel", [&]
+          { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
+      return output;
+    }
+    else
+    {
+      return vllm::aten_compute<Operation>(input, other);
+    }
+  }
+  else if (dim == 3)
+  {
+    constexpr uint32_t PATTERN_TRANSPOSE = 1;
+    constexpr uint32_t PATTERN_BROADCAST_0 = 2;
+    constexpr uint32_t PATTERN_BROADCAST_1 = 3;
+
+    // if (dim == 3 && (!input.is_contiguous() || !other.is_contiguous()))
+    // {
+    //   Operation::print(input.size(0), input.size(1), input.size(2),
+    //                    input.stride(0), input.stride(1), input.stride(2),
+    //                    other.stride(0), other.stride(1), other.stride(2));
+    // }
+    auto tensor_not_conti = input.is_contiguous() ? other : input;
+    bool order_flag;
+    int M, N, K;
+    int stride0, stride1, stride2;
+    int pattern = 0;
+    if (input.is_contiguous() != other.is_contiguous())
+    {
+      order_flag = !input.is_contiguous() ? true : false;
+      bool is_support = true;
+      M = input.size(0);
+      N = input.size(1);
+      K = input.size(2);
+      // avoid broadcast
+      is_support &= input.dim() == other.dim();
+      is_support &= dim == 3;
+      is_support &= input.size(0) == other.size(0);
       is_support &= input.size(1) == other.size(1);
       is_support &= input.size(2) == other.size(2);
-      pattern = is_support ? PATTERN_BROADCAST_0 : 0;
-      order_flag = true;
+      stride0 = tensor_not_conti.stride(0);
+      stride1 = tensor_not_conti.stride(1);
+      stride2 = tensor_not_conti.stride(2);
+      is_support &= stride1 == 1;
+      stride0 *= input.element_size();
+      stride1 *= input.element_size();
+      stride2 *= input.element_size();
+      pattern = is_support ? PATTERN_TRANSPOSE : 0;
+    }
+    else if (input.is_contiguous() && other.is_contiguous())
+    {
+      bool is_support = false;
+      is_support &= input.dim() == other.dim();
+      is_support &= dim == 3;
+      if (!is_support && other.size(0) == 1)
+      {
+        is_support = true;
+        is_support &= input.size(0) > 1;
+        is_support &= other.size(0) == 1;
+        is_support &= input.size(1) == other.size(1);
+        is_support &= input.size(2) == other.size(2);
+        pattern = is_support ? PATTERN_BROADCAST_0 : 0;
+        order_flag = true;
+      }
+
+      if (!is_support && input.size(0) == 1)
+      {
+        is_support = true;
+        is_support &= other.size(0) > 1;
+        is_support &= input.size(0) == 1;
+        is_support &= input.size(1) == other.size(1);
+        is_support &= input.size(2) == other.size(2);
+        pattern = is_support ? PATTERN_BROADCAST_0 : 0;
+        order_flag = false;
+      }
+
+      if (!is_support && input.size(1) == 1)
+      {
+        is_support = true;
+        is_support &= other.size(1) > 1;
+        is_support &= input.size(0) == other.size(0);
+        is_support &= input.size(2) == other.size(2);
+        pattern = is_support ? PATTERN_BROADCAST_1 : 0;
+        order_flag = true;
+      }
+
+      if (!is_support && other.size(1) == 1)
+      {
+        is_support = true;
+        is_support &= input.size(1) > 1;
+        is_support &= input.size(0) == other.size(0);
+        is_support &= input.size(2) == other.size(2);
+        pattern = is_support ? PATTERN_BROADCAST_1 : 0;
+        order_flag = false;
+      }
     }
 
-    if (!is_support && input.size(0) == 1)
+    if (pattern == PATTERN_TRANSPOSE)
     {
-      is_support = true;
-      is_support &= other.size(0) > 1;
-      is_support &= input.size(0) == 1;
-      is_support &= input.size(1) == other.size(1);
-      is_support &= input.size(2) == other.size(2);
-      pattern = is_support ? PATTERN_BROADCAST_0 : 0;
-      order_flag = false;
+      constexpr uint32_t BIG_TILE_SIZE_N = 64;
+      constexpr uint32_t BIG_TILE_SIZE_K = 64;
+      constexpr uint32_t M_SWIZZLE = 8;
+      const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(256, 1, 1);
+
+      auto options =
+          torch::TensorOptions().dtype(input.dtype()).device("cuda");
+      auto output =
+          torch::empty(input.sizes(), options);
+      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+
+      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_tn_big_tile_kernel", [&]
+            { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_tn_big_tile_kernel", [&]
+            { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
+      }
+
+      return output;
     }
-
-    if (!is_support && input.size(1) == 1)
+    else if (pattern == PATTERN_BROADCAST_0)
     {
-      is_support = true;
-      is_support &= other.size(1) > 1;
-      is_support &= input.size(0) == other.size(0);
-      is_support &= input.size(2) == other.size(2);
-      pattern = is_support ? PATTERN_BROADCAST_1 : 0;
-      order_flag = true;
+      M = order_flag ? input.size(0) : other.size(0);
+      N = order_flag ? input.size(1) : other.size(1);
+      K = order_flag ? input.size(2) : other.size(2);
+      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+      auto output = torch::empty({M, N, K}, options);
+      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+      int elements = M * N * K;
+      const uint32_t rows = 8;
+      const uint32_t vec = 16 / sizeof(input.dtype());;
+      if (N % rows == 0 && K % vec == 0)
+      {
+        constexpr uint32_t wg = 64;
+        int grid_x = (elements / (rows * vec) + wg - 1) / wg;
+        const dim3 grid_dim(grid_x, 1, 1);
+        const dim3 block_dim(wg, 1, 1);
+
+        if (order_flag)
+        {
+          VLLM_DISPATCH_FLOATING_TYPES(
+              input.scalar_type(), "operator_bcast_tile_kernel", [&]
+              { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
+                    <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
+        }
+        else
+        {
+          VLLM_DISPATCH_FLOATING_TYPES(
+              input.scalar_type(), "operator_bcast_tile_kernel", [&]
+              { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, false>
+                    <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
+        }
+      }
+      else
+      {
+        constexpr uint32_t BIG_TILE_SIZE_N = 64;
+        constexpr uint32_t BIG_TILE_SIZE_K = 64;
+        constexpr uint32_t M_SWIZZLE = 8;
+        const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+        const dim3 grid_dim(grid_x, 1, 1);
+        const dim3 block_dim(256, 1, 1);
+
+        if (order_flag)
+        {
+          VLLM_DISPATCH_FLOATING_TYPES(
+              input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+              { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                    <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+        }
+        else
+        {
+          VLLM_DISPATCH_FLOATING_TYPES(
+              input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+              { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                    <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+        }
+      }
+
+      return output;
     }
-
-    if (!is_support && other.size(1) == 1)
+    else if (pattern == PATTERN_BROADCAST_1)
     {
-      is_support = true;
-      is_support &= input.size(1) > 1;
-      is_support &= input.size(0) == other.size(0);
-      is_support &= input.size(2) == other.size(2);
-      pattern = is_support ? PATTERN_BROADCAST_1 : 0;
-      order_flag = false;
-    }
-  }
+      M = order_flag ? other.size(0) : input.size(0);
+      N = order_flag ? other.size(1) : input.size(1);
+      K = order_flag ? other.size(2) : input.size(2);
+      constexpr uint32_t BIG_TILE_SIZE_N = 64;
+      constexpr uint32_t BIG_TILE_SIZE_K = 64;
+      constexpr uint32_t M_SWIZZLE = 8;
+      const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(256, 1, 1);
 
-  if (pattern == PATTERN_TRANSPOSE)
-  {
-    constexpr uint32_t BIG_TILE_SIZE_N = 64;
-    constexpr uint32_t BIG_TILE_SIZE_K = 64;
-    constexpr uint32_t M_SWIZZLE = 8;
-    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-    const dim3 grid_dim(grid_x, 1, 1);
-    const dim3 block_dim(256, 1, 1);
+      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
+      auto output = torch::empty({M, N, K}, options);
+      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
-    auto options =
-        torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output =
-        torch::empty(input.sizes(), options);
-    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
 
-    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+            { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+            { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+      }
 
-    if (order_flag)
-    {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_tn_big_tile_kernel", [&]
-          { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
+      return output;
     }
     else
     {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_tn_big_tile_kernel", [&]
-          { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
+      return vllm::aten_compute<Operation>(input, other);
     }
-
-    return output;
-  }
-  else if (pattern == PATTERN_BROADCAST_0)
-  {
-    M = order_flag ? input.size(0) : other.size(0);
-    N = order_flag ? input.size(1) : other.size(1);
-    K = order_flag ? input.size(2) : other.size(2);
-    constexpr uint32_t BIG_TILE_SIZE_N = 64;
-    constexpr uint32_t BIG_TILE_SIZE_K = 64;
-    constexpr uint32_t M_SWIZZLE = 8;
-    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-    const dim3 grid_dim(grid_x, 1, 1);
-    const dim3 block_dim(256, 1, 1);
-
-    auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output = torch::empty({M, N, K}, options);
-    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    if (order_flag)
-    {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-          { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
-    }
-    else
-    {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-          { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
-    }
-
-    return output;
-  }
-  else if (pattern == PATTERN_BROADCAST_1)
-  {
-    M = order_flag ? other.size(0) : input.size(0);
-    N = order_flag ? other.size(1) : input.size(1);
-    K = order_flag ? other.size(2) : input.size(2);
-    constexpr uint32_t BIG_TILE_SIZE_N = 64;
-    constexpr uint32_t BIG_TILE_SIZE_K = 64;
-    constexpr uint32_t M_SWIZZLE = 8;
-    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-    const dim3 grid_dim(grid_x, 1, 1);
-    const dim3 block_dim(256, 1, 1);
-
-    auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-    auto output = torch::empty({M, N, K}, options);
-    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    if (order_flag)
-    {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-          { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
-    }
-    else
-    {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-          { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
-    }
-
-    return output;
-  }
-  else
-  {
-    return vllm::aten_compute<Operation>(input, other);
   }
 }
 
