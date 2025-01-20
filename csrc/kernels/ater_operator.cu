@@ -556,7 +556,7 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
     int N = input.size(0);
     int K = input.size(1);
     const uint32_t rows = 8;
-    const uint32_t vec = 8;
+    const uint32_t vec = 16 / sizeof(input.dtype());
     is_support &= N % rows == 0;
     is_support &= K % vec == 0;
     if (is_support)
@@ -724,7 +724,7 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
       const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
       int elements = M * N * K;
       const uint32_t rows = 8;
-      const uint32_t vec = 8;
+      const uint32_t vec = 16 / sizeof(input.dtype());;
       if (N % rows == 0 && K % vec == 0)
       {
         constexpr uint32_t wg = 64;
