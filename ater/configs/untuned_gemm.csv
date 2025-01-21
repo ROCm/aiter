@@ -1,7 +1,1 @@
-M,N,K,bias,dtype,outdtype
-4096,1280,8192,True,torch.bfloat16,torch.bfloat16
-128,1280,8192,True,torch.bfloat16,torch.bfloat16
-4096,8192,1024,True,torch.bfloat16,torch.bfloat16
-128,8192,1024,True,torch.bfloat16,torch.bfloat16
-4096,32,8192,True,torch.bfloat16,torch.float
-128,32,8192,True,torch.bfloat16,torch.float
+M,N,K,bias,dtype,outdtype,scaleAB

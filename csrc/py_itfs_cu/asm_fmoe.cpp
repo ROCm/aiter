@@ -364,8 +364,6 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
         TORCH_CHECK(false, __func__, " Input only supput Int8/Fp8!");
     }
 
-    torch::Tensor fc2_smooth_scale_value = !fc2_smooth_scale ? torch::empty_like(input_scale) : fc2_smooth_scale.value();
-
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
                                                input,
                                                gate,
@@ -379,7 +377,7 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
                                                input_scale,
                                                fc1_scale,
                                                fc2_scale,
-                                               fc2_smooth_scale_value);
+                                               fc2_smooth_scale);
 }
 
 void fmoe_int8_g1u0_a16(torch::Tensor &out,                    // [token_cnt, dim]

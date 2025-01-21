@@ -143,6 +143,8 @@ if __name__ == '__main__':
         shapes = pd.read_csv(args.input_file).fillna('')
         if 'outdtype' not in shapes.columns:
             shapes['outdtype'] = ''
+        if 'scaleAB' not in shapes.columns:
+            shapes['scaleAB'] = False
         for i in range(len(shapes)):
             ds = shapes.iloc[i]
             for bias in [True, False] if args.all_bias else [ds['bias']]:
@@ -151,7 +153,8 @@ if __name__ == '__main__':
                                 ds['K'],
                                 indtype=get_dtype(ds['dtype']),
                                 bias=bias,
-                                outdtype=get_dtype(ds['outdtype']))
+                                outdtype=get_dtype(ds['outdtype']),
+                                scaleAB=ds['scaleAB'])
     else:
         if not args.model_dir:
             print(">>> Warning! NO MODEL SPECIFIED. Tuning for LL2 13B TP1")

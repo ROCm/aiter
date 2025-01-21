@@ -32,17 +32,19 @@ atol = 1
 
 CACHE_INVALIDATE_BUFFERS = int(os.getenv("CACHE_INVALIDATE_BUFFERS", "37"))
 ONE = torch.ones(1, dtype=torch.float32, device='cuda')
+HALF = torch.tensor(0.5, dtype=torch.float32, device='cuda')
 
 
 class Gemm:
 
-    def __init__(self, m, n, k, bias, indtype, outdtype, rocblas_decode=False):
+    def __init__(self, m, n, k, bias, indtype, outdtype, scaleAB=False, rocblas_decode=False):
         self.m = m
         self.k = k
         self.n = n
-        self.bias = torch.randn(n, device='cuda').to(indtype) if bias else None
+        self.bias = torch.randn(n, device='cuda').to(outdtype) if bias else None
         self.indtype = indtype
         self.outdtype = outdtype
+        self.scaleAB = scaleAB
         self.use_rocblas = (indtype == outdtype
                             and str(indtype) != 'torch.float8_e4m3fnuz')
         self.nb = CACHE_INVALIDATE_BUFFERS
@@ -73,7 +75,9 @@ class Gemm:
         sols = ater.hipb_findallsols(self.inp,
                                      self.weights.t(),
                                      bias=self.bias,
-                                     out_dtype=self.outdtype)
+                                     out_dtype=self.outdtype,
+                                     scaleA=HALF if self.scaleAB else None,
+                                     scaleB=HALF if self.scaleAB else None)
         print('M N K bias dtype outdtype',
               self.m,
               self.n,
@@ -81,6 +85,7 @@ class Gemm:
               self.bias is not None,
               self.indtype,
               self.outdtype,
+              self.scaleAB,
               '>>> Total hipb solutions',
               len(sols),
               flush=True)
@@ -88,11 +93,13 @@ class Gemm:
         self.hipb_sols = sols
 
     def check_gemm_ref(self, libtype, solidx):
+        scaleA = HALF if self.scaleAB else ONE
+        scaleB = HALF if self.scaleAB else ONE
         if self.indtype == torch.float8_e4m3fnuz:
             ref = torch._scaled_mm(self.inp,
                                    self.weights.t(),
-                                   scale_a=ONE,
-                                   scale_b=ONE,
+                                   scale_a=scaleA,
+                                   scale_b=scaleB,
                                    out_dtype=self.outdtype)
             if type(ref) is tuple and len(ref) == 2:
                 ref = ref[0]
@@ -103,7 +110,9 @@ class Gemm:
                              self.weights.t(),
                              solidx,
                              bias=self.bias,
-                             out_dtype=self.outdtype)
+                             out_dtype=self.outdtype,
+                             scaleA=scaleA,
+                             scaleB=scaleB)
         elif libtype == 'rocblas':
             c = ater.rocb_mm(self.inp, self.weights.t(), solidx)
             if self.bias is not None:
@@ -126,14 +135,18 @@ class Gemm:
 
     def hipb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
         @perftest(num_warmup=cold_iters, num_iters=warm_iters)
-        def call_hipb_mm(input, weight, solidx, out_dtype):
-            ater.hipb_mm(input, weight, solidx, out_dtype=out_dtype)
+        def call_hipb_mm(input, weight, solidx, out_dtype, scale_a=None, scale_b=None):
+            ater.hipb_mm(input, weight, solidx, out_dtype=out_dtype, scaleA=scale_a, scaleB=scale_b)
+
+        scaleA = HALF if self.scaleAB else None
+        scaleB = HALF if self.scaleAB else None
 
         _, gtime = call_hipb_mm(self.inp,
                                 self.weights2[random.randint(
                                     0, self.nb - 1)].t(),
                                 solidx,
-                                out_dtype=self.outdtype)
+                                self.outdtype,
+                                scaleA, scaleB)
         gtime = gtime / 1000.0
         # print('>>>hipbtime',solidx)
         # for i in range(cold_iters):
@@ -213,12 +226,16 @@ class Gemm:
         return gtime
 
     def find_rocblas_sols(self):
-        sols = ater.rocb_findallsols(self.inp, self.weights.t())
+        if self.scaleAB or self.bias is not None:
+            sols = []
+        else:
+            sols = ater.rocb_findallsols(self.inp, self.weights.t())
         print('M N K dtype',
               self.m,
               self.n,
               self.k,
               self.indtype,
+              self.outdtype,
               '>>> Total rocb solutions',
               len(sols),
               flush=True)
@@ -327,7 +344,7 @@ class GemmTuner:
         else:
             self.tuned_shapes = None
 
-    def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None):
+    def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None, scaleAB=False):
         assert indtype is not None
         outdtype = outdtype if outdtype is not None else indtype
         assert outdtype is not None
@@ -336,14 +353,15 @@ class GemmTuner:
             (self.tuned_shapes['K'] == k) &
             (self.tuned_shapes['bias'] == bias) &
             (self.tuned_shapes['dtype'] == str(indtype)) &
-                (self.tuned_shapes['outdtype'] == str(outdtype))].empty)):
+            (self.tuned_shapes['outdtype'] == str(outdtype))].empty)):
             entry = {
                 'M': [m],
                 'N': [n],
                 'K': [k],
                 'bias': [bias],
                 'dtype': [indtype],
-                'outdtype': [outdtype]
+                'outdtype': [outdtype],
+                'scaleAB': [scaleAB]
             }
             df = pd.DataFrame(entry)
             self.gemm_problems = pd.concat([self.gemm_problems, df],
@@ -366,13 +384,14 @@ class GemmTuner:
                            ds['bias'],
                            indtype=indtype,
                            outdtype=outdtype,
+                           scaleAB=ds['scaleAB'],
                            rocblas_decode=self.rocblas_decode)
             gemmobj.find_fastest_solution()
             soldf.loc[i, 'libtype'] = gemmobj.best_libtype
             soldf.loc[i, 'solidx'] = gemmobj.best_solidx
             soldf.loc[i, 'soltimes'] = round(gemmobj.best_soltime*1000, 2)
             soldf.loc[i, 'kernelName'] = ater.getHipblasltKernelName(
-                int(gemmobj.best_solidx)) if gemmobj.best_libtype is 'hipblaslt' else ""
+                int(gemmobj.best_solidx)) if gemmobj.best_libtype == 'hipblaslt' else ""
 
             del gemmobj
             torch.cuda.empty_cache()
