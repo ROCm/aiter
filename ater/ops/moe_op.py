@@ -76,7 +76,7 @@ def fmoe_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
-    fc2_smooth_scale: Tensor,
+    fc2_smooth_scale: Optional[Tensor] = None,
 ): ...
 
 
