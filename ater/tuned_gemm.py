@@ -29,7 +29,7 @@ class TunedGemm:
 
         if (self.save_gemm == 1):
             self.tuned_df = pd.DataFrame(
-                columns=['M', 'N', 'K', 'bias', 'dtype'])
+                columns=['M', 'N', 'K', 'bias', 'dtype', 'outdtype', 'scaleAB'])
         else:
             self.tuned_df = None
 
@@ -49,7 +49,7 @@ class TunedGemm:
         solds = {}
         for i in range(len(df)):
             ds = df.iloc[i]
-            key = (ds['M'], ds['N'], ds['K'], ds['bias'], ds['dtype'], ds['outdtype'])
+            key = (ds['M'], ds['N'], ds['K'], ds['bias'], ds['dtype'], ds['outdtype'], ds['scaleAB'])
             if ds['libtype'] == 'hipblaslt':
                 soltype = self.solMap.index(ds['libtype'])
             elif ds['libtype'] == 'rocblas':
@@ -64,15 +64,15 @@ class TunedGemm:
         ]
 
     @functools.lru_cache(maxsize=1024)
-    def query_sol(self, m, n, k, bias, dtype, otype):
+    def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
         if dtype == torch.float16 and k % 8 == 0:
             if n > 8 and 0 < m <= 4:
                 return 3, 0
             elif n % 4 == 0 and m == 1 and k <= 8192:
                 return 3, 1
-        soltype, solidx = self.solids.get((m, n, k, bias, str(dtype), str(otype)), (0, 0))
+        soltype, solidx = self.solids.get((m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0))
         logger.info(
-            f'using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}')
+            f'using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}')
         return soltype, solidx
 
     def apply_skinny(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
@@ -117,6 +117,7 @@ class TunedGemm:
                     'bias': [bias is not None],
                     'dtype': [inp.dtype],
                     'outdtype': [otype],
+                    'scaleAB':[scale_a is not None or scale_b is not None],
                 })
             ]).drop_duplicates()
             self.tuned_df.to_csv(self.untune_path, index=False)
@@ -161,7 +162,8 @@ class TunedGemm:
                                          k=k,
                                          bias=use_bias,
                                          dtype=inp.dtype,
-                                         otype=otype)
+                                         otype=otype,
+                                         scaleAB=scale_a is not None or scale_b is not None)
         out = self.solfuncs[soltype](
             inp_view, weights, solidx, bias, otype, scale_a, scale_b, scale_c)
         if batched:

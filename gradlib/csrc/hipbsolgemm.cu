@@ -136,6 +136,7 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
     int m, int n, int k, const void *alpha, const void *a, int lda,
     const void *b, int ldb, const void *beta, void *c, int ldc,
     const void *bias, hipDataType intype, hipDataType outtype,
+    const void *scaleA, const void *scaleB, const void *scaleC,
     hipStream_t &stream)
 {
   int flag{0};
@@ -172,6 +173,25 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(
     auto epilogue = HIPBLASLT_EPILOGUE_BIAS;
     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
         matmul, HIPBLASLT_MATMUL_DESC_EPILOGUE, &epilogue, sizeof(epilogue)));
+  }
+
+  if (scaleA != nullptr)
+  {
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scaleA,
+        sizeof(scaleA)));
+  }
+  if (scaleB != nullptr)
+  {
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_B_SCALE_POINTER, &scaleB,
+        sizeof(scaleB)));
+  }
+  if (scaleC != nullptr)
+  {
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescSetAttribute(
+        matmul, HIPBLASLT_MATMUL_DESC_D_SCALE_POINTER, &scaleC,
+        sizeof(scaleC)));
   }
 
   // std::vector<hipblasLtMatmulHeuristicResult_t> heuristicResult(10);
@@ -332,8 +352,8 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
                       std::optional<torch::Tensor> bias = std::nullopt,
                       std::optional<py::object> out_dtype = std::nullopt,
-                      std::optional<torch::Tensor> scale1 = std::nullopt,
-                      std::optional<torch::Tensor> scale2 = std::nullopt,
+                      std::optional<torch::Tensor> scaleA = std::nullopt,
+                      std::optional<torch::Tensor> scaleB = std::nullopt,
                       std::optional<torch::Tensor> scaleOut = std::nullopt)
 {
   auto mat1_strides{mat1.strides()};
@@ -410,14 +430,14 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   int64_t mat2_ld = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
   int64_t result_ld = result.stride(transpose_result ? 0 : 1);
 
-  void *d_scale1 = nullptr, *d_scale2 = nullptr, *d_scaleOut = nullptr;
-  if (scale1.has_value())
+  void *d_scaleA = nullptr, *d_scaleB = nullptr, *d_scaleOut = nullptr;
+  if (scaleA.has_value())
   {
-    d_scale1 = static_cast<void *>(scale1.value().data_ptr());
+    d_scaleA = static_cast<void *>(scaleA.value().data_ptr());
   }
-  if (scale2.has_value())
+  if (scaleB.has_value())
   {
-    d_scale2 = static_cast<void *>(scale2.value().data_ptr());
+    d_scaleB = static_cast<void *>(scaleB.value().data_ptr());
   }
   if (scaleOut.has_value())
   {
@@ -431,7 +451,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   void *ptrB{static_cast<void *>((transpose_result ? mat1 : mat2).data_ptr())};
   void *ptrC{static_cast<void *>(result.data_ptr())};
   if (transpose_result)
-    std::swap(d_scale1, d_scale2);
+    std::swap(d_scaleA, d_scaleB);
   auto current_stream{torch::hip::getCurrentHIPStream().stream()};
   void *bias_ptr =
       bias.has_value() ? static_cast<void *>(bias.value().data_ptr()) : nullptr;
@@ -439,7 +459,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(
       hipblaslt_handle, transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
-      mat1_ld, d_scale1, ptrB, mat2_ld, d_scale2, &zero, ptrC, result_ld,
+      mat1_ld, d_scaleA, ptrB, mat2_ld, d_scaleB, &zero, ptrC, result_ld,
       d_scaleOut, bias_ptr, hipblasInType, hipblasOutType, current_stream,
       solution_index));
 
@@ -450,7 +470,10 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
 std::vector<int> hipb_findallsols(
     const torch::Tensor &mat1, const torch::Tensor &mat2,
     std::optional<torch::Tensor> bias = std::nullopt,
-    std::optional<py::object> out_dtype = std::nullopt)
+    std::optional<py::object> out_dtype = std::nullopt,
+    std::optional<torch::Tensor> scaleA = std::nullopt,
+    std::optional<torch::Tensor> scaleB = std::nullopt,
+    std::optional<torch::Tensor> scaleC = std::nullopt)
 {
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
@@ -532,12 +555,21 @@ std::vector<int> hipb_findallsols(
 
   auto bias_ptr =
       bias.has_value() ? static_cast<void *>(bias.value().data_ptr()) : nullptr;
+  
+  auto scaleA_ptr =
+      scaleA.has_value() ? static_cast<void *>(scaleA.value().data_ptr()) : nullptr;
+
+  auto scaleB_ptr =
+      scaleB.has_value() ? static_cast<void *>(scaleB.value().data_ptr()) : nullptr;
+  
+  auto scaleC_ptr =
+      scaleC.has_value() ? static_cast<void *>(scaleC.value().data_ptr()) : nullptr;
 
   return hipblasLtMatmul_findallsols_wrapper(
       hipblaslt_handle, transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
       transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N, m, n, k, &one, ptrA,
       mat1_ld, ptrB, mat2_ld, &zero, ptrC, result_ld, bias_ptr, hipblasInType,
-      hipblasOutType, current_stream);
+      hipblasOutType, scaleA_ptr, scaleB_ptr, scaleC_ptr, current_stream);
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -592,10 +624,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension");
   m.def("hipb_mm", &hipb_mm, "hipb_mm", py::arg("mat1"), py::arg("mat2"),
         py::arg("solution_index"), py::arg("bias") = std::nullopt,
-        py::arg("out_dtype") = std::nullopt, py::arg("scale1") = std::nullopt,
-        py::arg("scale2") = std::nullopt, py::arg("scaleOut") = std::nullopt);
+        py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
+        py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt);
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",
         py::arg("mat1"), py::arg("mat2"), py::arg("bias") = std::nullopt,
-        py::arg("out_dtype") = std::nullopt);
+        py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
+        py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt);
   m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
