@@ -261,10 +261,10 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False, use_g1u1
                     num_btype += el.element_size() * el.numel()
             return num_btype
 
-        num_tbtype = calculateTensorsSize(input, w1b, w2b, topk_weights, topk_ids,
+        num_tb = calculateTensorsSize(input, input, w1b, w2b, topk_weights, topk_ids,
                                             fc1_scale, fc2_scale, 
                                             fc1_smooth_scale, fc2_smooth_scale) / (1024*1024*1024*1024.0)
-        bw = num_tbtype * 1e6 / avg_b
+        bw = num_tb * 1e6 / avg_b
         print(f"[BW] {token=}, {quant=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:.2f}TB/s")
 
         # if not use_g1u1:
