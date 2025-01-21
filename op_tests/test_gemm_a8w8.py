@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from ater.test_common import checkAllclose, perftest, tensor_dump
+from aiter.test_common import checkAllclose, perftest, tensor_dump
 import torch
 import torch.nn.functional as F
 import numpy as np
 import sys
 import os
-import ater
-from ater.ops.shuffle import shuffle_weight
+import aiter
+from aiter.ops.shuffle import shuffle_weight
 
 
 @perftest()
@@ -23,11 +23,11 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
 
 @perftest()
 def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return ater.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias)
+    return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias)
 
 @perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return ater.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
+    return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
 
 def test_gemm(dtype, m, n, k):

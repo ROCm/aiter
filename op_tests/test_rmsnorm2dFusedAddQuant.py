@@ -4,9 +4,9 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import ater
+import aiter
 import argparse
-from ater.test_common import checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -30,7 +30,7 @@ def run_torch(input, weight, eps, residual=None, x_scale = None, y_scale_dtype =
     if y_scale_dtype is None:
         y_scale = None
     else:
-        output, y_scale = ater.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
+        output, y_scale = aiter.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
     return output, residual_out, y_scale
 
 @perftest()
@@ -39,7 +39,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
         y_scale = None
         if residual is None:
             residual_out = None
-            output = ater.rms_norm(
+            output = aiter.rms_norm(
                 input,
                 weight,
                 eps
@@ -47,7 +47,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
         elif residual is not None:
             residual_out = torch.empty_like(input)
             output = torch.empty_like(input)
-            ater.rmsnorm2d_fwd_with_add(
+            aiter.rmsnorm2d_fwd_with_add(
                 output,
                 input,
                 residual,
@@ -60,7 +60,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
         output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
         if residual is None:
             residual_out = None
-            ater.rmsnorm2d_fwd_with_dynamicquant(
+            aiter.rmsnorm2d_fwd_with_dynamicquant(
                 output,
                 input,
                 y_scale,
@@ -69,7 +69,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
             )
         elif residual is not None:
             residual_out = torch.empty_like(input)
-            ater.rmsnorm2d_fwd_with_add_dynamicquant(
+            aiter.rmsnorm2d_fwd_with_add_dynamicquant(
                 output,
                 input,
                 residual,
@@ -83,7 +83,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
         output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
         if residual is None:
             residual_out = None
-            ater.rmsnorm2d_fwd_with_smoothquant(
+            aiter.rmsnorm2d_fwd_with_smoothquant(
                 output,
                 input,
                 x_scale,
@@ -93,7 +93,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
             )
         elif residual is not None:
             residual_out = torch.empty_like(input)
-            ater.rmsnorm2d_fwd_with_add_smoothquant(
+            aiter.rmsnorm2d_fwd_with_add_smoothquant(
                 output,
                 input,
                 residual,

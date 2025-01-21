@@ -6,21 +6,21 @@ import os
 import torch
 import torch.distributed as dist
 
-from ater.dist.parallel_state import (ensure_model_parallel_initialized,
+from aiter.dist.parallel_state import (ensure_model_parallel_initialized,
                                       init_distributed_environment,
                                       set_custom_all_reduce,
                                       get_tp_group,
                                       graph_capture,
                                       destroy_model_parallel,
                                       destroy_distributed_environment)
-from ater.dist.utils import (get_open_port,
+from aiter.dist.utils import (get_open_port,
                              get_distributed_init_method,
                              get_ip)
-from ater.dist.communication_op import tensor_model_parallel_all_reduce
-from ater.test_common import checkAllclose, perftest, tensor_dump, tensor_load
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from multiprocessing import set_start_method, Pool, freeze_support
 import logging
-logger = logging.getLogger("ater")
+logger = logging.getLogger("aiter")
 
 set_start_method('spawn', force=True)
 

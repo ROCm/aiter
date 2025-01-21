@@ -2,12 +2,12 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
-import ater
+import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import ater
-from ater.test_common import checkAllclose, perftest
+import aiter
+from aiter.test_common import checkAllclose, perftest
 from gemm_a8w8_common import kernelInstance, kernels_list
 import argparse
 
@@ -45,7 +45,7 @@ def get_tuned_gemm_list(tuned_gemm_file):
 
 @perftest()
 def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
-    ater.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
+    aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
     return out
 
 
@@ -66,7 +66,7 @@ def tune_gemm(m, n, k, useSplitK = False):
     best_time = -1
     for i in range(kernels_num):
         kernel = kernels_list[i]
-        maxsplitK = ater.compute_gemm_SplitK(m, n, k, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK) \
+        maxsplitK = aiter.compute_gemm_SplitK(m, n, k, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK) \
             if useSplitK else 0
         for splitK in range(maxsplitK+1):
             try:
@@ -129,7 +129,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-i",
         "--untune_file",
-        default="ater/configs/a8w8_untuned_gemm.csv",
+        default="aiter/configs/a8w8_untuned_gemm.csv",
         required=False,
         help="input"
     )
@@ -137,7 +137,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-o",
         "--tune_file",
-        default="ater/configs/a8w8_tuned_gemm.csv",
+        default="aiter/configs/a8w8_tuned_gemm.csv",
         required=False,
         help="output: tuning result store this file"
     )

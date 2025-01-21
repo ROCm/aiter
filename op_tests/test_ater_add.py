@@ -3,8 +3,8 @@
 
 import torch
 import torch.nn.functional as F
-import ater
-from ater.test_common import checkAllclose, perftest
+import aiter
+from aiter.test_common import checkAllclose, perftest
 from torch.profiler import profile, record_function, ProfilerActivity
 
 # input shape: torch.Size([4096, 64, 160]) (20480, 1, 128) 
@@ -58,7 +58,7 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_m
     for j in range(100):
         #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=torch.float32).to(torch.int32)
         # output = torch.empty_like(tensor1)
-        output = ater.add(tensor0, tensor1)
+        output = aiter.add(tensor0, tensor1)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 print(torch.equal(result_con, output))

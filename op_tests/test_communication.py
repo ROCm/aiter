@@ -5,14 +5,14 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import os
-import ater
-from ater.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from ater.dist.parallel_state import (graph_capture)
+import aiter
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
+from aiter.dist.parallel_state import (graph_capture)
 import sys
 import traceback
 import logging
 import multiprocessing as mp
-logger = logging.getLogger("ater")
+logger = logging.getLogger("aiter")
 
 NORM = 0
 DUMP = 1
@@ -26,7 +26,7 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, input, withGraph=False):
     try:
         device = torch.device(f"cuda:{gpuID}")
         torch.cuda.set_device(device)
-        ater.init_dist_env(tp_size, gpuID)
+        aiter.init_dist_env(tp_size, gpuID)
 
         input = input.to(device)
         x = torch.empty_like(input)
@@ -43,7 +43,7 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, input, withGraph=False):
                 with torch.cuda.graph(graph, stream=gc.stream):
                     # run inplace here, to test accuracy, we need this
                     x.copy_(input)
-                    out = ater.all_reduce_asm(x)
+                    out = aiter.all_reduce_asm(x)
             torch.cuda.synchronize()
             out.fill_(0)
             dist.barrier()
@@ -52,7 +52,7 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, input, withGraph=False):
         else:
             @perftest()
             def run_ca(x):
-                return ater.all_reduce_asm(x)
+                return aiter.all_reduce_asm(x)
             out, us = run_ca(x)
         torch.cuda.synchronize()
         print(gpuID, 'finished')
@@ -62,7 +62,7 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, input, withGraph=False):
             ''.join(traceback.format_exception(*sys.exc_info()))
         ))
     finally:
-        ater.destroy_dist_env()
+        aiter.destroy_dist_env()
         return out, us
 
 
@@ -96,7 +96,7 @@ def run_all_reduce_rmsnorm(tp_size, pp_size,  gpuID, input, residual_in, weight,
     try:
         device = torch.device(f"cuda:{gpuID}")
         torch.cuda.set_device(device)
-        ater.init_dist_env(tp_size, gpuID)
+        aiter.init_dist_env(tp_size, gpuID)
 
         input = input.to(device)
         residual_in = residual_in.to(device)
@@ -111,7 +111,7 @@ def run_all_reduce_rmsnorm(tp_size, pp_size,  gpuID, input, residual_in, weight,
             graph = torch.cuda.CUDAGraph()
             with graph_capture() as gc:
                 with torch.cuda.graph(graph, stream=gc.stream):
-                    out, residual_out = ater.all_reduce_rmsnorm(
+                    out, residual_out = aiter.all_reduce_rmsnorm(
                         input, residual_in, weight, bias, epsilon)
             torch.cuda.synchronize()
             out.fill_(0)
@@ -121,7 +121,7 @@ def run_all_reduce_rmsnorm(tp_size, pp_size,  gpuID, input, residual_in, weight,
         else:
             @perftest()
             def run_ca(*args):
-                return ater.all_reduce_rmsnorm(*args)
+                return aiter.all_reduce_rmsnorm(*args)
             (out, residual_out), us = run_ca(
                 input, residual_in, weight, bias, epsilon)
         torch.cuda.synchronize()
@@ -133,7 +133,7 @@ def run_all_reduce_rmsnorm(tp_size, pp_size,  gpuID, input, residual_in, weight,
             ''.join(traceback.format_exception(*sys.exc_info()))
         ))
     finally:
-        ater.destroy_dist_env()
+        aiter.destroy_dist_env()
         return (out, residual_out), us
 
 
@@ -141,7 +141,7 @@ def run_all_reduce_rmsnorm_quant(tp_size, pp_size,  gpuID, input, residual_in, x
     try:
         device = torch.device(f"cuda:{gpuID}")
         torch.cuda.set_device(device)
-        ater.init_dist_env(tp_size, gpuID)
+        aiter.init_dist_env(tp_size, gpuID)
 
         input = input.to(device)
         residual_in = residual_in.to(device)
@@ -157,7 +157,7 @@ def run_all_reduce_rmsnorm_quant(tp_size, pp_size,  gpuID, input, residual_in, x
             graph = torch.cuda.CUDAGraph()
             with graph_capture() as gc:
                 with torch.cuda.graph(graph, stream=gc.stream):
-                    out, residual_out, ysacle = ater.all_reduce_rmsnorm_quant(
+                    out, residual_out, ysacle = aiter.all_reduce_rmsnorm_quant(
                         input, residual_in, xscale, weight, bias, epsilon)
             torch.cuda.synchronize()
             out.fill_(0)
@@ -167,7 +167,7 @@ def run_all_reduce_rmsnorm_quant(tp_size, pp_size,  gpuID, input, residual_in, x
         else:
             @perftest()
             def run_ca(*args):
-                return ater.all_reduce_rmsnorm_quant(*args)
+                return aiter.all_reduce_rmsnorm_quant(*args)
             (out, residual_out, ysacle), us = run_ca(
                 input, residual_in, xscale, weight, bias, epsilon)
         torch.cuda.synchronize()
@@ -180,7 +180,7 @@ def run_all_reduce_rmsnorm_quant(tp_size, pp_size,  gpuID, input, residual_in, x
             ''.join(traceback.format_exception(*sys.exc_info()))
         ))
     finally:
-        ater.destroy_dist_env()
+        aiter.destroy_dist_env()
         return (out, residual_out, ysacle), us
 
 
@@ -223,7 +223,7 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype,  withGraph=False, perTKQuant=
     )+bias
     yscale = None
     if perTKQuant:
-        ref_out, yscale = ater.pertoken_quant(
+        ref_out, yscale = aiter.pertoken_quant(
             ref_out, torch.float32, x_scale=xscale)
 
     rets = [el.get() for el in rets]

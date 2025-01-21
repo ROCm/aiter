@@ -4,7 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
-#include "ater_hip_common.h"
+#include "aiter_hip_common.h"
 
 // start to prepare the input and output buffer
 struct __attribute__((packed)) KernelArgs
@@ -80,9 +80,9 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
     args.ks = ks;
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    static AterAsmKernel splitK_impl("gemm_kernel_func", "gemm_a8w8_m128_splitK.co");
-    static AterAsmKernel noSplitK_impl("gemm_kernel_func", "gemm_a8w8_m128_noSplitK.co");
-    AterAsmKernel *impl_ptr = &noSplitK_impl;
+    static AiterAsmKernel splitK_impl("gemm_kernel_func", "gemm_a8w8_m128_splitK.co");
+    static AiterAsmKernel noSplitK_impl("gemm_kernel_func", "gemm_a8w8_m128_noSplitK.co");
+    AiterAsmKernel *impl_ptr = &noSplitK_impl;
     if (ks > 0)
         impl_ptr = &splitK_impl;
 

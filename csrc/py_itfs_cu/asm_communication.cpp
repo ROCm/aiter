@@ -7,7 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "communication_asm.h"
-#include "ater_hip_common.h"
+#include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 
 torch::Tensor all_reduce_asm(torch::Tensor &input,
@@ -92,7 +92,7 @@ torch::Tensor all_reduce_asm(torch::Tensor &input,
     args.stride_wave = stride_WV;
     args.loopcnt = 10;
 
-    static AterAsmKernel impl("allreduce_kernel_func", "all_reduce.co");
+    static AiterAsmKernel impl("allreduce_kernel_func", "all_reduce.co");
     impl.launch_kernel({&args,
                         &arg_size,
                         gdx, // gdx
@@ -232,7 +232,7 @@ std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor &input
     args.tgs = TGs;
     args.loopcnt = 0;
 
-    static AterAsmKernel impl("allreduce_rmsnorm_N8192_kernel", "allreduce_rmsnorm_N8192.co");
+    static AiterAsmKernel impl("allreduce_rmsnorm_N8192_kernel", "allreduce_rmsnorm_N8192.co");
 
     impl.launch_kernel({&args,
                         &arg_size,
@@ -378,7 +378,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> all_reduce_rmsnorm_quant
     args.tgs = TGs;
     args.loopcnt = 0;
 
-    static AterAsmKernel impl("allreduce_rmsnorm_qnt_N8192_kernel", "allreduce_rmsnorm_qnt_N8192.co");
+    static AiterAsmKernel impl("allreduce_rmsnorm_qnt_N8192_kernel", "allreduce_rmsnorm_qnt_N8192.co");
 
     impl.launch_kernel({&args,
                         &arg_size,

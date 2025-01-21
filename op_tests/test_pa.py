@@ -5,10 +5,10 @@ import random
 from typing import List, Optional, Tuple, Union
 import itertools
 import torch
-import ater
-from ater import paged_attn as ops
-from ater.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from ater import pertoken_quant
+import aiter
+from aiter import paged_attn as ops
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
+from aiter import pertoken_quant
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -19,6 +19,15 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
 }
+ck_naive_quant_algo = [
+    'NO',
+    'KV_8BIT_PERHEAD',
+    # // FP8/INT8 quant for KVCache, per-token quant
+    # // [num_tokens, nhead, hdim] -> [nhead, num_tokens]
+    'KV_8BIT_PERTOKEN',
+    # // same as 8bit per token quant but 4 bit
+    'KV_4BIT_PERTOKEN',
+]
 
 
 def get_kv_cache_torch_dtype(
@@ -251,7 +260,7 @@ def run_native(query,
 
 
 @perftest()
-def run_ater(query,
+def run_aiter(query,
              key_cache,
              value_cache,
              block_tables,
@@ -280,7 +289,7 @@ def run_ater(query,
 
 
 @perftest()
-def run_ater_naive(query,
+def run_aiter_naive(query,
                    key_cache,
                    value_cache,
                    block_tables,
@@ -296,7 +305,7 @@ def run_ater_naive(query,
                    v_scale,
                    block_size,
                    quant_algo=0):
-    return ater.pa_fwd_naive(
+    return aiter.pa_fwd_naive(
         query,
         key_cache,
         value_cache,
@@ -315,7 +324,7 @@ def run_ater_naive(query,
 
 
 @perftest()
-def run_ater_asm(query,
+def run_aiter_asm(query,
                  key_cache,
                  value_cache,
                  block_tables,
@@ -328,7 +337,7 @@ def run_ater_asm(query,
                  max_num_blocks,
                  k_scale=None,
                  v_scale=None):
-    return ater.pa_fwd_asm(
+    return aiter.pa_fwd_asm(
         query,
         key_cache,
         value_cache,
@@ -367,7 +376,7 @@ def load_input():
     #         tensor_load('V_cache.bin'),
     #         tensor_load('block_tables.bin'),
     #         tensor_load('seq_lens.bin'),
-    #         tensor_load('out_ater.bin'))
+    #         tensor_load('out_aiter.bin'))
     # return (tensor_load('/mnt/raid0/ljin1/pa_data/x8_Kzero/Q_16.bin'),
     #         tensor_load('/mnt/raid0/ljin1/pa_data/x8_Kzero/K_16.bin'),
     #         tensor_load('/mnt/raid0/ljin1/pa_data/x8_Kzero/V_16.bin'),
@@ -462,7 +471,7 @@ def test_paged_attention(
                                                     device)
         key_cache, value_cache = key_caches[0], value_caches[0]
 
-    out_ater, time_ater = run_ater(
+    out_aiter, time_aiter = run_aiter(
         query,
         key_cache,
         value_cache,
@@ -477,12 +486,12 @@ def test_paged_attention(
         v_scale,
     )
     if debug_mode != VERIFY:
-        out_golden = out_ater
-    checkAllclose(out_golden, out_ater,
-                  msg=f'golden vs ater_shomy:{time_ater}')
-    tensor_dump(out_ater, 'out_ater')
-    
-    out_ater_asm, time_ater_asm = run_ater_asm(
+        out_golden = out_aiter
+    checkAllclose(out_golden, out_aiter,
+                  msg=f'golden vs aiter_shomy:{time_aiter}')
+    # tensor_dump(out_aiter, 'out_aiter')
+
+    out_aiter_asm, time_aiter_asm = run_aiter_asm(
         query,
         key_cache,
         asm_V_shuffle(value_cache),
@@ -496,9 +505,9 @@ def test_paged_attention(
         max_num_blocks_per_seq
     )
 
-    checkAllclose(out_golden, out_ater_asm,
-                  msg=f'golden vs ater_asm:{time_ater_asm}')
-    tensor_dump(out_ater, 'out_ater')
+    checkAllclose(out_golden, out_aiter_asm,
+                  msg=f'golden vs aiter_asm:{time_aiter_asm}')
+    # tensor_dump(out_aiter, 'out_aiter')
 
     for quant_algo_, cache_type_ in [(0, key_cache.dtype), (2, torch.float8_e4m3fnuz), (2, torch.int8)]:
         if quant_algo_ == 0:
@@ -507,7 +516,7 @@ def test_paged_attention(
         else:
             k_quant_, k_scale_, v_quant_, v_scale_ = pertoken_quant_kvcache_symm(
                 key_cache, value_cache, quant_dtype=cache_type_)
-        out_ater_naive, time_ater_naive = run_ater_naive(
+        out_aiter_naive, time_aiter_naive = run_aiter_naive(
             query,
             k_quant_,
             v_quant_,
@@ -525,11 +534,11 @@ def test_paged_attention(
             block_size,
             quant_algo_
         )
-        checkAllclose(out_ater_asm, out_ater_naive,
-                      msg=f'golden vs ck_naive(quant:{quant_algo_}, kvcache:{cache_type_}):{time_ater_naive}')
-  
+        checkAllclose(out_aiter_asm, out_aiter_naive,
+                      msg=f'golden vs ck_naive(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_naive}')
+
         if cache_type_ == torch.int8:
-            out_ater_asm, time_ater_asm = run_ater_asm(
+            out_aiter_asm, time_aiter_asm = run_aiter_asm(
                 query,
                 k_quant_,
                 asm_V_shuffle(v_quant_),
@@ -544,8 +553,8 @@ def test_paged_attention(
                 k_scale_,
                 v_scale_,
             )
-            checkAllclose(out_golden, out_ater_asm,
-                          msg=f'golden vs ater_asm(quant:{quant_algo_}, kvcache:{cache_type_}):{time_ater_asm}')
+            checkAllclose(out_golden, out_aiter_asm,
+                          msg=f'golden vs aiter_asm(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_asm}')
     if debug_mode == DUMP:
         dump_input(query,
                    key_cache,
@@ -579,10 +588,11 @@ def test_paged_attention(
     # tensor_dump(out_native, 'out_native')
 
     # atol, rtol = 1e-2, 1e-2
-    # msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_ater=:<8.2f} us, uplift: {time_native/time_ater-1:<5.1%}"
-    # checkAllclose(out_native, out_ater, atol=atol, rtol=rtol, msg=msg)
+    # msg = f"[perf] dim: {str((num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, {time_native=:<8.2f} us, {time_aiter=:<8.2f} us, uplift: {time_native/time_aiter-1:<5.1%}"
+    # checkAllclose(out_native, out_aiter, atol=atol, rtol=rtol, msg=msg)
     # print(
     #     f"[test] dim: {str((ctx_lens, num_seqs, num_heads, head_size)):<20}, dtype: {dtype}, finished)\n")
+    print(f'finish~ {ctx_lens=}, {num_seqs=}, {num_heads=}, {head_size=}, {use_alibi=}, {block_size=}, {dtype=}, {kv_cache_dtype=}\n')
 
 
 for ctx_len in [1, 26, 128, 4097]:

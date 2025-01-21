@@ -286,7 +286,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default="ater/configs/a8w8_tuned_gemm.csv",
+        default="aiter/configs/a8w8_tuned_gemm.csv",
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py"
     )

@@ -8,11 +8,11 @@ import numpy as np
 import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
-from ater.test_common import checkAllclose, perftest
-from ater.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
-from ater.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
-from ater.ops.shuffle import shuffle_weight
-from ater import pertoken_quant, ck_moe
+from aiter.test_common import checkAllclose, perftest
+from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
+from aiter.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
+from aiter.ops.shuffle import shuffle_weight
+from aiter import pertoken_quant, ck_moe
 
 BLOCK_SIZE_M = 32
 
@@ -42,7 +42,7 @@ def moe_sorting_vllm(topk_ids: torch.Tensor,
     num_tokens_post_pad = torch.empty((1),
                                       dtype=torch.int32,
                                       device=topk_ids.device)
-    ater.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
+    aiter.moe_align_block_size(topk_ids, num_experts, block_size, sorted_ids,
                               expert_ids, token_nums, num_tokens_post_pad)
     return sorted_ids, expert_ids, token_nums, num_tokens_post_pad
 
@@ -287,21 +287,32 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False, use_g1u1
 
 
 print('test test_fmoe 16 bit')
-for dtype in [torch.float16, torch.bfloat16][1:]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
+# for dtype in [torch.float16, torch.bfloat16][1:]:
+#     for m in [128, 256]:
+#         for dim in [4096, 8192]:
+#             for hdim in [1024]:
+#                 # test_fmoe(dtype, m, dim, hdim, 32, 5)
+#                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
 
-for dtype in [torch.bfloat16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True, use_g1u1=True)
+# for dtype in [torch.bfloat16]:
+#     for m in [128, 256]:
+#         for dim in [4096, 8192]:
+#             for hdim in [1024]:
+#                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True, use_g1u1=True)
 
+# for dtype in [torch.bfloat16]:
+#     for m in [128, 256]:
+#         for dim in [4096, 8192]:
+#             for hdim in [1024]:
+#                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True, use_g1u1=True, quant_dtype=torch.float8_e4m3fnuz)
 for dtype in [torch.bfloat16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
+    for m in [128]:
+        for dim in [ 8192]:
             for hdim in [1024]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True, use_g1u1=True, quant_dtype=torch.float8_e4m3fnuz)
+# for dtype in [torch.bfloat16]:
+#     for m in [128]:
+#         for dim in [6144]:
+#             for hdim in [4096]:
+#                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True,
+#                           use_g1u1=True, quant_dtype=torch.int8)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from ater.test_common import checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -10,7 +10,7 @@ import os
 if 1:
     _path = os.path.abspath(os.path.dirname(__file__))
     sys.path.insert(0, f'{_path}/../../')
-    from ater.tuned_gemm import tgemm
+    from aiter.tuned_gemm import tgemm
 
 
 @perftest()

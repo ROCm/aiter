@@ -14,7 +14,7 @@
 #include "pos_encoding.h"
 #include "rmsnorm.h"
 #include "smoothquant.h"
-#include "ater_operator.h"
+#include "aiter_operator.h"
 #include "asm_gemm_a8w8.h"
 #include <torch/extension.h>
 #include "gemm_a8w8.h"
@@ -168,10 +168,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("fc1_scale"), py::arg("fc2_scale"),
             py::arg("fc2_smooth_scale") = std::nullopt);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
-      m.def("add", &ater_add, "apply for add with transpose and broadcast.");
-      m.def("mul", &ater_mul, "apply for mul with transpose and broadcast.");
-      m.def("sub", &ater_sub, "apply for sub with transpose and broadcast.");
-      m.def("div", &ater_div, "apply for div with transpose and broadcast.");
+      m.def("add", &aiter_add, "apply for add with transpose and broadcast.");
+      m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");
+      m.def("sub", &aiter_sub, "apply for sub with transpose and broadcast.");
+      m.def("div", &aiter_div, "apply for div with transpose and broadcast.");
       m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",
             py::arg("Q"),
             py::arg("K"),

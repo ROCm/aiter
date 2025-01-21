@@ -8,7 +8,7 @@ import shutil
 
 from setuptools import setup, find_packages
 from packaging.version import parse, Version
-from ater.jit import core
+from aiter.jit import core
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
@@ -23,7 +23,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
 blob_dir = f"{bd_dir}/blob"
-PACKAGE_NAME = 'ater'
+PACKAGE_NAME = 'aiter'
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
 if BUILD_TARGET == "auto":
@@ -73,12 +73,12 @@ if IS_ROCM:
 
     # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
     # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = [f'-DATER_ASM_DIR="{this_dir}/hsa/"']
+    generator_flag = [f'-DAITER_ASM_DIR="{this_dir}/hsa/"']
     torch_dir = torch.__path__[0]
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag.append("-DOLD_GENERATOR_PATH")
     assert os.path.exists(
-        ck_dir), f'CK is needed by ater, please make sure clone by "git clone --recursive https://github.com/ROCm/ater.git" or "git submodule sync ; git submodule update --init --recursive"'
+        ck_dir), f'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
     generator_flag.append("-DFIND_CK")
 
     shutil.copytree(ck_dir, f'{bd_dir}/ck', dirs_exist_ok=True)
@@ -118,7 +118,7 @@ if IS_ROCM:
         new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list
 
-        core.build_module(md_name = "ater_", 
+        core.build_module(md_name = "aiter_", 
                     srcs = all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
                     flags_extra_cc = all_opts_args_build["flags_extra_cc"],
                     flags_extra_hip = all_opts_args_build["flags_extra_hip"],

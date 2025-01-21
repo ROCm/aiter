@@ -4,7 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
-#include "ater_hip_common.h"
+#include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -72,8 +72,8 @@ private:
 public:
     FMoeKernel(const char *name, const char *hsaco, uint32_t sub_GU = 512)
     {
-        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << hsaco;
-        HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
+        std::cout << "hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << hsaco;
+        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
         this->sub_GU = sub_GU;

@@ -4,14 +4,14 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-import ater
-from ater.test_common import checkAllclose, perftest
+import aiter
+from aiter.test_common import checkAllclose, perftest
 import argparse
 
 
 @perftest()
 def run_torch(input, x_scale, y_scale_dtype=torch.float32):
-    output, y_scale = ater.pertoken_quant(
+    output, y_scale = aiter.pertoken_quant(
         input, x_scale=x_scale, y_scale_dtype=y_scale_dtype)
     return output, y_scale
 
@@ -23,7 +23,7 @@ def run_ck(input, x_scale, y_scale_dtype=torch.float32):
                          layout=input.layout, device=input.device)
     y_scale = torch.empty(
         input.shape[0], 1, device="cuda", dtype=y_scale_dtype)
-    ater.smoothquant_fwd(output,
+    aiter.smoothquant_fwd(output,
                          input,
                          x_scale,
                          y_scale)

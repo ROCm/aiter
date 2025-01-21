@@ -13,17 +13,17 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
 
 ## How to use gradlib
 
-1. to get GEMM shapes to be tuned, replace F.linear by tgemm.mm under ater/tuned_gemm.py,
+1. to get GEMM shapes to be tuned, replace F.linear by tgemm.mm under aiter/tuned_gemm.py,
    run
 
    `
     VLLM_TUNE_GEMM=1 python {workload_tests}
-shapes will be captured in ater/configs/untuned_gemm.csv
+shapes will be captured in aiter/configs/untuned_gemm.csv
    `
-2. to tune GEMMs in ater/configs/untuned_gemm.csv,
+2. to tune GEMMs in aiter/configs/untuned_gemm.csv,
    run
    
    ` 
-    python3 gradlib/gradlib/gemm_tuner.py --tuned_file ater/configs/tuned_gemm.csv  --input_file ater/configs/untuned_gemm.csv
+    python3 gradlib/gradlib/gemm_tuner.py --tuned_file aiter/configs/tuned_gemm.csv  --input_file aiter/configs/untuned_gemm.csv
    `
 4. then run your test as normal~

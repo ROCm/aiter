@@ -3,8 +3,8 @@
 
 import torch
 import torch.nn.functional as F
-import ater
-from ater.test_common import checkAllclose, perftest
+import aiter
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -36,9 +36,9 @@ def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
 def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     if residual is None:
         residual_out = None
-        output = ater.layer_norm(input, weight, bias, eps, x_bias)
+        output = aiter.layer_norm(input, weight, bias, eps, x_bias)
         # output = torch.empty_like(input)
-        # ater.layernorm2d_fwd(
+        # aiter.layernorm2d_fwd(
         #     output,
         #     input,
         #     weight,
@@ -48,7 +48,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
-        ater.layernorm2d_fwd_with_add(
+        aiter.layernorm2d_fwd_with_add(
             output,
             input,
             residual,
@@ -65,11 +65,11 @@ def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
 def run_asm(input, weight, bias, eps, residual=None):
     if residual is None:
         residual_out = None
-        output = ater.layer_norm(input, weight, bias, eps)
+        output = aiter.layer_norm(input, weight, bias, eps)
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
-        ater.layernorm2d_with_add_asm(
+        aiter.layernorm2d_with_add_asm(
             output,
             input,
             residual,

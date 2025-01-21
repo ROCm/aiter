@@ -3,8 +3,8 @@
 
 import torch
 import torch.nn.functional as F
-import ater
-from ater.test_common import checkAllclose, perftest
+import aiter
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest()
@@ -32,7 +32,7 @@ def run_torch(input, weight, eps, residual=None):
 def run_ck(input, weight, eps, residual=None):
     if residual is None:
         residual_out = None
-        output = ater.rms_norm(
+        output = aiter.rms_norm(
             input,
             weight,
             eps
@@ -40,7 +40,7 @@ def run_ck(input, weight, eps, residual=None):
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
-        ater.rmsnorm2d_fwd_with_add(
+        aiter.rmsnorm2d_fwd_with_add(
             output,
             input,
             residual,
@@ -56,9 +56,9 @@ def run_cu(input, weight, eps, residual=None):
     if residual is None:
         residual_out = None
         output = torch.empty_like(input)
-        ater.rms_norm_cu(output, input, weight, eps)
+        aiter.rms_norm_cu(output, input, weight, eps)
     else:
-        ater.fused_add_rms_norm_cu(
+        aiter.fused_add_rms_norm_cu(
             input,
             residual,
             weight,

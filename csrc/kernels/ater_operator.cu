@@ -554,7 +554,7 @@ namespace vllm
 }
 
 template <typename Operation>
-torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
 
@@ -834,22 +834,22 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
   }
 }
 
-torch::Tensor ater_add(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::AddOp>(input, other);
+  return aiter_operation<vllm::AddOp>(input, other);
 }
 
-torch::Tensor ater_sub(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::SubOp>(input, other);
+  return aiter_operation<vllm::SubOp>(input, other);
 }
 
-torch::Tensor ater_mul(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::MulOp>(input, other);
+  return aiter_operation<vllm::MulOp>(input, other);
 }
 
-torch::Tensor ater_div(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::DivOp>(input, other);
+  return aiter_operation<vllm::DivOp>(input, other);
 }

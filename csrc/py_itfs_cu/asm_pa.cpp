@@ -4,7 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
-#include "ater_hip_common.h"
+#include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -93,9 +93,9 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     args.KVs = stride_KV_head;
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    static AterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
-    static AterAsmKernel impl_a16w8("pa_kernel_func", "pa_a16w8.co");
-    AterAsmKernel *impl_ptr = &impl_a16w16;
+    static AiterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
+    static AiterAsmKernel impl_a16w8("pa_kernel_func", "pa_a16w8.co");
+    AiterAsmKernel *impl_ptr = &impl_a16w16;
 
     if (K_QScale)
         impl_ptr = &impl_a16w8;

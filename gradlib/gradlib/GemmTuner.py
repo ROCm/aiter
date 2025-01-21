@@ -17,15 +17,15 @@ import os
 import random
 from pathlib import Path
 
-import ater
+import aiter
 import pandas as pd
-import ater
+import aiter
 import torch
 import torch.nn.functional as F
-from ater.test_common import perftest
+from aiter.test_common import perftest
 
-ater.rocb_create_extension()
-ater.hipb_create_extension()
+aiter.rocb_create_extension()
+aiter.hipb_create_extension()
 
 rtol = 1e-5
 atol = 1
@@ -72,7 +72,7 @@ class Gemm:
         self.rocblas_decode = rocblas_decode
 
     def find_hipblas_sols(self):
-        sols = ater.hipb_findallsols(self.inp,
+        sols = aiter.hipb_findallsols(self.inp,
                                      self.weights.t(),
                                      bias=self.bias,
                                      out_dtype=self.outdtype,
@@ -106,7 +106,7 @@ class Gemm:
         else:
             ref = F.linear(self.inp, self.weights, self.bias)
         if libtype == 'hipblaslt':
-            c = ater.hipb_mm(self.inp,
+            c = aiter.hipb_mm(self.inp,
                              self.weights.t(),
                              solidx,
                              bias=self.bias,
@@ -114,7 +114,7 @@ class Gemm:
                              scaleA=scaleA,
                              scaleB=scaleB)
         elif libtype == 'rocblas':
-            c = ater.rocb_mm(self.inp, self.weights.t(), solidx)
+            c = aiter.rocb_mm(self.inp, self.weights.t(), solidx)
             if self.bias is not None:
                 c += self.bias
         if torch.allclose(c.to(self.outdtype),
@@ -136,7 +136,7 @@ class Gemm:
     def hipb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
         @perftest(num_warmup=cold_iters, num_iters=warm_iters)
         def call_hipb_mm(input, weight, solidx, out_dtype, scale_a=None, scale_b=None):
-            ater.hipb_mm(input, weight, solidx, out_dtype=out_dtype, scaleA=scale_a, scaleB=scale_b)
+            aiter.hipb_mm(input, weight, solidx, out_dtype=out_dtype, scaleA=scale_a, scaleB=scale_b)
 
         scaleA = HALF if self.scaleAB else None
         scaleB = HALF if self.scaleAB else None
@@ -150,13 +150,13 @@ class Gemm:
         gtime = gtime / 1000.0
         # print('>>>hipbtime',solidx)
         # for i in range(cold_iters):
-        #     ater.hipb_mm(self.inp,
+        #     aiter.hipb_mm(self.inp,
         #                            self.weights.t(),
         #                            solidx,
         #                            out_dtype=self.outdtype)
         # self.start.record()
         # for i in range(warm_iters):
-        #     ater.hipb_mm(self.inp,
+        #     aiter.hipb_mm(self.inp,
         #                            self.weights2[random.randint(
         #                                0, self.nb - 1)].t(),
         #                            solidx,
@@ -192,10 +192,10 @@ class Gemm:
     def rocb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
 
         def rocb_mm_bias(inp, w, solidx, bias):
-            return ater.rocb_mm(inp, w, solidx) + bias
+            return aiter.rocb_mm(inp, w, solidx) + bias
 
         def rocb_mm_nobias(inp, w, solidx, _):
-            return ater.rocb_mm(inp, w, solidx)
+            return aiter.rocb_mm(inp, w, solidx)
 
         rocb_fun = rocb_mm_bias if self.bias is not None else rocb_mm_nobias
 
@@ -229,7 +229,7 @@ class Gemm:
         if self.scaleAB or self.bias is not None:
             sols = []
         else:
-            sols = ater.rocb_findallsols(self.inp, self.weights.t())
+            sols = aiter.rocb_findallsols(self.inp, self.weights.t())
         print('M N K dtype',
               self.m,
               self.n,
@@ -390,7 +390,7 @@ class GemmTuner:
             soldf.loc[i, 'libtype'] = gemmobj.best_libtype
             soldf.loc[i, 'solidx'] = gemmobj.best_solidx
             soldf.loc[i, 'soltimes'] = round(gemmobj.best_soltime*1000, 2)
-            soldf.loc[i, 'kernelName'] = ater.getHipblasltKernelName(
+            soldf.loc[i, 'kernelName'] = aiter.getHipblasltKernelName(
                 int(gemmobj.best_solidx)) if gemmobj.best_libtype == 'hipblaslt' else ""
 
             del gemmobj

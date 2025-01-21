@@ -24,7 +24,7 @@ struct p2
     unsigned int _p0;
     unsigned int _p1;
 };
-struct AterAsmKernelArgs
+struct AiterAsmKernelArgs
 {
     void *args_ptr;
     void *arg_size_ptr;
@@ -37,22 +37,22 @@ struct AterAsmKernelArgs
     const hipStream_t stream;
 };
 
-class AterAsmKernel
+class AiterAsmKernel
 {
 private:
     hipModule_t module;
     hipFunction_t kernel_func;
 
 public:
-    AterAsmKernel(const char *name, const char *hsaco)
+    AiterAsmKernel(const char *name, const char *hsaco)
     {
-        std::cout << "hipModuleLoad: " << (std::string(ATER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << hsaco;
-        HIP_CALL(hipModuleLoad(&module, (std::string(ATER_ASM_DIR) + hsaco).c_str()));
+        std::cout << "hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << hsaco;
+        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
     };
 
-    void launch_kernel(const AterAsmKernelArgs &kargs)
+    void launch_kernel(const AiterAsmKernelArgs &kargs)
     {
         void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, kargs.args_ptr,
                           HIP_LAUNCH_PARAM_BUFFER_SIZE, kargs.arg_size_ptr,

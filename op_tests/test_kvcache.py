@@ -3,8 +3,8 @@
 
 import torch
 import torch.nn.functional as F
-import ater
-from ater.test_common import checkAllclose, perftest
+import aiter
+from aiter.test_common import checkAllclose, perftest
 from typing import List, Optional, Tuple, Union
 
 MAX_TOKEN_SUPPORTED = 16384
@@ -25,7 +25,7 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
     if quantCfg:
         k_scale = quantCfg['k_scale']
         v_scale = quantCfg['v_scale']
-        key, k_scale_ = ater.pertoken_quant(key,
+        key, k_scale_ = aiter.pertoken_quant(key,
                                             y_scale_dtype=quantCfg['y_scale_dtype'],
                                             quant_dtype=quantCfg['quant_dtype'])
         k_scale_ = k_scale_.permute(0, 1, 3, 2).view(
@@ -43,7 +43,7 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
                            head_size//x, x).permute(0, 2, 3, 1, 4)
 
     if quantCfg:
-        value, v_scale_ = ater.pertoken_quant(value,
+        value, v_scale_ = aiter.pertoken_quant(value,
                                               y_scale_dtype=quantCfg['y_scale_dtype'],
                                               quant_dtype=quantCfg['quant_dtype'])
         v_scale_ = v_scale_.permute(0, 1, 3, 2).view(
@@ -73,16 +73,16 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
 
 
 @perftest()
-def run_ater(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}):
+def run_aiter(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}):
     if quantCfg:
         k_scale = quantCfg['k_scale']
         v_scale = quantCfg['v_scale']
-        ater.reshape_and_cache_with_pertoken_quant(
+        aiter.reshape_and_cache_with_pertoken_quant(
             key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout)
     else:
         k_scale = None
         v_scale = None
-        ater.reshape_and_cache(
+        aiter.reshape_and_cache(
             key, value, k_cache, v_cache, slot_mapping, 'auto', 1.0, 1.0, asm_layout)
     return k_cache, v_cache, k_scale, v_scale
 
@@ -137,10 +137,10 @@ def test_reshape_and_cache(ctx_lens: int,
     if quantCfg:
         quantCfg['k_scale'] = k_scale.clone()
         quantCfg['v_scale'] = v_scale.clone()
-    out_a, us_a = run_ater(key, value, k_cache_a, v_cache_a,
+    out_a, us_a = run_aiter(key, value, k_cache_a, v_cache_a,
                            slot_mapping, block_size, x, asm_layout, quantCfg)
 
-    print(f'prefill part: ref vs ater {us_ref:.2f}us vs {us_a:.2f}us')
+    print(f'prefill part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     names = ['k_cache', 'v_cache', 'k_scale', 'v_scale']
     for i, el in enumerate(out_ref):
         if el is None:
@@ -170,10 +170,10 @@ def test_reshape_and_cache(ctx_lens: int,
     if quantCfg:
         quantCfg['k_scale'] = k_scale.clone()
         quantCfg['v_scale'] = v_scale.clone()
-    out_a, us_a = run_ater(key, value, k_cache_a, v_cache_a,
+    out_a, us_a = run_aiter(key, value, k_cache_a, v_cache_a,
                            slot_mapping, block_size, x, asm_layout, quantCfg)
 
-    print(f'decode part: ref vs ater {us_ref:.2f}us vs {us_a:.2f}us')
+    print(f'decode part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     names = ['k_cache', 'v_cache', 'k_scale', 'v_scale']
     for i, el in enumerate(out_ref):
         if el is None:
