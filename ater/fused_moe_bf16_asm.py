@@ -8,6 +8,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 import ater
+from ater import logger
 BLOCK_SIZE_M = 32
 
 
@@ -74,7 +75,14 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             ater.moe_smoothquant_fwd(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
         else:
-            a8, a8_scale = ater.pertoken_quant(hidden_states, torch.float, quant_dtype=w1.dtype)
+            if w1.dtype == torch.float8_e4m3fnuz:
+                a8 = torch.empty((M, model_dim), dtype=w1.dtype, device=device)
+                a8_scale = torch.empty(M, dtype=torch.float, device=device)
+                ater.dynamic_per_token_scaled_fp8_quant(
+                    a8, hidden_states, a8_scale)
+            else:
+                logger.warning(f'FMOE fall into pure torch quant...')
+                a8, a8_scale = ater.pertoken_quant(hidden_states, torch.float, quant_dtype=w1.dtype)
 
         if w2.shape[2] == w1.shape[1]:
             fmoe_func = ater.fmoe_int8_g1u0

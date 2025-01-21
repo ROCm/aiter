@@ -57,7 +57,7 @@ def dynamic_scaled_fp8_quant(
     out: Tensor, input: Tensor, scale: Tensor
 ):
     '''
-    function not correct, need to be fixed
+    must init out as zeroes
     '''
     ...
 
