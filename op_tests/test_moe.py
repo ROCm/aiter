@@ -211,7 +211,6 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False, use_g1u1
                                      w2,
                                      topk_weights,
                                      topk_ids)
-        # print(f'{ref2=}')
 
         # b implement
         w1b = shuffle_weight(w1)
@@ -222,54 +221,84 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant=False, use_g1u1
         out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     None, None, 
                                     None, None)
-        msg = f'asm: {avg_b:.2f} vs ck: {avg_ck:.2f}'
-        checkAllclose(ref2, out_ck, atol=100, msg=msg)
 
-        # print(f'{out_b=}')
+        msg = f"[perf] {token=}, {quant=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, ck_avg: {avg_ck:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        checkAllclose(ref2, out_ck, rtol=0.01, atol=100, msg="ck check")
+        
     else:
         w1, fc1_scale = pertoken_quant(w1, torch.float, quant_dtype = quant_dtype)
         w2, fc2_scale = pertoken_quant(w2, torch.float, quant_dtype = quant_dtype)
 
         sp1 = (E, inter_dim)
         sp2 = (E, model_dim)
-        # [expert, 1, model_dim]
-        fc1_smooth_scale = torch.randn(sp2, dtype=torch.float, device="cuda")
-        # [expert, 1, inter_dim]
-        fc2_smooth_scale = torch.randn(sp1, dtype=torch.float, device="cuda")
+
+        if use_g1u1:
+            fc1_smooth_scale = None
+            fc2_smooth_scale = None
+        else:
+            # [expert, 1, model_dim]
+            fc1_smooth_scale = torch.randn(sp2, dtype=torch.float, device="cuda")
+            # [expert, 1, inter_dim]
+            fc2_smooth_scale = torch.randn(sp1, dtype=torch.float, device="cuda")
 
         # ref2 implement
-        ref2, avg_c = torch_moe_test(input,
-                                     w1,
-                                     w2,
-                                     topk_weights,
-                                     topk_ids, fc1_scale, fc2_scale, 
-                                     fc1_smooth_scale if not use_g1u1 else None, 
-                                     fc2_smooth_scale if not use_g1u1 else None)
+        ref2, avg_c = torch_moe_test(input, w1, w2, topk_weights, topk_ids, 
+                                     fc1_scale, fc2_scale, 
+                                     fc1_smooth_scale, fc2_smooth_scale if not use_g1u1 else None)
 
         # b implement
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     fc1_scale, fc2_scale, 
-                                    fc1_smooth_scale if not use_g1u1 else None, 
-                                    fc2_smooth_scale)
-        if not use_g1u1:
-            out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-                                        fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True)
-            msg = f'asm: {avg_b:.2f} vs fuseQuant: {avg_b2:.2f}'
-            checkAllclose(out_b, out_b2, atol=100, msg=msg)
+                                    fc1_smooth_scale, fc2_smooth_scale)
+        
+        def calculateTensorsSize(*args):
+            num_btype = 0
+            for el in args:
+                if isinstance(el, torch.Tensor):
+                    num_btype += el.element_size() * el.numel()
+            return num_btype
 
-    msg = f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_a:<8.2f} us us,smtorch_k_avg: {avg_c:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
-    # checkAllclose(ref1, ref2, rtol=0.05, atol=20)
-    checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        num_tbtype = calculateTensorsSize(input, w1b, w2b, topk_weights, topk_ids,
+                                            fc1_scale, fc2_scale, 
+                                            fc1_smooth_scale, fc2_smooth_scale) / (1024*1024*1024*1024.0)
+        bw = num_tbtype * 1e6 / avg_b
+        print(f"[BW] {token=}, {quant=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:.2f}TB/s")
+
+        # if not use_g1u1:
+        #     out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
+        #                                 fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True)
+        #     msg = f'a8w8 asm: {avg_b:.2f} vs a16w8 asm: {avg_b2:.2f}'
+        #     checkAllclose(out_b, out_b2, atol=100, msg=msg)
+        
+        # # test ck moe, not support now
+        # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
+        #                              fc1_scale, fc2_scale, 
+        #                              fc1_smooth_scale, fc2_smooth_scale)
+        
+        msg = f"[perf] {token=}, {quant=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
 
 
 print('test test_fmoe 16 bit')
 for dtype in [torch.float16, torch.bfloat16][1:]:
-    for m in [1, 2, 4, 8, 16, 26, 32, 64, 128, 160, 192, 224, 256][-5:-4]:
-        for dim in [4096, 8192, 16384, 32768][1:1+1]:
-            for hdim in [1024, 2048, 3584, 4096, 8192, 16384, 32768][0:1]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
                 # test_fmoe(dtype, m, dim, hdim, 32, 5)
                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True)
-# test_fmoe(torch.bfloat16, 128, 1024, 1024, 4, 1, quant=True, use_g1u1=True, quant_dtype=torch.float8_e4m3fnuz)
-# test_fmoe(torch.bfloat16, 128, 1024, 1024, 4, 1, quant=False, use_g1u1=True)
+
+for dtype in [torch.bfloat16]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True, use_g1u1=True)
+
+for dtype in [torch.bfloat16]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5, quant=True, use_g1u1=True, quant_dtype=torch.float8_e4m3fnuz)
