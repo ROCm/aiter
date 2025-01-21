@@ -1,13 +1,5 @@
-# Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
-#
-# -*- coding:utf-8 -*-
-# @Script: setup.py
-# @Author: valarLip
-# @Email: lingpeng.jin@amd.com
-# @Create At: 2024-11-11 18:48:26
-# @Last Modified By: valarLip
-# @Last Modified At: 2024-12-03 18:22:58
-# @Description: This is description.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import warnings
 import os

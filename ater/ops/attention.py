@@ -1,13 +1,5 @@
-# Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
-#
-# -*- coding:utf-8 -*-
-# @Script: attention.py
-# @Author: valarLip
-# @Email: lingpeng.jin@amd.com
-# @Create At: 2024-12-04 21:35:47
-# @Last Modified By: valarLip
-# @Last Modified At: 2024-12-13 20:56:07
-# @Description: This is description.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import torch

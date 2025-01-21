@@ -1,13 +1,5 @@
-# Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
-#
-# -*- coding:utf-8 -*-
-# @Script: communication.py
-# @Author: valarLip
-# @Email: lingpeng.jin@amd.com
-# @Create At: 2024-12-14 15:47:26
-# @Last Modified By: valarLip
-# @Last Modified At: 2025-01-13 16:01:40
-# @Description: This is description.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor

@@ -1,13 +1,5 @@
-# Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
-#
-# -*- coding:utf-8 -*-
-# @Script: shuffle.py
-# @Author: valarLip
-# @Email: lingpeng.jin@amd.com
-# @Create At: 2024-12-11 13:38:14
-# @Last Modified By: valarLip
-# @Last Modified At: 2024-12-11 15:11:04
-# @Description: This is description.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 

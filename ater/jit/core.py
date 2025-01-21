@@ -1,13 +1,5 @@
-# Copyright (c) 2024 Advanced Micro Devices, Inc.  All rights reserved.
-#
-# -*- coding:utf-8 -*-
-# @Script: core.py
-# @Author: valarLip
-# @Email: lingpeng.jin@amd.com
-# @Create At: 2024-11-29 15:58:57
-# @Last Modified By: valarLip
-# @Last Modified At: 2025-01-14 16:15:31
-# @Description: This is description.
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import sys
