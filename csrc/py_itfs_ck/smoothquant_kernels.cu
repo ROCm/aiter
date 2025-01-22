@@ -41,10 +41,15 @@ void moe_smoothquant_fwd(torch::Tensor &out,      // [topk * tokens, hidden_size
                          torch::Tensor &y_scale)  // [topk * tokens,  1]
 {
     auto dtype = input.dtype();
+    auto odtype = out.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck smoothquant only support fp16 and bf16 data type");
+    
+    TORCH_CHECK(odtype == torch::kChar || odtype == torch::kFloat8_e4m3fnuz,
+                "ck smoothquant only support fp8 and int8 quant");
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
+    std::string odtype_str = torchDTypeToStr(out.dtype());
     int n = input.size(-1);
     int m = input.numel() / n;
     int experts = x_scale.size(0);
@@ -53,7 +58,8 @@ void moe_smoothquant_fwd(torch::Tensor &out,      // [topk * tokens, hidden_size
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     moe_smoothquant({
-                        dtype_str // input  dtype
+                        dtype_str, // input  dtype
+                        odtype_str // output dtype
                     },
                     {input.data_ptr(),    // [tokens, hidden_size], input, fp16/bf16
                      x_scale.data_ptr(),  // [experts, hidden_size], input, columnwise scale, fp32

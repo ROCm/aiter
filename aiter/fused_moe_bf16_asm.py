@@ -69,7 +69,7 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
         
         if fc1_smooth_scale is not None:
             a8 = torch.empty((topk * M, model_dim),
-                            dtype=torch.int8, device=device)
+                            dtype=w1.dtype, device=device)
             a8_scale = torch.empty((topk * M), dtype=torch.float, device=device)
 
             aiter.moe_smoothquant_fwd(

@@ -335,6 +335,14 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
+        static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
+        static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
+        static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
+        static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
+        static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
+        static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
+        static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
+
         static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
         static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
         static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
@@ -342,20 +350,21 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
         static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
         static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
         static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
+        
         if ((hidden_dim % 512) == 0)
-            impl_ptr = &impl_fp8_512;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_512 : &impl_fp8_s_512;
         else if ((hidden_dim % 448) == 0)
-            impl_ptr = &impl_fp8_448;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_448 : &impl_fp8_s_448;
         else if ((hidden_dim % 384) == 0)
-            impl_ptr = &impl_fp8_384;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_384 : &impl_fp8_s_384;
         else if ((hidden_dim % 320) == 0)
-            impl_ptr = &impl_fp8_320;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_320 : &impl_fp8_s_320;
         else if ((hidden_dim % 256) == 0)
-            impl_ptr = &impl_fp8_256;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_256 : &impl_fp8_s_256;
         else if ((hidden_dim % 192) == 0)
-            impl_ptr = &impl_fp8_192;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_192 : &impl_fp8_s_192;
         else if ((hidden_dim % 128) == 0)
-            impl_ptr = &impl_fp8_128;
+            impl_ptr = !fc2_smooth_scale.has_value()? &impl_fp8_128 : &impl_fp8_s_128;
         else
             TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
