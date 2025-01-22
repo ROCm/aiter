@@ -19,7 +19,7 @@ def moe_smoothquant_fwd(
 
 
 # following are pure torch implement
-def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype=torch.int8):
+def pertoken_quant(hidden_states_input, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8):
     if x_scale is None:
         hidden_states = hidden_states_input
     else:
