@@ -549,7 +549,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
 
 def get_config_file_name(E: int, N: int, dtype: Optional[str]) -> str:
     # device_name = current_platform.get_device_name().replace(" ", "_")
-    device_name = 'AMD_Instinct_MI308X_OAM'  # TODO: need to update
+    device_name = 'AMD_Instinct_OAM'  # TODO: need to update
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     return f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
 
