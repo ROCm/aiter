@@ -8,6 +8,7 @@
 #include "custom_all_reduce.h"
 #include "communication_asm.h"
 #include "custom.h"
+#include "mha_fwd.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
 #include "norm.h"
@@ -217,4 +218,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
             py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
             py::arg("block_m") = 32);
+      m.def("mha_fwd", &mha_fwd,
+            py::arg("q"), py::arg("k"), py::arg("v"),
+            py::arg("dropout_p"),
+            py::arg("softmax_scale"),
+            py::arg("is_causal"),
+            py::arg("window_size_left"),
+            py::arg("window_size_right"),
+            py::arg("return_softmax_lse"),
+            py::arg("return_dropout_randval"),
+            py::arg("out") = std::nullopt,
+            py::arg("alibi_slopes") = std::nullopt,
+            py::arg("gen") = std::nullopt);
 }

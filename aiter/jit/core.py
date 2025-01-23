@@ -120,11 +120,6 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
-            # ck
-            "-fno-offload-uniform-block",
-            "-fgpu-flush-denormals-to-zero",
-            "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
-            f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}",
         ]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
