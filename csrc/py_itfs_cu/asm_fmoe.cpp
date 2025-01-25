@@ -207,7 +207,7 @@ int get_heuristic_tile(int hidden_dim, int sub_X_cnt)
     uint32_t num_cu = dev_prop.multiProcessorCount;
     uint32_t empty_cu = num_cu;
     uint32_t tg_num = 0;
-    uint32_t round = 128;
+    uint32_t round = 0xffffffff;
     int selectedTile = 0;
 
     for (auto tile : tiles)

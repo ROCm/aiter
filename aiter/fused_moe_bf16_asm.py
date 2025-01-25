@@ -35,7 +35,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
                           dtype=moebuf_dtype,
                           device=device)
     aiter.moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
-                         num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M)
+                          num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
 
 
@@ -45,7 +45,8 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             fc2_scale=None,  # [expert, model_dim, 1]
             fc1_smooth_scale=None,  # [expert, 1, model_dim]
             fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-            a16=False
+            a16=False,
+            per_tensor_quant_scale=None,
             ):
     E, inter_dim, model_dim = w1.shape
     M, topk = topk_ids.shape
@@ -56,33 +57,44 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
-                  sorted_weights, sorted_expert_ids, num_tokens_post_padded, topk)
+                   sorted_weights, sorted_expert_ids, num_tokens_post_padded, topk)
     elif a16:
         aiter.fmoe_int8_g1u0_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
-                                sorted_weights, sorted_expert_ids, num_tokens_post_padded,
-                                topk,
-                                fc1_scale,
-                                fc2_scale,
-                                fc1_smooth_scale,
-                                fc2_smooth_scale)
+                                 sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                                 topk,
+                                 fc1_scale,
+                                 fc2_scale,
+                                 fc1_smooth_scale,
+                                 fc2_smooth_scale)
     else:
-        
+
         if fc1_smooth_scale is not None:
             a8 = torch.empty((topk * M, model_dim),
-                            dtype=w1.dtype, device=device)
-            a8_scale = torch.empty((topk * M), dtype=torch.float, device=device)
+                             dtype=w1.dtype, device=device)
+            a8_scale = torch.empty(
+                (topk * M), dtype=torch.float, device=device)
 
             aiter.moe_smoothquant_fwd(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
         else:
             if w1.dtype == torch.float8_e4m3fnuz:
-                a8 = torch.empty((M, model_dim), dtype=w1.dtype, device=device)
-                a8_scale = torch.empty(M, dtype=torch.float, device=device)
-                aiter.dynamic_per_token_scaled_fp8_quant(
-                    a8, hidden_states, a8_scale)
+                if per_tensor_quant_scale is None:
+                    a8 = torch.empty(
+                        (M, model_dim), dtype=w1.dtype, device=device)
+                    a8_scale = torch.empty(M, dtype=torch.float, device=device)
+                    aiter.dynamic_per_token_scaled_fp8_quant(
+                        a8, hidden_states, a8_scale)
+                else:
+                    a8 = torch.empty(
+                        (M, model_dim), dtype=w1.dtype, device=device)
+                    a8_scale = torch.empty(M, dtype=torch.float, device=device)
+                    aiter.static_scaled_fp8_quant(
+                        a8, hidden_states, per_tensor_quant_scale)
+                    a8_scale.fill_(per_tensor_quant_scale)
             else:
                 logger.warning(f'FMOE fall into pure torch quant...')
-                a8, a8_scale = aiter.pertoken_quant(hidden_states, torch.float, quant_dtype=w1.dtype)
+                a8, a8_scale = aiter.pertoken_quant(
+                    hidden_states, torch.float, quant_dtype=w1.dtype)
 
         if w2.shape[2] == w1.shape[1]:
             fmoe_func = aiter.fmoe_int8_g1u0
