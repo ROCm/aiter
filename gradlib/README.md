@@ -17,7 +17,7 @@ By gradlib, we can confirm the parameter of GEMMs with best performance in the s
    run
 
    `
-    VLLM_TUNE_GEMM=1 python {workload_tests}
+    AITER_TUNE_GEMM=1 python {workload_tests}
 shapes will be captured in aiter/configs/untuned_gemm.csv
    `
 2. to tune GEMMs in aiter/configs/untuned_gemm.csv,

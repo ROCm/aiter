@@ -31,7 +31,7 @@ class TunedGemm:
 
     def __init__(self):
         self.extensions_created = False
-        self.save_gemm = int(os.environ.get('VLLM_TUNE_GEMM', 0))
+        self.save_gemm = int(os.environ.get('AITER_TUNE_GEMM', 0))
         self.untune_path = f'{this_dir}/configs/untuned_gemm.csv'
         self.tune_path = f'{this_dir}/configs/tuned_gemm.csv'
         self.bestsols = {}
