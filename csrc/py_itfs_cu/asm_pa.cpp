@@ -58,6 +58,8 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     int num_kv_heads = K.size(1);
     int block_size = K.size(3);
     const int gqa_ratio = num_heads / num_kv_heads;
+    TORCH_CHECK(block_size == 16,
+                __func__, " for now only support block_size == 16");
 
     int dim = head_size;
     int stride_Q = gqa_ratio * dim * Q.itemsize();
