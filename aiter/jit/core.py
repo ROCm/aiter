@@ -9,6 +9,7 @@ import importlib
 import functools
 import traceback
 from typing import List, Optional
+import torch
 from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
@@ -277,9 +278,16 @@ def compile_ops(ops_name: str, fc_name: Optional[str] = None):
             if int(os.getenv("AITER_LOG_MORE", 0)) == 2:
                 import inspect
                 callargs = inspect.getcallargs(func, *args, **kwargs)
-                fuc_args = [
-                    f"\n        {el} = {getattr(callargs[el], 'shape', callargs[el])}" for el in callargs]
-                logger.info(f"    calling {md_name}({', '.join(fuc_args)})")
+
+                def getTensorInfo(el):
+                    if isinstance(el, torch.Tensor):
+                        return f'{el.shape} {el.dtype}'
+                    return el
+
+                callargs = [
+                    f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
+                logger.info(
+                    f"    calling {md_name}::{loadName}({', '.join(callargs)})")
 
             return op(*args, **kwargs)
         return wrapper
