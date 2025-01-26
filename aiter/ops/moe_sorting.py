@@ -10,7 +10,13 @@ import torch.nn.functional as F
 MD_NAME = "module_moe_sorting"
 
 
-
 @compile_ops("module_moe_sorting")
-def moe_sorting_fwd(input: Tensor, out: Tensor,
-                    x_scale: Tensor, y_scale: Tensor): ...
+def moe_sorting_fwd(topk_ids: Tensor,
+                    topk_weights: Tensor,
+                    sorted_token_ids: Tensor,
+                    sorted_weights: Tensor,
+                    sorted_expert_ids: Tensor,
+                    total_tokens_post_pad: Tensor,
+                    moe_buf: Tensor,
+                    num_experts: int,
+                    unit_size: int): ...
