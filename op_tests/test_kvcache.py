@@ -145,7 +145,8 @@ def test_reshape_and_cache(ctx_lens: int,
     for i, el in enumerate(out_ref):
         if el is None:
             continue
-        checkAllclose(el, out_a[i], msg=f'{names[i]} {el.shape}')
+        checkAllclose(el.to(torch.float32),
+                      out_a[i].to(torch.float32), msg=f'{names[i]} {el.shape}')
 
     # ##################################################### decode part
     qkv = torch.randn(
@@ -178,17 +179,19 @@ def test_reshape_and_cache(ctx_lens: int,
     for i, el in enumerate(out_ref):
         if el is None:
             continue
-        checkAllclose(el, out_a[i], msg=f'{names[i]} {el.shape}')
+        checkAllclose(el.to(torch.float32),
+                      out_a[i].to(torch.float32), msg=f'{names[i]} {el.shape}')
     print(
         f'finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DTyoe_KV=} {DTyoe_KVCache=}')
 
 
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
                        torch.bfloat16, torch.bfloat16)
-print('start quant')
-# test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
-#                        torch.bfloat16, torch.float8_e4m3fnuz, quantCfg={'y_scale_dtype': torch.float,
-#                                                                         'quant_dtype': torch.float8_e4m3fnuz})
+print('start quant fp16->fp8')
+test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
+                       torch.float16, torch.float8_e4m3fnuz, quantCfg={'y_scale_dtype': torch.float,
+                                                                        'quant_dtype': torch.float8_e4m3fnuz})
+print('start quant bf16->i8')
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
                        torch.bfloat16, torch.int8, quantCfg={'y_scale_dtype': torch.float,
                                                              'quant_dtype': torch.int8})

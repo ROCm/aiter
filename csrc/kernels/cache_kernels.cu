@@ -313,7 +313,7 @@ namespace vllm
     __device__ DType type_convert(SType);
 
     template <>
-    __device__ float type_convert<float, uint16_t>(uint16_t x)
+    __device__ float type_convert<float, __half>(__half x)
     {
       return __half2float(x);
     }
@@ -674,7 +674,7 @@ void reshape_and_cache_with_pertoken_quant(
     }
     else if (key.dtype() == at::ScalarType::Half)
     {
-      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(uint16_t, hip_fp8, dequant_scale_t);
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__half, hip_fp8, dequant_scale_t);
     }
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
@@ -695,7 +695,7 @@ void reshape_and_cache_with_pertoken_quant(
     }
     else if (key.dtype() == at::ScalarType::Half)
     {
-      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(uint16_t, int8_t, dequant_scale_t);
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__half, int8_t, dequant_scale_t);
     }
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
