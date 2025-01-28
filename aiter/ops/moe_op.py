@@ -101,6 +101,23 @@ def fmoe_int8_g1u0_a16(
 ): ...
 
 
+@compile_ops("module_moe_asm")
+def fmoe_fp8_g1u1_a16(
+    out: Tensor,
+    input: Tensor,  # bf16
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weight_buf: Tensor,
+    sorted_expert_ids: Tensor,
+    num_tokens_post_padded: Tensor,
+    topk: int,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    fc1_smooth_scale: Tensor,
+    fc2_smooth_scale: Tensor,
+): ...
+
 @compile_ops("module_moe")
 def ck_moe(
     hidden_states: Tensor,

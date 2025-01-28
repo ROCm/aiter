@@ -34,7 +34,7 @@ struct __attribute__((packed)) KernelArgs
     p2 _p11;
     unsigned int dim;
     p3 _p12;
-    unsigned int hidden_dim;
+    unsigned int inter_dim;
     p3 _p13;
     unsigned int token_cnt;
     p3 _p14;
@@ -99,21 +99,21 @@ public:
         int dim = input.size(1);
         int sub_X_cnt = sorted_expert_ids.size(0);
         int eprt = w1.size(0);
-        int hidden_dim = w2.size(2);
+        int inter_dim = w2.size(2);
         uint32_t sub_GU = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
 
         int stride_X = input.stride(0) * input.element_size();
         int stride_GU = dim * I_elemSize;
-        int stride_D = hidden_dim * I_elemSize;
-        int stride_expert_GU = stride_GU * hidden_dim;
+        int stride_D = inter_dim * I_elemSize;
+        int stride_expert_GU = stride_GU * inter_dim;
         int stride_expert_D = stride_D * dim;
-        int stride_expert_GUDQN = hidden_dim * sizeof(float);
+        int stride_expert_GUDQN = inter_dim * sizeof(float);
         int stride_expert_DDQN = dim * sizeof(float);
-        int stride_expert_SMTDQN = hidden_dim * sizeof(float);
+        int stride_expert_SMTDQN = inter_dim * sizeof(float);
         int stride_O = dim * O_elemSize;
-        if (hidden_dim * 2 == w1.size(1))
+        if (inter_dim * 2 == w1.size(1))
         {
             stride_expert_GU *= 2;
             stride_expert_GUDQN *= 2;
@@ -144,7 +144,7 @@ public:
         args.ptr_SW = sorted_weight_buf.data_ptr();
         args.ptr_SEP = sorted_expert_ids.data_ptr();
         args.dim = dim;
-        args.hidden_dim = hidden_dim;
+        args.inter_dim = inter_dim;
         args.token_cnt = token_cnt;
         args.eprt_cnt = eprt;
         args.Xs = stride_X;
@@ -159,7 +159,7 @@ public:
         args.topk = topk;
 
         // std::cout << "args.dim: " << args.dim << std::endl;
-        // std::cout << "args.hidden_dim: " << args.hidden_dim << std::endl;
+        // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
         // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
         // std::cout << "args.eprt_cnt: " << args.eprt_cnt << std::endl;
         // std::cout << "args.stride_X: " << args.Xs << std::endl;
@@ -177,7 +177,7 @@ public:
                           &arg_size, HIP_LAUNCH_PARAM_END};
 
         int bdx = 256;
-        int gdx = ((hidden_dim + sub_GU - 1) / sub_GU);
+        int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
         int gdy = sub_X_cnt;
         int gdz = 1;
         const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -197,7 +197,7 @@ public:
         }
     };
 };
-int get_heuristic_tile(int hidden_dim, int sub_X_cnt)
+int get_heuristic_tile(int inter_dim, int sub_X_cnt)
 {
     int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
     hipDevice_t dev;
@@ -212,9 +212,9 @@ int get_heuristic_tile(int hidden_dim, int sub_X_cnt)
 
     for (auto tile : tiles)
     {
-        if ((hidden_dim % tile) == 0)
+        if ((inter_dim % tile) == 0)
         {
-            tg_num = hidden_dim / tile * sub_X_cnt;
+            tg_num = inter_dim / tile * sub_X_cnt;
             uint32_t local_round = tg_num / num_cu + 1;
             if (local_round < round)
             {
@@ -270,40 +270,54 @@ void fmoe_int8_g1u0(torch::Tensor &out,                    // [token_cnt, dim]
                     torch::Tensor &num_tokens_post_padded, // [1]
                     uint32_t topk,                         //
                     torch::Tensor &input_scale,            // [token_cnt, 1]
-                    torch::Tensor &fc1_scale,              // [expert, 1, hidden_dim]
+                    torch::Tensor &fc1_scale,              // [expert, 1, inter_dim]
                     torch::Tensor &fc2_scale,              // [expert, 1, dim]
-                    torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
+                    torch::Tensor &fc2_smooth_scale        // [expert, 1, inter_dim]
 )
 {
     FMoeKernel *impl_ptr = nullptr;
-    int hidden_dim = down.size(2);
+    int inter_dim = down.size(2);
 
     if (input.dtype() == at::ScalarType::Char)
     {
-        static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe_int8_g1u0_subGU_512.co", 512);
-        static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe_int8_g1u0_subGU_448.co", 448);
-        static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe_int8_g1u0_subGU_384.co", 384);
-        static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe_int8_g1u0_subGU_320.co", 320);
-        static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe_int8_g1u0_subGU_256.co", 256);
-        static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe_int8_g1u0_subGU_192.co", 192);
-        static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe_int8_g1u0_subGU_128.co", 128);
 
-        if ((hidden_dim % 512) == 0)
+        if ((inter_dim % 512) == 0)
+        {
+            static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe_int8_g1u0_subGU_512.co", 512);
             impl_ptr = &impl_int8_512;
-        else if ((hidden_dim % 448) == 0)
+        }
+        else if ((inter_dim % 448) == 0)
+        {
+            static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe_int8_g1u0_subGU_448.co", 448);
             impl_ptr = &impl_int8_448;
-        else if ((hidden_dim % 384) == 0)
+        }
+        else if ((inter_dim % 384) == 0)
+        {
+            static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe_int8_g1u0_subGU_384.co", 384);
             impl_ptr = &impl_int8_384;
-        else if ((hidden_dim % 320) == 0)
+        }
+        else if ((inter_dim % 320) == 0)
+        {
+            static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe_int8_g1u0_subGU_320.co", 320);
             impl_ptr = &impl_int8_320;
-        else if ((hidden_dim % 256) == 0)
+        }
+        else if ((inter_dim % 256) == 0)
+        {
+            static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe_int8_g1u0_subGU_256.co", 256);
             impl_ptr = &impl_int8_256;
-        else if ((hidden_dim % 192) == 0)
+        }
+        else if ((inter_dim % 192) == 0)
+        {
+            static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe_int8_g1u0_subGU_192.co", 192);
             impl_ptr = &impl_int8_192;
-        else if ((hidden_dim % 128) == 0)
+        }
+        else if ((inter_dim % 128) == 0)
+        {
+            static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe_int8_g1u0_subGU_128.co", 128);
             impl_ptr = &impl_int8_128;
+        }
         else
-            TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else
     {
@@ -336,77 +350,102 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
                torch::Tensor &num_tokens_post_padded,                       // [1]
                uint32_t topk,                                               //
                torch::Tensor &input_scale,                                  // [token_cnt, 1]
-               torch::Tensor &fc1_scale,                                    // [expert, 1, hidden_dim]
+               torch::Tensor &fc1_scale,                                    // [expert, 1, inter_dim]
                torch::Tensor &fc2_scale,                                    // [expert, 1, dim]
-               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt // [expert, 1, hidden_dim]
+               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt // [expert, 1, inter_dim]
 )
 {
     FMoeKernel *impl_ptr = nullptr;
-    int hidden_dim = down.size(2);
+    int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(hidden_dim, sub_X_cnt); // todo,add tune interface here
+    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
 
     if (input.dtype() == at::ScalarType::Char)
     {
-        static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
-        static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
-        static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
-        static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
-        static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
-        static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
-        static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
-
         if (selectedTile == 512)
+        {
+            static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
             impl_ptr = &impl_int8_512;
+        }
         else if (selectedTile == 448)
+        {
+            static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
             impl_ptr = &impl_int8_448;
+        }
         else if (selectedTile == 384)
+        {
+            static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
             impl_ptr = &impl_int8_384;
+        }
         else if (selectedTile == 320)
+        {
+            static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
             impl_ptr = &impl_int8_320;
+        }
         else if (selectedTile == 256)
+        {
+            static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
             impl_ptr = &impl_int8_256;
+        }
         else if (selectedTile == 192)
+        {
+            static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
             impl_ptr = &impl_int8_192;
+        }
         else if (selectedTile == 128)
+        {
+            static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
             impl_ptr = &impl_int8_128;
+        }
         else
-            TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
-        static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
-        static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
-        static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
-        static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
-        static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
-        static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
-        static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
-
-        static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
-        static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
-        static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
-        static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
-        static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
-        static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
-        static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
-
         if (selectedTile == 512)
+        {
+            static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
+            static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_512 : &impl_fp8_s_512;
+        }
         else if (selectedTile == 448)
+        {
+            static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
+            static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_448 : &impl_fp8_s_448;
+        }
         else if (selectedTile == 384)
+        {
+            static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
+            static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_384 : &impl_fp8_s_384;
+        }
         else if (selectedTile == 320)
+        {
+            static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
+            static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_320 : &impl_fp8_s_320;
+        }
         else if (selectedTile == 256)
+        {
+            static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
+            static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_256 : &impl_fp8_s_256;
+        }
         else if (selectedTile == 192)
+        {
+            static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
+            static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_192 : &impl_fp8_s_192;
+        }
         else if (selectedTile == 128)
+        {
+            static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
+            static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
             impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_128 : &impl_fp8_s_128;
+        }
         else
-            TORCH_CHECK(false, __func__, " Unsupported hidden_dim " + std::to_string(hidden_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else
     {
@@ -438,13 +477,45 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,                    // [token_cnt, di
                         torch::Tensor &sorted_expert_ids,      // [max_num_m_blocks]
                         torch::Tensor &num_tokens_post_padded, // [1]
                         uint32_t topk,                         //
-                        torch::Tensor &fc1_scale,              // [expert, 1, hidden_dim]
+                        torch::Tensor &fc1_scale,              // [expert, 1, inter_dim]
                         torch::Tensor &fc2_scale,              // [expert, 1, dim]
-                        torch::Tensor &fc1_smooth_scale,       // [expert, 1, hidden_dim]
-                        torch::Tensor &fc2_smooth_scale        // [expert, 1, hidden_dim]
+                        torch::Tensor &fc1_smooth_scale,       // [expert, 1, dim]
+                        torch::Tensor &fc2_smooth_scale        // [expert, 1, inter_dim]
 )
 {
     static FMoeKernel impl("fmoe_kernel_func", "fmoe_int8_g1u0_smf.co");
+    impl.launch_kernel<uint8_t, uint16_t, true>(out,
+                                                input,
+                                                gate,
+                                                down,
+                                                sorted_token_ids,
+                                                sorted_weight_buf,
+                                                sorted_expert_ids,
+                                                num_tokens_post_padded,
+                                                topk,
+                                                // quant args
+                                                fc1_smooth_scale,
+                                                fc1_scale,
+                                                fc2_scale,
+                                                fc2_smooth_scale);
+}
+
+void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim]
+                       torch::Tensor &input,                  // [token_cnt, dim] M,K
+                       torch::Tensor &gate,                   // [expert, inter_dim*2, dim] N,K
+                       torch::Tensor &down,                   // [expert, dim, inter_dim]
+                       torch::Tensor &sorted_token_ids,       // [max_num_tokens_padded]
+                       torch::Tensor &sorted_weight_buf,      // [max_num_tokens_padded]
+                       torch::Tensor &sorted_expert_ids,      // [max_num_m_blocks]
+                       torch::Tensor &num_tokens_post_padded, // [1]
+                       uint32_t topk,                         //
+                       torch::Tensor &fc1_scale,              // [expert, 1, inter_dim]
+                       torch::Tensor &fc2_scale,              // [expert, 1, dim]
+                       torch::Tensor &fc1_smooth_scale,       // [expert, 1, dim]
+                       torch::Tensor &fc2_smooth_scale        // [expert, 1, inter_dim]
+)
+{
+    static FMoeKernel impl("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co");
     impl.launch_kernel<uint8_t, uint16_t, true>(out,
                                                 input,
                                                 gate,

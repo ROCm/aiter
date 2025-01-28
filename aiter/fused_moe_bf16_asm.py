@@ -39,7 +39,10 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
 
 
-def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
+def asm_moe(hidden_states,
+            w1,  # [expert, inter_dim*2, dim] N,K
+            w2,  # [expert, dim, inter_dim]
+            topk_weight, topk_ids,
             # following for int8 quant
             fc1_scale=None,  # [expert, inter_dim, 1]
             fc2_scale=None,  # [expert, model_dim, 1]
@@ -48,7 +51,7 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             a16=False,
             per_tensor_quant_scale=None,
             ):
-    E, inter_dim, model_dim = w1.shape
+    E, model_dim, inter_dim = w2.shape
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
     device = topk_ids.device
@@ -59,15 +62,29 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
                    sorted_weights, sorted_expert_ids, num_tokens_post_padded, topk)
     elif a16:
-        aiter.fmoe_int8_g1u0_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
-                                 sorted_weights, sorted_expert_ids, num_tokens_post_padded,
-                                 topk,
-                                 fc1_scale,
-                                 fc2_scale,
-                                 fc1_smooth_scale,
-                                 fc2_smooth_scale)
-    else:
+        # a16w8 smooth quant fmoe
+        if w1.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1.shape[1]:
+            aiter.fmoe_fp8_g1u1_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
+                                    sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                                    topk,
+                                    fc1_scale,
+                                    fc2_scale,
+                                    fc1_smooth_scale,
+                                    fc2_smooth_scale)
+        elif w1.dtype == torch.int8 and inter_dim == w1.shape[1]:
+            aiter.fmoe_int8_g1u0_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
+                                     sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                                     topk,
+                                     fc1_scale,
+                                     fc2_scale,
+                                     fc1_smooth_scale,
+                                     fc2_smooth_scale)
+        else:
+            raise ValueError(
+                f"Invalid args: {w1.dtype} {w1.shape=} {w2.shape=}")
 
+    else:
+        # a8w8 fmoe, opt: smooth quant
         if fc1_smooth_scale is not None:
             a8 = torch.empty((topk * M, model_dim),
                              dtype=w1.dtype, device=device)
@@ -78,19 +95,26 @@ def asm_moe(hidden_states, w1, w2, topk_weight, topk_ids,
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
         else:
             if w1.dtype == torch.float8_e4m3fnuz:
+                a8 = torch.empty(
+                    (M, model_dim), dtype=w1.dtype, device=device)
+                a8_scale = torch.empty(M, dtype=torch.float, device=device)
                 if per_tensor_quant_scale is None:
-                    a8 = torch.empty(
-                        (M, model_dim), dtype=w1.dtype, device=device)
-                    a8_scale = torch.empty(M, dtype=torch.float, device=device)
                     aiter.dynamic_per_token_scaled_fp8_quant(
                         a8, hidden_states, a8_scale)
                 else:
-                    a8 = torch.empty(
-                        (M, model_dim), dtype=w1.dtype, device=device)
-                    a8_scale = torch.empty(M, dtype=torch.float, device=device)
                     aiter.static_scaled_fp8_quant(
                         a8, hidden_states, per_tensor_quant_scale)
                     a8_scale.fill_(per_tensor_quant_scale)
+            elif w1.dtype == torch.int8:
+                a8 = torch.empty(
+                    (M, model_dim), dtype=w1.dtype, device=device)
+                a8_scale = torch.empty(M, dtype=torch.float, device=device)
+                fc1_smooth_scale = torch.ones(
+                    model_dim, dtype=torch.float, device=device)
+                aiter.smoothquant_fwd(a8,
+                                      hidden_states,
+                                      fc1_smooth_scale,
+                                      a8_scale)
             else:
                 logger.warning(f'FMOE fall into pure torch quant...')
                 a8, a8_scale = aiter.pertoken_quant(
