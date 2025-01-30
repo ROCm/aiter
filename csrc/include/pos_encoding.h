@@ -1,5 +1,6 @@
 #pragma once
 /*
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2024, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");

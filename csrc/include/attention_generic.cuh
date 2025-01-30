@@ -1,4 +1,5 @@
 /*
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Adapted from
  * https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention_utils.h
  * Copyright (c) 2023, The vLLM team.
