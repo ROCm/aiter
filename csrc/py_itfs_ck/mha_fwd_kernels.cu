@@ -42,7 +42,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                                    const at::Tensor q,
                                    const at::Tensor k,
                                    const at::Tensor v,
-                                   std::optional<at::Tensor> &alibi_slopes_,
+                                   std::optional<const at::Tensor> &alibi_slopes_,
                                    at::Tensor out,
                                    at::Tensor softmax_lse,
                                    at::Tensor dropout_randval,
@@ -143,8 +143,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
 
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q, // [b, sq, hq, d]
-        at::Tensor &k, // [b, sk, hk, d]
-        at::Tensor &v, // [b, sk, hk, d]
+        const at::Tensor &k, // [b, sk, hk, d]
+        const at::Tensor &v, // [b, sk, hk, d]
         float p_dropout,
         float softmax_scale,
         bool is_causal,
@@ -153,7 +153,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         bool return_softmax_lse,
         bool return_dropout_randval,
         std::optional<at::Tensor> out_,          // [b, sq, hq, d]
-        std::optional<at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+        std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
         std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.dtype();
