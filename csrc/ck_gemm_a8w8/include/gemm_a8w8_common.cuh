@@ -45,11 +45,11 @@ using F32 = float;
 using Row = ck::tensor_layout::gemm::RowMajor;
 using Col = ck::tensor_layout::gemm::ColumnMajor;
 
-using ADataType = I8;
-using BDataType = I8;
-using AccDataType = I32;
-using CShuffleDataType = I32;
-using ComputeDataType = I8;
+using ADataType = FP8;
+using BDataType = FP8;
+using AccDataType = F32;
+using CShuffleDataType = F32;
+using ComputeDataType = FP8;
 
 using ALayout = Row;
 using BLayout = Col;
@@ -146,6 +146,49 @@ struct MultiplyMultiplyAdd
             ck::type_convert<float>(c) * ck::type_convert<float>(d0) * ck::type_convert<float>(d1) + ck::type_convert<F32>(d2);
 
         e = ck::type_convert<ck::half_t>(x0_f);
+    }
+
+        template <>
+    __host__ __device__ constexpr void operator()<F16, float, float, float, F16>(F16 &e,
+                                                                            const float& c,
+                                                                            const float& d0,
+                                                                            const float& d1,
+                                                                            const F16 &d2) const
+    {
+        const float x0_f = c * d0 * d1 + ck::type_convert<F32>(d2);
+
+        e = ck::type_convert<F16>(x0_f);
+    }
+    template <>
+    __host__ __device__ constexpr void operator()<F16, float, F16, F16, F16>(F16 &e,
+                                                                            const float& c,
+                                                                            const F16& d0,
+                                                                            const F16& d1,
+                                                                            const F16 &d2) const
+    {
+        const float x0_f = c * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1) + ck::type_convert<F32>(d2);
+        e = ck::type_convert<F16>(x0_f);
+    }
+    
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, B16, B16, B16>(B16 &e,
+                                                                            const float& c,
+                                                                            const B16& d0,
+                                                                            const B16& d1,
+                                                                            const B16 &d2) const
+    {
+        const float x0_f = c * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1) + ck::type_convert<F32>(d2);
+        e = ck::type_convert<B16>(x0_f);
+    }
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, float, float, B16>(B16 &e,
+                                                                            const float& c,
+                                                                            const float& d0,
+                                                                            const float& d1,
+                                                                            const B16 &d2) const
+    {
+        const float x0_f = c * d0 * d1 + ck::type_convert<F32>(d2);
+        e = ck::type_convert<B16>(x0_f);
     }
 
     template <>

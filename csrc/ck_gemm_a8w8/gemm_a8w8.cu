@@ -144,6 +144,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
   return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
 
+
 torch::Tensor gemm_a8w8(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
@@ -153,10 +154,10 @@ torch::Tensor gemm_a8w8(
     std::optional<torch::Tensor> bias,
     int splitK)
 {
-  TORCH_CHECK(XQ.dtype() == at::ScalarType::Char && XQ.dtype() == WQ.dtype(),
-              "Weights and activations should both be int8!");
-  TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
-              "Scales should have the same dtype!");
+  const auto is_int8 = XQ.dtype() == at::ScalarType::Char && XQ.dtype() == WQ.dtype();
+  const auto is_fp8 = XQ.dtype() == at::ScalarType::Float8_e4m3fnuz && XQ.dtype() == WQ.dtype();
+  TORCH_CHECK(is_int8 || is_fp8, "Weights and activations should both be int8 or fp8!");
+  TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
   if (bias != std::nullopt)
     TORCH_CHECK(bias.value().dtype() == Y.dtype(),
                 "Out amd bias should have the same dtype!");
