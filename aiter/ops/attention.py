@@ -54,7 +54,6 @@ MD_NAME = "module_pa"
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sums: torch.Tensor,
-    block_mapping: torch.Tensor,
     max_logits: torch.Tensor,
     tmp_out: torch.Tensor,
     query: torch.Tensor,
