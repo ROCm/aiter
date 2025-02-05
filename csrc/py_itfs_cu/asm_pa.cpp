@@ -105,7 +105,6 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     {
         if (K.dtype() == at::ScalarType::Char)
         {
-            // static AiterAsmKernel impl_a16w8_i8("pa_kernel_func", "pa_a16w8.co");
             static AiterAsmKernel impl_a16w8_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_2tg_g8_i8.co");
             impl_ptr = &impl_a16w8_i8;
         }
@@ -119,7 +118,7 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     {
         TORCH_CHECK(Q.is_contiguous(),
                     __func__, ":a16w16 only support Q.is_contiguous() for now");
-        .is_contiguous() static AiterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
+        static AiterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
         impl_ptr = &impl_a16w16;
     }
     TORCH_CHECK(impl_ptr != nullptr,
