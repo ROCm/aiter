@@ -469,8 +469,20 @@ namespace vllm
     }
 
     // store the scale
-    k_dequant_scales[head_idx * max_kv_tokens + slot_idx] = k_token_scale;
-    v_dequant_scales[head_idx * max_kv_tokens + slot_idx] = v_token_scale;
+    if constexpr (asmLayout)
+    {
+      // [num_blocks, num_heads, block_size]
+      const int scale_idx = block_size * num_heads * block_idx +
+                            block_size * head_idx +
+                            block_offset;
+      k_dequant_scales[scale_idx] = k_token_scale;
+      v_dequant_scales[scale_idx] = v_token_scale;
+    }
+    else
+    {
+      k_dequant_scales[head_idx * max_kv_tokens + slot_idx] = k_token_scale;
+      v_dequant_scales[head_idx * max_kv_tokens + slot_idx] = v_token_scale;
+    }
 
     // now let's store out
 #pragma unroll
