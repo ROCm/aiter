@@ -41,3 +41,6 @@ __pycache__
 
 # editor
 .vscode
+
+# debug folder
+debug
