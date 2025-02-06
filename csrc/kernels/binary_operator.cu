@@ -16,10 +16,10 @@ typedef __hip_bfloat16 nv_bfloat16;
 namespace vllm
 {
   template <typename T, typename Operation>
-  inline __device__ T performOperation(T a, T b);
+  inline __device__ T performBinaryOperation(T a, T b);
 
   template <typename Operation>
-  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other);
+  torch::Tensor aten_binary_compute(torch::Tensor &input, torch::Tensor &other);
 
   struct AddOp
   {
@@ -105,7 +105,7 @@ namespace vllm
   };
 
   template <typename T, typename Operation, bool order_flag>
-  inline __device__ T performOperation(T a, T b)
+  inline __device__ T performBinaryOperation(T a, T b)
   {
     if constexpr (std::is_same_v<Operation, AddOp>)
     {
@@ -144,7 +144,7 @@ namespace vllm
   }
 
   template <typename Operation>
-  torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
+  torch::Tensor aten_binary_compute(torch::Tensor &input, torch::Tensor &other)
   {
     if constexpr (std::is_same_v<Operation, AddOp>)
     {
@@ -256,7 +256,7 @@ namespace vllm
 #pragma unroll
           for (uint32_t i = 0; i < elements_in_16B; i++)
           {
-            d.e[i] = performOperation<_T, Operation, order_flag>(sa[col * elements_in_16B + i][row], d.e[i]);
+            d.e[i] = performBinaryOperation<_T, Operation, order_flag>(sa[col * elements_in_16B + i][row], d.e[i]);
           }
           __uint128_t *pfc = (__uint128_t *)(pc + offset);
           *pfc = d.ow;
@@ -302,7 +302,7 @@ namespace vllm
           uint64_t offset = row * stride_k + col * sizeof(_T);
           const _T *pfb = (const _T *)(pb + offset);
           _T *pfc = (_T *)(pc + offset);
-          *pfc = performOperation<_T, Operation, order_flag>(sa[col][row], *pfb);
+          *pfc = performBinaryOperation<_T, Operation, order_flag>(sa[col][row], *pfb);
         }
       }
     }
@@ -372,7 +372,7 @@ namespace vllm
 #pragma unroll
           for (uint32_t i = 0; i < elements_in_16B; i++)
           {
-            d.e[i] = performOperation<_T, Operation, order_flag>(f.e[i], d.e[i]);
+            d.e[i] = performBinaryOperation<_T, Operation, order_flag>(f.e[i], d.e[i]);
           }
           __uint128_t *pfc = (__uint128_t *)(pc + offset);
           *pfc = d.ow;
@@ -400,7 +400,7 @@ namespace vllm
           const _T *pfa = (const _T *)(pa + offset);
           const _T *pfb = (const _T *)(pb + offset);
           _T *pfc = (_T *)(pc + offset);
-          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
+          *pfc = performBinaryOperation<_T, Operation, order_flag>(*pfa, *pfb);
         }
       }
     }
@@ -471,7 +471,7 @@ namespace vllm
 #pragma unroll
           for (uint32_t i = 0; i < elements_in_16B; i++)
           {
-            d.e[i] = performOperation<_T, Operation, order_flag>(f.e[i], d.e[i]);
+            d.e[i] = performBinaryOperation<_T, Operation, order_flag>(f.e[i], d.e[i]);
           }
           __uint128_t *pfc = (__uint128_t *)(pc + offset);
           *pfc = d.ow;
@@ -501,7 +501,7 @@ namespace vllm
           const _T *pfb = (const _T *)(pb + offset);
           _T *pfc = (_T *)(pc + offset);
 
-          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
+          *pfc = performBinaryOperation<_T, Operation, order_flag>(*pfa, *pfb);
         }
       }
     }
@@ -531,7 +531,7 @@ namespace vllm
           const _T *pfa = (const _T *)(pa + col);
           const _T *pfb = (const _T *)(pb + col);
           _T *pfc = (_T *)(pc + col);
-          *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
+          *pfc = performBinaryOperation<_T, Operation, order_flag>(*pfa, *pfb);
         }
       }
     }
@@ -539,7 +539,7 @@ namespace vllm
 }
 
 template <typename Operation>
-torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
 
@@ -583,7 +583,7 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
     }
     else
     {
-      return vllm::aten_compute<Operation>(input, other);
+      return vllm::aten_binary_compute<Operation>(input, other);
     }
   }
   else if (dim == 3)
@@ -814,27 +814,27 @@ torch::Tensor ater_operation(torch::Tensor &input, torch::Tensor &other)
     }
     else
     {
-      return vllm::aten_compute<Operation>(input, other);
+      return vllm::aten_binary_compute<Operation>(input, other);
     }
   }
 }
 
 torch::Tensor ater_add(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::AddOp>(input, other);
+  return binary_operation<vllm::AddOp>(input, other);
 }
 
 torch::Tensor ater_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::SubOp>(input, other);
+  return binary_operation<vllm::SubOp>(input, other);
 }
 
 torch::Tensor ater_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::MulOp>(input, other);
+  return binary_operation<vllm::MulOp>(input, other);
 }
 
 torch::Tensor ater_div(torch::Tensor &input, torch::Tensor &other)
 {
-  return ater_operation<vllm::DivOp>(input, other);
+  return binary_operation<vllm::DivOp>(input, other);
 }

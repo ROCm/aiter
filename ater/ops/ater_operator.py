@@ -9,7 +9,7 @@ compile_ops_ = {
     "srcs": [
         f"{ATER_CSRC_DIR}/pybind/ater_operator_pybind.cu",
         f"{ATER_CSRC_DIR}/include/ater_operator.h.cu",
-        f"{ATER_CSRC_DIR}/kernels/ater_operator.cu",
+        f"{ATER_CSRC_DIR}/kernels/binary_operator.cu",
     ],
     "md_name": MD_NAME,
 }
@@ -29,3 +29,9 @@ def ater_mul(input: Tensor, other: Tensor) -> Tensor: ...
 
 @compile_ops(**compile_ops_)
 def ater_div(input: Tensor, other: Tensor) -> Tensor: ...
+
+@compile_ops(**compile_ops_)
+def ater_sigmoid(input: Tensor) -> Tensor: ...
+
+@compile_ops(**compile_ops_)
+def ater_tanh(input: Tensor) -> Tensor: ...

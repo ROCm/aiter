@@ -48,7 +48,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             "                float k_scale, float v_scale) -> ()");
 #ifdef USE_CK_A8W8
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
-            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), 
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"),
             py::arg("bias") = std::nullopt, py::arg("splitK") = 0);
 #endif
       m.def("swap_blocks", &swap_blocks,
@@ -141,6 +141,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("mul", &ater_mul, "apply for mul with transpose and broadcast.");
       m.def("sub", &ater_sub, "apply for sub with transpose and broadcast.");
       m.def("div", &ater_div, "apply for div with transpose and broadcast.");
+      m.def("tanh", &ater_tanh, "apply for tanh.");
+      m.def("sigmoid", &ater_sigmoid, "apply for sigmoid.");
+
       m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",
             py::arg("Q"),
             py::arg("K"),
