@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -98,6 +99,7 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     args.GQA = gqa_ratio;
     // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs << std::endl;
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AiterAsmKernel *impl_ptr = nullptr;

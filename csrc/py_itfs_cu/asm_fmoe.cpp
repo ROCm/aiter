@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -180,6 +181,7 @@ public:
         int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
         int gdy = sub_X_cnt;
         int gdz = 1;
+        const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
         const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         if constexpr (switchGxy)
         {
