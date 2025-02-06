@@ -24,62 +24,37 @@ namespace vllm
     template <typename T>
     inline __device__ static T apply(T a)
     {
-      // return (T)(::tanhf(static_cast<float>(a)));
+      return (T)(::tanhf(static_cast<float>(a)));
 
-      float y, x = static_cast<float>(a);
-      float neg_x = -x;
-      const uint32_t log2e_ = 0x3fb8aa3b; // log2e_v<float>;
-      float tmp = 0, neg_tmp = 0, m = 0, n = 0, emu = 0, neg_emu = 0;
-      asm volatile(
-                   "v_mul_f32 %[v_neg_tmp], %[s_log2e], %[v_neg_x]; log2e*(-x)\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_mul_f32 %[v_tmp], %[s_log2e], %[v_x]        ; log2e*x\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_exp_f32 %[v_neg_emu], %[v_neg_tmp]          ; neg_emu = exp2(log2e*(-x)) 0.3678794515979072\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_exp_f32 %[v_emu], %[v_tmp]                  ; emu = exp2(log2e*x)\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_add_f32 %[v_m], %[v_emu], %[v_neg_emu]      ;m=emu+neg_emu\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_sub_f32 %[v_n], %[v_emu], %[v_neg_emu]      ;n=emu - neg_emu\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_rcp_f32 %[v_tmp], %[v_m]                      ; 1/m\n"
-                   "s_nop 4                                       ; hazard for rcp \n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "v_mul_f32 %[v_y], %[v_n], %[v_tmp]              ; n/m\n"
-                   "s_nop 8                                       ; hazard for exp\n" 
-                   "s_nop 8                                       ; hazard for exp\n"
-                   : [v_y] "=v"(y),
-                     [v_tmp] "+v"(tmp),
-                     [v_neg_tmp] "+v"(neg_tmp),
-                     [v_emu] "+v"(emu),
-                     [v_neg_emu] "+v"(neg_emu),
-                     [v_m] "+v"(m),
-                     [v_n] "+v"(n)
-                   : [v_x] "v"(x), [v_neg_x] "v"(neg_x), [s_log2e] "n" (log2e_)
-                   :);
-      return static_cast<T>(y);
+      // float y, x = static_cast<float>(a);
+      // float neg_x = -x;
+      // const uint32_t log2e_ = 0x3fb8aa3b; // log2e_v<float>;
+      // float tmp = 0, neg_tmp = 0, m = 0, n = 0, emu = 0, neg_emu = 0;
+      // asm volatile(
+      //              "v_mul_f32 %[v_neg_tmp], %[s_log2e], %[v_neg_x]; log2e*(-x)\n"
+      //              "s_nop 8                                       ; hazard for exp\n"
+      //              "v_mul_f32 %[v_tmp], %[s_log2e], %[v_x]        ; log2e*x\n"
+      //              "s_nop 8                                       ; hazard for exp\n" 
+      //              "v_exp_f32 %[v_neg_emu], %[v_neg_tmp]          ; neg_emu = exp2(log2e*(-x)) 0.3678794515979072\n"
+      //              "s_nop 8                                       ; hazard for exp\n"
+      //              "v_exp_f32 %[v_emu], %[v_tmp]                  ; emu = exp2(log2e*x)\n"
+      //              "s_nop 8                                       ; hazard for exp\n"
+      //              "v_add_f32 %[v_m], %[v_emu], %[v_neg_emu]      ;m=emu+neg_emu\n"  
+      //              "v_sub_f32 %[v_n], %[v_emu], %[v_neg_emu]      ;n=emu - neg_emu\n" 
+      //              "v_rcp_f32 %[v_tmp], %[v_m]                      ; 1/m\n"
+      //              "s_nop 4                                       ; hazard for rcp \n"
+      //              "v_mul_f32 %[v_y], %[v_n], %[v_tmp]              ; n/m\n"
+      //              "s_nop 8                                       ; hazard for exp\n" 
+      //              : [v_y] "=v"(y),
+      //                [v_tmp] "+v"(tmp),
+      //                [v_neg_tmp] "+v"(neg_tmp),
+      //                [v_emu] "+v"(emu),
+      //                [v_neg_emu] "+v"(neg_emu),
+      //                [v_m] "+v"(m),
+      //                [v_n] "+v"(n)
+      //              : [v_x] "v"(x), [v_neg_x] "v"(neg_x), [s_log2e] "n" (log2e_)
+      //              :);
+      // return static_cast<T>(y);
 
       // return (math.exp(x) - math.exp(-x)) / (math.exp(x) + math.exp(-x))
     }
@@ -95,23 +70,20 @@ namespace vllm
     template <typename T>
     inline __device__ static T apply(T x)
     {
-      float y, neg_a = static_cast<float>(-x);
-      const uint32_t log2e_ = 0x3fb8aa3b; // log2e_v<float>;
-      float tmp;
-      asm volatile("v_mul_f32 %[v_tmp], %[s_log2e], %[v_x]    ; log2e*x\n"
-                   "v_exp_f32 %[v_tmp], %[v_tmp]              ; emu = exp2(log2e*x)\n"
-                   "s_nop 4                                   ; hazard for exp\n"
-                   "v_add_f32 %[v_tmp], %[v_tmp], 1.0         ; emu+1.0f\n"
-                   "v_rcp_f32 %[v_y], %[v_tmp]                ; 1/(emu+1.0f)\n"
-                   "s_nop 4                                   ; hazard for rcp \n"
-                   "s_nop 4                                   ; hazard for rcp \n"
-                   "s_nop 4                                   ; hazard for rcp \n"
-                   "s_nop 4                                   ; hazard for rcp \n"
-                   : [v_y] "=v"(y), [v_tmp] "+v"(tmp)
-                   : [v_x] "v"(neg_a), [s_log2e] "n"(log2e_)
-                   :);
-      return static_cast<T>(y);
-      // return static_cast<T>(1.0f / (1.0f + expf(static_cast<float>(-a))));
+      // float y, neg_a = static_cast<float>(-x);
+      // const uint32_t log2e_ = 0x3fb8aa3b; // log2e_v<float>;
+      // float tmp;
+      // asm volatile("v_mul_f32 %[v_tmp], %[s_log2e], %[v_x]    ; log2e*x\n"
+      //              "v_exp_f32 %[v_tmp], %[v_tmp]              ; emu = exp2(log2e*x)\n"
+      //              "s_nop 4                                   ; hazard for exp\n"
+      //              "v_add_f32 %[v_tmp], %[v_tmp], 1.0         ; emu+1.0f\n"
+      //              "v_rcp_f32 %[v_y], %[v_tmp]                ; 1/(emu+1.0f)\n"
+      //              "s_nop 4                                   ; hazard for rcp \n"
+      //              : [v_y] "=v"(y), [v_tmp] "+v"(tmp)
+      //              : [v_x] "v"(neg_a), [s_log2e] "n"(log2e_)
+      //              :);
+      // return static_cast<T>(y);
+      return static_cast<T>(1.0f / (1.0f + expf(static_cast<float>(-a))));
     }
 
     static torch::Tensor compute(torch::Tensor &input)
