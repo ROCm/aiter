@@ -103,23 +103,41 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     AiterAsmKernel *impl_ptr = nullptr;
     if (K_QScale)
     {
-        if (K.dtype() == at::ScalarType::Char)
-        {
-            static AiterAsmKernel impl_a16w8_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_2tg_g8_i8.co");
-            impl_ptr = &impl_a16w8_i8;
-        }
-        else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
-        {
-            static AiterAsmKernel impl_a16w8_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_2tg_g8_f8.co");
-            impl_ptr = &impl_a16w8_f8;
+        if (Q.dtype() == at::ScalarType::Half) {
+            if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
+            {
+                static AiterAsmKernel impl_a16w8_f16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_f16_2tg_g8_i8.co");
+                impl_ptr = &impl_a16w8_f16_i8;
+            }
+            else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            {
+                static AiterAsmKernel impl_a16w8_f16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_f16_2tg_g8_f8.co");
+                impl_ptr = &impl_a16w8_f16_f8;
+            }
+        } else if (Q.dtype() == at::ScalarType::BFloat16) {
+            if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
+            {
+                static AiterAsmKernel impl_a16w8_b16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_b16_2tg_g8_i8.co");
+                impl_ptr = &impl_a16w8_b16_i8;
+            }
+            else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            {
+                static AiterAsmKernel impl_a16w8_b16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_b16_2tg_g8_f8.co");
+                impl_ptr = &impl_a16w8_b16_f8;
+            }
         }
     }
     else
     {
         TORCH_CHECK(Q.is_contiguous(),
                     __func__, ":a16w16 only support Q.is_contiguous() for now");
-        static AiterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
-        impl_ptr = &impl_a16w16;
+        if (Q.dtype() == at::ScalarType::Half) {
+            static AiterAsmKernel impl_a16w16_f16("pa_kernel_func", "pa_a16w16_f16.co");
+            impl_ptr = &impl_a16w16_f16;
+        } else if (Q.dtype() == at::ScalarType::BFloat16) {
+            static AiterAsmKernel impl_a16w16_b16("pa_kernel_func", "pa_a16w16_b16.co");
+            impl_ptr = &impl_a16w16_b16;
+        }
     }
     TORCH_CHECK(impl_ptr != nullptr,
                 __func__, ": unsupport current input type");
