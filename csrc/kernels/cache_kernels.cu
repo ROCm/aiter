@@ -373,7 +373,7 @@ namespace vllm
   }
 
   // TODO: this is for kv pertoken quant
-  template <typename scalar_t, typename cache_t, typename dequant_scale_t, int wg_size = 256, bool asmLayout = false>
+  template <typename scalar_t, typename cache_t, typename dequant_scale_t, bool asmLayout = false, int wg_size = 256>
   __global__ void reshape_and_cache_with_per_token_quant_kernel(
       const scalar_t *__restrict__ key,               // [num_tokens, num_heads, head_size]
       const scalar_t *__restrict__ value,             // [num_tokens, num_heads, head_size]
@@ -469,19 +469,21 @@ namespace vllm
     }
 
     // store the scale
+    int scale_idx;
     if constexpr (asmLayout)
     {
       // [num_blocks, num_heads, block_size]
-      const int scale_idx = block_size * num_heads * block_idx +
-                            block_size * head_idx +
-                            block_offset;
+      scale_idx = block_size * num_heads * block_idx +
+                  block_size * head_idx +
+                  block_offset;
       k_dequant_scales[scale_idx] = k_token_scale;
       v_dequant_scales[scale_idx] = v_token_scale;
     }
     else
     {
-      k_dequant_scales[head_idx * max_kv_tokens + slot_idx] = k_token_scale;
-      v_dequant_scales[head_idx * max_kv_tokens + slot_idx] = v_token_scale;
+      scale_idx = head_idx * max_kv_tokens + slot_idx;
+      k_dequant_scales[scale_idx] = k_token_scale;
+      v_dequant_scales[scale_idx] = v_token_scale;
     }
 
     // now let's store out
@@ -636,17 +638,33 @@ void reshape_and_cache_flash(
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(KV_T, CACHE_T, dequant_scale_t)    \
-  vllm::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t> \
-      <<<grid, block, 0, stream>>>(                                                   \
-          reinterpret_cast<KV_T *>(key.data_ptr()),                                   \
-          reinterpret_cast<KV_T *>(value.data_ptr()),                                 \
-          reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                          \
-          reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                        \
-          reinterpret_cast<dequant_scale_t *>(k_dequant_scales.data_ptr()),           \
-          reinterpret_cast<dequant_scale_t *>(v_dequant_scales.data_ptr()),           \
-          slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,                 \
-          num_heads, head_size, block_size, x, num_tokens, max_kv_tokens, dtypeMax);
+#define CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(KV_T, CACHE_T, dequant_scale_t)            \
+  if (asm_layout)                                                                             \
+  {                                                                                           \
+    vllm::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t, true> \
+        <<<grid, block, 0, stream>>>(                                                         \
+            reinterpret_cast<KV_T *>(key.data_ptr()),                                         \
+            reinterpret_cast<KV_T *>(value.data_ptr()),                                       \
+            reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                                \
+            reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                              \
+            reinterpret_cast<dequant_scale_t *>(k_dequant_scales.data_ptr()),                 \
+            reinterpret_cast<dequant_scale_t *>(v_dequant_scales.data_ptr()),                 \
+            slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,                       \
+            num_heads, head_size, block_size, x, num_tokens, max_kv_tokens, dtypeMax);        \
+  }                                                                                           \
+  else                                                                                        \
+  {                                                                                           \
+    vllm::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t>       \
+        <<<grid, block, 0, stream>>>(                                                         \
+            reinterpret_cast<KV_T *>(key.data_ptr()),                                         \
+            reinterpret_cast<KV_T *>(value.data_ptr()),                                       \
+            reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                                \
+            reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                              \
+            reinterpret_cast<dequant_scale_t *>(k_dequant_scales.data_ptr()),                 \
+            reinterpret_cast<dequant_scale_t *>(v_dequant_scales.data_ptr()),                 \
+            slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,                       \
+            num_heads, head_size, block_size, x, num_tokens, max_kv_tokens, dtypeMax);        \
+  }
 
 void reshape_and_cache_with_pertoken_quant(
     torch::Tensor &key,   // [num_tokens, num_heads, head_size]
