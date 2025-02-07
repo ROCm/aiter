@@ -52,6 +52,11 @@ public:
         std::cout << " Success" << std::endl;
     };
 
+    ~AiterAsmKernel()
+    {
+        HIP_CALL(hipModuleUnload(module));
+    }
+
     void launch_kernel(const AiterAsmKernelArgs &kargs)
     {
         void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, kargs.args_ptr,

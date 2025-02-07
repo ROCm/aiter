@@ -2,6 +2,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "py_itfs_common.h"
 
 #include "fused_moe.hpp"
@@ -17,6 +18,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                      std::optional<torch::Tensor> a2_scale, // [e, 1, n], smooth-quant-scale for 2nd gemm input
                      std::optional<int> block_m = 32)
 {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden_states));
     auto device = hidden_states.device();
     int topk_ids_numel = topk_ids.numel();
     int experts = w1.size(0);

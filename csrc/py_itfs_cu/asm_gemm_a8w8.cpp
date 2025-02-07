@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
 // start to prepare the input and output buffer
@@ -79,6 +80,7 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
     args.ldc = stride_c;
     args.ks = ks;
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(A));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     static AiterAsmKernel splitK_impl("gemm_kernel_func", "gemm_a8w8_m128_splitK.co");
     static AiterAsmKernel noSplitK_impl("gemm_kernel_func", "gemm_a8w8_m128_noSplitK.co");

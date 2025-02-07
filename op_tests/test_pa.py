@@ -668,5 +668,6 @@ def test_paged_attention(
 
 for num_heads in [(4, 1), (8, 1), (32, 8)]:
     for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097]:
-        test_paged_attention(ctx_len, 128, num_heads, 128, False, 16,
-                             torch.bfloat16, "auto", 0, "cuda:0")
+        for dtype in [torch.float16, torch.bfloat16]:
+            test_paged_attention(ctx_len, 128, num_heads, 128, False, 16,
+                                 dtype, "auto", 0, "cuda:0")
