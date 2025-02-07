@@ -172,6 +172,8 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             with_cuda=True,
             is_python_module=True,
         )
+        if os.path.exists(f'{this_dir}/{md_name}.so'):
+            os.remove(f'{this_dir}/{md_name}.so')
         shutil.copy(f'{opbd_dir}/{md_name}.so', f'{this_dir}')
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
@@ -287,7 +289,7 @@ def compile_ops(ops_name: str, fc_name: Optional[str] = None):
                 callargs = [
                     f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
                 logger.info(
-                    f"    calling {md_name}::{loadName}({', '.join(callargs)})")
+                    f"    calling {ops_name}::{loadName}({', '.join(callargs)})")
 
             return op(*args, **kwargs)
         return wrapper
