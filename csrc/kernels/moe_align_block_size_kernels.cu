@@ -16,6 +16,7 @@
  */
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <ATen/ATen.h>
 #include <THC/THCAtomics.cuh>
@@ -143,6 +144,7 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           torch::Tensor token_nums,
                           torch::Tensor num_tokens_post_pad)
 {
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(topk_ids));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_INTEGRAL_TYPES(
       topk_ids.scalar_type(), "moe_align_block_size_kernel", [&]
