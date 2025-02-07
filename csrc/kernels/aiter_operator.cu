@@ -559,6 +559,7 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
   bool is_same_dtype = input.dtype() == other.dtype();
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   if (dim == 2)
   {
