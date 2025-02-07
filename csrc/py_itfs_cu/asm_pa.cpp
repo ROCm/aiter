@@ -105,7 +105,8 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     AiterAsmKernel *impl_ptr = nullptr;
     if (K_QScale)
     {
-        if (Q.dtype() == at::ScalarType::Half) {
+        if (Q.dtype() == at::ScalarType::Half)
+        {
             if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
             {
                 static AiterAsmKernel impl_a16w8_f16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_f16_2tg_g8_i8.co");
@@ -116,7 +117,9 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                 static AiterAsmKernel impl_a16w8_f16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_f16_2tg_g8_f8.co");
                 impl_ptr = &impl_a16w8_f16_f8;
             }
-        } else if (Q.dtype() == at::ScalarType::BFloat16) {
+        }
+        else if (Q.dtype() == at::ScalarType::BFloat16)
+        {
             if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
             {
                 static AiterAsmKernel impl_a16w8_b16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_b16_2tg_g8_i8.co");
@@ -133,10 +136,15 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     {
         TORCH_CHECK(Q.is_contiguous(),
                     __func__, ":a16w16 only support Q.is_contiguous() for now");
-        if (Q.dtype() == at::ScalarType::Half) {
+        TORCH_CHECK(num_kv_heads == 1,
+                    __func__, ":a16w16 only support num_kv_heads==1, for now");
+        if (Q.dtype() == at::ScalarType::Half)
+        {
             static AiterAsmKernel impl_a16w16_f16("pa_kernel_func", "pa_a16w16_f16.co");
             impl_ptr = &impl_a16w16_f16;
-        } else if (Q.dtype() == at::ScalarType::BFloat16) {
+        }
+        else if (Q.dtype() == at::ScalarType::BFloat16)
+        {
             static AiterAsmKernel impl_a16w16_b16("pa_kernel_func", "pa_a16w16_b16.co");
             impl_ptr = &impl_a16w16_b16;
         }
