@@ -14,8 +14,9 @@
 
 #include <ATen/ATen.h>
 #include <torch/extension.h>
-#include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
@@ -381,6 +382,7 @@ __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
     int StrideB = K;
     int StrideE = N;
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
     auto device_gemm = DeviceGemmInstance{};
     auto invoker = device_gemm.MakeInvoker();
 
@@ -433,6 +435,7 @@ __forceinline__ torch::Tensor gemm_a8w8_mma_impl(
     int StrideB = K;
     int StrideE = N;
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
     auto device_gemm = DeviceGemmInstance{};
     auto invoker = device_gemm.MakeInvoker();
 

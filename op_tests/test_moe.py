@@ -333,7 +333,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
 
 print('test test_fmoe 16 bit')
 print('\ng1u0 no quant')
-for dtype in [torch.float16, torch.bfloat16][1:]:
+for dtype in [torch.float16, torch.bfloat16]:
     for m in [128, 256]:
         for dim in [4096, 8192]:
             for hdim in [1024]:
@@ -341,7 +341,7 @@ for dtype in [torch.float16, torch.bfloat16][1:]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant='No')
 
 print('\ng1u1 no quant')
-for dtype in [torch.float16, torch.bfloat16][1:]:
+for dtype in [torch.float16, torch.bfloat16]:
     for m in [128, 256]:
         for dim in [4096, 8192]:
             for hdim in [1024]:

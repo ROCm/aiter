@@ -30,10 +30,15 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
                                              quant_dtype=quantCfg['quant_dtype'])
         k_scale_ = k_scale_.permute(0, 1, 3, 2).view(
             num_batch*num_tokens, num_heads).contiguous()
-
-        k_scale = k_scale.permute(1, 0).contiguous()
-        k_scale[slot_mapping] = k_scale_
-        k_scale = k_scale.permute(1, 0).contiguous()
+        if asm_layout:
+            k_scale = k_scale.permute(0, 2, 1).contiguous().view(-1, num_heads)
+            k_scale[slot_mapping] = k_scale_
+            k_scale = k_scale.view(
+                num_blocks, block_size, num_heads).permute(0, 2, 1).contiguous()
+        else:
+            k_scale = k_scale.permute(1, 0).contiguous()
+            k_scale[slot_mapping] = k_scale_
+            k_scale = k_scale.permute(1, 0).contiguous()
 
     k_cache = k_cache.permute(0, 3, 1, 2, 4).contiguous().view(
         -1, num_heads, head_size)
@@ -48,10 +53,17 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
                                                quant_dtype=quantCfg['quant_dtype'])
         v_scale_ = v_scale_.permute(0, 1, 3, 2).view(
             num_batch*num_tokens, num_heads).contiguous()
+        if asm_layout:
+            v_scale = v_scale.permute(
+                0, 2, 1).contiguous().view(-1, num_heads)
+            v_scale[slot_mapping] = v_scale_
+            v_scale = v_scale.view(
+                num_blocks, block_size, num_heads).permute(0, 2, 1).contiguous()
+        else:
+            v_scale = v_scale.permute(1, 0).contiguous()
+            v_scale[slot_mapping] = v_scale_
+            v_scale = v_scale.permute(1, 0).contiguous()
 
-        v_scale = v_scale.permute(1, 0).contiguous()
-        v_scale[slot_mapping] = v_scale_
-        v_scale = v_scale.permute(1, 0).contiguous()
     if asm_layout:
         v_cache = v_cache.permute(0, 2, 4, 1, 3).contiguous().view(
             -1, num_heads, head_size)
@@ -105,9 +117,11 @@ def test_reshape_and_cache(ctx_lens: int,
     if asm_layout:
         k_cache_shape = (bs*num_blocks, kvhead, head_size // x, block_size, x)
         v_cache_shape = (bs*num_blocks, kvhead, block_size//x, head_size, x)
+        kv_scale_shape = (bs*num_blocks, kvhead, block_size)
     else:
         k_cache_shape = (bs*num_blocks, kvhead, head_size // x, block_size, x)
         v_cache_shape = (bs*num_blocks, kvhead, head_size, block_size)
+        kv_scale_shape = (kvhead, bs*max_token_num_support)
 
     # ##################################################### prefill part
     qkv = torch.randn(
@@ -117,7 +131,7 @@ def test_reshape_and_cache(ctx_lens: int,
     k_cache = torch.empty(k_cache_shape, dtype=DTyoe_KVCache, device=device)
     v_cache = torch.empty(v_cache_shape, dtype=DTyoe_KVCache, device=device)
     if quantCfg:
-        k_scale = torch.empty(kvhead, bs*max_token_num_support,
+        k_scale = torch.empty(kv_scale_shape,
                               dtype=quantCfg['y_scale_dtype'], device=key.device)
         v_scale = torch.empty_like(k_scale)
         quantCfg['k_scale'] = k_scale.clone()

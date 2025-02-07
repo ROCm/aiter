@@ -19,6 +19,14 @@ def moe_smoothquant_fwd(
 
 
 # following are pure torch implement
+def get_dtype_max(dtype):
+    try:
+        dtypeMax = torch.finfo(dtype).max
+    except:
+        dtypeMax = torch.iinfo(dtype).max
+    return dtypeMax
+
+
 def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8):
     if x_scale is None:
         hidden_states = x
@@ -32,10 +40,7 @@ def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch
         keepdim=True
     )
 
-    try:
-        dtypeMax = torch.finfo(quant_dtype).max
-    except:
-        dtypeMax = torch.iinfo(quant_dtype).max
+    dtypeMax = get_dtype_max(quant_dtype)
 
     per_token_scale = per_token_amax.to(dtype=torch.float32) / dtypeMax
     per_token_scale[per_token_scale == 0] = 1
@@ -46,10 +51,19 @@ def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch
     return y, y_scale
 
 
+def per_tensor_quant(x, scale=None, scale_dtype=torch.float, quant_dtype=torch.int8):
+    if scale is None:
+        dtypeMax = get_dtype_max(quant_dtype)
+        scale = torch.abs(x.to(torch.float)).max() / dtypeMax
+    y = x/scale
+
+    return y.to(quant_dtype), scale.to(scale_dtype)
+
+
 @compile_ops("module_quant")
 def static_scaled_fp8_quant(
     out: Tensor, input: Tensor, scale: Tensor
-):...
+): ...
 
 
 @compile_ops("module_quant")
@@ -65,4 +79,4 @@ def dynamic_scaled_fp8_quant(
 @compile_ops("module_quant")
 def dynamic_per_token_scaled_fp8_quant(
     out: Tensor, input: Tensor, scales: Tensor, scale_ub: Optional[Tensor] = None
-):...
+): ...
