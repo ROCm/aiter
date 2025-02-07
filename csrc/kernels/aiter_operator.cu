@@ -558,10 +558,12 @@ template <typename Operation>
 torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
+  bool is_same_dtype = input.dtype() == other.dtype();
 
   if (dim == 2)
   {
     bool is_support = true;
+    is_support &= is_same_dtype == true;
     is_support &= input.dim() == other.dim();
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
@@ -627,6 +629,7 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       N = input.size(1);
       K = input.size(2);
       // avoid broadcast
+      is_support &= is_same_dtype == true;
       is_support &= input.dim() == other.dim();
       is_support &= dim == 3;
       is_support &= input.size(0) == other.size(0);
@@ -644,11 +647,11 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
     else if (input.is_contiguous() && other.is_contiguous())
     {
       bool is_support = false;
-      is_support &= input.dim() == other.dim();
-      is_support &= dim == 3;
       if (!is_support && other.size(0) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= input.size(0) > 1;
         is_support &= other.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
@@ -660,6 +663,8 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && input.size(0) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= other.size(0) > 1;
         is_support &= input.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
@@ -671,6 +676,8 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && input.size(1) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= other.size(1) > 1;
         is_support &= input.size(0) == other.size(0);
         is_support &= input.size(2) == other.size(2);
@@ -681,6 +688,8 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && other.size(1) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= input.size(1) > 1;
         is_support &= input.size(0) == other.size(0);
         is_support &= input.size(2) == other.size(2);
