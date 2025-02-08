@@ -179,6 +179,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");
       m.def("sub", &aiter_sub, "apply for sub with transpose and broadcast.");
       m.def("div", &aiter_div, "apply for div with transpose and broadcast.");
+      m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid.");
+      m.def("tanh", &aiter_tanh, "apply for tanh.");
       m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",
             py::arg("Q"),
             py::arg("K"),
