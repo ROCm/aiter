@@ -1,31 +1,200 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import sys
-from dataclasses import dataclass
-import copy
 from pathlib import Path
 import pandas as pd
 import argparse
-import shutil
-from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
+from gemm_a8w8_common import KernelParameters, kernels_params_dict, default_kernels_dict
 
+TEMPLATE_PARAMS = "template_params"
+INSTANCE_FILE_SUFFIX = "instance_file_suffix"
+LOOK_UP_TABLE_HEADER_PATH = "gemm_a8w8_lookup.h"
+MANIFEST_HEADER_PATH = "gemm_a8w8_manifest.h"
 
+PARAM_INSTANCE_SUFFIX_LIST= [
+    {
+        TEMPLATE_PARAMS: "I8, I8, I32, I8, I32, B16, B16",
+        INSTANCE_FILE_SUFFIX: "I8_I8_I32_I8_I32_BF16_BF16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "I8, I8, I32, I8, I32, F32, B16",
+        INSTANCE_FILE_SUFFIX: "I8_I8_I32_I8_I32_F32_BF16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "I8, I8, I32, I8, I32, F16, F16",
+        INSTANCE_FILE_SUFFIX: "I8_I8_I32_I8_I32_F16_F16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "I8, I8, I32, I8, I32, F32, F16",
+        INSTANCE_FILE_SUFFIX: "I8_I8_I32_I8_I32_F32_F16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "FP8, FP8, F32, FP8, F32, B16, B16",
+        INSTANCE_FILE_SUFFIX: "FP8_FP8_F32_FP8_F32_B16_B16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "FP8, FP8, F32, FP8, F32, F32, B16",
+        INSTANCE_FILE_SUFFIX: "FP8_FP8_F32_FP8_F32_F32_B16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "FP8, FP8, F32, FP8, F32, F16, F16",
+        INSTANCE_FILE_SUFFIX: "FP8_FP8_F32_FP8_F32_F16_F16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "FP8, FP8, F32, FP8, F32, F32, F16",
+        INSTANCE_FILE_SUFFIX: "FP8_FP8_F32_FP8_F32_F32_F16.cpp"
+    }
+]
 
-class gemm_a8w8_fwd_codegen:
-    def __init__(self, working_path, istune=False):
-        self.working_path = working_path
-        self.impl_path = os.path.join(working_path, "impl")
-        self.instances_path = os.path.join(working_path, "instances")
-        self.istune = istune
-    
-    def gen_instance(self, k: kernelInstance):
-        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+TUNING_PARAM_INSTANCE_SUFFIX_LIST = [
+    {
+        TEMPLATE_PARAMS: "I8, I8, I32, I8, I32, B16, B16",
+        INSTANCE_FILE_SUFFIX: "I8_I8_I32_I8_I32_BF16_BF16.cpp"
+    },
+    {
+        TEMPLATE_PARAMS: "FP8, FP8, F32, FP8, F32, B16, B16",
+        INSTANCE_FILE_SUFFIX: "FP8_FP8_F32_FP8_F32_B16_B16.cpp"
+    },
+]
+
+def gen_a8w8_device_gemm_call_skip_bias_branch(k: KernelParameters, gemm_specialization: str) -> str:
+    return f"""using DeviceGemmInstance = DeviceGemmHelper<
+        ADataType,
+        BDataType,
+        AccDataType,
+        CShuffleDataType,
+        ComputeDataType,
+        DDataType,
+        EDataType,
+        {k.BLOCK_SIZE},
+        {k.MPerBLOCK},
+        {k.NPerBLOCK},
+        {k.KPerBLOCK},
+        {k.WAVE_TILE_M},
+        {k.WAVE_TILE_N},
+        {k.WAVE_MAP_M},
+        {k.WAVE_MAP_N},
+        S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+        {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+        {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+        ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
+        ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+        ck::tensor_operation::device::GemmSpecialization::{gemm_specialization}>;
+        
+        return gemm_a8w8_rowwise_impl<
+                ADataType,
+                BDataType,
+                AccDataType,
+                DDataType,
+                EDataType,
+                DeviceGemmInstance
+            >(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+"""
+
+def gen_a8w8_device_gemm_call(k: KernelParameters, gemm_specialization: str):
+    return f"""if (bias != std::nullopt)
+    {{
+        using DeviceGemmInstance = DeviceGemmHelperMMA<
+        ADataType,
+        BDataType,
+        AccDataType,
+        CShuffleDataType,
+        ComputeDataType,
+        DDataType,
+        EDataType,
+        {k.BLOCK_SIZE},
+        {k.MPerBLOCK},
+        {k.NPerBLOCK},
+        {k.KPerBLOCK},
+        {k.WAVE_TILE_M},
+        {k.WAVE_TILE_N},
+        {k.WAVE_MAP_M},
+        {k.WAVE_MAP_N},
+        S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}, {k.CBLOCK_SPV[0]}>,
+        {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+        {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+        ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
+        ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+        ck::tensor_operation::device::GemmSpecialization::{gemm_specialization}>;
+        // Run kernel instance.
+        
+        return gemm_a8w8_mma_impl<
+                ADataType,
+                BDataType,
+                DDataType,
+                EDataType,
+                DeviceGemmInstance
+            >(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    }}
+    else
+    {{
+        using DeviceGemmInstance = DeviceGemmHelper<
+        ADataType,
+        BDataType,
+        AccDataType,
+        CShuffleDataType,
+        ComputeDataType,
+        DDataType,
+        EDataType,
+        {k.BLOCK_SIZE},
+        {k.MPerBLOCK},
+        {k.NPerBLOCK},
+        {k.KPerBLOCK},
+        {k.WAVE_TILE_M},
+        {k.WAVE_TILE_N},
+        {k.WAVE_MAP_M},
+        {k.WAVE_MAP_N},
+        S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+        S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+        {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+        {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+        ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
+        ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+        ck::tensor_operation::device::GemmSpecialization::{gemm_specialization}>;
+        
+        return gemm_a8w8_rowwise_impl<
+                ADataType,
+                BDataType,
+                AccDataType,
+                DDataType,
+                EDataType,
+                DeviceGemmInstance
+            >(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    }}
+
+"""
+
+def gen_a8w8_implementation(k: KernelParameters, skip_bias_branch: bool) -> str:
+    if skip_bias_branch:
+        gemm_a8w8_device_gemm_instance_generator = gen_a8w8_device_gemm_call_skip_bias_branch
+    else:
+        gemm_a8w8_device_gemm_instance_generator = gen_a8w8_device_gemm_call
+
+    padding = "MNKPadding"
+    no_padding = "Default"
+    return f"""
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_common.cuh"
 
-template <typename DDataType, typename EDataType = DDataType>
+template <
+    typename ADataType,
+    typename BDataType,
+    typename CShuffleDataType,
+    typename ComputeDataType,
+    typename AccDataType,
+    typename DDataType,
+    typename EDataType
+    >
 torch::Tensor
 {k.name}(
     torch::Tensor &XQ,
@@ -35,117 +204,32 @@ torch::Tensor
     torch::Tensor &Y,
     std::optional<torch::Tensor> bias,
     int KBatch)
-{{{{
+{{
     // The smallest kernel we have available. Works well for memory bound shapes.
 
     // Check if this input needs to be padded.
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
     int K = WQ.size(1);
+
     bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK} * KBatch) != 0);
-    if (pad)
-    {{{{
-        // pad
-        {{INSTANCE_CONTENT_pad}}
-        // pad
-    }}}}
-    else
-    {{{{
-        // no pad
-        {{INSTANCE_CONTENT_nopad}}
-        // no pad
-    }}}}
-}}}}
+    if (pad) {{
+        {gemm_a8w8_device_gemm_instance_generator(k, padding)}
+    }}
+    else{{
+        {gemm_a8w8_device_gemm_instance_generator(k, no_padding)}
+    }}
+}}
+"""
 
-"""     
-        INSTANCE_CONTENT_bias = f"""if (bias != std::nullopt)
-        {{{{
-            using DeviceGemmInstance = DeviceGemmHelperMMA<
-                DDataType, EDataType,
-                {k.BLOCK_SIZE},
-                {k.MPerBLOCK},
-                {k.NPerBLOCK},
-                {k.KPerBLOCK},
-                {k.WAVE_TILE_M},
-                {k.WAVE_TILE_N},
-                {k.WAVE_MAP_M},
-                {k.WAVE_MAP_N},
-                S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}, {k.CBLOCK_SPV[0]}>,
-                {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-                {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-                ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
-                ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-                ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-            // Run kernel instance.
-            return gemm_a8w8_mma_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-        }}}}
-        else
-        {{{{
-           using DeviceGemmInstance = DeviceGemmHelper<
-                DDataType, EDataType,
-                {k.BLOCK_SIZE},
-                {k.MPerBLOCK},
-                {k.NPerBLOCK},
-                {k.KPerBLOCK},
-                {k.WAVE_TILE_M},
-                {k.WAVE_TILE_N},
-                {k.WAVE_MAP_M},
-                {k.WAVE_MAP_N},
-                S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
-                {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-                {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-                ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
-                ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-                ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-            // Run kernel instance.
-            return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-        }}}}
-""" 
-        INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelper<
-            DDataType, EDataType,
-            {k.BLOCK_SIZE},
-            {k.MPerBLOCK},
-            {k.NPerBLOCK},
-            {k.KPerBLOCK},
-            {k.WAVE_TILE_M},
-            {k.WAVE_TILE_N},
-            {k.WAVE_MAP_M},
-            {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
-            {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-            {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
-            ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-            ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-        // Run kernel instance.
-        return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-""" 
-        if self.istune:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
-                                                     INSTANCE_CONTENT_nopad=(INSTANCE_CONTENT_nobias.format(GemmSpec="Default")))
-        else:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=INSTANCE_CONTENT_bias.format(GemmSpec="MNKPadding"),
-                                                     INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_bias.format(GemmSpec="Default"))
-
-        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-                INSTANCE_IMPL_str)
-        
-        INSTANCE_template = """// SPDX-License-Identifier: MIT
+def gen_a8w8_instance(k: KernelParameters, template_params: str) -> str:
+    return f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "{name}.cuh"
+#include "{k.name}.cuh"
 
 template torch::Tensor
-{name}<{dtypes}>(
+{k.name}<{template_params}>(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -153,73 +237,42 @@ template torch::Tensor
     torch::Tensor &Y,
     std::optional<torch::Tensor> bias,
     int KBatch);
-
 """
-        INSTANCE_dBF16_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="B16")
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="F32, B16")
-        INSTANCE_dFP16_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="F16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="F32, F16")
 
-        if self.istune:
-            Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
-                INSTANCE_dBF16_eBF16)
-        else:
-            Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
-                INSTANCE_dBF16_eBF16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")).write_text(
-                INSTANCE_dFP32_eBF16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP16_eFP16.cpp")).write_text(
-                INSTANCE_dFP16_eFP16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")).write_text(
-                INSTANCE_dFP32_eFP16)
+def gen_kernel_dict_item_as_str(mnk: tuple, k: KernelParameters) -> str:
+    mnk_formatted = ', '.join(str(item) for item in mnk)
+    return f"{{ {{{mnk_formatted}}}, {k.name}<A_TYPE, B_TYPE, C_SHUFFLE_TYPE, COMPUTE_TYPE, ACC_TYPE, D_TYPE, E_TYPE>}}"
 
-    def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_head = """#pragma once
+def gen_lookup_dict(kernel_dict: dict) -> str:
+
+    kernel_dict_items = [
+        gen_kernel_dict_item_as_str(mnk, k)
+        for mnk, k in kernel_dict.items()
+        if isinstance(mnk, tuple)
+    ]
+    return f"""#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #ifdef USE_ROCM
-
-#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
-   {                                                                                                                             \\"""
-
-        LOOKUP_template = """
-       {{{MNK},                                                                                                       \\
-        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
-
-        LOOKUP_end = """
-   }
-
+#define GENERATE_LOOKUP_TABLE(A_TYPE, B_TYPE, C_SHUFFLE_TYPE, COMPUTE_TYPE, ACC_TYPE, D_TYPE, E_TYPE)       \\
+{{                                                                                                          \\
+    {",\\\n    ".join(kernel_dict_items) + " \\"}
+}}
 #endif // USE_ROCM
 """
-        with open(os.path.join(self.working_path, "gemm_a8w8_lookup.h"), "w") as f:
-            f.write(LOOKUP_head)
-            for mnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
-                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(LOOKUP_template.format(MNK="{"+(", ").join(
-                        map(lambda x: str(x), list(mnk))) + "}", kernel_name=k.name))
-                elif self.istune and isinstance(mnk, int):
-                    f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
-            f.write(LOOKUP_end)
 
-    def gen_manifest_head(self, kernels_dict):
-        MAINFEST_head = """#pragma once
-// SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
-#ifdef USE_ROCM
-
-#include <cstdlib>
-
-#include <torch/extension.h>
-"""
-        MAINFEST_template = """
-template <typename DDataType, typename EDataType>
+def gen_kernel_definition(kernel_name: str) -> str:
+    return f"""
+template <
+    typename ADataType,
+    typename BDataType,
+    typename CShuffleDataType,
+    typename ComputeDataType,
+    typename AccDataType,
+    typename DDataType,
+    typename EDataType
+>
 torch::Tensor
 {kernel_name}(
     torch::Tensor &XQ,
@@ -229,43 +282,72 @@ torch::Tensor
     torch::Tensor &Y,
     std::optional<torch::Tensor> bias,
     int KBatch);
-"""
-        MAINFEST_end = """
+    """
 
+def gen_manifest(kernels_dict: dict) -> str:
+    kernel_definition_list = [
+        gen_kernel_definition(k.name) for k in kernels_dict.values()   
+    ]
+    return f"""#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#include <cstdlib>
+
+#include <torch/extension.h>
+    {"\n".join(kernel_definition_list)}
 #endif // USE_ROCM
 """
 
-        with open(os.path.join(self.working_path, "gemm_a8w8_manifest.h"), "w") as f:
-            f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
-            f.write(MAINFEST_end)
-
-    def gen_instances(self, kernels_dict):
-        if os.path.exists(self.impl_path):
-            shutil.rmtree(self.impl_path)
-        os.mkdir(self.impl_path)
-        if os.path.exists(self.instances_path):
-            shutil.rmtree(self.instances_path)
-        os.mkdir(self.instances_path)
-
-        for mnk, k in kernels_dict.items():
-            self.gen_instance(k)
-
-        self.gen_lookup_dict(kernels_dict)
-        self.gen_manifest_head(kernels_dict)
+def gemm_a8w8_fwd_codegen(working_path: Path, kernel_parameters_dict: dict, is_tune: bool):
+    impl_directory = Path(os.path.join(working_path, "impl"))
+    instance_directory = Path(os.path.join(working_path, "instances"))
+    impl_directory.mkdir(exist_ok=True)
+    instance_directory.mkdir(exist_ok=True)
+    # generate and write the implementation files
+    for _, kernel_parameters in kernel_parameters_dict.items():
+        impl_path =  Path(os.path.join(impl_directory, f"{kernel_parameters.name}.cuh"))
+        kernels_impl_str = gen_a8w8_implementation(kernel_parameters, is_tune)
+        impl_path.write_text(kernels_impl_str)
 
 
-def get_tune_dict(tune_dict_csv):
+    # generate and write the implementation files for each supported specialization
+    for _, kernel_parameters in kernel_parameters_dict.items():
+        param_instance_list = TUNING_PARAM_INSTANCE_SUFFIX_LIST if is_tune else PARAM_INSTANCE_SUFFIX_LIST
+        for param_instance in param_instance_list:
+            template_params = param_instance[TEMPLATE_PARAMS]
+            instance_file_suffix = param_instance[INSTANCE_FILE_SUFFIX]
+            instance_file_name = f"{kernel_parameters.name}_{instance_file_suffix.lower()}"
+            instance_path = Path(os.path.join(instance_directory, instance_file_name))
+            kernel_instance_str = gen_a8w8_instance(kernel_parameters, template_params)
+            instance_path.write_text(kernel_instance_str)
+    
+    # generate and write the lookup table
+    look_up_dict_str = gen_lookup_dict(kernel_parameters_dict)
+    look_up_table_header_path = Path(os.path.join(working_path, LOOK_UP_TABLE_HEADER_PATH))
+    look_up_table_header_path.write_text(look_up_dict_str)
+    
+    # generate and write the manifest
+    manifest_str = gen_manifest(kernel_parameters_dict)
+    manifest_header_path = Path(os.path.join(working_path, MANIFEST_HEADER_PATH))
+    manifest_header_path.write_text(manifest_str)
+
+def get_tune_dict(tune_dict_csv: Path) -> dict:
+    if not os.path.exists(tune_dict_csv):
+        return default_kernels_dict
+    
     tune_dict = default_kernels_dict
-    if os.path.exists(tune_dict_csv):
-        tune_df = pd.read_csv(tune_dict_csv)
-        for i in range(len(tune_df)):
-            M = tune_df.loc[i, "M"]
-            N = tune_df.loc[i, "N"]
-            K = tune_df.loc[i, "K"]
-            kid = tune_df.loc[i, "kernelId"]
-            tune_dict[(M, N, K)] = kernels_list[kid] 
+    tune_df = pd.read_csv(tune_dict_csv)
+
+    for i in range(len(tune_df)):
+        M = tune_df.loc[i, "M"]
+        N = tune_df.loc[i, "N"]
+        K = tune_df.loc[i, "K"]
+        kid = tune_df.loc[i, "kernelId"]
+        tune_dict[(M, N, K)] = kernels_params_dict[kid]
+
     return tune_dict
 
 if __name__ == "__main__":
@@ -298,29 +380,10 @@ if __name__ == "__main__":
         help="generated tune instanses"
     )
 
-    # parser.add_argument(
-    #     "--out_type",
-    #     default="all",
-    #     required=False,
-    #     help="Specifie the type of scale\n \
-    #         all: [bf16, fp16] \n  \
-    #         bf16, fp16"
-    # )
-
-    # parser.add_argument(
-    #     "--scale_type",
-    #     default="all",
-    #     required=False,
-    #     help="Specifie the type of scale\n \
-    #         all: [fp32, same as out] \n  \
-    #         same: [same as out]"
-    # )
-
-
     args = parser.parse_args()
-    codegen = gemm_a8w8_fwd_codegen(args.working_path, args.tune)
+
 
     if args.tune:
-        codegen.gen_instances(kernels_list)
+        gemm_a8w8_fwd_codegen(args.working_path, kernels_params_dict, args.tune)
     else:
-        codegen.gen_instances(get_tune_dict(args.tune_file))
+        gemm_a8w8_fwd_codegen(args.working_path, get_tune_dict(args.tune_file), args.tune)
