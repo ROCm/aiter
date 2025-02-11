@@ -64,6 +64,9 @@ def run_ck(
             return_attn_probs=return_attn_probs,
         )
 
+    g = torch.randn_like(out)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+
     return out, lse, S_dmask
 
 
@@ -75,9 +78,9 @@ def test_mha_fwd(dtype):
     seqlen_k = 4
     d = 64
 
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
-    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
-    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
     alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=torch.float32) * 0.3
 
     out_ck, _, _ = run_ck(q, k, v, alibi_slopes=alibi_slopes)
