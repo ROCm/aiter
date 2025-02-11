@@ -42,14 +42,6 @@ namespace aiter
     template <typename T>
     inline __device__ static T apply(T a, T b) { return a + b; }
 
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("AddOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
-    }
-
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
       return torch::add(input, other);
@@ -64,14 +56,6 @@ namespace aiter
       return a - b;
     }
 
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("SubOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
-    }
-
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
       return torch::sub(input, other);
@@ -82,14 +66,6 @@ namespace aiter
   {
     template <typename T>
     inline __device__ static T apply(T a, T b) { return a * b; }
-
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("MulOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
-    }
 
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
@@ -104,14 +80,6 @@ namespace aiter
     {
       // assert(b == static_cast<T>(0));
       return a / b;
-    }
-
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("DivOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
     }
 
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
@@ -611,12 +579,6 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     constexpr uint32_t PATTERN_BROADCAST_0 = 2;
     constexpr uint32_t PATTERN_BROADCAST_1 = 3;
 
-    // if (dim == 3 && (!input.is_contiguous() || !other.is_contiguous()))
-    // {
-    //   Operation::print(input.size(0), input.size(1), input.size(2),
-    //                    input.stride(0), input.stride(1), input.stride(2),
-    //                    other.stride(0), other.stride(1), other.stride(2));
-    // }
     auto tensor_not_conti = input.is_contiguous() ? other : input;
     bool order_flag;
     int M, N, K;
