@@ -529,9 +529,10 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
   bool is_same_dtype = input.dtype() == other.dtype();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
-  if (dim == 2)
+  bool is_support = false;
+  if (!is_support && dim == 2)
   {
-    bool is_support = true;
+    is_support = true;
     is_support &= is_same_dtype == true;
     is_support &= input.dim() == other.dim();
     is_support &= input.size(0) == other.size(0);
@@ -568,12 +569,9 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
       return output;
     }
-    else
-    {
-      return aiter::aten_compute<Operation>(input, other);
-    }
   }
-  else if (dim == 3)
+
+  if (!is_support && dim == 3)
   {
     constexpr uint32_t PATTERN_TRANSPOSE = 1;
     constexpr uint32_t PATTERN_BROADCAST_0 = 2;
@@ -587,7 +585,7 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     if (input.is_contiguous() != other.is_contiguous())
     {
       order_flag = !input.is_contiguous() ? true : false;
-      bool is_support = true;
+      is_support = true;
       M = input.size(0);
       N = input.size(1);
       K = input.size(2);
@@ -609,14 +607,13 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     }
     else if (input.is_contiguous() && other.is_contiguous())
     {
-      bool is_support = false;
+      is_support = false;
       if (!is_support && other.size(0) == 1)
       {
         is_support = true;
         is_support &= is_same_dtype == true;
         is_support &= input.dim() == other.dim();
         is_support &= input.size(0) > 1;
-        is_support &= other.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
         is_support &= input.size(2) == other.size(2);
         pattern = is_support ? PATTERN_BROADCAST_0 : 0;
@@ -629,7 +626,6 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
         is_support &= is_same_dtype == true;
         is_support &= input.dim() == other.dim();
         is_support &= other.size(0) > 1;
-        is_support &= input.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
         is_support &= input.size(2) == other.size(2);
         pattern = is_support ? PATTERN_BROADCAST_0 : 0;
@@ -712,7 +708,8 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
       int elements = M * N * K;
       const uint32_t rows = 8;
-      const uint32_t vec = 16 / sizeof(input.dtype());;
+      const uint32_t vec = 16 / sizeof(input.dtype());
+      ;
       if (N % rows == 0 && K % vec == 0)
       {
         constexpr uint32_t wg = 64;
@@ -800,10 +797,11 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
 
       return output;
     }
-    else
-    {
-      return aiter::aten_compute<Operation>(input, other);
-    }
+  }
+
+  if (!is_support)
+  {
+    return aiter::aten_compute<Operation>(input, other);
   }
 }
 
