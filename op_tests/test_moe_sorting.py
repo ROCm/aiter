@@ -107,11 +107,11 @@ for dtype in [torch.bfloat16]:
     for m in [1, 7, 31, 64, 128, 256]:
         for E in [32, 256]:
             for top in [5, 8]:
-                test_moe_sorting(dtype, m, 4096, 4096, 32, 5)
+                test_moe_sorting(dtype, m, 4096, 4096, E, top)
 
 print('test test_moe_sorting, with expert mask')
 for dtype in [torch.bfloat16]:
     for m in [1, 7, 31, 64, 128, 256]:
         for E in [32, 256]:
             for top in [5, 8]:
-                test_moe_sorting(dtype, m, 4096, 4096, 32, 5, has_expert_mask=True)
+                test_moe_sorting(dtype, m, 4096, 4096, E, top, has_expert_mask=True)
