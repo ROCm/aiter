@@ -231,4 +231,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
             py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
             py::arg("block_m") = 32, py::arg("expert_mask") = std::nullopt);
+
+      m.def("rope_fwd", &rope_fwd);
+      m.def("rope_bwd", &rope_bwd);
+      m.def("rope_cached_fwd", &rope_cached_fwd);
+      m.def("rope_cached_bwd", &rope_cached_bwd);
+      m.def("rope_thd_fwd", &rope_thd_fwd);
+      m.def("rope_thd_bwd", &rope_thd_bwd);
+      m.def("rope_2d_fwd", &rope_2d_fwd);
+      m.def("rope_2d_bwd", &rope_2d_bwd);
 }
