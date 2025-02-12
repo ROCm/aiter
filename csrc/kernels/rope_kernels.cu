@@ -192,8 +192,8 @@ void dispatch_rope_fwd(
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const dim3 block(size_s, size_b);
-    const dim3 grid(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    const dim3 grid(size_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
     kn_rope_fwd<<<grid, block, 0, stream>>>(
         p_output,
@@ -217,8 +217,8 @@ void dispatch_rope_bwd(
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const dim3 block(size_s, size_b);
-    const dim3 grid(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+    const dim3 grid(size_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
     kn_rope_bwd<<<grid, block, 0, stream>>>(
         p_input_grads,
