@@ -1,9 +1,71 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import math
 from einops import rearrange, repeat
+import torch
+import torch.nn.functional as F
+
+
+def ck_randval_to_dropout_mask(randval, p):
+    # If p = 0.3, randval in 255 * (0.7, 1.0] will be dropout
+    # randval in 255 * [0, 0.7] will be kept
+    # If return dropout_mask >=0, value will be kept
+    return math.floor(255.0 * (1 - p)) - randval.to(torch.float32)
+
+
+def convert_flash_attn_S_to_softmax(
+    S,
+    seqlen_q,
+    seqlen_k,
+    query_padding_mask,
+    key_padding_mask,
+    head_dim,
+    is_dropout,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite window size
+):
+    """FlashAttention stores the S matrix in a different way.
+    Arguments:
+        S: (batch_size, nheads, seqlen_q_rounded, seqlen_k_rounded)
+        query_padding_mask: (batch_size, seqlen_q_rounded)
+        key_padding_mask: (batch_size, seqlen_k_rounded)
+    """
+    if causal:
+        window_size = (window_size[0], 0)
+    seqlen_q_rounded, seqlen_k_rounded = S.shape[-2:]
+    S_converted = S
+    if window_size[0] >= 0 or window_size[1] >= 0:
+        local_mask = construct_local_mask(
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            query_padding_mask,
+            key_padding_mask,
+            S.device,
+        )
+        local_mask = F.pad(
+            local_mask,
+            (0, seqlen_k_rounded - seqlen_k, 0, seqlen_q_rounded - seqlen_q),
+            value=True,
+        )
+        S_converted = S_converted.masked_fill(local_mask, 0.0)
+
+    # Need to zero out things not in attention_mask in case S was initialized with random values
+    # and some of those values aren't overwritten.
+    seqlen_q_og = (
+        query_padding_mask.shape[-1] if query_padding_mask is not None else seqlen_q_rounded
+    )
+    if query_padding_mask is not None:
+        query_padding_mask = F.pad(query_padding_mask, (0, seqlen_q_rounded - seqlen_q_og))
+        S_converted = S_converted.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
+    seqlen_k_og = key_padding_mask.shape[-1] if key_padding_mask is not None else seqlen_k
+    if key_padding_mask is not None:
+        key_padding_mask = F.pad(key_padding_mask, (0, seqlen_k_rounded - seqlen_k_og))
+        S_converted = S_converted.masked_fill(rearrange(~key_padding_mask, "b s -> b 1 1 s"), 0.0)
+    S_converted = F.pad(S_converted, (0, 0, 0, seqlen_q_og - seqlen_q_rounded))
+    S_converted = F.pad(S_converted, (0, seqlen_k_og - seqlen_k_rounded))
+    return S_converted[:, :, :seqlen_q, :seqlen_k]
 
 
 def attn_bias_from_alibi_slopes(
