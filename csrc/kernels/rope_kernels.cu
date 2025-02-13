@@ -234,7 +234,7 @@ void dispatch_rope_bwd(
 // Interfaces
 //
 
-void rope_fwd(
+void rope_fwd_impl(
     torch::Tensor&       output,        // [s, b, h, d]
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& freqs)         // [s, 1, 1, d]
@@ -271,7 +271,7 @@ void rope_fwd(
         });
 }
 
-void rope_bwd(
+void rope_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& freqs)         // [s, 1, 1, d]
@@ -308,7 +308,7 @@ void rope_bwd(
         });
 }
 
-void rope_cached_fwd(
+void rope_cached_fwd_impl(
     torch::Tensor&       output,        // [s, b, h, d]
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
@@ -317,7 +317,7 @@ void rope_cached_fwd(
 
 }
 
-void rope_cached_bwd(
+void rope_cached_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
@@ -326,7 +326,7 @@ void rope_cached_bwd(
 
 }
 
-void rope_thd_fwd(
+void rope_thd_fwd_impl(
     torch::Tensor&       output,        // [t, h, d]
     const torch::Tensor& input,         // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [t]
@@ -335,7 +335,7 @@ void rope_thd_fwd(
 
 }
 
-void rope_thd_bwd(
+void rope_thd_bwd_impl(
     torch::Tensor&       input_grads,   // [t, h, d]
     const torch::Tensor& output_grads,  // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [t]
@@ -344,7 +344,7 @@ void rope_thd_bwd(
 
 }
 
-void rope_2d_fwd(
+void rope_2d_fwd_impl(
     torch::Tensor&       output,
     const torch::Tensor& input,
     const torch::Tensor& cos_height,
@@ -355,7 +355,7 @@ void rope_2d_fwd(
 
 }
 
-void rope_2d_bwd(
+void rope_2d_bwd_impl(
     torch::Tensor&       input_grads,
     const torch::Tensor& output_grads,
     const torch::Tensor& cos_height,

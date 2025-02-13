@@ -24,24 +24,24 @@ def ref_rope_cached_fwd(x, cos, sin):
 def hip_rope_fwd(input, freqs, transpose_output):
     if transpose_output:
         b, s, h, d = input.shape
-        output = torch.empty((s, b, h, d)).transpose(0, 1)
+        output = torch.empty((s, b, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)
     else:
-        output = torch.empty_like(input)
-    aiter.rope_fwd(output, input, freqs)
+        output = torch.empty_like(input, requires_grad=False)
+    aiter.rope_fwd_impl(output, input, freqs)
     return output
 
 @perftest()
 def hip_rope_cached_fwd(input, cos, sin, transpose_output):
     if transpose_output: 
         b, s, h, d = input.shape
-        output = torch.empty((s, b, h, d), dtype=input.dtype, device=input.device).transpose(0, 1)
+        output = torch.empty((s, b, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)
     else:
-        output = torch.empty_like(input)
-    aiter.rope_cached_fwd(output, input, cos, sin)
+        output = torch.empty_like(input, requires_grad=False)
+    aiter.rope_cached_fwd_impl(output, input, cos, sin)
     return output
 
 def test_rope(dtype, dim_i, dim_freq, transpose_output):
-    input = torch.randn(dim_i, dtype=dtype, device="cuda")
+    input = torch.randn(dim_i, dtype=dtype, device="cuda", requires_grad=True)
     freqs = torch.randn(dim_freq, dtype=torch.float, device="cuda")
     ref = ref_rope_fwd(input, freqs)
     ref_cached = ref_rope_cached_fwd(input, freqs.cos(), freqs.sin())

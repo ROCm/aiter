@@ -5,12 +5,12 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("rope_fwd", &rope_fwd);
-    m.def("rope_bwd", &rope_bwd);
-    m.def("rope_cached_fwd", &rope_cached_fwd);
-    m.def("rope_cached_bwd", &rope_cached_bwd);
-    m.def("rope_thd_fwd", &rope_thd_fwd);
-    m.def("rope_thd_bwd", &rope_thd_bwd);
-    m.def("rope_2d_fwd", &rope_2d_fwd);
-    m.def("rope_2d_bwd", &rope_2d_bwd);
+    m.def("rope_fwd_impl", &rope_fwd_impl);
+    m.def("rope_bwd_impl", &rope_bwd_impl);
+    m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
+    m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);
+    m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);
+    m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
+    m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
+    m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 }
