@@ -12,7 +12,7 @@ BLOCK_SIZE_M = 32
 
 
 @perftest(num_iters=3,num_warmup=0)
-def test_moe_sorting_native(topk_ids: torch.Tensor,
+def test_moe_sorting_naive(topk_ids: torch.Tensor,
                       topk_weights: torch.Tensor,
                       num_experts: int,
                       expert_mask = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -77,7 +77,7 @@ def test_moe_sorting(dtype, token, model_dim, inter_dim, E, topk, has_expert_mas
     (sorted_ids_a,
      sorted_weights_a,
      sorted_expert_ids_a,
-     num_tokens_post_padded_a), avg_a = test_moe_sorting_native(
+     num_tokens_post_padded_a), avg_a = test_moe_sorting_naive(
         topk_ids, topk_weights, E, expert_mask)
 
     (sorted_ids_b,
@@ -91,8 +91,9 @@ def test_moe_sorting(dtype, token, model_dim, inter_dim, E, topk, has_expert_mas
         f"[perf] {token=}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(num_tokens_post_padded_a, num_tokens_post_padded_b, atol=0, msg='num_tokens_post_padded')
     mask = sorted_ids_a != (topk << 24 | token)
-    checkAllclose(sorted_ids_a[mask],
-                  sorted_ids_b[mask], msg='sorted_ids')
+    num_tokens_post_pad = num_tokens_post_padded_a.item()
+    checkAllclose(sorted_ids_a[:num_tokens_post_pad],
+                  sorted_ids_b[:num_tokens_post_pad], msg='sorted_ids')
     checkAllclose(sorted_weights_a[mask],
                   sorted_weights_b[mask], msg='sorted_weights')
     
