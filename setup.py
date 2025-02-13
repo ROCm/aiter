@@ -79,13 +79,6 @@ if IS_ROCM:
         generator_flag.append("-DOLD_GENERATOR_PATH")
     assert os.path.exists(
         ck_dir), f'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
-    generator_flag.append("-DFIND_CK")
-
-    shutil.copytree(ck_dir, f'{bd_dir}/ck', dirs_exist_ok=True)
-
-    ck_dir = f'{bd_dir}/ck'
-    os.system(
-        f'{sys.executable} {ck_dir}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {blob_dir}')
 
     cc_flag = []
 

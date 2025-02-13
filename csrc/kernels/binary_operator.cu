@@ -29,7 +29,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #endif
 #include <cuda_fp16.h>
 
-namespace vllm
+namespace aiter
 {
   template <typename T, typename Operation>
   inline __device__ T performOperation(T a, T b);
@@ -41,14 +41,6 @@ namespace vllm
   {
     template <typename T>
     inline __device__ static T apply(T a, T b) { return a + b; }
-
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("AddOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
-    }
 
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
@@ -64,14 +56,6 @@ namespace vllm
       return a - b;
     }
 
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("SubOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
-    }
-
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
       return torch::sub(input, other);
@@ -82,14 +66,6 @@ namespace vllm
   {
     template <typename T>
     inline __device__ static T apply(T a, T b) { return a * b; }
-
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("MulOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
-    }
 
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
     {
@@ -104,14 +80,6 @@ namespace vllm
     {
       // assert(b == static_cast<T>(0));
       return a / b;
-    }
-
-    void static print(
-        int M, int N, int K, int in_stride0, int in_stride1, int in_stride2,
-        int o_stride0, int o_stride1, int o_stride2)
-    {
-      printf("DivOp input shape: [%d %d %d], stride0: [%d %d %d], stride1: [%d %d %d]\n",
-             M, N, K, in_stride0, in_stride1, in_stride2, o_stride0, o_stride1, o_stride2);
     }
 
     static torch::Tensor compute(torch::Tensor &input, torch::Tensor &other)
@@ -555,13 +523,16 @@ namespace vllm
 }
 
 template <typename Operation>
-torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
 {
   int dim = input.dim();
+  bool is_same_dtype = input.dtype() == other.dtype();
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
 
   if (dim == 2)
   {
     bool is_support = true;
+    is_support &= is_same_dtype == true;
     is_support &= input.dim() == other.dim();
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
@@ -593,13 +564,13 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
 
       VLLM_DISPATCH_FLOATING_TYPES(
           input.scalar_type(), "operator_bcast_tile_kernel", [&]
-          { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
+          { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
       return output;
     }
     else
     {
-      return vllm::aten_compute<Operation>(input, other);
+      return aiter::aten_compute<Operation>(input, other);
     }
   }
   else if (dim == 3)
@@ -608,12 +579,6 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
     constexpr uint32_t PATTERN_BROADCAST_0 = 2;
     constexpr uint32_t PATTERN_BROADCAST_1 = 3;
 
-    // if (dim == 3 && (!input.is_contiguous() || !other.is_contiguous()))
-    // {
-    //   Operation::print(input.size(0), input.size(1), input.size(2),
-    //                    input.stride(0), input.stride(1), input.stride(2),
-    //                    other.stride(0), other.stride(1), other.stride(2));
-    // }
     auto tensor_not_conti = input.is_contiguous() ? other : input;
     bool order_flag;
     int M, N, K;
@@ -627,6 +592,7 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       N = input.size(1);
       K = input.size(2);
       // avoid broadcast
+      is_support &= is_same_dtype == true;
       is_support &= input.dim() == other.dim();
       is_support &= dim == 3;
       is_support &= input.size(0) == other.size(0);
@@ -644,11 +610,11 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
     else if (input.is_contiguous() && other.is_contiguous())
     {
       bool is_support = false;
-      is_support &= input.dim() == other.dim();
-      is_support &= dim == 3;
       if (!is_support && other.size(0) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= input.size(0) > 1;
         is_support &= other.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
@@ -660,6 +626,8 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && input.size(0) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= other.size(0) > 1;
         is_support &= input.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
@@ -671,6 +639,8 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && input.size(1) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= other.size(1) > 1;
         is_support &= input.size(0) == other.size(0);
         is_support &= input.size(2) == other.size(2);
@@ -681,6 +651,8 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && other.size(1) == 1)
       {
         is_support = true;
+        is_support &= is_same_dtype == true;
+        is_support &= input.dim() == other.dim();
         is_support &= input.size(1) > 1;
         is_support &= input.size(0) == other.size(0);
         is_support &= input.size(2) == other.size(2);
@@ -713,14 +685,14 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "operator_tn_big_tile_kernel", [&]
-            { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+            { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
       }
       else
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "operator_tn_big_tile_kernel", [&]
-            { vllm::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+            { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
       }
 
@@ -752,14 +724,14 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
         {
           VLLM_DISPATCH_FLOATING_TYPES(
               input.scalar_type(), "operator_bcast_tile_kernel", [&]
-              { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
+              { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
                     <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
         }
         else
         {
           VLLM_DISPATCH_FLOATING_TYPES(
               input.scalar_type(), "operator_bcast_tile_kernel", [&]
-              { vllm::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, false>
+              { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, false>
                     <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
         }
       }
@@ -776,14 +748,14 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
         {
           VLLM_DISPATCH_FLOATING_TYPES(
               input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-              { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+              { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                     <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
         }
         else
         {
           VLLM_DISPATCH_FLOATING_TYPES(
               input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-              { vllm::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+              { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                     <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
         }
       }
@@ -815,14 +787,14 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-            { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
       }
       else
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-            { vllm::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
       }
 
@@ -830,27 +802,27 @@ torch::Tensor aiter_operation(torch::Tensor &input, torch::Tensor &other)
     }
     else
     {
-      return vllm::aten_compute<Operation>(input, other);
+      return aiter::aten_compute<Operation>(input, other);
     }
   }
 }
 
 torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other)
 {
-  return aiter_operation<vllm::AddOp>(input, other);
+  return binary_operation<aiter::AddOp>(input, other);
 }
 
 torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  return aiter_operation<vllm::SubOp>(input, other);
+  return binary_operation<aiter::SubOp>(input, other);
 }
 
 torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  return aiter_operation<vllm::MulOp>(input, other);
+  return binary_operation<aiter::MulOp>(input, other);
 }
 
 torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
-  return aiter_operation<vllm::DivOp>(input, other);
+  return binary_operation<aiter::DivOp>(input, other);
 }
