@@ -163,8 +163,8 @@ def test_fmoe_ep(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1
         # print(f'{ref2[:,:5]=}')
         # print(f'{out_b[:,:5]=}')
         msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, ck_avg: {avg_ck:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
-        # checkAllclose(ref2, out_ck, rtol=0.01, atol=100, msg="ck check")
+        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+        # checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
 
     else:
         w1, fc1_scale = pertoken_quant(
@@ -219,7 +219,7 @@ def test_fmoe_ep(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1
             out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                           fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True, expert_mask=expert_mask)
             msg = f'[perf] a8w8 asm: {avg_b:.2f} vs a16w8 asm: {avg_b2:.2f} ......'
-            checkAllclose(out_b, out_b2, atol=100, msg=msg)
+            checkAllclose(out_b, out_b2, atol=10, msg=msg)
 
         # # test ck moe, not support now
         # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
@@ -227,8 +227,8 @@ def test_fmoe_ep(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1
         #                              fc1_smooth_scale, fc2_smooth_scale)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
-        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
+        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
 print('test test_fmoe 16 bit')

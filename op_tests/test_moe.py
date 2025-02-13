@@ -281,13 +281,13 @@ for dtype in [torch.bfloat16]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5,
                           quant='int8smoothquant', use_g1u1=False)
 
-print('\ng1u1 int8smoothquant not supported')
-for dtype in [torch.bfloat16]:
-    for m in [128]:
-        for dim in [4096, 6144,  8192]:
-            for hdim in [512, 1024, 1280]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='int8smoothquant', use_g1u1=True)
+# print('\ng1u1 int8smoothquant not supported')
+# for dtype in [torch.bfloat16]:
+#     for m in [128]:
+#         for dim in [4096, 6144,  8192]:
+#             for hdim in [512, 1024, 1280]:
+#                 test_fmoe(dtype, m, dim, hdim, 32, 5,
+#                           quant='int8smoothquant', use_g1u1=True)
 
 print('\ng1u1 fp8smoothquant')
 for dtype in [torch.bfloat16]:

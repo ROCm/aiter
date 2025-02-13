@@ -69,18 +69,21 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     std::string prec_st = !a1_scale ? "fp32" : torchDTypeToStr(a1_scale->dtype());
     std::string prec_sw = !w1_scale ? "fp32" : torchDTypeToStr(w1_scale->dtype());
     std::string prec_sq = !a2_scale ? "fp32" : torchDTypeToStr(a2_scale->dtype());
-    
-    fused_moe_traits traits{prec_i,
-                            prec_w,
-                            prec_o,
-                            prec_st,
-                            prec_sw,
-                            prec_sq,
-                            prec_kw,
-                            block_size,
-                            activation,
-                            gate_only,
-                            fused_quant};
+
+    fused_moe_traits traits{
+        prec_i,
+        prec_w,
+        prec_o,
+        prec_st,
+        prec_sw,
+        prec_sq,
+        prec_kw,
+        block_size,
+        activation,
+        gate_only,
+        fused_quant,
+        false, // TODO, enable local_expert_masking for ck next
+    };
 
     fused_moe_args args{hidden_states.data_ptr(),
                         a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr,
@@ -89,6 +92,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr,
                         w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr,
                         a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr,
+                        nullptr, // TODO, enable local_expert_masking for ck next
                         out.data_ptr(),
 
                         topk_ids.data_ptr(),
@@ -97,7 +101,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         sorted_weights.data_ptr(),
                         sorted_expert_ids.data_ptr(),
                         num_tokens_post_pad.data_ptr(),
-                        
+
                         block_size,
                         hidden_size,
                         shared_intermediate_size,
@@ -109,5 +113,5 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     fused_moe(traits, args, {stream});
-    return out; 
+    return out;
 }
