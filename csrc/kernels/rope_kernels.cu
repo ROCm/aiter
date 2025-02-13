@@ -242,7 +242,7 @@ void kn_rope_fwd(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
     const scalar_f_t* __restrict__ p_freqs,
-    const int32_t size_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_h, const int32_t size_d,
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
@@ -268,7 +268,7 @@ void kn_rope_bwd(
     scalar_t* __restrict__         p_input_grads,
     const scalar_t* __restrict__   p_output_grads,
     const scalar_f_t* __restrict__ p_freqs,
-    const int32_t size_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_h, const int32_t size_d,
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d,
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d)
@@ -295,7 +295,7 @@ void kn_rope_cached_fwd(
     const scalar_t* __restrict__   p_input,
     const scalar_f_t* __restrict__ p_cos,
     const scalar_f_t* __restrict__ p_sin,
-    const int32_t size_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_h, const int32_t size_d,
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
@@ -323,7 +323,7 @@ void kn_rope_cached_bwd(
     const scalar_t* __restrict__   p_output_grads,
     const scalar_f_t* __restrict__ p_cos,
     const scalar_f_t* __restrict__ p_sin,
-    const int32_t size_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_h, const int32_t size_d,
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d,
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d)
@@ -367,8 +367,7 @@ void dispatch_rope_fwd(
         p_output,
         p_input,
         p_freqs,
-        size_s, size_b, size_h, size_d,
-        size_f,
+        size_h, size_d, size_f,
         stride_i_s, stride_i_b, stride_i_h, stride_i_d,
         stride_o_s, stride_o_b, stride_o_h, stride_o_d);
 }
@@ -392,8 +391,7 @@ void dispatch_rope_bwd(
         p_input_grads,
         p_output_grads,
         p_freqs,
-        size_s, size_b, size_h, size_d,
-        size_f,
+        size_h, size_d, size_f,
         stride_o_s, stride_o_b, stride_o_h, stride_o_d,
         stride_i_s, stride_i_b, stride_i_h, stride_i_d);
 }
@@ -418,8 +416,7 @@ void dispatch_rope_cached_fwd(
         p_output,
         p_input,
         p_cos, p_sin,
-        size_s, size_b, size_h, size_d,
-        size_f,
+        size_h, size_d, size_f,
         stride_i_s, stride_i_b, stride_i_h, stride_i_d,
         stride_o_s, stride_o_b, stride_o_h, stride_o_d);
 }
@@ -444,8 +441,7 @@ void dispatch_rope_cached_bwd(
         p_input_grads,
         p_output_grads,
         p_cos, p_sin,
-        size_s, size_b, size_h, size_d,
-        size_f,
+        size_h, size_d, size_f,
         stride_o_s, stride_o_b, stride_o_h, stride_o_d,
         stride_i_s, stride_i_b, stride_i_h, stride_i_d);
 }
