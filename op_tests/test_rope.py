@@ -15,11 +15,11 @@ def hip_rope_fwd(input, freqs, transpose_output):
 def hip_rope_bwd(output_grads, freqs, transpose_output):
     return aiter.rope_bwd(output_grads, freqs, transpose_output)
 
-# @perftest()
+@perftest()
 def hip_rope_cached_fwd(input, cos, sin, transpose_output):
     return aiter.rope_cached_fwd(input, cos, sin, transpose_output)
 
-# @perftest()
+@perftest()
 def hip_rope_cached_bwd(output_grads, cos, sin, transpose_output):
     return aiter.rope_cached_bwd(output_grads, cos, sin, transpose_output)
 
@@ -49,26 +49,28 @@ def ref_rope_fwd(x, freqs):
     x_embed = (x * torch.cos(freqs)) + (rotate_half(x) * torch.sin(freqs))
     return x_embed.to(dtype=x.dtype)
 
-def ref_rope_cached_fwd(x, cos, sin):
-    x_embed = (x * cos) + (rotate_half(x) * sin)
-    return x_embed.to(dtype=x.dtype)
-
 
 def test_rope_sbhd(dtype, dim_i, dim_freqs, transpose_output):
     input_msg = f"dtype: {dtype}, dim_input: {str(dim_i):<20}, dim_freqs: {str(dim_freqs):<20}, transpose_output: {transpose_output}"
 
     input = torch.randn(dim_i, dtype=dtype, device="cuda", requires_grad=True)
     freqs = torch.randn(dim_freqs, dtype=torch.float, device="cuda")
+    cos   = torch.cos(freqs)
+    sin   = torch.sin(freqs)
     grad  = torch.randn(dim_i, dtype=dtype, device="cuda")
 
     ref = ref_rope_fwd(input, freqs)
     ref.backward(grad)
 
-    hip_fwd, hip_fwd_avg = hip_rope_fwd(input, freqs, transpose_output)
-    hip_bwd, hip_bwd_avg = hip_rope_bwd(grad, freqs, transpose_output)
+    hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, transpose_output)
+    hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, transpose_output)
+    hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(input, cos, sin, transpose_output)
+    hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, transpose_output)
 
-    checkAllclose(ref, hip_fwd, msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg} ")
-    checkAllclose(input.grad, hip_bwd, msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}")
+    checkAllclose(ref,        hip_fwd,        msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg} ")
+    checkAllclose(input.grad, hip_bwd,        msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg} ")
+    checkAllclose(ref,        hip_cached_fwd, msg=f"rope_cached_fwd - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg} ")
+    checkAllclose(input.grad, hip_cached_bwd, msg=f"rope_cached_bwd - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg} ")
 
 
 if __name__ == "__main__":
