@@ -7,6 +7,39 @@ import aiter
 from aiter.test_common import checkAllclose, perftest
 
 
+@perftest()
+def hip_rope_fwd(input, freqs, transpose_output):
+    return aiter.rope_fwd(input, freqs, transpose_output)
+
+@perftest()
+def hip_rope_bwd(output_grads, freqs, transpose_output):
+    return aiter.rope_bwd(output_grads, freqs, transpose_output)
+
+# @perftest()
+def hip_rope_cached_fwd(input, cos, sin, transpose_output):
+    return aiter.rope_cached_fwd(input, cos, sin, transpose_output)
+
+# @perftest()
+def hip_rope_cached_bwd(output_grads, cos, sin, transpose_output):
+    return aiter.rope_cached_bwd(output_grads, cos, sin, transpose_output)
+
+# @perftest()
+def hip_rope_thd_fwd(input, cu_seqlens, freqs):
+    return aiter.rope_thd_fwd(input, cu_seqlens, freqs)
+
+# @perftest()
+def hip_rope_thd_bwd(output_grads, cu_seqlens, freqs):
+    return aiter.rope_thd_bwd(output_grads, cu_seqlens, freqs)
+
+# @perftest()
+def hip_rope_2d_fwd(input, cos_height, sin_height, cos_width, sin_width):
+    return aiter.rope_2d_fwd(input, cos_height, sin_height, cos_width, sin_width)
+
+# @perftest()
+def hip_rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width):
+    return aiter.rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width)
+
+
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -20,37 +53,23 @@ def ref_rope_cached_fwd(x, cos, sin):
     x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed.to(dtype=x.dtype)
 
-@perftest()
-def hip_rope_fwd(input, freqs, transpose_output):
-    if transpose_output:
-        b, s, h, d = input.shape
-        output = torch.empty((s, b, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)
-    else:
-        output = torch.empty_like(input, requires_grad=False)
-    aiter.rope_fwd_impl(output, input, freqs)
-    return output
 
-@perftest()
-def hip_rope_cached_fwd(input, cos, sin, transpose_output):
-    if transpose_output: 
-        b, s, h, d = input.shape
-        output = torch.empty((s, b, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)
-    else:
-        output = torch.empty_like(input, requires_grad=False)
-    aiter.rope_cached_fwd_impl(output, input, cos, sin)
-    return output
+def test_rope_sbhd(dtype, dim_i, dim_freqs, transpose_output):
+    input_msg = f"dtype: {dtype}, dim_input: {str(dim_i):<20}, dim_freqs: {str(dim_freqs):<20}, transpose_output: {transpose_output}"
 
-def test_rope(dtype, dim_i, dim_freq, transpose_output):
     input = torch.randn(dim_i, dtype=dtype, device="cuda", requires_grad=True)
-    freqs = torch.randn(dim_freq, dtype=torch.float, device="cuda")
+    freqs = torch.randn(dim_freqs, dtype=torch.float, device="cuda")
+    grad  = torch.randn(dim_i, dtype=dtype, device="cuda")
+
     ref = ref_rope_fwd(input, freqs)
-    ref_cached = ref_rope_cached_fwd(input, freqs.cos(), freqs.sin())
-    hip, hip_avg = hip_rope_fwd(input, freqs, transpose_output)
-    hip_cached, hip_cached_avg = hip_rope_cached_fwd(input, freqs.cos(), freqs.sin(), transpose_output)
-    msg = f"[perf] dim_input: {str(dim_i):<20}, dtype_input: {dtype}, dim_freqs: {str(dim_freq):<20}, dtype_freqs: {torch.float}, transpose_output: {transpose_output}, avg: {hip_avg:<8.2f}, cached_avg: {hip_cached_avg:<8.2f}"
-    checkAllclose(ref, ref_cached)
-    checkAllclose(ref, hip, msg=msg)
-    checkAllclose(ref, hip_cached)
+    ref.backward(grad)
+
+    hip_fwd, hip_fwd_avg = hip_rope_fwd(input, freqs, transpose_output)
+    hip_bwd, hip_bwd_avg = hip_rope_bwd(grad, freqs, transpose_output)
+
+    checkAllclose(ref, hip_fwd, msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg} ")
+    checkAllclose(input.grad, hip_bwd, msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}")
+
 
 if __name__ == "__main__":
     for dtype in [torch.float16, torch.bfloat16]:
@@ -60,4 +79,4 @@ if __name__ == "__main__":
                     for h in (1,2,4,8,16):
                         for input_d in (128,160):
                             # for freq_d in (64, 128, 160, 192):
-                                test_rope(dtype, (b, s, h, input_d), (b, 1, 1, input_d), transpose_output)
+                                test_rope_sbhd(dtype, (b, s, h, input_d), (b, 1, 1, input_d), transpose_output)
