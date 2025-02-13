@@ -56,13 +56,13 @@ def ck_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                 fc2_scale=None,  # [expert, model_dim, 1]
                 fc1_smooth_scale=None,  # [expert, 1, model_dim]
                 fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-                ):
+                expert_mask=None):
     return ck_moe(hidden_states,
                   w1,
                   w2,
                   topk_weight,
                   topk_ids,
-                  fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+                  fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, expert_mask=expert_mask)
 
 
 quant_algo = [
@@ -155,16 +155,15 @@ def test_fmoe_ep(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1
             out_b, avg_b = asm_moe_test(
                 input, w1b, w2b, topk_weights, topk_ids, expert_mask=expert_mask)
 
-        # # test ck moe
-        # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-        #                              None, None,
-        #                              None, None)
-        avg_ck = 0
-        # print(f'{ref2[:,:5]=}')
-        # print(f'{out_b[:,:5]=}')
+        # test ck moe
+        out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
+                                     None, None,
+                                     None, None, expert_mask)
+
+
         msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, ck_avg: {avg_ck:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
-        # checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
+        checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
 
     else:
         w1, fc1_scale = pertoken_quant(

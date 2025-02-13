@@ -129,6 +129,7 @@ def ck_moe(
     fc2_scale: Optional[Tensor] = None,
     fc1_smooth_scale: Optional[Tensor] = None,
     fc2_smooth_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32
+    block_m: Optional[int] = 32,
+    expert_mask: Optional[Tensor] = None
 ): 
     ...
