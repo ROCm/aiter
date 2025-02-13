@@ -18,7 +18,7 @@ def rope_fwd_impl(
 ): 
     '''
     Forward propagation of traditional RoPE (Rotary Position Embedding).
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d] and in float.
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -42,7 +42,7 @@ def rope_bwd_impl(
 ): 
     '''
     Backward propagation of traditional RoPE (Rotary Position Embedding).
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d] and in float.
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -67,7 +67,7 @@ def rope_cached_fwd_impl(
 ): 
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d] and in float.
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -93,7 +93,7 @@ def rope_cached_bwd_impl(
 ): 
     '''
     Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d] and in float.
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...

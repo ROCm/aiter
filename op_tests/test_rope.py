@@ -50,11 +50,11 @@ def ref_rope_fwd(x, freqs):
     return x_embed.to(dtype=x.dtype)
 
 
-def test_rope_sbhd(dtype, dim_i, dim_freqs, transpose_output):
-    input_msg = f"dtype: {dtype}, dim_input: {str(dim_i):<20}, dim_freqs: {str(dim_freqs):<20}, transpose_output: {transpose_output}"
+def test_rope_sbhd(dtype, fdtype, dim_i, dim_freqs, transpose_output):
+    input_msg = f"dtype: {dtype}, freq_dtype: {fdtype}, dim_input: {str(dim_i):<20}, dim_freqs: {str(dim_freqs):<20}, transpose_output: {transpose_output}"
 
     input = torch.randn(dim_i, dtype=dtype, device="cuda", requires_grad=True)
-    freqs = torch.randn(dim_freqs, dtype=torch.float, device="cuda")
+    freqs = torch.randn(dim_freqs, dtype=fdtype, device="cuda")
     cos   = torch.cos(freqs)
     sin   = torch.sin(freqs)
     grad  = torch.randn(dim_i, dtype=dtype, device="cuda")
@@ -74,11 +74,12 @@ def test_rope_sbhd(dtype, dim_i, dim_freqs, transpose_output):
 
 
 if __name__ == "__main__":
-    for dtype in [torch.float16, torch.bfloat16]:
-        for transpose_output in (False, True):
-            for b in (1,2,4,8,16):
-                for s in (16,32,64,128):
-                    for h in (1,2,4,8,16):
-                        for input_d in (128,160):
-                            # for freq_d in (64, 128, 160, 192):
-                                test_rope_sbhd(dtype, (b, s, h, input_d), (b, 1, 1, input_d), transpose_output)
+    for dtype in [torch.float, torch.float16, torch.bfloat16]:
+        for fdtype in [torch.float, torch.float16, torch.bfloat16]:
+            for transpose_output in (False, True):
+                for b in (1,2,4,8,16):
+                    for s in (16,32,64,128):
+                        for h in (1,2,4,8,16):
+                            for input_d in (128,160):
+                                # for freq_d in (64, 128, 160, 192):
+                                    test_rope_sbhd(dtype, fdtype, (b, s, h, input_d), (b, 1, 1, input_d), transpose_output)
