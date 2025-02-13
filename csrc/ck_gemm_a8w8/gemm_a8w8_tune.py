@@ -67,10 +67,9 @@ def tune_gemm(m, n, k, dtype: torch.dtype, useSplitK = False):
 
     print(f"*******************M:{m} X N:{n} X K:{k}**************************")
     print(f"Start tuning a8w8 gemm kernel for M:{m}, N:{n}, K{k}:")
-    kernels_num = len(kernels_params_dict)
     best_kernelConfig = (-1, 0)
     best_time = -1
-    for i in range(kernels_num):
+    for i in range(len(kernels_params_dict)):
         kernel = kernels_params_dict[i]
         maxsplitK = aiter.compute_gemm_SplitK(m, n, k, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK) \
             if useSplitK else 0
@@ -86,7 +85,6 @@ def tune_gemm(m, n, k, dtype: torch.dtype, useSplitK = False):
                 else:
                     print(f"{str(dim):<20} kernelid:{i:<3d}\t No pass         , {kernel.name}, {splitK=}") 
             except RuntimeError as e:
-                print(str(e))
                 print(f"{str(dim):<20} kernelid:{i:<3d}\t No support      , {kernel.name}, {splitK=}") 
 
     best_kernelId, splitK = best_kernelConfig

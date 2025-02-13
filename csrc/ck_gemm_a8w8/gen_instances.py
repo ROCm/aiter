@@ -239,16 +239,20 @@ template torch::Tensor
     int KBatch);
 """
 
-def gen_kernel_dict_item_as_str(mnk: tuple, k: KernelParameters) -> str:
-    mnk_formatted = ', '.join(str(item) for item in mnk)
+def gen_kernel_dict_item_as_str(mnk: tuple | int, k: KernelParameters) -> str:
+    if isinstance(mnk, tuple):
+        mnk_formatted = ', '.join(str(item) for item in mnk)
+    else:
+        mnk_formatted = f"{str(mnk)}"
     return f"{{ {{{mnk_formatted}}}, {k.name}<A_TYPE, B_TYPE, C_SHUFFLE_TYPE, COMPUTE_TYPE, ACC_TYPE, D_TYPE, E_TYPE>}}"
 
-def gen_lookup_dict(kernel_dict: dict) -> str:
-
+def gen_lookup_dict(kernel_dict: dict, is_tune: bool) -> str:
+    # Do not include default kernels in the lookup table for non-tuning calls.
+    filter_mnk = lambda mnk : True if is_tune else isinstance(mnk, tuple)
     kernel_dict_items = [
         gen_kernel_dict_item_as_str(mnk, k)
         for mnk, k in kernel_dict.items()
-        if isinstance(mnk, tuple)
+        if filter_mnk(mnk)
     ]
     return f"""#pragma once
 // SPDX-License-Identifier: MIT
@@ -325,7 +329,7 @@ def gemm_a8w8_fwd_codegen(working_path: Path, kernel_parameters_dict: dict, is_t
             instance_path.write_text(kernel_instance_str)
     
     # generate and write the lookup table
-    look_up_dict_str = gen_lookup_dict(kernel_parameters_dict)
+    look_up_dict_str = gen_lookup_dict(kernel_parameters_dict, is_tune)
     look_up_table_header_path = Path(os.path.join(working_path, LOOK_UP_TABLE_HEADER_PATH))
     look_up_table_header_path.write_text(look_up_dict_str)
     
