@@ -243,7 +243,6 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     bool has_dropout = p_dropout > 0.0f;
 
     at::Tensor softmax_lse;
-    // TODO - check gradient, only training require lse
     if (return_softmax_lse) {
         softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));
     }

@@ -2,6 +2,7 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+from .bert_padding import pad_input, unpad_input
 from einops import rearrange, repeat
 import torch
 import torch.nn.functional as F
@@ -68,6 +69,30 @@ def convert_flash_attn_S_to_softmax(
     return S_converted[:, :, :seqlen_q, :seqlen_k]
 
 
+def pad_rearrange_dropout_mask_hts_to_bhss(S_dmask, cu_seqlens_q, seqlen_q_rounded, seqlen_k_rounded):
+    """ pad + rearrange [nheads, total_q, max_seqlen_k] into [b, nheads, seqlen_q_rounded, seqlen_k_rounded]
+    Arguments:
+        S_dmask: (nheads, total_q, max_seqlen_k)
+        cu_seqlens_q: (b + 1)
+    Output:
+        S_dmask: (b, nheads, seqlen_q_rounded, seqlen_k_rounded)
+    """
+    batch_size = cu_seqlens_q.numel() - 1
+    seqlens_q = torch.roll(cu_seqlens_q, shifts = -1) - cu_seqlens_q
+    seqlens_q = seqlens_q[0:batch_size].tolist()
+    S_dmask = torch.split(S_dmask, seqlens_q, dim=1)
+    # [(nheads, seqlen_q0, max_seqlen_k), (nheads, seqlen_q1, max_seqlen_k), ..., (nheads, seqlen_qb, max_seqlen_k)]
+    masks = ()
+    for mask in S_dmask:
+        # (nheads, seqlen_qi, max_seqlen_k) -> (nheads, seqlen_q_rounded, seqlen_k_rounded)
+        mask = F.pad(mask, (0, seqlen_k_rounded - mask.shape[2], 0, seqlen_q_rounded - mask.shape[1], 0, 0)).unsqueeze(1)
+        masks = masks + (mask, )
+    S_dmask = torch.cat(masks, dim=1)
+
+    S_dmask = S_dmask.transpose(0, 1)
+    return S_dmask
+
+
 def attn_bias_from_alibi_slopes(
     slopes, seqlen_q, seqlen_k, query_padding_mask=None, key_padding_mask=None, causal=False, key_leftpad=None
 ):
@@ -95,6 +120,130 @@ def attn_bias_from_alibi_slopes(
         )
         relative_pos = torch.abs(row_idx + sk - sq - col_idx)
         return -slopes * relative_pos.to(dtype=slopes.dtype)
+
+
+def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random"):
+    assert mode in ["full", "random", "third"]
+    if mode == "full":
+        lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
+    elif mode == "random":
+        lengths = torch.randint(
+            max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1), device=device
+        )
+    elif mode == "third":
+        lengths = torch.randint(max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device)
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
+    )
+    return padding_mask
+
+
+def generate_qkv(
+    q, k, v, query_padding_mask=None, key_padding_mask=None, kvpacked=False, qkvpacked=False
+):
+    """
+    Arguments:
+        q: (batch_size, seqlen_q, nheads, d)
+        k: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, d)
+        query_padding_mask: (batch_size, seqlen), bool
+        key_padding_mask: (batch_size, seqlen), bool
+    """
+    assert not (kvpacked and qkvpacked)
+    batch_size, seqlen_q, nheads, d = q.shape
+    _, seqlen_k, nheads_k, _ = k.shape
+    assert k.shape == (batch_size, seqlen_k, nheads_k, d)
+    assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+
+    if query_padding_mask is not None:
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q, query_padding_mask)
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
+    else:
+        q_unpad = rearrange(q, "b s h d -> (b s) h d")
+        cu_seqlens_q = torch.arange(
+            0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=q_unpad.device
+        )
+        max_seqlen_q = seqlen_q
+        output_pad_fn = lambda output_unpad: rearrange(
+            output_unpad, "(b s) h d -> b s h d", b=batch_size
+        )
+
+    if key_padding_mask is not None:
+        k_unpad, indices_k, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k, key_padding_mask)
+        v_unpad, _, _, _, _ = unpad_input(v, key_padding_mask)
+    else:
+        k_unpad = rearrange(k, "b s h d -> (b s) h d")
+        v_unpad = rearrange(v, "b s h d -> (b s) h d")
+        cu_seqlens_k = torch.arange(
+            0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=k_unpad.device
+        )
+        max_seqlen_k = seqlen_k
+
+    if qkvpacked:
+        assert (query_padding_mask == key_padding_mask).all()
+        assert nheads == nheads_k
+        qkv_unpad = torch.stack([q_unpad, k_unpad, v_unpad], dim=1)
+        qkv = torch.stack([q, k, v], dim=2)
+        if query_padding_mask is not None:
+            dqkv_pad_fn = lambda dqkv_unpad: pad_input(dqkv_unpad, indices_q, batch_size, seqlen_q)
+        else:
+            dqkv_pad_fn = lambda dqkv_unpad: rearrange(
+                dqkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+            )
+        return (
+            qkv_unpad.detach().requires_grad_(),
+            cu_seqlens_q,
+            max_seqlen_q,
+            qkv.detach().requires_grad_(),
+            output_pad_fn,
+            dqkv_pad_fn,
+        )
+    elif kvpacked:
+        kv_unpad = torch.stack([k_unpad, v_unpad], dim=1)
+        kv = torch.stack([k, v], dim=2)
+        dq_pad_fn = output_pad_fn
+        if key_padding_mask is not None:
+            dkv_pad_fn = lambda dkv_unpad: pad_input(dkv_unpad, indices_k, batch_size, seqlen_k)
+        else:
+            dkv_pad_fn = lambda dkv_unpad: rearrange(
+                dkv_unpad, "(b s) t h d -> b s t h d", b=batch_size
+            )
+        return (
+            q_unpad.detach().requires_grad_(),
+            kv_unpad.detach().requires_grad_(),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q.detach().requires_grad_(),
+            kv.detach().requires_grad_(),
+            output_pad_fn,
+            dq_pad_fn,
+            dkv_pad_fn,
+        )
+    else:
+        dq_pad_fn = output_pad_fn
+        if key_padding_mask is not None:
+            dk_pad_fn = lambda dk_unpad: pad_input(dk_unpad, indices_k, batch_size, seqlen_k)
+        else:
+            dk_pad_fn = lambda dk_unpad: rearrange(dk_unpad, "(b s) h d -> b s h d", b=batch_size)
+        return (
+            q_unpad.detach().requires_grad_(),
+            k_unpad.detach().requires_grad_(),
+            v_unpad.detach().requires_grad_(),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q.detach().requires_grad_(),
+            k.detach().requires_grad_(),
+            v.detach().requires_grad_(),
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        )
 
 
 def construct_local_mask(
