@@ -24,21 +24,21 @@ def hip_rope_cached_fwd(input, cos, sin, transpose_output):
 def hip_rope_cached_bwd(output_grads, cos, sin, transpose_output):
     return aiter.rope_cached_bwd(output_grads, cos, sin, transpose_output)
 
-# @perftest()
+@perftest()
 def hip_rope_thd_fwd(input, cu_seqlens, freqs):
     return aiter.rope_thd_fwd(input, cu_seqlens, freqs)
 
-# @perftest()
+@perftest()
 def hip_rope_thd_bwd(output_grads, cu_seqlens, freqs):
     return aiter.rope_thd_bwd(output_grads, cu_seqlens, freqs)
 
-# @perftest()
-def hip_rope_2d_fwd(input, cos_height, sin_height, cos_width, sin_width):
-    return aiter.rope_2d_fwd(input, cos_height, sin_height, cos_width, sin_width)
+@perftest()
+def hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w):
+    return aiter.rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
 
-# @perftest()
-def hip_rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width):
-    return aiter.rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width)
+@perftest()
+def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w):
+    return aiter.rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w)
 
 
 def rotate_half(x):
@@ -59,6 +59,18 @@ def ref_rope_thd_fwd(x, cu_seqlens, freqs):
         for xi in torch.split(x, seqlens)
     ])
     return x_embed.squeeze(1)
+
+def ref_rope_2d_fwd(x, size_h, size_w, cos_h, sin_h, cos_w, sin_w):
+    s, b, h, d = x.shape
+    x = x.view(s, size_h, size_w, h, d)
+    x1, x2 = x.chunk(2, dim=-1)
+    cos_h = cos_h[:, :size_h].unsqueeze(2)  # [1, H, 1, 1, D//2]
+    sin_h = sin_h[:, :size_h].unsqueeze(2)  # [1, H, 1, 1, D//2]
+    x1 = (x1 * cos_h) + (rotate_half(x1) * sin_h)
+    cos_w = cos_w[:, :size_w].unsqueeze(1)  # [1, 1, W, 1, D//2]
+    sin_w = sin_w[:, :size_w].unsqueeze(1)  # [1, 1, W, 1, D//2]
+    x2 = (x2 * cos_w) + (rotate_half(x2) * sin_w)
+    return torch.cat([x1, x2], dim=-1).view(s, b, h, d).to(dtype=x.dtype)
 
 
 def test_rope_sbhd(input, freqs, grad, transpose_output):
@@ -89,22 +101,44 @@ def test_rope_thd(input, cu_seqlens, freqs, grad):
     ref = ref_rope_thd_fwd(input, cu_seqlens, freqs)
     ref.backward(grad)
 
-    hip_fwd = hip_rope_thd_fwd(input, cu_seqlens, freqs)
-    hip_bwd = hip_rope_thd_bwd(grad, cu_seqlens, freqs)
+    hip_fwd, hip_fwd_avg = hip_rope_thd_fwd(input, cu_seqlens, freqs)
+    hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs)
 
-    checkAllclose(ref,        hip_fwd, msg=f"rope_thd_fwd - {input_msg}\n")
-    checkAllclose(input.grad, hip_bwd, msg=f"rope_thd_bwd - {input_msg}\n")
+    checkAllclose(ref,        hip_fwd, msg=f"rope_thd_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input.grad, hip_bwd, msg=f"rope_thd_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+
+
+def test_rope_2d(input, height, width, freqs_h, freqs_w, grad):
+    input_msg = f"dtype: {input.dtype}, freq_dtype: {freqs_h.dtype}, dim_input: {str(input.shape):<20}, dim_freqs: {str(freqs_h.shape):<20}"
+
+    cos_h = freqs_h.cos()
+    sin_h = freqs_h.sin()
+    cos_w = freqs_w.cos()
+    sin_w = freqs_w.sin()
+
+    ref = ref_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
+    ref.backward(grad)
+
+    hip_fwd, hip_fwd_avg = hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
+    hip_bwd, hip_bwd_avg = hip_rope_2d_bwd(grad, height, width, cos_h, sin_h, cos_w, sin_w)
+
+    checkAllclose(ref,        hip_fwd, msg=f"rope_2d_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input.grad, hip_bwd, msg=f"rope_2d_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
 if __name__ == "__main__":
     dtype_ = (torch.float, torch.float16, torch.bfloat16)
     transpose_output_ = (False, True)
-    batch_size_ = (1,2,4)
+    batch_size_ = (1, 2, 4)
     seq_size_ = (1024, 2048, 4096)
     head_size_ = (32, 64)
     hidden_dim_ = (128, 256)
     rotary_percent_ = (0.5, 1.0)
+    height_ = (32, 64)
+    width_ = (32, 64)
+    margin_ = (0, 1, 3)
 
+    # Test sbhd format for both cached and uncached
     for (dtype, fdtype,
          transpose_output,
          rotary_percent,
@@ -115,25 +149,38 @@ if __name__ == "__main__":
         rotary_percent_,
         batch_size_, seq_size_, head_size_, hidden_dim_
     ):
-        input = torch.randn((b, s, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((b, 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
-        grad  = torch.randn((b, s, h, d), dtype=dtype, device="cuda")
+        input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+        freqs = torch.randn((s, 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
+        grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         test_rope_sbhd(input, freqs, grad, transpose_output)
 
+    # Test thd format for uncached
     cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
                               dtype=torch.int32, device="cuda")
     for (dtype, fdtype,
-         transpose_output,
          rotary_percent,
          h, d
     ) in itertools.product(
         dtype_, dtype_,
-        transpose_output_,
         rotary_percent_,
         head_size_, hidden_dim_
     ):
         input = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((cu_seqlens[-1], 1, 1, d), dtype=dtype, device="cuda")
+        freqs = torch.randn((cu_seqlens[-1], 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
         grad  = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda")
         test_rope_thd(input, cu_seqlens, freqs, grad)
 
+    # Test 2d image format for cached
+    for (dtype, fdtype,
+         b, h, d,
+         height, width, margin
+    ) in itertools.product(
+        dtype_, dtype_,
+        batch_size_, head_size_, hidden_dim_,
+        height_, width_, margin_
+    ):
+        input   = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda", requires_grad=True)
+        freqs_h = torch.randn((1, height + margin, 1, d // 2), dtype=fdtype, device="cuda")
+        freqs_w = torch.randn((1, width + margin, 1, d // 2), dtype=fdtype, device="cuda")
+        grad    = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda")
+        test_rope_2d(input, height, width, freqs_h, freqs_w, grad)

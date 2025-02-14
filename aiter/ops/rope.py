@@ -160,50 +160,70 @@ def rope_thd_bwd(
 def rope_2d_fwd_impl(
     output: Tensor,
     input: Tensor,
-    cos_height: Tensor,
-    sin_height: Tensor,
-    cos_width: Tensor,
-    sin_width: Tensor
+    cos_h: Tensor,
+    sin_h: Tensor,
+    cos_w: Tensor,
+    sin_w: Tensor
 ):
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with 2D image as input.
+    Input size should be (b, H, W, h, d) while output should be in (b, s, h, d) where s = H * W.
+    cos_h and sin_h are in (1, H', 1, h, d // 2) where H' >= H.
+    cos_w and sin_w are in (1, 1, W', h, d // 2) where W' >= W.
     This implemenation rotates the 2nd half of elements.
     '''
     ...
 
 def rope_2d_fwd(
     input: Tensor,
-    cos_height: Tensor,
-    sin_height: Tensor,
-    cos_width: Tensor,
-    sin_width: Tensor
+    height: int,
+    width: int,
+    cos_h: Tensor,
+    sin_h: Tensor,
+    cos_w: Tensor,
+    sin_w: Tensor
 ) -> Tensor :
-    output = empty_like(input, requires_grad=False)
-    rope_2d_fwd_impl(output, input, cos_height, sin_height, cos_width, sin_width)
+    '''
+    Input and output are in (b, s, h, d) where s = H * W.
+    '''
+    b, s, h, d = input.shape
+    input = input.view(b, height, width, h, d)
+    output = empty((b, s, h, d), dtype=input.dtype, device=input.device, requires_grad=False)
+    rope_2d_fwd_impl(output, input, cos_h, sin_h, cos_w, sin_w)
     return output
 
 @compile_ops("module_rope")
 def rope_2d_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
-    cos_height: Tensor,
-    sin_height: Tensor,
-    cos_width: Tensor,
-    sin_width: Tensor
+    cos_h: Tensor,
+    sin_h: Tensor,
+    cos_w: Tensor,
+    sin_w: Tensor
 ):
     '''
     Backward propagation of RoPE (Rotary Position Embedding) with 2D image as input.
+    output_grads size should be (b, H, W, h, d) while input_grads should be in (b, s, h, d) where s = H * W.
+    cos_h and sin_h are in (1, H', 1, h, d // 2) where H' >= H.
+    cos_w and sin_w are in (1, 1, W', h, d // 2) where W' >= W.
     This implemenation rotates the 2nd half of elements.
     '''
     ...
 
 def rope_2d_bwd(
     output_grads: Tensor,
-    cos_height: Tensor,
-    sin_height: Tensor,
-    cos_width: Tensor,
-    sin_width: Tensor
+    height: int,
+    width: int,
+    cos_h: Tensor,
+    sin_h: Tensor,
+    cos_w: Tensor,
+    sin_w: Tensor
 ) -> Tensor :
-    input_grads = empty_like(output_grads, requires_grad=False)
-    rope_2d_bwd_impl(input_grads, output_grads, cos_height, sin_height, cos_width, sin_width)
+    '''
+    output_grads and input_grads are in (b, s, h, d) where s = H * W.
+    '''
+    b, s, h, d = output_grads.shape
+    output_grads = output_grads.view(b, height, width, h, d)
+    input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False)
+    rope_2d_bwd_impl(input_grads, output_grads, cos_h, sin_h, cos_w, sin_w)
     return input_grads

@@ -46,19 +46,19 @@ void rope_thd_bwd_impl(
 );
 
 void rope_2d_fwd_impl(
-    torch::Tensor&       output,
-    const torch::Tensor& input,
-    const torch::Tensor& cos_height,
-    const torch::Tensor& sin_height,
-    const torch::Tensor& cos_width,
-    const torch::Tensor& sin_width
+    torch::Tensor&       output,        // [b, H, W, h, d]
+    const torch::Tensor& input,         // [b, s, h, d] where s = H * W
+    const torch::Tensor& cos_h,         // [1, H', 1,  d // 2] where H' >= H
+    const torch::Tensor& sin_h,         // [1, H', 1,  d // 2] where H' >= H
+    const torch::Tensor& cos_w,         // [1, 1,  W', d // 2] where W' >= W
+    const torch::Tensor& sin_w          // [1, 1,  W', d // 2] where W' >= W
 );
 
 void rope_2d_bwd_impl(
-    torch::Tensor&       input_grads,
-    const torch::Tensor& output_grads,
-    const torch::Tensor& cos_height,
-    const torch::Tensor& sin_height,
-    const torch::Tensor& cos_width,
-    const torch::Tensor& sin_width
+    torch::Tensor&       input_grads,   // [b, H, W, h, d]
+    const torch::Tensor& output_grads,  // [b, s, h, d] where s = H * W
+    const torch::Tensor& cos_h,         // [1, H', 1,  d // 2] where H' >= H
+    const torch::Tensor& sin_h,         // [1, H', 1,  d // 2] where H' >= H
+    const torch::Tensor& cos_w,         // [1, 1,  W', d // 2] where W' >= W
+    const torch::Tensor& sin_w          // [1, 1,  W', d // 2] where W' >= W
 );
