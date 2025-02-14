@@ -64,7 +64,9 @@
         ],
         "md_name": "'module_cache'",
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "isASM": "False",
