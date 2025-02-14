@@ -12,7 +12,7 @@ from aiter import logger
 BLOCK_SIZE_M = 32
 
 
-def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask = None):
+def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype):
     block_size = BLOCK_SIZE_M
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -35,32 +35,28 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype,
                           dtype=moebuf_dtype,
                           device=device)
     aiter.moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
-                          num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M, expert_mask)
+                          num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M)
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
 
 
 def asm_moe(hidden_states,
-            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-            w2,  # [expert(local_expert:EP), dim, inter_dim]
+            w1,  # [expert, inter_dim*2, dim] N,K
+            w2,  # [expert, dim, inter_dim]
             topk_weight, topk_ids,
             # following for int8 quant
-            fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-            fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-            fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-            fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+            fc1_scale=None,  # [expert, inter_dim, 1]
+            fc2_scale=None,  # [expert, model_dim, 1]
+            fc1_smooth_scale=None,  # [expert, 1, model_dim]
+            fc2_smooth_scale=None,  # [expert, 1, inter_dim]
             a16=False,
             per_tensor_quant_scale=None,
-            expert_mask = None
             ):
     E, model_dim, inter_dim = w2.shape
-    if expert_mask is not None:
-        E = expert_mask.numel()
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
     device = topk_ids.device
     sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_padded, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
-                                                                                                    model_dim, dtype, expert_mask)
-    
+                                                                                                    model_dim, dtype)
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
@@ -95,12 +91,6 @@ def asm_moe(hidden_states,
             a8_scale = torch.empty(
                 (topk * M), dtype=torch.float, device=device)
 
-            # moe_smoothquant_fwd need topk_ids which contains local_expert_id
-            if expert_mask is not None:
-                local_expert_hash = expert_mask.cumsum(0, dtype=torch.int32)
-                local_expert_hash[local_expert_hash > 0] -= 1 
-                topk_ids = local_expert_hash[topk_ids]
-            
             aiter.moe_smoothquant_fwd(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
         else:
@@ -149,19 +139,14 @@ def asm_moe(hidden_states,
 
 def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
               # following for int8 quant
-              fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-              fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-              fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-              fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-              expert_mask=None):
+              fc1_scale=None,  # [expert, inter_dim, 1]
+              fc2_scale=None,  # [expert, model_dim, 1]
+              fc1_smooth_scale=None,  # [expert, 1, model_dim]
+              fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+              ):
     B, D = hidden_states.shape
     topk = topk_weight.shape[1]
     dtype = hidden_states.dtype
-    if expert_mask is not None:
-        local_expert_hash = (expert_mask.cumsum(0, dtype=torch.int32) - 1)
-        local_expert_hash[expert_mask == 0] = -1
-        topk_ids = local_expert_hash[topk_ids]
-
     hidden_states = hidden_states.view(
         B, -1, D).repeat(1, topk, 1)
     out = torch.zeros(

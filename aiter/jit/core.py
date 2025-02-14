@@ -101,9 +101,6 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         opbd_dir = f'{op_dir}/build'
         src_dir = f'{op_dir}/build/srcs'
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f'{this_dir}/{md_name}.so'):
-            os.remove(f'{this_dir}/{md_name}.so')
-
         sources = rename_cpp_to_cu(srcs, src_dir)
 
         flags_cc = ["-O3", "-std=c++17"]
@@ -175,6 +172,8 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             with_cuda=True,
             is_python_module=True,
         )
+        if os.path.exists(f'{this_dir}/{md_name}.so'):
+            os.remove(f'{this_dir}/{md_name}.so')
         shutil.copy(f'{opbd_dir}/{md_name}.so', f'{this_dir}')
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(

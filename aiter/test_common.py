@@ -122,7 +122,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
            {a[mask][:printNum]}
     b    : {b.shape}
            {b[mask][:printNum]}
-    delta:
+    dtlta:
            {delta[:printNum]}''')
         else:
             logger.info(
