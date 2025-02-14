@@ -247,16 +247,16 @@ void kn_rope_fwd(
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t seq_idx   = blockIdx.x;
-    const int32_t batch_idx = blockIdx.y;
-    const int32_t seq_i_idx = seq_idx * stride_i_s + batch_idx * stride_i_b;
-    const int32_t seq_o_idx = seq_idx * stride_o_s + batch_idx * stride_o_b;
-    const int32_t seq_f_idx = seq_idx * size_f;
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const int32_t offset_f = sid * size_f;
 
     kn_rope_group_fwd(
-        p_output + seq_o_idx,
-        p_input + seq_i_idx,
-        p_freqs + seq_f_idx,
+        p_output + offset_o,
+        p_input + offset_i,
+        p_freqs + offset_f,
         size_h, size_d, size_f,
         stride_i_h, stride_i_d,
         stride_o_h, stride_o_d);
@@ -273,16 +273,16 @@ void kn_rope_bwd(
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d,
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d)
 {
-    const int32_t seq_idx   = blockIdx.x;
-    const int32_t batch_idx = blockIdx.y;
-    const int32_t seq_o_idx = seq_idx * stride_o_s + batch_idx * stride_o_b;
-    const int32_t seq_i_idx = seq_idx * stride_i_s + batch_idx * stride_i_b;
-    const int32_t seq_f_idx = seq_idx * size_f;
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const int32_t offset_f = sid * size_f;
 
     kn_rope_group_bwd(
-        p_input_grads + seq_i_idx,
-        p_output_grads + seq_o_idx,
-        p_freqs + seq_f_idx,
+        p_input_grads + offset_i,
+        p_output_grads + offset_o,
+        p_freqs + offset_f,
         size_h, size_d, size_f,
         stride_o_h, stride_o_d,
         stride_i_h, stride_i_d);
@@ -300,17 +300,17 @@ void kn_rope_cached_fwd(
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t seq_idx   = blockIdx.x;
-    const int32_t batch_idx = blockIdx.y;
-    const int32_t seq_i_idx = seq_idx * stride_i_s + batch_idx * stride_i_b;
-    const int32_t seq_o_idx = seq_idx * stride_o_s + batch_idx * stride_o_b;
-    const int32_t seq_f_idx = seq_idx * size_f;
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const int32_t offset_f = sid * size_f;
 
     kn_rope_cached_group_fwd(
-        p_output + seq_o_idx,
-        p_input + seq_i_idx,
-        p_cos + seq_f_idx,
-        p_sin + seq_f_idx,
+        p_output + offset_o,
+        p_input + offset_i,
+        p_cos + offset_f,
+        p_sin + offset_f,
         size_h, size_d, size_f,
         stride_i_h, stride_i_d,
         stride_o_h, stride_o_d);
@@ -328,20 +328,84 @@ void kn_rope_cached_bwd(
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d,
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d)
 {
-    const int32_t seq_idx   = blockIdx.x;
-    const int32_t batch_idx = blockIdx.y;
-    const int32_t seq_o_idx = seq_idx * stride_o_s + batch_idx * stride_o_b;
-    const int32_t seq_i_idx = seq_idx * stride_i_s + batch_idx * stride_i_b;
-    const int32_t seq_f_idx = seq_idx * size_f;
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const int32_t offset_f = sid * size_f;
 
     kn_rope_cached_group_bwd(
-        p_input_grads + seq_i_idx,
-        p_output_grads + seq_o_idx,
-        p_cos + seq_f_idx,
-        p_sin + seq_f_idx,
+        p_input_grads + offset_i,
+        p_output_grads + offset_o,
+        p_cos + offset_f,
+        p_sin + offset_f,
         size_h, size_d, size_f,
         stride_o_h, stride_o_d,
         stride_i_h, stride_i_d);
+}
+
+template <typename scalar_t, typename scalar_f_t>
+__global__
+void kn_rope_thd_fwd(
+    scalar_t* __restrict__         p_output,
+    const scalar_t* __restrict__   p_input,
+    const int32_t* __restrict__    p_cu_seqlens,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_i_t, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_t, const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t tid = sid + p_cu_seqlens[bid];
+
+    if (tid < p_cu_seqlens[bid + 1])
+    {
+        const int32_t offset_i = tid * stride_i_t;
+        const int32_t offset_o = tid * stride_o_t;
+        const int32_t offset_f = sid * size_f;
+
+        kn_rope_group_fwd(
+            p_output + offset_o,
+            p_input + offset_i,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_i_h, stride_i_d,
+            stride_o_h, stride_o_d);
+    }
+}
+
+template <typename scalar_t, typename scalar_f_t>
+__global__
+void kn_rope_thd_bwd(
+    scalar_t* __restrict__         p_input_grads,
+    const scalar_t* __restrict__   p_output_grads,
+    const int32_t* __restrict__    p_cu_seqlens,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_o_t, const int32_t stride_o_h, const int32_t stride_o_d,
+    const int32_t stride_i_t, const int32_t stride_i_h, const int32_t stride_i_d)
+{
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t tid = sid + p_cu_seqlens[bid];
+
+    if (tid < p_cu_seqlens[bid + 1])
+    {
+        const int32_t offset_o = tid * stride_o_t;
+        const int32_t offset_i = tid * stride_i_t;
+        const int32_t offset_f = sid * size_f;
+
+        kn_rope_group_bwd(
+            p_input_grads + offset_i,
+            p_output_grads + offset_o,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_o_h, stride_o_d,
+            stride_i_h, stride_i_d);
+    }
 }
 
 // =====================================================================================================================
@@ -445,6 +509,59 @@ void dispatch_rope_cached_bwd(
         stride_o_s, stride_o_b, stride_o_h, stride_o_d,
         stride_i_s, stride_i_b, stride_i_h, stride_i_d);
 }
+
+template <typename scalar_t, typename scalar_f_t>
+void dispatch_rope_thd_fwd(
+    scalar_t* __restrict__         p_output,
+    const scalar_t* __restrict__   p_input,
+    const int32_t* __restrict__    p_cu_seqlens,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_max_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_i_t, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_t, const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 grid(size_max_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+
+    kn_rope_thd_fwd<<<grid, block, 0, stream>>>(
+        p_output,
+        p_input,
+        p_cu_seqlens,
+        p_freqs,
+        size_h, size_d, size_f,
+        stride_i_t, stride_i_h, stride_i_d,
+        stride_o_t, stride_o_h, stride_o_d);
+}
+
+template <typename scalar_t, typename scalar_f_t>
+void dispatch_rope_thd_bwd(
+    scalar_t* __restrict__         p_input_grads,
+    const scalar_t* __restrict__   p_output_grads,
+    const int32_t* __restrict__    p_cu_seqlens,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_max_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_o_t, const int32_t stride_o_h, const int32_t stride_o_d,
+    const int32_t stride_i_t, const int32_t stride_i_h, const int32_t stride_i_d)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 grid(size_max_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+
+    kn_rope_thd_bwd<<<grid, block, 0, stream>>>(
+        p_input_grads,
+        p_output_grads,
+        p_cu_seqlens,
+        p_freqs,
+        size_h, size_d, size_f,
+        stride_o_t, stride_o_h, stride_o_d,
+        stride_i_t, stride_i_h, stride_i_d);
+}
+
 
 // =====================================================================================================================
 // Interfaces
@@ -721,19 +838,135 @@ void rope_cached_bwd_impl(
 void rope_thd_fwd_impl(
     torch::Tensor&       output,        // [t, h, d]
     const torch::Tensor& input,         // [t, h, d]
-    const torch::Tensor& cu_seqlens,    // [t]
-    const torch::Tensor& freqs)         // [t, d]
+    const torch::Tensor& cu_seqlens,    // [b + 1]
+    const torch::Tensor& freqs)         // [max_s, 1, 1, d]
 {
+    // Get sizes of input and output
+    const int32_t size_h     = input.size(1);
+    const int32_t size_d     = input.size(2);
+    const int32_t size_f     = freqs.size(3);
+    const int32_t size_b     = cu_seqlens.size(0) - 1;
+    const int32_t size_max_s = freqs.size(0);
+    // Get strides of input
+    const int32_t stride_i_t = input.stride(0);
+    const int32_t stride_i_h = input.stride(1);
+    const int32_t stride_i_d = input.stride(2);
+    // Get strides of output
+    const int32_t stride_o_t = output.stride(0);
+    const int32_t stride_o_h = output.stride(1);
+    const int32_t stride_o_d = output.stride(2);
 
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(),
+        "kn_rope_fwd",
+        [&] {
+            switch (freqs.scalar_type())
+            {
+            case at::ScalarType::Float:
+                dispatch_rope_thd_fwd(
+                    output.data_ptr<scalar_t>(),
+                    input.data_ptr<scalar_t>(),
+                    cu_seqlens.data_ptr<int32_t>(),
+                    freqs.data_ptr<float>(),
+                    size_max_s, size_b, size_h, size_d,
+                    size_f, // size of last dimension of freqs.
+                    stride_i_t, stride_i_h, stride_i_d,
+                    stride_o_t, stride_o_h, stride_o_d);
+                break;
+            case at::ScalarType::Half:
+                dispatch_rope_thd_fwd(
+                    output.data_ptr<scalar_t>(),
+                    input.data_ptr<scalar_t>(),
+                    cu_seqlens.data_ptr<int32_t>(),
+                    freqs.data_ptr<at::Half>(),
+                    size_max_s, size_b, size_h, size_d,
+                    size_f, // size of last dimension of freqs.
+                    stride_i_t, stride_i_h, stride_i_d,
+                    stride_o_t, stride_o_h, stride_o_d);
+                break;
+            case at::ScalarType::BFloat16:
+                dispatch_rope_thd_fwd(
+                    output.data_ptr<scalar_t>(),
+                    input.data_ptr<scalar_t>(),
+                    cu_seqlens.data_ptr<int32_t>(),
+                    freqs.data_ptr<at::BFloat16>(),
+                    size_max_s, size_b, size_h, size_d,
+                    size_f, // size of last dimension of freqs.
+                    stride_i_t, stride_i_h, stride_i_d,
+                    stride_o_t, stride_o_h, stride_o_d);
+                break;
+            default:
+                assert(false);
+                break;
+            }
+        });
 }
 
 void rope_thd_bwd_impl(
     torch::Tensor&       input_grads,   // [t, h, d]
     const torch::Tensor& output_grads,  // [t, h, d]
-    const torch::Tensor& cu_seqlens,    // [t]
-    const torch::Tensor& freqs)         // [t, d]
+    const torch::Tensor& cu_seqlens,    // [b + 1]
+    const torch::Tensor& freqs)         // [max_s, 1, 1, d]
 {
+    // Get sizes of input and output
+    const int32_t size_h     = output_grads.size(1);
+    const int32_t size_d     = output_grads.size(2);
+    const int32_t size_f     = freqs.size(3);
+    const int32_t size_b     = cu_seqlens.size(0) - 1;
+    const int32_t size_max_s = freqs.size(0);
+    // Get strides of output_grads
+    const int32_t stride_o_t = output_grads.stride(0);
+    const int32_t stride_o_h = output_grads.stride(1);
+    const int32_t stride_o_d = output_grads.stride(2);
+    // Get strides of input_grads
+    const int32_t stride_i_t = input_grads.stride(0);
+    const int32_t stride_i_h = input_grads.stride(1);
+    const int32_t stride_i_d = input_grads.stride(2);
 
+    VLLM_DISPATCH_FLOATING_TYPES(
+        output_grads.scalar_type(),
+        "kn_rope_bwd",
+        [&] {
+            switch (freqs.scalar_type())
+            {
+            case at::ScalarType::Float:
+                dispatch_rope_thd_bwd(
+                    input_grads.data_ptr<scalar_t>(),
+                    output_grads.data_ptr<scalar_t>(),
+                    cu_seqlens.data_ptr<int32_t>(),
+                    freqs.data_ptr<float>(),
+                    size_max_s, size_b, size_h, size_d,
+                    size_f, // size of last dimension of freqs.
+                    stride_o_t, stride_o_h, stride_o_d,
+                    stride_i_t, stride_i_h, stride_i_d);
+                break;
+            case at::ScalarType::Half:
+                dispatch_rope_thd_bwd(
+                    input_grads.data_ptr<scalar_t>(),
+                    output_grads.data_ptr<scalar_t>(),
+                    cu_seqlens.data_ptr<int32_t>(),
+                    freqs.data_ptr<at::Half>(),
+                    size_max_s, size_b, size_h, size_d,
+                    size_f, // size of last dimension of freqs.
+                    stride_o_t, stride_o_h, stride_o_d,
+                    stride_i_t, stride_i_h, stride_i_d);
+                break;
+            case at::ScalarType::BFloat16:
+                dispatch_rope_thd_bwd(
+                    input_grads.data_ptr<scalar_t>(),
+                    output_grads.data_ptr<scalar_t>(),
+                    cu_seqlens.data_ptr<int32_t>(),
+                    freqs.data_ptr<at::BFloat16>(),
+                    size_max_s, size_b, size_h, size_d,
+                    size_f, // size of last dimension of freqs.
+                    stride_o_t, stride_o_h, stride_o_d,
+                    stride_i_t, stride_i_h, stride_i_d);
+                break;
+            default:
+                assert(false);
+                break;
+            }
+        });
 }
 
 void rope_2d_fwd_impl(

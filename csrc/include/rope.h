@@ -34,15 +34,15 @@ void rope_cached_bwd_impl(
 void rope_thd_fwd_impl(
     torch::Tensor&       output,        // [t, h, d]
     const torch::Tensor& input,         // [t, h, d]
-    const torch::Tensor& cu_seqlens,    // [t]
-    const torch::Tensor& freqs          // [t, d]
+    const torch::Tensor& cu_seqlens,    // [b + 1]
+    const torch::Tensor& freqs          // [max_s, 1, 1, d]
 );
 
 void rope_thd_bwd_impl(
     torch::Tensor&       input_grads,   // [t, h, d]
     const torch::Tensor& output_grads,  // [t, h, d]
-    const torch::Tensor& cu_seqlens,    // [t]
-    const torch::Tensor& freqs          // [t, d]
+    const torch::Tensor& cu_seqlens,    // [b + 1]
+    const torch::Tensor& freqs          // [max_s, 1, 1, d]
 );
 
 void rope_2d_fwd_impl(
