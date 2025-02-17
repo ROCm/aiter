@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor, empty, empty_like
-from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
-import torch.nn.functional as F
+from torch import Tensor, empty, empty_like, autograd
+from typing import Tuple, Union
+from ..jit.core import compile_ops
 
 
 MD_NAME = "module_rope"
@@ -58,6 +57,20 @@ def rope_bwd(
     rope_bwd_impl(input_grads, output_grads, freqs)
     return input_grads
 
+
+class RoPE(autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, freqs: Tensor, transpose_output: bool = False) -> Tensor:
+        ctx.transpose_output = transpose_output
+        ctx.save_for_backward(freqs)
+        return rope_fwd(x, freqs, transpose_output)
+    
+    @staticmethod
+    def backward(ctx, output_grads: Tensor) -> Tuple[Union[Tensor, None], ...]:
+        (freqs,) = ctx.saved_tensors
+        return rope_bwd(output_grads, freqs, ctx.transpose_output), None, None
+
+
 @compile_ops("module_rope")
 def rope_cached_fwd_impl(
     output: Tensor,
@@ -110,6 +123,20 @@ def rope_cached_bwd(
     rope_cached_bwd_impl(input_grads, output_grads, cos, sin)
     return input_grads
 
+
+class RoPECached(autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, cos: Tensor, sin: Tensor, transpose_output: bool = False) -> Tensor:
+        ctx.transpose_output = transpose_output
+        ctx.save_for_backward(cos, sin)
+        return rope_cached_fwd(x, cos, sin, transpose_output)
+    
+    @staticmethod
+    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+        cos, sin = ctx.saved_tensors
+        return rope_cached_bwd(output_grads, cos, sin, ctx.transpose_output), None, None
+
+
 @compile_ops("module_rope")
 def rope_thd_fwd_impl(
     output: Tensor,
@@ -156,6 +183,19 @@ def rope_thd_bwd(
     rope_thd_bwd_impl(input_grads, output_grads, cu_seqlens, freqs)
     return input_grads
 
+
+class RoPETHD(autograd.Function):
+    @staticmethod
+    def forward(ctx, x: Tensor, cu_seqlens: Tensor, freqs: Tensor):
+        ctx.save_for_backward(cu_seqlens, freqs)
+        return rope_thd_fwd(x, cu_seqlens, freqs)
+    
+    @staticmethod
+    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+        cu_seqlens, freqs = ctx.saved_tensors
+        return rope_thd_bwd(output_grads, cu_seqlens, freqs), None, None
+
+
 @compile_ops("module_rope")
 def rope_2d_fwd_impl(
     output: Tensor,
@@ -178,12 +218,12 @@ def rope_2d_fwd_impl(
 
 def rope_2d_fwd(
     input: Tensor,
-    img_height: int,
-    img_width: int,
     cos_h: Tensor,
     sin_h: Tensor,
     cos_w: Tensor,
-    sin_w: Tensor
+    sin_w: Tensor,
+    img_height: int,
+    img_width: int
 ) -> Tensor :
     output = empty_like(input, requires_grad=False)
     rope_2d_fwd_impl(output, input, cos_h, sin_h, cos_w, sin_w, img_height, img_width)
@@ -211,13 +251,30 @@ def rope_2d_bwd_impl(
 
 def rope_2d_bwd(
     output_grads: Tensor,
-    img_height: int,
-    img_width: int,
     cos_h: Tensor,
     sin_h: Tensor,
     cos_w: Tensor,
-    sin_w: Tensor
+    sin_w: Tensor,
+    img_height: int,
+    img_width: int
 ) -> Tensor :
     input_grads = empty_like(output_grads, requires_grad=False)
     rope_2d_bwd_impl(input_grads, output_grads, cos_h, sin_h, cos_w, sin_w, img_height, img_width)
     return input_grads
+
+
+class RoPE2D(autograd.Function):
+    @staticmethod
+    def forward(ctx, x:
+                Tensor, cos_height: Tensor, sin_height:
+                Tensor, cos_width: Tensor, sin_width: Tensor,
+                img_height: int, img_width: int) -> Tensor:
+        ctx.save_for_backward(cos_height, sin_height, cos_width, sin_width)
+        ctx.img_height = img_height
+        ctx.img_width = img_width
+        return rope_2d_fwd(x, cos_height, sin_height, cos_width, sin_width, img_height, img_width)
+    
+    @staticmethod
+    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+        cos_height, sin_height, cos_width, sin_width = ctx.saved_tensors
+        return rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width, ctx.img_height, ctx.img_height), None, None

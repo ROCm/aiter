@@ -119,8 +119,8 @@ def test_rope_2d(input, height, width, freqs_h, freqs_w, grad):
     ref = ref_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
     ref.backward(grad)
 
-    hip_fwd, hip_fwd_avg = hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
-    hip_bwd, hip_bwd_avg = hip_rope_2d_bwd(grad, height, width, cos_h, sin_h, cos_w, sin_w)
+    hip_fwd, hip_fwd_avg = hip_rope_2d_fwd(input, cos_h, sin_h, cos_w, sin_w, height, width)
+    hip_bwd, hip_bwd_avg = hip_rope_2d_bwd(grad, cos_h, sin_h, cos_w, sin_w, height, width)
 
     checkAllclose(ref,        hip_fwd, msg=f"rope_2d_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_bwd, msg=f"rope_2d_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
