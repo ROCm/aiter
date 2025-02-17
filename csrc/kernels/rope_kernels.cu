@@ -417,17 +417,17 @@ void kn_rope_2d_fwd(
     const scalar_f_t* __restrict__ p_sin_h,
     const scalar_f_t* __restrict__ p_cos_w,
     const scalar_f_t* __restrict__ p_sin_w,
-    const int32_t size_W, const int32_t size_h, const int32_t size_d,
-    const int32_t stride_i_b, const int32_t stride_i_H, const int32_t stride_i_W, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t img_width, const int32_t size_h, const int32_t size_d,
+    const int32_t stride_i_b, const int32_t stride_i_s, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_b, const int32_t stride_o_s, const int32_t stride_o_h, const int32_t stride_o_d)
 {
     const int Hid = blockIdx.x;
     const int Wid = blockIdx.y;
-    const int sid = Hid * size_W + Wid;
+    const int sid = Hid * img_width + Wid;
     const int bid = blockIdx.z;
     const int size_half_d = size_d >> 1;
 
-    const int offset_h_i = bid * stride_i_b + Hid * stride_i_H + Wid * stride_i_W;
+    const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
     const int offset_h_f = Hid * size_half_d;
     kn_rope_cached_group_fwd(
@@ -461,17 +461,17 @@ void kn_rope_2d_bwd(
     const scalar_f_t* __restrict__ p_sin_h,
     const scalar_f_t* __restrict__ p_cos_w,
     const scalar_f_t* __restrict__ p_sin_w,
-    const int32_t size_W, const int32_t size_h, const int32_t size_d,
-    const int32_t stride_o_b, const int32_t stride_o_H, const int32_t stride_o_W, const int32_t stride_o_h, const int32_t stride_o_d,
+    const int32_t img_width, const int32_t size_h, const int32_t size_d,
+    const int32_t stride_o_b, const int32_t stride_o_s, const int32_t stride_o_h, const int32_t stride_o_d,
     const int32_t stride_i_b, const int32_t stride_i_s, const int32_t stride_i_h, const int32_t stride_i_d)
 {
     const int Hid = blockIdx.x;
     const int Wid = blockIdx.y;
-    const int sid = Hid * size_W + Wid;
+    const int sid = Hid * img_width + Wid;
     const int bid = blockIdx.z;
     const int size_half_d = size_d >> 1;
 
-    const int offset_h_o = bid * stride_o_b + Hid * stride_o_H + Wid * stride_o_W;
+    const int offset_h_o = bid * stride_o_b + sid * stride_i_s;
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_f = Hid * size_half_d;
     kn_rope_cached_group_bwd(
@@ -658,13 +658,14 @@ void dispatch_rope_2d_fwd(
     const scalar_f_t* __restrict__ p_sin_h,
     const scalar_f_t* __restrict__ p_cos_w,
     const scalar_f_t* __restrict__ p_sin_w,
-    const int32_t size_b, const int32_t size_H, const int32_t size_W, const int32_t size_h, const int32_t size_d,
-    const int32_t stride_i_b, const int32_t stride_i_H, const int32_t stride_i_W, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int img_height, const int img_width,
+    const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t stride_i_b, const int32_t stride_i_s, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_b, const int32_t stride_o_s, const int32_t stride_o_h, const int32_t stride_o_d)
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const dim3 grid(size_H, size_W, size_b);
+    const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
     kn_rope_2d_fwd<<<grid, block, 0, stream>>>(
@@ -672,8 +673,8 @@ void dispatch_rope_2d_fwd(
         p_input,
         p_cos_h, p_sin_h,
         p_cos_w, p_sin_w,
-        size_W, size_h, size_d,
-        stride_i_b, stride_i_H, stride_i_W, stride_i_h, stride_i_d,
+        img_width, size_h, size_d,
+        stride_i_b, stride_i_s, stride_i_h, stride_i_d,
         stride_o_b, stride_o_s, stride_o_h, stride_o_d);
 }
 
@@ -685,13 +686,14 @@ void dispatch_rope_2d_bwd(
     const scalar_f_t* __restrict__ p_sin_h,
     const scalar_f_t* __restrict__ p_cos_w,
     const scalar_f_t* __restrict__ p_sin_w,
-    const int32_t size_b, const int32_t size_H, const int32_t size_W, const int32_t size_h, const int32_t size_d,
-    const int32_t stride_o_b, const int32_t stride_o_H, const int32_t stride_o_W, const int32_t stride_o_h, const int32_t stride_o_d,
+    const int img_height, const int img_width,
+    const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t stride_o_b, const int32_t stride_o_s, const int32_t stride_o_h, const int32_t stride_o_d,
     const int32_t stride_i_b, const int32_t stride_i_s, const int32_t stride_i_h, const int32_t stride_i_d)
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const dim3 grid(size_H, size_W, size_b);
+    const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
     kn_rope_2d_bwd<<<grid, block, 0, stream>>>(
@@ -699,8 +701,8 @@ void dispatch_rope_2d_bwd(
         p_output_grads,
         p_cos_h, p_sin_h,
         p_cos_w, p_sin_w,
-        size_W, size_h, size_d,
-        stride_o_b, stride_o_H, stride_o_W, stride_o_h, stride_o_d,
+        img_width, size_h, size_d,
+        stride_o_b, stride_o_s, stride_o_h, stride_o_d,
         stride_i_b, stride_i_s, stride_i_h, stride_i_d);
 }
 
@@ -1116,25 +1118,27 @@ void rope_2d_fwd_impl(
     const torch::Tensor& cos_h,
     const torch::Tensor& sin_h,
     const torch::Tensor& cos_w,
-    const torch::Tensor& sin_w)
+    const torch::Tensor& sin_w,
+    const int            img_height,
+    const int            img_width)
 {
     // Get sizes of input and output
     const int size_b = input.size(0);
-    const int size_H = input.size(1);
-    const int size_W = input.size(2);
-    const int size_h = input.size(3);
-    const int size_d = input.size(4);
+    const int size_s = input.size(1);
+    const int size_h = input.size(2);
+    const int size_d = input.size(3);
     // Get strides of input
     const int stride_i_b = input.stride(0);
-    const int stride_i_H = input.stride(1);
-    const int stride_i_W = input.stride(2);
-    const int stride_i_h = input.stride(3);
-    const int stride_i_d = input.stride(4);
+    const int stride_i_s = input.stride(1);
+    const int stride_i_h = input.stride(2);
+    const int stride_i_d = input.stride(3);
     // Get strides of output
     const int stride_o_b = output.stride(0);
     const int stride_o_s = output.stride(1);
     const int stride_o_h = output.stride(2);
     const int stride_o_d = output.stride(3);
+
+    TORCH_CHECK(size_s == img_height * img_width, "rope_2d_fwd_impl - input tensor shape doesn't match image size.");
 
     VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(),
@@ -1150,8 +1154,9 @@ void rope_2d_fwd_impl(
                     sin_h.data_ptr<float>(),
                     cos_w.data_ptr<float>(),
                     sin_w.data_ptr<float>(),
-                    size_b, size_H, size_W, size_h, size_d,
-                    stride_i_b, stride_i_H, stride_i_W, stride_i_h, stride_i_d,
+                    img_height, img_width,
+                    size_b, size_h, size_d,
+                    stride_i_b, stride_i_s, stride_i_h, stride_i_d,
                     stride_o_b, stride_o_s, stride_o_h, stride_o_d);
                 break;
             case at::ScalarType::Half:
@@ -1162,8 +1167,9 @@ void rope_2d_fwd_impl(
                     sin_h.data_ptr<at::Half>(),
                     cos_w.data_ptr<at::Half>(),
                     sin_w.data_ptr<at::Half>(),
-                    size_b, size_H, size_W, size_h, size_d,
-                    stride_i_b, stride_i_H, stride_i_W, stride_i_h, stride_i_d,
+                    img_height, img_width,
+                    size_b, size_h, size_d,
+                    stride_i_b, stride_i_s, stride_i_h, stride_i_d,
                     stride_o_b, stride_o_s, stride_o_h, stride_o_d);
                 break;
             case at::ScalarType::BFloat16:
@@ -1174,8 +1180,9 @@ void rope_2d_fwd_impl(
                     sin_h.data_ptr<at::BFloat16>(),
                     cos_w.data_ptr<at::BFloat16>(),
                     sin_w.data_ptr<at::BFloat16>(),
-                    size_b, size_H, size_W, size_h, size_d,
-                    stride_i_b, stride_i_H, stride_i_W, stride_i_h, stride_i_d,
+                    img_height, img_width,
+                    size_b, size_h, size_d,
+                    stride_i_b, stride_i_s, stride_i_h, stride_i_d,
                     stride_o_b, stride_o_s, stride_o_h, stride_o_d);
                 break;
             default:
@@ -1191,25 +1198,27 @@ void rope_2d_bwd_impl(
     const torch::Tensor& cos_h,
     const torch::Tensor& sin_h,
     const torch::Tensor& cos_w,
-    const torch::Tensor& sin_w)
+    const torch::Tensor& sin_w,
+    const int            img_height,
+    const int            img_width)
 {
     // Get sizes of input and output
     const int size_b = output_grads.size(0);
-    const int size_H = output_grads.size(1);
-    const int size_W = output_grads.size(2);
-    const int size_h = output_grads.size(3);
-    const int size_d = output_grads.size(4);
+    const int size_s = output_grads.size(1);
+    const int size_h = output_grads.size(2);
+    const int size_d = output_grads.size(3);
     // Get strides of output_grads
     const int stride_o_b = output_grads.stride(0);
-    const int stride_o_H = output_grads.stride(1);
-    const int stride_o_W = output_grads.stride(2);
-    const int stride_o_h = output_grads.stride(3);
-    const int stride_o_d = output_grads.stride(4);
+    const int stride_o_s = output_grads.stride(1);
+    const int stride_o_h = output_grads.stride(2);
+    const int stride_o_d = output_grads.stride(3);
     // Get strides of input_grads
     const int stride_i_b = input_grads.stride(0);
     const int stride_i_s = input_grads.stride(1);
     const int stride_i_h = input_grads.stride(2);
     const int stride_i_d = input_grads.stride(3);
+
+    TORCH_CHECK(size_s == img_height * img_width, "rope_2d_fwd_impl - input tensor shape doesn't match image size.");
 
     VLLM_DISPATCH_FLOATING_TYPES(
         output_grads.scalar_type(),
@@ -1225,8 +1234,9 @@ void rope_2d_bwd_impl(
                     sin_h.data_ptr<float>(),
                     cos_w.data_ptr<float>(),
                     sin_w.data_ptr<float>(),
-                    size_b, size_H, size_W, size_h, size_d,
-                    stride_o_b, stride_o_H, stride_o_W, stride_o_h, stride_o_d,
+                    img_height, img_width,
+                    size_b, size_h, size_d,
+                    stride_o_b, stride_o_s, stride_o_h, stride_o_d,
                     stride_i_b, stride_i_s, stride_i_h, stride_i_d);
                 break;
             case at::ScalarType::Half:
@@ -1237,8 +1247,9 @@ void rope_2d_bwd_impl(
                     sin_h.data_ptr<at::Half>(),
                     cos_w.data_ptr<at::Half>(),
                     sin_w.data_ptr<at::Half>(),
-                    size_b, size_H, size_W, size_h, size_d,
-                    stride_o_b, stride_o_H, stride_o_W, stride_o_h, stride_o_d,
+                    img_height, img_width,
+                    size_b, size_h, size_d,
+                    stride_o_b, stride_o_s, stride_o_h, stride_o_d,
                     stride_i_b, stride_i_s, stride_i_h, stride_i_d);
                 break;
             case at::ScalarType::BFloat16:
@@ -1249,8 +1260,9 @@ void rope_2d_bwd_impl(
                     sin_h.data_ptr<at::BFloat16>(),
                     cos_w.data_ptr<at::BFloat16>(),
                     sin_w.data_ptr<at::BFloat16>(),
-                    size_b, size_H, size_W, size_h, size_d,
-                    stride_o_b, stride_o_H, stride_o_W, stride_o_h, stride_o_d,
+                    img_height, img_width,
+                    size_b, size_h, size_d,
+                    stride_o_b, stride_o_s, stride_o_h, stride_o_d,
                     stride_i_b, stride_i_s, stride_i_h, stride_i_d);
                 break;
             default:
