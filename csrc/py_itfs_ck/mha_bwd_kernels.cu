@@ -196,12 +196,12 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
 }
 
 std::vector<at::Tensor>
-mha_bwd(const at::Tensor &dout, // [b, sq, hq, d]
-        const at::Tensor &q,    // [b, sq, hq, d]
-        const at::Tensor &k,    // [b, sk, hk, d]
-        const at::Tensor &v,    // [b, sk, hk, d]
-        const at::Tensor &out,  // [b, sq, hq, d]
-        const at::Tensor &softmax_lse,  // [b, sq, hq, d]
+mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
+        const at::Tensor &q,            // [b, sq, hq, d]
+        const at::Tensor &k,            // [b, sk, hk, d]
+        const at::Tensor &v,            // [b, sk, hk, d]
+        const at::Tensor &out,          // [b, sq, hq, d]
+        const at::Tensor &softmax_lse,  // [b, hq, sq]
         float p_dropout,
         float softmax_scale,
         bool is_causal,
