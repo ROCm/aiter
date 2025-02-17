@@ -192,18 +192,11 @@ class NinjaBuildExtension(BuildExtension):
 setup(
     name=PACKAGE_NAME,
     version="0.1.0",
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            "3rdparty",
-        )
-    ),
+    packages=["3rdparty", "csrc", "hsa","aiter"],
+    include_package_data=True,
+    package_data={
+        '': ['*'],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
@@ -212,9 +205,9 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[
-        "torch",
-    ],
+    # install_requires=[
+    #     "torch",
+    # ],
     setup_requires=[
         "packaging",
         "psutil",
