@@ -54,9 +54,9 @@ def run_torch(
 
     if dout == None:
         return out
-
-    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-    return out, dq, dk, dv
+    else:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        return out, dq, dk, dv
 
 
 def run_ck(
@@ -90,7 +90,7 @@ def run_ck(
         dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
-    out_unpad, sm_lse, S_dmask = aiter.flash_attn_varlen_func(
+    out_unpad, _, S_dmask = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
         v_unpad,
@@ -104,7 +104,7 @@ def run_ck(
         alibi_slopes=alibi_slopes,
         deterministic=deterministic,
         return_lse=return_lse,
-        return_attn_probs=True,
+        return_attn_probs=return_attn_probs,
     )
 
     out = output_pad_fn(out_unpad)
@@ -129,7 +129,14 @@ def run_ck(
         dropout_mask = None
 
     if dout == None:
-        return out, sm_lse, dropout_mask
+        return out, dropout_mask
+    else:
+        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), dout)
+        dq = dq_pad_fn(dq_unpad)
+        dk = dk_pad_fn(dk_unpad)
+        dv = dk_pad_fn(dv_unpad)
+        return out, dropout_mask, dq, dk, dv
+
 
 
 def test_mha_varlen_fwd():
@@ -145,23 +152,26 @@ def test_mha_varlen_fwd():
     return_lse = True
     return_attn_probs = True
 
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
-    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
-    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, "cuda", mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="random")
     alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=torch.float32)
-    dout = None
+    dout = torch.randn_like(q)
 
-    out_ck, _, dropout_mask = run_ck(q, k, v, query_padding_mask, key_padding_mask,
-                                     alibi_slopes, dout, dropout_p,
-                                     causal, window_size, deterministic, return_lse, return_attn_probs)
+    out, dropout_mask, dq, dk, dv = run_ck(
+        q, k, v, query_padding_mask, key_padding_mask, alibi_slopes,
+        dout, dropout_p, causal, window_size, deterministic, return_lse, return_attn_probs)
 
-    out_ref = run_torch(
-        q, k, v, query_padding_mask, key_padding_mask, alibi_slopes, dout,
-        dropout_p, dropout_mask, causal, window_size)
+    out_ref, dq_ref, dk_ref, dv_ref  = run_torch(
+        q, k, v, query_padding_mask, key_padding_mask, alibi_slopes,
+        dout, dropout_p, dropout_mask, causal, window_size)
 
-    checkAllclose(out_ck, out_ref, atol=0.01)
+    checkAllclose(out, out_ref, atol=0.01)
+    checkAllclose(dq, dq_ref, atol=0.01)
+    checkAllclose(dk, dk_ref, atol=0.01)
+    checkAllclose(dv, dv_ref, atol=0.01)
 
 
 test_mha_varlen_fwd()

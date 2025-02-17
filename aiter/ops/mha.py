@@ -47,6 +47,7 @@ def mha_varlen_fwd(
     gen: Optional[Generator] = None,
 ): ...
 
+
 @compile_ops("module_mha_bwd", fc_name="mha_bwd")
 def mha_bwd(
     dout: Tensor,
@@ -57,6 +58,34 @@ def mha_bwd(
     softmax_lse: Tensor,
     dropout_p: float,
     softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
+def mha_varlen_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
     is_causal: bool,
     window_size_left: int,
     window_size_right: int,
@@ -365,8 +394,6 @@ def _flash_attn_varlen_forward(
         alibi_slopes,
         None
     )
-    # if out.isnan().any() or softmax_lse.isnan().any():
-    #     breakpoint()
     return out, softmax_lse, S_dmask, rng_state
 
 
@@ -394,8 +421,39 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    # TODO
-    None
+    # dq, dk, dv are allocated by us so they should already be contiguous
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    (
+        dq,
+        dk,
+        dv,
+        softmax_d,
+    ) = mha_varlen_bwd(
+        dout,
+        q,
+        k,
+        v,
+        out,
+        softmax_lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        zero_tensors,
+        causal,
+        window_size_left,
+        window_size_right,
+        deterministic,
+        dq,
+        dk,
+        dv,
+        alibi_slopes,
+        rng_state,
+        None,
+    )
+    return softmax_d
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):

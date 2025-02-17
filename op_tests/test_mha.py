@@ -47,9 +47,9 @@ def run_torch(
 
     if dout == None:
         return out
-
-    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-    return out, dq, dk, dv
+    else:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        return out, dq, dk, dv
 
 
 def run_ck(
@@ -63,9 +63,9 @@ def run_ck(
     window_size=(-1, -1),  # -1 means infinite context window
     deterministic=False,
     return_lse=True,
-    return_attn_probs=True
+    return_attn_probs=False
 ):
-    out, lse, S_dmask = aiter.flash_attn_func(
+    out, _, S_dmask = aiter.flash_attn_func(
             q,
             k,
             v,
@@ -98,10 +98,10 @@ def run_ck(
         dropout_mask = None
 
     if dout == None:
-        return out, lse, dropout_mask
-
-    dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-    return out, lse, dropout_mask, dq, dk, dv
+        return out, dropout_mask
+    else:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        return out, dropout_mask, dq, dk, dv
 
 
 def test_flash_attn_output():
@@ -123,14 +123,14 @@ def test_flash_attn_output():
     alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=torch.float32)
     dout = torch.randn_like(q)
 
-    out_ck, _, dropout_mask, dq, dk, dv = run_ck(
+    out, dropout_mask, dq, dk, dv = run_ck(
         q, k, v, alibi_slopes, dout, dropout_p, causal,
         window_size, deterministic, return_lse, return_attn_probs)
 
     out_ref, dq_ref, dk_ref, dv_ref = run_torch(
         q, k, v, alibi_slopes, dout, dropout_p, dropout_mask, causal, window_size)
 
-    checkAllclose(out_ck, out_ref, atol=0.01)
+    checkAllclose(out, out_ref, atol=0.01)
     checkAllclose(dq, dq_ref, atol=0.01)
     checkAllclose(dk, dk_ref, atol=0.01)
     checkAllclose(dv, dv_ref, atol=0.01)
