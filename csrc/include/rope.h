@@ -11,9 +11,25 @@ void rope_fwd_impl(
     const torch::Tensor& freqs          // [s, 1, 1, d]
 );
 
+void rope_2c_fwd_impl(
+    torch::Tensor&       output_x,      // [s, b, h, d]
+    torch::Tensor&       output_y,      // [s, b, h, d]
+    const torch::Tensor& input_x,       // [s, b, h, d]
+    const torch::Tensor& input_y,       // [s, b, h, d]
+    const torch::Tensor& freqs          // [s, 1, 1, d]
+);
+
 void rope_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
+    const torch::Tensor& freqs          // [s, 1, 1, d]
+);
+
+void rope_2c_bwd_impl(
+    torch::Tensor&       input_grads_x, // [s, b, h, d]
+    torch::Tensor&       input_grads_y, // [s, b, h, d]
+    const torch::Tensor& output_grads_x,// [s, b, h, d]
+    const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& freqs          // [s, 1, 1, d]
 );
 
@@ -24,9 +40,27 @@ void rope_cached_fwd_impl(
     const torch::Tensor& sin            // [s, 1, 1, d]
 );
 
+void rope_cached_2c_fwd_impl(
+    torch::Tensor&       output_x,      // [s, b, h, d]
+    torch::Tensor&       output_y,      // [s, b, h, d]
+    const torch::Tensor& input_x,       // [s, b, h, d]
+    const torch::Tensor& input_y,       // [s, b, h, d]
+    const torch::Tensor& cos,           // [s, 1, 1, d]
+    const torch::Tensor& sin            // [s, 1, 1, d]
+);
+
 void rope_cached_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
+    const torch::Tensor& cos,           // [s, 1, 1, d]
+    const torch::Tensor& sin            // [s, 1, 1, d]
+);
+
+void rope_cached_2c_bwd_impl(
+    torch::Tensor&       input_grads_x, // [s, b, h, d]
+    torch::Tensor&       input_grads_y, // [s, b, h, d]
+    const torch::Tensor& output_grads_x,// [s, b, h, d]
+    const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin            // [s, 1, 1, d]
 );
