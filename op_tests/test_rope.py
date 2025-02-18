@@ -13,16 +13,32 @@ def hip_rope_fwd(input, freqs, transpose_output):
     return aiter.rope_fwd(input, freqs, transpose_output)
 
 @perftest()
+def hip_rope_2c_fwd(input_x, input_y, freqs, transpose_output):
+    return aiter.rope_2c_fwd(input_x, input_y, freqs, transpose_output)
+
+@perftest()
 def hip_rope_bwd(output_grads, freqs, transpose_output):
     return aiter.rope_bwd(output_grads, freqs, transpose_output)
+
+@perftest()
+def hip_rope_2c_bwd(output_grads_x, output_grads_y, freqs, transpose_output):
+    return aiter.rope_2c_bwd(output_grads_x, output_grads_y, freqs, transpose_output)
 
 @perftest()
 def hip_rope_cached_fwd(input, cos, sin, transpose_output):
     return aiter.rope_cached_fwd(input, cos, sin, transpose_output)
 
 @perftest()
+def hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output):
+    return aiter.rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output)
+
+@perftest()
 def hip_rope_cached_bwd(output_grads, cos, sin, transpose_output):
     return aiter.rope_cached_bwd(output_grads, cos, sin, transpose_output)
+
+@perftest()
+def hip_rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, transpose_output):
+    return aiter.rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, transpose_output)
 
 @perftest()
 def hip_rope_thd_fwd(input, cu_seqlens, freqs):
@@ -79,8 +95,8 @@ def test_rope_sbhd(input, freqs, grad, transpose_output):
     ref = ref_rope_sbhd_fwd(input, freqs)
     ref.backward(grad)
 
-    cos   = torch.cos(freqs)
-    sin   = torch.sin(freqs)
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
 
     hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, transpose_output)
     hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, transpose_output)
@@ -91,6 +107,35 @@ def test_rope_sbhd(input, freqs, grad, transpose_output):
     checkAllclose(input.grad, hip_bwd,        msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref,        hip_cached_fwd, msg=f"rope_cached_fwd - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_cached_bwd, msg=f"rope_cached_bwd - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
+
+
+def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, transpose_output):
+    assert(input_x.shape == input_y.shape)
+    assert(input_x.dtype == input_y.dtype)
+
+    input_msg = f"dtype: {input_x.dtype}, freq_dtype: {freqs.dtype}, dim_input: {str(input_x.shape):<20}, dim_freqs: {str(freqs.shape):<20}, transpose_output: {transpose_output}"
+
+    ref_x = ref_rope_sbhd_fwd(input_x, freqs)
+    ref_y = ref_rope_sbhd_fwd(input_y, freqs)
+    ref_x.backward(grad_x)
+    ref_y.backward(grad_y)
+
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+
+    (hip_fwd_x, hip_fwd_y), hip_fwd_avg = hip_rope_2c_fwd(input_x, input_y, freqs, transpose_output)
+    (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, transpose_output)
+    (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output)
+    (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, transpose_output)
+
+    checkAllclose(ref_x,        hip_fwd_x,        msg=f"rope_2c_fwd_x - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(ref_y,        hip_fwd_y,        msg=f"rope_2c_fwd_y - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_x.grad, hip_bwd_x,        msg=f"rope_2c_bwd_x - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_y.grad, hip_bwd_y,        msg=f"rope_2c_bwd_y - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(ref_x,        hip_cached_fwd_x, msg=f"rope_cached_2c_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(ref_y,        hip_cached_fwd_y, msg=f"rope_cached_2c_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_x.grad, hip_cached_bwd_x, msg=f"rope_cached_2c_bwd_x - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_y.grad, hip_cached_bwd_y, msg=f"rope_cached_2c_bwd_y - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
 def test_rope_thd(input, cu_seqlens, freqs, grad):
@@ -153,6 +198,9 @@ if __name__ == "__main__":
         freqs = torch.randn((s, 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
         grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         test_rope_sbhd(input, freqs, grad, transpose_output)
+        input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+        grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+        test_rope_sbhd_2c(input, input_y, freqs, grad, grad_y, transpose_output)
 
     # Test thd format for uncached
     cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
