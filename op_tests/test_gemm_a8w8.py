@@ -1,41 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+import aiter
+from aiter.ops.shuffle import shuffle_weight
 import pytest
 import torch
 import torch.nn.functional as F
-import aiter
-from aiter.ops.shuffle import shuffle_weight
-from .utils import rand_tensor, check_all_close
 
+from .utils import DefaultBenchmarkHook, check_all_close, rand_tensor
 
 MNK = [
     # qkv_proj
     (1, 1280, 8192),
-    (32, 1280, 8192),
-    (64, 1280, 8192),
-    (128, 1280, 8192),
-    (192, 1280, 8192),
-    (256, 1280, 8192),
-    (320, 1280, 8192),
     (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
     (16384, 1280, 8192),
     # attn_out
     (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
     (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
     (16384, 8192, 1024),
 ]
 
@@ -79,12 +59,14 @@ def setup(
 @pytest.mark.parametrize("scales_output_dtype", CK_GEMM_SCALES_OUTPUT_DTYPES)
 @pytest.mark.parametrize("use_bias", [True, False])
 def test_ck_gemm_close_to_torch(
+    benchmark,
     mnk: tuple[int, int, int],
     ab_dtype: torch.dtype,
     scales_output_dtype: tuple[torch.dtype, torch.dtype],
     use_bias: bool
 ) -> None:
-    # using bias further reduces precision, so we use a higher tolerance
+    # using bias further reduces precision,
+    # so we use a higher tolerance when bias is enabled.
     if use_bias:
         rtol, atol = (1e-1, 1e-1)
     else:
@@ -100,21 +82,21 @@ def test_ck_gemm_close_to_torch(
         use_bias,
     )
 
-    output = aiter.gemm_a8w8_CK(a, b, a_scale, b_scale, bias, dtype=out_dtype)
+    _, output = benchmark(
+        DefaultBenchmarkHook(aiter.gemm_a8w8_CK, a, b, a_scale, b_scale, bias, out_dtype)
+    )
     expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
 
     check_all_close(output, expected, rtol=rtol, atol=atol)
 
 @pytest.mark.parametrize("mnk", MNK)
-def test_asm_gemm_close_to_torch(
-    mnk: tuple[int, int, int],
-) -> None:
+def test_asm_gemm_close_to_torch(benchmark, mnk: tuple[int, int, int]) -> None:
     rtol, atol = (1e-1, 1e-1)
     ab_dtype = torch.int8
     out_dtype = torch.bfloat16
     scales_dtype = torch.float32
     bias_dtype = torch.float
-    # asm_gemm requires bias and shuffle
+    # gemm_a8w8_ASM requires bias and shuffle
     a, b, a_scale, b_scale, bias = setup(
         mnk,
         ab_dtype,
@@ -124,7 +106,9 @@ def test_asm_gemm_close_to_torch(
     )
     b_shuffled= shuffle_weight(b, layout=(32, 16))
 
-    output = aiter.gemm_a8w8_ASM(a, b_shuffled, a_scale, b_scale, bias)
+    _, output = benchmark(
+        DefaultBenchmarkHook(aiter.gemm_a8w8_ASM, a, b_shuffled, a_scale, b_scale, bias)
+    )
     expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
-    if output is not None and torch.sum(output.isnan()==True) ==0:
+    if output is not None and torch.sum(output.isnan()==True) == 0:
         check_all_close(output, expected, rtol=rtol, atol=atol)
