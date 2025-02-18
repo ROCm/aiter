@@ -16,7 +16,8 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                      std::optional<torch::Tensor> w2_scale, // [e, 1, k], down scale
                      std::optional<torch::Tensor> a1_scale, // [m, 1], token scale
                      std::optional<torch::Tensor> a2_scale, // [e, 1, n], smooth-quant-scale for 2nd gemm input
-                     std::optional<int> block_m = 32)
+                     std::optional<int> block_m = 32,
+                     std::optional<torch::Tensor> expert_mask = std::nullopt)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden_states));
     auto device = hidden_states.device();
@@ -69,18 +70,21 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     std::string prec_st = !a1_scale ? "fp32" : torchDTypeToStr(a1_scale->dtype());
     std::string prec_sw = !w1_scale ? "fp32" : torchDTypeToStr(w1_scale->dtype());
     std::string prec_sq = !a2_scale ? "fp32" : torchDTypeToStr(a2_scale->dtype());
-    
-    fused_moe_traits traits{prec_i,
-                            prec_w,
-                            prec_o,
-                            prec_st,
-                            prec_sw,
-                            prec_sq,
-                            prec_kw,
-                            block_size,
-                            activation,
-                            gate_only,
-                            fused_quant};
+
+    fused_moe_traits traits{
+        prec_i,
+        prec_w,
+        prec_o,
+        prec_st,
+        prec_sw,
+        prec_sq,
+        prec_kw,
+        block_size,
+        activation,
+        gate_only,
+        fused_quant,
+        expert_mask.has_value(), 
+    };
 
     fused_moe_args args{hidden_states.data_ptr(),
                         a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr,
@@ -89,6 +93,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr,
                         w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr,
                         a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr,
+                        expert_mask.has_value() ? expert_mask.value().data_ptr() : nullptr, 
                         out.data_ptr(),
 
                         topk_ids.data_ptr(),
@@ -97,7 +102,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         sorted_weights.data_ptr(),
                         sorted_expert_ids.data_ptr(),
                         num_tokens_post_pad.data_ptr(),
-                        
+
                         block_size,
                         hidden_size,
                         shared_intermediate_size,
@@ -109,5 +114,5 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     fused_moe(traits, args, {stream});
-    return out; 
+    return out;
 }

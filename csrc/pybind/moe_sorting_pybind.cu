@@ -4,5 +4,10 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("moe_sorting_fwd", &moe_sorting_fwd);
+    m.def("moe_sorting_fwd", &moe_sorting_fwd,
+          py::arg("topk_ids"), py::arg("topk_weights"), 
+          py::arg("sorted_token_ids"), py::arg("sorted_weights"), 
+          py::arg("sorted_expert_ids"), py::arg("total_tokens_post_pad"), 
+          py::arg("moe_buf"), py::arg("num_experts"), 
+          py::arg("unit_size"), py::arg("local_expert_mask")= std::nullopt);
 }
