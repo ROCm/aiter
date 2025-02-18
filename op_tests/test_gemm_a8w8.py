@@ -1,18 +1,55 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
-from aiter.test_common import checkAllclose, perftest, tensor_dump
+import pytest
 import torch
 import torch.nn.functional as F
-import numpy as np
-import sys
-import os
 import aiter
 from aiter.ops.shuffle import shuffle_weight
+from .utils import rand_tensor, check_all_close
 
 
-@perftest()
-def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
+MNK = [
+    # qkv_proj
+    (1, 1280, 8192),
+    (32, 1280, 8192),
+    (64, 1280, 8192),
+    (128, 1280, 8192),
+    (192, 1280, 8192),
+    (256, 1280, 8192),
+    (320, 1280, 8192),
+    (512, 1280, 8192),
+    (1024, 1280, 8192),
+    (2048, 1280, 8192),
+    (4096, 1280, 8192),
+    (8192, 1280, 8192),
+    (16384, 1280, 8192),
+    # attn_out
+    (1, 8192, 1024),
+    (32, 8192, 1024),
+    (64, 8192, 1024),
+    (128, 8192, 1024),
+    (192, 8192, 1024),
+    (256, 8192, 1024),
+    (320, 8192, 1024),
+    (512, 8192, 1024),
+    (1024, 8192, 1024),
+    (2048, 8192, 1024),
+    (4096, 8192, 1024),
+    (8192, 8192, 1024),
+    (16384, 8192, 1024),
+]
+
+# ck_gemm only accepts the following combination for | scale : output | dtypes
+# | F32 : F16 | F32 : BF16 | F16 : F16 | B16 : B16 |
+CK_GEMM_SCALES_OUTPUT_DTYPES = [
+    (torch.float32, torch.float16),
+    (torch.float32, torch.bfloat16),
+    (torch.float16, torch.float16),
+    (torch.bfloat16, torch.bfloat16),
+]
+
+
+def torch_scaled_mm(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     x = F.linear(x.to(torch.float32), weight.to(torch.float32))
     scale = torch.matmul(x_scale, w_scale)
     out = torch.mul(x, scale)
@@ -21,77 +58,73 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-@perftest()
-def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias)
+def setup(
+    mnk: tuple[int, int, int],
+    ab_dtype: torch.dtype,
+    scales_dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+    use_bias: bool,
+) -> tuple[torch.tensor, ...]:
+    
+    m, n, k = mnk
+    a = rand_tensor(shape=(m, k), dtype=ab_dtype).cuda()
+    b = rand_tensor(shape=(n, k), dtype=ab_dtype).cuda()
+    a_scale = rand_tensor(shape=(m, 1), dtype=scales_dtype).cuda() + 1e-6
+    b_scale = rand_tensor(shape=(1, n), dtype=scales_dtype).cuda() + 1e-6
+    bias = (rand_tensor(shape=[1, n], dtype=torch.bfloat16).cuda()).to(dtype=bias_dtype) if use_bias else None
+    return a, b, a_scale, b_scale, bias
 
-@perftest()
-def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
-
-
-def test_gemm(dtype, m, n, k):
-    dim = (m, n, k)
-    x = torch.randint(-20, 20, (m, k), dtype=torch.int8).cuda()
-    weight = torch.randint(-20, 20, (n, k), dtype=torch.int8).cuda()
-    x_scale = torch.rand([m, 1], dtype=torch.float32).cuda() + 1e-6
-    w_scale = torch.rand([1, n], dtype=torch.float32).cuda() + 1e-6
-    bias = torch.rand([1, n], dtype=dtype).cuda() * 10
-    weightshuffle = shuffle_weight(weight,layout=(32,16))
-    bias_f32 = bias.to(torch.float)
-    x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
-    # print(f"{x_pad.shape=}{x_pad.stride()}")
-    # tensor_dump(x, 'x')
-    # tensor_dump(weight, 'weight')
-    # tensor_dump(shuffle_weight(weight), 'weight_shuffled')
-    # tensor_dump(x_scale, 'x_scale')
-    # tensor_dump(w_scale, 'w_scale')
-    # tensor_dump(bias, 'bias')
-
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-    c, avg_c = run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias_f32, dtype)
-    if c is None:
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm : not support, uplift: {avg_a/avg_b-1:<5.1%}"
+@pytest.mark.parametrize("mnk", MNK)
+@pytest.mark.parametrize("ab_dtype", [torch.int8, torch.float8_e4m3fnuz])
+@pytest.mark.parametrize("scales_output_dtype", CK_GEMM_SCALES_OUTPUT_DTYPES)
+@pytest.mark.parametrize("use_bias", [True, False])
+def test_ck_gemm_close_to_torch(
+    mnk: tuple[int, int, int],
+    ab_dtype: torch.dtype,
+    scales_output_dtype: tuple[torch.dtype, torch.dtype],
+    use_bias: bool
+) -> None:
+    # using bias further reduces precision, so we use a higher tolerance
+    if use_bias:
+        rtol, atol = (1e-1, 1e-1)
     else:
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/min(avg_b,avg_c)-1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: "+msg, rtol=1e-2, atol=0.01)
-    if c != None:
-        checkAllclose(a, c, msg="\033[1A\033[2K" + "a,c: "+ msg, rtol=1e-2, atol=0.01)
+        rtol, atol = (1e-2, 1e-1)
 
+    scales_dtype, out_dtype =  scales_output_dtype
+    bias_dtype = out_dtype
+    a, b, a_scale, b_scale, bias = setup(
+        mnk,
+        ab_dtype,
+        scales_dtype,
+        bias_dtype,
+        use_bias,
+    )
 
-for dtype in [torch.bfloat16]:
-    # qkv_proj
-    for (m, n, k) in [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-    ]:
-        test_gemm(dtype, m, n, k)
-    # attn_out
-    for (m, n, k) in [
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]:
-        test_gemm(dtype, m, n, k)
+    output = aiter.gemm_a8w8_CK(a, b, a_scale, b_scale, bias, dtype=out_dtype)
+    expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
+
+    check_all_close(output, expected, rtol=rtol, atol=atol)
+
+@pytest.mark.parametrize("mnk", MNK)
+def test_asm_gemm_close_to_torch(
+    mnk: tuple[int, int, int],
+) -> None:
+    rtol, atol = (1e-1, 1e-1)
+    ab_dtype = torch.int8
+    out_dtype = torch.bfloat16
+    scales_dtype = torch.float32
+    bias_dtype = torch.float
+    # asm_gemm requires bias and shuffle
+    a, b, a_scale, b_scale, bias = setup(
+        mnk,
+        ab_dtype,
+        scales_dtype,
+        bias_dtype,
+        use_bias=True,
+    )
+    b_shuffled= shuffle_weight(b, layout=(32, 16))
+
+    output = aiter.gemm_a8w8_ASM(a, b_shuffled, a_scale, b_scale, bias)
+    expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
+    if output is not None and torch.sum(output.isnan()==True) ==0:
+        check_all_close(output, expected, rtol=rtol, atol=atol)

@@ -28,3 +28,6 @@ there are number of op test, you can run them like this: `python3 op_tests/test_
 |GEMM        | D=AxB+C                                                                                     |
 |FusedMoE    | bf16 balabala                                                                               |
 |WIP         | coming soon...                                                                              |
+
+## Ops
+1. [INT8/FP8 A8W8 Per-Tensor/Rowwise Scaling GEMM](csrc/ck_gemm_a8w8/README.md)
