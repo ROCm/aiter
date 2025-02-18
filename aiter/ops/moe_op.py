@@ -42,7 +42,7 @@ def fmoe(
     sorted_token_ids: Tensor,
     sorted_weight_buf: Tensor,
     sorted_expert_ids: Tensor,
-    num_tokens_post_padded: Tensor,
+    num_valid_ids: Tensor,
     topk: int,
 ): ...
 
@@ -56,7 +56,7 @@ def fmoe_int8_g1u0(
     sorted_token_ids: Tensor,
     sorted_weight_buf: Tensor,
     sorted_expert_ids: Tensor,
-    num_tokens_post_padded: Tensor,
+    num_valid_ids: Tensor,
     topk: int,
     input_scale: Tensor,
     fc1_scale: Tensor,
@@ -74,7 +74,7 @@ def fmoe_g1u1(
     sorted_token_ids: Tensor,
     sorted_weight_buf: Tensor,
     sorted_expert_ids: Tensor,
-    num_tokens_post_padded: Tensor,
+    num_valid_ids: Tensor,
     topk: int,
     input_scale: Tensor,
     fc1_scale: Tensor,
@@ -92,7 +92,7 @@ def fmoe_int8_g1u0_a16(
     sorted_token_ids: Tensor,
     sorted_weight_buf: Tensor,
     sorted_expert_ids: Tensor,
-    num_tokens_post_padded: Tensor,
+    num_valid_ids: Tensor,
     topk: int,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
@@ -110,7 +110,7 @@ def fmoe_fp8_g1u1_a16(
     sorted_token_ids: Tensor,
     sorted_weight_buf: Tensor,
     sorted_expert_ids: Tensor,
-    num_tokens_post_padded: Tensor,
+    num_valid_ids: Tensor,
     topk: int,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
@@ -137,7 +137,6 @@ def fmoe_fp8_blockscale_g1u1(
     fc2_smooth_scale: Optional[Tensor] = None,
 ): ...
 
-
 @compile_ops("module_moe")
 def ck_moe(
     hidden_states: Tensor,
@@ -151,5 +150,36 @@ def ck_moe(
     fc2_smooth_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     expert_mask: Optional[Tensor] = None
-): 
-    ...
+): ...
+
+
+@compile_ops("module_moe_ck2stages")
+def ck_moe_stage1(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    w1_scale: Optional[Tensor] = None,
+    a1_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32
+): ...
+
+
+@compile_ops("module_moe_ck2stages")
+def ck_moe_stage2(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    sorted_weights: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    w2_scale: Optional[Tensor] = None,
+    a2_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32
+): ...

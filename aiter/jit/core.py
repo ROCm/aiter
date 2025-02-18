@@ -14,6 +14,7 @@ from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json
+import multiprocessing
 
 PREBUILD_KERNELS = False
 if os.path.exists(os.path.dirname(os.path.abspath(__file__))+"/aiter_.so"):
@@ -28,8 +29,12 @@ AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
+
 # copy ck to build, thus hippify under bd_dir
-shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
+if multiprocessing.current_process().name == 'MainProcess':
+    shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
+    if os.path.exists(f'{bd_dir}/ck/library'):
+        shutil.rmtree(f'{bd_dir}/ck/library')
 CK_DIR = f'{bd_dir}/ck'
 
 
@@ -179,7 +184,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
             md_name,
-            ''.join(traceback.format_exception(*sys.exc_info()))
+            '-->'.join(traceback.format_exception(*sys.exc_info()))
         ))
         sys.exit()
     logger.info(

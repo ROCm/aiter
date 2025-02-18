@@ -131,6 +131,8 @@ void dynamic_scaled_fp8_quant(torch::Tensor& out,          // [..., d]
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "scaled_fp8_quant_kernel", [&] {
+        vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(scale.data_ptr<float>(),
+                                                      1, 0.0f);
         vllm::segmented_max_reduction<scalar_t><<<grid, block, 0, stream>>>(
             scale.data_ptr<float>(), input.data_ptr<scalar_t>(), num_elems);
         vllm::scaled_fp8_quant_kernel<scalar_t><<<grid, block, 0, stream>>>(
