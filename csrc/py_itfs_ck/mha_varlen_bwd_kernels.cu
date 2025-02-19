@@ -241,6 +241,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d]
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+    TORCH_CHECK(deterministic == true, "Only support deterministic for now");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 

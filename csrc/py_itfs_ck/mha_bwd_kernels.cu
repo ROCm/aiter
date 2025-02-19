@@ -228,6 +228,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
+    TORCH_CHECK(deterministic == true, "Only support deterministic for now");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
