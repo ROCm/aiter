@@ -3,7 +3,7 @@
 
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
 import torch.nn.functional as F
 
 
