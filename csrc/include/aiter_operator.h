@@ -7,3 +7,5 @@ torch::Tensor aiter_add(torch::Tensor &input0, torch::Tensor &input1);
 torch::Tensor aiter_mul(torch::Tensor &input0, torch::Tensor &input1);
 torch::Tensor aiter_sub(torch::Tensor &input0, torch::Tensor &input1);
 torch::Tensor aiter_div(torch::Tensor &input0, torch::Tensor &input1);
+torch::Tensor aiter_sigmoid(torch::Tensor &input);
+torch::Tensor aiter_tanh(torch::Tensor &input);

@@ -19,12 +19,20 @@ def moe_smoothquant_fwd(
 
 
 # following are pure torch implement
-def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype=torch.int8):
+def get_dtype_max(dtype):
+    try:
+        dtypeMax = torch.finfo(dtype).max
+    except:
+        dtypeMax = torch.iinfo(dtype).max
+    return dtypeMax
+
+
+def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8):
     if x_scale is None:
-        hidden_states = hidden_states_input
+        hidden_states = x
     else:
         # smooth quant
-        hidden_states = hidden_states_input.to(x_scale) * x_scale
+        hidden_states = x.to(x_scale) * x_scale
     # [m, 1]
     per_token_amax, _ = torch.max(
         input=torch.abs(hidden_states),
@@ -32,24 +40,30 @@ def pertoken_quant(hidden_states_input, y_scale_dtype, x_scale=None, quant_dtype
         keepdim=True
     )
 
-    try:
-        dtypeMax = torch.finfo(quant_dtype).max
-    except:
-        dtypeMax = torch.iinfo(quant_dtype).max
+    dtypeMax = get_dtype_max(quant_dtype)
 
     per_token_scale = per_token_amax.to(dtype=torch.float32) / dtypeMax
     per_token_scale[per_token_scale == 0] = 1
 
     # quant hidden_states
-    hidden_states = (hidden_states / per_token_scale).to(dtype=quant_dtype)
+    y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
+    y_scale = per_token_scale.to(y_scale_dtype)
+    return y, y_scale
 
-    return hidden_states, per_token_scale.to(y_scale_dtype)
+
+def per_tensor_quant(x, scale=None, scale_dtype=torch.float, quant_dtype=torch.int8):
+    if scale is None:
+        dtypeMax = get_dtype_max(quant_dtype)
+        scale = torch.abs(x.to(torch.float)).max() / dtypeMax
+    y = x/scale
+
+    return y.to(quant_dtype), scale.to(scale_dtype)
 
 
 @compile_ops("module_quant")
 def static_scaled_fp8_quant(
     out: Tensor, input: Tensor, scale: Tensor
-):...
+): ...
 
 
 @compile_ops("module_quant")
@@ -65,4 +79,4 @@ def dynamic_scaled_fp8_quant(
 @compile_ops("module_quant")
 def dynamic_per_token_scaled_fp8_quant(
     out: Tensor, input: Tensor, scales: Tensor, scale_ub: Optional[Tensor] = None
-):...
+): ...

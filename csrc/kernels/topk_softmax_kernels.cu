@@ -1,4 +1,5 @@
 /*
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Adapted from https://github.com/NVIDIA/TensorRT-LLM/blob/v0.7.1/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu
  * Copyright (c) 2024, The vLLM team.
  * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -202,7 +203,8 @@ __launch_bounds__(TPB) __global__ void moeTopK(const float* inputs_after_softmax
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, bool need_renorm>
 __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     void topkGatingSoftmax(const float *input, const bool *finished, float *output, const int num_rows, int *indices,
-                           int *source_rows, const int k, const int start_expert, const int end_expert)
+                           int *source_rows, const int k, const int start_expert, const int end_expert,
+                           const int output_stride, const int indices_stride)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
     static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
@@ -377,9 +379,11 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
 
             // The lead thread from each sub-group will write out the final results to global memory. (This will be a
             // single) thread per row of the input/output matrices.
+            const int output_idx = output_stride * thread_row + k_idx;
+            const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx = k * thread_row + k_idx;
-            output[idx] = max_val;
-            indices[idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
+            output[output_idx] = max_val;
+            indices[indices_idx] = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
             source_rows[idx] = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
@@ -412,7 +416,7 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
             renorm_value = 1 / renorm_value;
             for (int k_idx = 0; k_idx < k; k_idx++)
             {
-                int64_t const idx = k * thread_row + k_idx;
+                int64_t const idx = output_stride * thread_row + k_idx;
                 output[idx] *= renorm_value;
             }
         }
@@ -436,7 +440,10 @@ struct TopkConstants
 
 template <int EXPERTS, int WARPS_PER_TB>
 void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished, float *output, int *indices,
-                                     int *source_row, const int num_rows, const int k, const int start_expert, const int end_expert, const bool need_renorm, cudaStream_t stream)
+                                     int *source_row, const int num_rows, const int k, 
+                                     const int start_expert, const int end_expert, 
+                                     const int output_stride, const int indices_stride,
+                                     const bool need_renorm, cudaStream_t stream)
 {
     static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
 
@@ -451,12 +458,12 @@ void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished, f
     if (need_renorm)
     {
         topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, true><<<num_blocks, block_dim, 0, stream>>>(
-            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
+            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, output_stride, indices_stride);
     }
     else
     {
         topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false><<<num_blocks, block_dim, 0, stream>>>(
-            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert);
+            input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, output_stride, indices_stride);
     }
     
 
@@ -465,7 +472,8 @@ void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished, f
 #define LAUNCH_SOFTMAX(NUM_EXPERTS, WARPS_PER_TB)                            \
     topkGatingSoftmaxLauncherHelper<NUM_EXPERTS, WARPS_PER_TB>(              \
         gating_output, nullptr, topk_weights, topk_indicies,                 \
-        token_expert_indices, num_tokens, topk, 0, num_experts, need_renorm, \
+        token_expert_indices, num_tokens, topk, 0, num_experts,              \
+        topk_weights_stride, topk_id_stride, need_renorm,                    \
         stream);
 
 void topkGatingSoftmaxKernelLauncher(
@@ -477,6 +485,8 @@ void topkGatingSoftmaxKernelLauncher(
     const int num_tokens,
     const int num_experts,
     const int topk,
+    const int topk_weights_stride,
+    const int topk_id_stride,
     const bool need_renorm,
     cudaStream_t stream) {
     static constexpr int WARPS_PER_TB = 4;
@@ -551,6 +561,8 @@ void topk_softmax(
     const int num_experts = gating_output.size(-1);
     const int num_tokens = gating_output.numel() / num_experts;
     const int topk = topk_weights.size(-1);
+    const int topk_weights_stride = topk_weights.stride(0);
+    const int topk_id_stride = topk_indices.stride(0);
 
     const bool is_pow_2 = (num_experts != 0) && ((num_experts & (num_experts - 1)) == 0);
     const bool needs_workspace = !is_pow_2 || num_experts > 256;
@@ -568,6 +580,8 @@ void topk_softmax(
         num_tokens,
         num_experts,
         topk,
+        topk_weights_stride,
+        topk_id_stride,
         need_renorm,
         stream);
 }

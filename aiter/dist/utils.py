@@ -1,4 +1,5 @@
 '''
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2024, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1245,17 +1246,15 @@ def weak_bind(bound_method: Callable[..., Any], ) -> Callable[..., None]:
 
     return weak_bound
 
-
-# From: https://stackoverflow.com/a/4104188/2749989
 def run_once(f: Callable[P, None]) -> Callable[P, None]:
 
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
-        if not wrapper.has_run:  # type: ignore[attr-defined]
-            wrapper.has_run = True  # type: ignore[attr-defined]
+    def run_once_wrapper(*args: P.args, **kwargs: P.kwargs) -> None:
+        if not run_once_wrapper.ran_once_flag:  # type: ignore[attr-defined]
+            run_once_wrapper.ran_once_flag = True  # type: ignore[attr-defined]
             return f(*args, **kwargs)
 
-    wrapper.has_run = False  # type: ignore[attr-defined]
-    return wrapper
+    run_once_wrapper.ran_once_flag = False  # type: ignore[attr-defined]
+    return run_once_wrapper
 
 
 class FlexibleArgumentParser(argparse.ArgumentParser):

@@ -1,4 +1,5 @@
 '''
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2024, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +32,7 @@ class TunedGemm:
 
     def __init__(self):
         self.extensions_created = False
-        self.save_gemm = int(os.environ.get('VLLM_TUNE_GEMM', 0))
+        self.save_gemm = int(os.environ.get('AITER_TUNE_GEMM', 0))
         self.untune_path = f'{this_dir}/configs/untuned_gemm.csv'
         self.tune_path = f'{this_dir}/configs/tuned_gemm.csv'
         self.bestsols = {}
@@ -65,7 +66,8 @@ class TunedGemm:
         solds = {}
         for i in range(len(df)):
             ds = df.iloc[i]
-            key = (ds['M'], ds['N'], ds['K'], ds['bias'], ds['dtype'], ds['outdtype'], ds['scaleAB'])
+            key = (ds['M'], ds['N'], ds['K'], ds['bias'],
+                   ds['dtype'], ds['outdtype'], ds['scaleAB'])
             if ds['libtype'] == 'hipblaslt':
                 soltype = self.solMap.index(ds['libtype'])
             elif ds['libtype'] == 'rocblas':
@@ -86,7 +88,8 @@ class TunedGemm:
                 return 3, 0
             elif n % 4 == 0 and m == 1 and k <= 8192:
                 return 3, 1
-        soltype, solidx = self.solids.get((m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0))
+        soltype, solidx = self.solids.get(
+            (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0))
         logger.info(
             f'using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}')
         return soltype, solidx
@@ -106,12 +109,13 @@ class TunedGemm:
                               device='cuda')
             ops.LLMM1(weights, inp, out, 4)
         if bias is not None:
-            return out + bias
+            out += bias
+        return out
 
     def apply_hipb_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         if otype is None:
             otype = inp.dtype
-        return hipb_mm(inp, weights.t(), solidx,bias, otype, scale_a, scale_b, scale_c)
+        return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
     def apply_rocb_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         assert scale_a != None and scale_b != None and scale_c != None, "scale_a, scale_b, scale_c must be None for rocblas"
@@ -133,16 +137,16 @@ class TunedGemm:
                     'bias': [bias is not None],
                     'dtype': [inp.dtype],
                     'outdtype': [otype],
-                    'scaleAB':[scale_a is not None or scale_b is not None],
+                    'scaleAB': [scale_a is not None or scale_b is not None],
                 })
             ]).drop_duplicates()
             self.tuned_df.to_csv(self.untune_path, index=False)
         if inp.dtype == torch.float8_e4m3fnuz:
             if scale_a is None:
-                scale_a = torch.ones(1, dtype=torch.float, device = inp.device)
+                scale_a = torch.ones(1, dtype=torch.float, device=inp.device)
             if scale_b is None:
-                scale_b = torch.ones(1, dtype=torch.float, device = inp.device)
-            
+                scale_b = torch.ones(1, dtype=torch.float, device=inp.device)
+
             return torch._scaled_mm(inp,
                                     weights.t(),
                                     out_dtype=otype,

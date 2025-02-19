@@ -61,6 +61,13 @@ def run_iters(num_iters, func, *args, **kwargs):
     return data
 
 
+def run_perftest(func, *args, num_iters=101, num_warmup=10, **kwargs):
+    @perftest(num_iters=num_iters, num_warmup=num_warmup)
+    def worker():
+        return func(*args, **kwargs)
+    return worker()
+
+
 def get_trace_perf(prof, num_iters):
     assert (num_iters > 1)
     num_iters -= 1
@@ -106,27 +113,29 @@ def get_trace_perf(prof, num_iters):
     return df.at[avg_name, 'device_time_total']
 
 
-def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg=''):
+def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = ~isClose
     if isClose.all():
         logger.info(f'{msg}[checkAllclose {atol=} {rtol=} passed~]')
     else:
-        percent = (a[mask]).numel()/a.numel()
+        num = mask.sum()
+        printNum = min(printNum, num)
+        percent = num/a.numel()
         delta = (a-b)[mask]
         if percent > 0.01:
             logger.info(f'''{msg}[checkAllclose {atol=} {rtol=} failed!]
-        a:  {a.shape}
-            {a[mask]}
-        b:  {b.shape}
-            {b[mask]}
-    dtlta:
-            {delta}''')
+    a    : {a.shape}
+           {a[mask][:printNum]}
+    b    : {b.shape}
+           {b[mask][:printNum]}
+    delta:
+           {delta[:printNum]}''')
         else:
             logger.info(
                 f'''{msg}[checkAllclose {atol=} {rtol=} waring!] a and b results are not all close''')
         logger.info(
-            f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({(a[mask]).numel()} of {a.numel()}) elements')
+            f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements')
 
 
 def tensor_dump(x: torch.tensor, name: str, dir='./'):

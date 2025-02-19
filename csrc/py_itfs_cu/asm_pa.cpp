@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -28,7 +29,7 @@ struct __attribute__((packed)) KernelArgs
     p3 _p12;
     unsigned int mblk;
     p3 _p13;
-    unsigned int batch;
+    unsigned int kv_nheads;
     p3 _p14;
     unsigned int Qs;
     p3 _p15;
@@ -36,6 +37,8 @@ struct __attribute__((packed)) KernelArgs
     p3 _p16;
     unsigned int KVs;
     p3 _p17;
+    unsigned int GQA;
+    p3 _p18;
 };
 
 const float f_log2E = log2f(expf(1));
@@ -58,9 +61,11 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     int num_kv_heads = K.size(1);
     int block_size = K.size(3);
     const int gqa_ratio = num_heads / num_kv_heads;
+    TORCH_CHECK(block_size == 16,
+                __func__, " for now only support block_size == 16");
 
     int dim = head_size;
-    int stride_Q = gqa_ratio * dim * Q.itemsize();
+    int stride_Q = Q.stride(0) * Q.itemsize();
     int stride_KV_head = block_size * dim * K.itemsize();
     int stride_KV_blk = stride_KV_head * num_kv_heads;
     float k_log2e = f_log2E;
@@ -87,27 +92,74 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     }
     args.sclg2e = k_scalar;
     args.mblk = max_num_blocks;
-    args.batch = batch;
+    args.kv_nheads = num_kv_heads;
     args.Qs = stride_Q;
     args.Bs = stride_KV_blk;
     args.KVs = stride_KV_head;
+    args.GQA = gqa_ratio;
+    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs << std::endl;
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    static AiterAsmKernel impl_a16w16("pa_kernel_func", "pa_a16w16.co");
-    static AiterAsmKernel impl_a16w8("pa_kernel_func", "pa_a16w8.co");
-    AiterAsmKernel *impl_ptr = &impl_a16w16;
 
+    AiterAsmKernel *impl_ptr = nullptr;
     if (K_QScale)
-        impl_ptr = &impl_a16w8;
+    {
+        if (Q.dtype() == at::ScalarType::Half)
+        {
+            if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
+            {
+                static AiterAsmKernel impl_a16w8_f16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_f16_2tg_g8_i8.co");
+                impl_ptr = &impl_a16w8_f16_i8;
+            }
+            else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            {
+                static AiterAsmKernel impl_a16w8_f16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_f16_2tg_g8_f8.co");
+                impl_ptr = &impl_a16w8_f16_f8;
+            }
+        }
+        else if (Q.dtype() == at::ScalarType::BFloat16)
+        {
+            if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
+            {
+                static AiterAsmKernel impl_a16w8_b16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_b16_2tg_g8_i8.co");
+                impl_ptr = &impl_a16w8_b16_i8;
+            }
+            else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            {
+                static AiterAsmKernel impl_a16w8_b16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_b16_2tg_g8_f8.co");
+                impl_ptr = &impl_a16w8_b16_f8;
+            }
+        }
+    }
+    else
+    {
+        TORCH_CHECK(Q.is_contiguous(),
+                    __func__, ":a16w16 only support Q.is_contiguous() for now");
+        TORCH_CHECK(num_kv_heads == 1,
+                    __func__, ":a16w16 only support num_kv_heads==1, for now");
+        if (Q.dtype() == at::ScalarType::Half)
+        {
+            static AiterAsmKernel impl_a16w16_f16("pa_kernel_func", "pa_a16w16_f16.co");
+            impl_ptr = &impl_a16w16_f16;
+        }
+        else if (Q.dtype() == at::ScalarType::BFloat16)
+        {
+            static AiterAsmKernel impl_a16w16_b16("pa_kernel_func", "pa_a16w16_b16.co");
+            impl_ptr = &impl_a16w16_b16;
+        }
+    }
+    TORCH_CHECK(impl_ptr != nullptr,
+                __func__, ": unsupport current input type");
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
-                             1,     // gdx
-                             batch, // gdy
-                             1,     // gdz
-                             256,   // bdx: 4 wv64
-                             1,     // bdy
-                             1,     // bdz
+                             num_kv_heads, // gdx
+                             batch,        // gdy
+                             1,            // gdz
+                             256,          // bdx: 4 wv64
+                             1,            // bdy
+                             1,            // bdz
                              stream});
     return output;
 }

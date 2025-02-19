@@ -1,4 +1,5 @@
 '''
+ * Copyright © Advanced Micro Devices, Inc. All rights reserved.
  * Copyright (c) 2024, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -549,7 +550,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
 
 def get_config_file_name(E: int, N: int, dtype: Optional[str]) -> str:
     # device_name = current_platform.get_device_name().replace(" ", "_")
-    device_name = 'AMD_Instinct_MI308X_OAM'  # TODO: need to update
+    device_name = 'AMD_Instinct_OAM'  # TODO: need to update
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     return f"E={E},N={N},device_name={device_name}{dtype_selector}.json"
 
@@ -643,20 +644,24 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
 
     M, _ = hidden_states.shape
 
-    topk_weights = torch.empty(M,
-                               topk,
-                               dtype=torch.float32,
-                               device=hidden_states.device)
-    topk_ids = torch.empty(M,
-                           topk,
-                           dtype=torch.int32,
-                           device=hidden_states.device)
+    if topk_weights is None:
+        topk_weights = torch.empty(M,
+                                topk,
+                                dtype=torch.float32,
+                                device=hidden_states.device)
+    if topk_ids is None:
+        topk_ids = torch.empty(M,
+                            topk,
+                            dtype=torch.int32,
+                            device=hidden_states.device)
     token_expert_indicies = torch.empty(M,
                                         topk,
                                         dtype=torch.int32,

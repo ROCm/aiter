@@ -4,6 +4,7 @@
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -65,6 +66,7 @@ void layernorm2d_with_add_asm(torch::Tensor &out,          // [m ,n]
     args.ptr_OutResidual = residual_out.data_ptr();
     args.ptr_InResidual = residual_in.data_ptr();
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     int sub_M = 2;
     static AiterAsmKernel impl("layer_norm_kernel_func", "layer_norm.co");
@@ -117,6 +119,7 @@ void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
     args.ptr_OutYScale = yscale.data_ptr();
     args.ptr_XScale = xscale.data_ptr();
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     int sub_M = 2;
     static AiterAsmKernel impl("layer_norm_qnt", "layer_norm_qnt.co");

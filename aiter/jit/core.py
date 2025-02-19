@@ -9,6 +9,7 @@ import importlib
 import functools
 import traceback
 from typing import List, Optional
+import torch
 from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
@@ -100,6 +101,9 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         opbd_dir = f'{op_dir}/build'
         src_dir = f'{op_dir}/build/srcs'
         os.makedirs(src_dir, exist_ok=True)
+        if os.path.exists(f'{this_dir}/{md_name}.so'):
+            os.remove(f'{this_dir}/{md_name}.so')
+
         sources = rename_cpp_to_cu(srcs, src_dir)
 
         flags_cc = ["-O3", "-std=c++17"]
@@ -250,15 +254,6 @@ def get_args_of_build(ops_name: str):
 def compile_ops(ops_name: str, fc_name: Optional[str] = None):
     def decorator(func):
         def wrapper(*args, **kwargs):
-            d_args = get_args_of_build(ops_name)
-            md_name = d_args["md_name"]
-            srcs = d_args["srcs"]
-            flags_extra_cc = d_args["flags_extra_cc"]
-            flags_extra_hip = d_args["flags_extra_hip"]
-            blob_gen_cmd = d_args["blob_gen_cmd"]
-            extra_include = d_args["extra_include"]
-            extra_ldflags = d_args["extra_ldflags"]
-            verbose = d_args["verbose"]
             loadName = fc_name
             if fc_name is None:
                 loadName = func.__name__
@@ -269,11 +264,34 @@ def compile_ops(ops_name: str, fc_name: Optional[str] = None):
                     if hasattr(aiter_, loadName):
                         module = aiter_
                 if module is None:
-                    module = get_module(md_name)
+                    module = get_module(ops_name)
             except Exception as e:
+                d_args = get_args_of_build(ops_name)
+                md_name = d_args["md_name"]
+                srcs = d_args["srcs"]
+                flags_extra_cc = d_args["flags_extra_cc"]
+                flags_extra_hip = d_args["flags_extra_hip"]
+                blob_gen_cmd = d_args["blob_gen_cmd"]
+                extra_include = d_args["extra_include"]
+                extra_ldflags = d_args["extra_ldflags"]
+                verbose = d_args["verbose"]
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
+            op = getattr(module, loadName)
+            if int(os.getenv("AITER_LOG_MORE", 0)) == 2:
+                import inspect
+                callargs = inspect.getcallargs(func, *args, **kwargs)
 
-            return getattr(module, loadName)(*args, **kwargs)
+                def getTensorInfo(el):
+                    if isinstance(el, torch.Tensor):
+                        return f'{el.shape} {el.dtype}'
+                    return el
+
+                callargs = [
+                    f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
+                logger.info(
+                    f"    calling {ops_name}::{loadName}({', '.join(callargs)})")
+
+            return op(*args, **kwargs)
         return wrapper
     return decorator

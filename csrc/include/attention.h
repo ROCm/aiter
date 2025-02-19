@@ -9,6 +9,6 @@ void paged_attention(
     torch::Tensor &value_cache, int64_t num_kv_heads, double scale,
     torch::Tensor &block_tables, torch::Tensor &context_lens,
     int64_t block_size, int64_t max_context_len,
-    const c10::optional<torch::Tensor> &alibi_slopes,
+    const std::optional<torch::Tensor> &alibi_slopes,
     const std::string &kv_cache_dtype, double k_scale, double v_scale,
-    const c10::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);
+    const std::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);

@@ -3,6 +3,7 @@
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include "py_itfs_common.h"
 
 #include "layernorm2d_fwd.hpp"
@@ -26,6 +27,7 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
     int y_stride = out.stride(0);
     int yr_stride = -1;
     bool SaveMeanVar = false;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     layernorm2d_fwd({
@@ -84,6 +86,7 @@ void layernorm2d_with_add(torch::Tensor &out,          // [m ,n]
     int y_stride = out.stride(0);
     int yr_stride = residual_out.stride(0);
     bool SaveMeanVar = false;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     layernorm2d_fwd({
@@ -136,6 +139,7 @@ void layernorm2d_with_smoothquant(torch::Tensor &out,    // [m ,n]
     int y_stride = out.stride(0);
     int yr_stride = -1;
     bool SaveMeanVar = false;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     layernorm2d_fwd({
@@ -190,6 +194,7 @@ void layernorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
     int y_stride = out.stride(0);
     int yr_stride = residual_out.stride(0);
     bool SaveMeanVar = false;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     layernorm2d_fwd({
@@ -240,6 +245,7 @@ void layernorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
     int y_stride = out.stride(0);
     int yr_stride = -1;
     bool SaveMeanVar = false;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     layernorm2d_fwd({
@@ -292,6 +298,7 @@ void layernorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
     int y_stride = out.stride(0);
     int yr_stride = residual_out.stride(0);
     bool SaveMeanVar = false;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     layernorm2d_fwd({

@@ -1470,16 +1470,16 @@ void wvSpltK_(void *in_a, void *in_b, void *out_c, const int M_in,
   switch (N_in)
   {
   case 1:
-    WVSPLTK(16, 2, 2, 2, 2, 2, 2, 1) // MI308
+    WVSPLTK(16, 2, 2, 2, 2, 2, 2, 1)
     break;
   case 2:
-    WVSPLTK(16, 2, 2, 2, 2, 2, 2, 2) // MI308
+    WVSPLTK(16, 2, 2, 2, 2, 2, 2, 2)
     break;
   case 3:
-    WVSPLTK(16, 4, 7, 7, 1, 1, 1, 3) // MI308
+    WVSPLTK(16, 4, 7, 7, 1, 1, 1, 3)
     break;
   case 4:
-    WVSPLTK(16, 4, 7, 7, 1, 1, 1, 4) // MI308
+    WVSPLTK(16, 4, 7, 7, 1, 1, 1, 4)
     break;
   default:
     throw std::runtime_error("Unsupported N value: " + std::to_string(M_in) +
