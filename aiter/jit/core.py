@@ -14,6 +14,7 @@ from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json
+from packaging.version import parse, Version
 
 PREBUILD_KERNELS = False
 if os.path.exists(os.path.dirname(os.path.abspath(__file__))+"/aiter_.so"):
@@ -87,6 +88,10 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+
+
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
     return importlib.import_module(f'{__package__}.{md_name}')
@@ -124,7 +129,22 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
+
+            "-fgpu-flush-denormals-to-zero",
         ]
+
+        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+        hip_version = get_hip_version()
+        if hip_version > Version('5.7.23302'):
+            flags_hip += ["-fno-offload-uniform-block"]
+        if hip_version > Version('6.1.40090'):
+            flags_hip += ["-mllvm", "-enable-post-misched=0"]
+        if hip_version > Version('6.2.41132'):
+            flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
+                        "-mllvm", "-amdgpu-function-calls=false"]
+        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+            flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()

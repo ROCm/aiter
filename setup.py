@@ -97,7 +97,20 @@ if IS_ROCM:
         "-Wno-switch-bool",
         "-Wno-vla-cxx-extension",
         "-Wno-undefined-func-template",
+        "-fgpu-flush-denormals-to-zero",
     ]
+
+    # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+    hip_version = get_hip_version()
+    if hip_version > Version('5.7.23302'):
+        cc_flag += ["-fno-offload-uniform-block"]
+    if hip_version > Version('6.1.40090'):
+        cc_flag += ["-mllvm", "-enable-post-misched=0"]
+    if hip_version > Version('6.2.41132'):
+        cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
+                    "-mllvm", "-amdgpu-function-calls=false"]
+    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -111,7 +124,7 @@ if IS_ROCM:
         new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list
 
-        core.build_module(md_name = "aiter_", 
+        core.build_module(md_name = "aiter_",
                     srcs = all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
                     flags_extra_cc = all_opts_args_build["flags_extra_cc"],
                     flags_extra_hip = all_opts_args_build["flags_extra_hip"],
