@@ -23,6 +23,19 @@ def rope_fwd_impl(
     ...
 
 @compile_ops("module_rope")
+def rope_bwd_impl(
+    input_grads: Tensor,
+    output_grads: Tensor,
+    freqs: Tensor
+): 
+    '''
+    Backward propagation of traditional RoPE (Rotary Position Embedding).
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
+    This implemenation rotates the 2nd half of elements.
+    '''
+    ...
+
+@compile_ops("module_rope")
 def rope_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -32,19 +45,6 @@ def rope_2c_fwd_impl(
 ): 
     '''
     Forward propagation of traditional RoPE (Rotary Position Embedding) on two channels.
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
-    This implemenation rotates the 2nd half of elements.
-    '''
-    ...
-
-@compile_ops("module_rope")
-def rope_bwd_impl(
-    input_grads: Tensor,
-    output_grads: Tensor,
-    freqs: Tensor
-): 
-    '''
-    Backward propagation of traditional RoPE (Rotary Position Embedding).
     Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
@@ -80,6 +80,20 @@ def rope_cached_fwd_impl(
     ...
 
 @compile_ops("module_rope")
+def rope_cached_bwd_impl(
+    input_grads: Tensor,
+    output_grads: Tensor,
+    cos: Tensor,
+    sin: Tensor
+): 
+    '''
+    Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
+    This implemenation rotates the 2nd half of elements.
+    '''
+    ...
+
+@compile_ops("module_rope")
 def rope_cached_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -90,20 +104,6 @@ def rope_cached_2c_fwd_impl(
 ): 
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin on two channels.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
-    This implemenation rotates the 2nd half of elements.
-    '''
-    ...
-
-@compile_ops("module_rope")
-def rope_cached_bwd_impl(
-    input_grads: Tensor,
-    output_grads: Tensor,
-    cos: Tensor,
-    sin: Tensor
-): 
-    '''
-    Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
@@ -206,6 +206,17 @@ def rope_fwd(
     rope_fwd_impl(output, input, freqs)
     return output
 
+def rope_bwd(
+    output_grads: Tensor,
+    freqs: Tensor,
+    transpose_output: bool = False
+) -> Tensor :
+    s, b, h, d = output_grads.shape
+    input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False).transpose(0, 1)\
+        if transpose_output else empty_like(output_grads, requires_grad=False)
+    rope_bwd_impl(input_grads, output_grads, freqs)
+    return input_grads
+
 def rope_2c_fwd(
     input_x: Tensor,
     input_y: Tensor,
@@ -219,17 +230,6 @@ def rope_2c_fwd(
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_2c_fwd_impl(output_x, output_y, input_x, input_y, freqs)
     return output_x, output_y
-
-def rope_bwd(
-    output_grads: Tensor,
-    freqs: Tensor,
-    transpose_output: bool = False
-) -> Tensor :
-    s, b, h, d = output_grads.shape
-    input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False).transpose(0, 1)\
-        if transpose_output else empty_like(output_grads, requires_grad=False)
-    rope_bwd_impl(input_grads, output_grads, freqs)
-    return input_grads
 
 def rope_2c_bwd(
     output_grads_x: Tensor,
@@ -257,6 +257,18 @@ def rope_cached_fwd(
     rope_cached_fwd_impl(output, input, cos, sin)
     return output
 
+def rope_cached_bwd(
+    output_grads: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    transpose_output: bool = False
+) -> Tensor :
+    s, b, h, d = output_grads.shape
+    input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False).transpose(0, 1)\
+        if transpose_output else empty_like(output_grads, requires_grad=False)
+    rope_cached_bwd_impl(input_grads, output_grads, cos, sin)
+    return input_grads
+
 def rope_cached_2c_fwd(
     input_x: Tensor,
     input_y: Tensor,
@@ -271,18 +283,6 @@ def rope_cached_2c_fwd(
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_cached_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin)
     return output_x, output_y
-
-def rope_cached_bwd(
-    output_grads: Tensor,
-    cos: Tensor,
-    sin: Tensor,
-    transpose_output: bool = False
-) -> Tensor :
-    s, b, h, d = output_grads.shape
-    input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False).transpose(0, 1)\
-        if transpose_output else empty_like(output_grads, requires_grad=False)
-    rope_cached_bwd_impl(input_grads, output_grads, cos, sin)
-    return input_grads
 
 def rope_cached_2c_bwd(
     output_grads_x: Tensor,
