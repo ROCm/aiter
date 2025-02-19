@@ -198,9 +198,10 @@ if __name__ == "__main__":
         freqs = torch.randn((s, 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
         grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         test_rope_sbhd(input, freqs, grad, transpose_output)
+        input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        test_rope_sbhd_2c(input, input_y, freqs, grad, grad_y, transpose_output)
+        test_rope_sbhd_2c(input_x, input_y, freqs, grad, grad_y, transpose_output)
 
     # Test thd format for uncached
     cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
