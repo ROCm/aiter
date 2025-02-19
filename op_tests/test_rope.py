@@ -13,12 +13,12 @@ def hip_rope_fwd(input, freqs, transpose_output):
     return aiter.rope_fwd(input, freqs, transpose_output)
 
 @perftest()
-def hip_rope_2c_fwd(input_x, input_y, freqs, transpose_output):
-    return aiter.rope_2c_fwd(input_x, input_y, freqs, transpose_output)
-
-@perftest()
 def hip_rope_bwd(output_grads, freqs, transpose_output):
     return aiter.rope_bwd(output_grads, freqs, transpose_output)
+
+@perftest()
+def hip_rope_2c_fwd(input_x, input_y, freqs, transpose_output):
+    return aiter.rope_2c_fwd(input_x, input_y, freqs, transpose_output)
 
 @perftest()
 def hip_rope_2c_bwd(output_grads_x, output_grads_y, freqs, transpose_output):
@@ -29,12 +29,12 @@ def hip_rope_cached_fwd(input, cos, sin, transpose_output):
     return aiter.rope_cached_fwd(input, cos, sin, transpose_output)
 
 @perftest()
-def hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output):
-    return aiter.rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output)
-
-@perftest()
 def hip_rope_cached_bwd(output_grads, cos, sin, transpose_output):
     return aiter.rope_cached_bwd(output_grads, cos, sin, transpose_output)
+
+@perftest()
+def hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output):
+    return aiter.rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output)
 
 @perftest()
 def hip_rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, transpose_output):
