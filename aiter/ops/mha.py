@@ -285,7 +285,7 @@ def flash_attn_func(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
-    deterministic=False,
+    deterministic=True,
     return_lse=False,
     return_attn_probs=False,
 ):
