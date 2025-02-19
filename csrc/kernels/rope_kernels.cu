@@ -544,9 +544,8 @@ struct Op2cCachedBwd
 // Kernel Entries
 //
 
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_fwd(
+template <typename scalar_t, typename scalar_f_t, typename Kernel>
+__global__ void kn_entry_1c_sbhd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
     const scalar_f_t* __restrict__ p_freqs,
@@ -561,7 +560,7 @@ void kn_rope_fwd(
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op1cUncachedFwd{}(
+    Kernel{}(
         p_output + offset_o,
         p_input + offset_i,
         p_freqs + offset_f,
@@ -570,9 +569,8 @@ void kn_rope_fwd(
         stride_o_h, stride_o_d);
 }
 
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_2c_fwd(
+template <typename scalar_t, typename scalar_f_t, typename Kernel>
+__global__ void kn_entry_2c_sbhd_uncached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
     const scalar_t* __restrict__   p_input_x,
@@ -593,7 +591,7 @@ void kn_rope_2c_fwd(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f = sid * size_f;
 
-    Op2cUncachedFwd{}(
+    Kernel{}(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -606,71 +604,8 @@ void kn_rope_2c_fwd(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_bwd(
-    scalar_t* __restrict__         p_input_grads,
-    const scalar_t* __restrict__   p_output_grads,
-    const scalar_f_t* __restrict__ p_freqs,
-    const int32_t size_h, const int32_t size_d,
-    const int32_t size_f,   // size of last dimension of freqs.
-    const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d,
-    const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d)
-{
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
-    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
-    const int32_t offset_f = sid * size_f;
-
-    Op1cUncachedBwd{}(
-        p_input_grads + offset_i,
-        p_output_grads + offset_o,
-        p_freqs + offset_f,
-        size_h, size_d, size_f,
-        stride_o_h, stride_o_d,
-        stride_i_h, stride_i_d);
-}
-
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_2c_bwd(
-    scalar_t* __restrict__         p_input_grads_x,
-    scalar_t* __restrict__         p_input_grads_y,
-    const scalar_t* __restrict__   p_output_grads_x,
-    const scalar_t* __restrict__   p_output_grads_y,
-    const scalar_f_t* __restrict__ p_freqs,
-    const int32_t size_h, const int32_t size_d,
-    const int32_t size_f,   // size of last dimension of freqs.
-    const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
-    const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d,
-    const int32_t stride_ix_s, const int32_t stride_ix_b, const int32_t stride_ix_h, const int32_t stride_ix_d,
-    const int32_t stride_iy_s, const int32_t stride_iy_b, const int32_t stride_iy_h, const int32_t stride_iy_d)
-{
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const int32_t offset_f = sid * size_f;
-
-    Op2cUncachedBwd{}(
-        p_input_grads_x + offset_ix,
-        p_input_grads_y + offset_iy,
-        p_output_grads_x + offset_ox,
-        p_output_grads_y + offset_oy,
-        p_freqs + offset_f,
-        size_h, size_d, size_f,
-        stride_ox_h, stride_ox_d,
-        stride_oy_h, stride_oy_d,
-        stride_ix_h, stride_ix_d,
-        stride_iy_h, stride_iy_d);
-}
-
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_cached_fwd(
+template <typename scalar_t, typename scalar_f_t, typename Kernel>
+__global__ void kn_entry_1c_sbhd_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
     const scalar_f_t* __restrict__ p_cos,
@@ -686,7 +621,7 @@ void kn_rope_cached_fwd(
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op1cCachedFwd{}(
+    Kernel{}(
         p_output + offset_o,
         p_input + offset_i,
         p_cos + offset_f,
@@ -696,9 +631,8 @@ void kn_rope_cached_fwd(
         stride_o_h, stride_o_d);
 }
 
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_cached_2c_fwd(
+template <typename scalar_t, typename scalar_f_t, typename Kernel>
+__global__ void kn_entry_2c_sbhd_cached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
     const scalar_t* __restrict__   p_input_x,
@@ -720,7 +654,7 @@ void kn_rope_cached_2c_fwd(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f = sid * size_f;
 
-    Op2cCachedFwd{}(
+    Kernel{}(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -734,75 +668,8 @@ void kn_rope_cached_2c_fwd(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_cached_bwd(
-    scalar_t* __restrict__         p_input_grads,
-    const scalar_t* __restrict__   p_output_grads,
-    const scalar_f_t* __restrict__ p_cos,
-    const scalar_f_t* __restrict__ p_sin,
-    const int32_t size_h, const int32_t size_d,
-    const int32_t size_f,   // size of last dimension of freqs.
-    const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d,
-    const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d)
-{
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
-    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
-    const int32_t offset_f = sid * size_f;
-
-    Op1cCachedBwd{}(
-        p_input_grads + offset_i,
-        p_output_grads + offset_o,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_o_h, stride_o_d,
-        stride_i_h, stride_i_d);
-}
-
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_cached_2c_bwd(
-    scalar_t* __restrict__         p_input_grads_x,
-    scalar_t* __restrict__         p_input_grads_y,
-    const scalar_t* __restrict__   p_output_grads_x,
-    const scalar_t* __restrict__   p_output_grads_y,
-    const scalar_f_t* __restrict__ p_cos,
-    const scalar_f_t* __restrict__ p_sin,
-    const int32_t size_h, const int32_t size_d,
-    const int32_t size_f,   // size of last dimension of freqs.
-    const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
-    const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d,
-    const int32_t stride_ix_s, const int32_t stride_ix_b, const int32_t stride_ix_h, const int32_t stride_ix_d,
-    const int32_t stride_iy_s, const int32_t stride_iy_b, const int32_t stride_iy_h, const int32_t stride_iy_d)
-{
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const int32_t offset_f = sid * size_f;
-
-    Op2cCachedBwd{}(
-        p_input_grads_x + offset_ix,
-        p_input_grads_y + offset_iy,
-        p_output_grads_x + offset_ox,
-        p_output_grads_y + offset_oy,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_ox_h, stride_ox_d,
-        stride_oy_h, stride_oy_d,
-        stride_ix_h, stride_ix_d,
-        stride_iy_h, stride_iy_d);
-}
-
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_thd_fwd(
+template <typename scalar_t, typename scalar_f_t, typename Kernel>
+__global__ void kn_entry_1c_thd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
     const int32_t* __restrict__    p_cu_seqlens,
@@ -822,7 +689,7 @@ void kn_rope_thd_fwd(
         const int32_t offset_o = tid * stride_o_t;
         const int32_t offset_f = sid * size_f;
 
-        Op1cUncachedFwd{}(
+        Kernel{}(
             p_output + offset_o,
             p_input + offset_i,
             p_freqs + offset_f,
@@ -832,41 +699,8 @@ void kn_rope_thd_fwd(
     }
 }
 
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_thd_bwd(
-    scalar_t* __restrict__         p_input_grads,
-    const scalar_t* __restrict__   p_output_grads,
-    const int32_t* __restrict__    p_cu_seqlens,
-    const scalar_f_t* __restrict__ p_freqs,
-    const int32_t size_h, const int32_t size_d,
-    const int32_t size_f,   // size of last dimension of freqs.
-    const int32_t stride_o_t, const int32_t stride_o_h, const int32_t stride_o_d,
-    const int32_t stride_i_t, const int32_t stride_i_h, const int32_t stride_i_d)
-{
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t tid = sid + p_cu_seqlens[bid];
-
-    if (tid < p_cu_seqlens[bid + 1])
-    {
-        const int32_t offset_o = tid * stride_o_t;
-        const int32_t offset_i = tid * stride_i_t;
-        const int32_t offset_f = sid * size_f;
-
-        Op1cUncachedBwd{}(
-            p_input_grads + offset_i,
-            p_output_grads + offset_o,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_o_h, stride_o_d,
-            stride_i_h, stride_i_d);
-    }
-}
-
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_2d_fwd(
+template <typename scalar_t, typename scalar_f_t, typename Kernel>
+__global__ void kn_entry_1c_2d_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
     const scalar_f_t* __restrict__ p_cos_h,
@@ -886,7 +720,7 @@ void kn_rope_2d_fwd(
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
     const int offset_h_f = Hid * size_half_d;
-    Op1cCachedFwd{}(
+    Kernel{}(
         p_output + offset_h_o,
         p_input + offset_h_i,
         p_cos_h + offset_h_f,
@@ -898,7 +732,7 @@ void kn_rope_2d_fwd(
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
     const int offset_w_f = Wid * size_half_d;
-    Op1cCachedFwd{}(
+    Kernel{}(
         p_output + offset_w_o,
         p_input + offset_w_i,
         p_cos_w + offset_w_f,
@@ -906,50 +740,6 @@ void kn_rope_2d_fwd(
         size_h, size_half_d, size_half_d,
         stride_i_h, stride_i_d,
         stride_o_h, stride_o_d);
-}
-
-template <typename scalar_t, typename scalar_f_t>
-__global__
-void kn_rope_2d_bwd(
-    scalar_t* __restrict__         p_input_grads,
-    const scalar_t* __restrict__   p_output_grads,
-    const scalar_f_t* __restrict__ p_cos_h,
-    const scalar_f_t* __restrict__ p_sin_h,
-    const scalar_f_t* __restrict__ p_cos_w,
-    const scalar_f_t* __restrict__ p_sin_w,
-    const int32_t img_width, const int32_t size_h, const int32_t size_d,
-    const int32_t stride_o_b, const int32_t stride_o_s, const int32_t stride_o_h, const int32_t stride_o_d,
-    const int32_t stride_i_b, const int32_t stride_i_s, const int32_t stride_i_h, const int32_t stride_i_d)
-{
-    const int Hid = blockIdx.x;
-    const int Wid = blockIdx.y;
-    const int sid = Hid * img_width + Wid;
-    const int bid = blockIdx.z;
-    const int size_half_d = size_d >> 1;
-
-    const int offset_h_o = bid * stride_o_b + sid * stride_i_s;
-    const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
-    const int offset_h_f = Hid * size_half_d;
-    Op1cCachedBwd{}(
-        p_input_grads + offset_h_i,
-        p_output_grads + offset_h_o,
-        p_cos_h + offset_h_f,
-        p_sin_h + offset_h_f,
-        size_h, size_half_d, size_half_d,
-        stride_o_h, stride_o_d,
-        stride_i_h, stride_i_d);
-
-    const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
-    const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
-    const int offset_w_f = Wid * size_half_d;
-    Op1cCachedBwd{}(
-        p_input_grads + offset_w_i,
-        p_output_grads + offset_w_o,
-        p_cos_w + offset_w_f,
-        p_sin_w + offset_w_f,
-        size_h, size_half_d, size_half_d,
-        stride_o_h, stride_o_d,
-        stride_i_h, stride_i_d);
 }
 
 // =====================================================================================================================
@@ -971,7 +761,7 @@ void dispatch_rope_fwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_fwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_sbhd_uncached<scalar_t, scalar_f_t, Op1cUncachedFwd><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_freqs,
@@ -999,7 +789,7 @@ void dispatch_rope_2c_fwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_2c_fwd<<<grid, block, 0, stream>>>(
+    kn_entry_2c_sbhd_uncached<scalar_t, scalar_f_t, Op2cUncachedFwd><<<grid, block, 0, stream>>>(
         p_output_x,
         p_output_y,
         p_input_x,
@@ -1027,7 +817,7 @@ void dispatch_rope_bwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_bwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_sbhd_uncached<scalar_t, scalar_f_t, Op1cUncachedBwd><<<grid, block, 0, stream>>>(
         p_input_grads,
         p_output_grads,
         p_freqs,
@@ -1055,7 +845,7 @@ void dispatch_rope_2c_bwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_2c_bwd<<<grid, block, 0, stream>>>(
+    kn_entry_2c_sbhd_uncached<scalar_t, scalar_f_t, Op2cUncachedBwd><<<grid, block, 0, stream>>>(
         p_input_grads_x,
         p_input_grads_y,
         p_output_grads_x,
@@ -1084,7 +874,7 @@ void dispatch_rope_cached_fwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_cached_fwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_sbhd_cached<scalar_t, scalar_f_t, Op1cCachedFwd><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_cos, p_sin,
@@ -1113,7 +903,7 @@ void dispatch_rope_cached_2c_fwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_cached_2c_fwd<<<grid, block, 0, stream>>>(
+    kn_entry_2c_sbhd_cached<scalar_t, scalar_f_t, Op2cCachedFwd><<<grid, block, 0, stream>>>(
         p_output_x,
         p_output_y,
         p_input_x,
@@ -1142,7 +932,7 @@ void dispatch_rope_cached_bwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_cached_bwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_sbhd_cached<scalar_t, scalar_f_t, Op1cCachedBwd><<<grid, block, 0, stream>>>(
         p_input_grads,
         p_output_grads,
         p_cos, p_sin,
@@ -1171,7 +961,7 @@ void dispatch_rope_cached_2c_bwd(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_cached_2c_bwd<<<grid, block, 0, stream>>>(
+    kn_entry_2c_sbhd_cached<scalar_t, scalar_f_t, Op2cCachedBwd><<<grid, block, 0, stream>>>(
         p_input_grads_x,
         p_input_grads_y,
         p_output_grads_x,
@@ -1200,7 +990,7 @@ void dispatch_rope_thd_fwd(
     const dim3 grid(size_max_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_thd_fwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_thd_uncached<scalar_t, scalar_f_t, Op1cUncachedFwd><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_cu_seqlens,
@@ -1226,7 +1016,7 @@ void dispatch_rope_thd_bwd(
     const dim3 grid(size_max_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_thd_bwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_thd_uncached<scalar_t, scalar_f_t, Op1cUncachedBwd><<<grid, block, 0, stream>>>(
         p_input_grads,
         p_output_grads,
         p_cu_seqlens,
@@ -1254,7 +1044,7 @@ void dispatch_rope_2d_fwd(
     const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_2d_fwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_2d_cached<scalar_t, scalar_f_t, Op1cCachedFwd><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_cos_h, p_sin_h,
@@ -1282,7 +1072,7 @@ void dispatch_rope_2d_bwd(
     const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_rope_2d_bwd<<<grid, block, 0, stream>>>(
+    kn_entry_1c_2d_cached<scalar_t, scalar_f_t, Op1cCachedBwd><<<grid, block, 0, stream>>>(
         p_input_grads,
         p_output_grads,
         p_cos_h, p_sin_h,
