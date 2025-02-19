@@ -1980,7 +1980,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
                                      torch::Tensor& v_scale,
                                      const c10::optional<torch::Tensor>& fp8_out_scale)
 {
-    const int num_kv_heads = key_cache.size(1);
+    const int num_kv_heads = kv_cache_layout=="HND" ? key_cache.size(1) : key_cache.size(2);
     int num_seqs        = query.size(0);
     int num_heads       = query.size(1);
     int head_size       = query.size(2);
@@ -1998,7 +1998,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     KVT* value_cache_ptr       = reinterpret_cast<KVT*>(value_cache.data_ptr());
     int* kv_indptr_ptr         = kv_indptr.data_ptr<int>();
     int* kv_page_indices_ptr   = kv_page_indices.data_ptr<int>();
-    int* kv_last_page_lens_ptr = kv_last_page_lens ? kv_last_page_lens.value().data_ptr<int>() : nullptr;
+    int* kv_last_page_lens_ptr = BLOCK_SIZE > 1 ? kv_last_page_lens.value().data_ptr<int>() : nullptr;
 
     const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
     const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());

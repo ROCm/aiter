@@ -31,11 +31,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("paged_attention_rocm", &paged_attention,
             "paged_attention_rocm(Tensor! out, Tensor workspace_buffer,"
             "                Tensor query, Tensor key_cache,"
-            "                Tensor value_cache, int num_kv_heads,"
+            "                Tensor value_cache,"
             "                float scale, Tensor kv_indptr,"
             "                Tensor kv_page_indices, Tensor kv_last_page_lens,"
             "                int block_size,"
-            "                int max_context_len,"
+            "                int max_num_partitions,"
             "                Tensor? alibi_slopes,"
             "                str kv_cache_dtype,"
             "                str kv_cache_layout,"
