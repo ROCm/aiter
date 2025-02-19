@@ -32,6 +32,7 @@ if find_aiter is not None:
         package_path = find_aiter.submodule_search_locations[0]
     elif find_aiter.origin:
         package_path = find_aiter.origin
+    package_path = os.path.dirname(package_path)
     import site
     site_packages_dirs = site.getsitepackages()
     ### develop mode
