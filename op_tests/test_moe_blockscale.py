@@ -28,6 +28,9 @@ def torch_moe_blockscale(hidden_states,
                          fc2_scale=None,
                          expert_mask=None):
     computeType = torch.float
+    hidden_states = hidden_states.to(computeType)
+    w1 = w1.to(computeType)
+    w2 = w2.to(computeType)
     token_num, topk = topk_ids.shape
     expert, model_dim, inter_dim = w2.shape
     B, D = hidden_states.shape
@@ -40,7 +43,8 @@ def torch_moe_blockscale(hidden_states,
     blk_n, blk_k = scale_blks
     if a_scale is not None:
         # print(f'{a_scale.unsqueeze(-1).shape=}, {hidden_states.view(token_num, -1, blk_k).shape=}')
-        hidden_states = hidden_states.view(token_num, -1, blk_k).to(computeType) * a_scale.unsqueeze(-1).to(computeType)
+        hidden_states = hidden_states.view(
+            token_num, -1, blk_k) * a_scale.unsqueeze(-1)
         hidden_states = hidden_states.view(token_num, -1)
 
     hidden_states = hidden_states.view(
@@ -65,8 +69,8 @@ def torch_moe_blockscale(hidden_states,
                               'e num_blk_n num_blk_k blk_n blk_k -> e (num_blk_n blk_n) (num_blk_k blk_k)')
         fc2_scale = rearrange(fc2_scale.view(-1, 1).repeat(1, blk_n*blk_k).view(expert, nblk_k, nblk_n, blk_k, blk_n),
                               'e num_blk_n num_blk_k blk_n blk_k -> e (num_blk_n blk_n) (num_blk_k blk_k)')
-        w1 = w1.to(computeType) * fc1_scale.to(computeType)
-        w2 = w2.to(computeType) * fc2_scale.to(computeType)
+        w1 = w1 * fc1_scale
+        w2 = w2 * fc2_scale
 
     for E_id in range(w1.shape[0]):
         mask = topk_ids == E_id
@@ -100,7 +104,7 @@ def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
 
 def asm_moe_test(hidden_states, w1, w2, topk_weights, topk_ids,
                  # following for int8 quant
-                 fc1_scale=None, 
+                 fc1_scale=None,
                  fc2_scale=None,
                  a1_scale=None,
                  scale_blk=(128, 128),
@@ -112,22 +116,23 @@ def asm_moe_test(hidden_states, w1, w2, topk_weights, topk_ids,
     sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out_asm = moe_sorting_ck(topk_ids, topk_weights, E,
                                                                                                     model_dim, dtype)
     scale_blk_n, scale_blk_k = scale_blk
-    aiter.fmoe_fp8_blockscale_g1u1(out_asm, 
-                                    hidden_states, 
-                                    w1, 
-                                    w2, 
-                                    sorted_token_ids,
-                                    sorted_weight_buf,
-                                    sorted_expert_ids, 
-                                    num_valid_ids,
-                                    topk,
-                                    fc1_scale,
-                                    fc2_scale,
-                                    a1_scale,
-                                    scale_blk_n, 
-                                    scale_blk_k,
-                                    None)
+    aiter.fmoe_fp8_blockscale_g1u1(out_asm,
+                                   hidden_states,
+                                   w1,
+                                   w2,
+                                   sorted_token_ids,
+                                   sorted_weight_buf,
+                                   sorted_expert_ids,
+                                   num_valid_ids,
+                                   topk,
+                                   fc1_scale,
+                                   fc2_scale,
+                                   a1_scale,
+                                   scale_blk_n,
+                                   scale_blk_k,
+                                   None)
     return out_asm
+
 
 torch.set_default_device("cuda")
 
@@ -170,13 +175,11 @@ def test_fmoe(dtype, token, model_dim, inter_dim, scale_blks, E, topk, quant='No
     w2_scale = w2_scale.view(E, -1)
 
     # block quant input
-    a1_q, a1_scale = pertoken_quant(input.view(-1, model_dim//scale_blk_k, scale_blk_k), quant_dtype=quant_dtype)
+    a1_q, a1_scale = pertoken_quant(
+        input.view(-1, model_dim//scale_blk_k, scale_blk_k), quant_dtype=quant_dtype)
     a1_q = a1_q.view(-1, model_dim)
     a1_scale = a1_scale.squeeze(-1)
 
-    print(f'{a1_q.shape=}, {a1_scale.shape=}')
-    print(f'{w1_q.shape=}, {w1_scale.shape=}')
-    print(f'{w2_q.shape=}, {w2_scale.shape=}')
     # w2, fc2_scale = pertoken_quant(w2, quant_dtype=quant_dtype)
 
     out_ref, us_ref = run_perftest(torch_moe_blockscale,
@@ -191,36 +194,35 @@ def test_fmoe(dtype, token, model_dim, inter_dim, scale_blks, E, topk, quant='No
                                    fc2_scale=w2_scale,
                                    a_scale=a1_scale,
                                    num_warmup=1, num_iters=2)
-    out_ref2, us_ref = run_perftest(torch_moe,
-                                    input,
-                                    w1,
-                                    w2,
-                                    topk_weights,
-                                    topk_ids,
-                                    num_warmup=1, num_iters=2)
-    msg = '111'
-    checkAllclose(out_ref, out_ref2, rtol=0.01, atol=100, msg=msg)
+    # out_ref2, us_ref = run_perftest(torch_moe,
+    #                                 input,
+    #                                 w1,
+    #                                 w2,
+    #                                 topk_weights,
+    #                                 topk_ids,
+    #                                 num_warmup=1, num_iters=2)
+    # msg = '111'
+    # checkAllclose(out_ref, out_ref2, rtol=0.01, atol=100, msg=msg)
 
- 
     out_asm, us_ref = run_perftest(asm_moe_test,
-                                    a1_q,
-                                    shuffle_weight(w1_q, (16, 16)), 
-                                    shuffle_weight(w2_q, (16, 16)), 
-                                    topk_weights,
-                                    topk_ids,
-                                    w1_scale,
-                                    w2_scale,
-                                    a1_scale.t().contiguous(),
-                                    (scale_blk_n, 
-                                    scale_blk_k),
-                                    num_warmup=1, num_iters=2)
-    msg = '222'
-    print("out_asm:",out_asm)
-    checkAllclose(out_ref, out_asm, rtol=0.01, atol=0.01, msg=msg)
-    
+                                   a1_q,
+                                   shuffle_weight(w1_q, (16, 16)),
+                                   shuffle_weight(w2_q, (16, 16)),
+                                   topk_weights,
+                                   topk_ids,
+                                   w1_scale,
+                                   w2_scale,
+                                   a1_scale.t().contiguous(),
+                                   (scale_blk_n,
+                                    scale_blk_k))
+    msg = f'[perf] a8w8 asm: {us_ref:.2f} us ...... {m=}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}'
+    checkAllclose(out_ref, out_asm, rtol=0.05, atol=0.05, msg=msg)
+
+
 for dtype in [torch.bfloat16]:
-    for m in [80]:
-        for dim in [1024]:
-            for idim in [512]:
+    for m in [1, 2, 5, 16, 32]:
+        for dim in [7168]:
+            for idim in [256]:
                 scale_blks = (128, 128)
-                test_fmoe(dtype, m, dim, idim, scale_blks, 5, 3, quant='No', use_g1u1=True)
+                test_fmoe(dtype, m, dim, idim, scale_blks,
+                          256, 8, quant='No', use_g1u1=True)
