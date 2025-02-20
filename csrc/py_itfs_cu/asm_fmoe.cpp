@@ -653,7 +653,7 @@ void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim
         impl_ptr = &impl_320;
     }
     else
-        TORCH_CHECK(false, __func__, " Unsupported selectedTile " + std::to_string(selectedTile) + ", which should be divisible by 320 or 512");
+        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
 
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,
