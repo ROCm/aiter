@@ -381,38 +381,94 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     {
         if (selectedTile == 512)
         {
-            static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
-            impl_ptr = &impl_int8_512;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_512("fmoe_int8_g1u1_multix_subGU_512", "fmoe_int8_g1u1_multix_subGU_512.co", 512);
+                impl_ptr = &impl_int8_s_512;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
+                impl_ptr = &impl_int8_512;
+            }
         }
         else if (selectedTile == 448)
         {
-            static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
-            impl_ptr = &impl_int8_448;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_448("fmoe_int8_g1u1_multix_subGU_448", "fmoe_int8_g1u1_multix_subGU_448.co", 448);
+                impl_ptr = &impl_int8_s_448;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
+                impl_ptr = &impl_int8_448;
+            }
         }
         else if (selectedTile == 384)
         {
-            static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
-            impl_ptr = &impl_int8_384;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_384("fmoe_int8_g1u1_multix_subGU_384", "fmoe_int8_g1u1_multix_subGU_384.co", 384);
+                impl_ptr = &impl_int8_s_384;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
+                impl_ptr = &impl_int8_384;
+            }
         }
         else if (selectedTile == 320)
         {
-            static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
-            impl_ptr = &impl_int8_320;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_320("fmoe_int8_g1u1_multix_subGU_320", "fmoe_int8_g1u1_multix_subGU_320.co", 320);
+                impl_ptr = &impl_int8_s_320;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
+                impl_ptr = &impl_int8_320;
+            }
         }
         else if (selectedTile == 256)
         {
-            static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
-            impl_ptr = &impl_int8_256;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_256("fmoe_int8_g1u1_multix_subGU_256", "fmoe_int8_g1u1_multix_subGU_256.co", 256);
+                impl_ptr = &impl_int8_s_256;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
+                impl_ptr = &impl_int8_256;
+            }
         }
         else if (selectedTile == 192)
         {
-            static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
-            impl_ptr = &impl_int8_192;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_192("fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192);
+                impl_ptr = &impl_int8_s_192;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
+                impl_ptr = &impl_int8_192;
+            }
         }
         else if (selectedTile == 128)
         {
-            static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
-            impl_ptr = &impl_int8_128;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_128("fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128);
+                impl_ptr = &impl_int8_s_128;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
+                impl_ptr = &impl_int8_128;
+            }
         }
         else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
@@ -421,45 +477,94 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     {
         if (selectedTile == 512)
         {
-            static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
-            static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_512 : &impl_fp8_s_512;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
+                impl_ptr = &impl_fp8_s_512;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
+                impl_ptr = &impl_fp8_512;
+            }
         }
         else if (selectedTile == 448)
         {
-            static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
-            static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_448 : &impl_fp8_s_448;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
+                impl_ptr = &impl_fp8_s_448;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
+                impl_ptr = &impl_fp8_448;
+            }
         }
         else if (selectedTile == 384)
         {
-            static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
-            static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_384 : &impl_fp8_s_384;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
+                impl_ptr = &impl_fp8_s_384;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
+                impl_ptr = &impl_fp8_384;
+            }
         }
         else if (selectedTile == 320)
         {
-            static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
-            static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_320 : &impl_fp8_s_320;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
+                impl_ptr = &impl_fp8_s_320;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
+                impl_ptr = &impl_fp8_320;
+            }
         }
         else if (selectedTile == 256)
         {
-            static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
-            static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_256 : &impl_fp8_s_256;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
+                impl_ptr = &impl_fp8_s_256;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
+                impl_ptr = &impl_fp8_256;
+            }
         }
         else if (selectedTile == 192)
         {
-            static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
-            static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_192 : &impl_fp8_s_192;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
+                impl_ptr = &impl_fp8_s_192;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
+                impl_ptr = &impl_fp8_192;
+            }
         }
         else if (selectedTile == 128)
         {
-            static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
-            static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_128 : &impl_fp8_s_128;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
+                impl_ptr = &impl_fp8_s_128;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
+                impl_ptr = &impl_fp8_128;
+            }
         }
         else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
