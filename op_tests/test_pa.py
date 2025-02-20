@@ -139,8 +139,8 @@ def ref_masked_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
-    k_scale=1.0,
-    v_scale=1.0,
+    k_scale=torch.Tensor,  # [1] or [nhead, 1, seq_lenth]
+    v_scale=torch.Tensor,  # [1] or [nhead, 1, seq_lenth]
     attn_mask: Optional[torch.Tensor] = None,
     dtype=None
 ) -> torch.Tensor:
@@ -148,6 +148,7 @@ def ref_masked_attention(
     attn_weights = scale * \
         torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
+    # [nhead, q_len, ctx_len]
     attn_weights *= k_scale
 
     if attn_mask is not None:
@@ -156,11 +157,11 @@ def ref_masked_attention(
     attn_weights = torch.softmax(attn_weights, dim=-1)
 
     attn_weights *= v_scale
-    if v_scale != 1.0:
-        attn_weights, p_scale = aiter.per_tensor_quant(
-            attn_weights,  quant_dtype=torch.int8)
-        # attn_weights,  quant_dtype=key.dtype)
-        # attn_weights = attn_weights.float()*p_scale
+    # if v_scale != 1.0:
+    #     attn_weights, p_scale = aiter.per_tensor_quant(
+    #         attn_weights,  quant_dtype=torch.int8)
+    #     # attn_weights,  quant_dtype=key.dtype)
+    #     # attn_weights = attn_weights.float()*p_scale
 
     out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
     out *= p_scale
@@ -216,7 +217,7 @@ def pertoken_quant_kvcache_symm(
     return k_quant, k_scale, v_quant, v_scale, k_scale_asm, v_scale_asm
 
 
-@perftest(num_iters=5)
+@perftest(num_iters=2)
 def run_native(query,
                k_cache,
                v_cache,
@@ -227,8 +228,8 @@ def run_native(query,
                num_kv_heads,
                scale,
                alibi_slopes,
-               k_scale,
-               v_scale,
+               k_scale_cache,
+               v_scale_cache,
                num_queries_per_kv,
                dtype):
     output = torch.zeros_like(query).to(dtype)
@@ -250,16 +251,25 @@ def run_native(query,
     for i in range(num_seqs):
         q = query[i].unsqueeze(0)
         block_table = block_tables_lst[i]
-        seq_len = int(seq_lens_lst[i])
+        ctx_len = int(seq_lens_lst[i])
 
         idx = [int(block_table[j // block_size])*block_size+(j % block_size)
-               for j in range(seq_len)]
+               for j in range(ctx_len)]
         if k_cache.dtype == torch.float8_e4m3fnuz:
             keys = k_cache.view(torch.int8)[idx].view(torch.float8_e4m3fnuz)
             values = v_cache.view(torch.int8)[idx].view(torch.float8_e4m3fnuz)
         else:
             keys = k_cache[idx]
             values = v_cache[idx]
+        if k_scale_cache.numel() > 1:
+            k_scale = k_scale_cache[:, idx].contiguous().view(
+                num_kv_heads, 1, ctx_len)
+            v_scale = v_scale_cache[:, idx].contiguous().view(
+                num_kv_heads, 1, ctx_len)
+        else:
+            k_scale = k_scale_cache  # [1]
+            v_scale = v_scale_cache  # [1]
+
         if num_queries_per_kv > 1:
             # Handle MQA and GQA
             keys = torch.repeat_interleave(keys, num_queries_per_kv, dim=1)
@@ -268,8 +278,8 @@ def run_native(query,
         alibi_bias = None
         if alibi_slopes is not None:
             # Create the ALiBi bias used in the paged attention kernel.
-            position_ids = torch.arange(seq_len).int()
-            alibi_bias = (position_ids - seq_len + 1).float()
+            position_ids = torch.arange(ctx_len).int()
+            alibi_bias = (position_ids - ctx_len + 1).float()
             alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(
                 1, 1, -1)
 
@@ -633,50 +643,30 @@ def test_paged_attention(
             )
             checkAllclose(out_golden, out_aiter_asm,
                           msg=f'golden vs aiter_asm:{time_aiter_asm:.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})')
-            # if quant_algo == "KV_8BIT_PER_TOKEN":
-            #     if cache_type_ == torch.float8_e4m3fnuz:
-            #         tp = 'fp8'
-            #     elif cache_type_ == torch.int8:
-            #         tp = 'int8'
-            #     dump_input(
-            #         f'/mnt/raid0/ljin1/dk/ater/debug_ctx7_bs1_{tp}',
-            #         query,
-            #         k_quant_,
-            #         asm_V_shuffle(v_quant_),
-            #         block_tables,
-            #         seq_lens,
-            #         max_seq_len,
-            #         kv_cache_dtype,
-            #         num_kv_heads,
-            #         scale,
-            #         alibi_slopes,
-            #         k_scale_asm,
-            #         v_scale_asm,
-            #         out_golden,
-            #         out_aiter_asm)
-            if quant_algo == "KV_8BIT_PER_TENSOR":
-                q_quant_, q_scale_ = aiter.per_tensor_quant(
-                    query,  quant_dtype=cache_type_)
-                out_native, time_native = run_native(
-                    # query,
-                    q_quant_,
-                    k_quant_,
-                    v_quant_,
-                    block_tables,
-                    seq_lens,
-                    max_seq_len,
-                    kv_cache_dtype,
-                    num_kv_heads,
-                    # scale,
-                    scale*q_scale_.item(),
-                    alibi_slopes,
-                    k_scale_.item(),
-                    v_scale_.item(),
-                    num_queries_per_kv,
-                    dtype
-                )
-                checkAllclose(
-                    out_golden, out_native, msg=f'golden vs torch_native: {time_native:.2f} us...... (quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})')
+
+            # if quant_algo == "KV_8BIT_PER_TENSOR":
+            #     q_quant_, q_scale_ = aiter.per_tensor_quant(
+            #         query,  quant_dtype=cache_type_)
+            out_native, time_native = run_native(
+                query,
+                # q_quant_,
+                k_quant_,
+                v_quant_,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                kv_cache_dtype,
+                num_kv_heads,
+                scale,
+                # scale*q_scale_.item(),
+                alibi_slopes,
+                k_scale_,
+                v_scale_,
+                num_queries_per_kv,
+                dtype
+            )
+            checkAllclose(
+                out_golden, out_native, msg=f'golden vs torch_native: {time_native:.2f} us...... (quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})')
 
     if debug_mode == DUMP:
         dump_input(query,

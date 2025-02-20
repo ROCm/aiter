@@ -73,6 +73,7 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     ret = []
     for el in els:
         if not os.path.exists(el):
+            logger.warning(f'---> {el} not exists!!!!!!')
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
@@ -141,7 +142,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             flags_hip += ["-mllvm", "-enable-post-misched=0"]
         if hip_version > Version('6.2.41132'):
             flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
-                        "-mllvm", "-amdgpu-function-calls=false"]
+                          "-mllvm", "-amdgpu-function-calls=false"]
         if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
             flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
