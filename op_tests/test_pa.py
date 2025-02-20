@@ -139,8 +139,9 @@ def ref_masked_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
-    k_scale=torch.Tensor,  # [1] or [nhead, 1, seq_lenth]
-    v_scale=torch.Tensor,  # [1] or [nhead, 1, seq_lenth]
+    nkvhead,
+    k_scale=torch.Tensor,  # [1] or [nkvhead, 1, seq_lenth]
+    v_scale=torch.Tensor,  # [1] or [nkvhead, 1, seq_lenth]
     attn_mask: Optional[torch.Tensor] = None,
     dtype=None
 ) -> torch.Tensor:
@@ -148,15 +149,20 @@ def ref_masked_attention(
     attn_weights = scale * \
         torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
-    # [nhead, q_len, ctx_len]
+    # [nqhead, q_len, ctx_len]
+    nqhead, q_len, ctx_len = attn_weights.shape
+    attn_weights = attn_weights.view(nqhead//nkvhead, nkvhead, q_len, ctx_len)
     attn_weights *= k_scale
+    attn_weights = attn_weights.view(nqhead, q_len, ctx_len)
 
     if attn_mask is not None:
         attn_weights = attn_weights + attn_mask.float()
 
     attn_weights = torch.softmax(attn_weights, dim=-1)
 
+    attn_weights = attn_weights.view(nqhead//nkvhead, nkvhead, q_len, ctx_len)
     attn_weights *= v_scale
+    attn_weights = attn_weights.view(nqhead, q_len, ctx_len)
     # if v_scale != 1.0:
     #     attn_weights, p_scale = aiter.per_tensor_quant(
     #         attn_weights,  quant_dtype=torch.int8)
@@ -284,8 +290,9 @@ def run_native(query,
                 1, 1, -1)
 
         out = ref_masked_attention(q, keys, values, scale,
-                                   k_scale,
-                                   v_scale, alibi_bias, dtype)
+                                   num_kv_heads,
+                                   k_scale, v_scale,
+                                   alibi_bias, dtype)
         out = out.view(num_query_heads, head_size)
         output[i].copy_(out, non_blocking=True)
     return output  # , 1
