@@ -9,52 +9,52 @@ import itertools
 
 
 @perftest()
-def hip_rope_fwd(input, freqs, transpose_output):
-    return aiter.rope_fwd(input, freqs, transpose_output)
+def hip_rope_fwd(input, freqs, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_fwd(input, freqs, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_bwd(output_grads, freqs, transpose_output):
-    return aiter.rope_bwd(output_grads, freqs, transpose_output)
+def hip_rope_bwd(output_grads, freqs, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_bwd(output_grads, freqs, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_2c_fwd(input_x, input_y, freqs, transpose_output):
-    return aiter.rope_2c_fwd(input_x, input_y, freqs, transpose_output)
+def hip_rope_2c_fwd(input_x, input_y, freqs, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_2c_fwd(input_x, input_y, freqs, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_2c_bwd(output_grads_x, output_grads_y, freqs, transpose_output):
-    return aiter.rope_2c_bwd(output_grads_x, output_grads_y, freqs, transpose_output)
+def hip_rope_2c_bwd(output_grads_x, output_grads_y, freqs, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_2c_bwd(output_grads_x, output_grads_y, freqs, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_cached_fwd(input, cos, sin, transpose_output):
-    return aiter.rope_cached_fwd(input, cos, sin, transpose_output)
+def hip_rope_cached_fwd(input, cos, sin, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_cached_fwd(input, cos, sin, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_cached_bwd(output_grads, cos, sin, transpose_output):
-    return aiter.rope_cached_bwd(output_grads, cos, sin, transpose_output)
+def hip_rope_cached_bwd(output_grads, cos, sin, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_cached_bwd(output_grads, cos, sin, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output):
-    return aiter.rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output)
+def hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_cached_2c_fwd(input_x, input_y, cos, sin, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, transpose_output):
-    return aiter.rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, transpose_output)
+def hip_rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, reuse_freqs_front_part, transpose_output)
 
 @perftest()
-def hip_rope_thd_fwd(input, cu_seqlens, freqs):
-    return aiter.rope_thd_fwd(input, cu_seqlens, freqs)
+def hip_rope_thd_fwd(input, cu_seqlens, freqs, reuse_freqs_front_part):
+    return aiter.rope_thd_fwd(input, cu_seqlens, freqs, reuse_freqs_front_part)
 
 @perftest()
-def hip_rope_thd_bwd(output_grads, cu_seqlens, freqs):
-    return aiter.rope_thd_bwd(output_grads, cu_seqlens, freqs)
+def hip_rope_thd_bwd(output_grads, cu_seqlens, freqs, reuse_freqs_front_part):
+    return aiter.rope_thd_bwd(output_grads, cu_seqlens, freqs, reuse_freqs_front_part)
 
 @perftest()
-def hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w):
-    return aiter.rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
+def hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freqs_front_part):
+    return aiter.rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freqs_front_part)
 
 @perftest()
-def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w):
-    return aiter.rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w)
+def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freqs_front_part):
+    return aiter.rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freqs_front_part)
 
 
 def rotate_half(x):
@@ -98,10 +98,10 @@ def test_rope_sbhd(input, freqs, grad, transpose_output):
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
-    hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, transpose_output)
-    hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, transpose_output)
-    hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(input, cos, sin, transpose_output)
-    hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, transpose_output)
+    hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, False, transpose_output)
+    hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, False, transpose_output)
+    hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(input, cos, sin, False, transpose_output)
+    hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, False, transpose_output)
 
     checkAllclose(ref,        hip_fwd,        msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_bwd,        msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
@@ -123,10 +123,10 @@ def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, transpose_output)
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
-    (hip_fwd_x, hip_fwd_y), hip_fwd_avg = hip_rope_2c_fwd(input_x, input_y, freqs, transpose_output)
-    (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, transpose_output)
-    (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, transpose_output)
-    (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, transpose_output)
+    (hip_fwd_x, hip_fwd_y), hip_fwd_avg = hip_rope_2c_fwd(input_x, input_y, freqs, False, transpose_output)
+    (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, False, transpose_output)
+    (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, False, transpose_output)
+    (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, False, transpose_output)
 
     checkAllclose(ref_x,        hip_fwd_x,        msg=f"rope_2c_fwd_x - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_y,        hip_fwd_y,        msg=f"rope_2c_fwd_y - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
@@ -146,8 +146,8 @@ def test_rope_thd(input, cu_seqlens, freqs, grad):
     ref = ref_rope_thd_fwd(input, cu_seqlens, freqs)
     ref.backward(grad)
 
-    hip_fwd, hip_fwd_avg = hip_rope_thd_fwd(input, cu_seqlens, freqs)
-    hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs)
+    hip_fwd, hip_fwd_avg = hip_rope_thd_fwd(input, cu_seqlens, freqs, False)
+    hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs, False)
 
     checkAllclose(ref,        hip_fwd, msg=f"rope_thd_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_bwd, msg=f"rope_thd_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
@@ -164,8 +164,8 @@ def test_rope_2d(input, height, width, freqs_h, freqs_w, grad):
     ref = ref_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w)
     ref.backward(grad)
 
-    hip_fwd, hip_fwd_avg = hip_rope_2d_fwd(input, cos_h, sin_h, cos_w, sin_w, height, width)
-    hip_bwd, hip_bwd_avg = hip_rope_2d_bwd(grad, cos_h, sin_h, cos_w, sin_w, height, width)
+    hip_fwd, hip_fwd_avg = hip_rope_2d_fwd(input, cos_h, sin_h, cos_w, sin_w, height, width, False)
+    hip_bwd, hip_bwd_avg = hip_rope_2d_bwd(grad, cos_h, sin_h, cos_w, sin_w, height, width, False)
 
     checkAllclose(ref,        hip_fwd, msg=f"rope_2d_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_bwd, msg=f"rope_2d_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
