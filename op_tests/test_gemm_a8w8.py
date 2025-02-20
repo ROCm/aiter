@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from .utils import DefaultBenchmarkHook, check_all_close, rand_tensor
+from .utils import check_all_close, rand_tensor
 
 MNK = [
     # qkv_proj
@@ -102,9 +102,7 @@ def test_ck_gemm_close_to_torch(
         use_bias,
     )
 
-    _, output = benchmark(
-        DefaultBenchmarkHook(aiter.gemm_a8w8_CK, a, b, a_scale, b_scale, bias, out_dtype)
-    )
+    output = benchmark(100, 10, False, aiter.gemm_a8w8_CK, a, b, a_scale, b_scale, bias, out_dtype)
     expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
 
     check_all_close(output, expected, rtol=rtol, atol=atol)
@@ -126,9 +124,7 @@ def test_asm_gemm_close_to_torch(benchmark, mnk: tuple[int, int, int]) -> None:
     )
     b_shuffled= shuffle_weight(b, layout=(32, 16))
 
-    _, output = benchmark(
-        DefaultBenchmarkHook(aiter.gemm_a8w8_ASM, a, b_shuffled, a_scale, b_scale, bias)
-    )
+    output = benchmark(100, 10, False, aiter.gemm_a8w8_ASM, a, b_shuffled, a_scale, b_scale, bias)
     expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
     if output is not None and torch.sum(output.isnan()==True) == 0:
         check_all_close(output, expected, rtol=rtol, atol=atol)
