@@ -11,11 +11,31 @@ from .utils import DefaultBenchmarkHook, check_all_close, rand_tensor
 MNK = [
     # qkv_proj
     (1, 1280, 8192),
+    (32, 1280, 8192),
+    (64, 1280, 8192),
+    (128, 1280, 8192),
+    (192, 1280, 8192),
+    (256, 1280, 8192),
+    (320, 1280, 8192),
     (512, 1280, 8192),
+    (1024, 1280, 8192),
+    (2048, 1280, 8192),
+    (4096, 1280, 8192),
+    (8192, 1280, 8192),
     (16384, 1280, 8192),
     # attn_out
     (1, 8192, 1024),
+    (32, 8192, 1024),
+    (64, 8192, 1024),
+    (128, 8192, 1024),
+    (192, 8192, 1024),
+    (256, 8192, 1024),
+    (320, 8192, 1024),
     (512, 8192, 1024),
+    (1024, 8192, 1024),
+    (2048, 8192, 1024),
+    (4096, 8192, 1024),
+    (8192, 8192, 1024),
     (16384, 8192, 1024),
 ]
 
@@ -47,11 +67,11 @@ def setup(
 ) -> tuple[torch.tensor, ...]:
     
     m, n, k = mnk
-    a = rand_tensor(shape=(m, k), dtype=ab_dtype).cuda()
-    b = rand_tensor(shape=(n, k), dtype=ab_dtype).cuda()
-    a_scale = rand_tensor(shape=(m, 1), dtype=scales_dtype).cuda() + 1e-6
-    b_scale = rand_tensor(shape=(1, n), dtype=scales_dtype).cuda() + 1e-6
-    bias = (rand_tensor(shape=[1, n], dtype=torch.bfloat16).cuda()).to(dtype=bias_dtype) if use_bias else None
+    a = rand_tensor(size=(m, k), dtype=ab_dtype).cuda()
+    b = rand_tensor(size=(n, k), dtype=ab_dtype).cuda()
+    a_scale = rand_tensor(size=(m, 1), dtype=scales_dtype).cuda() + 1e-6
+    b_scale = rand_tensor(size=(1, n), dtype=scales_dtype).cuda() + 1e-6
+    bias = (rand_tensor(size=(1, n), dtype=bias_dtype).cuda()) if use_bias else None
     return a, b, a_scale, b_scale, bias
 
 @pytest.mark.parametrize("mnk", MNK)

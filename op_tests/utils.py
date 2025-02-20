@@ -1,7 +1,6 @@
 from functools import partial
 import numpy as np
 import os
-import pandas as pd
 import torch
 import torch.profiler as tpf
 from typing import Callable, Generic, TypeVar
@@ -89,49 +88,36 @@ delta details: {percent:.1%} ({num_not_close} of {a.numel()}) elements
         """
     assert is_close.all(), message
 
-def get_trace_perf(prof, num_iters):
-    # TODO: clean up
-    assert (num_iters > 1)
-    num_iters -= 1
-    df = []
-    cols = ['name', 'self_cpu_time_total', 'self_device_time_total',
-            'device_type', 'device_index',]
-    for el in prof.events():
-        df.append([getattr(el, x, None) for x in cols])
-    df = pd.DataFrame(df, columns=cols)
-    df['cnt'] = 1
-    rets = []
-    for name, d in df.groupby('name', sort=False):
-        r = d.iloc[1:][['cnt',
-                        'self_cpu_time_total',
-                        'self_device_time_total']].sum()
-        if not r.empty:
-            device_type = str(d['device_type'].iat[0]).split('.')[-1]
-            r['name'] = name
-            r['device_type'] = device_type
-            r['device_index'] = str(d['device_index'].iat[0])
-            if device_type == 'CUDA':
-                r['device_time_total'] = r['self_device_time_total']
-                r['host_time_total'] = 0
-            else:
-                r['host_time_total'] = r['self_device_time_total']
-                r['device_time_total'] = 0
+def extract_avg_cuda_time_trace(torch_profiler: torch.profiler) -> float:
+    """
+    Extract the average CUDA time from a PyTorch profiler trace.
 
-        rets.append(r)
-    df = pd.DataFrame(rets)
+    This function calculates the mean of the self device time for all CUDA events
+    in the profiler trace, excluding the first event.
 
-    cols = ['name', 'cnt', 'host_time_total', 'device_time_total',
-            'device_type', 'device_index',]
-    cols = [el for el in cols if el in df.columns]
-    df = df[(df.host_time_total > 0) | (df.device_time_total > 0)]
+    Parameters
+    ----------
+        torch_profiler : torch.profiler
+            A PyTorch profiler object containing trace events.
 
-    timerList = ['host_time_total', 'device_time_total', ]
-    df = df[cols].sort_values(timerList, ignore_index=True)
-    avg_name = '[avg us/iter]'
-    for el in timerList:
-        df.at[avg_name, el] = df[el].sum()/num_iters
-    return df.at[avg_name, 'device_time_total']
-
+    Returns
+    -------
+        float: The average CUDA time across all CUDA events, or 0.0 if there are
+               insufficient events or no CUDA events.
+    """
+    get_cuda_total_time = lambda event: getattr(event, "self_device_time_total", 0.0)
+    is_cuda = lambda event: getattr(event, "device_type", None) == torch.profiler.DeviceType.CUDA
+    
+    if len(torch_profiler.events()) <=1:
+        return 0.0
+    
+    return np.mean(
+        [
+            get_cuda_total_time(event)
+            for event in torch_profiler.events()[1:]
+            if is_cuda(event) 
+        ]
+    )
 
 def execute_callback(
     num_iterations: int,
@@ -235,7 +221,7 @@ def profile(
     
     # Profile using cuda.Event
     # Note: The use of AITER_LOG_MORE variable 
-    # is temporary (as we shift to using pytest)
+    # is temporary (until we completly shift to using pytest)
     # and should be replaced with a more descriptive
     # flag.
     if int(os.environ.get('AITER_LOG_MORE', 0)):
@@ -255,8 +241,7 @@ def profile(
     ) as prof:
         execute_callback(num_iterations, func, *args, **kwargs)
 
-    average_latency = get_trace_perf(prof, num_iterations)
-
+    average_latency = extract_avg_cuda_time_trace(prof)
     return average_latency, result
 
 def profile_cuda_graph(
