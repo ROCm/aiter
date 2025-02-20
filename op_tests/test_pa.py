@@ -217,7 +217,7 @@ def pertoken_quant_kvcache_symm(
     return k_quant, k_scale, v_quant, v_scale, k_scale_asm, v_scale_asm
 
 
-@perftest(num_iters=5)
+@perftest(num_iters=2)
 def run_native(query,
                k_cache,
                v_cache,
@@ -278,8 +278,8 @@ def run_native(query,
         alibi_bias = None
         if alibi_slopes is not None:
             # Create the ALiBi bias used in the paged attention kernel.
-            position_ids = torch.arange(seq_len).int()
-            alibi_bias = (position_ids - seq_len + 1).float()
+            position_ids = torch.arange(ctx_len).int()
+            alibi_bias = (position_ids - ctx_len + 1).float()
             alibi_bias = alibi_slopes.view(-1, 1, 1) * alibi_bias.view(
                 1, 1, -1)
 
