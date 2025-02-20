@@ -1,8 +1,10 @@
 from functools import partial
+import numpy as np
+import os
 import pandas as pd
 import torch
 import torch.profiler as tpf
-from typing import Any, Callable, Generic, TypeVar
+from typing import Callable, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -10,7 +12,7 @@ MAX_RAND_INT = 20
 MIN_RAND_INT = -20
 
 def rand_tensor(
-    shape: tuple[int, int],
+    size: torch.Size,
     dtype: torch.dtype
 ) -> torch.tensor:
     """
@@ -19,32 +21,31 @@ def rand_tensor(
     - For integer types: Uses torch.randint to generate random integers within a fixed range.
     - For float types: Uses torch.rand to generate random floats between 0 and 1.
 
-    Parameters:
-    -----------
-    shape : tuple[int, int]
-        The shape of the output tensor. Must be a tuple of two integers.
-    dtype : torch.dtype
-        The desired data type of the output tensor.
+    Parameters
+    ----------
+    size: torch.Size
+        The size of the generated tensor.
+    dtype: torch.dtype
+        The data type of the generated tensor.
 
-    Returns:
-    --------
-    torch.Tensor
-        A random tensor of the specified shape and data type.
-
-    Raises:
+    Returns
     -------
+    torch.Tensor : A random tensor of the specified shape and data type.
+
+    Raises
+    ------
     ValueError
         If an unsupported data type is provided.
     """
     if dtype in [torch.int8, torch.int16, torch.int32, torch.int64]:
         # For integer types, use randint
-        return torch.randint(MIN_RAND_INT, MAX_RAND_INT, shape, dtype=dtype)
+        return torch.randint(MIN_RAND_INT, MAX_RAND_INT, size=size, dtype=dtype)
     elif dtype in [torch.float16, torch.float32, torch.float64, torch.bfloat16]:
         # For float types, use rand
-        return torch.rand(shape, dtype=dtype)
+        return torch.rand(size=size, dtype=dtype)
     elif dtype == torch.float8_e4m3fnuz:
         # Special case for float8_e4m3fnuz
-        return torch.rand(shape, dtype=torch.float16).to(torch.float8_e4m3fnuz)
+        return torch.rand(size=size, dtype=torch.float16).to(torch.float8_e4m3fnuz)
 
     raise ValueError(f"Unsupported dtype: {dtype}")
 
@@ -56,19 +57,19 @@ def check_all_close(
 ) -> None:
     """
     Check if all elements in two tensors are close within specified tolerances.
-
-    Parameters:
-    -----------
-    a : torch.Tensor
+    
+    Parameters
+    ----------
+    a: torch.tensor
         First input tensor.
-    b : torch.Tensor
-        Second input tensor to compare with 'a'.
-    rtol : float
-        Relative tolerance.
-    atol : float
-        Absolute tolerance.
+    b: torch.tensor
+        Second input tensor.
+    rtol: float
+        Relative tolerence.
+    atol: float
+        Absolute tolerence.
 
-    Raises:
+    Raises
     -------
     AssertionError
         If any elements in 'a' and 'b' are not close within the specified tolerances.
@@ -131,16 +132,70 @@ def get_trace_perf(prof, num_iters):
         df.at[avg_name, el] = df[el].sum()/num_iters
     return df.at[avg_name, 'device_time_total']
 
-def execute_callback(num_iterations: int, func: Callable[..., T], *args, **kwargs) -> T:
-    """"
-    Execute a function multiple times and return the result of the last execution.
 
-    Returns:
-        T: The result of the last function execution.
+def execute_callback(
+    num_iterations: int,
+    func: Callable[..., T],
+    *args,
+    **kwargs
+) -> T:
+    """
+    Executes a callback for a given number of iterations.
+
+    Parameters
+    ----------
+        num_iterations : int.
+            The number of iterations to use for profiling the callback.
+        func : Callable[..., T].
+            A callback function with arbitrary arguments to be executed.
+        *args
+            Variable length argument list for the callback function.
+        **kwargs
+            Keyword arguments for the callback function.
+
+    Returns
+    -------
+        T: The last value returned by the callback function.
     """
     for _ in range(num_iterations):
         result = func(*args, **kwargs)
     return result
+
+def time_callback_with_cuda_event(
+    num_iterations: int,
+    func: Callable[..., T],
+    *args,
+    **kwargs
+) -> float:
+    """
+    Measure the average execution time of a given function using CUDA
+    events in milliseconds.
+    
+    Parameters
+    ----------
+        num_iterations : int.
+            The number of iterations to use for profiling the callback.
+        func : Callable[..., T].
+            A callback function with arbitrary arguments to be executed.
+        *args
+            Variable length argument list for the callback function.
+        **kwargs
+            Keyword arguments for the callback function.
+    Returns
+    -------
+        float: The average execution time in milliseconds over all iterations.
+    """
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    latency_list = []
+    for _ in range(num_iterations):
+        start_event.record()
+        func(*args, **kwargs)
+        end_event.record()
+        end_event.synchronize()
+        latency = start_event.elapsed_time(end_event)
+        latency_list.append(latency)
+    return np.mean(latency_list)
 
 def profile(
     num_iterations: int,
@@ -148,20 +203,47 @@ def profile(
     func: Callable[..., T],
     *args,
     **kwargs
-) -> T:
+) -> tuple[float, T]:
     """
     Profile the execution of a function using PyTorch Profiler.
 
     This function performs warmup iterations, then profiles the actual execution
     of the function for a specified number of iterations.
+    
+    Parameters
+    ----------
+        num_iterations : int.
+            The number of iterations to use for profiling the callback.
+        num_warmup_iterations : int.
+            The number of iterations to use for warmup before profiling the callback.
+        func : Callable[..., T].
+            A callback function with arbitrary arguments to be executed.
+        *args
+            Variable length argument list for the callback function.
+        **kwargs
+            Keyword arguments for the callback function.
 
-    Returns:
+    Returns
+    -------
         tuple[float, T]: A tuple containing:
-            - float: The average execution time.
+            - float: The average execution time in milliseconds.
             - T: The result of the last function execution.
     """
+
     #  warmup
-    execute_callback(num_warmup_iterations, func, *args, **kwargs)
+    result = execute_callback(num_warmup_iterations, func, *args, **kwargs)
+    
+    # Profile using cuda.Event
+    # Note: The use of AITER_LOG_MORE variable 
+    # is temporary (as we shift to using pytest)
+    # and should be replaced with a more descriptive
+    # flag.
+    if int(os.environ.get('AITER_LOG_MORE', 0)):
+        average_latency = time_callback_with_cuda_event(
+            num_iterations, func, *args, **kwargs)
+        return average_latency, result
+    
+    # Profile using torch.profiler 
     with tpf.profile(
         activities=[
             tpf.ProfilerActivity.CPU,
@@ -171,9 +253,11 @@ def profile(
         with_stack=True,
         with_modules=True,
     ) as prof:
-        result = execute_callback(num_iterations, func, *args, **kwargs)
+        execute_callback(num_iterations, func, *args, **kwargs)
 
-    return get_trace_perf(prof, num_iterations), result
+    average_latency = get_trace_perf(prof, num_iterations)
+
+    return average_latency, result
 
 def profile_cuda_graph(
     num_iterations: int,
@@ -181,16 +265,30 @@ def profile_cuda_graph(
     func: Callable[..., T],
     *args,
     **kwargs
-) -> T:
+) -> tuple[float, T]:
     """
     Profile the execution of a function using CUDA Graph and PyTorch Profiler.
 
     This function creates a CUDA Graph for the given function, then profiles its
     execution using the standard profile function.
 
-    Returns:
+    Parameters
+    ----------
+        num_iterations : int.
+            The number of iterations to use for profiling the callback.
+        num_warmup_iterations : int.
+            The number of iterations to use for warmup before profiling the callback.
+        func : Callable[..., T].
+            A callback function with arbitrary arguments to be executed.
+        *args
+            Variable length argument list for the callback function.
+        **kwargs
+            Keyword arguments for the callback function.
+
+    Returns
+    -------
         tuple[float, T]: A tuple containing:
-            - float: The average execution time or other performance metric.
+            - float: The average execution time in milliseconds.
             - T: The result of the last function execution.
     """
     graph = torch.cuda.CUDAGraph()
@@ -210,8 +308,8 @@ class BenchmarkHook(Generic[T]):
     ----------------
     T : The return type of the function being benchmarked.
 
-    Attributes:
-    -----------
+    Attributes
+    ----------
     num_iterations : int
         The number of times the function will be executed during benchmarking.
     num_warmup_iterations : int
@@ -224,14 +322,14 @@ class BenchmarkHook(Generic[T]):
     kwargs : dict
         Keyword arguments to be passed to the benchmarked function.
 
-    Methods:
-    --------
+    Methods
+    -------
     __call__() -> tuple[float, T]
         Executes the benchmarking process and returns a tuple containing
         the execution time and the result of the benchmarked function.
 
-    Usage:
-    ------
+    Usage
+    -----
     def test_example(benchmark):
         def function_to_benchmark(x: int) -> int:
             return x * 2
@@ -280,6 +378,7 @@ class BenchmarkHook(Generic[T]):
             *self.args,
             **self.kwargs
         )
-
+    
+# Define some BenchmarkHook partials for conveniance
 DefaultBenchmarkHook = partial(BenchmarkHook, 100, 10, False)
 DefaultCudaGraphBenchmarkHook = partial(BenchmarkHook, 100, 10, True)
