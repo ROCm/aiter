@@ -281,7 +281,7 @@
     },
     "module_aiter_operator": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/binary_operator_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/aiter_operator_pybind.cu'",
             "f'{AITER_CSRC_DIR}/include/aiter_operator.h'",
             "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'",
             "f'{AITER_CSRC_DIR}/kernels/unary_operator.cu'"
