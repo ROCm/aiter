@@ -11,8 +11,13 @@ void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           int64_t block_size, torch::Tensor sorted_token_ids,
                           torch::Tensor experts_ids,
-                          torch::Tensor token_nums,
                           torch::Tensor num_tokens_post_pad);
+
+void sgl_moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+                            int64_t block_size,
+                            torch::Tensor sorted_token_ids,
+                            torch::Tensor experts_ids,
+                            torch::Tensor num_tokens_post_pad);
 
 void fmoe(torch::Tensor &out,                    // [token_cnt, dim]
           torch::Tensor &input,                  // [token_cnt, dim] M,K

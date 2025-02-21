@@ -10,6 +10,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("moe_align_block_size", &moe_align_block_size,
             "Aligning the number of tokens to be processed by each expert such "
             "that it is divisible by the block size.");
+      m.def("sgl_moe_align_block_size", &sgl_moe_align_block_size,
+            "Aligning the number of tokens to be processed by each expert such "
+            "that it is divisible by the block size.");
       m.def("fmoe", &fmoe);
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);
       m.def("fmoe_g1u1", &fmoe_g1u1,
