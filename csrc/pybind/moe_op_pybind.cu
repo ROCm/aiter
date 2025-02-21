@@ -22,5 +22,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("fc2_smooth_scale") = std::nullopt);
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);
+      m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,
+            py::arg("out"), py::arg("input"),
+            py::arg("gate"), py::arg("down"),
+            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),
+            py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),
+            py::arg("topk"),
+            py::arg("fc1_scale"), py::arg("fc2_scale"),
+            py::arg("input_scale"),
+            py::arg("fc_scale_blkn") = 128, py::arg("fc_scale_blkk") = 128,
+            py::arg("fc2_smooth_scale") = std::nullopt);
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 }

@@ -12,6 +12,7 @@ if importlib.util.find_spec('hipbsolidxgemm_') is not None:
     from hipbsolidxgemm_ import *
 if importlib.util.find_spec('rocsolidxgemm_') is not None:
     from rocsolidxgemm_ import *
+from .ops.mha import *
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
@@ -26,6 +27,7 @@ from .ops.pos_encoding import *
 from .ops.cache import *
 from .ops.rmsnorm import *
 from .ops.communication import *
+from .ops.rope import *
 
 
 def getLogger():

@@ -2,15 +2,15 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 
-#define HIP_CALL(call)                                                                  \
-    do                                                                                  \
-    {                                                                                   \
-        hipError_t err = call;                                                          \
-        if (err != hipSuccess)                                                          \
-        {                                                                               \
-            printf("[HIP error](%s) fail to call %s\n", hipGetErrorString(err), #call); \
-            exit(0);                                                                    \
-        }                                                                               \
+#define HIP_CALL(call)                                                                      \
+    do                                                                                      \
+    {                                                                                       \
+        hipError_t err = call;                                                              \
+        if (err != hipSuccess)                                                              \
+        {                                                                                   \
+            printf("\n[AITER] fail to call %s... [HIP error](%s)\n", #call, hipGetErrorString(err)); \
+            exit(0);                                                                        \
+        }                                                                                   \
     } while (0)
 
 struct p3

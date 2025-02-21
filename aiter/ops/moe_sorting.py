@@ -19,4 +19,5 @@ def moe_sorting_fwd(topk_ids: Tensor,
                     total_tokens_post_pad: Tensor,
                     moe_buf: Tensor,
                     num_experts: int,
-                    unit_size: int): ...
+                    unit_size: int,
+                    local_expert_mask: Optional[Tensor]=None): ...

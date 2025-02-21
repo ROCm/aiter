@@ -61,6 +61,13 @@ def run_iters(num_iters, func, *args, **kwargs):
     return data
 
 
+def run_perftest(func, *args, num_iters=101, num_warmup=10, **kwargs):
+    @perftest(num_iters=num_iters, num_warmup=num_warmup)
+    def worker():
+        return func(*args, **kwargs)
+    return worker()
+
+
 def get_trace_perf(prof, num_iters):
     assert (num_iters > 1)
     num_iters -= 1
@@ -111,6 +118,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
     mask = ~isClose
     if isClose.all():
         logger.info(f'{msg}[checkAllclose {atol=} {rtol=} passed~]')
+        return True
     else:
         num = mask.sum()
         printNum = min(printNum, num)
@@ -122,13 +130,14 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
            {a[mask][:printNum]}
     b    : {b.shape}
            {b[mask][:printNum]}
-    dtlta:
+    delta:
            {delta[:printNum]}''')
         else:
             logger.info(
                 f'''{msg}[checkAllclose {atol=} {rtol=} waring!] a and b results are not all close''')
         logger.info(
             f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements')
+        return False
 
 
 def tensor_dump(x: torch.tensor, name: str, dir='./'):

@@ -110,14 +110,14 @@ public:
         int stride_D = inter_dim * I_elemSize;
         int stride_expert_GU = stride_GU * inter_dim;
         int stride_expert_D = stride_D * dim;
-        int stride_expert_GUDQN = inter_dim * sizeof(float);
-        int stride_expert_DDQN = dim * sizeof(float);
+        int stride_expert_GUDQN = w1_dqn.has_value() ? w1_dqn.value().size(1) * sizeof(float) : 0;
+        int stride_expert_DDQN = w2_dqn.has_value() ? w2_dqn.value().size(1) * sizeof(float) : 0;
         int stride_expert_SMTDQN = inter_dim * sizeof(float);
         int stride_O = dim * O_elemSize;
         if (inter_dim * 2 == w1.size(1))
         {
             stride_expert_GU *= 2;
-            stride_expert_GUDQN *= 2;
+            // stride_expert_GUDQN *= 2;
         }
 
         KernelArgs args;
@@ -159,6 +159,14 @@ public:
         args.eSMQs = stride_expert_SMTDQN;
         args.topk = topk;
 
+        void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
+                          &arg_size, HIP_LAUNCH_PARAM_END};
+
+        int bdx = 256;
+        int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
+        int gdy = sub_X_cnt;
+        int gdz = 1;
+
         // std::cout << "args.dim: " << args.dim << std::endl;
         // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
         // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
@@ -173,14 +181,9 @@ public:
         // std::cout << "args.stride_expert_DDQN: " << args.eDQs << std::endl;
         // std::cout << "args.stride_expert_SMTDQN: " << args.eSMQs << std::endl;
         // std::cout << "args.topk: " << args.topk << std::endl;
+        // std::cout << "gdx: " << gdx << std::endl;
+        // std::cout << "gdy: " << gdy << std::endl;
 
-        void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, &args, HIP_LAUNCH_PARAM_BUFFER_SIZE,
-                          &arg_size, HIP_LAUNCH_PARAM_END};
-
-        int bdx = 256;
-        int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
-        int gdy = sub_X_cnt;
-        int gdz = 1;
         const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
         const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
         if constexpr (switchGxy)
@@ -378,38 +381,94 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     {
         if (selectedTile == 512)
         {
-            static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
-            impl_ptr = &impl_int8_512;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_512("fmoe_int8_g1u1_multix_subGU_512", "fmoe_int8_g1u1_multix_subGU_512.co", 512);
+                impl_ptr = &impl_int8_s_512;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
+                impl_ptr = &impl_int8_512;
+            }
         }
         else if (selectedTile == 448)
         {
-            static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
-            impl_ptr = &impl_int8_448;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_448("fmoe_int8_g1u1_multix_subGU_448", "fmoe_int8_g1u1_multix_subGU_448.co", 448);
+                impl_ptr = &impl_int8_s_448;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
+                impl_ptr = &impl_int8_448;
+            }
         }
         else if (selectedTile == 384)
         {
-            static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
-            impl_ptr = &impl_int8_384;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_384("fmoe_int8_g1u1_multix_subGU_384", "fmoe_int8_g1u1_multix_subGU_384.co", 384);
+                impl_ptr = &impl_int8_s_384;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
+                impl_ptr = &impl_int8_384;
+            }
         }
         else if (selectedTile == 320)
         {
-            static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
-            impl_ptr = &impl_int8_320;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_320("fmoe_int8_g1u1_multix_subGU_320", "fmoe_int8_g1u1_multix_subGU_320.co", 320);
+                impl_ptr = &impl_int8_s_320;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
+                impl_ptr = &impl_int8_320;
+            }
         }
         else if (selectedTile == 256)
         {
-            static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
-            impl_ptr = &impl_int8_256;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_256("fmoe_int8_g1u1_multix_subGU_256", "fmoe_int8_g1u1_multix_subGU_256.co", 256);
+                impl_ptr = &impl_int8_s_256;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
+                impl_ptr = &impl_int8_256;
+            }
         }
         else if (selectedTile == 192)
         {
-            static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
-            impl_ptr = &impl_int8_192;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_192("fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192);
+                impl_ptr = &impl_int8_s_192;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
+                impl_ptr = &impl_int8_192;
+            }
         }
         else if (selectedTile == 128)
         {
-            static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
-            impl_ptr = &impl_int8_128;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_int8_s_128("fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128);
+                impl_ptr = &impl_int8_s_128;
+            }
+            else
+            {
+                static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
+                impl_ptr = &impl_int8_128;
+            }
         }
         else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
@@ -418,45 +477,94 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     {
         if (selectedTile == 512)
         {
-            static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
-            static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_512 : &impl_fp8_s_512;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
+                impl_ptr = &impl_fp8_s_512;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
+                impl_ptr = &impl_fp8_512;
+            }
         }
         else if (selectedTile == 448)
         {
-            static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
-            static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_448 : &impl_fp8_s_448;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
+                impl_ptr = &impl_fp8_s_448;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
+                impl_ptr = &impl_fp8_448;
+            }
         }
         else if (selectedTile == 384)
         {
-            static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
-            static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_384 : &impl_fp8_s_384;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
+                impl_ptr = &impl_fp8_s_384;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
+                impl_ptr = &impl_fp8_384;
+            }
         }
         else if (selectedTile == 320)
         {
-            static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
-            static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_320 : &impl_fp8_s_320;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
+                impl_ptr = &impl_fp8_s_320;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
+                impl_ptr = &impl_fp8_320;
+            }
         }
         else if (selectedTile == 256)
         {
-            static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
-            static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_256 : &impl_fp8_s_256;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
+                impl_ptr = &impl_fp8_s_256;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
+                impl_ptr = &impl_fp8_256;
+            }
         }
         else if (selectedTile == 192)
         {
-            static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
-            static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_192 : &impl_fp8_s_192;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
+                impl_ptr = &impl_fp8_s_192;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
+                impl_ptr = &impl_fp8_192;
+            }
         }
         else if (selectedTile == 128)
         {
-            static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
-            static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
-            impl_ptr = !fc2_smooth_scale.has_value() ? &impl_fp8_128 : &impl_fp8_s_128;
+            if (fc2_smooth_scale.has_value())
+            {
+                static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
+                impl_ptr = &impl_fp8_s_128;
+            }
+            else
+            {
+                static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
+                impl_ptr = &impl_fp8_128;
+            }
         }
         else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
@@ -532,20 +640,20 @@ void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
+    //int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
 
-    if (selectedTile == 512)
+    if (inter_dim %512==0)
     {
         static FMoeKernel impl_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
         impl_ptr = &impl_512;
     }
-    else if (selectedTile == 320)
+    else if (inter_dim %320==0)
     {
         static FMoeKernel impl_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
         impl_ptr = &impl_320;
     }
     else
-        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
 
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,
@@ -561,4 +669,49 @@ void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim
                                                      fc1_scale,
                                                      fc2_scale,
                                                      fc2_smooth_scale);
+}
+
+void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, dim]
+                              torch::Tensor &input,             // [token_cnt, dim] M,K
+                              torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
+                              torch::Tensor &down,              // [expert, dim, inter_dim]
+                              torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                              torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                              torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                              torch::Tensor &num_valid_ids,     // [1]
+                              uint32_t topk,                    //
+                              torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
+                              torch::Tensor &fc2_scale,         // [expert, 1, dim]
+                              torch::Tensor input_scale,        // [expert, 1, dim]
+                              int fc_scale_blkn = 128,
+                              int fc_scale_blkk = 128,
+                              std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt) // [expert, 1, inter_dim])
+{
+    FMoeKernel *impl_ptr = nullptr;
+    int inter_dim = down.size(2);
+    int sub_X_cnt = sorted_expert_ids.size(0);
+    // int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
+
+    if (out.dtype() == at::ScalarType::BFloat16 && inter_dim % 256 == 0 && fc_scale_blkn == 128 && fc_scale_blkk == 128)
+    {
+        static FMoeKernel impl_256("fmoe_fp8_blockscale_g1u1_subGU_256", "fmoe_fp8_blockscale_g1u1_subGU_256.co", 320);
+        impl_ptr = &impl_256;
+    }
+    else
+        TORCH_CHECK(false, __func__, " Only support out dtype = bf16, inter_dim % 256 = 0 and fc_scale_blkn and fc_scale_blkk is 128");
+
+    impl_ptr->launch_kernel<uint8_t, uint16_t, false>(out,
+                                                      input,
+                                                      gate,
+                                                      down,
+                                                      sorted_token_ids,
+                                                      sorted_weight_buf,
+                                                      sorted_expert_ids,
+                                                      num_valid_ids,
+                                                      topk,
+                                                      // quant args
+                                                      input_scale,
+                                                      fc1_scale,
+                                                      fc2_scale,
+                                                      fc2_smooth_scale);
 }
