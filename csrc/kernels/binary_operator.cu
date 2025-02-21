@@ -33,15 +33,17 @@ typedef __hip_bfloat16 nv_bfloat16;
 
 namespace aiter
 {
-  template <class _T, int _WG, int _vec, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
+  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
   __global__ void operator_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
   {
     // pad LDS row by dword
+    constexpr uint32_t element_size = sizeof(_T); // in bytes
+    constexpr uint32_t elements_in_16B = 16 / element_size;
     constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
 
     union BLOCK_16B
     {
-      _T e[_vec];
+      _T e[elements_in_16B];
       __uint128_t ow;
     };
 
@@ -67,7 +69,7 @@ namespace aiter
     const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
     // use 128bit load&store whenever possible
-    if (current_n_size % _vec == 0 && current_k_size % 8 == 0)
+    if (current_n_size % elements_in_16B == 0 && current_k_size % 8 == 0)
     {
       // Copy full tile with large loads
       constexpr uint32_t row_bytes = BIG_TILE_SIZE_K * sizeof(_T);
@@ -83,14 +85,14 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % ld_per_row;
         uint32_t row = threadIdx.x / ld_per_row + t * rows_per_wg;
-        uint64_t offset = (col * _vec < current_k_size && row < current_n_size) ? row * stride2 + col * sizeof(__uint128_t) : 0;
+        uint64_t offset = (col * elements_in_16B < current_k_size && row < current_n_size) ? row * stride2 + col * sizeof(__uint128_t) : 0;
         const __uint128_t *pfa = (const __uint128_t *)(pat + offset);
         BLOCK_16B d;
         d.ow = *pfa;
 #pragma unroll
-        for (uint32_t i = 0; i < _vec; i++)
+        for (uint32_t i = 0; i < elements_in_16B; i++)
         {
-          sa[row][col * _vec + i] = d.e[i];
+          sa[row][col * elements_in_16B + i] = d.e[i];
         }
       }
       __syncthreads();
@@ -109,7 +111,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
         uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
-        if (col * _vec < current_n_size && row < current_k_size)
+        if (col * elements_in_16B < current_n_size && row < current_k_size)
         {
           uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
           BLOCK_16B d;
@@ -117,9 +119,9 @@ namespace aiter
           d.ow = *pfb;
 // Transpose tile on read from LDS
 #pragma unroll
-          for (uint32_t i = 0; i < _vec; i++)
+          for (uint32_t i = 0; i < elements_in_16B; i++)
           {
-            d.e[i] = aiter::performOperation<_T, Operation, order_flag>(sa[col * _vec + i][row], d.e[i]);
+            d.e[i] = aiter::performOperation<_T, Operation, order_flag>(sa[col * elements_in_16B + i][row], d.e[i]);
           }
           __uint128_t *pfc = (__uint128_t *)(pc + offset);
           *pfc = d.ow;
@@ -174,7 +176,6 @@ namespace aiter
   template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
   __global__ void operator_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
   {
-    // pad LDS row by dword
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
 
@@ -205,7 +206,7 @@ namespace aiter
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
 
     // use 128bit load&store whenever possible
-    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    if (current_n_size % 8 == 0 && current_k_size % elements_in_16B == 0)
     {
       // Copy full tile with large loads
       constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
@@ -223,7 +224,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
         uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
-        if (col * 8 < current_n_size && row < current_k_size)
+        if (col * elements_in_16B < current_n_size && row < current_k_size)
         {
           uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
           BLOCK_16B d, f;
@@ -303,7 +304,7 @@ namespace aiter
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
 
     // use 128bit load&store whenever possible
-    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    if (current_n_size % 8 == 0 && current_k_size % elements_in_16B == 0)
     {
       // Copy full tile with large loads
       constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
@@ -321,7 +322,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
         uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
-        if (col * 8 < current_n_size && row < current_k_size)
+        if (col * elements_in_16B < current_n_size && row < current_k_size)
         {
           uint64_t offset_a = col * sizeof(__uint128_t);
           uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
@@ -370,14 +371,16 @@ namespace aiter
     }
   }
 
-  template <class _T, int _rows, int _vec, typename Operation, bool order_flag>
+  template <class _T, int _rows, typename Operation, bool order_flag>
   __global__ void operator_bcast_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
                                              const int M, const int N, const int K)
   {
+    constexpr uint32_t element_size = sizeof(_T); // in bytes
+    constexpr uint32_t elements_in_16B = 16 / element_size;
     int bpe = sizeof(_T);
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n_tiles = N / _rows;
-    uint32_t k_tiles = K / _vec;
+    uint32_t k_tiles = K / elements_in_16B;
     if (idx < (uint64_t)M * n_tiles * k_tiles)
     {
       uint32_t ti = idx / (k_tiles * n_tiles);
@@ -386,12 +389,12 @@ namespace aiter
       uint32_t tk = idx_block % k_tiles;
       for (int row = 0; row < _rows; row++)
       {
-        uint64_t offset_b = (uint64_t)(tj + row * n_tiles) * K + tk * _vec;
-        uint64_t offset_ac = (uint64_t)(tj + row * n_tiles) * K + tk * _vec + (uint64_t)ti * N * K;
+        uint64_t offset_b = (uint64_t)(tj + row * n_tiles) * K + tk * elements_in_16B;
+        uint64_t offset_ac = (uint64_t)(tj + row * n_tiles) * K + tk * elements_in_16B + (uint64_t)ti * N * K;
         const uint8_t *pa = (const uint8_t *)a + offset_ac * bpe;
         const uint8_t *pb = (const uint8_t *)b + offset_b * bpe;
         const uint8_t *pc = (const uint8_t *)c + offset_ac * bpe;
-        for (int col = 0; col < _vec; col++)
+        for (int col = 0; col < elements_in_16B; col++)
         {
           const _T *pfa = (const _T *)(pa + col * bpe);
           const _T *pfb = (const _T *)(pb + col * bpe);
@@ -436,28 +439,27 @@ std::vector<int64_t> broadcastShapes(const torch::Tensor &tensor1, const torch::
   return result_shape;
 }
 
-template <typename Operation, int vec>
-void binary_operation_vec(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, int pattern, bool order_flag)
+template <int pattern, typename Operation>
+struct BinaryOperationPattern;
+
+// PATTERN_TRANSPOSE
+template <typename Operation>
+struct BinaryOperationPattern<1, Operation>
 {
-  int dim = input.dim();
-  constexpr uint32_t PATTERN_TRANSPOSE = 1;
-  constexpr uint32_t PATTERN_BROADCAST_0 = 2;
-  constexpr uint32_t PATTERN_BROADCAST_1 = 3;
-
-  auto shape = output.sizes().vec();
-  void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-  void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-  void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  int num_elements = output.numel();
-  int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
-  int M = dim == 2 ? 1 : rem_dim_size;
-  int N = shape[dim - 2];
-  int K = shape[dim - 1];
-
-  if (pattern == PATTERN_TRANSPOSE)
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
   {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int num_elements = output.numel();
+    int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
+    int M = dim == 2 ? 1 : rem_dim_size;
+    int N = shape[dim - 2];
+    int K = shape[dim - 1];
+
     auto tensor_not_conti = input.is_contiguous() ? other : input;
     int stride0 = tensor_not_conti.stride(0);
     int stride2 = tensor_not_conti.stride(2);
@@ -469,28 +471,46 @@ void binary_operation_vec(torch::Tensor &input, torch::Tensor &other, torch::Ten
     const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
-
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (order_flag)
     {
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_tn_big_tile_kernel", [&]
-          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, vec, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
     }
     else
     {
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_tn_big_tile_kernel", [&]
-          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, vec, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
     }
   }
-  else if (pattern == PATTERN_BROADCAST_0)
+};
+
+// PATTERN_BROADCAST_0
+template <typename Operation>
+struct BinaryOperationPattern<2, Operation>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
   {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+    int num_elements = output.numel();
+    int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
+    int M = dim == 2 ? 1 : rem_dim_size;
+    int N = shape[dim - 2];
+    int K = shape[dim - 1];
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
     const uint32_t rows = 8;
-    // printf("PATTERN:%d\n", PATTERN_BROADCAST_0);
+    int vec = 16 / output.element_size();
     if (N % rows == 0 && K % vec == 0)
     {
       constexpr uint32_t wg = 64;
@@ -502,20 +522,19 @@ void binary_operation_vec(torch::Tensor &input, torch::Tensor &other, torch::Ten
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast_tile_kernel", [&]
-            { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
+            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, true>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
       }
       else
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast_tile_kernel", [&]
-            { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, false>
+            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, false>
                   <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
       }
     }
     else
     {
-      printf("in else.\n");
       constexpr uint32_t BIG_TILE_SIZE_N = 64;
       constexpr uint32_t BIG_TILE_SIZE_K = 64;
       constexpr uint32_t M_SWIZZLE = 8;
@@ -539,14 +558,33 @@ void binary_operation_vec(torch::Tensor &input, torch::Tensor &other, torch::Ten
       }
     }
   }
-  else if (pattern == PATTERN_BROADCAST_1)
+};
+
+// PATTERN_BROADCAST_1
+template <typename Operation>
+struct BinaryOperationPattern<3, Operation>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
   {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int num_elements = output.numel();
+    int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
+    int M = dim == 2 ? 1 : rem_dim_size;
+    int N = shape[dim - 2];
+    int K = shape[dim - 1];
+
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
     constexpr uint32_t M_SWIZZLE = 8;
     const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     if (order_flag)
     {
@@ -563,6 +601,11 @@ void binary_operation_vec(torch::Tensor &input, torch::Tensor &other, torch::Ten
                 <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
     }
   }
+};
+
+template <int pattern, typename Operation>
+void binary_operation_pattern(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag) {
+    BinaryOperationPattern<pattern, Operation>::apply(input, other, output, order_flag);
 }
 
 template <typename Operation>
@@ -670,22 +713,17 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     void *buf_b = reinterpret_cast<void *>(other0.data_ptr());
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
-    int elementSize = output.element_size();
-    if (elementSize == 1)
+    if (pattern == PATTERN_TRANSPOSE)
     {
-      binary_operation_vec<Operation, 16>(input0, other0, output, pattern, order_flag);
+      binary_operation_pattern<1, Operation>(input0, other0, output, order_flag);
     }
-    else if (elementSize == 2)
+    else if (pattern == PATTERN_BROADCAST_0)
     {
-      binary_operation_vec<Operation, 8>(input0, other0, output, pattern, order_flag);
+      binary_operation_pattern<2, Operation>(input0, other0, output, order_flag);
     }
-    else if (elementSize == 4)
+    else if (pattern == PATTERN_BROADCAST_1)
     {
-      binary_operation_vec<Operation, 4>(input0, other0, output, pattern, order_flag);
-    }
-    else if (elementSize == 8)
-    {
-      binary_operation_vec<Operation, 2>(input0, other0, output, pattern, order_flag);
+      binary_operation_pattern<3, Operation>(input0, other0, output, order_flag);
     }
     return output;
   }
