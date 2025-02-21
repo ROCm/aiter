@@ -6,8 +6,8 @@ from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
 import torch
 
-@compile_ops("module_mha_fwd", fc_name="mha_fwd")
-def mha_fwd(
+@compile_ops("module_mha_fwd_fp16_nobias", fc_name="mha_fwd_fp16_nobias")
+def mha_fwd_fp16_nobias(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -24,8 +24,134 @@ def mha_fwd(
 ): ...
 
 
-@compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
-def mha_varlen_fwd(
+@compile_ops("module_mha_fwd_fp16_alibi", fc_name="mha_fwd_fp16_alibi")
+def mha_fwd_fp16_alibi(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_fwd_bf16_nobias", fc_name="mha_fwd_bf16_nobias")
+def mha_fwd_bf16_nobias(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_fwd_bf16_alibi", fc_name="mha_fwd_bf16_alibi")
+def mha_fwd_bf16_alibi(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_fwd_fp16_nobias", fc_name="mha_varlen_fwd_fp16_nobias")
+def mha_varlen_fwd_fp16_nobias(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_fwd_fp16_alibi", fc_name="mha_varlen_fwd_fp16_alibi")
+def mha_varlen_fwd_fp16_alibi(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_fwd_bf16_nobias", fc_name="mha_varlen_fwd_bf16_nobias")
+def mha_varlen_fwd_bf16_nobias(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    block_table: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_fwd_bf16_alibi", fc_name="mha_varlen_fwd_bf16_alibi")
+def mha_varlen_fwd_bf16_alibi(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -117,21 +243,73 @@ def _flash_attn_forward(
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = mha_fwd(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size_left,
-        window_size_right,
-        return_lse,
-        return_softmax,
-        None,
-        alibi_slopes,
-        None,
-    )
+
+    if q.dtype == torch.float16:
+        if alibi_slopes is None:
+            out, softmax_lse, S_dmask, rng_state = mha_fwd_fp16_nobias(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                alibi_slopes,
+                None,
+            )
+        elif alibi_slopes is not None:
+            out, softmax_lse, S_dmask, rng_state = mha_fwd_fp16_alibi(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                alibi_slopes,
+                None,
+            )
+    elif q.dtype == torch.bfloat16:
+        if alibi_slopes is None:
+            out, softmax_lse, S_dmask, rng_state = mha_fwd_bf16_nobias(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                alibi_slopes,
+                None,
+            )
+        elif alibi_slopes is not None:
+            out, softmax_lse, S_dmask, rng_state = mha_fwd_bf16_alibi(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                alibi_slopes,
+                None,
+            )
     return out, softmax_lse, S_dmask, rng_state
 
 
@@ -373,27 +551,96 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        zero_tensors,
-        causal,
-        window_size_left,
-        window_size_right,
-        return_lse,
-        return_softmax,
-        None,
-        block_table,
-        alibi_slopes,
-        None
-    )
+    if q.dtype == torch.float16:
+        if alibi_slopes is None:
+            out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd_fp16_nobias(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                block_table,
+                alibi_slopes,
+                None
+            )
+        elif alibi_slopes is not None:
+            out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd_fp16_alibi(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                block_table,
+                alibi_slopes,
+                None
+            )
+    elif q.dtype == torch.bfloat16:
+        if alibi_slopes is None:
+            out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd_bf16_nobias(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                block_table,
+                alibi_slopes,
+                None
+            )
+        elif alibi_slopes is not None:
+            out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd_bf16_alibi(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                return_lse,
+                return_softmax,
+                None,
+                block_table,
+                alibi_slopes,
+                None
+            )
     return out, softmax_lse, S_dmask, rng_state
 
 
