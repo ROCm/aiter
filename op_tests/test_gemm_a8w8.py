@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import aiter
+from aiter.test_common import assert_all_close, rand_tensor
 from aiter.ops.shuffle import shuffle_weight
 import pytest
 import torch
 import torch.nn.functional as F
 
-from .utils import check_all_close, rand_tensor
 
 MNK = [
     # qkv_proj
@@ -105,7 +105,7 @@ def test_ck_gemm_close_to_torch(
     output = benchmark(aiter.gemm_a8w8_CK, a, b, a_scale, b_scale, bias, out_dtype)
     expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
 
-    check_all_close(output, expected, rtol=rtol, atol=atol)
+    assert_all_close(output, expected, rtol=rtol, atol=atol)
 
 @pytest.mark.parametrize("mnk", MNK)
 def test_asm_gemm_close_to_torch(benchmark, mnk: tuple[int, int, int]) -> None:
@@ -127,4 +127,4 @@ def test_asm_gemm_close_to_torch(benchmark, mnk: tuple[int, int, int]) -> None:
     output = benchmark(aiter.gemm_a8w8_ASM, a, b_shuffled, a_scale, b_scale, bias)
     expected = torch_scaled_mm(a, b, a_scale, b_scale, bias, dtype=out_dtype)
     if output is not None and torch.sum(output.isnan()==True) == 0:
-        check_all_close(output, expected, rtol=rtol, atol=atol)
+        assert_all_close(output, expected, rtol=rtol, atol=atol)
