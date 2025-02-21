@@ -24,7 +24,27 @@ logger = logging.getLogger("aiter")
 
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
-AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
+
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+
+find_aiter = importlib.util.find_spec("aiter")
+if find_aiter is not None:
+    if find_aiter.submodule_search_locations:
+        package_path = find_aiter.submodule_search_locations[0]
+    elif find_aiter.origin:
+        package_path = find_aiter.origin
+    package_path = os.path.dirname(package_path)
+    import site
+    site_packages_dirs = site.getsitepackages()
+    ### develop mode
+    if package_path not in site_packages_dirs:
+        AITER_ROOT_DIR = AITER_CORE_DIR
+    ### install mode
+    else:
+        AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
+else:
+    print("aiter is not installed.")
+
 AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")

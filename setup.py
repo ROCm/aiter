@@ -182,6 +182,15 @@ else:
     raise NotImplementedError("Only ROCM is supported")
 
 
+if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+    shutil.rmtree("aiter_meta")
+## link "3rdparty", "hsa", "csrc" into "aiter_meta"
+shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+shutil.copytree("hsa", "aiter_meta/hsa")
+shutil.copytree("csrc", "aiter_meta/csrc")
+
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # calculate the maximum allowed NUM_JOBS based on cores
@@ -205,18 +214,11 @@ class NinjaBuildExtension(BuildExtension):
 setup(
     name=PACKAGE_NAME,
     version="0.1.0",
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            "3rdparty",
-        )
-    ),
+    packages=["aiter_meta","aiter"],
+    include_package_data=True,
+    package_data={
+        '': ['*'],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
@@ -225,15 +227,18 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[
-        "torch",
-    ],
+    # install_requires=[
+    #     "torch",
+    # ],
     setup_requires=[
         "packaging",
         "psutil",
         "ninja",
     ],
 )
+
+if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+    shutil.rmtree("aiter_meta")
 # if os.path.exists(bd_dir):
 #     shutil.rmtree(bd_dir)
 # if os.path.exists(blob_dir):

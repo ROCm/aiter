@@ -21,6 +21,7 @@
 #include "gemm_a8w8.h"
 #include "quant.h"
 #include "moe_ck.h"
+#include "rope.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -189,7 +190,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("topk"),
             py::arg("fc1_scale"), py::arg("fc2_scale"),
             py::arg("fc1_smooth_scale"), py::arg("fc2_smooth_scale") = std::nullopt,
-            py::arg("fc_scale_blkn") = std::128, py::arg("fc_scale_blkk") = std::128);
+            py::arg("fc_scale_blkn") = 128, py::arg("fc_scale_blkk") = 128);
       m.def("add", &aiter_add, "apply for add with transpose and broadcast.");
       m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");
       m.def("sub", &aiter_sub, "apply for sub with transpose and broadcast.");
