@@ -56,22 +56,23 @@ def hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freq
 def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freqs_front_part):
     return aiter.rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, reuse_freqs_front_part)
 
-
 def rotate_half(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def ref_rope_sbhd_fwd(x, freqs):
-    freqs_dim = freqs.shape[-1]
+def ref_rope_sbhd_fwd(x, freqs: torch.Tensor, reuse_freqs_front_part):
+    freqs_dim = freqs.shape[-1] * (2 if reuse_freqs_front_part else 1)
     x, x_forward = x[..., :freqs_dim], x[..., freqs_dim:]
+    if reuse_freqs_front_part:
+        freqs = freqs.repeat([1 for _ in range(freqs.dim()-1)] + [2])
     x_embed = (x * torch.cos(freqs)) + (rotate_half(x) * torch.sin(freqs))
     return torch.cat((x_embed.to(dtype=x.dtype), x_forward), dim=-1)
 
-def ref_rope_thd_fwd(x, cu_seqlens, freqs):
+def ref_rope_thd_fwd(x, cu_seqlens, freqs, reuse_freqs_front_part):
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     x_embed = torch.cat([
-        ref_rope_sbhd_fwd(xi.unsqueeze(1), freqs[: xi.size(0)])
+        ref_rope_sbhd_fwd(xi.unsqueeze(1), freqs[: xi.size(0)], reuse_freqs_front_part)
         for xi in torch.split(x, seqlens)
     ])
     return x_embed.squeeze(1)
@@ -89,19 +90,19 @@ def ref_rope_2d_fwd(x, size_h, size_w, cos_h, sin_h, cos_w, sin_w):
     return torch.cat([x1, x2], dim=-1).view(s, b, h, d).to(dtype=x.dtype)
 
 
-def test_rope_sbhd(input, freqs, grad, transpose_output):
+def test_rope_sbhd(input, freqs, grad, transpose_output, reuse_freqs_front_part):
     input_msg = f"dtype: {input.dtype}, freq_dtype: {freqs.dtype}, dim_input: {str(input.shape):<20}, dim_freqs: {str(freqs.shape):<20}, transpose_output: {transpose_output}"
 
-    ref = ref_rope_sbhd_fwd(input, freqs)
+    ref = ref_rope_sbhd_fwd(input, freqs, reuse_freqs_front_part)
     ref.backward(grad)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
-    hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, False, transpose_output)
-    hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, False, transpose_output)
-    hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(input, cos, sin, False, transpose_output)
-    hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, False, transpose_output)
+    hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, reuse_freqs_front_part, transpose_output)
+    hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, reuse_freqs_front_part, transpose_output)
+    hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(input, cos, sin, reuse_freqs_front_part, transpose_output)
+    hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, reuse_freqs_front_part, transpose_output)
 
     checkAllclose(ref,        hip_fwd,        msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_bwd,        msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
@@ -109,24 +110,24 @@ def test_rope_sbhd(input, freqs, grad, transpose_output):
     checkAllclose(input.grad, hip_cached_bwd, msg=f"rope_cached_bwd - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
-def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, transpose_output):
+def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, transpose_output, reuse_freqs_front_part):
     assert(input_x.shape == input_y.shape)
     assert(input_x.dtype == input_y.dtype)
 
     input_msg = f"dtype: {input_x.dtype}, freq_dtype: {freqs.dtype}, dim_input: {str(input_x.shape):<20}, dim_freqs: {str(freqs.shape):<20}, transpose_output: {transpose_output}"
 
-    ref_x = ref_rope_sbhd_fwd(input_x, freqs)
-    ref_y = ref_rope_sbhd_fwd(input_y, freqs)
+    ref_x = ref_rope_sbhd_fwd(input_x, freqs, reuse_freqs_front_part)
+    ref_y = ref_rope_sbhd_fwd(input_y, freqs, reuse_freqs_front_part)
     ref_x.backward(grad_x)
     ref_y.backward(grad_y)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
-    (hip_fwd_x, hip_fwd_y), hip_fwd_avg = hip_rope_2c_fwd(input_x, input_y, freqs, False, transpose_output)
-    (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, False, transpose_output)
-    (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, False, transpose_output)
-    (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, False, transpose_output)
+    (hip_fwd_x, hip_fwd_y), hip_fwd_avg = hip_rope_2c_fwd(input_x, input_y, freqs, reuse_freqs_front_part, transpose_output)
+    (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, reuse_freqs_front_part, transpose_output)
+    (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, reuse_freqs_front_part, transpose_output)
+    (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, reuse_freqs_front_part, transpose_output)
 
     checkAllclose(ref_x,        hip_fwd_x,        msg=f"rope_2c_fwd_x - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_y,        hip_fwd_y,        msg=f"rope_2c_fwd_y - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
@@ -138,16 +139,16 @@ def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, transpose_output)
     checkAllclose(input_y.grad, hip_cached_bwd_y, msg=f"rope_cached_2c_bwd_y - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
-def test_rope_thd(input, cu_seqlens, freqs, grad):
+def test_rope_thd(input, cu_seqlens, freqs, grad, reuse_freqs_front_part):
     torch.set_printoptions(profile="full")
     input_msg = f"dtype: {input.dtype}, freq_dtype: {freqs.dtype}, dim_input: {str(input.shape):<20}, dim_freqs: {str(freqs.shape):<20}, cu_seqlens: {cu_seqlens}"
     torch.set_printoptions(profile="default")
 
-    ref = ref_rope_thd_fwd(input, cu_seqlens, freqs)
+    ref = ref_rope_thd_fwd(input, cu_seqlens, freqs, reuse_freqs_front_part)
     ref.backward(grad)
 
-    hip_fwd, hip_fwd_avg = hip_rope_thd_fwd(input, cu_seqlens, freqs, False)
-    hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs, False)
+    hip_fwd, hip_fwd_avg = hip_rope_thd_fwd(input, cu_seqlens, freqs, reuse_freqs_front_part)
+    hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs, reuse_freqs_front_part)
 
     checkAllclose(ref,        hip_fwd, msg=f"rope_thd_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(input.grad, hip_bwd, msg=f"rope_thd_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
@@ -178,7 +179,7 @@ if __name__ == "__main__":
     seq_size_ = (1024, 2048, 4096)
     head_size_ = (32, 64)
     hidden_dim_ = (128, 256)
-    rotary_percent_ = (0.5, 1.0)
+    rotary_percent_and_reuse_ = ((1.0, True), (0.5, False), (1.0, False))
     height_ = (32, 64)
     width_ = (32, 64)
     margin_ = (0, 1, 3)
@@ -186,38 +187,44 @@ if __name__ == "__main__":
     # Test sbhd format for both cached and uncached
     for (dtype, fdtype,
          transpose_output,
-         rotary_percent,
+         rotary_percent_and_reuse,
          b, s, h, d
     ) in itertools.product(
         dtype_, dtype_,
         transpose_output_,
-        rotary_percent_,
+        rotary_percent_and_reuse_,
         batch_size_, seq_size_, head_size_, hidden_dim_
     ):
+        rotary_percent = rotary_percent_and_reuse[0]
+        reuse_freqs_front_part = rotary_percent_and_reuse[1]
+        freqs_ratio = 2 if reuse_freqs_front_part else 1
         input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((s, 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
+        freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
         grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        test_rope_sbhd(input, freqs, grad, transpose_output)
+        test_rope_sbhd(input, freqs, grad, transpose_output, reuse_freqs_front_part)
         input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        test_rope_sbhd_2c(input_x, input_y, freqs, grad, grad_y, transpose_output)
+        test_rope_sbhd_2c(input_x, input_y, freqs, grad, grad_y, transpose_output, reuse_freqs_front_part)
 
     # Test thd format for uncached
     cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
                               dtype=torch.int32, device="cuda")
     for (dtype, fdtype,
-         rotary_percent,
+         rotary_percent_and_reuse,
          h, d
     ) in itertools.product(
         dtype_, dtype_,
-        rotary_percent_,
+        rotary_percent_and_reuse_,
         head_size_, hidden_dim_
     ):
+        rotary_percent = rotary_percent_and_reuse[0]
+        reuse_freqs_front_part = rotary_percent_and_reuse[1]
+        freqs_ratio = 2 if reuse_freqs_front_part else 1
         input = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((cu_seqlens[-1], 1, 1, int(d * rotary_percent)), dtype=fdtype, device="cuda")
+        freqs = torch.randn((cu_seqlens[-1], 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
         grad  = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda")
-        test_rope_thd(input, cu_seqlens, freqs, grad)
+        test_rope_thd(input, cu_seqlens, freqs, grad, reuse_freqs_front_part)
 
     # Test 2d image format for cached
     for (dtype, fdtype,

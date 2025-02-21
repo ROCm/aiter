@@ -244,7 +244,7 @@ struct Op2cUncachedBwd
         const int32_t offset_half_f_y   = size_valid_half_f * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
         {
             const int32_t offset_ox_d = did * stride_ox_d;
             const int32_t offset_oy_d = did * stride_oy_d;
@@ -283,7 +283,7 @@ struct Op2cUncachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_f)
+        if (size_d > size_valid_f)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -294,7 +294,7 @@ struct Op2cUncachedBwd
                 const int32_t offset_iy = hid * stride_iy_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
                 {
                     p_input_grads_x[offset_ix + did * stride_ix_d] = p_output_grads_x[offset_ox + did * stride_ox_d];
                     p_input_grads_y[offset_iy + did * stride_iy_d] = p_output_grads_y[offset_oy + did * stride_oy_d];
