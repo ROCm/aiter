@@ -151,9 +151,13 @@ namespace aiter
     }
   }
 
-  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
-  __global__ void operator_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K, int stride0, int stride2)
+  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag, int Size>
+  __global__ void operator_tn_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                              const int N, const int K, int stride0, int stride2, std::array<torch::ScalarType, Size> scalar_types)
   {
+    for (const auto& dtype : scalar_types) {
+        printf("Processed ScalarType: %d\n", dtype);
+    }
     // pad LDS row by dword
     constexpr uint32_t LDS_PAD = 4 / sizeof(_T);
     constexpr uint32_t element_size = sizeof(_T); // in bytes
@@ -291,8 +295,9 @@ namespace aiter
     }
   }
 
-  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
-  __global__ void operator_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
+  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag, int Size>
+  __global__ void operator_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                                 const int N, const int K, std::array<torch::ScalarType, Size> scalar_types)
   {
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
@@ -388,8 +393,9 @@ namespace aiter
     }
   }
 
-  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
-  __global__ void operator_bcast1_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
+  template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag, int Size>
+  __global__ void operator_bcast1_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                                  const int N, const int K, std::array<torch::ScalarType, Size> scalar_types)
   {
     // pad LDS row by dword
     constexpr uint32_t element_size = sizeof(_T); // in bytes
@@ -489,9 +495,9 @@ namespace aiter
     }
   }
 
-  template <class _T, int _rows, typename Operation, bool order_flag>
+  template <class _T, int _rows, typename Operation, bool order_flag, int Size>
   __global__ void operator_bcast_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
-                                             const int M, const int N, const int K)
+                                             const int M, const int N, const int K, std::array<torch::ScalarType, Size> scalar_types)
   {
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
@@ -557,14 +563,15 @@ std::vector<int64_t> broadcastShapes(const torch::Tensor &tensor1, const torch::
   return result_shape;
 }
 
-template <int pattern, typename Operation>
+template <int pattern, typename Operation, int N>
 struct BinaryOperationPattern;
 
 // PATTERN_TRANSPOSE
-template <typename Operation>
-struct BinaryOperationPattern<1, Operation>
+template <typename Operation, int Size>
+struct BinaryOperationPattern<1, Operation, Size>
 {
-  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag,
+                    std::array<torch::ScalarType, Size> scalar_types)
   {
     int dim = input.dim();
     auto shape = output.sizes().vec();
@@ -595,24 +602,25 @@ struct BinaryOperationPattern<1, Operation>
     {
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_tn_big_tile_kernel", [&]
-          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
+          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, Size>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2, scalar_types); });
     }
     else
     {
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_tn_big_tile_kernel", [&]
-          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
+          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, Size>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2, scalar_types); });
     }
   }
 };
 
 // PATTERN_BROADCAST_0
-template <typename Operation>
-struct BinaryOperationPattern<2, Operation>
+template <typename Operation, int Size>
+struct BinaryOperationPattern<2, Operation, Size>
 {
-  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag,
+                    std::array<torch::ScalarType, Size> scalar_types)
   {
     int dim = input.dim();
     auto shape = output.sizes().vec();
@@ -640,15 +648,15 @@ struct BinaryOperationPattern<2, Operation>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast_tile_kernel", [&]
-            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, true>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
+            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, true, Size>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K, scalar_types); });
       }
       else
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast_tile_kernel", [&]
-            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, false>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
+            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, false, Size>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K, scalar_types); });
       }
     }
     else
@@ -664,25 +672,26 @@ struct BinaryOperationPattern<2, Operation>
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-            { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+            { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, Size>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, scalar_types); });
       }
       else
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-            { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+            { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, Size>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, scalar_types); });
       }
     }
   }
 };
 
 // PATTERN_BROADCAST_1
-template <typename Operation>
-struct BinaryOperationPattern<3, Operation>
+template <typename Operation, int Size>
+struct BinaryOperationPattern<3, Operation, Size>
 {
-  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag,
+                    std::array<torch::ScalarType, Size> scalar_types)
   {
     int dim = input.dim();
     auto shape = output.sizes().vec();
@@ -708,23 +717,24 @@ struct BinaryOperationPattern<3, Operation>
     {
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, Size>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, scalar_types); });
     }
     else
     {
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, Size>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, scalar_types); });
     }
   }
 };
 
-template <int pattern, typename Operation>
-void binary_operation_pattern(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+template <int pattern, typename Operation, int N>
+void binary_operation_pattern(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag,
+                              std::array<torch::ScalarType, N> scalar_types)
 {
-  BinaryOperationPattern<pattern, Operation>::apply(input, other, output, order_flag);
+  BinaryOperationPattern<pattern, Operation, N>::apply(input, other, output, order_flag, scalar_types);
 }
 
 template <typename Operation>
@@ -825,24 +835,25 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     auto options = torch::TensorOptions().dtype(out_dtype).device(input.device());
     auto output = torch::empty(out_shape, options);
 
-    torch::Tensor input0 = in0_dtype == out_dtype ? input : input.to(out_dtype);
-    torch::Tensor other0 = in1_dtype == out_dtype ? other : other.to(out_dtype);
+    // torch::Tensor input0 = in0_dtype == out_dtype ? input : input.to(out_dtype);
+    // torch::Tensor other0 = in1_dtype == out_dtype ? other : other.to(out_dtype);
 
-    void *buf_a = reinterpret_cast<void *>(input0.data_ptr());
-    void *buf_b = reinterpret_cast<void *>(other0.data_ptr());
-    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+    std::array<torch::ScalarType, 3> scalar_types;
+    scalar_types[0] = input.scalar_type();
+    scalar_types[1] = other.scalar_type();
+    scalar_types[2] = output.scalar_type();
 
     if (pattern == PATTERN_TRANSPOSE)
     {
-      binary_operation_pattern<1, Operation>(input0, other0, output, order_flag);
+      binary_operation_pattern<1, Operation, 3>(input, other, output, order_flag, scalar_types);
     }
     else if (pattern == PATTERN_BROADCAST_0)
     {
-      binary_operation_pattern<2, Operation>(input0, other0, output, order_flag);
+      binary_operation_pattern<2, Operation, 3>(input, other, output, order_flag, scalar_types);
     }
     else if (pattern == PATTERN_BROADCAST_1)
     {
-      binary_operation_pattern<3, Operation>(input0, other0, output, order_flag);
+      binary_operation_pattern<3, Operation, 3>(input, other, output, order_flag, scalar_types);
     }
     return output;
   }
@@ -872,5 +883,6 @@ torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
   return binary_operation<aiter::DivOp>(input, other);
 }
 
-// inline at::Tensor add(const at::Tensor & self, const at::Scalar & other) {
-// }
+inline at::Tensor add(const at::Tensor &self, const at::Scalar &other)
+{
+}
