@@ -154,9 +154,14 @@ class RotaryEmbedding(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
+        # if     is_nope_first
+        # [num_tokens, num_heads, nope_size+rope_size]
+        # if NOT is_nope_first
+        # [num_tokens, num_heads, rope_size+nope_size],
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        is_nope_first=False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # from vllm import _custom_ops as ops
         import aiter as ops
@@ -168,11 +173,11 @@ class RotaryEmbedding(nn.Module):
         if offsets is not None:
             ops.batched_rotary_embedding(positions, query, key, self.head_size,
                                          self.cos_sin_cache,
-                                         self.is_neox_style, self.rotary_dim,
+                                         self.is_neox_style, is_nope_first, self.rotary_dim,
                                          offsets)
         else:
             ops.rotary_embedding_fwd(positions, query, key, self.head_size,
-                                     self.cos_sin_cache, self.is_neox_style)
+                                     self.cos_sin_cache, self.is_neox_style, is_nope_first)
         return query, key
 
     def forward_xpu(
