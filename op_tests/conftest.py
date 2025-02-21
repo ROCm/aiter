@@ -10,6 +10,10 @@ from functools import partial
 
 T = TypeVar("T")
 
+AITER_LOG_MORE = int(os.environ.get('AITER_LOG_MORE', 0))
+NUM_ITERATIONS = int(os.environ.get('NUM_ITERATIONS', 100))
+NUM_WARMUP_ITERATION = os.environ.get('NUM_WARMUP_ITERATION', 10)
+USE_CUDA_GRAPH = os.environ.get('USE_CUDA_GRAPH', 0)
 
 def execute_callback(
     num_iterations: int,
@@ -146,7 +150,7 @@ def profile(
     # is temporary (until we completly shift to using pytest)
     # and should be replaced with a more descriptive
     # flag.
-    if int(os.environ.get('AITER_LOG_MORE', 0)):
+    if AITER_LOG_MORE:
         latency_list = time_callback_with_cuda_event(
             num_iterations, func, *args, **kwargs)
         return latency_list, result
@@ -221,9 +225,6 @@ def benchmark() -> Generator[Callable[..., tuple[float, T]], None, None]:
     -----
         def test_example(benchmark):
             avg_time, result = benchmark(
-                num_iterations=100,
-                num_warmup_iterations=10,
-                use_cuda_graph=False,
                 func=my_function_to_test,
                 arg1=value1,
                 arg2=value2
@@ -232,27 +233,17 @@ def benchmark() -> Generator[Callable[..., tuple[float, T]], None, None]:
     test_result_data: dict[str, list[dict[str, float]]] = defaultdict(list)
 
     def _benchmark(
-        num_iterations: int, 
-        num_warmup_iterations: int,
-        use_cuda_graph: bool,
         func: Callable[..., T],
         *args,
         **kwargs
-    ) -> tuple[float, T]:
+    ) -> T:
         
         test_name = os.environ.get('PYTEST_CURRENT_TEST').split(':')[-1].split(' ')[0]
+        profile_func = profile_cuda_graph if USE_CUDA_GRAPH else profile
 
-        if use_cuda_graph:
-            execution_time_list, result = profile_cuda_graph(
-                num_iterations,
-                num_warmup_iterations,
-                func,
-                *args,
-                **kwargs
-            )
-        execution_time_list, result = profile(
-            num_iterations,
-            num_warmup_iterations,
+        execution_time_list, result = profile_func(
+            NUM_ITERATIONS,
+            NUM_WARMUP_ITERATION,
             func,
             *args,
             **kwargs
@@ -264,9 +255,9 @@ def benchmark() -> Generator[Callable[..., tuple[float, T]], None, None]:
             "std_time": np.std(execution_time_list),
             "min_time": np.min(execution_time_list),
             "max_time": np.max(execution_time_list),
-            "iterations": num_iterations,
-            "warmup": num_warmup_iterations,
-            "cuda_graph": use_cuda_graph
+            "iterations": NUM_ITERATIONS,
+            "warmup": NUM_WARMUP_ITERATION,
+            "cuda_graph": USE_CUDA_GRAPH
         }
         test_result_data[test_name].append(stats)
         
