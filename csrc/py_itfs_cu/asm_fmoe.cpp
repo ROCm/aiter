@@ -69,6 +69,7 @@ private:
     hipModule_t module;
     hipFunction_t kernel_func;
     uint32_t sub_GU = 512;
+    bool is_int4 = false;
 
 public:
     FMoeKernel(const char *name, const char *hsaco, uint32_t sub_GU = 512)
@@ -79,6 +80,11 @@ public:
         std::cout << " Success" << std::endl;
         this->sub_GU = sub_GU;
     };
+
+    void set_int4(bool is_int4_) 
+    {
+        is_int4 = is_int4_;
+    }
 
     template <typename T, typename T_O, bool switchGxy = false>
     void launch_kernel(torch::Tensor &out,                    // [token_cnt, dim]
@@ -100,7 +106,7 @@ public:
         int dim = input.size(1);
         int sub_X_cnt = sorted_expert_ids.size(0);
         int eprt = w1.size(0);
-        int inter_dim = w2.size(2);
+        int inter_dim = is_int4 ? w2.size(2) * 8 : w2.size(2);
         uint32_t sub_GU = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
@@ -108,6 +114,11 @@ public:
         int stride_X = input.stride(0) * input.element_size();
         int stride_GU = dim * I_elemSize;
         int stride_D = inter_dim * I_elemSize;
+        if (is_int4)
+        {
+            stride_GU /= 2;
+            stride_D /= 2;
+        }
         int stride_expert_GU = stride_GU * inter_dim;
         int stride_expert_D = stride_D * dim;
         int stride_expert_GUDQN = w1_dqn.has_value() ? w1_dqn.value().size(1) * sizeof(float) : 0;
@@ -166,7 +177,6 @@ public:
         int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
         int gdy = sub_X_cnt;
         int gdz = 1;
-
         // std::cout << "args.dim: " << args.dim << std::endl;
         // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
         // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
@@ -376,8 +386,14 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
     int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
-
-    if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
+    if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
+    {
+        selectedTile = 512;
+        static FMoeKernel impl_int4_512("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
+        impl_ptr = &impl_int4_512;
+        impl_ptr->set_int4(true);
+    }
+    else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
         if (selectedTile == 512)
         {
