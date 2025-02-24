@@ -174,8 +174,8 @@ def mha_varlen_fwd_bf16_alibi(
 ): ...
 
 
-@compile_ops("module_mha_bwd", fc_name="mha_bwd")
-def mha_bwd(
+@compile_ops("module_mha_bwd_fp16_nobias", fc_name="mha_bwd_fp16_nobias")
+def mha_bwd_fp16_nobias(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -197,8 +197,161 @@ def mha_bwd(
 ): ...
 
 
-@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
-def mha_varlen_bwd(
+@compile_ops("module_mha_bwd_fp16_alibi", fc_name="mha_bwd_fp16_alibi")
+def mha_bwd_fp16_alibi(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_bwd_bf16_nobias", fc_name="mha_bwd_bf16_nobias")
+def mha_bwd_bf16_nobias(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_bwd_bf16_alibi", fc_name="mha_bwd_bf16_alibi")
+def mha_bwd_bf16_alibi(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_bwd_fp16_nobias", fc_name="mha_varlen_bwd_fp16_nobias")
+def mha_varlen_bwd_fp16_nobias(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_bwd_fp16_alibi", fc_name="mha_varlen_bwd_fp16_alibi")
+def mha_varlen_bwd_fp16_alibi(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_bwd_bf16_nobias", fc_name="mha_varlen_bwd_bf16_nobias")
+def mha_varlen_bwd_bf16_nobias(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
+@compile_ops("module_mha_varlen_bwd_bf16_alibi", fc_name="mha_varlen_bwd_bf16_alibi")
+def mha_varlen_bwd_bf16_alibi(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -333,32 +486,116 @@ def _flash_attn_backward(
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (
-        dq,
-        dk,
-        dv,
-        softmax_d,
-    ) = mha_bwd(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size_left,
-        window_size_right,
-        deterministic,
-        dq,
-        dk,
-        dv,
-        alibi_slopes,
-        rng_state,
-        None,
-    )
+    if q.dtype == torch.float16:
+        if alibi_slopes is None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_bwd_fp16_nobias(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
+        elif alibi_slopes is not None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_bwd_fp16_alibi(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
+    elif q.dtype == torch.bfloat16:
+        if alibi_slopes is None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_bwd_bf16_nobias(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
+        elif alibi_slopes is not None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_bwd_bf16_alibi(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dropout_p,
+                softmax_scale,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
     return softmax_d
 
 
@@ -669,37 +906,136 @@ def _flash_attn_varlen_backward(
     zero_tensors: bool = False,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
-    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    (
-        dq,
-        dk,
-        dv,
-        softmax_d,
-    ) = mha_varlen_bwd(
-        dout,
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        zero_tensors,
-        causal,
-        window_size_left,
-        window_size_right,
-        deterministic,
-        dq,
-        dk,
-        dv,
-        alibi_slopes,
-        rng_state,
-        None,
-    )
+    if q.dtype == torch.float16:
+        if alibi_slopes is None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_varlen_bwd_fp16_nobias(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
+        elif alibi_slopes is not None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_varlen_bwd_fp16_alibi(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
+    elif q.dtype == torch.bfloat16:
+        if alibi_slopes is None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_varlen_bwd_bf16_nobias(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
+        elif alibi_slopes is not None:
+            dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+            (
+                dq,
+                dk,
+                dv,
+                softmax_d,
+            ) = mha_varlen_bwd_bf16_alibi(
+                dout,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                zero_tensors,
+                causal,
+                window_size_left,
+                window_size_right,
+                deterministic,
+                dq,
+                dk,
+                dv,
+                alibi_slopes,
+                rng_state,
+                None,
+            )
     return softmax_d
 
 

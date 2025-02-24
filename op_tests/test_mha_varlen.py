@@ -145,7 +145,7 @@ def run_ck(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("deterministic", [True])
+@pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("alibi", [False, True])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])

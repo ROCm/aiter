@@ -489,12 +489,12 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 202 --filter *bf16* --output_dir {{}}'"
         ]
     },
-    "module_mha_bwd": {
+    "module_mha_bwd_fp16_nobias": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
         ],
-        "md_name": "'module_mha_bwd'",
+        "md_name": "'module_mha_bwd_fp16_nobias'",
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -506,14 +506,71 @@
         ],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 10 --output_dir {{}}'"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 300 --filter *fp16* --output_dir {{}}'"
     },
-    "module_mha_varlen_bwd": {
+    "module_mha_bwd_fp16_alibi": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_bwd_fp16_alibi'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 302 --filter *fp16* --output_dir {{}}'"
+    },
+    "module_mha_bwd_bf16_nobias": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_bwd_bf16_nobias'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 300 --filter *bf16* --output_dir {{}}'"
+    },
+    "module_mha_bwd_bf16_alibi": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_bwd_bf16_alibi'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 302 --filter *bf16* --output_dir {{}}'"
+    },
+    "module_mha_varlen_bwd_fp16_nobias": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
         ],
-        "md_name": "'module_mha_varlen_bwd'",
+        "md_name": "'module_mha_varlen_bwd_fp16_nobias'",
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -525,6 +582,63 @@
         ],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 11 --output_dir {{}}'"
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --filter *fp16* --output_dir {{}}'"
+    },
+    "module_mha_varlen_bwd_fp16_alibi": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_varlen_bwd_fp16_alibi'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 402 --filter *fp16* --output_dir {{}}'"
+    },
+    "module_mha_varlen_bwd_bf16_nobias": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_varlen_bwd_bf16_nobias'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --filter *bf16* --output_dir {{}}'"
+    },
+    "module_mha_varlen_bwd_bf16_alibi": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_varlen_bwd_bf16_alibi'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 402 --filter *bf16* --output_dir {{}}'"
     }
 }
