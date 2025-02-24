@@ -212,9 +212,9 @@ public:
         }
     };
 };
-int get_heuristic_tile(int inter_dim, int sub_X_cnt)
+int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int> &available_tiles)
 {
-    int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
+    // int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
@@ -225,7 +225,7 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt)
     uint32_t round = 0xffffffff;
     int selectedTile = 0;
 
-    for (auto tile : tiles)
+    for (auto tile : available_tiles)
     {
         if ((inter_dim % tile) == 0)
         {
@@ -385,16 +385,33 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
     if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
-        selectedTile = 512;
-        static FMoeKernel impl_int4_512("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
-        impl_ptr = &impl_int4_512;
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
+        if (selectedTile == 512) 
+        {
+            static FMoeKernel impl_int4_512("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
+            impl_ptr = &impl_int4_512;
+        }
+        else if (selectedTile == 256) 
+        {
+            static FMoeKernel impl_int4_256("fmoe_int4fp8_g1u1_subGU_256_gelu", "fmoe_int4fp8_g1u1_subGU_256_gelu.co", 256);
+            impl_ptr = &impl_int4_256;
+        }
+        else if (selectedTile == 128) 
+        {
+            static FMoeKernel impl_int4_128("fmoe_int4fp8_g1u1_subGU_128_gelu", "fmoe_int4fp8_g1u1_subGU_128_gelu.co", 128);
+            impl_ptr = &impl_int4_128;
+        }
+        else
+        {
+            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 256, or 512");
+        }
         impl_ptr->set_int4(true);
     }
     else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); // todo,add tune interface here
         if (selectedTile == 512)
         {
             if (fc2_smooth_scale.has_value())
@@ -491,6 +508,7 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); 
         if (selectedTile == 512)
         {
             if (fc2_smooth_scale.has_value())
@@ -656,14 +674,14 @@ void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    //int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
+    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
 
-    if (inter_dim %512==0)
+    if (selectedTile == 512)
     {
         static FMoeKernel impl_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
         impl_ptr = &impl_512;
     }
-    else if (inter_dim %320==0)
+    else if (selectedTile == 320)
     {
         static FMoeKernel impl_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
         impl_ptr = &impl_320;
