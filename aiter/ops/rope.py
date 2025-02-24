@@ -4,6 +4,7 @@
 from torch import Tensor, empty, empty_like, autograd
 from typing import Tuple, Union
 from ..jit.core import compile_ops
+from enum import IntEnum
 
 
 MD_NAME = "module_rope"
@@ -14,6 +15,7 @@ def rope_fwd_impl(
     output: Tensor,
     input: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -29,6 +31,7 @@ def rope_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -46,6 +49,7 @@ def rope_2c_fwd_impl(
     input_x: Tensor,
     input_y: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -63,6 +67,7 @@ def rope_2c_bwd_impl(
     output_grads_x: Tensor,
     output_grads_y: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -79,6 +84,7 @@ def rope_cached_fwd_impl(
     input: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -95,6 +101,7 @@ def rope_cached_bwd_impl(
     output_grads: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -113,6 +120,7 @@ def rope_cached_2c_fwd_impl(
     input_y: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -131,6 +139,7 @@ def rope_cached_2c_bwd_impl(
     output_grads_y: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ): 
     '''
@@ -147,6 +156,7 @@ def rope_thd_fwd_impl(
     input: Tensor,
     cu_seqlens: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ):
     '''
@@ -164,6 +174,7 @@ def rope_thd_bwd_impl(
     output_grads: Tensor,
     cu_seqlens: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ):
     '''
@@ -185,6 +196,7 @@ def rope_2d_fwd_impl(
     sin_w: Tensor,
     img_height: int,
     img_width: int,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ):
     '''
@@ -208,6 +220,7 @@ def rope_2d_bwd_impl(
     sin_w: Tensor,
     img_height: int,
     img_width: int,
+    rotate_style: int,
     reuse_freqs_front_part : bool
 ):
     '''
@@ -226,31 +239,34 @@ def rope_2d_bwd_impl(
 def rope_fwd(
     input: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
     s, b, h, d = input.shape
     output = empty((b, s, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input, requires_grad=False)
-    rope_fwd_impl(output, input, freqs, reuse_freqs_front_part)
+    rope_fwd_impl(output, input, freqs, rotate_style, reuse_freqs_front_part)
     return output
 
 def rope_bwd(
     output_grads: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
     s, b, h, d = output_grads.shape
     input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads, requires_grad=False)
-    rope_bwd_impl(input_grads, output_grads, freqs, reuse_freqs_front_part)
+    rope_bwd_impl(input_grads, output_grads, freqs, rotate_style, reuse_freqs_front_part)
     return input_grads
 
 def rope_2c_fwd(
     input_x: Tensor,
     input_y: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
@@ -259,13 +275,14 @@ def rope_2c_fwd(
         if transpose_output else empty_like(input_x, requires_grad=False)
     output_y = empty((b, s, h, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_y, requires_grad=False)
-    rope_2c_fwd_impl(output_x, output_y, input_x, input_y, freqs, reuse_freqs_front_part)
+    rope_2c_fwd_impl(output_x, output_y, input_x, input_y, freqs, rotate_style, reuse_freqs_front_part)
     return output_x, output_y
 
 def rope_2c_bwd(
     output_grads_x: Tensor,
     output_grads_y: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
@@ -274,33 +291,35 @@ def rope_2c_bwd(
         if transpose_output else empty_like(output_grads_x, requires_grad=False)
     input_grads_y = empty((b, s, h, d), dtype=output_grads_y.dtype, device=output_grads_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads_y, requires_grad=False)
-    rope_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, freqs, reuse_freqs_front_part)
+    rope_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, freqs, rotate_style, reuse_freqs_front_part)
     return input_grads_x, input_grads_y
 
 def rope_cached_fwd(
     input: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
     s, b, h, d = input.shape
     output = empty((b, s, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input, requires_grad=False)
-    rope_cached_fwd_impl(output, input, cos, sin, reuse_freqs_front_part)
+    rope_cached_fwd_impl(output, input, cos, sin, rotate_style, reuse_freqs_front_part)
     return output
 
 def rope_cached_bwd(
     output_grads: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
     s, b, h, d = output_grads.shape
     input_grads = empty((b, s, h, d), dtype=output_grads.dtype, device=output_grads.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads, requires_grad=False)
-    rope_cached_bwd_impl(input_grads, output_grads, cos, sin, reuse_freqs_front_part)
+    rope_cached_bwd_impl(input_grads, output_grads, cos, sin, rotate_style, reuse_freqs_front_part)
     return input_grads
 
 def rope_cached_2c_fwd(
@@ -308,6 +327,7 @@ def rope_cached_2c_fwd(
     input_y: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
@@ -316,7 +336,7 @@ def rope_cached_2c_fwd(
         if transpose_output else empty_like(input_x, requires_grad=False)
     output_y = empty((b, s, h, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_y, requires_grad=False)
-    rope_cached_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, reuse_freqs_front_part)
+    rope_cached_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, rotate_style, reuse_freqs_front_part)
     return output_x, output_y
 
 def rope_cached_2c_bwd(
@@ -324,6 +344,7 @@ def rope_cached_2c_bwd(
     output_grads_y: Tensor,
     cos: Tensor,
     sin: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
     transpose_output: bool = False
 ) -> Tensor :
@@ -332,27 +353,29 @@ def rope_cached_2c_bwd(
         if transpose_output else empty_like(output_grads_x, requires_grad=False)
     input_grads_y = empty((b, s, h, d), dtype=output_grads_y.dtype, device=output_grads_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads_y, requires_grad=False)
-    rope_cached_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, cos, sin, reuse_freqs_front_part)
+    rope_cached_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, cos, sin, rotate_style, reuse_freqs_front_part)
     return input_grads_x, input_grads_y
 
 def rope_thd_fwd(
     input: Tensor,
     cu_seqlens: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
 ) -> Tensor :
     output = empty_like(input, requires_grad=False)
-    rope_thd_fwd_impl(output, input, cu_seqlens, freqs, reuse_freqs_front_part)
+    rope_thd_fwd_impl(output, input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
     return output
 
 def rope_thd_bwd(
     output_grads: Tensor,
     cu_seqlens: Tensor,
     freqs: Tensor,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
 ) -> Tensor :
     input_grads = empty_like(output_grads, requires_grad=False)
-    rope_thd_bwd_impl(input_grads, output_grads, cu_seqlens, freqs, reuse_freqs_front_part)
+    rope_thd_bwd_impl(input_grads, output_grads, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
     return input_grads
 
 def rope_2d_fwd(
@@ -363,10 +386,11 @@ def rope_2d_fwd(
     sin_w: Tensor,
     img_height: int,
     img_width: int,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
 ) -> Tensor :
     output = empty_like(input, requires_grad=False)
-    rope_2d_fwd_impl(output, input, cos_h, sin_h, cos_w, sin_w, img_height, img_width, reuse_freqs_front_part)
+    rope_2d_fwd_impl(output, input, cos_h, sin_h, cos_w, sin_w, img_height, img_width, rotate_style, reuse_freqs_front_part)
     return output
 
 def rope_2d_bwd(
@@ -377,51 +401,55 @@ def rope_2d_bwd(
     sin_w: Tensor,
     img_height: int,
     img_width: int,
+    rotate_style: int,
     reuse_freqs_front_part : bool,
 ) -> Tensor :
     input_grads = empty_like(output_grads, requires_grad=False)
-    rope_2d_bwd_impl(input_grads, output_grads, cos_h, sin_h, cos_w, sin_w, img_height, img_width, reuse_freqs_front_part)
+    rope_2d_bwd_impl(input_grads, output_grads, cos_h, sin_h, cos_w, sin_w, img_height, img_width, rotate_style, reuse_freqs_front_part)
     return input_grads
 
 
 
 class RoPE(autograd.Function):
     @staticmethod
-    def forward(ctx, x: Tensor, freqs: Tensor, reuse_freqs_front_part : bool, transpose_output: bool = False) -> Tensor:
+    def forward(ctx, x: Tensor, freqs: Tensor, rotate_style: int, reuse_freqs_front_part : bool, transpose_output: bool = False) -> Tensor:
+        ctx.rotate_style = rotate_style
         ctx.reuse_freqs_front_part = reuse_freqs_front_part
         ctx.transpose_output = transpose_output
         ctx.save_for_backward(freqs)
-        return rope_fwd(x, freqs, reuse_freqs_front_part, transpose_output)
+        return rope_fwd(x, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
     
     @staticmethod
     def backward(ctx, output_grads: Tensor) -> Tuple[Union[Tensor, None], ...]:
         (freqs,) = ctx.saved_tensors
-        return rope_bwd(output_grads, freqs, ctx.reuse_freqs_front_part, ctx.transpose_output), None, None
+        return rope_bwd(output_grads, freqs, ctx.rotate_style, ctx.reuse_freqs_front_part, ctx.transpose_output), None, None
     
 class RoPECached(autograd.Function):
     @staticmethod
-    def forward(ctx, x: Tensor, cos: Tensor, sin: Tensor, reuse_freqs_front_part : bool, transpose_output: bool = False) -> Tensor:
+    def forward(ctx, x: Tensor, cos: Tensor, sin: Tensor, rotate_style: int, reuse_freqs_front_part : bool, transpose_output: bool = False) -> Tensor:
+        ctx.rotate_style = rotate_style
         ctx.reuse_freqs_front_part = reuse_freqs_front_part
         ctx.transpose_output = transpose_output
         ctx.save_for_backward(cos, sin)
-        return rope_cached_fwd(x, cos, sin, reuse_freqs_front_part, transpose_output)
+        return rope_cached_fwd(x, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
     
     @staticmethod
     def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
         cos, sin = ctx.saved_tensors
-        return rope_cached_bwd(output_grads, cos, sin, ctx.reuse_freqs_front_part, ctx.transpose_output), None, None
+        return rope_cached_bwd(output_grads, cos, sin, ctx.rotate_style, ctx.reuse_freqs_front_part, ctx.transpose_output), None, None
 
 class RoPETHD(autograd.Function):
     @staticmethod
-    def forward(ctx, x: Tensor, cu_seqlens: Tensor, freqs: Tensor, reuse_freqs_front_part : bool):
+    def forward(ctx, x: Tensor, cu_seqlens: Tensor, freqs: Tensor, rotate_style: int, reuse_freqs_front_part : bool):
+        ctx.rotate_style = rotate_style
         ctx.reuse_freqs_front_part = reuse_freqs_front_part
         ctx.save_for_backward(cu_seqlens, freqs)
-        return rope_thd_fwd(x, cu_seqlens, freqs, reuse_freqs_front_part)
+        return rope_thd_fwd(x, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
     
     @staticmethod
     def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
         cu_seqlens, freqs = ctx.saved_tensors
-        return rope_thd_bwd(output_grads, cu_seqlens, freqs, ctx.reuse_freqs_front_part), None, None
+        return rope_thd_bwd(output_grads, cu_seqlens, freqs, ctx.rotate_style, ctx.reuse_freqs_front_part), None, None
 
 class RoPE2D(autograd.Function):
     @staticmethod
@@ -429,14 +457,16 @@ class RoPE2D(autograd.Function):
                 Tensor, cos_height: Tensor, sin_height:
                 Tensor, cos_width: Tensor, sin_width: Tensor,
                 img_height: int, img_width: int,
+                rotate_style: int,
                 reuse_freqs_front_part : bool) -> Tensor:
         ctx.img_height = img_height
         ctx.img_width = img_width
+        ctx.rotate_style = rotate_style
         ctx.reuse_freqs_front_part = reuse_freqs_front_part
         ctx.save_for_backward(cos_height, sin_height, cos_width, sin_width)
-        return rope_2d_fwd(x, cos_height, sin_height, cos_width, sin_width, img_height, img_width, reuse_freqs_front_part)
+        return rope_2d_fwd(x, cos_height, sin_height, cos_width, sin_width, img_height, img_width, rotate_style, reuse_freqs_front_part)
     
     @staticmethod
     def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
         cos_height, sin_height, cos_width, sin_width = ctx.saved_tensors
-        return rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width, ctx.img_height, ctx.img_height, ctx.reuse_freqs_front_part), None, None
+        return rope_2d_bwd(output_grads, cos_height, sin_height, cos_width, sin_width, ctx.img_height, ctx.img_height, ctx.rotate_style, ctx.reuse_freqs_front_part), None, None
