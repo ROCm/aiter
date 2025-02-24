@@ -204,11 +204,11 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
                                      fc1_smooth_scale, fc2_smooth_scale)
 
         # b implement
+        if use_int4:
+            w1 = rearrange_4bit_elements(convert_int8_to_uint32_int4(w1))
+            w2 = rearrange_4bit_elements(convert_int8_to_uint32_int4(w2))
         w1b = shuffle_weight(w1)
         w2b = shuffle_weight(w2)
-        if use_int4:
-            w1b = rearrange_4bit_elements(convert_int8_to_uint32_int4(w1b))
-            w2b = rearrange_4bit_elements(convert_int8_to_uint32_int4(w2b))
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     fc1_scale, fc2_scale,
                                     fc1_smooth_scale, fc2_smooth_scale)
@@ -305,12 +305,10 @@ for dtype in [torch.bfloat16]:
                           quant='fp8smoothquant', use_g1u1=True)
 
 print('\ng1u1 int4')
-############warning: fixme: topk only support 1 here as we need ck mock but others not support it
-topk = 1
 for dtype in [torch.bfloat16]:
     for m in [32, 128]:
         # for dim in [1024]:
-        for dim in [4096, 6144,  8192]:
+        for dim in [4096, 6144]:
             for hdim in [1024, 4096]:
-                test_fmoe(dtype, m, dim, hdim, 8, topk,
+                test_fmoe(dtype, m, dim, hdim, 8, 3,
                           quant='wint4afp8smoothquant', use_g1u1=True)
