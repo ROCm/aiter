@@ -6,7 +6,7 @@ from torch import Tensor
 from typing import List, Optional
 import functools
 import pandas as pd
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
 
 
 @compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8")
@@ -64,7 +64,7 @@ def get_CKGEMM_config(
     K: int,
 ):
     if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
-        ckgemm_dict = pd.read_csv(f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv").drop_duplicates()
+        ckgemm_dict = pd.read_csv(f"{AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv").drop_duplicates()
         get_CKGEMM_config.ckgemm_dict = ckgemm_dict.set_index(['M','N','K']).to_dict('index')
     config = get_CKGEMM_config.ckgemm_dict.get((M,N,K), None)
     if config != None:
@@ -84,7 +84,7 @@ def get_ASMGEMM_config(
     dtype: torch.dtype
 ):
     if not hasattr(get_ASMGEMM_config, "asmgemm_dict"):
-        asmGemmDictDf = pd.read_csv(f"{AITER_ROOT_DIR}/aiter/configs/asm_a8w8_gemm.csv").drop_duplicates()
+        asmGemmDictDf = pd.read_csv(f"{AITER_CORE_DIR}/aiter/configs/asm_a8w8_gemm.csv").drop_duplicates()
         asmGemmDictDf.bias = asmGemmDictDf.bias.apply(lambda s: True if s in ['True',1,'true'] else False)
         get_ASMGEMM_config.asmgemm_dict = asmGemmDictDf.set_index(['M','N','K','bias','outdtype']).to_dict('index')
     return get_ASMGEMM_config.asmgemm_dict.get((M,N,K,bias,str(dtype)), None)

@@ -126,7 +126,6 @@ namespace aiter
       static_assert(false, "Unsupported operation");
     }
   }
-
   template <typename Operation>
   torch::Tensor aten_compute(torch::Tensor &input, torch::Tensor &other)
   {
@@ -188,7 +187,7 @@ namespace aiter
     const uint32_t current_n_size = (ti == (n_tiles - 1) && (N % BIG_TILE_SIZE_N) != 0) ? (N % BIG_TILE_SIZE_N) : BIG_TILE_SIZE_N;
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
     // use 128bit load&store whenever possible
-    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    if (current_n_size % elements_in_16B == 0 && current_k_size % 8 == 0)
     {
       // Copy full tile with large loads
       constexpr uint32_t row_bytes = BIG_TILE_SIZE_K * sizeof(_T);
@@ -204,7 +203,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % ld_per_row;
         uint32_t row = threadIdx.x / ld_per_row + t * rows_per_wg;
-        uint64_t offset = (col * 8 < current_k_size && row < current_n_size) ? row * stride2 + col * sizeof(__uint128_t) : 0;
+        uint64_t offset = (col * elements_in_16B < current_k_size && row < current_n_size) ? row * stride2 + col * sizeof(__uint128_t) : 0;
         const __uint128_t *pfa = (const __uint128_t *)(pat + offset);
         BLOCK_16B d;
         d.ow = *pfa;
@@ -230,7 +229,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
         uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
-        if (col * 8 < current_n_size && row < current_k_size)
+        if (col * elements_in_16B < current_n_size && row < current_k_size)
         {
           uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
           BLOCK_16B d;
@@ -295,7 +294,6 @@ namespace aiter
   template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag>
   __global__ void operator_bcast_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int N, const int K)
   {
-    // pad LDS row by dword
     constexpr uint32_t element_size = sizeof(_T); // in bytes
     constexpr uint32_t elements_in_16B = 16 / element_size;
 
@@ -326,7 +324,7 @@ namespace aiter
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
 
     // use 128bit load&store whenever possible
-    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    if (current_n_size % 8 == 0 && current_k_size % elements_in_16B == 0)
     {
       // Copy full tile with large loads
       constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
@@ -344,7 +342,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
         uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
-        if (col * 8 < current_n_size && row < current_k_size)
+        if (col * elements_in_16B < current_n_size && row < current_k_size)
         {
           uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
           BLOCK_16B d, f;
@@ -424,7 +422,7 @@ namespace aiter
     const uint32_t current_k_size = (tj == (k_tiles - 1) && (K % BIG_TILE_SIZE_K) != 0) ? (K % BIG_TILE_SIZE_K) : BIG_TILE_SIZE_K;
 
     // use 128bit load&store whenever possible
-    if (current_n_size % 8 == 0 && current_k_size % 8 == 0)
+    if (current_n_size % 8 == 0 && current_k_size % elements_in_16B == 0)
     {
       // Copy full tile with large loads
       constexpr uint32_t row_bytes_wr = BIG_TILE_SIZE_N * sizeof(_T);
@@ -442,7 +440,7 @@ namespace aiter
       {
         uint32_t col = threadIdx.x % vmem_per_row_wr;
         uint32_t row = threadIdx.x / vmem_per_row_wr + t * rows_per_wg_wr;
-        if (col * 8 < current_n_size && row < current_k_size)
+        if (col * elements_in_16B < current_n_size && row < current_k_size)
         {
           uint64_t offset_a = col * sizeof(__uint128_t);
           uint64_t offset = row * stride_k + col * sizeof(__uint128_t);
@@ -491,12 +489,16 @@ namespace aiter
     }
   }
 
-  template <class _T, int _rows, int _vec, typename Operation, bool order_flag>
-  __global__ void operator_bcast_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c, const int M, const int N, const int K)
+  template <class _T, int _rows, typename Operation, bool order_flag>
+  __global__ void operator_bcast_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int M, const int N, const int K)
   {
+    constexpr uint32_t element_size = sizeof(_T); // in bytes
+    constexpr uint32_t elements_in_16B = 16 / element_size;
+    int bpe = sizeof(_T);
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t n_tiles = N / _rows;
-    uint32_t k_tiles = K / _vec;
+    uint32_t k_tiles = K / elements_in_16B;
     if (idx < (uint64_t)M * n_tiles * k_tiles)
     {
       uint32_t ti = idx / (k_tiles * n_tiles);
@@ -505,16 +507,16 @@ namespace aiter
       uint32_t tk = idx_block % k_tiles;
       for (int row = 0; row < _rows; row++)
       {
-        uint64_t offset_b = (uint64_t)(tj + row * n_tiles) * K + tk * _vec;
-        uint64_t offset_ac = (uint64_t)(tj + row * n_tiles) * K + tk * _vec + (uint64_t)ti * N * K;
-        const _T *pa = (const _T *)a + offset_ac;
-        const _T *pb = (const _T *)b + offset_b;
-        _T *pc = (_T *)c + offset_ac;
-        for (int col = 0; col < _vec; col++)
+        uint64_t offset_b = (uint64_t)(tj + row * n_tiles) * K + tk * elements_in_16B;
+        uint64_t offset_ac = (uint64_t)(tj + row * n_tiles) * K + tk * elements_in_16B + (uint64_t)ti * N * K;
+        const uint8_t *pa = (const uint8_t *)a + offset_ac * bpe;
+        const uint8_t *pb = (const uint8_t *)b + offset_b * bpe;
+        const uint8_t *pc = (const uint8_t *)c + offset_ac * bpe;
+        for (int col = 0; col < elements_in_16B; col++)
         {
-          const _T *pfa = (const _T *)(pa + col);
-          const _T *pfb = (const _T *)(pb + col);
-          _T *pfc = (_T *)(pc + col);
+          const _T *pfa = (const _T *)(pa + col * bpe);
+          const _T *pfb = (const _T *)(pb + col * bpe);
+          _T *pfc = (_T *)(pc + col * bpe);
           *pfc = performOperation<_T, Operation, order_flag>(*pfa, *pfb);
         }
       }
@@ -522,101 +524,256 @@ namespace aiter
   }
 }
 
+std::vector<int64_t> broadcastShapes(const torch::Tensor &tensor1, const torch::Tensor &tensor2)
+{
+  auto shape1 = tensor1.sizes().vec();
+  auto shape2 = tensor2.sizes().vec();
+
+  int64_t max_dim = std::max(shape1.size(), shape2.size());
+  shape1.insert(shape1.begin(), max_dim - shape1.size(), 1);
+  shape2.insert(shape2.begin(), max_dim - shape2.size(), 1);
+
+  std::vector<int64_t> result_shape(max_dim, 1);
+  for (int64_t i = 0; i < max_dim; ++i)
+  {
+    if (shape1[i] == 1)
+    {
+      result_shape[i] = shape2[i];
+    }
+    else if (shape2[i] == 1)
+    {
+      result_shape[i] = shape1[i];
+    }
+    else if (shape1[i] == shape2[i])
+    {
+      result_shape[i] = shape1[i];
+    }
+    else
+    {
+      throw std::invalid_argument("Incompatible shapes for binary operator.");
+    }
+  }
+
+  return result_shape;
+}
+
+template <int pattern, typename Operation>
+struct BinaryOperationPattern;
+
+// PATTERN_TRANSPOSE
+template <typename Operation>
+struct BinaryOperationPattern<1, Operation>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int num_elements = output.numel();
+    int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
+    int M = dim == 2 ? 1 : rem_dim_size;
+    int N = shape[dim - 2];
+    int K = shape[dim - 1];
+
+    auto tensor_not_conti = input.is_contiguous() ? other : input;
+    int stride0 = tensor_not_conti.stride(0);
+    int stride2 = tensor_not_conti.stride(2);
+    stride0 *= tensor_not_conti.element_size();
+    stride2 *= tensor_not_conti.element_size();
+    constexpr uint32_t BIG_TILE_SIZE_N = 64;
+    constexpr uint32_t BIG_TILE_SIZE_K = 64;
+    constexpr uint32_t M_SWIZZLE = 8;
+    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+    const dim3 grid_dim(grid_x, 1, 1);
+    const dim3 block_dim(256, 1, 1);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (order_flag)
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          output.scalar_type(), "operator_tn_big_tile_kernel", [&]
+          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
+    }
+    else
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          output.scalar_type(), "operator_tn_big_tile_kernel", [&]
+          { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
+    }
+  }
+};
+
+// PATTERN_BROADCAST_0
+template <typename Operation>
+struct BinaryOperationPattern<2, Operation>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+    int num_elements = output.numel();
+    int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
+    int M = dim == 2 ? 1 : rem_dim_size;
+    int N = shape[dim - 2];
+    int K = shape[dim - 1];
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const uint32_t rows = 8;
+    int vec = 16 / output.element_size();
+    if (N % rows == 0 && K % vec == 0)
+    {
+      constexpr uint32_t wg = 64;
+      int grid_x = (num_elements / (rows * vec) + wg - 1) / wg;
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast_tile_kernel", [&]
+            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, true>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast_tile_kernel", [&]
+            { aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, false>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
+      }
+    }
+    else
+    {
+      constexpr uint32_t BIG_TILE_SIZE_N = 64;
+      constexpr uint32_t BIG_TILE_SIZE_K = 64;
+      constexpr uint32_t M_SWIZZLE = 8;
+      const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(256, 1, 1);
+
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+            { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast_big_tile_kernel", [&]
+            { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+      }
+    }
+  }
+};
+
+// PATTERN_BROADCAST_1
+template <typename Operation>
+struct BinaryOperationPattern<3, Operation>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int num_elements = output.numel();
+    int rem_dim_size = num_elements / (shape[dim - 2] * shape[dim - 1]);
+    int M = dim == 2 ? 1 : rem_dim_size;
+    int N = shape[dim - 2];
+    int K = shape[dim - 1];
+
+    constexpr uint32_t BIG_TILE_SIZE_N = 64;
+    constexpr uint32_t BIG_TILE_SIZE_K = 64;
+    constexpr uint32_t M_SWIZZLE = 8;
+    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+    const dim3 grid_dim(grid_x, 1, 1);
+    const dim3 block_dim(256, 1, 1);
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (order_flag)
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
+    }
+    else
+    {
+      VLLM_DISPATCH_FLOATING_TYPES(
+          output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
+    }
+  }
+};
+
+template <int pattern, typename Operation>
+void binary_operation_pattern(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+{
+  BinaryOperationPattern<pattern, Operation>::apply(input, other, output, order_flag);
+}
+
 template <typename Operation>
 torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
 {
-  int dim = input.dim();
-  bool is_same_dtype = input.dtype() == other.dtype();
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  int dim = input.dim();
 
-  if (dim == 2)
+  bool is_support = false;
+  bool order_flag = true;
+  int pattern = 0;
+  constexpr uint32_t PATTERN_TRANSPOSE = 1;
+  constexpr uint32_t PATTERN_BROADCAST_0 = 2;
+  constexpr uint32_t PATTERN_BROADCAST_1 = 3;
+  if (!is_support && dim == 2)
   {
-    bool is_support = true;
-    is_support &= is_same_dtype == true;
+    is_support = true;
     is_support &= input.dim() == other.dim();
     is_support &= input.size(0) == other.size(0);
     is_support &= input.size(1) == other.size(1);
     is_support &= input.size(1) > 512;
     is_support &= input.is_contiguous() == other.is_contiguous();
     is_support &= input.is_contiguous() == true;
-    int M = 1;
-    int N = input.size(0);
-    int K = input.size(1);
-    const uint32_t rows = 8;
-    const uint32_t vec = 16 / sizeof(input.dtype());
-    is_support &= N % rows == 0;
-    is_support &= K % vec == 0;
-    if (is_support)
-    {
-      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-      auto output = torch::empty({N, K}, options);
-      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-      int elements = N * K;
-
-      constexpr uint32_t wg = 256;
-      int grid_x = (elements / (rows * vec) + wg - 1) / wg;
-      const dim3 grid_dim(grid_x, 1, 1);
-      const dim3 block_dim(wg, 1, 1);
-
-      VLLM_DISPATCH_FLOATING_TYPES(
-          input.scalar_type(), "operator_bcast_tile_kernel", [&]
-          { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
-      return output;
-    }
-    else
-    {
-      return aiter::aten_compute<Operation>(input, other);
-    }
+    pattern = is_support ? PATTERN_BROADCAST_0 : 0;
   }
-  else if (dim == 3)
-  {
-    constexpr uint32_t PATTERN_TRANSPOSE = 1;
-    constexpr uint32_t PATTERN_BROADCAST_0 = 2;
-    constexpr uint32_t PATTERN_BROADCAST_1 = 3;
 
-    auto tensor_not_conti = input.is_contiguous() ? other : input;
-    bool order_flag;
-    int M, N, K;
-    int stride0, stride1, stride2;
-    int pattern = 0;
+  if (!is_support && dim == 3)
+  {
     if (input.is_contiguous() != other.is_contiguous())
     {
+      auto tensor_not_conti = input.is_contiguous() ? other : input;
       order_flag = !input.is_contiguous() ? true : false;
-      bool is_support = true;
-      M = input.size(0);
-      N = input.size(1);
-      K = input.size(2);
+      is_support = true;
       // avoid broadcast
-      is_support &= is_same_dtype == true;
       is_support &= input.dim() == other.dim();
-      is_support &= dim == 3;
       is_support &= input.size(0) == other.size(0);
       is_support &= input.size(1) == other.size(1);
       is_support &= input.size(2) == other.size(2);
-      stride0 = tensor_not_conti.stride(0);
-      stride1 = tensor_not_conti.stride(1);
-      stride2 = tensor_not_conti.stride(2);
-      is_support &= stride1 == 1;
-      stride0 *= input.element_size();
-      stride1 *= input.element_size();
-      stride2 *= input.element_size();
+      is_support &= tensor_not_conti.stride(1) == 1;
       pattern = is_support ? PATTERN_TRANSPOSE : 0;
     }
     else if (input.is_contiguous() && other.is_contiguous())
     {
-      bool is_support = false;
+      is_support = false;
       if (!is_support && other.size(0) == 1)
       {
         is_support = true;
-        is_support &= is_same_dtype == true;
         is_support &= input.dim() == other.dim();
         is_support &= input.size(0) > 1;
-        is_support &= other.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
         is_support &= input.size(2) == other.size(2);
         pattern = is_support ? PATTERN_BROADCAST_0 : 0;
@@ -626,10 +783,8 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && input.size(0) == 1)
       {
         is_support = true;
-        is_support &= is_same_dtype == true;
         is_support &= input.dim() == other.dim();
         is_support &= other.size(0) > 1;
-        is_support &= input.size(0) == 1;
         is_support &= input.size(1) == other.size(1);
         is_support &= input.size(2) == other.size(2);
         pattern = is_support ? PATTERN_BROADCAST_0 : 0;
@@ -639,7 +794,6 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && input.size(1) == 1)
       {
         is_support = true;
-        is_support &= is_same_dtype == true;
         is_support &= input.dim() == other.dim();
         is_support &= other.size(1) > 1;
         is_support &= input.size(0) == other.size(0);
@@ -651,7 +805,6 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       if (!is_support && other.size(1) == 1)
       {
         is_support = true;
-        is_support &= is_same_dtype == true;
         is_support &= input.dim() == other.dim();
         is_support &= input.size(1) > 1;
         is_support &= input.size(0) == other.size(0);
@@ -660,150 +813,42 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
         order_flag = false;
       }
     }
+  }
+
+  if (is_support)
+  {
+    auto in0_dtype = input.dtype();
+    auto in1_dtype = other.dtype();
+    torch::ScalarType out_dtype = torch::promote_types(input.scalar_type(), other.scalar_type());
+    std::vector<int64_t> out_shape = broadcastShapes(input, other);
+    auto device = input.device();
+    auto options = torch::TensorOptions().dtype(out_dtype).device(input.device());
+    auto output = torch::empty(out_shape, options);
+
+    torch::Tensor input0 = in0_dtype == out_dtype ? input : input.to(out_dtype);
+    torch::Tensor other0 = in1_dtype == out_dtype ? other : other.to(out_dtype);
+
+    void *buf_a = reinterpret_cast<void *>(input0.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other0.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
 
     if (pattern == PATTERN_TRANSPOSE)
     {
-      constexpr uint32_t BIG_TILE_SIZE_N = 64;
-      constexpr uint32_t BIG_TILE_SIZE_K = 64;
-      constexpr uint32_t M_SWIZZLE = 8;
-      const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-      const dim3 grid_dim(grid_x, 1, 1);
-      const dim3 block_dim(256, 1, 1);
-
-      auto options =
-          torch::TensorOptions().dtype(input.dtype()).device("cuda");
-      auto output =
-          torch::empty(input.sizes(), options);
-      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-
-      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-      if (order_flag)
-      {
-        VLLM_DISPATCH_FLOATING_TYPES(
-            input.scalar_type(), "operator_tn_big_tile_kernel", [&]
-            { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, stride0, stride2); });
-      }
-      else
-      {
-        VLLM_DISPATCH_FLOATING_TYPES(
-            input.scalar_type(), "operator_tn_big_tile_kernel", [&]
-            { aiter::operator_tn_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, stride0, stride2); });
-      }
-
-      return output;
+      binary_operation_pattern<1, Operation>(input0, other0, output, order_flag);
     }
     else if (pattern == PATTERN_BROADCAST_0)
     {
-      M = order_flag ? input.size(0) : other.size(0);
-      N = order_flag ? input.size(1) : other.size(1);
-      K = order_flag ? input.size(2) : other.size(2);
-      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-      auto output = torch::empty({M, N, K}, options);
-      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-      int elements = M * N * K;
-      const uint32_t rows = 8;
-      const uint32_t vec = 16 / sizeof(input.dtype());;
-      if (N % rows == 0 && K % vec == 0)
-      {
-        constexpr uint32_t wg = 64;
-        int grid_x = (elements / (rows * vec) + wg - 1) / wg;
-        const dim3 grid_dim(grid_x, 1, 1);
-        const dim3 block_dim(wg, 1, 1);
-
-        if (order_flag)
-        {
-          VLLM_DISPATCH_FLOATING_TYPES(
-              input.scalar_type(), "operator_bcast_tile_kernel", [&]
-              { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, true>
-                    <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K); });
-        }
-        else
-        {
-          VLLM_DISPATCH_FLOATING_TYPES(
-              input.scalar_type(), "operator_bcast_tile_kernel", [&]
-              { aiter::operator_bcast_tile_kernel<scalar_t, rows, vec, Operation, false>
-                    <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K); });
-        }
-      }
-      else
-      {
-        constexpr uint32_t BIG_TILE_SIZE_N = 64;
-        constexpr uint32_t BIG_TILE_SIZE_K = 64;
-        constexpr uint32_t M_SWIZZLE = 8;
-        const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-        const dim3 grid_dim(grid_x, 1, 1);
-        const dim3 block_dim(256, 1, 1);
-
-        if (order_flag)
-        {
-          VLLM_DISPATCH_FLOATING_TYPES(
-              input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-              { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                    <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
-        }
-        else
-        {
-          VLLM_DISPATCH_FLOATING_TYPES(
-              input.scalar_type(), "operator_bcast_big_tile_kernel", [&]
-              { aiter::operator_bcast_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                    <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
-        }
-      }
-
-      return output;
+      binary_operation_pattern<2, Operation>(input0, other0, output, order_flag);
     }
     else if (pattern == PATTERN_BROADCAST_1)
     {
-      M = order_flag ? other.size(0) : input.size(0);
-      N = order_flag ? other.size(1) : input.size(1);
-      K = order_flag ? other.size(2) : input.size(2);
-      constexpr uint32_t BIG_TILE_SIZE_N = 64;
-      constexpr uint32_t BIG_TILE_SIZE_K = 64;
-      constexpr uint32_t M_SWIZZLE = 8;
-      const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
-      const dim3 grid_dim(grid_x, 1, 1);
-      const dim3 block_dim(256, 1, 1);
-
-      auto options = torch::TensorOptions().dtype(input.dtype()).device("cuda");
-      auto output = torch::empty({M, N, K}, options);
-      void *buf_c = reinterpret_cast<void *>(output.data_ptr());
-
-      void *buf_a = reinterpret_cast<void *>(input.data_ptr());
-      void *buf_b = reinterpret_cast<void *>(other.data_ptr());
-
-      const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-      if (order_flag)
-      {
-        VLLM_DISPATCH_FLOATING_TYPES(
-            input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N); });
-      }
-      else
-      {
-        VLLM_DISPATCH_FLOATING_TYPES(
-            input.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N); });
-      }
-
-      return output;
+      binary_operation_pattern<3, Operation>(input0, other0, output, order_flag);
     }
-    else
-    {
-      return aiter::aten_compute<Operation>(input, other);
-    }
+    return output;
+  }
+  else
+  {
+    return aiter::aten_compute<Operation>(input, other);
   }
 }
 
@@ -826,3 +871,6 @@ torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
   return binary_operation<aiter::DivOp>(input, other);
 }
+
+// inline at::Tensor add(const at::Tensor & self, const at::Scalar & other) {
+// }

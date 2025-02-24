@@ -87,7 +87,6 @@ def torch_moe_blockscale(hidden_states,
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
 
-# @perftest(num_warmup=1, num_iters=2)
 def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    # following for int8 quant
                    fc1_scale=None,  # [expert, inter_dim, 1]

@@ -69,6 +69,7 @@ private:
     hipModule_t module;
     hipFunction_t kernel_func;
     uint32_t sub_GU = 512;
+    bool is_int4 = false;
 
 public:
     FMoeKernel(const char *name, const char *hsaco, uint32_t sub_GU = 512)
@@ -79,6 +80,11 @@ public:
         std::cout << " Success" << std::endl;
         this->sub_GU = sub_GU;
     };
+
+    void set_int4(bool is_int4_) 
+    {
+        is_int4 = is_int4_;
+    }
 
     template <typename T, typename T_O, bool switchGxy = false>
     void launch_kernel(torch::Tensor &out,                    // [token_cnt, dim]
@@ -100,7 +106,7 @@ public:
         int dim = input.size(1);
         int sub_X_cnt = sorted_expert_ids.size(0);
         int eprt = w1.size(0);
-        int inter_dim = w2.size(2);
+        int inter_dim = is_int4 ? w2.size(2) * 8 : w2.size(2);
         uint32_t sub_GU = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
@@ -108,10 +114,15 @@ public:
         int stride_X = input.stride(0) * input.element_size();
         int stride_GU = dim * I_elemSize;
         int stride_D = inter_dim * I_elemSize;
+        if (is_int4)
+        {
+            stride_GU /= 2;
+            stride_D /= 2;
+        }
         int stride_expert_GU = stride_GU * inter_dim;
         int stride_expert_D = stride_D * dim;
-        int stride_expert_GUDQN = w1_dqn.has_value() ? w1_dqn.value().size(1) * sizeof(float) : 0;
-        int stride_expert_DDQN = w2_dqn.has_value() ? w2_dqn.value().size(1) * sizeof(float) : 0;
+        int stride_expert_GUDQN = w1_dqn.has_value() ? w1_dqn.value().stride(0) * sizeof(float) : 0;
+        int stride_expert_DDQN = w2_dqn.has_value() ? w2_dqn.value().stride(0) * sizeof(float) : 0;
         int stride_expert_SMTDQN = inter_dim * sizeof(float);
         int stride_O = dim * O_elemSize;
         if (inter_dim * 2 == w1.size(1))
@@ -166,7 +177,6 @@ public:
         int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
         int gdy = sub_X_cnt;
         int gdz = 1;
-
         // std::cout << "args.dim: " << args.dim << std::endl;
         // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
         // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
@@ -202,9 +212,9 @@ public:
         }
     };
 };
-int get_heuristic_tile(int inter_dim, int sub_X_cnt)
+int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int> &available_tiles)
 {
-    int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
+    // int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
     hipDevice_t dev;
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
@@ -215,7 +225,7 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt)
     uint32_t round = 0xffffffff;
     int selectedTile = 0;
 
-    for (auto tile : tiles)
+    for (auto tile : available_tiles)
     {
         if ((inter_dim % tile) == 0)
         {
@@ -375,10 +385,33 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
-
-    if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
+    if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
+        if (selectedTile == 512) 
+        {
+            static FMoeKernel impl_int4_512("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
+            impl_ptr = &impl_int4_512;
+        }
+        else if (selectedTile == 256) 
+        {
+            static FMoeKernel impl_int4_256("fmoe_int4fp8_g1u1_subGU_256_gelu", "fmoe_int4fp8_g1u1_subGU_256_gelu.co", 256);
+            impl_ptr = &impl_int4_256;
+        }
+        else if (selectedTile == 128) 
+        {
+            static FMoeKernel impl_int4_128("fmoe_int4fp8_g1u1_subGU_128_gelu", "fmoe_int4fp8_g1u1_subGU_128_gelu.co", 128);
+            impl_ptr = &impl_int4_128;
+        }
+        else
+        {
+            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 256, or 512");
+        }
+        impl_ptr->set_int4(true);
+    }
+    else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
+    {
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); // todo,add tune interface here
         if (selectedTile == 512)
         {
             if (fc2_smooth_scale.has_value())
@@ -475,6 +508,7 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); 
         if (selectedTile == 512)
         {
             if (fc2_smooth_scale.has_value())
@@ -640,20 +674,20 @@ void fmoe_fp8_g1u1_a16(torch::Tensor &out,                    // [token_cnt, dim
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    //int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
+    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
 
-    if (inter_dim %512==0)
+    if (selectedTile == 512)
     {
         static FMoeKernel impl_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
         impl_ptr = &impl_512;
     }
-    else if (inter_dim %320==0)
+    else if (selectedTile == 320)
     {
         static FMoeKernel impl_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
         impl_ptr = &impl_320;
     }
     else
-        TORCH_CHECK(false, __func__, " Unsupported selectedTile " + std::to_string(selectedTile) + ", which should be divisible by 320 or 512");
+        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
 
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,

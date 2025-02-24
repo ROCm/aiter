@@ -116,7 +116,7 @@
         "extra_include": [],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
@@ -281,7 +281,7 @@
     },
     "module_aiter_operator": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/binary_operator_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/aiter_operator_pybind.cu'",
             "f'{AITER_CSRC_DIR}/include/aiter_operator.h'",
             "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'",
             "f'{AITER_CSRC_DIR}/kernels/unary_operator.cu'"
@@ -302,7 +302,9 @@
         ],
         "md_name": "'module_quant'",
         "flags_extra_cc": [],
-        "flags_extra_hip": ["'-DENABLE_FP8'"],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "isASM": "False",
