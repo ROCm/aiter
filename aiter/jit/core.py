@@ -134,6 +134,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         flags_cc = ["-O3", "-std=c++17"]
         flags_hip = [
+            "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
             "-D__HIP_PLATFORM_AMD__=1",

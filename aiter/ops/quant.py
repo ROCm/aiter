@@ -27,7 +27,7 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
-def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8):
+def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8, dtypeMax=None):
     if x_scale is None:
         hidden_states = x
     else:
@@ -40,7 +40,8 @@ def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch
         keepdim=True
     )
 
-    dtypeMax = get_dtype_max(quant_dtype)
+    if not dtypeMax:
+        dtypeMax = get_dtype_max(quant_dtype)
 
     per_token_scale = per_token_amax.to(dtype=torch.float32) / dtypeMax
     per_token_scale[per_token_scale == 0] = 1
