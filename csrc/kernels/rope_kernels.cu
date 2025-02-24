@@ -2,6 +2,7 @@
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <c10/cuda/CUDAGuard.h>
+#include "rope.h"
 #include "dispatch_utils.h"
 
 // =====================================================================================================================
@@ -21,6 +22,9 @@
 // thd:                 Shape of tensor.
 // 2d:                  2D image.
 //
+
+#define ROTATE_STYLE_NEOX 0
+#define ROTATE_STYLE_GPTJ 1
 
 struct Op1cUncachedFwd
 {
@@ -1130,6 +1134,7 @@ void rope_fwd_impl(
     torch::Tensor&       output,        // [s, b, h, d]
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1168,6 +1173,7 @@ void rope_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1208,6 +1214,7 @@ void rope_2c_fwd_impl(
     const torch::Tensor& input_x,       // [s, b, h, d]
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1260,6 +1267,7 @@ void rope_2c_bwd_impl(
     const torch::Tensor& output_grads_x,// [s, b, h, d]
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1311,6 +1319,7 @@ void rope_cached_fwd_impl(
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1351,6 +1360,7 @@ void rope_cached_bwd_impl(
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1393,6 +1403,7 @@ void rope_cached_2c_fwd_impl(
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1447,6 +1458,7 @@ void rope_cached_2c_bwd_impl(
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1499,6 +1511,7 @@ void rope_thd_fwd_impl(
     const torch::Tensor& input,         // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1537,6 +1550,7 @@ void rope_thd_bwd_impl(
     const torch::Tensor& output_grads,  // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1579,6 +1593,7 @@ void rope_2d_fwd_impl(
     const torch::Tensor& sin_w,
     const int            img_height,
     const int            img_width,
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1626,6 +1641,7 @@ void rope_2d_bwd_impl(
     const torch::Tensor& sin_w,
     const int            img_height,
     const int            img_width,
+    const int            rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output

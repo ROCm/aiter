@@ -5,10 +5,17 @@
 
 #include <torch/extension.h>
 
+enum class RotateStyle
+{
+    NEOX = 0,
+    GPTJ = 1
+};
+
 void rope_fwd_impl(
     torch::Tensor&       output,        // [s, b, h, d]
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -16,6 +23,7 @@ void rope_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -25,6 +33,7 @@ void rope_2c_fwd_impl(
     const torch::Tensor& input_x,       // [s, b, h, d]
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -34,6 +43,7 @@ void rope_2c_bwd_impl(
     const torch::Tensor& output_grads_x,// [s, b, h, d]
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -42,6 +52,7 @@ void rope_cached_fwd_impl(
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -50,6 +61,7 @@ void rope_cached_bwd_impl(
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -60,6 +72,7 @@ void rope_cached_2c_fwd_impl(
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -70,6 +83,7 @@ void rope_cached_2c_bwd_impl(
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -78,6 +92,7 @@ void rope_thd_fwd_impl(
     const torch::Tensor& input,         // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d // 2] if reuse_freqs_front_part else [max_s, 1, 1, d], where max_s = cu_seqlens[-1]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -86,6 +101,7 @@ void rope_thd_bwd_impl(
     const torch::Tensor& output_grads,  // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d // 2] if reuse_freqs_front_part else [max_s, 1, 1, d], where max_s = cu_seqlens[-1]
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -98,6 +114,7 @@ void rope_2d_fwd_impl(
     const torch::Tensor& sin_w,         // [1, 1,  W', d // 4] if reuse_freqs_front_part else [1, 1,  W', d // 2], where W' >= W
     const int            img_height,    // H
     const int            img_width,     // W
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
 
@@ -110,5 +127,6 @@ void rope_2d_bwd_impl(
     const torch::Tensor& sin_w,         // [1, 1,  W', d // 4] if reuse_freqs_front_part else [1, 1,  W', d // 2], where W' >= W
     const int            img_height,    // H
     const int            img_width,     // W
+    const int            rotate_style,
     const bool           reuse_freqs_front_part
 );
