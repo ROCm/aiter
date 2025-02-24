@@ -9,14 +9,52 @@
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
 
-fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
+struct fmha_bwd_traits_all: public fmha_bwd_traits
+{
+    fmha_bwd_traits_all(const mask_info &mask,
+        std::string dtype,
+        int head_size,
+        bool has_dropout,
+        bool enable_alibi,
+        bool deterministic
+        bool use_ext_asm,
+        bool is_v3_atomic_fp32,
+        int how_v3_bf16_cvt): fmha_bwd_traits{head_size,
+            head_size,
+            dtype,
+            false, // is_group_mode
+            mask.type,
+            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
+            false,    // has_dbias
+            has_dropout,
+            false, // s_randval
+            deterministic}, 
+            use_ext_asm{use_ext_asm},
+            is_v3_atomic_fp32{is_v3_atomic_fp32},
+            how_v3_bf16_cvt{how_v3_bf16_cvt} {}
+    bool use_ext_asm;
+    bool is_v3_atomic_fp32;
+    int how_v3_bf16_cvt;
+}
+
+float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
+    float r = fmha_bwd_v3(traits, args, stream_config);
+    if (r == -1) {
+        r = fmha_bwd(traits, args, stream_config);
+    }
+}
+
+fmha_bwd_traits_all get_ck_fmha_bwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size,
                                        bool has_dropout,
                                        bool enable_alibi,
-                                       bool deterministic)
+                                       bool deterministic
+                                       bool use_ext_asm,
+                                       bool is_v3_atomic_fp32,
+                                       int how_v3_bf16_cvt)
 {
-    return fmha_bwd_traits{head_size,
+    return fmha_bwd_traits_all{head_size,
                            head_size,
                            dtype,
                            false, // is_group_mode
@@ -25,7 +63,10 @@ fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                            false,    // has_dbias
                            has_dropout,
                            false, // s_randval
-                           deterministic};
+                           deterministic,
+                           use_ext_asm,
+                           is_v3_atomic_fp32,
+                           how_v3_bf16_cvt};
 }
 
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
@@ -100,11 +141,11 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(1);
     ck_tile::index_t nhead_stride_dv = dv.stride(2);
 
-    // dq_acc: (split, batch_size, seqlen_q, nheads, hdim)
+    // dq_acc: (split, batch_size, nheads, seqlen_q, hdim)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
     ck_tile::index_t batch_stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
-    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(3);
+    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(2);
+    ck_tile::index_t stride_dq_acc = dq_acc.stride(3);
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -353,9 +394,10 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
-
+        
+        // TODO: for debug fix this
         auto traits =
-            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
+            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic, true, true, 1);
 
         auto args =
             get_ck_fmha_bwd_args(
@@ -382,7 +424,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_bwd(traits, args, stream_config);
+        float t = fmha_bwd_router(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
