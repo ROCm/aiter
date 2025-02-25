@@ -121,8 +121,8 @@ public:
         }
         int stride_expert_GU = stride_GU * inter_dim;
         int stride_expert_D = stride_D * dim;
-        int stride_expert_GUDQN = w1_dqn.has_value() ? w1_dqn.value().size(1) * sizeof(float) : 0;
-        int stride_expert_DDQN = w2_dqn.has_value() ? w2_dqn.value().size(1) * sizeof(float) : 0;
+        int stride_expert_GUDQN = w1_dqn.has_value() ? w1_dqn.value().stride(0) * sizeof(float) : 0;
+        int stride_expert_DDQN = w2_dqn.has_value() ? w2_dqn.value().stride(0) * sizeof(float) : 0;
         int stride_expert_SMTDQN = inter_dim * sizeof(float);
         int stride_O = dim * O_elemSize;
         if (inter_dim * 2 == w1.size(1))
