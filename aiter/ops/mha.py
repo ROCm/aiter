@@ -116,6 +116,7 @@ def _flash_attn_forward(
     return_lse: bool,
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    print("forward")
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_fwd(
         q,
@@ -155,6 +156,7 @@ def _flash_attn_backward(
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
+    print(dropout_p, causal, window_size_left, window_size_right, deterministic)
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
         dq,
