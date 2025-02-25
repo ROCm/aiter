@@ -37,17 +37,18 @@ struct Op1cUncachedFwd
         const int32_t stride_i_h, const int32_t stride_i_d,
         const int32_t stride_o_h, const int32_t stride_o_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f     = size_valid_half_f * stride_i_d;
+        // rotate count
+        const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r   = size_r >> 1;
+        const int32_t offset_half_f = size_half_r * stride_i_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_i_d = did * stride_i_d;
             const int32_t offset_o_d = did * stride_o_d;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
+            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
 
             float cos, sin;
             sincosf(float(p_freqs[fid]), &sin, &cos);
@@ -60,15 +61,15 @@ struct Op1cUncachedFwd
 
                 const float input = float(p_input[offset_i]);
                 const float input_rotate =
-                    (did < size_valid_half_f) ? float(-p_input[offset_i + offset_half_f]):
-                                                float( p_input[offset_i - offset_half_f]);
+                    (did < size_half_r) ? float(-p_input[offset_i + offset_half_f]):
+                                          float( p_input[offset_i - offset_half_f]);
 
                 p_output[offset_o] = scalar_t(input * cos + input_rotate * sin);
             }
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -77,7 +78,7 @@ struct Op1cUncachedFwd
                 const int32_t offset_o = hid * stride_o_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
                 }
@@ -97,24 +98,25 @@ struct Op1cUncachedBwd
         const int32_t stride_o_h, const int32_t stride_o_d,
         const int32_t stride_i_h, const int32_t stride_i_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f     = size_valid_half_f * stride_i_d;
+        // rotate count
+        const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r   = size_r >> 1;
+        const int32_t offset_half_f = size_half_r * stride_i_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_o_d = did * stride_o_d;
             const int32_t offset_i_d = did * stride_i_d;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_valid_half_f);
-            const int32_t fid_sin_1 = did - size_valid_half_f;
+            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
+            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
+            const int32_t fid_sin_1 = did - size_half_r;
 
             const float cos = cosf(float(p_freqs[fid_cos]));
             const float sin =
-                (did < size_valid_half_f) ? sinf(float(p_freqs[fid_sin_0])) :
-                                           -sinf(float(p_freqs[fid_sin_1]));
+                (did < size_half_r) ? sinf(float(p_freqs[fid_sin_0])) :
+                                     -sinf(float(p_freqs[fid_sin_1]));
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -124,15 +126,15 @@ struct Op1cUncachedBwd
 
                 const float output_grad = float(p_output_grads[offset_o]);
                 const float output_grad_rotate =
-                    (did < size_valid_half_f) ? float(p_output_grads[offset_o + offset_half_f]):
-                                                float(p_output_grads[offset_o - offset_half_f]);
+                    (did < size_half_r) ? float(p_output_grads[offset_o + offset_half_f]):
+                                          float(p_output_grads[offset_o - offset_half_f]);
 
                 p_input_grads[offset_i] = scalar_t(output_grad * cos + output_grad_rotate * sin);
             }
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -141,7 +143,7 @@ struct Op1cUncachedBwd
                 const int32_t offset_i = hid * stride_i_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_input_grads[offset_i + did * stride_i_d] = p_output_grads[offset_o + did * stride_o_d];
                 }
@@ -165,20 +167,21 @@ struct Op2cUncachedFwd
         const int32_t stride_ox_h, const int32_t stride_ox_d,
         const int32_t stride_oy_h, const int32_t stride_oy_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f_x   = size_valid_half_f * stride_ix_d;
-        const int32_t offset_half_f_y   = size_valid_half_f * stride_iy_d;
+        // rotate count
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_ix_d = did * stride_ix_d;
             const int32_t offset_iy_d = did * stride_iy_d;
             const int32_t offset_ox_d = did * stride_ox_d;
             const int32_t offset_oy_d = did * stride_oy_d;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
+            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
 
             float cos, sin;
             sincosf(float(p_freqs[fid]), &sin, &cos);
@@ -194,11 +197,11 @@ struct Op2cUncachedFwd
                 const float input_x = float(p_input_x[offset_ix]);
                 const float input_y = float(p_input_y[offset_iy]);
                 const float input_x_rotate =
-                    (did < size_valid_half_f) ? float(-p_input_x[offset_ix + offset_half_f_x]):
-                                                float( p_input_x[offset_ix - offset_half_f_x]);
+                    (did < size_half_r) ? float(-p_input_x[offset_ix + offset_half_r_x]):
+                                          float( p_input_x[offset_ix - offset_half_r_x]);
                 const float input_y_rotate =
-                    (did < size_valid_half_f) ? float(-p_input_y[offset_iy + offset_half_f_y]):
-                                                float( p_input_y[offset_iy - offset_half_f_y]);
+                    (did < size_half_r) ? float(-p_input_y[offset_iy + offset_half_r_y]):
+                                          float( p_input_y[offset_iy - offset_half_r_y]);
 
                 p_output_x[offset_ox] = scalar_t(input_x * cos + input_x_rotate * sin);
                 p_output_y[offset_oy] = scalar_t(input_y * cos + input_y_rotate * sin);
@@ -206,7 +209,7 @@ struct Op2cUncachedFwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -217,7 +220,7 @@ struct Op2cUncachedFwd
                 const int32_t offset_oy = hid * stride_oy_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
                     p_output_y[offset_oy + did * stride_oy_d] = p_input_y[offset_iy + did * stride_iy_d];
@@ -242,27 +245,28 @@ struct Op2cUncachedBwd
         const int32_t stride_ix_h, const int32_t stride_ix_d,
         const int32_t stride_iy_h, const int32_t stride_iy_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f_x   = size_valid_half_f * stride_ix_d;
-        const int32_t offset_half_f_y   = size_valid_half_f * stride_iy_d;
+        // rotate count
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_ox_d = did * stride_ox_d;
             const int32_t offset_oy_d = did * stride_oy_d;
             const int32_t offset_ix_d = did * stride_ix_d;
             const int32_t offset_iy_d = did * stride_iy_d;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_valid_half_f);
-            const int32_t fid_sin_1 = did - size_valid_half_f;
+            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
+            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
+            const int32_t fid_sin_1 = did - size_half_r;
 
             const float cos = cosf(float(p_freqs[fid_cos]));
             const float sin =
-                (did < size_valid_half_f) ? sinf(float(p_freqs[fid_sin_0])) :
-                                           -sinf(float(p_freqs[fid_sin_1]));
+                (did < size_half_r) ? sinf(float(p_freqs[fid_sin_0])) :
+                                     -sinf(float(p_freqs[fid_sin_1]));
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -275,11 +279,11 @@ struct Op2cUncachedBwd
                 const float output_grad_x = float(p_output_grads_x[offset_ox]);
                 const float output_grad_y = float(p_output_grads_y[offset_oy]);
                 const float output_grad_x_rotate =
-                    (did < size_valid_half_f) ? float(p_output_grads_x[offset_ox + offset_half_f_x]):
-                                                float(p_output_grads_x[offset_ox - offset_half_f_x]);
+                    (did < size_half_r) ? float(p_output_grads_x[offset_ox + offset_half_r_x]):
+                                          float(p_output_grads_x[offset_ox - offset_half_r_x]);
                 const float output_grad_y_rotate =
-                    (did < size_valid_half_f) ? float(p_output_grads_y[offset_oy + offset_half_f_y]):
-                                                float(p_output_grads_y[offset_oy - offset_half_f_y]);
+                    (did < size_half_r) ? float(p_output_grads_y[offset_oy + offset_half_r_y]):
+                                          float(p_output_grads_y[offset_oy - offset_half_r_y]);
 
                 p_input_grads_x[offset_ix] = scalar_t(output_grad_x * cos + output_grad_x_rotate * sin);
                 p_input_grads_y[offset_iy] = scalar_t(output_grad_y * cos + output_grad_y_rotate * sin);
@@ -287,7 +291,7 @@ struct Op2cUncachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -298,7 +302,7 @@ struct Op2cUncachedBwd
                 const int32_t offset_iy = hid * stride_iy_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_input_grads_x[offset_ix + did * stride_ix_d] = p_output_grads_x[offset_ox + did * stride_ox_d];
                     p_input_grads_y[offset_iy + did * stride_iy_d] = p_output_grads_y[offset_oy + did * stride_oy_d];
@@ -320,20 +324,21 @@ struct Op1cCachedFwd
         const int32_t stride_i_h, const int32_t stride_i_d,
         const int32_t stride_o_h, const int32_t stride_o_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f     = size_valid_half_f * stride_i_d;
+        // rotate count
+        const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r   = size_r >> 1;
+        const int32_t offset_half_f = size_half_r * stride_i_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_i_d = did * stride_i_d;
             const int32_t offset_o_d = did * stride_o_d;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
+            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
 
-            const float   cos = p_cos[fid];
-            const float   sin = p_sin[fid];
+            const float cos = p_cos[fid];
+            const float sin = p_sin[fid];
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -343,15 +348,15 @@ struct Op1cCachedFwd
 
                 const float input = float(p_input[offset_i]);
                 const float input_rotate =
-                    (did < size_valid_half_f) ? float(-p_input[offset_i + offset_half_f]):
-                                                float( p_input[offset_i - offset_half_f]);
+                    (did < size_half_r) ? float(-p_input[offset_i + offset_half_f]):
+                                          float( p_input[offset_i - offset_half_f]);
 
                 p_output[offset_o] = scalar_t(input * cos + input_rotate * sin);
             }
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -360,7 +365,7 @@ struct Op1cCachedFwd
                 const int32_t offset_o = hid * stride_o_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
                 }
@@ -381,22 +386,23 @@ struct Op1cCachedBwd
         const int32_t stride_o_h, const int32_t stride_o_d,
         const int32_t stride_i_h, const int32_t stride_i_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f     = size_valid_half_f * stride_i_d;
+        // rotate count
+        const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r   = size_r >> 1;
+        const int32_t offset_half_f = size_half_r * stride_i_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_o_d = did * stride_o_d;
             const int32_t offset_i_d = did * stride_i_d;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_valid_half_f);
-            const int32_t fid_sin_1 = did - size_valid_half_f;
+            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
+            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
+            const int32_t fid_sin_1 = did - size_half_r;
 
             const float cos = float(p_cos[fid_cos]);
-            const float sin = (did < size_valid_half_f) ? float(p_sin[fid_sin_0]) : -float(p_sin[fid_sin_1]);
+            const float sin = (did < size_half_r) ? float(p_sin[fid_sin_0]) : -float(p_sin[fid_sin_1]);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -406,15 +412,15 @@ struct Op1cCachedBwd
 
                 const float output_grad = float(p_output_grads[offset_o]);
                 const float output_grad_rotate =
-                    (did < size_valid_half_f) ? float(p_output_grads[offset_o + offset_half_f]):
-                                                float(p_output_grads[offset_o - offset_half_f]);
+                    (did < size_half_r) ? float(p_output_grads[offset_o + offset_half_f]):
+                                          float(p_output_grads[offset_o - offset_half_f]);
 
                 p_input_grads[offset_i] = scalar_t(output_grad * cos + output_grad_rotate * sin);
             }
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -423,7 +429,7 @@ struct Op1cCachedBwd
                 const int32_t offset_i = hid * stride_i_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_input_grads[offset_i + did * stride_i_d] = p_output_grads[offset_o + did * stride_o_d];
                 }
@@ -448,20 +454,21 @@ struct Op2cCachedFwd
         const int32_t stride_ox_h, const int32_t stride_ox_d,
         const int32_t stride_oy_h, const int32_t stride_oy_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f_x   = size_valid_half_f * stride_ix_d;
-        const int32_t offset_half_f_y   = size_valid_half_f * stride_iy_d;
+        // rotate count
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_ix_d = did * stride_ix_d;
             const int32_t offset_iy_d = did * stride_iy_d;
             const int32_t offset_ox_d = did * stride_ox_d;
             const int32_t offset_oy_d = did * stride_oy_d;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
+            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
 
             const float   cos = p_cos[fid];
             const float   sin = p_sin[fid];
@@ -477,11 +484,11 @@ struct Op2cCachedFwd
                 const float input_x = float(p_input_x[offset_ix]);
                 const float input_y = float(p_input_y[offset_iy]);
                 const float input_x_rotate =
-                    (did < size_valid_half_f) ? float(-p_input_x[offset_ix + offset_half_f_x]):
-                                                float( p_input_x[offset_ix - offset_half_f_x]);
+                    (did < size_half_r) ? float(-p_input_x[offset_ix + offset_half_r_x]):
+                                          float( p_input_x[offset_ix - offset_half_r_x]);
                 const float input_y_rotate =
-                    (did < size_valid_half_f) ? float(-p_input_y[offset_iy + offset_half_f_y]):
-                                                float( p_input_y[offset_iy - offset_half_f_y]);
+                    (did < size_half_r) ? float(-p_input_y[offset_iy + offset_half_r_y]):
+                                          float( p_input_y[offset_iy - offset_half_r_y]);
 
                 p_output_x[offset_ox] = scalar_t(input_x * cos + input_x_rotate * sin);
                 p_output_y[offset_oy] = scalar_t(input_y * cos + input_y_rotate * sin);
@@ -489,7 +496,7 @@ struct Op2cCachedFwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -500,7 +507,7 @@ struct Op2cCachedFwd
                 const int32_t offset_oy = hid * stride_oy_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
                     p_output_y[offset_oy + did * stride_oy_d] = p_input_y[offset_iy + did * stride_iy_d];
@@ -526,25 +533,26 @@ struct Op2cCachedBwd
         const int32_t stride_ix_h, const int32_t stride_ix_d,
         const int32_t stride_iy_h, const int32_t stride_iy_d)
     {
-        const int32_t size_valid_f      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_valid_half_f = size_valid_f >> 1;
-        const int32_t offset_half_f_x   = size_valid_half_f * stride_ix_d;
-        const int32_t offset_half_f_y   = size_valid_half_f * stride_iy_d;
+        // rotate count
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_valid_f; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
         {
             const int32_t offset_ox_d = did * stride_ox_d;
             const int32_t offset_oy_d = did * stride_oy_d;
             const int32_t offset_ix_d = did * stride_ix_d;
             const int32_t offset_iy_d = did * stride_iy_d;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_valid_half_f) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_valid_half_f);
-            const int32_t fid_sin_1 = did - size_valid_half_f;
+            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
+            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
+            const int32_t fid_sin_1 = did - size_half_r;
 
             const float cos = float(p_cos[fid_cos]);
-            const float sin = (did < size_valid_half_f) ? float(p_sin[fid_sin_0]) : -float(p_sin[fid_sin_1]);
+            const float sin = (did < size_half_r) ? float(p_sin[fid_sin_0]) : -float(p_sin[fid_sin_1]);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -557,11 +565,11 @@ struct Op2cCachedBwd
                 const float output_grad_x = float(p_output_grads_x[offset_ox]);
                 const float output_grad_y = float(p_output_grads_y[offset_oy]);
                 const float output_grad_x_rotate =
-                    (did < size_valid_half_f) ? float(p_output_grads_x[offset_ox + offset_half_f_x]):
-                                                float(p_output_grads_x[offset_ox - offset_half_f_x]);
+                    (did < size_half_r) ? float(p_output_grads_x[offset_ox + offset_half_r_x]):
+                                          float(p_output_grads_x[offset_ox - offset_half_r_x]);
                 const float output_grad_y_rotate =
-                    (did < size_valid_half_f) ? float(p_output_grads_y[offset_oy + offset_half_f_y]):
-                                                float(p_output_grads_y[offset_oy - offset_half_f_y]);
+                    (did < size_half_r) ? float(p_output_grads_y[offset_oy + offset_half_r_y]):
+                                          float(p_output_grads_y[offset_oy - offset_half_r_y]);
 
                 p_input_grads_x[offset_ix] = scalar_t(output_grad_x * cos + output_grad_x_rotate * sin);
                 p_input_grads_y[offset_iy] = scalar_t(output_grad_y * cos + output_grad_y_rotate * sin);
@@ -569,7 +577,7 @@ struct Op2cCachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_valid_f)
+        if (size_d > size_r)
         {
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -580,7 +588,7 @@ struct Op2cCachedBwd
                 const int32_t offset_iy = hid * stride_iy_h;
 
                 #pragma unroll
-                for (int32_t did = threadIdx.x + size_valid_f; did < size_d; did += blockDim.x)
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
                 {
                     p_input_grads_x[offset_ix + did * stride_ix_d] = p_output_grads_x[offset_ox + did * stride_ox_d];
                     p_input_grads_y[offset_iy + did * stride_iy_d] = p_output_grads_y[offset_oy + did * stride_oy_d];
