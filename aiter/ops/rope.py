@@ -18,7 +18,8 @@ def rope_fwd_impl(
 ): 
     '''
     Forward propagation of traditional RoPE (Rotary Position Embedding).
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, it should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -32,7 +33,8 @@ def rope_bwd_impl(
 ): 
     '''
     Backward propagation of traditional RoPE (Rotary Position Embedding).
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, it should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -48,7 +50,8 @@ def rope_2c_fwd_impl(
 ): 
     '''
     Forward propagation of traditional RoPE (Rotary Position Embedding) on two channels.
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, it should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -64,7 +67,8 @@ def rope_2c_bwd_impl(
 ): 
     '''
     Backward propagation of traditional RoPE (Rotary Position Embedding) on two channels.
-    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, it should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -79,7 +83,8 @@ def rope_cached_fwd_impl(
 ): 
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -94,7 +99,8 @@ def rope_cached_bwd_impl(
 ): 
     '''
     Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -111,7 +117,8 @@ def rope_cached_2c_fwd_impl(
 ): 
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin on two channels.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -128,7 +135,8 @@ def rope_cached_2c_bwd_impl(
 ): 
     '''
     Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin on two channels.
-    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -144,6 +152,8 @@ def rope_thd_fwd_impl(
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with input sizes: (t, h, d).
     where t is cumulative sum of sequence lengths.
+    Freqs should be in shape of [s, 1, 1, d // 2] if reuse_freqs_front_part is true. Otherwise,
+    it should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -159,6 +169,8 @@ def rope_thd_bwd_impl(
     '''
     Backward propagation of RoPE (Rotary Position Embedding) with input sizes: (t, h, d).
     where t is cumulative sum of sequence lengths.
+    Freqs should be in shape of [s, 1, 1, d // 2] if reuse_freqs_front_part is true. Otherwise,
+    it should be in [s, 1, 1, d].
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -178,8 +190,10 @@ def rope_2d_fwd_impl(
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with 2D image as input.
     Input and output should be in (b, s, h, d) where s = H * W.
-    cos_h and sin_h are in (1, H', 1, h, d // 2) where H' >= H.
-    cos_w and sin_w are in (1, 1, W', h, d // 2) where W' >= W.
+    cos_h and sin_h are in (1, H', 1, h, d // 4) if reuse_freqs_front_part is true. Otherwise,
+    it should be in (1, H', 1, h, d // 2) where H' >= H.
+    cos_w and sin_w are in (1, 1, W', h, d // 2) if reuse_freqs_front_part is true. Otherwise,
+    it should be in (1, 1, W', h, d // 2) where W' >= W.
     This implemenation rotates the 2nd half of elements.
     '''
     ...
@@ -199,8 +213,10 @@ def rope_2d_bwd_impl(
     '''
     Backward propagation of RoPE (Rotary Position Embedding) with 2D image as input.
     output_grads and input_grads should be in (b, s, h, d) where s = H * W.
-    cos_h and sin_h are in (1, H', 1, h, d // 2) where H' >= H.
-    cos_w and sin_w are in (1, 1, W', h, d // 2) where W' >= W.
+    cos_h and sin_h are in (1, H', 1, h, d // 4) if reuse_freqs_front_part is true. Otherwise,
+    it should be in (1, H', 1, h, d // 2) where H' >= H.
+    cos_w and sin_w are in (1, 1, W', h, d // 2) if reuse_freqs_front_part is true. Otherwise,
+    it should be in (1, 1, W', h, d // 2) where W' >= W.
     This implemenation rotates the 2nd half of elements.
     '''
     ...
