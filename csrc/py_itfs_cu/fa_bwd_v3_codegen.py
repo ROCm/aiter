@@ -76,6 +76,7 @@ FMHA_BWD_API = """
 #include <hip/hip_fp16.h>
 #include "aiter_hip_common.h"
 #include <iostream>
+#include "mha_bwd.h"
 
 #define HSA_KERNEL "kernel_func"
 
