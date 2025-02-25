@@ -725,11 +725,11 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
     // int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
-    const char* numa_balance_set = std::getenv("AITER_NUMA_BALANCE_SET");
+    const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
 
     if (out.dtype() == at::ScalarType::BFloat16 && inter_dim % 256 == 0 && fc_scale_blkn == 128 && fc_scale_blkk == 128)
     {
-        if (numa_balance_set != nullptr && strcmp(numa_balance_set, "1") == 0)
+        if (enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
         {
             static FMoeKernel impl_256_novs("fmoe_fp8_blockscale_g1u1_novs_subGU_256", "fmoe_fp8_blockscale_g1u1_novs_subGU_256.co", 320);
             impl_ptr = &impl_256_novs;
