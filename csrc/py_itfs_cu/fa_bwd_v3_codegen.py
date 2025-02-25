@@ -76,7 +76,6 @@ FMHA_BWD_API = """
 #include <hip/hip_fp16.h>
 #include "aiter_hip_common.h"
 #include <iostream>
-#include "hsaco/fmha_hsaco.hpp"
 
 #define HSA_KERNEL "kernel_func"
 
@@ -292,7 +291,7 @@ float fmha_bwd_v3_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}
@@ -336,7 +335,7 @@ float fmha_bwd_v3_hdp_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}
@@ -379,7 +378,7 @@ float fmha_bwd_v3_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }},
@@ -424,7 +423,7 @@ float fmha_bwd_v3_hdp_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }},
@@ -432,10 +431,10 @@ float fmha_bwd_v3_hdp_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
     );
 }}
 
-float fmha_bwd_v3(fmha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_config& s){{
+float fmha_bwd_v3(fmha_bwd_traits_all t, fmha_bwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
 
-    if (t.uses_bwd_v3 == true){{
+    if (t.use_ext_asm == true){{
         if ((t.is_group_mode == false) && (t.bias_type == bias_enum::no_bias) && (t.has_dbias == false) && (t.has_dropout == false) && (t.is_deterministic == false) && (a.hdim_q == a.hdim_v) &&
                     (a.seqlen_q == a.seqlen_k) && (a.nhead_q % a.nhead_k == 0) && (a.stride_q == a.stride_do) && (a.nhead_stride_q == a.nhead_stride_do) && (a.batch_stride_q == a.batch_stride_do) &&
                     (a.stride_k == a.stride_v) && (a.nhead_stride_k == a.nhead_stride_v) && (a.batch_stride_k == a.batch_stride_v) && (a.nhead_stride_k == a.nhead_stride_dk) && (a.nhead_stride_v == a.nhead_stride_dv) &&
