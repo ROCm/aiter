@@ -205,17 +205,6 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             f"{bd_include_dir}",
         ]+extra_include
 
-        print(md_name,
-            sources,
-            flags_cc,
-            flags_hip,
-            extra_ldflags,
-            extra_include_paths,
-            opbd_dir,
-            verbose,
-            1212121212121212)
-
-
         module = cpp_extension.load(
             md_name,
             sources,
