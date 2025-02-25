@@ -5,6 +5,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
+#include "mha_bwd.h"
 
 float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
     float r = fmha_bwd_v3(traits, args, stream_config);
@@ -19,24 +20,20 @@ fmha_bwd_traits_all get_ck_fmha_bwd_traits(const mask_info &mask,
                                        int head_size,
                                        bool has_dropout,
                                        bool enable_alibi,
-                                       bool deterministic
+                                       bool deterministic,
                                        bool use_ext_asm,
                                        bool is_v3_atomic_fp32,
                                        int how_v3_bf16_cvt)
 {
-    return fmha_bwd_traits_all{head_size,
-                           head_size,
-                           dtype,
-                           false, // is_group_mode
-                           mask.type,
-                           enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
-                           false,    // has_dbias
-                           has_dropout,
-                           false, // s_randval
-                           deterministic,
-                           use_ext_asm,
-                           is_v3_atomic_fp32,
-                           how_v3_bf16_cvt};
+    return fmha_bwd_traits_all(mask,
+                    dtype,
+                    head_size,
+                    has_dropout,
+                    enable_alibi,
+                    deterministic,
+                    use_ext_asm,
+                    is_v3_atomic_fp32,
+                    how_v3_bf16_cvt);
 }
 
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,

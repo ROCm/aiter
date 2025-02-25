@@ -25,9 +25,9 @@ struct fmha_bwd_traits_all: public fmha_bwd_traits
             has_dropout,
             false, // s_randval
             deterministic}, 
-            use_ext_asm{use_ext_asm},
-            is_v3_atomic_fp32{is_v3_atomic_fp32},
-            how_v3_bf16_cvt{how_v3_bf16_cvt} {}
+            use_ext_asm(use_ext_asm),
+            is_v3_atomic_fp32(is_v3_atomic_fp32),
+            how_v3_bf16_cvt(how_v3_bf16_cvt) {}
     bool use_ext_asm;
     bool is_v3_atomic_fp32;
     int how_v3_bf16_cvt;
