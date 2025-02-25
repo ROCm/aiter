@@ -266,13 +266,9 @@ if __name__ == "__main__":
     ):
         rotary_percent = rotary_percent_and_reuse[0]
         reuse_freqs_front_part = rotary_percent_and_reuse[1]
+        freqs_ratio = 2 if reuse_freqs_front_part else 1
         input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // 2), dtype=fdtype, device="cuda")
-        if not reuse_freqs_front_part:
-            if rotate_style == RotateStyle.NEOX:
-                freqs = freqs.repeat([1] * (freqs.dim()-1) + [2])
-            elif rotate_style == RotateStyle.GPTJ:
-                freqs = freqs.repeat_interleave(2, dim=-1)
+        freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
         grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, transpose_output)
         input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
@@ -295,13 +291,9 @@ if __name__ == "__main__":
     ):
         rotary_percent = rotary_percent_and_reuse[0]
         reuse_freqs_front_part = rotary_percent_and_reuse[1]
+        freqs_ratio = 2 if reuse_freqs_front_part else 1
         input = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda", requires_grad=True)
         freqs = torch.randn((cu_seqlens[-1], 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
-        if not reuse_freqs_front_part:
-            if rotate_style == RotateStyle.NEOX:
-                freqs = freqs.repeat([1] * (freqs.dim()-1) + [2])
-            elif rotate_style == RotateStyle.GPTJ:
-                freqs = freqs.repeat_interleave(2, dim=-1)
         grad  = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda")
         test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part)
 
