@@ -3,6 +3,8 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+float fmha_bwd_v3(fmha_bwd_traits, fmha_bwd_args, const ck_tile::stream_config&);
+
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout, // [b, sq, hq, d]
         const at::Tensor &q,    // [b, sq, hq, d]

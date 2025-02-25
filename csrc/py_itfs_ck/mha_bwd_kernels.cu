@@ -16,7 +16,7 @@ struct fmha_bwd_traits_all: public fmha_bwd_traits
         int head_size,
         bool has_dropout,
         bool enable_alibi,
-        bool deterministic
+        bool deterministic,
         bool use_ext_asm,
         bool is_v3_atomic_fp32,
         int how_v3_bf16_cvt): fmha_bwd_traits{head_size,
@@ -35,7 +35,7 @@ struct fmha_bwd_traits_all: public fmha_bwd_traits
     bool use_ext_asm;
     bool is_v3_atomic_fp32;
     int how_v3_bf16_cvt;
-}
+};
 
 float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
     float r = fmha_bwd_v3(traits, args, stream_config);

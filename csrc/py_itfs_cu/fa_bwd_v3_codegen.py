@@ -80,7 +80,7 @@ FMHA_BWD_API = """
 
 #define HSA_KERNEL "kernel_func"
 
-struct __attribute__((packed)) fmha_bwd_v3_args
+struct __attribute__((packed)) fmha_bwd_xqa_v3_args
 {{
     void* ptr_dq;
     p2 _p0;
@@ -126,7 +126,7 @@ struct __attribute__((packed)) fmha_bwd_v3_args
     p3 _p20;
 }};
 
-struct __attribute__((packed)) fmha_bwd_v3_gen_args
+struct __attribute__((packed)) fmha_bwd_xqa_v3_dp_args
 {{
     void* ptr_dq;
     p2 _p0;
