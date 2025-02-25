@@ -234,7 +234,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
     return module
 
 
-def get_args_of_build(ops_name: str):
+def get_args_of_build(ops_name: str, exclue=[]):
     d_opt_build_args = {"srcs": [],
                         "md_name": "",
                         "flags_extra_cc": [],
@@ -276,6 +276,9 @@ def get_args_of_build(ops_name: str):
                 for ops_name, d_ops in data.items():
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
+                        continue
+                    # exclude
+                    if ops_name in exclue:
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
