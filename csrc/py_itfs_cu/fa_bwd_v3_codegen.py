@@ -291,7 +291,7 @@ float fmha_bwd_v3_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_hsaco); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}
@@ -335,7 +335,7 @@ float fmha_bwd_v3_hdp_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_hsaco); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}
@@ -378,7 +378,7 @@ float fmha_bwd_v3_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_hsaco); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }},
@@ -423,7 +423,7 @@ float fmha_bwd_v3_hdp_xqa_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
+    static fmha_bwd_v3_kernel impl(HSA_KERNEL, FmhaBwdV3hsaco<dq_dk_dv_v3_traits_>::bwd_v3_hsaco); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
         [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }},
