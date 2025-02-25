@@ -6,10 +6,6 @@
 #include "dispatch_utils.h"
 
 // =====================================================================================================================
-// Kernel Functionalities
-//
-
-//
 // Keyword interpretation
 // ----------------------------------------------------------------
 // 1c/2c:               The number of channels. 2c means two inputs and two outputs.
@@ -25,6 +21,10 @@
 
 #define ROTATE_STYLE_NEOX 0
 #define ROTATE_STYLE_GPTJ 1
+
+// =====================================================================================================================
+// Kernel Helper Functions
+//
 
 template <int32_t RotateStyle, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
 inline __device__ void get_cos_sin_uncached(
@@ -140,6 +140,29 @@ inline __device__ void get_cos_sin_cached(
     }
 }
 
+template <int32_t RotateStyle>
+inline __device__ void get_offset_d(
+    int32_t* p_offset_0, int32_t* p_offset_1,
+    const int32_t did,
+    const int32_t stride_d,
+    const int32_t offset_half_r)
+{
+    if constexpr (RotateStyle == ROTATE_STYLE_NEOX)
+    {
+        *p_offset_0 = did * stride_d;
+        *p_offset_1 = *p_offset_0 + offset_half_r;
+    }
+    else if constexpr (RotateStyle == ROTATE_STYLE_GPTJ)
+    {
+        *p_offset_0 = 2 * did;
+        *p_offset_1 = *p_offset_0 + 1;
+    }
+}
+
+// =====================================================================================================================
+// Kernel Functionalities
+//
+
 struct Op1cUncachedFwd
 {
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
@@ -161,10 +184,9 @@ struct Op1cUncachedFwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element
-            const int32_t offset_i_d_0 = did * stride_i_d;
-            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
-            const int32_t offset_o_d_0 = did * stride_o_d;
-            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
+            int32_t offset_i_d_0, offset_i_d_1, offset_o_d_0, offset_o_d_1;
+            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
+            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -228,10 +250,9 @@ struct Op1cUncachedBwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
-            const int32_t offset_o_d_0 = did * stride_o_d;
-            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
-            const int32_t offset_i_d_0 = did * stride_i_d;
-            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
+            int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
+            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
+            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -301,14 +322,12 @@ struct Op2cUncachedFwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
-            const int32_t offset_ix_d_0 = did * stride_ix_d;
-            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
-            const int32_t offset_iy_d_0 = did * stride_iy_d;
-            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
-            const int32_t offset_ox_d_0 = did * stride_ox_d;
-            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
-            const int32_t offset_oy_d_0 = did * stride_oy_d;
-            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
+            int32_t offset_ix_d_0, offset_ix_d_1, offset_ox_d_0, offset_ox_d_1;
+            get_offset_d<RotateStyle>(&offset_ix_d_0, &offset_ix_d_1, did, stride_ix_d, offset_half_r_ix);
+            get_offset_d<RotateStyle>(&offset_ox_d_0, &offset_ox_d_1, did, stride_ox_d, offset_half_r_ox);
+            int32_t offset_iy_d_0, offset_iy_d_1, offset_oy_d_0, offset_oy_d_1;
+            get_offset_d<RotateStyle>(&offset_iy_d_0, &offset_iy_d_1, did, stride_iy_d, offset_half_r_iy);
+            get_offset_d<RotateStyle>(&offset_oy_d_0, &offset_oy_d_1, did, stride_oy_d, offset_half_r_oy);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -391,14 +410,12 @@ struct Op2cUncachedBwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
-            const int32_t offset_ox_d_0 = did * stride_ox_d;
-            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
-            const int32_t offset_oy_d_0 = did * stride_oy_d;
-            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
-            const int32_t offset_ix_d_0 = did * stride_ix_d;
-            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
-            const int32_t offset_iy_d_0 = did * stride_iy_d;
-            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
+            int32_t offset_ox_d_0, offset_ox_d_1, offset_ix_d_0, offset_ix_d_1;
+            get_offset_d<RotateStyle>(&offset_ox_d_0, &offset_ox_d_1, did, stride_ox_d, offset_half_r_ox);
+            get_offset_d<RotateStyle>(&offset_ix_d_0, &offset_ix_d_1, did, stride_ix_d, offset_half_r_ix);
+            int32_t offset_oy_d_0, offset_oy_d_1, offset_iy_d_0, offset_iy_d_1;
+            get_offset_d<RotateStyle>(&offset_oy_d_0, &offset_oy_d_1, did, stride_oy_d, offset_half_r_oy);
+            get_offset_d<RotateStyle>(&offset_iy_d_0, &offset_iy_d_1, did, stride_iy_d, offset_half_r_iy);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -476,10 +493,9 @@ struct Op1cCachedFwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element
-            const int32_t offset_i_d_0 = did * stride_i_d;
-            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
-            const int32_t offset_o_d_0 = did * stride_o_d;
-            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
+            int32_t offset_i_d_0, offset_i_d_1, offset_o_d_0, offset_o_d_1;
+            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
+            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -544,10 +560,9 @@ struct Op1cCachedBwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
-            const int32_t offset_o_d_0 = did * stride_o_d;
-            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
-            const int32_t offset_i_d_0 = did * stride_i_d;
-            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
+            int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
+            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
+            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
@@ -618,14 +633,12 @@ struct Op2cCachedFwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
-            const int32_t offset_ix_d_0 = did * stride_ix_d;
-            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
-            const int32_t offset_iy_d_0 = did * stride_iy_d;
-            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
-            const int32_t offset_ox_d_0 = did * stride_ox_d;
-            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
-            const int32_t offset_oy_d_0 = did * stride_oy_d;
-            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
+            int32_t offset_ix_d_0, offset_ix_d_1, offset_ox_d_0, offset_ox_d_1;
+            get_offset_d<RotateStyle>(&offset_ix_d_0, &offset_ix_d_1, did, stride_ix_d, offset_half_r_ix);
+            get_offset_d<RotateStyle>(&offset_ox_d_0, &offset_ox_d_1, did, stride_ox_d, offset_half_r_ox);
+            int32_t offset_iy_d_0, offset_iy_d_1, offset_oy_d_0, offset_oy_d_1;
+            get_offset_d<RotateStyle>(&offset_iy_d_0, &offset_iy_d_1, did, stride_iy_d, offset_half_r_iy);
+            get_offset_d<RotateStyle>(&offset_oy_d_0, &offset_oy_d_1, did, stride_oy_d, offset_half_r_oy);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
@@ -709,14 +722,12 @@ struct Op2cCachedBwd
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
-            const int32_t offset_ox_d_0 = did * stride_ox_d;
-            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
-            const int32_t offset_oy_d_0 = did * stride_oy_d;
-            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
-            const int32_t offset_ix_d_0 = did * stride_ix_d;
-            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
-            const int32_t offset_iy_d_0 = did * stride_iy_d;
-            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
+            int32_t offset_ox_d_0, offset_ox_d_1, offset_ix_d_0, offset_ix_d_1;
+            get_offset_d<RotateStyle>(&offset_ox_d_0, &offset_ox_d_1, did, stride_ox_d, offset_half_r_ox);
+            get_offset_d<RotateStyle>(&offset_ix_d_0, &offset_ix_d_1, did, stride_ix_d, offset_half_r_ix);
+            int32_t offset_oy_d_0, offset_oy_d_1, offset_iy_d_0, offset_iy_d_1;
+            get_offset_d<RotateStyle>(&offset_oy_d_0, &offset_oy_d_1, did, stride_oy_d, offset_half_r_oy);
+            get_offset_d<RotateStyle>(&offset_iy_d_0, &offset_iy_d_1, did, stride_iy_d, offset_half_r_iy);
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
