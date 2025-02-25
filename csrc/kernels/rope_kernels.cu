@@ -26,9 +26,123 @@
 #define ROTATE_STYLE_NEOX 0
 #define ROTATE_STYLE_GPTJ 1
 
+template <int32_t RotateStyle, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
+inline __device__ void get_cos_sin_uncached(
+    float* p_cos_0, float* p_sin_0,
+    float* p_cos_1, float* p_sin_1,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t did,
+    const int32_t size_half_r)
+{
+    if constexpr (RotateStyle == ROTATE_STYLE_NEOX)
+    {
+        if constexpr (IsForward == true)
+        {
+            sincosf(float(p_freqs[did]), p_sin_0, p_cos_0);
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
+            }
+            else
+            {
+                sincosf(float(p_freqs[did + size_half_r]), p_sin_1, p_cos_1);
+            }
+        }
+        else
+        {
+            const float f_did = float(p_freqs[did]);
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                *p_cos_0 = cosf(f_did);
+                *p_sin_0 = sinf(f_did);
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
+            }
+            else
+            {
+                const float f_did_a = p_freqs[did + size_half_r];
+                *p_cos_0 = cosf(f_did);
+                *p_sin_0 = sinf(f_did_a);
+                *p_cos_1 = cosf(f_did_a);
+                *p_sin_1 = sinf(f_did);
+            }
+        }
+    }
+    else if constexpr (RotateStyle == ROTATE_STYLE_GPTJ)
+    {
+        if constexpr (IsForward == true)
+        {
+
+        }
+        else
+        {
+
+        }
+    }
+}
+
+template <int32_t RotateStyle, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
+inline __device__ void get_cos_sin_cached(
+    float* p_cos_0, float* p_sin_0,
+    float* p_cos_1, float* p_sin_1,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int32_t did,
+    const int32_t size_half_r)
+{
+    if constexpr (RotateStyle == ROTATE_STYLE_NEOX)
+    {
+        if constexpr (IsForward == true)
+        {
+            *p_cos_0 = float(p_cos[did]);
+            *p_sin_0 = float(p_sin[did]);
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
+            }
+            else
+            {
+                *p_cos_1 = float(p_cos[did + size_half_r]);
+                *p_sin_1 = float(p_sin[did + size_half_r]);
+            }
+        }
+        else
+        {
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                *p_cos_0 = float(p_cos[did]);
+                *p_sin_0 = float(p_sin[did]);
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
+            }
+            else
+            {
+                const int32_t did_a = did + size_half_r;
+                *p_cos_0 = float(p_cos[did]);
+                *p_sin_0 = float(p_sin[did_a]);
+                *p_cos_1 = float(p_cos[did_a]);
+                *p_sin_1 = float(p_sin[did]);
+            }
+        }
+    }
+    else if constexpr (RotateStyle == ROTATE_STYLE_GPTJ)
+    {
+        if constexpr (IsForward == true)
+        {
+
+        }
+        else
+        {
+
+        }
+    }
+}
+
 struct Op1cUncachedFwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_output,
         const scalar_t* __restrict__   p_input,
@@ -52,18 +166,9 @@ struct Op1cUncachedFwd
             const int32_t offset_o_d_0 = did * stride_o_d;
             const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
 
-            float cos_0, sin_0;
-            sincosf(float(p_freqs[did]), &sin_0, &cos_0);
-            float cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                sincosf(float(p_freqs[did + size_half_r]), &sin_1, &cos_1);
-            }
+            float cos_0, sin_0, cos_1, sin_1;
+            get_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -104,7 +209,7 @@ struct Op1cUncachedFwd
 
 struct Op1cUncachedBwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_input_grads,
         const scalar_t* __restrict__   p_output_grads,
@@ -128,23 +233,9 @@ struct Op1cUncachedBwd
             const int32_t offset_i_d_0 = did * stride_i_d;
             const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
 
-            const float f_did = p_freqs[did];
             float cos_0, sin_0, cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_0 = cosf(f_did);
-                sin_0 = sinf(f_did);
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                const float f_did_a = p_freqs[did + size_half_r];
-                cos_0 = cosf(f_did);
-                sin_0 = sinf(f_did_a);
-                cos_1 = cosf(f_did_a);
-                sin_1 = sinf(f_did);
-            }
+            get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -185,7 +276,7 @@ struct Op1cUncachedBwd
 
 struct Op2cUncachedFwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_output_x,
         scalar_t* __restrict__         p_output_y,
@@ -219,18 +310,9 @@ struct Op2cUncachedFwd
             const int32_t offset_oy_d_0 = did * stride_oy_d;
             const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
 
-            float cos_0, sin_0;
-            sincosf(float(p_freqs[did]), &sin_0, &cos_0);
-            float cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                sincosf(float(p_freqs[did + size_half_r]), &sin_1, &cos_1);
-            }
+            float cos_0, sin_0, cos_1, sin_1;
+            get_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -284,7 +366,7 @@ struct Op2cUncachedFwd
 
 struct Op2cUncachedBwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_input_grads_x,
         scalar_t* __restrict__         p_input_grads_y,
@@ -318,23 +400,9 @@ struct Op2cUncachedBwd
             const int32_t offset_iy_d_0 = did * stride_iy_d;
             const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
 
-            const float f_did = p_freqs[did];
             float cos_0, sin_0, cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_0 = cosf(f_did);
-                sin_0 = sinf(f_did);
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                const float f_did_a = p_freqs[did + size_half_r];
-                cos_0 = cosf(f_did);
-                sin_0 = sinf(f_did_a);
-                cos_1 = cosf(f_did_a);
-                sin_1 = sinf(f_did);
-            }
+            get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -388,7 +456,7 @@ struct Op2cUncachedBwd
 
 struct Op1cCachedFwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_output,
         const scalar_t* __restrict__   p_input,
@@ -413,20 +481,9 @@ struct Op1cCachedFwd
             const int32_t offset_o_d_0 = did * stride_o_d;
             const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
 
-            const float cos_0 = float(p_cos[did]);
-            const float sin_0 = float(p_sin[did]);
-            float cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                const int32_t did_a = did + size_half_r;
-                cos_1 = float(p_cos[did_a]);
-                sin_1 = float(p_sin[did_a]);
-            }
+            float cos_0, sin_0, cos_1, sin_1;
+            get_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -467,7 +524,7 @@ struct Op1cCachedFwd
 
 struct Op1cCachedBwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_input_grads,
         const scalar_t* __restrict__   p_output_grads,
@@ -493,21 +550,8 @@ struct Op1cCachedBwd
             const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
 
             float cos_0, sin_0, cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_0 = float(p_cos[did]);
-                sin_0 = float(p_sin[did]);
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                const int32_t did_a = did + size_half_r;
-                cos_0 = float(p_cos[did]);
-                sin_0 = float(p_sin[did_a]);
-                cos_1 = float(p_cos[did_a]);
-                sin_1 = float(p_sin[did]);
-            }
+            get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -548,7 +592,7 @@ struct Op1cCachedBwd
 
 struct Op2cCachedFwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_output_x,
         scalar_t* __restrict__         p_output_y,
@@ -583,20 +627,9 @@ struct Op2cCachedFwd
             const int32_t offset_oy_d_0 = did * stride_oy_d;
             const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
 
-            const float cos_0 = float(p_cos[did]);
-            const float sin_0 = float(p_sin[did]);
-            float cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                const int32_t did_a = did + size_half_r;
-                cos_1 = float(p_cos[did_a]);
-                sin_1 = float(p_sin[did_a]);
-            }
+            float cos_0, sin_0, cos_1, sin_1;
+            get_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -650,7 +683,7 @@ struct Op2cCachedFwd
 
 struct Op2cCachedBwd
 {
-    template <bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
     __device__ static void apply(
         scalar_t* __restrict__         p_input_grads_x,
         scalar_t* __restrict__         p_input_grads_y,
@@ -686,21 +719,8 @@ struct Op2cCachedBwd
             const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
 
             float cos_0, sin_0, cos_1, sin_1;
-            if constexpr (ReuseFreqsFrontPart)
-            {
-                cos_0 = float(p_cos[did]);
-                sin_0 = float(p_sin[did]);
-                cos_1 = cos_0;
-                sin_1 = sin_0;
-            }
-            else
-            {
-                const int32_t did_a = did + size_half_r;
-                cos_0 = float(p_cos[did]);
-                sin_0 = float(p_sin[did_a]);
-                cos_1 = float(p_cos[did_a]);
-                sin_1 = float(p_sin[did]);
-            }
+            get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -756,7 +776,7 @@ struct Op2cCachedBwd
 // Kernel Entries
 //
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_sbhd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -772,7 +792,7 @@ __global__ void kn_entry_1c_sbhd_uncached(
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
         p_output + offset_o,
         p_input + offset_i,
         p_freqs + offset_f,
@@ -781,7 +801,7 @@ __global__ void kn_entry_1c_sbhd_uncached(
         stride_o_h, stride_o_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_uncached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -803,7 +823,7 @@ __global__ void kn_entry_2c_sbhd_uncached(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -816,7 +836,7 @@ __global__ void kn_entry_2c_sbhd_uncached(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_sbhd_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -833,7 +853,7 @@ __global__ void kn_entry_1c_sbhd_cached(
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
         p_output + offset_o,
         p_input + offset_i,
         p_cos + offset_f,
@@ -843,7 +863,7 @@ __global__ void kn_entry_1c_sbhd_cached(
         stride_o_h, stride_o_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -866,7 +886,7 @@ __global__ void kn_entry_2c_sbhd_cached(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -880,7 +900,7 @@ __global__ void kn_entry_2c_sbhd_cached(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_thd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -901,7 +921,7 @@ __global__ void kn_entry_1c_thd_uncached(
         const int32_t offset_o = tid * stride_o_t;
         const int32_t offset_f = sid * size_f;
 
-        Op::template apply<ReuseFreqsFrontPart>(
+        Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
             p_output + offset_o,
             p_input + offset_i,
             p_freqs + offset_f,
@@ -911,7 +931,7 @@ __global__ void kn_entry_1c_thd_uncached(
     }
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_2d_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -932,7 +952,7 @@ __global__ void kn_entry_1c_2d_cached(
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
     const int offset_h_f = Hid * size_half_d;
-    Op::template apply<ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
         p_output + offset_h_o,
         p_input + offset_h_i,
         p_cos_h + offset_h_f,
@@ -944,7 +964,7 @@ __global__ void kn_entry_1c_2d_cached(
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
     const int offset_w_f = Wid * size_half_d;
-    Op::template apply<ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
         p_output + offset_w_o,
         p_input + offset_w_i,
         p_cos_w + offset_w_f,
@@ -958,7 +978,7 @@ __global__ void kn_entry_1c_2d_cached(
 // Dispatches
 //
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 void dispatch_1c_sbhd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -973,7 +993,7 @@ void dispatch_1c_sbhd_uncached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_sbhd_uncached<Op, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
+    kn_entry_1c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_freqs,
@@ -982,7 +1002,7 @@ void dispatch_1c_sbhd_uncached(
         stride_o_s, stride_o_b, stride_o_h, stride_o_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_uncached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1001,7 +1021,7 @@ void dispatch_2c_sbhd_uncached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_2c_sbhd_uncached<Op, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
+    kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
         p_output_x,
         p_output_y,
         p_input_x,
@@ -1014,7 +1034,7 @@ void dispatch_2c_sbhd_uncached(
         stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 void dispatch_1c_sbhd_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1030,7 +1050,7 @@ void dispatch_1c_sbhd_cached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_sbhd_cached<Op, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
+    kn_entry_1c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_cos, p_sin,
@@ -1039,7 +1059,7 @@ void dispatch_1c_sbhd_cached(
         stride_o_s, stride_o_b, stride_o_h, stride_o_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_cached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1059,7 +1079,7 @@ void dispatch_2c_sbhd_cached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_2c_sbhd_cached<Op, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
+    kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
         p_output_x,
         p_output_y,
         p_input_x,
@@ -1072,7 +1092,7 @@ void dispatch_2c_sbhd_cached(
         stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 void dispatch_1c_thd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1088,7 +1108,7 @@ void dispatch_1c_thd_uncached(
     const dim3 grid(size_max_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_thd_uncached<Op, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
+    kn_entry_1c_thd_uncached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_cu_seqlens,
@@ -1098,7 +1118,7 @@ void dispatch_1c_thd_uncached(
         stride_o_t, stride_o_h, stride_o_d);
 }
 
-template <typename Op, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
 void dispatch_1c_2d_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1116,7 +1136,7 @@ void dispatch_1c_2d_cached(
     const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_2d_cached<Op, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
+    kn_entry_1c_2d_cached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
         p_output,
         p_input,
         p_cos_h, p_sin_h,
@@ -1126,7 +1146,7 @@ void dispatch_1c_2d_cached(
         stride_o_b, stride_o_s, stride_o_h, stride_o_d);
 }
 
-#define DISPATCH_ROPE_TYPES_PARAMS(TYPE0, TYPE1, REUSE_FREQS_FRONT_PART, NAME, ...)                    \
+#define DISPATCH_ROPE_TYPES_PARAMS(TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NAME, ...)      \
     switch(TYPE0) {                                                                                    \
         case at::ScalarType::Float: {                                                                  \
             using scalar_t_0 = float;                                                                  \
@@ -1137,12 +1157,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1151,12 +1199,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1165,12 +1241,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1189,12 +1293,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1203,12 +1335,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1217,12 +1377,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1241,12 +1429,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1255,12 +1471,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1269,12 +1513,40 @@ void dispatch_1c_2d_cached(
                     if (REUSE_FREQS_FRONT_PART)                                                        \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     else                                                                               \
                     {                                                                                  \
                         constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        __VA_ARGS__;                                                                   \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
+                        {                                                                              \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
+                            __VA_ARGS__;                                                               \
+                        }                                                                              \
+                        else                                                                           \
+                        {                                                                              \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
+                                        std::to_string(ROTATE_STYLE), ".");                            \
+                        }                                                                              \
                     }                                                                                  \
                     break;                                                                             \
                 }                                                                                      \
@@ -1296,7 +1568,7 @@ void rope_fwd_impl(
     torch::Tensor&       output,        // [s, b, h, d]
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1319,9 +1591,10 @@ void rope_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         freqs.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_sbhd_uncached<Op1cUncachedFwd, ...>",
-        dispatch_1c_sbhd_uncached<Op1cUncachedFwd, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             freqs.data_ptr<scalar_t_1>(),
@@ -1335,7 +1608,7 @@ void rope_bwd_impl(
     torch::Tensor&       input_grads,   // [s, b, h, d]
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1358,9 +1631,10 @@ void rope_bwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         output_grads.scalar_type(),
         freqs.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_sbhd_uncached<Op1cUncachedBwd, ...>",
-        dispatch_1c_sbhd_uncached<Op1cUncachedBwd, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             freqs.data_ptr<scalar_t_1>(),
@@ -1376,7 +1650,7 @@ void rope_2c_fwd_impl(
     const torch::Tensor& input_x,       // [s, b, h, d]
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1407,9 +1681,10 @@ void rope_2c_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
         freqs.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_2c_sbhd_uncached<Op2cUncachedFwd, ...>",
-        dispatch_2c_sbhd_uncached<Op2cUncachedFwd, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_uncached<Op2cUncachedFwd, RotateStyle, ReuseFreqsFrontPart>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -1429,7 +1704,7 @@ void rope_2c_bwd_impl(
     const torch::Tensor& output_grads_x,// [s, b, h, d]
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1460,9 +1735,10 @@ void rope_2c_bwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         output_grads_x.scalar_type(),
         freqs.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_2c_sbhd_uncached<Op2cUncachedBwd, ...>",
-        dispatch_2c_sbhd_uncached<Op2cUncachedBwd, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_uncached<Op2cUncachedBwd, RotateStyle, ReuseFreqsFrontPart>(
             input_grads_x.data_ptr<scalar_t_0>(),
             input_grads_y.data_ptr<scalar_t_0>(),
             output_grads_x.data_ptr<scalar_t_0>(),
@@ -1481,7 +1757,7 @@ void rope_cached_fwd_impl(
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1504,9 +1780,10 @@ void rope_cached_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         cos.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_sbhd_cached<Op1cCachedFwd, ...>",
-        dispatch_1c_sbhd_cached<Op1cCachedFwd, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
@@ -1522,7 +1799,7 @@ void rope_cached_bwd_impl(
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1545,9 +1822,10 @@ void rope_cached_bwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         output_grads.scalar_type(),
         cos.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_sbhd_cached<Op1cCachedBwd, ...>",
-        dispatch_1c_sbhd_cached<Op1cCachedBwd, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
@@ -1565,7 +1843,7 @@ void rope_cached_2c_fwd_impl(
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1596,9 +1874,10 @@ void rope_cached_2c_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
         cos.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_2c_sbhd_cached<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached<Op2cCachedFwd, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_cached<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -1620,7 +1899,7 @@ void rope_cached_2c_bwd_impl(
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1651,9 +1930,10 @@ void rope_cached_2c_bwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         output_grads_x.scalar_type(),
         cos.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_2c_sbhd_cached<Op2cCachedBwd, ...>",
-        dispatch_2c_sbhd_cached<Op2cCachedBwd, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_cached<Op2cCachedBwd, RotateStyle, ReuseFreqsFrontPart>(
             input_grads_x.data_ptr<scalar_t_0>(),
             input_grads_y.data_ptr<scalar_t_0>(),
             output_grads_x.data_ptr<scalar_t_0>(),
@@ -1673,7 +1953,7 @@ void rope_thd_fwd_impl(
     const torch::Tensor& input,         // [t, h, d]
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d]
-    const int            rotate_style,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1694,9 +1974,10 @@ void rope_thd_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         freqs.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_thd_uncached<Op1cUncachedFwd, ...>",
-        dispatch_1c_thd_uncached<Op1cUncachedFwd, ReuseFreqsFrontPart>(
+        dispatch_1c_thd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cu_seqlens.data_ptr<int32_t>(),
@@ -1733,9 +2014,10 @@ void rope_thd_bwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         output_grads.scalar_type(),
         freqs.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_thd_uncached<Op1cUncachedBwd, ...>",
-        dispatch_1c_thd_uncached<Op1cUncachedBwd, ReuseFreqsFrontPart>(
+        dispatch_1c_thd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cu_seqlens.data_ptr<int32_t>(),
@@ -1753,9 +2035,9 @@ void rope_2d_fwd_impl(
     const torch::Tensor& sin_h,
     const torch::Tensor& cos_w,
     const torch::Tensor& sin_w,
-    const int            img_height,
-    const int            img_width,
-    const int            rotate_style,
+    const int32_t        img_height,
+    const int32_t        img_width,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1779,9 +2061,10 @@ void rope_2d_fwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         cos_h.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_2d_cached<Op1cCachedFwd, ...>",
-        dispatch_1c_2d_cached<Op1cCachedFwd, ReuseFreqsFrontPart>(
+        dispatch_1c_2d_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cos_h.data_ptr<scalar_t_1>(),
@@ -1801,9 +2084,9 @@ void rope_2d_bwd_impl(
     const torch::Tensor& sin_h,
     const torch::Tensor& cos_w,
     const torch::Tensor& sin_w,
-    const int            img_height,
-    const int            img_width,
-    const int            rotate_style,
+    const int32_t        img_height,
+    const int32_t        img_width,
+    const int32_t        rotate_style,
     const bool           reuse_freqs_front_part)
 {
     // Get sizes of input and output
@@ -1827,9 +2110,10 @@ void rope_2d_bwd_impl(
     DISPATCH_ROPE_TYPES_PARAMS(
         output_grads.scalar_type(),
         cos_h.scalar_type(),
+        rotate_style,
         reuse_freqs_front_part,
         "dispatch_1c_2d_cached<Op1cCachedBwd, ...>",
-        dispatch_1c_2d_cached<Op1cCachedBwd, ReuseFreqsFrontPart>(
+        dispatch_1c_2d_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cos_h.data_ptr<scalar_t_1>(),
