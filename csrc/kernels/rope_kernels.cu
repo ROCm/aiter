@@ -46,30 +46,40 @@ struct Op1cUncachedFwd
         #pragma unroll
         for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            // i: Input, O: output, d: in hidden Dim, 0: former element, 1: latter element
+            // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element
             const int32_t offset_i_d_0 = did * stride_i_d;
             const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
             const int32_t offset_o_d_0 = did * stride_o_d;
             const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-
-            float cos, sin;
-            sincosf(float(p_freqs[fid]), &sin, &cos);
+            float cos_0, sin_0;
+            sincosf(float(p_freqs[did]), &sin_0, &cos_0);
+            float cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                sincosf(float(p_freqs[did + size_half_r]), &sin_1, &cos_1);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_i_0 = hid * stride_i_h + offset_i_d_0;
-                const int32_t offset_i_1 = hid * stride_i_h + offset_i_d_1;
-                const int32_t offset_o_0 = hid * stride_o_h + offset_o_d_0;
-                const int32_t offset_o_1 = hid * stride_o_h + offset_o_d_1;
+                const int32_t offset_i_h = hid * stride_i_h;
+                const int32_t offset_o_h = hid * stride_o_h;
+                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
+                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
+                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
+                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
 
                 const float input_0 = float(p_input[offset_i_0]);
                 const float input_1 = float(p_input[offset_i_1]);
 
-                p_output[offset_o_0] = scalar_t(input_0 * cos - input_1 * sin);
-                p_output[offset_o_1] = scalar_t(input_1 * cos + input_0 * sin);
+                p_output[offset_o_0] = scalar_t(input_0 * cos_0 - input_1 * sin_0);
+                p_output[offset_o_1] = scalar_t(input_1 * cos_1 + input_0 * sin_1);
             }
         }
 
@@ -104,37 +114,53 @@ struct Op1cUncachedBwd
         const int32_t stride_i_h, const int32_t stride_i_d)
     {
         // rotate count
-        const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r   = size_r >> 1;
-        const int32_t offset_half_r = size_half_r * stride_i_d;
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_o = size_half_r * stride_o_d;
+        const int32_t offset_half_r_i = size_half_r * stride_i_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_o_d = did * stride_o_d;
-            const int32_t offset_i_d = did * stride_i_d;
+            // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
+            const int32_t offset_o_d_0 = did * stride_o_d;
+            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
+            const int32_t offset_i_d_0 = did * stride_i_d;
+            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
-            const int32_t fid_sin_1 = did - size_half_r;
-
-            const float cos = cosf(float(p_freqs[fid_cos]));
-            const float sin =
-                (did < size_half_r) ? sinf(float(p_freqs[fid_sin_0])) :
-                                     -sinf(float(p_freqs[fid_sin_1]));
+            const float f_did = p_freqs[did];
+            float cos_0, sin_0, cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_0 = cosf(f_did);
+                sin_0 = sinf(f_did);
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                const float f_did_a = p_freqs[did + size_half_r];
+                cos_0 = cosf(f_did);
+                sin_0 = sinf(f_did_a);
+                cos_1 = cosf(f_did_a);
+                sin_1 = sinf(f_did);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_o = hid * stride_o_h + offset_o_d;
-                const int32_t offset_i = hid * stride_i_h + offset_i_d;
+                const int32_t offset_o_h = hid * stride_o_h;
+                const int32_t offset_i_h = hid * stride_i_h;
+                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
+                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
+                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
+                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
 
-                const float output_grad = float(p_output_grads[offset_o]);
-                const float output_grad_rotate =
-                    (did < size_half_r) ? float(p_output_grads[offset_o + offset_half_r]):
-                                          float(p_output_grads[offset_o - offset_half_r]);
+                const float output_grad_0 = float(p_output_grads[offset_o_0]);
+                const float output_grad_1 = float(p_output_grads[offset_o_1]);
 
-                p_input_grads[offset_i] = scalar_t(output_grad * cos + output_grad_rotate * sin);
+                p_input_grads[offset_i_0] = scalar_t(output_grad_0 * cos_0 + output_grad_1 * sin_0);
+                p_input_grads[offset_i_1] = scalar_t(output_grad_1 * cos_1 - output_grad_0 * sin_1);
             }
         }
 
@@ -173,43 +199,64 @@ struct Op2cUncachedFwd
         const int32_t stride_oy_h, const int32_t stride_oy_d)
     {
         // rotate count
-        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r     = size_r >> 1;
-        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
-        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
+        const int32_t size_r           = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r      = size_r >> 1;
+        const int32_t offset_half_r_ix = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_ox = size_half_r * stride_ox_d;
+        const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
+        const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_ix_d = did * stride_ix_d;
-            const int32_t offset_iy_d = did * stride_iy_d;
-            const int32_t offset_ox_d = did * stride_ox_d;
-            const int32_t offset_oy_d = did * stride_oy_d;
+            // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
+            const int32_t offset_ix_d_0 = did * stride_ix_d;
+            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
+            const int32_t offset_iy_d_0 = did * stride_iy_d;
+            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
+            const int32_t offset_ox_d_0 = did * stride_ox_d;
+            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
+            const int32_t offset_oy_d_0 = did * stride_oy_d;
+            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-
-            float cos, sin;
-            sincosf(float(p_freqs[fid]), &sin, &cos);
+            float cos_0, sin_0;
+            sincosf(float(p_freqs[did]), &sin_0, &cos_0);
+            float cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                sincosf(float(p_freqs[did + size_half_r]), &sin_1, &cos_1);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_ix = hid * stride_ix_h + offset_ix_d;
-                const int32_t offset_iy = hid * stride_iy_h + offset_iy_d;
-                const int32_t offset_ox = hid * stride_ox_h + offset_ox_d;
-                const int32_t offset_oy = hid * stride_oy_h + offset_oy_d;
+                const int32_t offset_ix_h = hid * stride_ix_h;
+                const int32_t offset_ox_h = hid * stride_ox_h;
+                const int32_t offset_iy_h = hid * stride_iy_h;
+                const int32_t offset_oy_h = hid * stride_oy_h;
+                const int32_t offset_ix_0 = offset_ix_h + offset_ix_d_0;
+                const int32_t offset_ix_1 = offset_ix_h + offset_ix_d_1;
+                const int32_t offset_ox_0 = offset_ox_h + offset_ox_d_0;
+                const int32_t offset_ox_1 = offset_ox_h + offset_ox_d_1;
+                const int32_t offset_iy_0 = offset_iy_h + offset_iy_d_0;
+                const int32_t offset_iy_1 = offset_iy_h + offset_iy_d_1;
+                const int32_t offset_oy_0 = offset_oy_h + offset_oy_d_0;
+                const int32_t offset_oy_1 = offset_oy_h + offset_oy_d_1;
 
-                const float input_x = float(p_input_x[offset_ix]);
-                const float input_y = float(p_input_y[offset_iy]);
-                const float input_x_rotate =
-                    (did < size_half_r) ? float(-p_input_x[offset_ix + offset_half_r_x]):
-                                          float( p_input_x[offset_ix - offset_half_r_x]);
-                const float input_y_rotate =
-                    (did < size_half_r) ? float(-p_input_y[offset_iy + offset_half_r_y]):
-                                          float( p_input_y[offset_iy - offset_half_r_y]);
+                const float input_x_0 = float(p_input_x[offset_ix_0]);
+                const float input_x_1 = float(p_input_x[offset_ix_1]);
+                const float input_y_0 = float(p_input_y[offset_iy_0]);
+                const float input_y_1 = float(p_input_y[offset_iy_1]);
 
-                p_output_x[offset_ox] = scalar_t(input_x * cos + input_x_rotate * sin);
-                p_output_y[offset_oy] = scalar_t(input_y * cos + input_y_rotate * sin);
+                p_output_x[offset_ox_0] = scalar_t(input_x_0 * cos_0 - input_x_1 * sin_0);
+                p_output_x[offset_ox_1] = scalar_t(input_x_1 * cos_1 + input_x_0 * sin_1);
+                p_output_y[offset_oy_0] = scalar_t(input_y_0 * cos_0 - input_y_1 * sin_0);
+                p_output_y[offset_oy_1] = scalar_t(input_y_1 * cos_1 + input_y_0 * sin_1);
             }
         }
 
@@ -251,47 +298,69 @@ struct Op2cUncachedBwd
         const int32_t stride_iy_h, const int32_t stride_iy_d)
     {
         // rotate count
-        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r     = size_r >> 1;
-        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
-        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
+        const int32_t size_r           = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r      = size_r >> 1;
+        const int32_t offset_half_r_ox = size_half_r * stride_ox_d;
+        const int32_t offset_half_r_ix = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
+        const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_ox_d = did * stride_ox_d;
-            const int32_t offset_oy_d = did * stride_oy_d;
-            const int32_t offset_ix_d = did * stride_ix_d;
-            const int32_t offset_iy_d = did * stride_iy_d;
+            // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
+            const int32_t offset_ox_d_0 = did * stride_ox_d;
+            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
+            const int32_t offset_oy_d_0 = did * stride_oy_d;
+            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
+            const int32_t offset_ix_d_0 = did * stride_ix_d;
+            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
+            const int32_t offset_iy_d_0 = did * stride_iy_d;
+            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
-            const int32_t fid_sin_1 = did - size_half_r;
-
-            const float cos = cosf(float(p_freqs[fid_cos]));
-            const float sin =
-                (did < size_half_r) ? sinf(float(p_freqs[fid_sin_0])) :
-                                     -sinf(float(p_freqs[fid_sin_1]));
+            const float f_did = p_freqs[did];
+            float cos_0, sin_0, cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_0 = cosf(f_did);
+                sin_0 = sinf(f_did);
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                const float f_did_a = p_freqs[did + size_half_r];
+                cos_0 = cosf(f_did);
+                sin_0 = sinf(f_did_a);
+                cos_1 = cosf(f_did_a);
+                sin_1 = sinf(f_did);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_ox = hid * stride_ox_h + offset_ox_d;
-                const int32_t offset_oy = hid * stride_oy_h + offset_oy_d;
-                const int32_t offset_ix = hid * stride_ix_h + offset_ix_d;
-                const int32_t offset_iy = hid * stride_iy_h + offset_iy_d;
+                const int32_t offset_ox_h = hid * stride_ox_h;
+                const int32_t offset_ix_h = hid * stride_ix_h;
+                const int32_t offset_oy_h = hid * stride_oy_h;
+                const int32_t offset_iy_h = hid * stride_iy_h;
+                const int32_t offset_ox_0 = offset_ox_h + offset_ox_d_0;
+                const int32_t offset_ox_1 = offset_ox_h + offset_ox_d_1;
+                const int32_t offset_ix_0 = offset_ix_h + offset_ix_d_0;
+                const int32_t offset_ix_1 = offset_ix_h + offset_ix_d_1;
+                const int32_t offset_oy_0 = offset_oy_h + offset_oy_d_0;
+                const int32_t offset_oy_1 = offset_oy_h + offset_oy_d_1;
+                const int32_t offset_iy_0 = offset_iy_h + offset_iy_d_0;
+                const int32_t offset_iy_1 = offset_iy_h + offset_iy_d_1;
 
-                const float output_grad_x = float(p_output_grads_x[offset_ox]);
-                const float output_grad_y = float(p_output_grads_y[offset_oy]);
-                const float output_grad_x_rotate =
-                    (did < size_half_r) ? float(p_output_grads_x[offset_ox + offset_half_r_x]):
-                                          float(p_output_grads_x[offset_ox - offset_half_r_x]);
-                const float output_grad_y_rotate =
-                    (did < size_half_r) ? float(p_output_grads_y[offset_oy + offset_half_r_y]):
-                                          float(p_output_grads_y[offset_oy - offset_half_r_y]);
+                const float output_grad_x_0 = float(p_output_grads_x[offset_ox_0]);
+                const float output_grad_x_1 = float(p_output_grads_x[offset_ox_1]);
+                const float output_grad_y_0 = float(p_output_grads_y[offset_oy_0]);
+                const float output_grad_y_1 = float(p_output_grads_y[offset_oy_1]);
 
-                p_input_grads_x[offset_ix] = scalar_t(output_grad_x * cos + output_grad_x_rotate * sin);
-                p_input_grads_y[offset_iy] = scalar_t(output_grad_y * cos + output_grad_y_rotate * sin);
+                p_input_grads_x[offset_ix_0] = scalar_t(output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0);
+                p_input_grads_x[offset_ix_1] = scalar_t(output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1);
+                p_input_grads_y[offset_iy_0] = scalar_t(output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0);
+                p_input_grads_y[offset_iy_1] = scalar_t(output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1);
             }
         }
 
@@ -332,31 +401,48 @@ struct Op1cCachedFwd
         // rotate count
         const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r   = size_r >> 1;
-        const int32_t offset_half_r = size_half_r * stride_i_d;
+        const int32_t offset_half_r_i = size_half_r * stride_i_d;
+        const int32_t offset_half_r_o = size_half_r * stride_o_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_i_d = did * stride_i_d;
-            const int32_t offset_o_d = did * stride_o_d;
+            // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element
+            const int32_t offset_i_d_0 = did * stride_i_d;
+            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
+            const int32_t offset_o_d_0 = did * stride_o_d;
+            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-
-            const float cos = p_cos[fid];
-            const float sin = p_sin[fid];
+            const float cos_0 = float(p_cos[did]);
+            const float sin_0 = float(p_sin[did]);
+            float cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                const int32_t did_a = did + size_half_r;
+                cos_1 = float(p_cos[did_a]);
+                sin_1 = float(p_sin[did_a]);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_i = hid * stride_i_h + offset_i_d;
-                const int32_t offset_o = hid * stride_o_h + offset_o_d;
+                const int32_t offset_i_h = hid * stride_i_h;
+                const int32_t offset_o_h = hid * stride_o_h;
+                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
+                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
+                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
+                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
 
-                const float input = float(p_input[offset_i]);
-                const float input_rotate =
-                    (did < size_half_r) ? float(-p_input[offset_i + offset_half_r]):
-                                          float( p_input[offset_i - offset_half_r]);
+                const float input_0 = float(p_input[offset_i_0]);
+                const float input_1 = float(p_input[offset_i_1]);
 
-                p_output[offset_o] = scalar_t(input * cos + input_rotate * sin);
+                p_output[offset_o_0] = scalar_t(input_0 * cos_0 - input_1 * sin_0);
+                p_output[offset_o_1] = scalar_t(input_1 * cos_1 + input_0 * sin_1);
             }
         }
 
@@ -392,35 +478,52 @@ struct Op1cCachedBwd
         const int32_t stride_i_h, const int32_t stride_i_d)
     {
         // rotate count
-        const int32_t size_r        = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r   = size_r >> 1;
-        const int32_t offset_half_r = size_half_r * stride_i_d;
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_o = size_half_r * stride_o_d;
+        const int32_t offset_half_r_i = size_half_r * stride_i_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_o_d = did * stride_o_d;
-            const int32_t offset_i_d = did * stride_i_d;
+            // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
+            const int32_t offset_o_d_0 = did * stride_o_d;
+            const int32_t offset_o_d_1 = offset_o_d_0 + offset_half_r_o;
+            const int32_t offset_i_d_0 = did * stride_i_d;
+            const int32_t offset_i_d_1 = offset_i_d_0 + offset_half_r_i;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
-            const int32_t fid_sin_1 = did - size_half_r;
-
-            const float cos = float(p_cos[fid_cos]);
-            const float sin = (did < size_half_r) ? float(p_sin[fid_sin_0]) : -float(p_sin[fid_sin_1]);
+            float cos_0, sin_0, cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_0 = float(p_cos[did]);
+                sin_0 = float(p_sin[did]);
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                const int32_t did_a = did + size_half_r;
+                cos_0 = float(p_cos[did]);
+                sin_0 = float(p_sin[did_a]);
+                cos_1 = float(p_cos[did_a]);
+                sin_1 = float(p_sin[did]);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_o = hid * stride_o_h + offset_o_d;
-                const int32_t offset_i = hid * stride_i_h + offset_i_d;
+                const int32_t offset_o_h = hid * stride_o_h;
+                const int32_t offset_i_h = hid * stride_i_h;
+                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
+                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
+                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
+                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
 
-                const float output_grad = float(p_output_grads[offset_o]);
-                const float output_grad_rotate =
-                    (did < size_half_r) ? float(p_output_grads[offset_o + offset_half_r]):
-                                          float(p_output_grads[offset_o - offset_half_r]);
+                const float output_grad_0 = float(p_output_grads[offset_o_0]);
+                const float output_grad_1 = float(p_output_grads[offset_o_1]);
 
-                p_input_grads[offset_i] = scalar_t(output_grad * cos + output_grad_rotate * sin);
+                p_input_grads[offset_i_0] = scalar_t(output_grad_0 * cos_0 + output_grad_1 * sin_0);
+                p_input_grads[offset_i_1] = scalar_t(output_grad_1 * cos_1 - output_grad_0 * sin_1);
             }
         }
 
@@ -460,43 +563,66 @@ struct Op2cCachedFwd
         const int32_t stride_oy_h, const int32_t stride_oy_d)
     {
         // rotate count
-        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r     = size_r >> 1;
-        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
-        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
+        const int32_t size_r           = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r      = size_r >> 1;
+        const int32_t offset_half_r_ix = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_ox = size_half_r * stride_ox_d;
+        const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
+        const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_ix_d = did * stride_ix_d;
-            const int32_t offset_iy_d = did * stride_iy_d;
-            const int32_t offset_ox_d = did * stride_ox_d;
-            const int32_t offset_oy_d = did * stride_oy_d;
+            // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
+            const int32_t offset_ix_d_0 = did * stride_ix_d;
+            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
+            const int32_t offset_iy_d_0 = did * stride_iy_d;
+            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
+            const int32_t offset_ox_d_0 = did * stride_ox_d;
+            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
+            const int32_t offset_oy_d_0 = did * stride_oy_d;
+            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
 
-            const int32_t fid = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-
-            const float   cos = p_cos[fid];
-            const float   sin = p_sin[fid];
+            const float cos_0 = float(p_cos[did]);
+            const float sin_0 = float(p_sin[did]);
+            float cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                const int32_t did_a = did + size_half_r;
+                cos_1 = float(p_cos[did_a]);
+                sin_1 = float(p_sin[did_a]);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_ix = hid * stride_ix_h + offset_ix_d;
-                const int32_t offset_iy = hid * stride_iy_h + offset_iy_d;
-                const int32_t offset_ox = hid * stride_ox_h + offset_ox_d;
-                const int32_t offset_oy = hid * stride_oy_h + offset_oy_d;
+                const int32_t offset_ix_h = hid * stride_ix_h;
+                const int32_t offset_ox_h = hid * stride_ox_h;
+                const int32_t offset_iy_h = hid * stride_iy_h;
+                const int32_t offset_oy_h = hid * stride_oy_h;
+                const int32_t offset_ix_0 = offset_ix_h + offset_ix_d_0;
+                const int32_t offset_ix_1 = offset_ix_h + offset_ix_d_1;
+                const int32_t offset_ox_0 = offset_ox_h + offset_ox_d_0;
+                const int32_t offset_ox_1 = offset_ox_h + offset_ox_d_1;
+                const int32_t offset_iy_0 = offset_iy_h + offset_iy_d_0;
+                const int32_t offset_iy_1 = offset_iy_h + offset_iy_d_1;
+                const int32_t offset_oy_0 = offset_oy_h + offset_oy_d_0;
+                const int32_t offset_oy_1 = offset_oy_h + offset_oy_d_1;
 
-                const float input_x = float(p_input_x[offset_ix]);
-                const float input_y = float(p_input_y[offset_iy]);
-                const float input_x_rotate =
-                    (did < size_half_r) ? float(-p_input_x[offset_ix + offset_half_r_x]):
-                                          float( p_input_x[offset_ix - offset_half_r_x]);
-                const float input_y_rotate =
-                    (did < size_half_r) ? float(-p_input_y[offset_iy + offset_half_r_y]):
-                                          float( p_input_y[offset_iy - offset_half_r_y]);
+                const float input_x_0 = float(p_input_x[offset_ix_0]);
+                const float input_x_1 = float(p_input_x[offset_ix_1]);
+                const float input_y_0 = float(p_input_y[offset_iy_0]);
+                const float input_y_1 = float(p_input_y[offset_iy_1]);
 
-                p_output_x[offset_ox] = scalar_t(input_x * cos + input_x_rotate * sin);
-                p_output_y[offset_oy] = scalar_t(input_y * cos + input_y_rotate * sin);
+                p_output_x[offset_ox_0] = scalar_t(input_x_0 * cos_0 - input_x_1 * sin_0);
+                p_output_x[offset_ox_1] = scalar_t(input_x_1 * cos_1 + input_x_0 * sin_1);
+                p_output_y[offset_oy_0] = scalar_t(input_y_0 * cos_0 - input_y_1 * sin_0);
+                p_output_y[offset_oy_1] = scalar_t(input_y_1 * cos_1 + input_y_0 * sin_1);
             }
         }
 
@@ -539,45 +665,68 @@ struct Op2cCachedBwd
         const int32_t stride_iy_h, const int32_t stride_iy_d)
     {
         // rotate count
-        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r     = size_r >> 1;
-        const int32_t offset_half_r_x = size_half_r * stride_ix_d;
-        const int32_t offset_half_r_y = size_half_r * stride_iy_d;
+        const int32_t size_r           = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r      = size_r >> 1;
+        const int32_t offset_half_r_ox = size_half_r * stride_ox_d;
+        const int32_t offset_half_r_ix = size_half_r * stride_ix_d;
+        const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
+        const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
         {
-            const int32_t offset_ox_d = did * stride_ox_d;
-            const int32_t offset_oy_d = did * stride_oy_d;
-            const int32_t offset_ix_d = did * stride_ix_d;
-            const int32_t offset_iy_d = did * stride_iy_d;
+            // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
+            const int32_t offset_ox_d_0 = did * stride_ox_d;
+            const int32_t offset_ox_d_1 = offset_ox_d_0 + offset_half_r_ox;
+            const int32_t offset_oy_d_0 = did * stride_oy_d;
+            const int32_t offset_oy_d_1 = offset_oy_d_0 + offset_half_r_oy;
+            const int32_t offset_ix_d_0 = did * stride_ix_d;
+            const int32_t offset_ix_d_1 = offset_ix_d_0 + offset_half_r_ix;
+            const int32_t offset_iy_d_0 = did * stride_iy_d;
+            const int32_t offset_iy_d_1 = offset_iy_d_0 + offset_half_r_iy;
 
-            const int32_t fid_cos   = ReuseFreqsFrontPart ? (did % size_half_r) : did;
-            const int32_t fid_sin_0 = ReuseFreqsFrontPart ? did : (did + size_half_r);
-            const int32_t fid_sin_1 = did - size_half_r;
-
-            const float cos = float(p_cos[fid_cos]);
-            const float sin = (did < size_half_r) ? float(p_sin[fid_sin_0]) : -float(p_sin[fid_sin_1]);
+            float cos_0, sin_0, cos_1, sin_1;
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                cos_0 = float(p_cos[did]);
+                sin_0 = float(p_sin[did]);
+                cos_1 = cos_0;
+                sin_1 = sin_0;
+            }
+            else
+            {
+                const int32_t did_a = did + size_half_r;
+                cos_0 = float(p_cos[did]);
+                sin_0 = float(p_sin[did_a]);
+                cos_1 = float(p_cos[did_a]);
+                sin_1 = float(p_sin[did]);
+            }
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
-                const int32_t offset_ox = hid * stride_ox_h + offset_ox_d;
-                const int32_t offset_oy = hid * stride_oy_h + offset_oy_d;
-                const int32_t offset_ix = hid * stride_ix_h + offset_ix_d;
-                const int32_t offset_iy = hid * stride_iy_h + offset_iy_d;
+                const int32_t offset_ox_h = hid * stride_ox_h;
+                const int32_t offset_ix_h = hid * stride_ix_h;
+                const int32_t offset_oy_h = hid * stride_oy_h;
+                const int32_t offset_iy_h = hid * stride_iy_h;
+                const int32_t offset_ox_0 = offset_ox_h + offset_ox_d_0;
+                const int32_t offset_ox_1 = offset_ox_h + offset_ox_d_1;
+                const int32_t offset_ix_0 = offset_ix_h + offset_ix_d_0;
+                const int32_t offset_ix_1 = offset_ix_h + offset_ix_d_1;
+                const int32_t offset_oy_0 = offset_oy_h + offset_oy_d_0;
+                const int32_t offset_oy_1 = offset_oy_h + offset_oy_d_1;
+                const int32_t offset_iy_0 = offset_iy_h + offset_iy_d_0;
+                const int32_t offset_iy_1 = offset_iy_h + offset_iy_d_1;
 
-                const float output_grad_x = float(p_output_grads_x[offset_ox]);
-                const float output_grad_y = float(p_output_grads_y[offset_oy]);
-                const float output_grad_x_rotate =
-                    (did < size_half_r) ? float(p_output_grads_x[offset_ox + offset_half_r_x]):
-                                          float(p_output_grads_x[offset_ox - offset_half_r_x]);
-                const float output_grad_y_rotate =
-                    (did < size_half_r) ? float(p_output_grads_y[offset_oy + offset_half_r_y]):
-                                          float(p_output_grads_y[offset_oy - offset_half_r_y]);
+                const float output_grad_x_0 = float(p_output_grads_x[offset_ox_0]);
+                const float output_grad_x_1 = float(p_output_grads_x[offset_ox_1]);
+                const float output_grad_y_0 = float(p_output_grads_y[offset_oy_0]);
+                const float output_grad_y_1 = float(p_output_grads_y[offset_oy_1]);
 
-                p_input_grads_x[offset_ix] = scalar_t(output_grad_x * cos + output_grad_x_rotate * sin);
-                p_input_grads_y[offset_iy] = scalar_t(output_grad_y * cos + output_grad_y_rotate * sin);
+                p_input_grads_x[offset_ix_0] = scalar_t(output_grad_x_0 * cos_0 + output_grad_x_1 * sin_0);
+                p_input_grads_x[offset_ix_1] = scalar_t(output_grad_x_1 * cos_1 - output_grad_x_0 * sin_1);
+                p_input_grads_y[offset_iy_0] = scalar_t(output_grad_y_0 * cos_0 + output_grad_y_1 * sin_0);
+                p_input_grads_y[offset_iy_1] = scalar_t(output_grad_y_1 * cos_1 - output_grad_y_0 * sin_1);
             }
         }
 
