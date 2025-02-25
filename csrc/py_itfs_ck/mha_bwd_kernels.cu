@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
+#include <iostream>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "py_itfs_common.h"
@@ -40,7 +40,8 @@ struct fmha_bwd_traits_all: public fmha_bwd_traits
 float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
     float r = fmha_bwd_v3(traits, args, stream_config);
     if (r == -1) {
-        r = fmha_bwd(traits, args, stream_config);
+        // r = fmha_bwd(traits, args, stream_config);
+        std::cout << "******************v3 failed*******************" << std::endl;
     }
 }
 
@@ -269,7 +270,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
-    TORCH_CHECK(deterministic == true, "Only support deterministic for now");
+    // TORCH_CHECK(deterministic == true, "Only support deterministic for now");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 

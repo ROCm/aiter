@@ -58,7 +58,7 @@ BWD_V3_PADDING_CHECK_MAP = {
     2: "true"
 }
 
-FMHA_BWD_API_FILENAME="fmha_bwd_api.cpp"
+FMHA_BWD_API_FILENAME="asm_fmha_bwd_v3.cpp"
 
 FMHA_BWD_KERNEL_HEADER = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.\n
@@ -79,16 +79,6 @@ FMHA_BWD_API = """
 #include "hsaco/fmha_hsaco.hpp"
 
 #define HSA_KERNEL "kernel_func"
-#define HIP_CALL(call)                                                              \\
-    do                                                                              \\
-    {{                                                                               \\
-        hipError_t err = call;                                                      \\
-        if(err != hipSuccess)                                                       \\
-        {{                                                                           \\
-            printf("[hiperror](%d) fail to call %s", static_cast<int>(err), #call); \\
-            exit(0);                                                                \\
-        }}                                                                           \\
-    }} while(0)
 
 struct __attribute__((packed)) fmha_bwd_v3_args
 {{
