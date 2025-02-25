@@ -13,6 +13,7 @@ float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_t
         // r = fmha_bwd(traits, args, stream_config);
         std::cout << "******************v3 failed*******************" << std::endl;
     }
+    return r;
 }
 
 fmha_bwd_traits_all get_ck_fmha_bwd_traits(const mask_info &mask,
@@ -361,11 +362,12 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
+        stream_config.log_level_ = 1;
         
         // TODO: for debug fix this
         auto traits =
             get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic, true, true, 1);
-        std::cout << traits.is_group_mode << " " << traits.bias_type << " " << traits.has_dbias << std::endl;
+        std::cout << traits.is_group_mode << " " << traits.has_dbias << std::endl;
         auto args =
             get_ck_fmha_bwd_args(
                 mask,
@@ -393,7 +395,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         std::cout << args.hdim_q << " == " << args.hdim_v << std::endl;
 
         std::cout << args.seqlen_q << " == " << args.seqlen_k << std::endl;
-        std::cout << args.nhead_q << " % " args.nhead_k << " == 0" << std::endl;
+        std::cout << args.nhead_q << " % " << args.nhead_k << " == 0" << std::endl;
         std::cout << args.stride_q << " == " << args.stride_do << std::endl;
         std::cout << args.nhead_stride_q << " == " << args.nhead_stride_do << std::endl;
         std::cout << args.batch_stride_q << " == " << args.batch_stride_do << std::endl;
