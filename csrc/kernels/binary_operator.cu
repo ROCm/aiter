@@ -1070,9 +1070,9 @@ void dispatch_second(torch::Tensor &input, torch::Tensor &other, torch::Tensor &
   {
     DISPATCH_SECOND(pattern, Operation, _T0, torch::kFloat32, float);
     DISPATCH_SECOND(pattern, Operation, _T0, torch::kFloat64, double);
-    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt32, int);
-    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt64, long long);
-    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kBool, bool);
+    DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt32, int);
+    DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt64, long long);
+    DISPATCH_SECOND(pattern, Operation, _T0, torch::kBool, bool);
     DISPATCH_SECOND(pattern, Operation, _T0, torch::kHalf, torch::Half);
     DISPATCH_SECOND(pattern, Operation, _T0, torch::kBFloat16, torch::BFloat16);
   default:
@@ -1087,9 +1087,9 @@ void dispatch_first(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
   {
     DISPATCH_FIRST(pattern, Operation, torch::kFloat32, float);
     DISPATCH_FIRST(pattern, Operation, torch::kFloat64, double);
-    // DISPATCH_FIRST(pattern, Operation, torch::kInt32, int);
-    // DISPATCH_FIRST(pattern, Operation, torch::kInt64, long long);
-    // DISPATCH_FIRST(pattern, Operation, torch::kBool, bool);
+    DISPATCH_FIRST(pattern, Operation, torch::kInt32, int);
+    DISPATCH_FIRST(pattern, Operation, torch::kInt64, long long);
+    DISPATCH_FIRST(pattern, Operation, torch::kBool, bool);
     DISPATCH_FIRST(pattern, Operation, torch::kHalf, torch::Half);
     DISPATCH_FIRST(pattern, Operation, torch::kBFloat16, torch::BFloat16);
   default:
