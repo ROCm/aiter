@@ -10,8 +10,7 @@
 float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
     float r = fmha_bwd_v3(traits, args, stream_config);
     if (r == -1) {
-        // r = fmha_bwd(traits, args, stream_config);
-        std::cout << "******************v3 failed*******************" << std::endl;
+        r = fmha_bwd(traits, args, stream_config);
     }
     return r;
 }
@@ -362,12 +361,12 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
-        stream_config.log_level_ = 1;
         
         // TODO: for debug fix this
+        stream_config.log_level_ = 1;
         auto traits =
             get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic, true, true, 1);
-        std::cout << traits.is_group_mode << " " << traits.has_dbias << std::endl;
+
         auto args =
             get_ck_fmha_bwd_args(
                 mask,
@@ -392,20 +391,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
                 softmax_scale,
                 p_dropout,
                 drop_seed_offset);
-        std::cout << args.hdim_q << " == " << args.hdim_v << std::endl;
-
-        std::cout << args.seqlen_q << " == " << args.seqlen_k << std::endl;
-        std::cout << args.nhead_q << " % " << args.nhead_k << " == 0" << std::endl;
-        std::cout << args.stride_q << " == " << args.stride_do << std::endl;
-        std::cout << args.nhead_stride_q << " == " << args.nhead_stride_do << std::endl;
-        std::cout << args.batch_stride_q << " == " << args.batch_stride_do << std::endl;
-        std::cout << args.batch_stride_dk << " == " << args.batch_stride_k << std::endl;
-
-        std::cout << args.stride_k << " == " << args.stride_v << std::endl;
-        std::cout << args.nhead_stride_k << " == " << args.nhead_stride_dk << std::endl;
-        std::cout << args.nhead_stride_v << " == " << args.nhead_stride_dv << std::endl;
-        std::cout << args.batch_stride_dk << " / " << args.batch_stride_k << " == " << args.nhead_q << " / " << args.nhead_k << std::endl;
-        std::cout << args.batch_stride_dv << " / " << args.batch_stride_v << " == " << args.nhead_q << " / " << args.nhead_k << std::endl;
 
         float t = fmha_bwd_router(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
@@ -421,6 +406,5 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
-    std::cout << "finished `mha_bwd`" << std::endl;
     return { dq, dk, dv, softmax_d };
 }
