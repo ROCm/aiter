@@ -248,22 +248,25 @@ def gen_kernel_dict_item_as_str(mnk: tuple | int, k: KernelParameters) -> str:
 
 def gen_lookup_dict(kernel_dict: dict, is_tune: bool) -> str:
     # Do not include default kernels in the lookup table for non-tuning calls.
-    filter_mnk = lambda mnk : True if is_tune else isinstance(mnk, tuple)
+    filter_mnk = lambda mnk: True if is_tune else isinstance(mnk, tuple)
     kernel_dict_items = [
         gen_kernel_dict_item_as_str(mnk, k)
         for mnk, k in kernel_dict.items()
         if filter_mnk(mnk)
     ]
+    
+    lookup_table = ",\\\n    ".join(kernel_dict_items)
+    
     return f"""#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #ifdef USE_ROCM
-#define GENERATE_LOOKUP_TABLE(A_TYPE, B_TYPE, C_SHUFFLE_TYPE, COMPUTE_TYPE, ACC_TYPE, D_TYPE, E_TYPE)       \\
-{{                                                                                                          \\
-    {",\\\n    ".join(kernel_dict_items) + " \\"}
+#define GENERATE_LOOKUP_TABLE(A_TYPE, B_TYPE, C_SHUFFLE_TYPE, COMPUTE_TYPE, ACC_TYPE, D_TYPE, E_TYPE)      \\
+{{                                                                                                         \\
+    {lookup_table} \\
 }}
-#endif // USE_ROCM
+#endif
 """
 
 def gen_kernel_definition(kernel_name: str) -> str:
@@ -292,6 +295,8 @@ def gen_manifest(kernels_dict: dict) -> str:
     kernel_definition_list = [
         gen_kernel_definition(k.name) for k in kernels_dict.values()   
     ]
+    kernel_definitions = "\n".join(kernel_definition_list)
+    
     return f"""#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -301,8 +306,8 @@ def gen_manifest(kernels_dict: dict) -> str:
 #include <cstdlib>
 
 #include <torch/extension.h>
-    {"\n".join(kernel_definition_list)}
-#endif // USE_ROCM
+{kernel_definitions}
+#endif
 """
 
 def gemm_a8w8_fwd_codegen(working_path: Path, kernel_parameters_dict: dict, is_tune: bool):

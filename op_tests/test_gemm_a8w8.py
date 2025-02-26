@@ -58,7 +58,7 @@ def torch_scaled_mm(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16
     return out.to(dtype)
 
 
-def setup(
+def setup_gemm_test(
     mnk: tuple[int, int, int],
     ab_dtype: torch.dtype,
     scales_dtype: torch.dtype,
@@ -94,7 +94,7 @@ def test_ck_gemm_close_to_torch(
 
     scales_dtype, out_dtype =  scales_output_dtype
     bias_dtype = out_dtype
-    a, b, a_scale, b_scale, bias = setup(
+    a, b, a_scale, b_scale, bias = setup_gemm_test(
         mnk,
         ab_dtype,
         scales_dtype,
@@ -115,7 +115,7 @@ def test_asm_gemm_close_to_torch(benchmark, mnk: tuple[int, int, int]) -> None:
     scales_dtype = torch.float32
     bias_dtype = torch.float
     # gemm_a8w8_ASM requires bias and shuffle
-    a, b, a_scale, b_scale, bias = setup(
+    a, b, a_scale, b_scale, bias = setup_gemm_test(
         mnk,
         ab_dtype,
         scales_dtype,
