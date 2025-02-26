@@ -125,25 +125,20 @@ transpose_output: {transpose_output}
 """
 
     ref = ref_rope_sbhd_fwd(input, freqs, rotate_style, reuse_freqs_front_part)
-    if rotate_style == RotateStyle.NEOX:
-        ref.backward(grad)
+    ref.backward(grad)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
     hip_fwd,        hip_fwd_avg        = hip_rope_fwd(input, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
-    if rotate_style == RotateStyle.NEOX:
-        hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
+    hip_bwd,        hip_bwd_avg        = hip_rope_bwd(grad, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
     hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(input, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
-    if rotate_style == RotateStyle.NEOX:
-        hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
+    hip_cached_bwd, hip_cached_bwd_avg = hip_rope_cached_bwd(grad, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
 
     checkAllclose(ref,        hip_fwd,        msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
-    if rotate_style == RotateStyle.NEOX:
-        checkAllclose(input.grad, hip_bwd,        msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input.grad, hip_bwd,        msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref,        hip_cached_fwd, msg=f"rope_cached_fwd - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
-    if rotate_style == RotateStyle.NEOX:
-        checkAllclose(input.grad, hip_cached_bwd, msg=f"rope_cached_bwd - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input.grad, hip_cached_bwd, msg=f"rope_cached_bwd - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
 def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, rotate_style, reuse_freqs_front_part, transpose_output):
@@ -162,30 +157,25 @@ transpose_output: {transpose_output}
 
     ref_x = ref_rope_sbhd_fwd(input_x, freqs, rotate_style, reuse_freqs_front_part)
     ref_y = ref_rope_sbhd_fwd(input_y, freqs, rotate_style, reuse_freqs_front_part)
-    if rotate_style == RotateStyle.NEOX:
-        ref_x.backward(grad_x)
-        ref_y.backward(grad_y)
+    ref_x.backward(grad_x)
+    ref_y.backward(grad_y)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
     (hip_fwd_x, hip_fwd_y), hip_fwd_avg = hip_rope_2c_fwd(input_x, input_y, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
-    if rotate_style == RotateStyle.NEOX:
-        (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
+    (hip_bwd_x, hip_bwd_y), hip_bwd_avg = hip_rope_2c_bwd(grad_x, grad_y, freqs, rotate_style, reuse_freqs_front_part, transpose_output)
     (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(input_x, input_y, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
-    if rotate_style == RotateStyle.NEOX:
-        (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
+    (hip_cached_bwd_x, hip_cached_bwd_y), hip_cached_bwd_avg = hip_rope_cached_2c_bwd(grad_x, grad_y, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
 
     checkAllclose(ref_x,        hip_fwd_x,        msg=f"rope_2c_fwd_x - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_y,        hip_fwd_y,        msg=f"rope_2c_fwd_y - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
-    if rotate_style == RotateStyle.NEOX:
-        checkAllclose(input_x.grad, hip_bwd_x,        msg=f"rope_2c_bwd_x - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
-        checkAllclose(input_y.grad, hip_bwd_y,        msg=f"rope_2c_bwd_y - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_x.grad, hip_bwd_x,        msg=f"rope_2c_bwd_x - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_y.grad, hip_bwd_y,        msg=f"rope_2c_bwd_y - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_x,        hip_cached_fwd_x, msg=f"rope_cached_2c_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_y,        hip_cached_fwd_y, msg=f"rope_cached_2c_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
-    if rotate_style == RotateStyle.NEOX:
-        checkAllclose(input_x.grad, hip_cached_bwd_x, msg=f"rope_cached_2c_bwd_x - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
-        checkAllclose(input_y.grad, hip_cached_bwd_y, msg=f"rope_cached_2c_bwd_y - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_x.grad, hip_cached_bwd_x, msg=f"rope_cached_2c_bwd_x - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input_y.grad, hip_cached_bwd_y, msg=f"rope_cached_2c_bwd_y - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
 def test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part):
@@ -202,16 +192,13 @@ cu_seqlens: {cu_seqlens}
     torch.set_printoptions(profile="default")
 
     ref = ref_rope_thd_fwd(input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
-    if rotate_style == RotateStyle.NEOX:
-        ref.backward(grad)
+    ref.backward(grad)
 
     hip_fwd, hip_fwd_avg = hip_rope_thd_fwd(input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
-    if rotate_style == RotateStyle.NEOX:
-        hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
+    hip_bwd, hip_bwd_avg = hip_rope_thd_bwd(grad, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
 
     checkAllclose(ref,        hip_fwd, msg=f"rope_thd_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n")
-    if rotate_style == RotateStyle.NEOX:
-        checkAllclose(input.grad, hip_bwd, msg=f"rope_thd_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(input.grad, hip_bwd, msg=f"rope_thd_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
 def test_rope_2d(input, height, width, freqs_h, freqs_w, grad):

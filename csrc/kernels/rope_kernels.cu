@@ -2,7 +2,6 @@
 // Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <c10/cuda/CUDAGuard.h>
-#include "rope.h"
 #include "dispatch_utils.h"
 
 // =====================================================================================================================
@@ -36,7 +35,7 @@ inline __device__ void get_cos_sin_uncached(
 {
     if constexpr (RotateStyle == ROTATE_STYLE_NEOX)
     {
-        if constexpr (IsForward == true)
+        if constexpr (IsForward)
         {
             sincosf(float(p_freqs[did]), p_sin_0, p_cos_0);
             if constexpr (ReuseFreqsFrontPart)
@@ -51,27 +50,27 @@ inline __device__ void get_cos_sin_uncached(
         }
         else
         {
-            const float f_did = float(p_freqs[did]);
+            const float f_did_0 = float(p_freqs[did]);
             if constexpr (ReuseFreqsFrontPart)
             {
-                *p_cos_0 = cosf(f_did);
-                *p_sin_0 = sinf(f_did);
+                *p_cos_0 = cosf(f_did_0);
+                *p_sin_0 = sinf(f_did_0);
                 *p_cos_1 = *p_cos_0;
                 *p_sin_1 = *p_sin_0;
             }
             else
             {
-                const float f_did_a = p_freqs[did + size_half_r];
-                *p_cos_0 = cosf(f_did);
-                *p_sin_0 = sinf(f_did_a);
-                *p_cos_1 = cosf(f_did_a);
-                *p_sin_1 = sinf(f_did);
+                const float f_did_1 = p_freqs[did + size_half_r];
+                *p_cos_0 = cosf(f_did_0);
+                *p_sin_0 = sinf(f_did_1);
+                *p_cos_1 = cosf(f_did_1);
+                *p_sin_1 = sinf(f_did_0);
             }
         }
     }
     else if constexpr (RotateStyle == ROTATE_STYLE_GPTJ)
     {
-        if constexpr (IsForward == true)
+        if constexpr (IsForward)
         {
             if constexpr (ReuseFreqsFrontPart)
             {
@@ -89,11 +88,18 @@ inline __device__ void get_cos_sin_uncached(
         {
             if constexpr (ReuseFreqsFrontPart)
             {
-                // TODO
+                sincosf(float(p_freqs[did]), p_sin_0, p_cos_0);
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
             }
             else
             {
-                // TODO
+                const float f_did_0 = float(p_freqs[did * 2]);
+                const float f_did_1 = float(p_freqs[did * 2 + 1]);
+                *p_cos_0 = cosf(f_did_0);
+                *p_sin_0 = sinf(f_did_1);
+                *p_cos_1 = cosf(f_did_1);
+                *p_sin_1 = sinf(f_did_0);
             }
         }
     }
@@ -110,7 +116,7 @@ inline __device__ void get_cos_sin_cached(
 {
     if constexpr (RotateStyle == ROTATE_STYLE_NEOX)
     {
-        if constexpr (IsForward == true)
+        if constexpr (IsForward)
         {
             *p_cos_0 = float(p_cos[did]);
             *p_sin_0 = float(p_sin[did]);
@@ -145,7 +151,7 @@ inline __device__ void get_cos_sin_cached(
     }
     else if constexpr (RotateStyle == ROTATE_STYLE_GPTJ)
     {
-        if constexpr (IsForward == true)
+        if constexpr (IsForward)
         {
             if constexpr (ReuseFreqsFrontPart)
             {
@@ -166,11 +172,17 @@ inline __device__ void get_cos_sin_cached(
         {
             if constexpr (ReuseFreqsFrontPart)
             {
-                // TODO
+                *p_cos_0 = float(p_cos[did]);
+                *p_sin_0 = float(p_sin[did]);
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
             }
             else
             {
-                // TODO
+                *p_cos_0 = float(p_cos[did * 2]);
+                *p_sin_0 = float(p_sin[did * 2 + 1]);
+                *p_cos_1 = float(p_cos[did * 2 + 1]);
+                *p_sin_1 = float(p_sin[did * 2]);
             }
         }
     }
