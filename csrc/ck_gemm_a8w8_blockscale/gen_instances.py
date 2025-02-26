@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
-from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
+from gemm_a8w8_blockscale_common import kernelInstance, kernels_list, default_kernels_dict
 
 
 """ 

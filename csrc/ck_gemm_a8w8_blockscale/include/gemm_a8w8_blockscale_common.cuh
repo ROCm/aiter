@@ -12,6 +12,12 @@
 #include <initializer_list>
 #include <cstdlib>
 
+#include <ATen/ATen.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
 #include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3_ab_scale.hpp"
@@ -67,20 +73,20 @@ static constexpr ck::index_t Scale_Block_N = 128;
 static constexpr ck::index_t Scale_Block_K = 128;
 
 template<typename DDataType, typename EDataType, 
-        index_t BlockSize,      
-        index_t MPerBlock, index_t NPerBlock, index_t KPerBlock,
-        index_t AK1, index_t BK1,
-        index_t MPerXDL, index_t NPerXDL,
-        index_t MXdlPerWave, index_t NXdlPerWave,       
+        ck::index_t BlockSize,      
+        ck::index_t MPerBlock, ck::index_t NPerBlock, ck::index_t KPerBlock,
+        ck::index_t AK1, ck::index_t BK1,
+        ck::index_t MPerXDL, ck::index_t NPerXDL,
+        ck::index_t MXdlPerWave, ck::index_t NXdlPerWave,       
         typename ABlockTransferThreadClusterLengths_AK0_M_AK1,  
         typename BBlockTransferThreadClusterLengths_BK0_N_BK1,
         typename CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
         typename CDEShuffleBlockTransferScalarPerVectors,        
-        BlockGemmPipelineScheduler BlkGemmPipeSched = BlockGemmPipelineScheduler::Intrawave,
-        BlockGemmPipelineVersion BlkGemmPipelineVer = BlockGemmPipelineVersion::v1 >
+        ck::BlockGemmPipelineScheduler BlkGemmPipeSched = ck::BlockGemmPipelineScheduler::Intrawave,
+        ck::BlockGemmPipelineVersion BlkGemmPipelineVer = ck::BlockGemmPipelineVersion::v1 >
 using DeviceGemmHelperF8BlockScale = ck::tensor_operation::device::DeviceGemmMultiD_ABScale_Xdl_CShuffle_V3
     // clang-format off
-         <A0Layout, B0Layout, DsLayout, ELayout,
+         < A0Layout, B0Layout, DsLayout, ELayout,
           A0DataType, A1DataType, B0DataType, B1DataType, DsDataType<DDataType>, EDataType, AccDataType, CShuffleDataType, 
           AElementOp,  BElementOp, CDEElementOp, GemmSpec,
           BlockSize, Scale_Block_M, Scale_Block_N, Scale_Block_K,  
@@ -98,7 +104,7 @@ using DeviceGemmHelperF8BlockScale = ck::tensor_operation::device::DeviceGemmMul
           CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock, 
           CDEShuffleBlockTransferScalarPerVectors,  
           ck::BlockGemmPipelineScheduler::Intrawave, 
-          ck::BlockGemmPipelineVersion::v1, ComputeTypeA>;
+          ck::BlockGemmPipelineVersion::v1, ComputeTypeA >;
     // clang-format on
 
 template <typename DDataType, typename EDataType, typename DeviceGemmInstance>
