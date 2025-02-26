@@ -73,11 +73,28 @@ inline __device__ void get_cos_sin_uncached(
     {
         if constexpr (IsForward == true)
         {
-
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                sincosf(float(p_freqs[did]), p_sin_0, p_cos_0);
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
+            }
+            else
+            {
+                sincosf(float(p_freqs[did * 2]),     p_sin_0, p_cos_0);
+                sincosf(float(p_freqs[did * 2 + 1]), p_sin_1, p_cos_1);
+            }
         }
         else
         {
-
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                // TODO
+            }
+            else
+            {
+                // TODO
+            }
         }
     }
 }
@@ -119,10 +136,9 @@ inline __device__ void get_cos_sin_cached(
             }
             else
             {
-                const int32_t did_a = did + size_half_r;
                 *p_cos_0 = float(p_cos[did]);
-                *p_sin_0 = float(p_sin[did_a]);
-                *p_cos_1 = float(p_cos[did_a]);
+                *p_sin_0 = float(p_sin[did + size_half_r]);
+                *p_cos_1 = float(p_cos[did + size_half_r]);
                 *p_sin_1 = float(p_sin[did]);
             }
         }
@@ -131,11 +147,31 @@ inline __device__ void get_cos_sin_cached(
     {
         if constexpr (IsForward == true)
         {
-
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                *p_cos_0 = float(p_cos[did]);
+                *p_sin_0 = float(p_sin[did]);
+                *p_cos_1 = *p_cos_0;
+                *p_sin_1 = *p_sin_0;
+            }
+            else
+            {
+                *p_cos_0 = float(p_cos[did * 2]);
+                *p_sin_0 = float(p_sin[did * 2]);
+                *p_cos_1 = float(p_cos[did * 2 + 1]);
+                *p_sin_1 = float(p_sin[did * 2 + 1]);
+            }
         }
         else
         {
-
+            if constexpr (ReuseFreqsFrontPart)
+            {
+                // TODO
+            }
+            else
+            {
+                // TODO
+            }
         }
     }
 }
@@ -145,7 +181,7 @@ inline __device__ void get_offset_d(
     int32_t* p_offset_0, int32_t* p_offset_1,
     const int32_t did,
     const int32_t stride_d,
-    const int32_t offset_half_r)
+    const int32_t offset_half_r) // = stride_d * size_r / 2, size_r = rotate size
 {
     if constexpr (RotateStyle == ROTATE_STYLE_NEOX)
     {
@@ -154,8 +190,8 @@ inline __device__ void get_offset_d(
     }
     else if constexpr (RotateStyle == ROTATE_STYLE_GPTJ)
     {
-        *p_offset_0 = 2 * did;
-        *p_offset_1 = *p_offset_0 + 1;
+        *p_offset_0 = 2 * did * stride_d;
+        *p_offset_1 = *p_offset_0 + stride_d;
     }
 }
 
