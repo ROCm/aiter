@@ -5,8 +5,7 @@ import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, run_perftest
-from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
-from aiter.fused_moe_gelu import fused_topk
+from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck, fused_topk
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
 from einops import rearrange
@@ -87,7 +86,6 @@ def torch_moe_blockscale(hidden_states,
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
 
-# @perftest(num_warmup=1, num_iters=2)
 def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    # following for int8 quant
                    fc1_scale=None,  # [expert, inter_dim, 1]

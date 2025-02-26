@@ -115,6 +115,11 @@ def get_hip_version():
 
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
+    numa_balance_set = os.popen(
+        "cat /proc/sys/kernel/numa_balancing").read().strip()
+    if numa_balance_set == "1":
+        logger.warning("WARNING: NUMA balancing is enabled, which may cause errors. "
+                       "It is recommended to disable NUMA balancing by running 'sudo sh -c echo 0 > /proc/sys/kernel/numa_balancing' ")
     return importlib.import_module(f'{__package__}.{md_name}')
 
 
@@ -134,6 +139,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         flags_cc = ["-O3", "-std=c++17"]
         flags_hip = [
+            "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
             "-D__HIP_PLATFORM_AMD__=1",
@@ -228,7 +234,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
     return module
 
 
-def get_args_of_build(ops_name: str):
+def get_args_of_build(ops_name: str, exclue=[]):
     d_opt_build_args = {"srcs": [],
                         "md_name": "",
                         "flags_extra_cc": [],
@@ -271,6 +277,9 @@ def get_args_of_build(ops_name: str):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
+                    # exclude
+                    if ops_name in exclue:
+                        continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
@@ -282,14 +291,14 @@ def get_args_of_build(ops_name: str):
                 return d_all_ops
             # no find opt_name in json.
             elif data.get(ops_name) == None:
-                print("Not found this operator in 'optCompilerConfig.json'. ")
+                logger.warning("Not found this operator in 'optCompilerConfig.json'. ")
                 return d_opt_build_args
             # parser single opt
             else:
                 compile_ops_ = data.get(ops_name)
                 return convert(compile_ops_)
         else:
-            print("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
+            logger.warning("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
 
 
 def compile_ops(ops_name: str, fc_name: Optional[str] = None):

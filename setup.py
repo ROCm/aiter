@@ -119,7 +119,11 @@ if IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
-        all_opts_args_build = core.get_args_of_build("all")
+        exclude_ops=["module_mha_fwd",
+                     "module_mha_varlen_fwd",
+                     "module_mha_bwd",
+                     "module_mha_varlen_bwd"]
+        all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list
