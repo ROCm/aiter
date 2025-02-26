@@ -102,7 +102,7 @@ using DeviceGemmHelperF8BlockScale = ck::tensor_operation::device::DeviceGemmMul
     // clang-format on
 
 template <typename DDataType, typename EDataType, typename DeviceGemmInstance>
-__forceinline__ torch::Tensor gemm_fp8_blockscale_impl(
+__forceinline__ torch::Tensor gemm_a8w8_blockscale_impl(
     torch::Tensor& XQ,
     torch::Tensor& WQ,
     torch::Tensor& x_scale,

@@ -22,11 +22,3 @@ torch::Tensor gemm_a8w8_tune(
     torch::Tensor &Y,
     int kernelId,
     int splitK);
-
-torch::Tensor gemm_a8w8_fp8_blockscale(
-    torch::Tensor& XQ,
-    torch::Tensor& WQ,
-    torch::Tensor& x_scale,
-    torch::Tensor& w_scale,
-    torch::Tensor& Y);
-

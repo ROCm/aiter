@@ -11,8 +11,14 @@ import shutil
 from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
 
 
+""" 
 
-class gemm_a8w8_fwd_codegen:
+a8w8_blockscale_gemm instance gen 
+
+"""
+
+
+class gemm_a8w8_blockscale_codegen:
     def __init__(self, working_path, istune=False):
         self.working_path = working_path
         self.impl_path = os.path.join(working_path, "impl")
@@ -23,18 +29,17 @@ class gemm_a8w8_fwd_codegen:
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_common.cuh"
+#include "gemm_a8w8_blockscale_common.cuh"
 
-template <typename DDataType, typename EDataType = DDataType>
+template <tyename DDataType, typename EDataType=DDataType>
 torch::Tensor
 {k.name}(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
-    int KBatch)
+    torch::Tensor &Y
+    )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
 
@@ -58,83 +63,29 @@ torch::Tensor
 }}}}
 
 """     
-        INSTANCE_CONTENT_bias = f"""if (bias != std::nullopt)
-        {{{{
-            using DeviceGemmInstance = DeviceGemmHelperMMA<
-                DDataType, EDataType,
-                {k.BLOCK_SIZE},
-                {k.MPerBLOCK},
-                {k.NPerBLOCK},
-                {k.KPerBLOCK},
-                {k.WAVE_TILE_M},
-                {k.WAVE_TILE_N},
-                {k.WAVE_MAP_M},
-                {k.WAVE_MAP_N},
-                S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}, {k.CBLOCK_SPV[0]}>,
-                {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-                {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-                ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
-                ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-                ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-            // Run kernel instance.
-            return gemm_a8w8_mma_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-        }}}}
-        else
-        {{{{
-           using DeviceGemmInstance = DeviceGemmHelper<
-                DDataType, EDataType,
-                {k.BLOCK_SIZE},
-                {k.MPerBLOCK},
-                {k.NPerBLOCK},
-                {k.KPerBLOCK},
-                {k.WAVE_TILE_M},
-                {k.WAVE_TILE_N},
-                {k.WAVE_MAP_M},
-                {k.WAVE_MAP_N},
-                S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-                S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
-                {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-                {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-                ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
-                ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-                ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
-            // Run kernel instance.
-            return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-        }}}}
-""" 
-        INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelper<
+
+        INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelperF8BlockScale<        
             DDataType, EDataType,
             {k.BLOCK_SIZE},
-            {k.MPerBLOCK},
-            {k.NPerBLOCK},
-            {k.KPerBLOCK},
-            {k.WAVE_TILE_M},
-            {k.WAVE_TILE_N},
-            {k.WAVE_MAP_M},
-            {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
-            {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
-            {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            ck::BlockGemmPipelineScheduler::{k.LOOP_SCHED},
-            ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
-            ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
+            {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
+            {k.AK1}, {k.BK1},
+            {k.MPerXDL}, {k.NPerXDL}, 
+            {k.MXdlPerWave}, {k.NXdlPerWave}, 
+            S<{(", ").join(map(lambda x:str(x),k.ABlockTransferThreadClusterLengths_AK0_M_AK1))}>, 
+            S<{(", ").join(map(lambda x:str(x),k.BBlockTransferThreadClusterLengths_BK0_N_BK1))}>,
+            S<{(", ").join(map(lambda x:str(x),k.CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock))}>,
+            S<{(", ").join(map(lambda x:str(x),k.CDEShuffleBlockTransferScalarPerVectors))}>,
+            ck::BlockGemmPipelineScheduler::{k.BlkGemmPipeSched},
+            ck::BlockGemmPipelineVersion::v{k.BlkGemmPipelineVer}>;
         // Run kernel instance.
-        return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+        return gemm_a8w8_blockscale_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """ 
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
                                                      INSTANCE_CONTENT_nopad=(INSTANCE_CONTENT_nobias.format(GemmSpec="Default")))
         else:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=INSTANCE_CONTENT_bias.format(GemmSpec="MNKPadding"),
-                                                     INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_bias.format(GemmSpec="Default"))
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding"),
+                                                     INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_nobias.format(GemmSpec="Default"))
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
                 INSTANCE_IMPL_str)
@@ -150,9 +101,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
-    int KBatch);
+    torch::Tensor &Y
+    );
 
 """
         INSTANCE_dBF16_eBF16 = INSTANCE_template.format(
@@ -163,6 +113,7 @@ template torch::Tensor
             name=k.name, dtypes="F16")
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
             name=k.name, dtypes="F32, F16")
+        # TODO: dFP8_eFP8 
 
         if self.istune:
             Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
@@ -196,7 +147,7 @@ template torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(os.path.join(self.working_path, "gemm_a8w8_lookup.h"), "w") as f:
+        with open(os.path.join(self.working_path, "gemm_a8w8_blockscale_lookup.h"), "w") as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
                 # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
@@ -226,16 +177,14 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
-    int KBatch);
+    torch::Tensor &Y);
 """
         MAINFEST_end = """
 
 #endif // USE_ROCM
 """
 
-        with open(os.path.join(self.working_path, "gemm_a8w8_manifest.h"), "w") as f:
+        with open(os.path.join(self.working_path, "gemm_a8w8_blockscale_manifest.h"), "w") as f:
             f.write(MAINFEST_head)
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
@@ -254,6 +203,7 @@ torch::Tensor
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)
+
 
 
 def get_tune_dict(tune_dict_csv):
@@ -318,8 +268,8 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
-    codegen = gemm_a8w8_fwd_codegen(args.working_path, args.tune)
-
+    codegen = gemm_a8w8_blockscale_codegen(args.working_path, args.tune)
+    
     if args.tune:
         codegen.gen_instances(kernels_list)
     else:

@@ -57,7 +57,6 @@ RowwiseKernel rowwise_dispatch(int id)
 }
 
 
-
 torch::Tensor gemm_a8w8_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
