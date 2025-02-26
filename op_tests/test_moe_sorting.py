@@ -5,8 +5,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe_gelu import fused_topk
-from aiter.fused_moe_bf16_asm import moe_sorting_ck
+from aiter.fused_moe_bf16_asm import moe_sorting_ck, fused_topk
 
 BLOCK_SIZE_M = 32
 
@@ -62,7 +61,7 @@ def test_moe_sorting_naive(topk_ids: torch.Tensor,
 
 @perftest()
 def test_moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask = None):
-    return moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask)
+    return moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask=expert_mask)
 
 
 def test_moe_sorting(dtype, token, model_dim, inter_dim, E, topk, has_expert_mask = False):

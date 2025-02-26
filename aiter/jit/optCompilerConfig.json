@@ -116,7 +116,7 @@
         "extra_include": [],
         "isASM": "False",
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
@@ -249,21 +249,6 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_transpose_operator": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/transpose_operator_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/include/transpose_operator.h.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/transpose_operator.cu'"
-        ],
-        "md_name": "'module_transpose_operator'",
-        "flags_extra_cc": [],
-        "flags_extra_hip": [],
-        "extra_ldflags": "None",
-        "extra_include": [],
-        "isASM": "False",
-        "verbose": "False",
-        "blob_gen_cmd": "''"
-    },
     "module_gemm_a8w8_tune": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_tune_pybind.cu'",
@@ -281,7 +266,7 @@
     },
     "module_aiter_operator": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/binary_operator_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/aiter_operator_pybind.cu'",
             "f'{AITER_CSRC_DIR}/include/aiter_operator.h'",
             "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'",
             "f'{AITER_CSRC_DIR}/kernels/unary_operator.cu'"
@@ -302,7 +287,9 @@
         ],
         "md_name": "'module_quant'",
         "flags_extra_cc": [],
-        "flags_extra_hip": ["'-DENABLE_FP8'"],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "isASM": "False",
@@ -322,5 +309,84 @@
         "isASM": "False",
         "verbose": "True",
         "blob_gen_cmd": "''"
+    },
+    "module_mha_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_fwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_fwd'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 10 --output_dir {{}}'"
+    },
+    "module_mha_varlen_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_fwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_varlen_fwd'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 11 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 11 --output_dir {{}}'"
+        ]
+    },
+    "module_mha_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_bwd'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 10 --output_dir {{}}'"
+    },
+    "module_mha_varlen_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_varlen_bwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_pybind.cu'"
+        ],
+        "md_name": "'module_mha_varlen_bwd'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 11 --output_dir {{}}'"
     }
 }

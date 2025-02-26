@@ -14,6 +14,7 @@ from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json
+from packaging.version import parse, Version
 
 PREBUILD_KERNELS = False
 if os.path.exists(os.path.dirname(os.path.abspath(__file__))+"/aiter_.so"):
@@ -23,7 +24,27 @@ logger = logging.getLogger("aiter")
 
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
-AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
+
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+
+find_aiter = importlib.util.find_spec("aiter")
+if find_aiter is not None:
+    if find_aiter.submodule_search_locations:
+        package_path = find_aiter.submodule_search_locations[0]
+    elif find_aiter.origin:
+        package_path = find_aiter.origin
+    package_path = os.path.dirname(package_path)
+    import site
+    site_packages_dirs = site.getsitepackages()
+    ### develop mode
+    if package_path not in site_packages_dirs:
+        AITER_ROOT_DIR = AITER_CORE_DIR
+    ### install mode
+    else:
+        AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
+else:
+    print("aiter is not installed.")
+
 AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
@@ -72,6 +93,7 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     ret = []
     for el in els:
         if not os.path.exists(el):
+            logger.warning(f'---> {el} not exists!!!!!!')
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
@@ -87,8 +109,17 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+
+
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
+    numa_balance_set = os.popen(
+        "cat /proc/sys/kernel/numa_balancing").read().strip()
+    if numa_balance_set == "1":
+        logger.warning("WARNING: NUMA balancing is enabled, which may cause errors. "
+                       "It is recommended to disable NUMA balancing by running 'sudo sh -c echo 0 > /proc/sys/kernel/numa_balancing' ")
     return importlib.import_module(f'{__package__}.{md_name}')
 
 
@@ -108,6 +139,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         flags_cc = ["-O3", "-std=c++17"]
         flags_hip = [
+            "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
             "-D__HIP_PLATFORM_AMD__=1",
@@ -124,7 +156,22 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
+
+            "-fgpu-flush-denormals-to-zero",
         ]
+
+        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+        hip_version = get_hip_version()
+        if hip_version > Version('5.7.23302'):
+            flags_hip += ["-fno-offload-uniform-block"]
+        if hip_version > Version('6.1.40090'):
+            flags_hip += ["-mllvm", "-enable-post-misched=0"]
+        if hip_version > Version('6.2.41132'):
+            flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
+                          "-mllvm", "-amdgpu-function-calls=false"]
+        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+            flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -187,7 +234,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
     return module
 
 
-def get_args_of_build(ops_name: str):
+def get_args_of_build(ops_name: str, exclue=[]):
     d_opt_build_args = {"srcs": [],
                         "md_name": "",
                         "flags_extra_cc": [],
@@ -230,6 +277,9 @@ def get_args_of_build(ops_name: str):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
+                    # exclude
+                    if ops_name in exclue:
+                        continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
@@ -241,14 +291,14 @@ def get_args_of_build(ops_name: str):
                 return d_all_ops
             # no find opt_name in json.
             elif data.get(ops_name) == None:
-                print("Not found this operator in 'optCompilerConfig.json'. ")
+                logger.warning("Not found this operator in 'optCompilerConfig.json'. ")
                 return d_opt_build_args
             # parser single opt
             else:
                 compile_ops_ = data.get(ops_name)
                 return convert(compile_ops_)
         else:
-            print("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
+            logger.warning("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
 
 
 def compile_ops(ops_name: str, fc_name: Optional[str] = None):

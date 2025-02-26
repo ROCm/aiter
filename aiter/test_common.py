@@ -124,6 +124,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
     mask = ~isClose
     if isClose.all():
         logger.info(f'{msg}[checkAllclose {atol=} {rtol=} passed~]')
+        return True
     else:
         num = mask.sum()
         printNum = min(printNum, num)
@@ -142,6 +143,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
                 f'''{msg}[checkAllclose {atol=} {rtol=} waring!] a and b results are not all close''')
         logger.info(
             f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements')
+        return False
 
 
 def tensor_dump(x: torch.tensor, name: str, dir='./'):

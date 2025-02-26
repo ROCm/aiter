@@ -20,6 +20,11 @@
 #include "gemm_a8w8.h"
 #include "quant.h"
 #include "moe_ck.h"
+#include "rope.h"
+// #include "mha_varlen_fwd.h"
+// #include "mha_varlen_bwd.h"
+// #include "mha_bwd.h"
+// #include "mha_fwd.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -188,7 +193,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("topk"),
             py::arg("fc1_scale"), py::arg("fc2_scale"),
             py::arg("fc1_smooth_scale"), py::arg("fc2_smooth_scale") = std::nullopt,
-            py::arg("fc_scale_blkn") = std::128, py::arg("fc_scale_blkk") = std::128);
+            py::arg("fc_scale_blkn") = 128, py::arg("fc_scale_blkk") = 128);
       m.def("add", &aiter_add, "apply for add with transpose and broadcast.");
       m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");
       m.def("sub", &aiter_sub, "apply for sub with transpose and broadcast.");
@@ -240,7 +245,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
             py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
             py::arg("block_m") = 32, py::arg("expert_mask") = std::nullopt);
-
       m.def("rope_fwd_impl", &rope_fwd_impl);
       m.def("rope_bwd_impl", &rope_bwd_impl);
       m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
@@ -249,4 +253,73 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);
       m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
       m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+      // m.def("mha_fwd", &mha_fwd,
+      //       py::arg("q"), py::arg("k"), py::arg("v"),
+      //       py::arg("dropout_p"),
+      //       py::arg("softmax_scale"),
+      //       py::arg("is_causal"),
+      //       py::arg("window_size_left"),
+      //       py::arg("window_size_right"),
+      //       py::arg("return_softmax_lse"),
+      //       py::arg("return_dropout_randval"),
+      //       py::arg("out") = std::nullopt,
+      //       py::arg("alibi_slopes") = std::nullopt,
+      //       py::arg("gen") = std::nullopt);
+      // m.def("mha_varlen_fwd", &mha_varlen_fwd,
+      //       py::arg("q"), py::arg("k"), py::arg("v"),
+      //       py::arg("cu_seqlens_q"),
+      //       py::arg("cu_seqlens_k"),
+      //       py::arg("max_seqlen_q"),
+      //       py::arg("max_seqlen_k"),
+      //       py::arg("dropout_p"),
+      //       py::arg("softmax_scale"),
+      //       py::arg("zero_tensors"),
+      //       py::arg("is_causal"),
+      //       py::arg("window_size_left"),
+      //       py::arg("window_size_right"),
+      //       py::arg("return_softmax_lse"),
+      //       py::arg("return_dropout_randval"),
+      //       py::arg("out") = std::nullopt,
+      //       py::arg("block_table") = std::nullopt,
+      //       py::arg("alibi_slopes") = std::nullopt,
+      //       py::arg("gen") = std::nullopt);
+      // m.def("mha_bwd", &mha_bwd,
+      //       py::arg("dout"),
+      //       py::arg("q"), py::arg("k"), py::arg("v"),
+      //       py::arg("out"),
+      //       py::arg("softmax_lse"),
+      //       py::arg("dropout_p"),
+      //       py::arg("softmax_scale"),
+      //       py::arg("is_causal"),
+      //       py::arg("window_size_left"),
+      //       py::arg("window_size_right"),
+      //       py::arg("deterministic"),
+      //       py::arg("dq") = std::nullopt,
+      //       py::arg("dk") = std::nullopt,
+      //       py::arg("dv") = std::nullopt,
+      //       py::arg("alibi_slopes") = std::nullopt,
+      //       py::arg("rng_state") = std::nullopt,
+      //       py::arg("gen") = std::nullopt);
+      // m.def("mha_varlen_bwd", &mha_varlen_bwd,
+      //       py::arg("dout"),
+      //       py::arg("q"), py::arg("k"), py::arg("v"),
+      //       py::arg("out"),
+      //       py::arg("softmax_lse"),
+      //       py::arg("cu_seqlens_q"),
+      //       py::arg("cu_seqlens_k"),
+      //       py::arg("max_seqlen_q"),
+      //       py::arg("max_seqlen_k"),
+      //       py::arg("dropout_p"),
+      //       py::arg("softmax_scale"),
+      //       py::arg("zero_tensors"),
+      //       py::arg("is_causal"),
+      //       py::arg("window_size_left"),
+      //       py::arg("window_size_right"),
+      //       py::arg("deterministic"),
+      //       py::arg("dq") = std::nullopt,
+      //       py::arg("dk") = std::nullopt,
+      //       py::arg("dv") = std::nullopt,
+      //       py::arg("alibi_slopes") = std::nullopt,
+      //       py::arg("rng_state") = std::nullopt,
+      //       py::arg("gen") = std::nullopt);
 }
