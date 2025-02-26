@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <iostream>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "py_itfs_common.h"
@@ -364,6 +363,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         
         // TODO: for debug fix this
         stream_config.log_level_ = 1;
+        // TODO: v3 traits need interface
         auto traits =
             get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic, true, true, 1);
 
