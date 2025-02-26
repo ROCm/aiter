@@ -24,6 +24,11 @@ struct IntTupleHash
   }
 };
 
+using BlockscaleKernelMap = std::unorder_map<
+    std::tuple<int, int, int>,
+    BlockscaleKernel, 
+    IntTupleHash>;
+
 
 // Helper function to return the next largest power of 2
 static constexpr int nextPow2(unsigned int num)
@@ -34,7 +39,7 @@ static constexpr int nextPow2(unsigned int num)
 }
 
 template <typename DDataType, typename EDataType = DDataType>
-RowwiseKernel blockscale_dispatch(int M, int N, int K)
+BlockscaleKernel blockscale_dispatch(int M, int N, int K)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
