@@ -81,7 +81,7 @@ public:
         this->sub_GU = sub_GU;
     };
 
-    void set_int4(bool is_int4_) 
+    void set_int4(bool is_int4_)
     {
         is_int4 = is_int4_;
     }
@@ -388,17 +388,17 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
-        if (selectedTile == 512) 
+        if (selectedTile == 512)
         {
             static FMoeKernel impl_int4_512("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
             impl_ptr = &impl_int4_512;
         }
-        else if (selectedTile == 256) 
+        else if (selectedTile == 256)
         {
             static FMoeKernel impl_int4_256("fmoe_int4fp8_g1u1_subGU_256_gelu", "fmoe_int4fp8_g1u1_subGU_256_gelu.co", 256);
             impl_ptr = &impl_int4_256;
         }
-        else if (selectedTile == 128) 
+        else if (selectedTile == 128)
         {
             static FMoeKernel impl_int4_128("fmoe_int4fp8_g1u1_subGU_128_gelu", "fmoe_int4fp8_g1u1_subGU_128_gelu.co", 128);
             impl_ptr = &impl_int4_128;
@@ -508,7 +508,7 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
-        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); 
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
         if (selectedTile == 512)
         {
             if (fc2_smooth_scale.has_value())
@@ -725,11 +725,20 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
     // int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
+    const char *enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
 
     if (out.dtype() == at::ScalarType::BFloat16 && inter_dim % 256 == 0 && fc_scale_blkn == 128 && fc_scale_blkk == 128)
     {
-        static FMoeKernel impl_256("fmoe_fp8_blockscale_g1u1_subGU_256", "fmoe_fp8_blockscale_g1u1_subGU_256.co", 320);
-        impl_ptr = &impl_256;
+        if (enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+        {
+            static FMoeKernel impl_256("fmoe_fp8_blockscale_g1u1_subGU_256", "fmoe_fp8_blockscale_g1u1_subGU_256.co", 256);
+            impl_ptr = &impl_256;
+        }
+        else
+        {
+            static FMoeKernel impl_256_novs("fmoe_fp8_blockscale_g1u1_novs_subGU_256", "fmoe_fp8_blockscale_g1u1_novs_subGU_256.co", 256);
+            impl_ptr = &impl_256_novs;
+        }
     }
     else
         TORCH_CHECK(false, __func__, " Only support out dtype = bf16, inter_dim % 256 = 0 and fc_scale_blkn and fc_scale_blkk is 128");

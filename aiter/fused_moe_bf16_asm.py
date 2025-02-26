@@ -216,3 +216,46 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
     return (
         out * topk_weight.view(B, -1, 1)
     ).sum(dim=1).to(dtype)
+
+
+def fused_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], (
+        "Number of tokens mismatch")
+
+    M, _ = hidden_states.shape
+
+    if topk_weights is None:
+        topk_weights = torch.empty(M,
+                                   topk,
+                                   dtype=torch.float32,
+                                   device=hidden_states.device)
+    if topk_ids is None:
+        topk_ids = torch.empty(M,
+                               topk,
+                               dtype=torch.int32,
+                               device=hidden_states.device)
+    token_expert_indicies = torch.empty(M,
+                                        topk,
+                                        dtype=torch.int32,
+                                        device=hidden_states.device)
+
+    aiter.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),  # TODO(woosuk): Optimize this.
+        renormalize
+    )
+    del token_expert_indicies  # Not used. Will be used in the future.
+
+    # if renormalize:
+    #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids
