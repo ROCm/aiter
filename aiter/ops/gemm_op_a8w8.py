@@ -187,3 +187,14 @@ def gemm_a8w8_tune(
     kernelId: int,
     splitK = 0
 ): ...
+
+@compile_ops("module_gemm_a8w8_blockscale_tune",fc_name="gemm_a8w8_blockscale_tune")
+def gemm_a8w8_blockscale_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK = 0
+): ...

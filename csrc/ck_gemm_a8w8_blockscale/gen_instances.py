@@ -8,7 +8,7 @@ from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
-from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
+from gemm_a8w8_blockscale_common import kernelInstance, kernels_list, default_kernels_dict
 
 
 """ 
@@ -31,7 +31,7 @@ class gemm_a8w8_blockscale_codegen:
 
 #include "gemm_a8w8_blockscale_common.cuh"
 
-template <tyename DDataType, typename EDataType=DDataType>
+template <typename DDataType, typename EDataType>
 torch::Tensor
 {k.name}(
     torch::Tensor &XQ,
@@ -47,7 +47,7 @@ torch::Tensor
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
     int K = WQ.size(1);
-    bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK} * KBatch) != 0);
+    bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK}) != 0);
     if (pad)
     {{{{
         // pad
@@ -67,16 +67,20 @@ torch::Tensor
         INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelperF8BlockScale<        
             DDataType, EDataType,
             {k.BLOCK_SIZE},
+            {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
             {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL}, 
-            {k.MXdlPerWave}, {k.NXdlPerWave}, 
-            S<{(", ").join(map(lambda x:str(x),k.ABlockTransferThreadClusterLengths_AK0_M_AK1))}>, 
-            S<{(", ").join(map(lambda x:str(x),k.BBlockTransferThreadClusterLengths_BK0_N_BK1))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CDEShuffleBlockTransferScalarPerVectors))}>,
-            ck::BlockGemmPipelineScheduler::{k.BlkGemmPipeSched},
-            ck::BlockGemmPipelineVersion::v{k.BlkGemmPipelineVer}>;
+            {k.WAVE_MAP_M}, {k.WAVE_MAP_N}, 
+            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>, 
+            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+            {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
+            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+            ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
+            ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+            ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
         return gemm_a8w8_blockscale_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
 """ 
@@ -105,26 +109,18 @@ template torch::Tensor
     );
 
 """
-        INSTANCE_dBF16_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="B16")
         INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
             name=k.name, dtypes="F32, B16")
-        INSTANCE_dFP16_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="F16")
         INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
             name=k.name, dtypes="F32, F16")
         # TODO: dFP8_eFP8 
 
         if self.istune:
             Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
-                INSTANCE_dBF16_eBF16)
+                INSTANCE_dFP32_eBF16)
         else:
-            Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
-                INSTANCE_dBF16_eBF16)
             Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")).write_text(
                 INSTANCE_dFP32_eBF16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP16_eFP16.cpp")).write_text(
-                INSTANCE_dFP16_eFP16)
             Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")).write_text(
                 INSTANCE_dFP32_eFP16)
 
@@ -236,7 +232,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-f",
         "--tune_file",
-        default="aiter/configs/a8w8_tuned_gemm.csv",
+        default="aiter/configs/a8w8_blockscale_tuned_gemm.csv",
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py"
     )
