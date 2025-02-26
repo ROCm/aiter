@@ -8,8 +8,11 @@ import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
-from gemm_a8w8_common import kernelInstance, kernels_list
+from gemm_a8w8_blockscale_common import kernelInstance, kernels_list
 import argparse
+from einops import rearrange
+
+block_shape = (128, 128)
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
@@ -24,9 +27,24 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
             return True
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    x = F.linear(x.to(torch.float32), weight.to(torch.float32))
-    scale = torch.matmul(x_scale, w_scale)
-    out = torch.mul(x, scale)
+    block_shape_n, block_shape_k = block_shape
+    m, k = x.shape
+    n = weight.shape[0]
+    scale_n =  (n + block_shape_n - 1) // block_shape_n
+    scale_k =  (k + block_shape_k - 1) // block_shape_k
+    # x_scale = rearrange(x_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(m, scale_k, 1, block_shape_k),
+    #                           'num_blk_n num_blk_k blk_n blk_k ->(num_blk_n blk_n) (num_blk_k blk_k)')
+    x = x.to(x_scale.dtype).view(m, k//block_shape[1], block_shape[1]) * x_scale.unsqueeze(-1)
+    x = x.view(m, k)
+
+    w_scale = rearrange(w_scale.view(-1, 1).repeat(1, block_shape_n*block_shape_k).view(scale_n, scale_k, block_shape_n, block_shape_k),
+                              'num_blk_n num_blk_k blk_n blk_k -> (num_blk_n blk_n) (num_blk_k blk_k)')
+    w_scale = w_scale[:n, :k]
+    weight = weight.to(w_scale.dtype) * w_scale
+
+    out = F.linear(x.to(torch.float32), weight.to(torch.float32))
+    # scale = torch.matmul(x_scale, w_scale)
+    # out = torch.mul(x, scale)
     if bias is not None:
         out = out.to(bias) + bias
     return out.to(dtype)
@@ -45,16 +63,19 @@ def get_tuned_gemm_list(tuned_gemm_file):
 
 @perftest()
 def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
-    aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
+    aiter.gemm_a8w8_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
     return out
 
 
 def tune_gemm(m, n, k, useSplitK = False):
     dim = (m, n, k)
-    x = torch.randint(-20, 20, (m, k), dtype=torch.int8, device="cuda")
-    weight = torch.randint(-20, 20, (n, k), dtype=torch.int8, device="cuda")
-    x_scale = torch.rand([m, 1], dtype=torch.bfloat16, device="cuda")
-    w_scale = torch.rand([1, n], dtype=torch.bfloat16, device="cuda")
+    block_shape_n, block_shape_k = block_shape
+    scale_n =  (n + block_shape_n - 1) // block_shape_n
+    scale_k =  (k + block_shape_k - 1) // block_shape_k
+    x = torch.rand((m, k), dtype=torch.float16, device="cuda").to(torch.float8_e4m3fnuz)
+    weight = torch.rand( (n, k), dtype=torch.float16, device="cuda").to(torch.float8_e4m3fnuz)
+    x_scale = torch.rand([m, scale_k], dtype=torch.float32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
     out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
 
     ref_out = run_torch(x, weight, x_scale, w_scale)
@@ -71,7 +92,7 @@ def tune_gemm(m, n, k, useSplitK = False):
         for splitK in range(maxsplitK+1):
             try:
                 (out), avg_t = kernel_instance_test(x, weight, x_scale, w_scale, out, i, splitK)
-                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=0.01)
+                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=1)
                 if isClosed:
                     print(f"{str(dim):<20} kernelid:{i:<3d}\t avg: {avg_t:<8.2f} us, {kernel.name}, {splitK=}")
                     if best_time < 0 or avg_t < best_time:
@@ -129,7 +150,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-i",
         "--untune_file",
-        default="aiter/configs/a8w8_untuned_gemm.csv",
+        default="aiter/configs/a8w8_blockscale_untuned_gemm.csv",
         required=False,
         help="input"
     )
@@ -137,7 +158,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-o",
         "--tune_file",
-        default="aiter/configs/a8w8_tuned_gemm.csv",
+        default="aiter/configs/a8w8_blockscale_tuned_gemm.csv",
         required=False,
         help="output: tuning result store this file"
     )

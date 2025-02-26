@@ -79,7 +79,7 @@ RowwiseKernel blockscale_dispatch(int M, int N, int K)
       return it->second;
     }
     // Otherwise, use heuristics.
-    blockscale_heuristic_dispatch<DDataType, EDataType>(M, N, K);
+    return a8w8_blockscale_1x128x128_256x16x128x128_8x16_16x16_16x16x1_8x32x1_1x16x1x16_8_1x2_intrawave_v1<DDataType, EDataType>;
 }
 
 torch::Tensor gemm_a8w8_blockscale(
@@ -104,14 +104,6 @@ torch::Tensor gemm_a8w8_blockscale(
   else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
   {
     blockscale_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
-  }
-  else if (Y.dtype() == at::ScalarType::Half)
-  {
-    blockscale_dispatch<F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
-  }
-  else if (Y.dtype() == at::ScalarType::BFloat16)
-  {
-    blockscale_dispatch<B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
   }
   else
   {
