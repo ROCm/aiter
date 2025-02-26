@@ -72,8 +72,8 @@ def tune_gemm(m, n, k, useSplitK = False):
     block_shape_n, block_shape_k = block_shape
     scale_n =  (n + block_shape_n - 1) // block_shape_n
     scale_k =  (k + block_shape_k - 1) // block_shape_k
-    x = torch.rand((m, k), dtype=torch.float16, device="cuda").to(torch.float8_e4m3fnuz)
-    weight = torch.rand( (n, k), dtype=torch.float16, device="cuda").to(torch.float8_e4m3fnuz)
+    x = (torch.rand((m, k), dtype=torch.float16, device="cuda")/10).to(torch.float8_e4m3fnuz)
+    weight = (torch.rand( (n, k), dtype=torch.float16, device="cuda")/10).to(torch.float8_e4m3fnuz)
     x_scale = torch.rand([m, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
     out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
@@ -92,7 +92,7 @@ def tune_gemm(m, n, k, useSplitK = False):
         for splitK in range(maxsplitK+1):
             try:
                 (out), avg_t = kernel_instance_test(x, weight, x_scale, w_scale, out, i, splitK)
-                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=1)
+                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=0.1)
                 if isClosed:
                     print(f"{str(dim):<20} kernelid:{i:<3d}\t avg: {avg_t:<8.2f} us, {kernel.name}, {splitK=}")
                     if best_time < 0 or avg_t < best_time:
@@ -101,6 +101,7 @@ def tune_gemm(m, n, k, useSplitK = False):
                 else:
                     print(f"{str(dim):<20} kernelid:{i:<3d}\t No pass         , {kernel.name}, {splitK=}") 
             except RuntimeError as e:
+                print(e)
                 print(f"{str(dim):<20} kernelid:{i:<3d}\t No support      , {kernel.name}, {splitK=}") 
 
     best_kernelId, splitK = best_kernelConfig

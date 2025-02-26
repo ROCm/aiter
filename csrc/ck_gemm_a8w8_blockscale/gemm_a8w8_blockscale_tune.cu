@@ -66,7 +66,7 @@ torch::Tensor gemm_a8w8_blockscale_tune(
     int kernelId,
     int splitK)
 {
-  TORCH_CHECK(XQ.dtype() == at::ScalarType::Char && XQ.dtype() == WQ.dtype(),
+  TORCH_CHECK(XQ.dtype() == at::ScalarType::Float8_e4m3fnuz && XQ.dtype() == WQ.dtype(),
               "Weights and activations should both be fp8!");
   TORCH_CHECK( x_scale.dtype() == w_scale.dtype(),
               "Scales should have the same dtype!");

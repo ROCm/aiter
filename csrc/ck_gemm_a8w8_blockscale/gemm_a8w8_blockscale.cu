@@ -7,7 +7,7 @@
 #include <cmath>
 
    
-using BlockscaleKernel = std::function<
+using BlockwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &, 
                   torch::Tensor &)>; 
@@ -24,11 +24,10 @@ struct IntTupleHash
   }
 };
 
-using BlockscaleKernelMap = std::unorder_map<
+using BlockwiseKernelMap = std::unordered_map<
     std::tuple<int, int, int>,
-    BlockscaleKernel, 
+    BlockwiseKernel, 
     IntTupleHash>;
-
 
 // Helper function to return the next largest power of 2
 static constexpr int nextPow2(unsigned int num)
@@ -39,7 +38,7 @@ static constexpr int nextPow2(unsigned int num)
 }
 
 template <typename DDataType, typename EDataType = DDataType>
-BlockscaleKernel blockscale_dispatch(int M, int N, int K)
+BlockwiseKernel blockscale_dispatch(int M, int N, int K)
 {
     // For a given shape, either find the best kernel via lookup or heuristic.
     // For many small M shapes, we bucket them to the next largest kernel.
@@ -48,9 +47,9 @@ BlockscaleKernel blockscale_dispatch(int M, int N, int K)
     static const auto lookup = []
     {
       if constexpr (std::is_same_v<EDataType, F16>) {
-          return BlockscaleKernelMap{GENERATE_LOOKUP_TABLE(DDataType,F16)};
+          return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,F16)};
       } else if constexpr (std::is_same_v<EDataType, B16>) {
-          return BlockscaleKernelMap{GENERATE_LOOKUP_TABLE(DDataType,B16)};
+          return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,B16)};
       } else {
           static_assert(false, "blockscale_dispatch used with unsupported dtype!");
       } }();
@@ -84,7 +83,7 @@ BlockscaleKernel blockscale_dispatch(int M, int N, int K)
       return it->second;
     }
     // Otherwise, use heuristics.
-    return a8w8_blockscale_1x128x128_256x16x128x128_8x16_16x16_16x16x1_8x32x1_1x16x1x16_8_1x2_intrawave_v1<DDataType, EDataType>;
+    return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<DDataType, EDataType>;
 }
 
 torch::Tensor gemm_a8w8_blockscale(
@@ -95,7 +94,7 @@ torch::Tensor gemm_a8w8_blockscale(
     torch::Tensor& Y)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-    TORCH_CHECK(x_scale.dtype() == Y.dtype() && w_scale.dtype() == Y.dtype(),
+    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
                 "Scales and output should have the same dtype!");
 
   int M = XQ.size(0);
