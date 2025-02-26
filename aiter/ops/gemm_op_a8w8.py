@@ -38,6 +38,15 @@ def gemm_a8w8_asm(
 ): ...
 
 
+@compile_ops("module_gemm_a8w8_blockscale", fc_name="gemm_a8w8_blockscale")
+def gemm_a8w8_blockscale(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+): ...
+
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(
         M: int,

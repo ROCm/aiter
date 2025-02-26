@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_common.cuh"
-#include "gemm_a8w8_manifest.h"
-#include "gemm_a8w8_lookup.h"
+#include "gemm_a8w8_blockscale_common.cuh"
+#include "gemm_a8w8_blockscale_manifest.h"
+#include "gemm_a8w8_blockscale_lookup.h"
 #include <string>
 
 using BlockscaleKernel = std::function<
@@ -55,7 +55,7 @@ BlockscaleKernel blockscale_dispatch(int M, int N, int K)
  
 }
 
-torch::Tensor gemm_a8w8_fp8_blockscale_tune(
+torch::Tensor gemm_a8w8_blockscale_tune(
     torch::Tensor& XQ,
     torch::Tensor& WQ,
     torch::Tensor& x_scale,

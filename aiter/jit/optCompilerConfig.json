@@ -118,6 +118,22 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
     },
+    "module_gemm_a8w8_blockscale": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'"
+        ],
+        "md_name": "'module_gemm_a8w8_blockscale'",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
+    
+    },
     "module_gemm_a8w8_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_asm_pybind.cu'",
