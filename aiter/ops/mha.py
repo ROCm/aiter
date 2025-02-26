@@ -395,20 +395,16 @@ def _flash_attn_forward(
     return_lse: bool,
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
+    modules = {
+        (torch.float16, 'nobias'): mha_fwd_fp16_nobias,
+        (torch.float16, 'alibi'): mha_fwd_fp16_alibi,
+        (torch.bfloat16, 'nobias'): mha_fwd_bf16_nobias,
+        (torch.bfloat16, 'alibi'): mha_fwd_bf16_alibi
+    }
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if q.dtype == torch.float16:
-        if alibi_slopes is None:
-            md_name = 'mha_fwd_fp16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_fwd_fp16_alibi'
-    elif q.dtype == torch.bfloat16:
-        if alibi_slopes is None:
-            md_name = 'mha_fwd_bf16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_fwd_bf16_alibi'
-
-    out, softmax_lse, S_dmask, rng_state = globals()[md_name](
+    out, softmax_lse, S_dmask, rng_state = modules[q.dtype, bias_type](
         q,
         k,
         v,
@@ -445,16 +441,13 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if q.dtype == torch.float16:
-        if alibi_slopes is None:
-            md_name = 'mha_bwd_fp16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_bwd_fp16_alibi'
-    elif q.dtype == torch.bfloat16:
-        if alibi_slopes is None:
-            md_name = 'mha_bwd_bf16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_bwd_bf16_alibi'
+    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
+    modules = {
+        (torch.float16, 'nobias'): mha_bwd_fp16_nobias,
+        (torch.float16, 'alibi'): mha_bwd_fp16_alibi,
+        (torch.bfloat16, 'nobias'): mha_bwd_bf16_nobias,
+        (torch.bfloat16, 'alibi'): mha_bwd_bf16_alibi
+    }
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -463,7 +456,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = globals()[md_name](
+    ) = modules[q.dtype, bias_type](
         dout,
         q,
         k,
@@ -674,18 +667,16 @@ def _flash_attn_varlen_forward(
     block_table: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
+    modules = {
+        (torch.float16, 'nobias'): mha_varlen_fwd_fp16_nobias,
+        (torch.float16, 'alibi'): mha_varlen_fwd_fp16_alibi,
+        (torch.bfloat16, 'nobias'): mha_varlen_fwd_bf16_nobias,
+        (torch.bfloat16, 'alibi'): mha_varlen_fwd_bf16_alibi
+    }
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    if q.dtype == torch.float16:
-        if alibi_slopes is None:
-            md_name = 'mha_varlen_fwd_fp16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_varlen_fwd_fp16_alibi'
-    elif q.dtype == torch.bfloat16:
-        if alibi_slopes is None:
-            md_name = 'mha_varlen_fwd_bf16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_varlen_fwd_bf16_alibi'
-    out, softmax_lse, S_dmask, rng_state = globals()[md_name](
+    out, softmax_lse, S_dmask, rng_state = modules[q.dtype, bias_type](
         q,
         k,
         v,
@@ -733,16 +724,13 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    if q.dtype == torch.float16:
-        if alibi_slopes is None:
-            md_name = 'mha_varlen_bwd_fp16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_varlen_bwd_fp16_alibi'
-    elif q.dtype == torch.bfloat16:
-        if alibi_slopes is None:
-            md_name = 'mha_varlen_bwd_bf16_nobias'
-        elif alibi_slopes is not None:
-            md_name = 'mha_varlen_bwd_bf16_alibi'
+    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
+    modules = {
+        (torch.float16, 'nobias'): mha_varlen_bwd_fp16_nobias,
+        (torch.float16, 'alibi'): mha_varlen_bwd_fp16_alibi,
+        (torch.bfloat16, 'nobias'): mha_varlen_bwd_bf16_nobias,
+        (torch.bfloat16, 'alibi'): mha_varlen_bwd_bf16_alibi
+    }
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -751,7 +739,7 @@ def _flash_attn_varlen_backward(
         dk,
         dv,
         softmax_d,
-    ) = globals()[md_name](
+    ) = modules[q.dtype, bias_type](
         dout,
         q,
         k,
