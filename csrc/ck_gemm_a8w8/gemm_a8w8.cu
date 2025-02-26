@@ -2,8 +2,11 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_common.cuh"
+#include "gemm_fp8_blockscale_common.cuh"
 #include "gemm_a8w8_manifest.h"
 #include "gemm_a8w8_lookup.h"
+#include "gemm_fp8_blockscale_manifest.h"
+#include "gemm_fp8_blockscale_lookup.h"
 #include <cmath>
 
 using RowwiseKernel = std::function<
@@ -11,6 +14,11 @@ using RowwiseKernel = std::function<
                   torch::Tensor &, torch::Tensor &, 
                   torch::Tensor &, std::optional<torch::Tensor>,
                   int)>;
+        
+using BlockscaleKernel = std::function<
+    torch::Tensor(torch::Tensor &, torch::Tensor &,
+                  torch::Tensor &, torch::Tensor &, 
+                  torch::Tensor &)>; 
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -29,6 +37,11 @@ struct IntTupleHash
 using RowwiseKernelMap = std::unordered_map<
     std::tuple<int, int, int>,
     RowwiseKernel,
+    IntTupleHash>;
+
+using BlockscaleKernelMap = std::unorder_map<
+    std::tuple<int, int, int>,
+    BlockscaleKernel, 
     IntTupleHash>;
 
 template <typename DDataType, typename EDataType = DDataType>
@@ -144,6 +157,55 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
   return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
 
+template <typename DDataType, typename EDataType = DDataType>
+RowwiseKernel blockscale_dispatch(int M, int N, int K)
+{
+    // For a given shape, either find the best kernel via lookup or heuristic.
+    // For many small M shapes, we bucket them to the next largest kernel.
+    // This is fine since kernels are padded anyway.
+    
+    static const auto lookup = []
+    {
+      if constexpr (std::is_same_v<EDataType, F16>) {
+          return BlockscaleKernelMap{GENERATE_LOOKUP_TABLE(DDataType,F16)};
+      } else if constexpr (std::is_same_v<EDataType, B16>) {
+          return BlockscaleKernelMap{GENERATE_LOOKUP_TABLE(DDataType,B16)};
+      } else {
+          static_assert(false, "blockscale_dispatch used with unsupported dtype!");
+      } }();
+    
+    // First check if this shape(M,N,K) is available in the direct lookup.
+    auto it = lookup.find({M, N, K});
+    // If we found an optimal kernel, use it.
+    if (it != lookup.end())
+    {
+      return it->second;
+    }
+
+    int padded_m = M;
+    if (M > 1 && M <= 16)
+    {
+      padded_m = 16;
+    }
+    else if (M <= 16384)
+    {
+      padded_m = nextPow2(M);
+    }
+    else if (M <= 20480)
+    {
+      padded_m = 20480;
+    }
+    // Second check if this shape(padded_m,N,K) is available in the direct lookup.
+    it = lookup.find({padded_m, N, K});
+    // If we found an optimal kernel, use it.
+    if (it != lookup.end())
+    {
+      return it->second;
+    }
+    // Otherwise, use heuristics.
+    blockscale_heuristic_dispatch<DDataType, EDataType>(M, N, K);
+}
+
 torch::Tensor gemm_a8w8(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
@@ -181,6 +243,44 @@ torch::Tensor gemm_a8w8(
   else if (Y.dtype() == at::ScalarType::BFloat16)
   {
     rowwise_dispatch<B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+  }
+  else
+  {
+    TORCH_CHECK(false, "Unsupported scales/output dtype!");
+  }
+  return Y;
+}
+
+torch::Tensor gemm_a8w8_fp8_blockscale(
+    torch::Tensor& XQ,
+    torch::Tensor& WQ,
+    torch::Tensor& x_scale,
+    torch::Tensor& w_scale,
+    torch::Tensor& Y)
+{
+    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
+    TORCH_CHECK(x_scale.dtype() == Y.dtype() && w_scale.dtype() == Y.dtype(),
+                "Scales and output should have the same dtype!");
+
+  int M = XQ.size(0);
+  int N = WQ.size(0);
+  int K = XQ.size(1);
+
+  if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
+  {
+    blockscale_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+  }
+  else if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
+  {
+    blockscale_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+  }
+  else if (Y.dtype() == at::ScalarType::Half)
+  {
+    blockscale_dispatch<F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+  }
+  else if (Y.dtype() == at::ScalarType::BFloat16)
+  {
+    blockscale_dispatch<B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
   }
   else
   {
