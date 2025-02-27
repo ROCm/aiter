@@ -11,4 +11,5 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      int max_num_blocks,
                      std::optional<torch::Tensor> &K_QScale,
                      std::optional<torch::Tensor> &V_QScale,
-                     std::optional<torch::Tensor> &out_);
+                     std::optional<torch::Tensor> &out_,
+                     std::optional<int> high_precision = 0);

@@ -51,7 +51,8 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      int max_num_blocks,
                      std::optional<torch::Tensor> &K_QScale,
                      std::optional<torch::Tensor> &V_QScale,
-                     std::optional<torch::Tensor> &out_)
+                     std::optional<torch::Tensor> &out_,
+                     std::optional<int> high_precision = 0)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch = context_lens.size(0);
@@ -127,8 +128,26 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
             }
             else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
             {
-                static AiterAsmKernel impl_a16w8_b16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_b16_2tg_g8_f8.co");
-                impl_ptr = &impl_a16w8_b16_f8;
+                if (high_precision.value() == 0)
+                {
+                    static AiterAsmKernel impl_a16w8_b16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_b16_2tg_g8_f8.co");
+                    impl_ptr = &impl_a16w8_b16_f8;
+                }
+                else if (high_precision.value() == 1)
+                {
+                    static AiterAsmKernel impl_a16w8_b16_f8_tail_bf16("pa_a16w8_2tg_g8_f8_tail_bf16", "pa_a16w8_bf16_2tg_g8_f8_tail_bf16.co");
+                    impl_ptr = &impl_a16w8_b16_f8_tail_bf16;
+                }
+                else if (high_precision.value() == 2)
+                {
+                    static AiterAsmKernel impl_a16w8_b16_f8_gemm1_bf16("pa_a16w8_2tg_g8_f8_gemm1_bf16", "pa_a16w8_bf16_2tg_g8_f8_gemm1_bf16.co");
+                    impl_ptr = &impl_a16w8_b16_f8_gemm1_bf16;
+                }
+                else
+                {
+                    TORCH_CHECK(false,
+                                __func__, ": high_precision value only support (0, 1, 2) grades on asm pa for fp8 kv cache !!!");
+                }
             }
         }
     }
