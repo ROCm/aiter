@@ -6,8 +6,8 @@ from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
 import torch
 
-@compile_ops("module_mha_fwd_fp16_nobias", fc_name="mha_fwd_fp16_nobias")
-def mha_fwd_fp16_nobias(
+@compile_ops("module_mha_fwd", fc_name="mha_fwd")
+def mha_fwd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -24,62 +24,8 @@ def mha_fwd_fp16_nobias(
 ): ...
 
 
-@compile_ops("module_mha_fwd_fp16_alibi", fc_name="mha_fwd_fp16_alibi")
-def mha_fwd_fp16_alibi(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_fwd_bf16_nobias", fc_name="mha_fwd_bf16_nobias")
-def mha_fwd_bf16_nobias(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_fwd_bf16_alibi", fc_name="mha_fwd_bf16_alibi")
-def mha_fwd_bf16_alibi(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_fwd_fp16_nobias", fc_name="mha_varlen_fwd_fp16_nobias")
-def mha_varlen_fwd_fp16_nobias(
+@compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
+def mha_varlen_fwd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -102,80 +48,8 @@ def mha_varlen_fwd_fp16_nobias(
 ): ...
 
 
-@compile_ops("module_mha_varlen_fwd_fp16_alibi", fc_name="mha_varlen_fwd_fp16_alibi")
-def mha_varlen_fwd_fp16_alibi(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_fwd_bf16_nobias", fc_name="mha_varlen_fwd_bf16_nobias")
-def mha_varlen_fwd_bf16_nobias(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_fwd_bf16_alibi", fc_name="mha_varlen_fwd_bf16_alibi")
-def mha_varlen_fwd_bf16_alibi(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_bwd_fp16_nobias", fc_name="mha_bwd_fp16_nobias")
-def mha_bwd_fp16_nobias(
+@compile_ops("module_mha_bwd", fc_name="mha_bwd")
+def mha_bwd(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -197,77 +71,8 @@ def mha_bwd_fp16_nobias(
 ): ...
 
 
-@compile_ops("module_mha_bwd_fp16_alibi", fc_name="mha_bwd_fp16_alibi")
-def mha_bwd_fp16_alibi(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_bwd_bf16_nobias", fc_name="mha_bwd_bf16_nobias")
-def mha_bwd_bf16_nobias(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_bwd_bf16_alibi", fc_name="mha_bwd_bf16_alibi")
-def mha_bwd_bf16_alibi(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_bwd_fp16_nobias", fc_name="mha_varlen_bwd_fp16_nobias")
-def mha_varlen_bwd_fp16_nobias(
+@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
+def mha_varlen_bwd(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -291,90 +96,7 @@ def mha_varlen_bwd_fp16_nobias(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_bwd_fp16_alibi", fc_name="mha_varlen_bwd_fp16_alibi")
-def mha_varlen_bwd_fp16_alibi(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_bwd_bf16_nobias", fc_name="mha_varlen_bwd_bf16_nobias")
-def mha_varlen_bwd_bf16_nobias(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_bwd_bf16_alibi", fc_name="mha_varlen_bwd_bf16_alibi")
-def mha_varlen_bwd_bf16_alibi(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
+    custom_build_args:Optional[dict]=None,
 ): ...
 
 
@@ -395,16 +117,38 @@ def _flash_attn_forward(
     return_lse: bool,
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
-    modules = {
-        (torch.float16, 'nobias'): mha_fwd_fp16_nobias,
-        (torch.float16, 'alibi'): mha_fwd_fp16_alibi,
-        (torch.bfloat16, 'nobias'): mha_fwd_bf16_nobias,
-        (torch.bfloat16, 'alibi'): mha_fwd_bf16_alibi
-    }
-    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    md_name = 'mha_fwd'
+    filter = '*'
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter += 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter += 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter += '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter += '_alibi*'
+    if return_lse:
+        md_name += '_lse'
+        filter += '_lse*'
+    else:
+        md_name += '_nlse'
+        filter+= '_nlse*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter += '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter += '_dropout*'
 
-    out, softmax_lse, S_dmask, rng_state = modules[q.dtype, bias_type](
+    blob_gen_cmd = f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
+        '--receipt 100 --filter {} --output_dir {{}}'.format(filter)
+
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, softmax_lse, S_dmask, rng_state = mha_fwd(
         q,
         k,
         v,
@@ -418,6 +162,7 @@ def _flash_attn_forward(
         None,
         alibi_slopes,
         None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -441,13 +186,36 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
-    modules = {
-        (torch.float16, 'nobias'): mha_bwd_fp16_nobias,
-        (torch.float16, 'alibi'): mha_bwd_fp16_alibi,
-        (torch.bfloat16, 'nobias'): mha_bwd_bf16_nobias,
-        (torch.bfloat16, 'alibi'): mha_bwd_bf16_alibi
-    }
+    md_name = 'mha_bwd'
+    filter1 = '*'
+    filter2 = '*'
+    filter3 = '*'
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter1+= 'fp16*'
+        filter2+= 'fp16*'
+        filter3+= 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter1+= 'bf16*'
+        filter2+= 'bf16*'
+        filter3+= 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter3+= '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter3+= '_alibi*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter3+= '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter3+= '_dropout*'
+    filter = f'{filter1}@{filter2}@{filter3}'
+
+    blob_gen_cmd = f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd ' \
+        '--receipt 300 --filter {} --output_dir {{}}'.format(filter)
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -456,7 +224,7 @@ def _flash_attn_backward(
         dk,
         dv,
         softmax_d,
-    ) = modules[q.dtype, bias_type](
+    ) = mha_bwd(
         dout,
         q,
         k,
@@ -475,6 +243,7 @@ def _flash_attn_backward(
         alibi_slopes,
         rng_state,
         None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return softmax_d
 
@@ -667,16 +436,55 @@ def _flash_attn_varlen_forward(
     block_table: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
-    modules = {
-        (torch.float16, 'nobias'): mha_varlen_fwd_fp16_nobias,
-        (torch.float16, 'alibi'): mha_varlen_fwd_fp16_alibi,
-        (torch.bfloat16, 'nobias'): mha_varlen_fwd_bf16_nobias,
-        (torch.bfloat16, 'alibi'): mha_varlen_fwd_bf16_alibi
-    }
+    md_name = 'mha_varlen_fwd'
+    filter_fwd = '*'            # get_fwd_blobs()
+    filter_fwd_splitkv1 = '*'   # get_fwd_splitkv_combine_blobs()
+    filter_fwd_splitkv2 = '*'   # get_fwd_splitkv_blobs()
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter_fwd+= 'fp16*'
+        filter_fwd_splitkv1+= 'fp16*'
+        filter_fwd_splitkv2+= 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter_fwd+= 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter_fwd+= '_nbias*'
+        filter_fwd_splitkv2+= '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter_fwd+= '_alibi*'
+        filter_fwd_splitkv2+= '_alibi*'
+    if return_lse:
+        md_name += '_lse'
+        filter_fwd+= '_lse*'
+        filter_fwd_splitkv2+= '_lse*'
+    else:
+        md_name += '_nlse'
+        filter_fwd+= '_nlse*'
+        filter_fwd_splitkv2+= '_nlse*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter_fwd+= '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter_fwd+= '_dropout*'
+    if block_table is None:
+        md_name += '_npagedkv'
+        filter_fwd_splitkv2+= '_npagedkv*'
+    else:
+        md_name += '_pagedkv'
+        filter_fwd_splitkv2+= '_pagedkv*'
+    filter_fwd_splitkv = f'{filter_fwd_splitkv1}@{filter_fwd_splitkv2}@'
+
+    blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
+        '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd)]
+    blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
+        '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd_splitkv))
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = modules[q.dtype, bias_type](
+    out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
         q,
         k,
         v,
@@ -695,7 +503,8 @@ def _flash_attn_varlen_forward(
         None,
         block_table,
         alibi_slopes,
-        None
+        None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -724,13 +533,36 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    bias_type = 'nobias' if alibi_slopes is None else 'alibi'
-    modules = {
-        (torch.float16, 'nobias'): mha_varlen_bwd_fp16_nobias,
-        (torch.float16, 'alibi'): mha_varlen_bwd_fp16_alibi,
-        (torch.bfloat16, 'nobias'): mha_varlen_bwd_bf16_nobias,
-        (torch.bfloat16, 'alibi'): mha_varlen_bwd_bf16_alibi
-    }
+    md_name = 'mha_varlen_bwd'
+    filter1 = '*'
+    filter2 = '*'
+    filter3 = '*'
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter1+= 'fp16*'
+        filter2+= 'fp16*'
+        filter3+= 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter1+= 'bf16*'
+        filter2+= 'bf16*'
+        filter3+= 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter3+= '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter3+= '_alibi*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter3+= '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter3+= '_dropout*'
+    filter = f'{filter1}@{filter2}@{filter3}'
+
+    blob_gen_cmd = f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd ' \
+        '--receipt 400 --filter {} --output_dir {{}}'.format(filter)
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -739,7 +571,7 @@ def _flash_attn_varlen_backward(
         dk,
         dv,
         softmax_d,
-    ) = modules[q.dtype, bias_type](
+    ) = mha_varlen_bwd(
         dout,
         q,
         k,
@@ -763,6 +595,7 @@ def _flash_attn_varlen_backward(
         alibi_slopes,
         rng_state,
         None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return softmax_d
 
