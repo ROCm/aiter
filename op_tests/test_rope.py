@@ -42,6 +42,14 @@ def hip_rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, rotate_styl
     return aiter.rope_cached_2c_bwd(output_grads_x, output_grads_y, cos, sin, rotate_style, reuse_freqs_front_part, transpose_output)
 
 @perftest()
+def hip_rope_cached_positions_2d_fwd(input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_cached_positions_2c_fwd(input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, transpose_output)
+
+@perftest()
+def hip_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, transpose_output):
+    return aiter.rope_cached_positions_offsets_2c_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, transpose_output)
+
+@perftest()
 def hip_rope_thd_fwd(input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part):
     return aiter.rope_thd_fwd(input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part)
 
@@ -178,6 +186,36 @@ transpose_output: {transpose_output}
     checkAllclose(input_y.grad, hip_cached_bwd_y, msg=f"rope_cached_2c_bwd_y - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
+def test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, transpose_output):
+    input_msg = f"""
+dtype: {input_x.dtype}, \
+freq_dtype: {freqs.dtype}, \
+dim_input: {str(input_x.shape):<20}, \
+dim_freqs: {str(freqs.shape):<20}, \
+dim_positions: {str(positions.shape):<20}, \
+dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
+rotate_style: {rotate_style.value}, \
+reuse_freqs_front_part: {reuse_freqs_front_part}, \
+transpose_output: {transpose_output}
+"""
+
+    ref_x = ref_rope_sbhd_fwd(input_x, freqs[positions if offsets is None else torch.add(positions, offsets)], rotate_style, reuse_freqs_front_part)
+    ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)], rotate_style, reuse_freqs_front_part)
+
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+
+    if offsets is None:
+        (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_positions_2d_fwd(
+            input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, transpose_output)
+    else:
+        (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_positions_offsets_2d_fwd(
+            input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, transpose_output)
+
+    checkAllclose(ref_x, hip_cached_fwd_x, msg=f"rope_cached_position_2d_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
+    checkAllclose(ref_y, hip_cached_fwd_y, msg=f"rope_cached_position_2d_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
+
+
 def test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part):
     torch.set_printoptions(profile="full")
     input_msg = f"""
@@ -262,6 +300,33 @@ if __name__ == "__main__":
         input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         test_rope_sbhd_2c(input_x, input_y, freqs, grad, grad_y, rotate_style, reuse_freqs_front_part, transpose_output)
+
+    # Test sbhd format for cached with position (and offsets)
+    for (dtype, fdtype,
+         transpose_output,
+         rotate_style,
+         rotary_percent_and_reuse,
+         has_offsets,
+         b, s, h, d
+    ) in itertools.product(
+        dtype_, dtype_,
+        transpose_output_,
+        rotate_style_,
+        rotary_percent_and_reuse_,
+        (True, False),
+        batch_size_, seq_size_, head_size_, hidden_dim_
+    ):
+        rotary_percent = rotary_percent_and_reuse[0]
+        reuse_freqs_front_part = rotary_percent_and_reuse[1]
+        freqs_ratio = 2 if reuse_freqs_front_part else 1
+        freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+        positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,), device="cuda")
+        offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,), device="cuda") if has_offsets else None
+        input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+        input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+        grad_x  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+        grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+        test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, transpose_output)
 
     # Test thd format for uncached
     cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
