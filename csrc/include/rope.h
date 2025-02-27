@@ -81,6 +81,31 @@ void rope_cached_2c_bwd_impl(
     const bool           reuse_freqs_front_part
 );
 
+void rope_cached_positions_2c_fwd_impl(
+    torch::Tensor&       output_x,      // [s, b, h, d]
+    torch::Tensor&       output_y,      // [s, b, h, d]
+    const torch::Tensor& input_x,       // [s, b, h, d]
+    const torch::Tensor& input_y,       // [s, b, h, d]
+    const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const torch::Tensor& positions,     // [s]
+    const int32_t        rotate_style,  // 0: NEOX style, 1: GPT-J style
+    const bool           reuse_freqs_front_part
+);
+
+void rope_cached_positions_offsets_2c_fwd_impl(
+    torch::Tensor&       output_x,      // [s, b, h, d]
+    torch::Tensor&       output_y,      // [s, b, h, d]
+    const torch::Tensor& input_x,       // [s, b, h, d]
+    const torch::Tensor& input_y,       // [s, b, h, d]
+    const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
+    const torch::Tensor& positions,     // [s]
+    const torch::Tensor& offsets,       // [s]
+    const int32_t        rotate_style,  // 0: NEOX style, 1: GPT-J style
+    const bool           reuse_freqs_front_part
+);
+
 void rope_thd_fwd_impl(
     torch::Tensor&       output,        // [t, h, d]
     const torch::Tensor& input,         // [t, h, d]
