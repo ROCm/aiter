@@ -12,16 +12,20 @@ import sys
 from aiter.ops.triton.moe_op import fused_moe as triton_moe 
 
 
-def torch_moe(a, b, c, a_scale, b_scale, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8):
+def torch_moe(a, b, c, a_scale, b_scale, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16):
     if fp8_w8a8:
         a , _ , a_scale = quantize_fp8(a)
 
     M, top_k, _ = c.shape
-    #ref_out = torch.empty_like(c)
+    
     # Repeat a -> (M, top_k, K)
     a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
     # (M, top_k, N, K)
-    b_indexed = b.half()[topk_ids]
+    if fp8_w8a8:
+        b_indexed = b.half()[topk_ids]
+    else:
+        b_indexed = b[topk_ids]
+
     c = torch.einsum("mek,menk->men", a_expanded.to(dtype), b_indexed.to(dtype))
 
     if routed_weight:
@@ -33,6 +37,9 @@ def torch_moe(a, b, c, a_scale, b_scale, topk_ids, topk_weights, routed_weight, 
         c = c * a_scale
         c = c.to(dtype)
     
+    if int8_w8a16:
+        c = c * b_scale[topk_ids].unsqueeze(-1)
+        c = c.to(dtype)
 
     return c 
 
@@ -144,10 +151,31 @@ def quantize_fp8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Ten
 
     scale = scale.squeeze(dim=quantize_dim)
 
-    print(f"scale={scale}")
     return tensor_quantized, scale, 1 / scale
 
-def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, dtype, fp8_w8a8: bool):
+def quantize_int8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
+    max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
+    max_repr_val = torch.iinfo(torch.int8).max
+    max_vals[max_vals == 0] = 1e-8 # Avoid division by zero
+
+    # Compute scale factors for each channel
+    scale: torch.Tensor = max_repr_val / max_vals.to(torch.float32)
+
+    # Quantize the tensor
+    tensor = tensor * scale
+    tensor.clamp_(-max_repr_val, max_repr_val)
+    tensor = tensor.round_()
+    tensor_quantized = tensor.to(torch.int8)
+
+    scale = scale.squeeze(dim=quantize_dim)
+
+    return tensor_quantized, scale, 1 / scale
+
+
+def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, dtype, fp8_w8a8: bool, int8_w8a16: bool):
+    assert not (fp8_w8a8 and int8_w8a16)
+
     a = torch.randn((M, K), dtype=dtype, device='cuda')
     b = torch.rand((E, N, K), dtype=dtype, device='cuda')
     a_scale = None
@@ -155,6 +183,9 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
 
     if fp8_w8a8:
         b, _, b_scale = quantize_fp8(b, dim=(0,))
+    
+    if int8_w8a16:
+        b, _, b_scale = quantize_int8(b, dim=(0,))
         
     b_zp = False #Todo add support for int4_w4a8
 
@@ -185,20 +216,21 @@ torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, t
                                                (16, 14336, 128, 1, 1), (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8),
                                                (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8)])
 @pytest.mark.parametrize('routed_weight', [False, True])
-@pytest.mark.parametrize('fp8_w8a8', [True, False]) #TODO add support for fp8
+@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) 
+#@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, True)]) 
 #@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO: Accuracy issues with float16
 @pytest.mark.parametrize('dtype', [torch.bfloat16])
-def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, dtype):
+def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, dtype):
     torch.manual_seed(20)
     a, b, triton_out, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
-        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8)
+        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16)
 
     triton_moe(a, b, triton_out, a_scale, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
-                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, False, False)
+                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16, False)
 
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
-                        num_tokens_post_padded, dtype, fp8_w8a8)
+                        num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16)
 
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
