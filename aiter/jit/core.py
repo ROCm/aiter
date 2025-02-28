@@ -307,27 +307,26 @@ def compile_ops(ops_name: str, fc_name: Optional[str] = None):
             loadName = fc_name
             if fc_name is None:
                 loadName = func.__name__
-
-            d_args = get_args_of_build(ops_name)
-            custom_build_args = custom_build_args or {}
-            d_args = {key: custom_build_args.get(key, d_args[key]) for key in d_args}
-
-            md_name = d_args["md_name"]
-            srcs = d_args["srcs"]
-            flags_extra_cc = d_args["flags_extra_cc"]
-            flags_extra_hip = d_args["flags_extra_hip"]
-            blob_gen_cmd = d_args["blob_gen_cmd"]
-            extra_include = d_args["extra_include"]
-            extra_ldflags = d_args["extra_ldflags"]
-            verbose = d_args["verbose"]
             try:
                 module = None
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
                 if module is None:
-                    module = get_module(md_name)
+                    module = get_module(custom_build_args.get(md_name, ops_name))
             except Exception as e:
+                d_args = get_args_of_build(ops_name)
+                custom_build_args = custom_build_args or {}
+                d_args = {key: custom_build_args.get(key, d_args[key]) for key in d_args}
+
+                md_name = d_args["md_name"]
+                srcs = d_args["srcs"]
+                flags_extra_cc = d_args["flags_extra_cc"]
+                flags_extra_hip = d_args["flags_extra_hip"]
+                blob_gen_cmd = d_args["blob_gen_cmd"]
+                extra_include = d_args["extra_include"]
+                extra_ldflags = d_args["extra_ldflags"]
+                verbose = d_args["verbose"]
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
             op = getattr(module, loadName)
