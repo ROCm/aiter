@@ -146,11 +146,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
 
-            "-mllvm", "-enable-post-misched=0",
-            "-mllvm", "-amdgpu-early-inline-all=true",
-            "-mllvm", "-amdgpu-function-calls=false",
             "-mllvm", "--amdgpu-kernarg-preload-count=16",
-            "-mllvm", "-amdgpu-coerce-illegal-types=1",
             # "-v", "--save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",

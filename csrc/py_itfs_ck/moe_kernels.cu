@@ -71,6 +71,14 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     std::string prec_sw = !w1_scale ? "fp32" : torchDTypeToStr(w1_scale->dtype());
     std::string prec_sq = !a2_scale ? "fp32" : torchDTypeToStr(a2_scale->dtype());
 
+    int workspace_size = ck_tile::moe_sorting_get_workspace_size(tokens, experts);
+    void *ws_ptr = nullptr;
+    if (workspace_size > 0)
+    {
+        auto ws = torch::zeros({workspace_size}, torch::TensorOptions().dtype(topk_ids.dtype()).device(device_of(topk_ids)));
+        ws_ptr = ws.data_ptr();
+    }
+    
     fused_moe_traits traits{
         prec_i,
         prec_w,
@@ -95,6 +103,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr,
                         expert_mask.has_value() ? expert_mask.value().data_ptr() : nullptr, 
                         out.data_ptr(),
+                        ws_ptr,
 
                         topk_ids.data_ptr(),
                         topk_weights.data_ptr(),
