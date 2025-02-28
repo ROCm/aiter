@@ -1001,26 +1001,36 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
     int num_elements = output.numel();
     int rem_dim_size = 1;
-    for (int i = 0; i < dim - 2; ++i)
+    int M, N, K;
+    if (dim == 1)
     {
-      rem_dim_size *= shape[i];
+      M = 1;
+      N = input.numel() / 512;
+      K = 512;
     }
-    int M = dim == 3 ? shape[0] : rem_dim_size;
-    int N = shape[dim - 2];
-    int K = shape[dim - 1];
-    if (N < rows) {
-      K = N * K;
-      N = M;
-      M = 1; 
+    else
+    {
+      for (int i = 0; i < dim - 2; ++i)
+      {
+        rem_dim_size *= shape[i];
+      }
+      M = dim == 3 ? shape[0] : rem_dim_size;
+      N = shape[dim - 2];
+      K = shape[dim - 1];
+      if (N < rows)
+      {
+        K = N * K;
+        N = M;
+        M = 1;
+      }
     }
-
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     bool types_match = typeid(_T0) == typeid(_T1);
 
     int vec = 16 / output.element_size();
     if (N % rows == 0 && K % vec == 0)
     {
-      constexpr uint32_t wg = 64;
+      constexpr uint32_t wg = 256;
       int grid_x = (num_elements / (rows * vec) + wg - 1) / wg;
       const dim3 grid_dim(grid_x, 1, 1);
       const dim3 block_dim(wg, 1, 1);
@@ -1068,12 +1078,12 @@ void dispatch_second(torch::Tensor &input, torch::Tensor &other, torch::Tensor &
 {
   switch (other.scalar_type())
   {
-    DISPATCH_SECOND(pattern, Operation, _T0, torch::kFloat32, float);
-    DISPATCH_SECOND(pattern, Operation, _T0, torch::kFloat64, double);
-    DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt32, int);
-    DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt64, long long);
-    DISPATCH_SECOND(pattern, Operation, _T0, torch::kBool, bool);
-    DISPATCH_SECOND(pattern, Operation, _T0, torch::kHalf, torch::Half);
+    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kFloat32, float);
+    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kFloat64, double);
+    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt32, int);
+    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kInt64, long long);
+    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kBool, bool);
+    // DISPATCH_SECOND(pattern, Operation, _T0, torch::kHalf, torch::Half);
     DISPATCH_SECOND(pattern, Operation, _T0, torch::kBFloat16, torch::BFloat16);
   default:
     break;
@@ -1085,12 +1095,12 @@ void dispatch_first(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 {
   switch (input.scalar_type())
   {
-    DISPATCH_FIRST(pattern, Operation, torch::kFloat32, float);
-    DISPATCH_FIRST(pattern, Operation, torch::kFloat64, double);
-    DISPATCH_FIRST(pattern, Operation, torch::kInt32, int);
-    DISPATCH_FIRST(pattern, Operation, torch::kInt64, long long);
-    DISPATCH_FIRST(pattern, Operation, torch::kBool, bool);
-    DISPATCH_FIRST(pattern, Operation, torch::kHalf, torch::Half);
+    // DISPATCH_FIRST(pattern, Operation, torch::kFloat32, float);
+    // DISPATCH_FIRST(pattern, Operation, torch::kFloat64, double);
+    // DISPATCH_FIRST(pattern, Operation, torch::kInt32, int);
+    // DISPATCH_FIRST(pattern, Operation, torch::kInt64, long long);
+    // DISPATCH_FIRST(pattern, Operation, torch::kBool, bool);
+    // DISPATCH_FIRST(pattern, Operation, torch::kHalf, torch::Half);
     DISPATCH_FIRST(pattern, Operation, torch::kBFloat16, torch::BFloat16);
   default:
     break;
@@ -1120,6 +1130,10 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     is_support &= (input.dim() == other.dim());
     is_support &= input.is_contiguous() == other.is_contiguous();
     is_support &= input.is_contiguous() == true;
+    if (input.dim() == 1)
+    {
+      is_support &= input.numel() % 128 == 0;
+    }
     for (int i = 0; i < input.dim() && is_support; ++i)
     {
       is_support &= (input.size(i) == other.size(i));
@@ -1244,8 +1258,4 @@ torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
 torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
   return binary_operation<aiter::DivOp>(input, other);
-}
-
-inline at::Tensor add(const at::Tensor &self, const at::Scalar &other)
-{
 }
