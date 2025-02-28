@@ -80,7 +80,6 @@ def test_mla(ctx_lens, batch_size, nhead,
                                                    kv_indices,
                                                    kv_last_page_lens,
                                                    sm_scale,
-                                                #    num_kv_splits=num_kv_splits
                                                    )
 
     # print(f'{out_asm.view(batch_size, -1)=}')
@@ -91,6 +90,8 @@ def test_mla(ctx_lens, batch_size, nhead,
     checkAllclose(out_ref, out_asm,
                   msg=f'attn_out    [golden vs aiter_asm]:{us_ref:.2f} us vs {us_asm:.2f} us......')
     print()
+    return {'triton': us_ref,
+            'asm': us_asm}
 
 
 ctx_len = 3200
@@ -99,11 +100,11 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 nhead = 16  # 128/TP8
 block_size = 1
-num_kv_splits = 1
+num_kv_splits = 16  # don't why but sglang force 16.... for triton
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
-    for ctx_len in [64, 512, 1024, 3200]:
-        for batch_size in [1, 2, 3, 5, 16, 32, 64, 128]:
-            test_mla(ctx_len, batch_size, nhead,
-                    kv_lora_rank,
-                    qk_nope_head_dim, qk_rope_head_dim,
-                    dtype, kvtype, block_size, num_kv_splits)
+    for ctx_len in [21, 64, 256, 512, 1024, 3200]:
+        for batch_size in [1, 2, 3, 5, 16, 32, 64, 128, 256]:
+            ret = test_mla(ctx_len, batch_size, nhead,
+                           kv_lora_rank,
+                           qk_nope_head_dim, qk_rope_head_dim,
+                           dtype, kvtype, block_size, num_kv_splits)
