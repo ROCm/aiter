@@ -549,6 +549,7 @@ def _fwd_kernel_stage2_asm(
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
+    mgc: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -569,7 +570,8 @@ def _fwd_kernel_stage2_asm(
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
-        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+        kv_len_per_split = tl.maximum(mgc,
+            tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS))
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(
             split_kv_start + kv_len_per_split, cur_batch_seq_len)

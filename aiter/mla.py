@@ -14,17 +14,22 @@ def mla_decode_fwd(
     kv_indptr,
     kv_indices,
     kv_last_page_lens,
-    num_kv_splits,
     sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
     logit_cap=0.0,
+    num_kv_splits=None,  # for experts only!!!
 ):
+    device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
-    device = q.device
 
     num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     bs, nhead, v_head_dim = o.shape
+
+    if num_kv_splits is None:
+        device_properties = torch.cuda.get_device_properties(device)
+        cu_num = device_properties.multi_processor_count
+        num_kv_splits = max(1, cu_num//bs)
 
     logits = torch.empty(
         (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device)
@@ -62,6 +67,7 @@ def mla_decode_fwd(
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
+        mgc=64,
         num_warps=4,
         num_stages=2,
         **extra_kargs,

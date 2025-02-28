@@ -79,8 +79,8 @@ def test_mla(ctx_lens, batch_size, nhead,
                                                    kv_indptr,
                                                    kv_indices,
                                                    kv_last_page_lens,
-                                                   num_kv_splits,
                                                    sm_scale,
+                                                #    num_kv_splits=num_kv_splits
                                                    )
 
     # print(f'{out_asm.view(batch_size, -1)=}')
@@ -99,7 +99,7 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 nhead = 16  # 128/TP8
 block_size = 1
-num_kv_splits = 8
+num_kv_splits = 1
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
     for ctx_len in [64, 512, 1024, 3200]:
         for batch_size in [1, 2, 3, 5, 16, 32, 64, 128]:
