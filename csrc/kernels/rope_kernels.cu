@@ -26,7 +26,7 @@
 //
 
 template <int32_t RotateStyle, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
-inline __device__ void get_cos_sin_uncached(
+__device__ __forceinline__ void get_cos_sin_uncached(
     float* p_cos_0, float* p_sin_0,
     float* p_cos_1, float* p_sin_1,
     const scalar_f_t* __restrict__ p_freqs,
@@ -106,7 +106,7 @@ inline __device__ void get_cos_sin_uncached(
 }
 
 template <int32_t RotateStyle, bool IsForward, bool ReuseFreqsFrontPart, typename scalar_f_t>
-inline __device__ void get_cos_sin_cached(
+__device__ __forceinline__ void get_cos_sin_cached(
     float* p_cos_0, float* p_sin_0,
     float* p_cos_1, float* p_sin_1,
     const scalar_f_t* __restrict__ p_cos,
@@ -189,7 +189,7 @@ inline __device__ void get_cos_sin_cached(
 }
 
 template <int32_t RotateStyle>
-inline __device__ void get_offset_d(
+__device__ __forceinline__ void get_offset_d(
     int32_t* p_offset_0, int32_t* p_offset_1,
     const int32_t did,
     const int32_t stride_d,
@@ -207,14 +207,74 @@ inline __device__ void get_offset_d(
     }
 }
 
+template <typename scalar_t>
+__device__ __forceinline__ void elementwise_copy(
+    scalar_t* __restrict__       p_output,
+    const scalar_t* __restrict__ p_input,
+    const int32_t hid_end,
+    const int32_t did_start, const int32_t did_end,
+    const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    if (did_end > did_start)
+    {
+        #pragma unroll
+        for (int32_t hid = threadIdx.y; hid < hid_end; hid += blockDim.y)
+        {
+            const int32_t offset_i = hid * stride_i_h;
+            const int32_t offset_o = hid * stride_o_h;
+
+            #pragma unroll
+            for (int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
+            {
+                p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
+            }
+        }
+    }
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ void elementwise_copy_2c(
+    scalar_t* __restrict__       p_output_x,
+    scalar_t* __restrict__       p_output_y,
+    const scalar_t* __restrict__ p_input_x,
+    const scalar_t* __restrict__ p_input_y,
+    const int32_t hid_end,
+    const int32_t did_start, const int32_t did_end,
+    const int32_t stride_ix_h, const int32_t stride_ix_d,
+    const int32_t stride_iy_h, const int32_t stride_iy_d,
+    const int32_t stride_ox_h, const int32_t stride_ox_d,
+    const int32_t stride_oy_h, const int32_t stride_oy_d)
+{
+    if (did_end > did_start)
+    {
+        #pragma unroll
+        for (int32_t hid = threadIdx.y; hid < hid_end; hid += blockDim.y)
+        {
+            const int32_t offset_ix = hid * stride_ix_h;
+            const int32_t offset_iy = hid * stride_iy_h;
+            const int32_t offset_ox = hid * stride_ox_h;
+            const int32_t offset_oy = hid * stride_oy_h;
+
+            #pragma unroll
+            for (int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
+            {
+                p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
+                p_output_y[offset_oy + did * stride_oy_d] = p_input_y[offset_iy + did * stride_iy_d];
+            }
+        }
+    }
+}
+
 // =====================================================================================================================
 // Kernel Functionalities
 //
 
 struct Op1cUncachedFwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_output,
         const scalar_t* __restrict__   p_input,
         const scalar_f_t* __restrict__ p_freqs,
@@ -227,9 +287,10 @@ struct Op1cUncachedFwd
         const int32_t size_half_r   = size_r >> 1;
         const int32_t offset_half_r_i = size_half_r * stride_i_d;
         const int32_t offset_half_r_o = size_half_r * stride_o_d;
+        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element
             int32_t offset_i_d_0, offset_i_d_1, offset_o_d_0, offset_o_d_1;
@@ -238,7 +299,7 @@ struct Op1cUncachedFwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -259,19 +320,23 @@ struct Op1cUncachedFwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
+        if constexpr (!Inplace)
         {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            if constexpr (NopeFirst)
             {
-                const int32_t offset_i = hid * stride_i_h;
-                const int32_t offset_o = hid * stride_o_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
-                }
+                elementwise_copy(
+                    p_output, p_input,
+                    size_h, 0, size_d - size_r,
+                    stride_i_h, stride_i_d,
+                    stride_o_h, stride_o_d);
+            }
+            else
+            {
+                elementwise_copy(
+                    p_output, p_input,
+                    size_h, size_r, size_d,
+                    stride_i_h, stride_i_d,
+                    stride_o_h, stride_o_d);
             }
         }
     }
@@ -279,8 +344,9 @@ struct Op1cUncachedFwd
 
 struct Op1cUncachedBwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_input_grads,
         const scalar_t* __restrict__   p_output_grads,
         const scalar_f_t* __restrict__ p_freqs,
@@ -293,9 +359,10 @@ struct Op1cUncachedBwd
         const int32_t size_half_r     = size_r >> 1;
         const int32_t offset_half_r_o = size_half_r * stride_o_d;
         const int32_t offset_half_r_i = size_half_r * stride_i_d;
+        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
             int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
@@ -304,7 +371,7 @@ struct Op1cUncachedBwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -340,13 +407,35 @@ struct Op1cUncachedBwd
                 }
             }
         }
+
+        // the rest are just forwarded
+        if constexpr (!Inplace)
+        {
+            if constexpr (NopeFirst)
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, 0, size_d - size_r,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+            else
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, size_r, size_d,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+        }
     }
 };
 
 struct Op2cUncachedFwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_output_x,
         scalar_t* __restrict__         p_output_y,
         const scalar_t* __restrict__   p_input_x,
@@ -365,9 +454,10 @@ struct Op2cUncachedFwd
         const int32_t offset_half_r_ox = size_half_r * stride_ox_d;
         const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
         const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
+        const int32_t did_start        = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
             int32_t offset_ix_d_0, offset_ix_d_1, offset_ox_d_0, offset_ox_d_1;
@@ -379,7 +469,7 @@ struct Op2cUncachedFwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -428,13 +518,35 @@ struct Op2cUncachedFwd
                 }
             }
         }
+
+        // the rest are just forwarded
+        if constexpr (!Inplace)
+        {
+            if constexpr (NopeFirst)
+            {
+                elementwise_copy_2c(
+                    p_output_x, p_output_y, p_input_x, p_input_y,
+                    size_h, 0, size_d - size_r,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
+            }
+            else
+            {
+                elementwise_copy_2c(
+                    p_output_x, p_output_y, p_input_x, p_input_y,
+                    size_h, size_r, size_d,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
+            }
+        }
     }
 };
 
 struct Op2cUncachedBwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_input_grads_x,
         scalar_t* __restrict__         p_input_grads_y,
         const scalar_t* __restrict__   p_output_grads_x,
@@ -453,9 +565,10 @@ struct Op2cUncachedBwd
         const int32_t offset_half_r_ix = size_half_r * stride_ix_d;
         const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
         const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
+        const int32_t did_start        = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
             int32_t offset_ox_d_0, offset_ox_d_1, offset_ix_d_0, offset_ix_d_1;
@@ -467,7 +580,7 @@ struct Op2cUncachedBwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -516,13 +629,35 @@ struct Op2cUncachedBwd
                 }
             }
         }
+
+        // the rest are just forwarded
+        if constexpr (!Inplace)
+        {
+            if constexpr (NopeFirst)
+            {
+                elementwise_copy_2c(
+                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
+                    size_h, 0, size_d - size_r,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
+            }
+            else
+            {
+                elementwise_copy_2c(
+                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
+                    size_h, size_r, size_d,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
+            }
+        }
     }
 };
 
 struct Op1cCachedFwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_output,
         const scalar_t* __restrict__   p_input,
         const scalar_f_t* __restrict__ p_cos,
@@ -536,9 +671,10 @@ struct Op1cCachedFwd
         const int32_t size_half_r   = size_r >> 1;
         const int32_t offset_half_r_i = size_half_r * stride_i_d;
         const int32_t offset_half_r_o = size_half_r * stride_o_d;
+        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element
             int32_t offset_i_d_0, offset_i_d_1, offset_o_d_0, offset_o_d_1;
@@ -547,7 +683,7 @@ struct Op1cCachedFwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -568,19 +704,23 @@ struct Op1cCachedFwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
+        if constexpr (!Inplace)
         {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            if constexpr (NopeFirst)
             {
-                const int32_t offset_i = hid * stride_i_h;
-                const int32_t offset_o = hid * stride_o_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
-                }
+                elementwise_copy(
+                    p_output, p_input,
+                    size_h, 0, size_d - size_r,
+                    stride_i_h, stride_i_d,
+                    stride_o_h, stride_o_d);
+            }
+            else
+            {
+                elementwise_copy(
+                    p_output, p_input,
+                    size_h, size_r, size_d,
+                    stride_i_h, stride_i_d,
+                    stride_o_h, stride_o_d);
             }
         }
     }
@@ -588,8 +728,9 @@ struct Op1cCachedFwd
 
 struct Op1cCachedBwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_input_grads,
         const scalar_t* __restrict__   p_output_grads,
         const scalar_f_t* __restrict__ p_cos,
@@ -603,9 +744,10 @@ struct Op1cCachedBwd
         const int32_t size_half_r     = size_r >> 1;
         const int32_t offset_half_r_o = size_half_r * stride_o_d;
         const int32_t offset_half_r_i = size_half_r * stride_i_d;
+        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
             int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
@@ -614,7 +756,7 @@ struct Op1cCachedBwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -635,19 +777,23 @@ struct Op1cCachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
+        if constexpr (!Inplace)
         {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            if constexpr (NopeFirst)
             {
-                const int32_t offset_o = hid * stride_o_h;
-                const int32_t offset_i = hid * stride_i_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_input_grads[offset_i + did * stride_i_d] = p_output_grads[offset_o + did * stride_o_d];
-                }
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, 0, size_d - size_r,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+            else
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, size_r, size_d,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
             }
         }
     }
@@ -655,8 +801,9 @@ struct Op1cCachedBwd
 
 struct Op2cCachedFwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_output_x,
         scalar_t* __restrict__         p_output_y,
         const scalar_t* __restrict__   p_input_x,
@@ -676,9 +823,10 @@ struct Op2cCachedFwd
         const int32_t offset_half_r_ox = size_half_r * stride_ox_d;
         const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
         const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
+        const int32_t did_start        = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
             int32_t offset_ix_d_0, offset_ix_d_1, offset_ox_d_0, offset_ox_d_1;
@@ -690,7 +838,7 @@ struct Op2cCachedFwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -721,22 +869,23 @@ struct Op2cCachedFwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
+        if constexpr (!Inplace)
         {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            if constexpr (NopeFirst)
             {
-                const int32_t offset_ix = hid * stride_ix_h;
-                const int32_t offset_iy = hid * stride_iy_h;
-                const int32_t offset_ox = hid * stride_ox_h;
-                const int32_t offset_oy = hid * stride_oy_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
-                    p_output_y[offset_oy + did * stride_oy_d] = p_input_y[offset_iy + did * stride_iy_d];
-                }
+                elementwise_copy_2c(
+                    p_output_x, p_output_y, p_input_x, p_input_y,
+                    size_h, 0, size_d - size_r,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
+            }
+            else
+            {
+                elementwise_copy_2c(
+                    p_output_x, p_output_y, p_input_x, p_input_y,
+                    size_h, size_r, size_d,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
             }
         }
     }
@@ -744,8 +893,9 @@ struct Op2cCachedFwd
 
 struct Op2cCachedBwd
 {
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
-    __device__ static void apply(
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply(
         scalar_t* __restrict__         p_input_grads_x,
         scalar_t* __restrict__         p_input_grads_y,
         const scalar_t* __restrict__   p_output_grads_x,
@@ -765,9 +915,10 @@ struct Op2cCachedBwd
         const int32_t offset_half_r_ix = size_half_r * stride_ix_d;
         const int32_t offset_half_r_oy = size_half_r * stride_oy_d;
         const int32_t offset_half_r_iy = size_half_r * stride_iy_d;
+        const int32_t did_start        = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
-        for (int32_t did = threadIdx.x; did < size_half_r; did += blockDim.x)
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             // i: Input, o: output, d: in hidden Dim, 0: former element, 1: latter element, x: 1st channel, y: 2nd channel
             int32_t offset_ox_d_0, offset_ox_d_1, offset_ix_d_0, offset_ix_d_1;
@@ -779,7 +930,7 @@ struct Op2cCachedBwd
 
             float cos_0, sin_0, cos_1, sin_1;
             get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did, size_half_r);
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
             #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
@@ -810,22 +961,23 @@ struct Op2cCachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
+        if constexpr (!Inplace)
         {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            if constexpr (NopeFirst)
             {
-                const int32_t offset_ox = hid * stride_ox_h;
-                const int32_t offset_oy = hid * stride_oy_h;
-                const int32_t offset_ix = hid * stride_ix_h;
-                const int32_t offset_iy = hid * stride_iy_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_input_grads_x[offset_ix + did * stride_ix_d] = p_output_grads_x[offset_ox + did * stride_ox_d];
-                    p_input_grads_y[offset_iy + did * stride_iy_d] = p_output_grads_y[offset_oy + did * stride_oy_d];
-                }
+                elementwise_copy_2c(
+                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
+                    size_h, 0, size_d - size_r,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
+            }
+            else
+            {
+                elementwise_copy_2c(
+                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
+                    size_h, size_r, size_d,
+                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
+                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
             }
         }
     }
@@ -835,7 +987,8 @@ struct Op2cCachedBwd
 // Kernel Entries
 //
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_sbhd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -845,13 +998,13 @@ __global__ void kn_entry_1c_sbhd_uncached(
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
     const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_o,
         p_input + offset_i,
         p_freqs + offset_f,
@@ -860,7 +1013,31 @@ __global__ void kn_entry_1c_sbhd_uncached(
         stride_o_h, stride_o_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_sbhd_uncached_inplace(
+    scalar_t* __restrict__         p_inout,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_s, const int32_t stride_b, const int32_t stride_h, const int32_t stride_d)
+{
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
+    const int32_t offset   = sid * stride_s + bid * stride_b;
+    const int32_t offset_f = sid * size_f;
+
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout + offset,
+        p_inout + offset,
+        p_freqs + offset_f,
+        size_h, size_d, size_f,
+        stride_h, stride_d,
+        stride_h, stride_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_uncached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -874,15 +1051,15 @@ __global__ void kn_entry_2c_sbhd_uncached(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
+    const int32_t sid       = blockIdx.x;
+    const int32_t bid       = blockIdx.y;
     const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
     const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_f = sid * size_f;
+    const int32_t offset_f  = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -895,7 +1072,38 @@ __global__ void kn_entry_2c_sbhd_uncached(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_2c_sbhd_uncached_inplace(
+    scalar_t* __restrict__         p_inout_x,
+    scalar_t* __restrict__         p_inout_y,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
+    const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
+{
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
+    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const int32_t offset_f = sid * size_f;
+
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_freqs + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_sbhd_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -906,13 +1114,13 @@ __global__ void kn_entry_1c_sbhd_cached(
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
     const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_o,
         p_input + offset_i,
         p_cos + offset_f,
@@ -922,7 +1130,33 @@ __global__ void kn_entry_1c_sbhd_cached(
         stride_o_h, stride_o_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_sbhd_cached_inplace(
+    scalar_t* __restrict__         p_inout,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_s, const int32_t stride_b, const int32_t stride_h, const int32_t stride_d)
+{
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
+    const int32_t offset   = sid * stride_s + bid * stride_b;
+    const int32_t offset_f = sid * size_f;
+
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout + offset,
+        p_inout + offset,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_h, stride_d,
+        stride_h, stride_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -937,15 +1171,15 @@ __global__ void kn_entry_2c_sbhd_cached(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
+    const int32_t sid       = blockIdx.x;
+    const int32_t bid       = blockIdx.y;
     const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
     const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_f = sid * size_f;
+    const int32_t offset_f  = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -959,7 +1193,40 @@ __global__ void kn_entry_2c_sbhd_cached(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_2c_sbhd_cached_inplace(
+    scalar_t* __restrict__         p_inout_x,
+    scalar_t* __restrict__         p_inout_y,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
+    const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
+{
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
+    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const int32_t offset_f = sid * size_f;
+
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -975,15 +1242,15 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
+    const int32_t sid       = blockIdx.x;
+    const int32_t bid       = blockIdx.y;
     const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
     const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f  = p_indirect_buffer[sid] * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -997,7 +1264,41 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
+    scalar_t* __restrict__         p_inout_x,
+    scalar_t* __restrict__         p_inout_y,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
+    const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
+{
+    const int32_t sid      = blockIdx.x;
+    const int32_t bid      = blockIdx.y;
+    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const int32_t offset_f = p_indirect_buffer[sid] * size_f;
+
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect2(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1014,15 +1315,15 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
+    const int32_t sid       = blockIdx.x;
+    const int32_t bid       = blockIdx.y;
     const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
     const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f  = (p_indirect_buffer_0[sid] + p_indirect_buffer_1[sid]) * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output_x + offset_ox,
         p_output_y + offset_oy,
         p_input_x + offset_ix,
@@ -1036,7 +1337,42 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
         stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
+    scalar_t* __restrict__         p_inout_x,
+    scalar_t* __restrict__         p_inout_y,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer_0,
+    const int64_t* __restrict__    p_indirect_buffer_1,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
+    const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
+{
+    const int32_t sid       = blockIdx.x;
+    const int32_t bid       = blockIdx.y;
+    const int32_t offset_x  = sid * stride_x_s + bid * stride_x_b;
+    const int32_t offset_y  = sid * stride_y_s + bid * stride_y_b;
+    const int32_t offset_f  = (p_indirect_buffer_0[sid] + p_indirect_buffer_1[sid]) * size_f;
+
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_thd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1057,7 +1393,7 @@ __global__ void kn_entry_1c_thd_uncached(
         const int32_t offset_o = tid * stride_o_t;
         const int32_t offset_f = sid * size_f;
 
-        Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+        Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
             p_output + offset_o,
             p_input + offset_i,
             p_freqs + offset_f,
@@ -1067,7 +1403,37 @@ __global__ void kn_entry_1c_thd_uncached(
     }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_thd_uncached_inplace(
+    scalar_t* __restrict__         p_inout,
+    const int32_t* __restrict__    p_cu_seqlens,
+    const scalar_f_t* __restrict__ p_freqs,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,   // size of last dimension of freqs.
+    const int32_t stride_t, const int32_t stride_h, const int32_t stride_d)
+{
+    const int32_t sid = blockIdx.x;
+    const int32_t bid = blockIdx.y;
+    const int32_t tid = sid + p_cu_seqlens[bid];
+
+    if (tid < p_cu_seqlens[bid + 1])
+    {
+        const int32_t offset   = tid * stride_t;
+        const int32_t offset_f = sid * size_f;
+
+        Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout + offset,
+            p_inout + offset,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_h, stride_d,
+            stride_h, stride_d);
+    }
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_1c_2d_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1088,7 +1454,7 @@ __global__ void kn_entry_1c_2d_cached(
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
     const int offset_h_f = Hid * size_half_d;
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_h_o,
         p_input + offset_h_i,
         p_cos_h + offset_h_f,
@@ -1100,7 +1466,7 @@ __global__ void kn_entry_1c_2d_cached(
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
     const int offset_w_f = Wid * size_half_d;
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart>(
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_w_o,
         p_input + offset_w_i,
         p_cos_w + offset_w_f,
@@ -1110,11 +1476,52 @@ __global__ void kn_entry_1c_2d_cached(
         stride_o_h, stride_o_d);
 }
 
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_2d_cached_inplace(
+    scalar_t* __restrict__         p_inout,
+    const scalar_f_t* __restrict__ p_cos_h,
+    const scalar_f_t* __restrict__ p_sin_h,
+    const scalar_f_t* __restrict__ p_cos_w,
+    const scalar_f_t* __restrict__ p_sin_w,
+    const int32_t img_width, const int32_t size_h, const int32_t size_d,
+    const int32_t stride_b, const int32_t stride_s, const int32_t stride_h, const int32_t stride_d)
+{
+    const int Hid = blockIdx.x;
+    const int Wid = blockIdx.y;
+    const int sid = Hid * img_width + Wid;
+    const int bid = blockIdx.z;
+    const int size_half_d = size_d >> 1;
+
+    const int offset_h   = bid * stride_b + sid * stride_s;
+    const int offset_h_f = Hid * size_half_d;
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout + offset_h,
+        p_inout + offset_h,
+        p_cos_h + offset_h_f,
+        p_sin_h + offset_h_f,
+        size_h, size_half_d, size_half_d,
+        stride_h, stride_d,
+        stride_h, stride_d);
+
+    const int offset_w   = offset_h + size_half_d * stride_d;
+    const int offset_w_f = Wid * size_half_d;
+    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        p_inout + offset_w,
+        p_inout + offset_w,
+        p_cos_w + offset_w_f,
+        p_sin_w + offset_w_f,
+        size_h, size_half_d, size_half_d,
+        stride_h, stride_d,
+        stride_h, stride_d);
+}
+
 // =====================================================================================================================
 // Dispatches
 //
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_1c_sbhd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1129,16 +1536,33 @@ void dispatch_1c_sbhd_uncached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output,
-        p_input,
-        p_freqs,
-        size_h, size_d, size_f,
-        stride_i_s, stride_i_b, stride_i_h, stride_i_d,
-        stride_o_s, stride_o_b, stride_o_h, stride_o_d);
+    if (p_output == p_input)
+    {
+        assert(stride_i_s == stride_o_s);
+        assert(stride_i_b == stride_o_b);
+        assert(stride_i_h == stride_o_h);
+        assert(stride_i_d == stride_o_d);
+
+        kn_entry_1c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_freqs,
+            size_h, size_d, size_f,
+            stride_i_s, stride_i_b, stride_i_h, stride_i_d);
+    }
+    else
+    {
+        kn_entry_1c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_input,
+            p_freqs,
+            size_h, size_d, size_f,
+            stride_i_s, stride_i_b, stride_i_h, stride_i_d,
+            stride_o_s, stride_o_b, stride_o_h, stride_o_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_uncached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1157,20 +1581,43 @@ void dispatch_2c_sbhd_uncached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output_x,
-        p_output_y,
-        p_input_x,
-        p_input_y,
-        p_freqs,
-        size_h, size_d, size_f,
-        stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-        stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-        stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-        stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
+    {
+        assert(stride_ix_s == stride_ox_s);
+        assert(stride_ix_b == stride_ox_b);
+        assert(stride_ix_h == stride_ox_h);
+        assert(stride_ix_d == stride_ox_d);
+        assert(stride_iy_s == stride_oy_s);
+        assert(stride_iy_b == stride_oy_b);
+        assert(stride_iy_h == stride_oy_h);
+        assert(stride_iy_d == stride_oy_d);
+
+        kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_freqs,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+    }
+    else
+    {
+        kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_input_x,
+            p_input_y,
+            p_freqs,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_1c_sbhd_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1186,16 +1633,33 @@ void dispatch_1c_sbhd_cached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output,
-        p_input,
-        p_cos, p_sin,
-        size_h, size_d, size_f,
-        stride_i_s, stride_i_b, stride_i_h, stride_i_d,
-        stride_o_s, stride_o_b, stride_o_h, stride_o_d);
+    if (p_output == p_input)
+    {
+        assert(stride_i_s == stride_o_s);
+        assert(stride_i_b == stride_o_b);
+        assert(stride_i_h == stride_o_h);
+        assert(stride_i_d == stride_o_d);
+
+        kn_entry_1c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_cos, p_sin,
+            size_h, size_d, size_f,
+            stride_i_s, stride_i_b, stride_i_h, stride_i_d);
+    }
+    else
+    {
+        kn_entry_1c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_input,
+            p_cos, p_sin,
+            size_h, size_d, size_f,
+            stride_i_s, stride_i_b, stride_i_h, stride_i_d,
+            stride_o_s, stride_o_b, stride_o_h, stride_o_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_cached(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1215,20 +1679,43 @@ void dispatch_2c_sbhd_cached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output_x,
-        p_output_y,
-        p_input_x,
-        p_input_y,
-        p_cos, p_sin,
-        size_h, size_d, size_f,
-        stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-        stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-        stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-        stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
+    {
+        assert(stride_ix_s == stride_ox_s);
+        assert(stride_ix_b == stride_ox_b);
+        assert(stride_ix_h == stride_ox_h);
+        assert(stride_ix_d == stride_ox_d);
+        assert(stride_iy_s == stride_oy_s);
+        assert(stride_iy_b == stride_oy_b);
+        assert(stride_iy_h == stride_oy_h);
+        assert(stride_iy_d == stride_oy_d);
+
+        kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_cos, p_sin,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+    }
+    else
+    {
+        kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_input_x,
+            p_input_y,
+            p_cos, p_sin,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_cached_indirect(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1249,21 +1736,45 @@ void dispatch_2c_sbhd_cached_indirect(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output_x,
-        p_output_y,
-        p_input_x,
-        p_input_y,
-        p_cos, p_sin,
-        p_indirect_buffer,
-        size_h, size_d, size_f,
-        stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-        stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-        stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-        stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
+    {
+        assert(stride_ix_s == stride_ox_s);
+        assert(stride_ix_b == stride_ox_b);
+        assert(stride_ix_h == stride_ox_h);
+        assert(stride_ix_d == stride_ox_d);
+        assert(stride_iy_s == stride_oy_s);
+        assert(stride_iy_b == stride_oy_b);
+        assert(stride_iy_h == stride_oy_h);
+        assert(stride_iy_d == stride_oy_d);
+
+        kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_cos, p_sin,
+            p_indirect_buffer,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+    }
+    else
+    {
+        kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_input_x,
+            p_input_y,
+            p_cos, p_sin,
+            p_indirect_buffer,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_cached_indirect2(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1285,22 +1796,47 @@ void dispatch_2c_sbhd_cached_indirect2(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output_x,
-        p_output_y,
-        p_input_x,
-        p_input_y,
-        p_cos, p_sin,
-        p_indirect_buffer_0,
-        p_indirect_buffer_1,
-        size_h, size_d, size_f,
-        stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-        stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-        stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-        stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
+    {
+        assert(stride_ix_s == stride_ox_s);
+        assert(stride_ix_b == stride_ox_b);
+        assert(stride_ix_h == stride_ox_h);
+        assert(stride_ix_d == stride_ox_d);
+        assert(stride_iy_s == stride_oy_s);
+        assert(stride_iy_b == stride_oy_b);
+        assert(stride_iy_h == stride_oy_h);
+        assert(stride_iy_d == stride_oy_d);
+
+        kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_cos, p_sin,
+            p_indirect_buffer_0,
+            p_indirect_buffer_1,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+    }
+    else
+    {
+        kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output_x,
+            p_output_y,
+            p_input_x,
+            p_input_y,
+            p_cos, p_sin,
+            p_indirect_buffer_0,
+            p_indirect_buffer_1,
+            size_h, size_d, size_f,
+            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_1c_thd_uncached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1316,17 +1852,34 @@ void dispatch_1c_thd_uncached(
     const dim3 grid(size_max_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_thd_uncached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output,
-        p_input,
-        p_cu_seqlens,
-        p_freqs,
-        size_h, size_d, size_f,
-        stride_i_t, stride_i_h, stride_i_d,
-        stride_o_t, stride_o_h, stride_o_d);
+    if (p_output == p_input)
+    {
+        assert(stride_i_t == stride_o_t);
+        assert(stride_i_h == stride_o_h);
+        assert(stride_i_d == stride_o_d);
+
+        kn_entry_1c_thd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_cu_seqlens,
+            p_freqs,
+            size_h, size_d, size_f,
+            stride_i_t, stride_i_h, stride_i_d);
+    }
+    else
+    {
+        kn_entry_1c_thd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_input,
+            p_cu_seqlens,
+            p_freqs,
+            size_h, size_d, size_f,
+            stride_i_t, stride_i_h, stride_i_d,
+            stride_o_t, stride_o_h, stride_o_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, typename scalar_t, typename scalar_f_t>
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_1c_2d_cached(
     scalar_t* __restrict__         p_output,
     const scalar_t* __restrict__   p_input,
@@ -1344,428 +1897,769 @@ void dispatch_1c_2d_cached(
     const dim3 grid(img_height, img_width, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    kn_entry_1c_2d_cached<Op, RotateStyle, ReuseFreqsFrontPart><<<grid, block, 0, stream>>>(
-        p_output,
-        p_input,
-        p_cos_h, p_sin_h,
-        p_cos_w, p_sin_w,
-        img_width, size_h, size_d,
-        stride_i_b, stride_i_s, stride_i_h, stride_i_d,
-        stride_o_b, stride_o_s, stride_o_h, stride_o_d);
+    if (p_output == p_input)
+    {
+        assert(stride_i_s == stride_o_s);
+        assert(stride_i_b == stride_o_b);
+        assert(stride_i_h == stride_o_h);
+        assert(stride_i_d == stride_o_d);
+
+        kn_entry_1c_2d_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_cos_h, p_sin_h,
+            p_cos_w, p_sin_w,
+            img_width, size_h, size_d,
+            stride_i_b, stride_i_s, stride_i_h, stride_i_d);
+    }
+    else
+    {
+        kn_entry_1c_2d_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
+            p_output,
+            p_input,
+            p_cos_h, p_sin_h,
+            p_cos_w, p_sin_w,
+            img_width, size_h, size_d,
+            stride_i_b, stride_i_s, stride_i_h, stride_i_d,
+            stride_o_b, stride_o_s, stride_o_h, stride_o_d);
+    }
 }
 
-#define DISPATCH_ROPE_TYPES_PARAMS(TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NAME, ...)      \
-    switch(TYPE0) {                                                                                    \
-        case at::ScalarType::Float: {                                                                  \
-            using scalar_t_0 = float;                                                                  \
-            switch(TYPE1)                                                                              \
-            {                                                                                          \
-                case at::ScalarType::Float: {                                                          \
-                    using scalar_t_1 = float;                                                          \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                case at::ScalarType::Half: {                                                           \
-                    using scalar_t_1 = at::Half;                                                       \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                case at::ScalarType::BFloat16: {                                                       \
-                    using scalar_t_1 = at::BFloat16;                                                   \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                default:                                                                               \
-                    TORCH_CHECK(false, NAME " does't support ",                                        \
-                        toString(TYPE0), " with ", toString(TYPE1), ".");                              \
-            }                                                                                          \
-            break;                                                                                     \
-        }                                                                                              \
-        case at::ScalarType::Half: {                                                                   \
-            using scalar_t_0 = at::Half;                                                               \
-            switch(TYPE1)                                                                              \
-            {                                                                                          \
-                case at::ScalarType::Float: {                                                          \
-                    using scalar_t_1 = float;                                                          \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                case at::ScalarType::Half: {                                                           \
-                    using scalar_t_1 = at::Half;                                                       \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                case at::ScalarType::BFloat16: {                                                       \
-                    using scalar_t_1 = at::BFloat16;                                                   \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                default:                                                                               \
-                    TORCH_CHECK(false, NAME " does't support ",                                        \
-                        toString(TYPE0), " with ", toString(TYPE1), ".");                              \
-            }                                                                                          \
-            break;                                                                                     \
-        }                                                                                              \
-        case at::ScalarType::BFloat16: {                                                               \
-            using scalar_t_0 = at::BFloat16;                                                           \
-            switch(TYPE1)                                                                              \
-            {                                                                                          \
-                case at::ScalarType::Float: {                                                          \
-                    using scalar_t_1 = float;                                                          \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                case at::ScalarType::Half: {                                                           \
-                    using scalar_t_1 = at::Half;                                                       \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                case at::ScalarType::BFloat16: {                                                       \
-                    using scalar_t_1 = at::BFloat16;                                                   \
-                    if (REUSE_FREQS_FRONT_PART)                                                        \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = true;                                     \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    else                                                                               \
-                    {                                                                                  \
-                        constexpr bool ReuseFreqsFrontPart = false;                                    \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                         \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                    \
-                        {                                                                              \
-                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                         \
-                            __VA_ARGS__;                                                               \
-                        }                                                                              \
-                        else                                                                           \
-                        {                                                                              \
-                            TORCH_CHECK(false, NAME " does't support rotate type ",                    \
-                                        std::to_string(ROTATE_STYLE), ".");                            \
-                        }                                                                              \
-                    }                                                                                  \
-                    break;                                                                             \
-                }                                                                                      \
-                default:                                                                               \
-                    TORCH_CHECK(false, NAME " does't support ",                                        \
-                        toString(TYPE0), " with ", toString(TYPE1), ".");                              \
-            }                                                                                          \
-            break;                                                                                     \
-        }                                                                                              \
-        default:                                                                                       \
-            TORCH_CHECK(false, NAME " does't support ", toString(TYPE0), ".");                         \
+#define DISPATCH_ROPE_TYPES_PARAMS(TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
+    switch(TYPE0) {                                                                                           \
+        case at::ScalarType::Float: {                                                                         \
+            using scalar_t_0 = float;                                                                         \
+            switch(TYPE1)                                                                                     \
+            {                                                                                                 \
+                case at::ScalarType::Float: {                                                                 \
+                    using scalar_t_1 = float;                                                                 \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                case at::ScalarType::Half: {                                                                  \
+                    using scalar_t_1 = at::Half;                                                              \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                case at::ScalarType::BFloat16: {                                                              \
+                    using scalar_t_1 = at::BFloat16;                                                          \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                default:                                                                                      \
+                    TORCH_CHECK(false, NAME " does't support ",                                               \
+                        toString(TYPE0), " with ", toString(TYPE1), ".");                                     \
+            }                                                                                                 \
+            break;                                                                                            \
+        }                                                                                                     \
+        case at::ScalarType::Half: {                                                                          \
+            using scalar_t_0 = at::Half;                                                                      \
+            switch(TYPE1)                                                                                     \
+            {                                                                                                 \
+                case at::ScalarType::Float: {                                                                 \
+                    using scalar_t_1 = float;                                                                 \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                case at::ScalarType::Half: {                                                                  \
+                    using scalar_t_1 = at::Half;                                                              \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                case at::ScalarType::BFloat16: {                                                              \
+                    using scalar_t_1 = at::BFloat16;                                                          \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                default:                                                                                      \
+                    TORCH_CHECK(false, NAME " does't support ",                                               \
+                        toString(TYPE0), " with ", toString(TYPE1), ".");                                     \
+            }                                                                                                 \
+            break;                                                                                            \
+        }                                                                                                     \
+        case at::ScalarType::BFloat16: {                                                                      \
+            using scalar_t_0 = at::BFloat16;                                                                  \
+            switch(TYPE1)                                                                                     \
+            {                                                                                                 \
+                case at::ScalarType::Float: {                                                                 \
+                    using scalar_t_1 = float;                                                                 \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                case at::ScalarType::Half: {                                                                  \
+                    using scalar_t_1 = at::Half;                                                              \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                case at::ScalarType::BFloat16: {                                                              \
+                    using scalar_t_1 = at::BFloat16;                                                          \
+                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = true;                                            \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    else                                                                                      \
+                    {                                                                                         \
+                        constexpr bool ReuseFreqsFrontPart = false;                                           \
+                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        {                                                                                     \
+                            constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
+                            if (NOPE_FIRST)                                                                   \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = true;                                              \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                            else                                                                              \
+                            {                                                                                 \
+                                constexpr bool NopeFirst = false;                                             \
+                                __VA_ARGS__;                                                                  \
+                            }                                                                                 \
+                        }                                                                                     \
+                        else                                                                                  \
+                        {                                                                                     \
+                            TORCH_CHECK(false, NAME " does't support rotate type ",                           \
+                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                        }                                                                                     \
+                    }                                                                                         \
+                    break;                                                                                    \
+                }                                                                                             \
+                default:                                                                                      \
+                    TORCH_CHECK(false, NAME " does't support ",                                               \
+                        toString(TYPE0), " with ", toString(TYPE1), ".");                                     \
+            }                                                                                                 \
+            break;                                                                                            \
+        }                                                                                                     \
+        default:                                                                                              \
+            TORCH_CHECK(false, NAME " does't support ", toString(TYPE0), ".");                                \
     }
 
 // =====================================================================================================================
@@ -1777,7 +2671,8 @@ void rope_fwd_impl(
     const torch::Tensor& input,         // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = input.size(0);
@@ -1801,8 +2696,9 @@ void rope_fwd_impl(
         freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_sbhd_uncached<Op1cUncachedFwd, ...>",
-        dispatch_1c_sbhd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             freqs.data_ptr<scalar_t_1>(),
@@ -1817,7 +2713,8 @@ void rope_bwd_impl(
     const torch::Tensor& output_grads,  // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = output_grads.size(0);
@@ -1841,8 +2738,9 @@ void rope_bwd_impl(
         freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_sbhd_uncached<Op1cUncachedBwd, ...>",
-        dispatch_1c_sbhd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             freqs.data_ptr<scalar_t_1>(),
@@ -1859,7 +2757,8 @@ void rope_2c_fwd_impl(
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = input_x.size(0);
@@ -1891,8 +2790,9 @@ void rope_2c_fwd_impl(
         freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_2c_sbhd_uncached<Op2cUncachedFwd, ...>",
-        dispatch_2c_sbhd_uncached<Op2cUncachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_uncached<Op2cUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -1913,7 +2813,8 @@ void rope_2c_bwd_impl(
     const torch::Tensor& output_grads_y,// [s, b, h, d]
     const torch::Tensor& freqs,         // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = output_grads_x.size(0);
@@ -1945,8 +2846,9 @@ void rope_2c_bwd_impl(
         freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_2c_sbhd_uncached<Op2cUncachedBwd, ...>",
-        dispatch_2c_sbhd_uncached<Op2cUncachedBwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_uncached<Op2cUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads_x.data_ptr<scalar_t_0>(),
             input_grads_y.data_ptr<scalar_t_0>(),
             output_grads_x.data_ptr<scalar_t_0>(),
@@ -1966,7 +2868,8 @@ void rope_cached_fwd_impl(
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = input.size(0);
@@ -1990,8 +2893,9 @@ void rope_cached_fwd_impl(
         cos.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_sbhd_cached<Op1cCachedFwd, ...>",
-        dispatch_1c_sbhd_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
@@ -2008,7 +2912,8 @@ void rope_cached_bwd_impl(
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = output_grads.size(0);
@@ -2032,8 +2937,9 @@ void rope_cached_bwd_impl(
         cos.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_sbhd_cached<Op1cCachedBwd, ...>",
-        dispatch_1c_sbhd_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_sbhd_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
@@ -2052,7 +2958,8 @@ void rope_cached_2c_fwd_impl(
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = input_x.size(0);
@@ -2084,8 +2991,9 @@ void rope_cached_2c_fwd_impl(
         cos.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_2c_sbhd_cached<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_cached<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -2108,7 +3016,8 @@ void rope_cached_2c_bwd_impl(
     const torch::Tensor& cos,           // [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = output_grads_x.size(0);
@@ -2140,8 +3049,9 @@ void rope_cached_2c_bwd_impl(
         cos.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_2c_sbhd_cached<Op2cCachedBwd, ...>",
-        dispatch_2c_sbhd_cached<Op2cCachedBwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_cached<Op2cCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads_x.data_ptr<scalar_t_0>(),
             input_grads_y.data_ptr<scalar_t_0>(),
             output_grads_x.data_ptr<scalar_t_0>(),
@@ -2165,7 +3075,8 @@ void rope_cached_positions_2c_fwd_impl(
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& positions,     // [s]
     const int32_t        rotate_style,  // 0: NEOX style, 1: GPT-J style
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = input_x.size(0);
@@ -2199,8 +3110,9 @@ void rope_cached_positions_2c_fwd_impl(
         cos.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_2c_sbhd_cached_indirect<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached_indirect<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_cached_indirect<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -2226,7 +3138,8 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const torch::Tensor& positions,     // [s]
     const torch::Tensor& offsets,       // [s]
     const int32_t        rotate_style,  // 0: NEOX style, 1: GPT-J style
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_s = input_x.size(0);
@@ -2261,8 +3174,9 @@ void rope_cached_positions_offsets_2c_fwd_impl(
         cos.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_2c_sbhd_cached_indirect2<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached_indirect2<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_2c_sbhd_cached_indirect2<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -2285,7 +3199,8 @@ void rope_thd_fwd_impl(
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d]
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_h     = input.size(1);
@@ -2307,8 +3222,9 @@ void rope_thd_fwd_impl(
         freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_thd_uncached<Op1cUncachedFwd, ...>",
-        dispatch_1c_thd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_thd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cu_seqlens.data_ptr<int32_t>(),
@@ -2325,7 +3241,8 @@ void rope_thd_bwd_impl(
     const torch::Tensor& cu_seqlens,    // [b + 1]
     const torch::Tensor& freqs,         // [max_s, 1, 1, d]
     const int            rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int32_t size_h     = output_grads.size(1);
@@ -2347,8 +3264,9 @@ void rope_thd_bwd_impl(
         freqs.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_thd_uncached<Op1cUncachedBwd, ...>",
-        dispatch_1c_thd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_thd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cu_seqlens.data_ptr<int32_t>(),
@@ -2369,7 +3287,8 @@ void rope_2d_fwd_impl(
     const int32_t        img_height,
     const int32_t        img_width,
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int size_b = input.size(0);
@@ -2394,8 +3313,9 @@ void rope_2d_fwd_impl(
         cos_h.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_2d_cached<Op1cCachedFwd, ...>",
-        dispatch_1c_2d_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_2d_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cos_h.data_ptr<scalar_t_1>(),
@@ -2418,7 +3338,8 @@ void rope_2d_bwd_impl(
     const int32_t        img_height,
     const int32_t        img_width,
     const int32_t        rotate_style,
-    const bool           reuse_freqs_front_part)
+    const bool           reuse_freqs_front_part,
+    const bool           nope_first)
 {
     // Get sizes of input and output
     const int size_b = output_grads.size(0);
@@ -2443,8 +3364,9 @@ void rope_2d_bwd_impl(
         cos_h.scalar_type(),
         rotate_style,
         reuse_freqs_front_part,
+        nope_first,
         "dispatch_1c_2d_cached<Op1cCachedBwd, ...>",
-        dispatch_1c_2d_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart>(
+        dispatch_1c_2d_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cos_h.data_ptr<scalar_t_1>(),
