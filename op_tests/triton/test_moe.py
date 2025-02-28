@@ -12,12 +12,27 @@ import sys
 from aiter.ops.triton.moe_op import fused_moe as triton_moe 
 
 
-def torch_moe(a, b, c, a_scale, b_scale, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16):
+def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16):
     if fp8_w8a8:
         a , _ , a_scale = quantize_fp8(a)
 
-    M, top_k, _ = c.shape
-    
+    M, top_k, N = c.shape
+    _, K = a.shape
+
+    if int4_w4a16:
+        b = torch.repeat_interleave(b, repeats=2, dim=2) #Expand to (E, N, K) 
+        b_shifter = ((torch.arange(0, K, device=b.device) % 2)*4)[None, None, :]
+        b = (b >> b_shifter) & 0xF
+        b_scale = torch.repeat_interleave(b_scale, repeats=group_size, dim=2) #(E, N, K)
+        if b_zp is not None:
+            b_zp = torch.repeat_interleave(b_zp, repeats=2, dim=1) #(E,N//2,K//group_size) -> (E, N, K // group_size)
+            b_zp = torch.repeat_interleave(b_zp, repeats=group_size, dim=2) #(E,N,K//group_size) -> (E, N, K)
+            b_zp_shifter = ((torch.arange(0,N, device=b.device) % 2) * 4)[None, :, None]
+            b_zp = ((b_zp >> b_zp_shifter) & 0xF)
+            b = ((b - b_zp) * b_scale)
+        else:
+            b = ((b - 8) * b_scale)
+
     # Repeat a -> (M, top_k, K)
     a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
     # (M, top_k, N, K)
@@ -172,6 +187,49 @@ def quantize_int8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Te
 
     return tensor_quantized, scale, 1 / scale
 
+def quantize_int4(tensor: torch.Tensor, group_size: int, has_zp: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    #reshape tensor
+    k, n = tensor.shape
+    tensor = tensor.reshape(-1, group_size, n)
+    tensor = tensor.permute(1, 0, 2)
+    
+    max_val = torch.max(tensor, 0, keepdim=True).values
+    min_val = torch.min(tensor, 0, keepdim=True).values
+
+    #Asymmetric quantization
+    zp = None
+    if has_zp:
+        max_q_val = 15
+        min_q_val = 0  #Min maps to 0
+        scale = (max_val - min_val).clamp(min=1e-5) / (max_q_val)
+        zp = torch.round(torch.abs(min_val / scale)).clamp(min_q_val, max_q_val).int()
+    #Symmetric quantization
+    else:
+        max_q_val = 7 
+        min_q_val = -7  
+        scale = max_val / max_q_val
+
+    #quantize and clamp
+    tensor_q = torch.round(tensor / scale).int() + (zp if has_zp else 0)
+    tensor_q = torch.clamp(tensor, min_q_val, max_q_val)
+
+    #restore shapes
+    tensor_q = tensor_q.reshape((group_size, - 1, n))
+    tensor_q = tensor_q.permute(1, 0 , 2)
+    tensor_q = tensor_q.reshape((k, n)).contiguous()
+
+    #scale
+    scale = scale.reshape((-1, n)).contiguous()
+
+    #zp
+    if zp is not None:
+        zp = zp.reshape((-1, n)).contiguous()
+        zp = zp.to(device=tensor.device)
+
+    #print(f"tensor_q={tensor_q}, scale={scale}, zp={zp}")
+    return tensor_q, scale, zp
+
 
 def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, dtype, fp8_w8a8: bool, int8_w8a16: bool):
     assert not (fp8_w8a8 and int8_w8a16)
@@ -202,11 +260,53 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
 
     return a, b, c, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
 
+def input_helper_int4_w4a16(M: int, N: int, K: int , top_k: int, E: int, routed_weight: bool, dtype: torch.dtype, group_size: int, has_zp: bool):
+
+    a = torch.randn((M, K), dtype=dtype, device='cuda')
+    b = torch.rand((E, N, K), dtype=dtype, device='cuda')
+    print(f"b_orig.shape={b.shape} b_orig={b}")
+
+    b_q = torch.empty((E, N, K // 2), dtype=torch.uint8, device='cuda')
+    b_scale = torch.empty((E, N, K // group_size), dtype=dtype, device='cuda')
+    if has_zp:
+        b_zp = torch.empty((E, N // 2, K // group_size), dtype=torch.uint8, device='cuda')
+    else:
+        b_zp = None
+
+    for e in range(E):
+        q, scale, zp = quantize_int4(b[e].T, group_size=group_size, has_zp=has_zp)
+        q = q.T
+        q = q[:, 1::2] * 16 + q[:, ::2] #Note, 2<<4=16. For bf16, etc, torch doesn't have shift. 
+        b_q[e] = q
+        b_scale[e] = scale.T
+        if has_zp:
+            zp = zp.T.contiguous().to(torch.uint8)
+            zp = zp[1::2, :] << 4 | zp[::2, :] #Note, 2<<4=16. For bf16, etc, torch doesn't have shift. 
+            b_zp[e] = zp
+        
+    #print(f"b_scale.shape={b_scale.shape}")
+    #print(f"b_q.shape={b_q.shape}")
+    if has_zp:
+        print(f"b_zp={b_zp}")
+    b = b_q
+
+    c = torch.zeros((M, top_k, N), dtype=dtype, device='cuda')
+
+    values = torch.randn(M, E, dtype=dtype, device='cuda')
+
+    softmax_vals = torch.softmax(values, dim=1)
+    topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
+
+    config = get_default_config()
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
+
+    return a, b, c, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
+
 
 torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, torch.float32 : tl.float32}
 
 
-#Note: TODO This four result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
+#Note: TODO These 2 result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
 #@pytest.mark.parametrize("M, N, K, top_k, E", [(64, 14336, 4096, 2, 8), (16, 14336, 1, 2, 4), (4, 4, 8, 1, 2),
 #                                               (1, 14336, 128, 2, 4), (3, 14336, 128, 2, 4), (16, 14336, 128, 1, 4),
 #                                               (16, 14336, 128, 1, 1), (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8),
@@ -229,8 +329,30 @@ def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: 
                        num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16, False)
 
     torch_out = torch.empty_like(triton_out)
-    torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
-                        num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16)
+    torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, None, 0, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
+                        num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, False)
 
     # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+@pytest.mark.parametrize("M, N, K, top_k, E", [(1, 64, 128, 1, 2), (1, 64, 128, 2, 4), (4, 32, 64, 4, 16), (8, 96, 256, 2, 16)])
+@pytest.mark.parametrize('routed_weight', [False, True])
+@pytest.mark.parametrize('group_size',[8, 16, 32, 64])
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize('has_zp',[False, True])
+def test_fused_moe_int4_w4a16(M: int, N: int, K: int, top_k:int, E: int, 
+                                routed_weight: bool, dtype: torch.dtype, group_size: int, 
+                                has_zp: bool
+):
+    torch.manual_seed(20)
+    a, b, triton_out, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper_int4_w4a16(
+        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, group_size=group_size, has_zp=has_zp)
+
+    triton_moe(a, b, triton_out, None, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=True, block_shape=(0, group_size))
+
+    torch_out = torch.empty_like(triton_out)
+    torch_out = torch_moe(a, b, torch_out, None, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, False, False, True)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
