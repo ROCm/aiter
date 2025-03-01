@@ -50,6 +50,14 @@ def hip_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos, sin, positio
     return aiter.rope_cached_positions_offsets_2c_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
 
 @perftest()
+def hip_rope_cached_positions_2d_fwd_inplace(input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first):
+    return aiter.rope_cached_positions_2c_fwd_inplace(input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
+
+@perftest()
+def hip_rope_cached_positions_offsets_2d_fwd_inplace(input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first):
+    return aiter.rope_cached_positions_offsets_2c_fwd_inplace(input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
+
+@perftest()
 def hip_rope_thd_fwd(input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first):
     return aiter.rope_thd_fwd(input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first)
 
@@ -64,6 +72,19 @@ def hip_rope_2d_fwd(input, height, width, cos_h, sin_h, cos_w, sin_w, rotate_sty
 @perftest()
 def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, rotate_style, reuse_freqs_front_part, nope_first):
     return aiter.rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, rotate_style, reuse_freqs_front_part, nope_first)
+
+@perftest()
+def legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos_sin, positions, rotate_style, nope_first):
+    s, b, h, d = input_x.shape
+    aiter.rotary_embedding_fwd(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos_sin, rotate_style is RotateStyle.NEOX)
+    return input_x, input_y
+
+@perftest()
+def legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos_sin, positions, offsets, rotate_style, nope_first):
+    s, b, h, d = input_x.shape
+    rotate_dim =  cos_sin.size(1)
+    aiter.batched_rotary_embedding(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos_sin, rotate_style is RotateStyle.NEOX, rotate_dim, offsets.view(-1))
+    return input_x, input_y
 
 
 class RotateStyle(IntEnum):
@@ -206,8 +227,8 @@ nope_first: {nope_first}, \
 transpose_output: {transpose_output}
 """
 
-    ref_x = ref_rope_sbhd_fwd(input_x, freqs[positions if offsets is None else torch.add(positions, offsets)], rotate_style, reuse_freqs_front_part, nope_first)
-    ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)], rotate_style, reuse_freqs_front_part, nope_first)
+    ref_x = ref_rope_sbhd_fwd(input_x, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, reuse_freqs_front_part, nope_first)
+    ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, reuse_freqs_front_part, nope_first)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
@@ -221,6 +242,53 @@ transpose_output: {transpose_output}
 
     checkAllclose(ref_x, hip_cached_fwd_x, msg=f"rope_cached_position_2d_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_y, hip_cached_fwd_y, msg=f"rope_cached_position_2d_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
+
+
+def compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first, check_correction=False):
+    input_msg = f"""dtype: {input_x.dtype}, \
+freq_dtype: {freqs.dtype}, \
+dim_input: {str(input_x.shape):<20}, \
+dim_freqs: {str(freqs.shape):<20}, \
+dim_positions: {str(positions.shape):<20}, \
+dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
+rotate_style: {rotate_style.value}, \
+nope_first: {nope_first}
+"""
+
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+    cos_sin = torch.cat((cos, sin), dim=-1).squeeze(1,2)
+
+    # perftest cannot test correction of inplace operators
+    if check_correction:
+        ref_x = ref_rope_sbhd_fwd(input_x, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
+        ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
+        s, b, h, d = input_x.shape
+        hip_input_x, hip_input_y = input_x.clone(), input_y.clone()
+        leg_input_x, leg_input_y = input_x.clone().view(s * b, -1), input_y.clone().view(s * b, -1)
+        if offsets is None:
+            aiter.rope_cached_positions_2c_fwd_inplace(hip_input_x, hip_input_y, cos, sin, positions, rotate_style, True, nope_first)
+            aiter.rotary_embedding_fwd(positions, leg_input_x, leg_input_y, d, cos_sin, rotate_style is RotateStyle.NEOX)
+        else:
+            aiter.rope_cached_positions_offsets_2c_fwd_inplace(hip_input_x, hip_input_y, cos, sin, positions, offsets, rotate_style, True, nope_first)
+            aiter.batched_rotary_embedding(positions, leg_input_x, leg_input_y, d, cos_sin, rotate_style is RotateStyle.NEOX, cos_sin.size(1), offsets.view(-1))
+
+        checkAllclose(ref_x, hip_input_x, msg=f"correction: hip_fwd_x - {input_msg}\n")
+        checkAllclose(ref_y, hip_input_y, msg=f"correction: hip_fwd_y - {input_msg}\n")
+        checkAllclose(ref_x, leg_input_x.view(s, b, h, d), msg=f"correction: leg_fwd_x - {input_msg}\n")
+        checkAllclose(ref_y, leg_input_y.view(s, b, h, d), msg=f"correction: leg_fwd_y - {input_msg}\n")
+
+    if offsets is None:
+        _, hip_cached_fwd_avg = hip_rope_cached_positions_2d_fwd_inplace(
+            input_x, input_y, cos, sin, positions, rotate_style, True, nope_first)
+        _, leg_cached_fwd_avg = legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos_sin, positions, rotate_style, nope_first)
+    else:
+        _, hip_cached_fwd_avg = hip_rope_cached_positions_offsets_2d_fwd_inplace(
+            input_x, input_y, cos, sin, positions, offsets, rotate_style, True, nope_first)
+        _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos_sin, positions, offsets, rotate_style, nope_first)
+
+    print(f"{input_msg}\nhip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us.")
+
 
 
 def test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first):
@@ -328,7 +396,7 @@ if __name__ == "__main__":
         transpose_output_,
         rotate_style_,
         rotary_percent_and_reuse_,
-        (True, False),
+        (False, True),
         batch_size_, seq_size_, head_size_, hidden_dim_
     ):
         rotary_percent = rotary_percent_and_reuse[0]
@@ -336,13 +404,44 @@ if __name__ == "__main__":
         nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
         freqs_ratio = 2 if reuse_freqs_front_part else 1
         freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
-        positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,), device="cuda")
-        offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,), device="cuda") if has_offsets else None
+        positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
+        offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
         input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
         grad_x  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
         test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+    # Compare new with legacy
+    # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
+    rotary_percent_and_reuse_compare_ = (
+        (1.0, True, False),
+        (0.5, True, False),)
+    for (dtype, fdtype,
+         transpose_output,
+         rotate_style,
+         rotary_percent_and_reuse,
+         has_offsets,
+         b, s, h, d
+    ) in itertools.product(
+        dtype_, dtype_,
+        transpose_output_,
+        rotate_style_,
+        rotary_percent_and_reuse_compare_,
+        (False, True),
+        batch_size_, seq_size_, head_size_, hidden_dim_
+    ):
+        rotary_percent = rotary_percent_and_reuse[0]
+        reuse_freqs_front_part = rotary_percent_and_reuse[1]
+        nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
+        freqs_ratio = 2 if reuse_freqs_front_part else 1
+        freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+        positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
+        offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
+        input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+        input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+        compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first)
+    exit()
 
     # Test thd format for uncached
     cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
