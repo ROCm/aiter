@@ -1248,7 +1248,8 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
     const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_f  = p_indirect_buffer[sid] * size_f;
+    const int32_t ib_idx    = sid * gridDim.y + bid;
+    const int64_t offset_f  = p_indirect_buffer[ib_idx] * size_f;
 
     Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output_x + offset_ox,
@@ -1281,7 +1282,8 @@ __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
     const int32_t bid      = blockIdx.y;
     const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
     const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
-    const int32_t offset_f = p_indirect_buffer[sid] * size_f;
+    const int32_t ib_idx    = sid * gridDim.y + bid;
+    const int64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
 
     Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
         p_inout_x + offset_x,
@@ -1321,7 +1323,8 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
     const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
     const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_f  = (p_indirect_buffer_0[sid] + p_indirect_buffer_1[sid]) * size_f;
+    const int32_t ib_idx    = sid * gridDim.y + bid;
+    const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
     Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output_x + offset_ox,
@@ -1355,7 +1358,8 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
     const int32_t bid       = blockIdx.y;
     const int32_t offset_x  = sid * stride_x_s + bid * stride_x_b;
     const int32_t offset_y  = sid * stride_y_s + bid * stride_y_b;
-    const int32_t offset_f  = (p_indirect_buffer_0[sid] + p_indirect_buffer_1[sid]) * size_f;
+    const int32_t ib_idx    = sid * gridDim.y + bid;
+    const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
     Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
         p_inout_x + offset_x,
@@ -3073,7 +3077,7 @@ void rope_cached_positions_2c_fwd_impl(
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
-    const torch::Tensor& positions,     // [s]
+    const torch::Tensor& positions,     // [s, b]
     const int32_t        rotate_style,  // 0: NEOX style, 1: GPT-J style
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -3103,7 +3107,7 @@ void rope_cached_positions_2c_fwd_impl(
     const int32_t stride_oy_h = output_y.stride(2);
     const int32_t stride_oy_d = output_y.stride(3);
     // Get strides of positions and offsets
-    assert(1 == positions.stride(0) && 1 == positions.dim());
+    assert(1 == positions.stride(1) && 2 == positions.dim());
 
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
@@ -3135,8 +3139,8 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const torch::Tensor& input_y,       // [s, b, h, d]
     const torch::Tensor& cos,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
     const torch::Tensor& sin,           // [s, 1, 1, d // 2] if reuse_freqs_front_part else [s, 1, 1, d]
-    const torch::Tensor& positions,     // [s]
-    const torch::Tensor& offsets,       // [s]
+    const torch::Tensor& positions,     // [s, b]
+    const torch::Tensor& offsets,       // [s, b]
     const int32_t        rotate_style,  // 0: NEOX style, 1: GPT-J style
     const bool           reuse_freqs_front_part,
     const bool           nope_first)
@@ -3166,8 +3170,8 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const int32_t stride_oy_h = output_y.stride(2);
     const int32_t stride_oy_d = output_y.stride(3);
     // Get strides of positions and offsets
-    assert(1 == positions.stride(0) && 1 == positions.dim());
-    assert(1 == offsets.stride(0)   && 1 == offsets.dim());
+    assert(1 == positions.stride(1) && 2 == positions.dim());
+    assert(1 == offsets.stride(1)   && 2 == offsets.dim());
 
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),

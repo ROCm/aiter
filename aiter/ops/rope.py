@@ -189,7 +189,7 @@ def rope_cached_positions_2c_fwd_impl(
 ):
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
-    on two channels. Offsets here is optional.
+    on two channels. Offsets here is optional. Both positions and offsets should be in [s, b].
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
     if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
@@ -214,7 +214,7 @@ def rope_cached_positions_offsets_2c_fwd_impl(
 ):
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
-    on two channels. Offsets here is optional.
+    on two channels. Offsets here is optional. Both positions and offsets should be in [s, b].
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
     if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
@@ -335,6 +335,16 @@ def rope_fwd(
     rope_fwd_impl(output, input, freqs, rotate_style, reuse_freqs_front_part, nope_first)
     return output
 
+def rope_fwd_inplace(
+    input: Tensor,
+    freqs: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_fwd_impl(input, input, freqs, rotate_style, reuse_freqs_front_part, nope_first)
+    return input
+
 def rope_bwd(
     output_grads: Tensor,
     freqs: Tensor,
@@ -365,6 +375,17 @@ def rope_2c_fwd(
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_2c_fwd_impl(output_x, output_y, input_x, input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
+
+def rope_2c_fwd_inplace(
+    input_x: Tensor,
+    input_y: Tensor,
+    freqs: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_2c_fwd_impl(input_x, input_y, input_x, input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first)
+    return input_x, input_y
 
 def rope_2c_bwd(
     output_grads_x: Tensor,
@@ -398,6 +419,17 @@ def rope_cached_fwd(
     rope_cached_fwd_impl(output, input, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
     return output
 
+def rope_cached_fwd_inplace(
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_cached_fwd_impl(input, input, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
+    return input
+
 def rope_cached_bwd(
     output_grads: Tensor,
     cos: Tensor,
@@ -430,6 +462,18 @@ def rope_cached_2c_fwd(
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_cached_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
+
+def rope_cached_2c_fwd_inplace(
+    input_x: Tensor,
+    input_y: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_cached_2c_fwd_impl(input_x, input_y, input_x, input_y, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
+    return input_x, input_y
 
 def rope_cached_2c_bwd(
     output_grads_x: Tensor,
@@ -468,6 +512,18 @@ def rope_cached_positions_2c_fwd(
     rope_cached_positions_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
 
+def rope_cached_positions_2c_fwd_inplace(
+    input_x: Tensor,
+    input_y: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_cached_positions_2c_fwd_impl(input_x, input_y, input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
+
 def rope_cached_positions_offsets_2c_fwd(
     input_x: Tensor,
     input_y: Tensor,
@@ -488,6 +544,19 @@ def rope_cached_positions_offsets_2c_fwd(
     rope_cached_positions_offsets_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
 
+def rope_cached_positions_offsets_2c_fwd_inplace(
+    input_x: Tensor,
+    input_y: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_cached_positions_offsets_2c_fwd_impl(input_x, input_y, input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
+
 def rope_thd_fwd(
     input: Tensor,
     cu_seqlens: Tensor,
@@ -499,6 +568,17 @@ def rope_thd_fwd(
     output = empty_like(input, requires_grad=False)
     rope_thd_fwd_impl(output, input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first)
     return output
+
+def rope_thd_fwd_inplace(
+    input: Tensor,
+    cu_seqlens: Tensor,
+    freqs: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_thd_fwd_impl(input, input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first)
+    return input
 
 def rope_thd_bwd(
     output_grads: Tensor,
@@ -527,6 +607,21 @@ def rope_2d_fwd(
     output = empty_like(input, requires_grad=False)
     rope_2d_fwd_impl(output, input, cos_h, sin_h, cos_w, sin_w, img_height, img_width, rotate_style, reuse_freqs_front_part, nope_first)
     return output
+
+def rope_2d_fwd_inplace(
+    input: Tensor,
+    cos_h: Tensor,
+    sin_h: Tensor,
+    cos_w: Tensor,
+    sin_w: Tensor,
+    img_height: int,
+    img_width: int,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_2d_fwd_impl(input, input, cos_h, sin_h, cos_w, sin_w, img_height, img_width, rotate_style, reuse_freqs_front_part, nope_first)
+    return input
 
 def rope_2d_bwd(
     output_grads: Tensor,
