@@ -28,6 +28,7 @@ from .ops.rmsnorm import *
 from .ops.communication import *
 from .ops.rope import *
 from .ops.mha import *
+from . import mla
 
 def getLogger():
     global logger
