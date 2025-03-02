@@ -46,6 +46,7 @@ else:
     print("aiter is not installed.")
 
 AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
+os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
@@ -247,9 +248,9 @@ def get_args_of_build(ops_name: str, exclue=[]):
 
     def convert(d_ops: dict):
         # judge isASM
-        if d_ops["isASM"].lower() == "true":
-            d_ops["flags_extra_hip"].append(
-                "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
+        # if d_ops["isASM"].lower() == "true":
+        #     d_ops["flags_extra_hip"].append(
+        #         "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
         del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):

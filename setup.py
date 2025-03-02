@@ -73,7 +73,7 @@ if IS_ROCM:
 
     # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
     # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = [f'-DAITER_ASM_DIR="{this_dir}/hsa/"']
+    generator_flag = []
     torch_dir = torch.__path__[0]
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag.append("-DOLD_GENERATOR_PATH")
@@ -192,6 +192,7 @@ if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
 shutil.copytree("3rdparty", "aiter_meta/3rdparty")
 shutil.copytree("hsa", "aiter_meta/hsa")
 shutil.copytree("csrc", "aiter_meta/csrc")
+os.chmod("aiter_meta", 0o777)
 
 
 
