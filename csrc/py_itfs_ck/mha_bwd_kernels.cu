@@ -1,31 +1,38 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
+#include "mha_bwd.h"
 
-#include "fmha_bwd.hpp"
-#include "mask.hpp"
+float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
+    float r = fmha_bwd_v3(traits, args, stream_config);
+    if (r == -1) {
+        r = fmha_bwd(traits, args, stream_config);
+    }
+    return r;
+}
 
-fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
+fmha_bwd_traits_all get_ck_fmha_bwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size,
                                        bool has_dropout,
                                        bool enable_alibi,
-                                       bool deterministic)
+                                       bool deterministic,
+                                       bool use_ext_asm,
+                                       bool is_v3_atomic_fp32,
+                                       int how_v3_bf16_cvt)
 {
-    return fmha_bwd_traits{head_size,
-                           head_size,
-                           dtype,
-                           false, // is_group_mode
-                           mask.type,
-                           enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
-                           false,    // has_dbias
-                           has_dropout,
-                           false, // s_randval
-                           deterministic};
+    return fmha_bwd_traits_all(mask,
+                    dtype,
+                    head_size,
+                    has_dropout,
+                    enable_alibi,
+                    deterministic,
+                    use_ext_asm,
+                    is_v3_atomic_fp32,
+                    how_v3_bf16_cvt);
 }
 
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
@@ -100,11 +107,11 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(1);
     ck_tile::index_t nhead_stride_dv = dv.stride(2);
 
-    // dq_acc: (split, batch_size, seqlen_q, nheads, hdim)
+    // dq_acc: (split, batch_size, nheads, seqlen_q, hdim)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
     ck_tile::index_t batch_stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
-    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(3);
+    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(2);
+    ck_tile::index_t stride_dq_acc = dq_acc.stride(3);
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -228,7 +235,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
     TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
-    TORCH_CHECK(deterministic == true, "Only support deterministic for now");
+    // TORCH_CHECK(deterministic == true, "Only support deterministic for now");
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
@@ -315,11 +322,11 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({nsplits, batch_size, num_heads, seqlen_q, head_size}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
@@ -353,9 +360,12 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
-
+        
+        // TODO: for debug fix this
+        stream_config.log_level_ = 1;
+        // TODO: v3 traits need interface
         auto traits =
-            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
+            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic, true, true, 1);
 
         auto args =
             get_ck_fmha_bwd_args(
@@ -382,7 +392,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_bwd(traits, args, stream_config);
+        float t = fmha_bwd_router(traits, args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -396,6 +406,5 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
-
     return { dq, dk, dv, softmax_d };
 }

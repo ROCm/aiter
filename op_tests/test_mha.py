@@ -201,15 +201,28 @@ def test_flash_attn_output(
 
 
 if __name__ == '__main__':
+    # batch_size = 1
+    # nheads = 1
+    # (seqlen_q, seqlen_k) = (4, 4)
+    # d = 64
+    # dropout_p = 0.5
+    # causal = False
+    # local = False
+    # alibi = False
+    # deterministic = True
+    # mha_type = 'mha'
+    # dtype = torch.bfloat16
+
+    # for bwd v3 test
     batch_size = 1
     nheads = 1
-    (seqlen_q, seqlen_k) = (4, 4)
+    (seqlen_q, seqlen_k) = (64, 64)
     d = 64
-    dropout_p = 0.5
+    dropout_p = 0.0
     causal = False
     local = False
     alibi = False
-    deterministic = True
+    deterministic = False
     mha_type = 'mha'
     dtype = torch.bfloat16
 
