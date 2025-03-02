@@ -46,12 +46,6 @@ using F32 = float;
 using Row = ck::tensor_layout::gemm::RowMajor;
 using Col = ck::tensor_layout::gemm::ColumnMajor;
 
-using ADataType = I8;
-using BDataType = I8;
-using AccDataType = I32;
-using CShuffleDataType = I32;
-using ComputeDataType = I8;
-
 using ALayout = Row;
 using BLayout = Col;
 using D0Layout = Row;
@@ -66,6 +60,7 @@ using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 using AElementOp = PassThrough;
 using BElementOp = PassThrough;
 
+template<typename AccDataType>
 struct RowwiseScale
 {
     template <typename E, typename C, typename D0, typename D1>
@@ -149,6 +144,49 @@ struct MultiplyMultiplyAdd
         e = ck::type_convert<ck::half_t>(x0_f);
     }
 
+        template <>
+    __host__ __device__ constexpr void operator()<F16, float, float, float, F16>(F16 &e,
+                                                                            const float& c,
+                                                                            const float& d0,
+                                                                            const float& d1,
+                                                                            const F16 &d2) const
+    {
+        const float x0_f = c * d0 * d1 + ck::type_convert<F32>(d2);
+
+        e = ck::type_convert<F16>(x0_f);
+    }
+    template <>
+    __host__ __device__ constexpr void operator()<F16, float, F16, F16, F16>(F16 &e,
+                                                                            const float& c,
+                                                                            const F16& d0,
+                                                                            const F16& d1,
+                                                                            const F16 &d2) const
+    {
+        const float x0_f = c * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1) + ck::type_convert<F32>(d2);
+        e = ck::type_convert<F16>(x0_f);
+    }
+    
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, B16, B16, B16>(B16 &e,
+                                                                            const float& c,
+                                                                            const B16& d0,
+                                                                            const B16& d1,
+                                                                            const B16 &d2) const
+    {
+        const float x0_f = c * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1) + ck::type_convert<F32>(d2);
+        e = ck::type_convert<B16>(x0_f);
+    }
+    template <>
+    __host__ __device__ constexpr void operator()<B16, float, float, float, B16>(B16 &e,
+                                                                            const float& c,
+                                                                            const float& d0,
+                                                                            const float& d1,
+                                                                            const B16 &d2) const
+    {
+        const float x0_f = c * d0 * d1 + ck::type_convert<F32>(d2);
+        e = ck::type_convert<B16>(x0_f);
+    }
+
     template <>
     __host__ __device__ constexpr void operator()<ck::bhalf_t, int, ck::bhalf_t, ck::bhalf_t, ck::bhalf_t>(
         ck::bhalf_t &e, const int &c, const ck::bhalf_t &d0, const ck::bhalf_t &d1, const ck::bhalf_t &d2) const
@@ -160,7 +198,6 @@ struct MultiplyMultiplyAdd
     }
 };
 
-using CDEElementOp = RowwiseScale;
 using CDEElementOp2 = MultiplyMultiplyAdd;
 
 template <typename DDataType>
@@ -169,23 +206,15 @@ using DsDataType = ck::Tuple<DDataType, DDataType>;
 template <typename DDataType, typename D2DataType>
 using DsDataType2 = ck::Tuple<DDataType, DDataType, D2DataType>;
 
-#if 0
-template <typename DDataType, typename EDataType=DDataType>
-using DeviceOpInstance = ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShuffle_V3
-// clang-format off
-///######|  ALayout|  BLayout| DsLayout| ELayout|      AData|      BData|               DsData|                 EData|     AccData|         CShuffle|           A|           B|          CDE|           GEMM| Block|  MPer|  NPer|  KPer| AK1| BK1| MPer| NPer| MXdl| NXdl|  ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockTransfer| ABlockLds|  BBlockTransfer| BBlockTransfer| BBlockTransfer| BlockTransfer| BBlockTransfer| BBlockTransfer| BBlockLds|    CShuffle|    CShuffle| CBlockTransferClusterLengths|  CBlockTransfer|
-///######|         |         |         |        |       Type|       Type|                 Type|                  Type|        Type|         DataType| Elementwise| Elementwise|  Elementwise| Spacialization|  Size| Block| Block| Block|    |    |  XDL|  XDL|  Per|  Per|   ThreadCluster|  ThreadCluster| SrcAccessOrder|   SrcVectorDim|      SrcScalar|      DstScalar| AddExtraM|   ThreadCluster|  ThreadCluster| SrcAccessOrder|  SrcVectorDim|      SrcScalar|      DstScalar| AddExtraN| MXdlPerWave| NXdlPerWave|         _MBlock_MWaveMPerXdl| ScalarPerVector|
-///######|         |         |         |        |           |           |                     |                      |            |                 |   Operation|   Operation|    Operation|               |      |      |      |      |    |    |     |     | Wave| Wave| Lengths_K0_M_K1|   ArrangeOrder|               |               |      PerVector|   PerVector_K1|          | Lengths_K0_N_K1|   ArrangeOrder|               |              |      PerVector|   PerVector_K1|          |  PerShuffle|  PerShuffle|         _NBlock_NWaveNPerXdl|   _NWaveNPerXdl|
-///######|         |         |         |        |           |           |                     |                      |            |                 |            |            |             |               |      |      |      |      |    |    |     |     |     |     |                |               |               |               |               |               |          |                |               |               |              |               |               |          |            |            |                             |    S<C, D0, D1>|
-///###### RRR
-///      <      Row,      Row, DsLayout, ELayout, ADataType, BDataType, DsDataType<DDataType>, EDataType, AccDataType, CShuffleDataType,  AElementOp,  BElementOp, CDEElementOp,       GemmSpec,   256,   256,   128,    64,  16,   4,  32,   32,    4,    2,     S<4, 64, 1>,     S<1, 0, 2>,    S<1, 0, 2>,               2,             16,             16,          0,    S<16, 16, 1>,    S<0, 2, 1>,     S<0, 2, 1>,             1,               8,              4,          0,          1,           1,               S<1, 32, 1, 8>,      S<8, 8, 1>,  ck::BlockGemmPipelineScheduler::Interwave, ck::BlockGemmPipelineVersion::v1, I8>;
-///###### RCR
-         <      Row,      Col, DsLayout, ELayout, ADataType, BDataType, DsDataType<DDataType>, EDataType, AccDataType, CShuffleDataType,  AElementOp,  BElementOp, CDEElementOp,       GemmSpec,   256,   256,   128,    64,  16,  16,  32,   32,    4,    2,     S<4, 64, 1>,     S<1, 0, 2>,    S<1, 0, 2>,               2,             16,             16,          0,     S<4, 64, 1>,    S<1, 0, 2>,     S<1, 0, 2>,             2,              16,             16,          0,          1,           1,               S<1, 32, 1, 8>,      S<8, 8, 1>,  ck::BlockGemmPipelineScheduler::Interwave, ck::BlockGemmPipelineVersion::v1, I8>;
-// clang-format on
-#endif
 
 template <
-    typename DDataType, typename EDataType,
+    typename ADataType,
+    typename BDataType,
+    typename AccDataType,
+    typename CShuffleDataType,
+    typename ComputeDataType,
+    typename DDataType,
+    typename EDataType,
     int BLOCK_SIZE,
     int MBLOCK,
     int NBLOCK,
@@ -218,7 +247,7 @@ using DeviceGemmHelper =
         CShuffleDataType,
         AElementOp,
         BElementOp,
-        CDEElementOp,
+        RowwiseScale<AccDataType>,
         GEMM_SPEC,
         BLOCK_SIZE,                      // Block Size
         MBLOCK,                          // M per Block
@@ -253,7 +282,13 @@ using DeviceGemmHelper =
         ComputeDataType>;
 
 template <
-    typename DDataType, typename EDataType,
+    typename ADataType,
+    typename BDataType,
+    typename AccDataType,
+    typename CShuffleDataType,
+    typename ComputeDataType,
+    typename DDataType,
+    typename EDataType,
     int BLOCK_SIZE,
     int MBLOCK,
     int NBLOCK,
@@ -320,8 +355,14 @@ using DeviceGemmHelperMMA =
         PIPELINE_VERSION,
         ComputeDataType>;
 
-template <typename DDataType, typename EDataType,
-          typename DeviceGemmInstance>
+template <
+    typename ADataType,
+    typename BDataType,
+    typename AccDataType,
+    typename DDataType,
+    typename EDataType,
+    typename DeviceGemmInstance
+>
 __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
@@ -345,7 +386,7 @@ __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
 
     auto a_element_op = AElementOp{};
     auto b_element_op = BElementOp{};
-    auto cde_element_op = CDEElementOp{};
+    auto cde_element_op = RowwiseScale<AccDataType>{};
 
     constexpr ck::index_t NumDTensor = DeviceGemmInstance::NumDTensor;
 
@@ -373,8 +414,13 @@ __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
     return Y;
 }
 
-template <typename DDataType, typename EDataType,
-          typename DeviceGemmInstance>
+template <
+    typename ADataType,
+    typename BDataType,
+    typename DDataType,
+    typename EDataType,
+    typename DeviceGemmInstance
+>
 __forceinline__ torch::Tensor gemm_a8w8_mma_impl(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
