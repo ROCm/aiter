@@ -119,7 +119,8 @@ def get_module(md_name):
         "cat /proc/sys/kernel/numa_balancing").read().strip()
     if numa_balance_set == "1":
         logger.warning("WARNING: NUMA balancing is enabled, which may cause errors. "
-                       "It is recommended to disable NUMA balancing by running 'sudo sh -c echo 0 > /proc/sys/kernel/numa_balancing' ")
+                       "It is recommended to disable NUMA balancing by running 'sudo sh -c echo 0 > /proc/sys/kernel/numa_balancing' "
+                       "for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing")
     return importlib.import_module(f'{__package__}.{md_name}')
 
 
@@ -299,10 +300,11 @@ def get_args_of_build(ops_name: str, exclue=[]):
                 "ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
 
 
-def compile_ops(md_name: str, fc_name: Optional[str] = None):
+def compile_ops(_md_name: str, fc_name: Optional[str] = None):
     def decorator(func):
         def wrapper(*args, custom_build_args={}, **kwargs):
             loadName = fc_name
+            md_name = _md_name
             if fc_name is None:
                 loadName = func.__name__
             try:
@@ -316,6 +318,9 @@ def compile_ops(md_name: str, fc_name: Optional[str] = None):
             except Exception as e:
                 d_args = get_args_of_build(md_name)
                 d_args.update(custom_build_args)
+
+                # update module if we have coustom build
+                md_name = custom_build_args.get('md_name', md_name)
 
                 srcs = d_args["srcs"]
                 flags_extra_cc = d_args["flags_extra_cc"]
