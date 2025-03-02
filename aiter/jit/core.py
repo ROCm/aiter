@@ -299,20 +299,22 @@ def get_args_of_build(ops_name: str, exclue=[]):
 
 def compile_ops(ops_name: str, fc_name: Optional[str] = None):
     def decorator(func):
-        def wrapper(*args, **kwargs):
+        def wrapper(*args, custom_build_args=None, **kwargs):
             loadName = fc_name
             if fc_name is None:
                 loadName = func.__name__
-
             try:
                 module = None
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
                 if module is None:
-                    module = get_module(ops_name)
+                    module = get_module(custom_build_args.get(md_name, ops_name))
             except Exception as e:
                 d_args = get_args_of_build(ops_name)
+                custom_build_args = custom_build_args or {}
+                d_args = {key: custom_build_args.get(key, d_args[key]) for key in d_args}
+
                 md_name = d_args["md_name"]
                 srcs = d_args["srcs"]
                 flags_extra_cc = d_args["flags_extra_cc"]
@@ -336,7 +338,7 @@ def compile_ops(ops_name: str, fc_name: Optional[str] = None):
                 callargs = [
                     f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
                 logger.info(
-                    f"    calling {ops_name}::{loadName}({', '.join(callargs)})")
+                    f"    calling {md_name}::{loadName}({', '.join(callargs)})")
 
             return op(*args, **kwargs)
         return wrapper

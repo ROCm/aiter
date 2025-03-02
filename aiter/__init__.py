@@ -27,6 +27,7 @@ from .ops.cache import *
 from .ops.rmsnorm import *
 from .ops.communication import *
 from .ops.rope import *
+from .ops.topk import *
 from .ops.mha import *
 from . import mla
 
