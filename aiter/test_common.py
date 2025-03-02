@@ -88,7 +88,7 @@ def log_args(func, *args, **kwargs):
     callargs = [
         f"\n                {el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
     logger.info(
-        f"    calling {func.__name__}({', '.join(callargs)})")
+        f"\ncalling {func.__name__}({', '.join(callargs)})")
 
 
 def get_trace_perf(prof, num_iters):

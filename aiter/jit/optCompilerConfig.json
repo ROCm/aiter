@@ -165,6 +165,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp'"
         ],
