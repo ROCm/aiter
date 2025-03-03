@@ -6,7 +6,7 @@
  * @Email: lingpeng.jin@amd.com
  * @Create At: 2025-03-01 12:16:14
  * @Last Modified By: valarLip
- * @Last Modified At: 2025-03-02 00:32:08
+ * @Last Modified At: 2025-03-02 11:40:21
  * @Description: This is description.
  */
 
@@ -173,6 +173,7 @@ namespace aiter
         }
         __syncthreads();
 
+        float sum = 0.0f;
         for (int k = 0; k < topk; ++k)
         {
             float max_val = -INFINITY;
@@ -213,6 +214,10 @@ namespace aiter
                 topk_values[k] = max_val;
                 topk_indices[k] = max_idx;
                 scores[max_idx] = -INFINITY;
+                if (need_renorm)
+                {
+                    sum += max_val;
+                }
             }
             __syncthreads();
         }
@@ -221,17 +226,10 @@ namespace aiter
         {
             if (threadIdx.x == 0)
             {
-                float sum = 0.0f;
-                for (int k = 0; k < topk; ++k)
-                {
-                    sum += topk_values[k];
-                }
-                for (int k = 0; k < topk; ++k)
-                {
-                    topk_values[k] /= sum;
-                }
+                scores[0] = sum; // reuse lds
             }
             __syncthreads();
+            sum = scores[0];
         }
 
         // if (threadIdx.x == 0)
@@ -258,7 +256,7 @@ namespace aiter
 
         for (int k = threadIdx.x; k < topk; k += blockDim.x)
         {
-            topk_weights[token_idx * stride_tk + k] = topk_values[k];
+            topk_weights[token_idx * stride_tk + k] = need_renorm ? topk_values[k] / sum : topk_values[k];
             topk_ids[token_idx * stride_tk + k] = topk_indices[k];
         }
     }
