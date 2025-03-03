@@ -2,15 +2,15 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 
-#define HIP_CALL(call)                                                                      \
-    do                                                                                      \
-    {                                                                                       \
-        hipError_t err = call;                                                              \
-        if (err != hipSuccess)                                                              \
-        {                                                                                   \
+#define HIP_CALL(call)                                                                               \
+    do                                                                                               \
+    {                                                                                                \
+        hipError_t err = call;                                                                       \
+        if (err != hipSuccess)                                                                       \
+        {                                                                                            \
             printf("\n[AITER] fail to call %s... [HIP error](%s)\n", #call, hipGetErrorString(err)); \
-            exit(0);                                                                        \
-        }                                                                                   \
+            exit(0);                                                                                 \
+        }                                                                                            \
     } while (0)
 
 struct p3
@@ -69,3 +69,13 @@ public:
                                        0, kargs.stream, nullptr, (void **)&config));
     };
 };
+
+inline int get_cu_num() const
+{
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+    uint32_t num_cu = dev_prop.multiProcessorCount;
+    return num_cu;
+}
