@@ -21,7 +21,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("sorted_expert_ids"), py::arg("num_tokens_post_padded"),
             py::arg("topk"), py::arg("input_scale"),
             py::arg("fc1_scale"), py::arg("fc2_scale"),
-            py::arg("fc2_smooth_scale") = std::nullopt);
+            py::arg("fc2_smooth_scale") = std::nullopt,
+            py::arg("activation") = "silu");
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,

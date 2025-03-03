@@ -50,16 +50,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
       m.def("paged_attention_rocm", &paged_attention,
-            "paged_attention_rocm(Tensor! out, Tensor exp_sums,"
-            "                Tensor max_logits, Tensor tmp_out,"
+            "paged_attention_rocm(Tensor! out, Tensor workspace_buffer,"
             "                Tensor query, Tensor key_cache,"
-            "                Tensor value_cache, int num_kv_heads,"
-            "                float scale, Tensor block_tables,"
-            "                Tensor context_lens, int block_size,"
-            "                int max_context_len,"
+            "                Tensor value_cache,"
+            "                float scale, Tensor kv_indptr,"
+            "                Tensor kv_page_indices, Tensor kv_last_page_lens,"
+            "                int block_size,"
+            "                int max_num_partitions,"
             "                Tensor? alibi_slopes,"
             "                str kv_cache_dtype,"
-            "                float k_scale, float v_scale) -> ()");
+            "                str kv_cache_layout,"
+            "                float logits_soft_cap,"
+            "                Tensor k_scale, Tensor v_scale) -> ()");
 
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"),
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"),
@@ -182,7 +184,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("sorted_expert_ids"), py::arg("num_tokens_post_padded"),
             py::arg("topk"), py::arg("input_scale"),
             py::arg("fc1_scale"), py::arg("fc2_scale"),
-            py::arg("fc2_smooth_scale") = std::nullopt);
+            py::arg("fc2_smooth_scale") = std::nullopt,
+            py::arg("activation") = "silu");
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,
@@ -244,7 +247,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("topk_weights"), py::arg("topk_ids"),
             py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
             py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
-            py::arg("block_m") = 32, py::arg("expert_mask") = std::nullopt);
+            py::arg("block_m") = 32, py::arg("expert_mask") = std::nullopt,
+            py::arg("acitvation") = std::nullopt);
       m.def("rope_fwd_impl", &rope_fwd_impl);
       m.def("rope_bwd_impl", &rope_bwd_impl);
       m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);

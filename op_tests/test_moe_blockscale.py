@@ -9,6 +9,7 @@ from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck, fused_t
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
 from einops import rearrange
+from aiter.fused_moe_api import aiter_moe
 
 BLOCK_SIZE_M = 32
 
@@ -213,8 +214,20 @@ def test_fmoe(dtype, token, model_dim, inter_dim, scale_blks, E, topk, quant='No
                                    a1_scale.t().contiguous(),
                                    (scale_blk_n,
                                     scale_blk_k))
+
+    out_asm2 = aiter_moe(input,
+                         shuffle_weight(w1_q, (16, 16)),
+                         shuffle_weight(w2_q, (16, 16)),
+                         topk_weights,
+                         topk_ids,
+                         w1_scale,
+                         w2_scale,
+                         None,
+                         block_shape=(scale_blk_n, scale_blk_k))
     msg = f'[perf] a8w8 asm: {us_ref:.2f} us ...... {m=}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}'
     checkAllclose(out_ref, out_asm, rtol=0.05, atol=0.05, msg=msg)
+    checkAllclose(out_ref, out_asm2, rtol=0.05,
+                  atol=0.05, msg="aiter moe api check")
 
 
 for dtype in [torch.bfloat16]:

@@ -17,12 +17,13 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                      std::optional<torch::Tensor> a1_scale, // [m, 1], token scale
                      std::optional<torch::Tensor> a2_scale, // [e, 1, n], smooth-quant-scale for 2nd gemm input
                      std::optional<int> block_m = 32,
-                     std::optional<torch::Tensor> expert_mask = std::nullopt)
+                     std::optional<torch::Tensor> expert_mask = std::nullopt,
+                     std::optional<std::string> acitvation = std::nullopt)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden_states));
     auto device = hidden_states.device();
     int topk_ids_numel = topk_ids.numel();
-    int experts = w1.size(0);
+    int experts = expert_mask.has_value()? expert_mask.value().numel() : w1.size(0);
     int topk = topk_ids.size(1);
     int tokens = topk_ids.size(0);
     int hidden_size = w1.size(2);
@@ -45,12 +46,28 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     auto prec_kw = torchDTypeToStr(topk_weights.dtype());
 
     int gate_only = 1;
-    int activation = 0;
+    int activation_function = 0;
     int fused_quant = 0;
     if (shared_intermediate_size_0 == 2 * shared_intermediate_size)
     {
         gate_only = 0;
-        activation = 1;
+        activation_function = 1;
+    }
+
+    if (acitvation.has_value())
+    {
+        if (acitvation.value() == "silu")
+        {
+            activation_function = 1;
+        }
+        else if (acitvation.value() == "gelu")
+        {
+            activation_function = 0;
+        }
+        else
+        {
+            TORCH_CHECK(false, __func__, "CK moe unsupported acitvation(" + acitvation.value() + "), only support silu and gelu");
+        }
     }
 
     if (!w1_scale.has_value())
@@ -88,7 +105,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
         prec_sq,
         prec_kw,
         block_size,
-        activation,
+        activation_function,
         gate_only,
         fused_quant,
         expert_mask.has_value(), 
