@@ -2,11 +2,11 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
 import itertools
 from enum import IntEnum
+import argparse
 
 
 @perftest()
@@ -287,7 +287,7 @@ nope_first: {nope_first}
             input_x, input_y, cos, sin, positions, offsets, rotate_style, True, nope_first)
         _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos_sin, positions, offsets, rotate_style, nope_first)
 
-    print(f"{input_msg}\nhip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us.")
+    print(f"{input_msg}hip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us.\n")
 
 
 
@@ -340,6 +340,12 @@ dim_freqs: {str(freqs_h.shape):<20}
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no_check', action='store_true', help="Do not check correctness of ops. Default: False.")
+    parser.add_argument('--compare', action='store_true', help="Compare with legacy implementation. Default: False")
+    parser.add_argument('--compare_check', action='store_true', help="Check correctness when compare with legacy implementation. Default: False")
+    args = parser.parse_args()
+
     dtype_ = (torch.float, torch.float16, torch.bfloat16)[1:2]
     transpose_output_ = (False, True)[-1:]
     batch_size_ = (1, 2, 4)[-1:]
@@ -359,123 +365,127 @@ if __name__ == "__main__":
     rotate_style_ = (RotateStyle.NEOX, RotateStyle.GPTJ)
 
     # Test sbhd format for both cached and uncached
-    for (dtype, fdtype,
-         transpose_output,
-         rotate_style,
-         rotary_percent_and_reuse,
-         b, s, h, d
-    ) in itertools.product(
-        dtype_, dtype_,
-        transpose_output_,
-        rotate_style_,
-        rotary_percent_and_reuse_,
-        batch_size_, seq_size_, head_size_, hidden_dim_
-    ):
-        rotary_percent = rotary_percent_and_reuse[0]
-        reuse_freqs_front_part = rotary_percent_and_reuse[1]
-        nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
-        freqs_ratio = 2 if reuse_freqs_front_part else 1
-        input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
-        grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
-        input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        test_rope_sbhd_2c(input_x, input_y, freqs, grad, grad_y, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+    if not args.no_check:
+        for (dtype, fdtype,
+            transpose_output,
+            rotate_style,
+            rotary_percent_and_reuse,
+            b, s, h, d
+        ) in itertools.product(
+            dtype_, dtype_,
+            transpose_output_,
+            rotate_style_,
+            rotary_percent_and_reuse_,
+            batch_size_, seq_size_, head_size_, hidden_dim_
+        ):
+            rotary_percent = rotary_percent_and_reuse[0]
+            reuse_freqs_front_part = rotary_percent_and_reuse[1]
+            nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
+            freqs_ratio = 2 if reuse_freqs_front_part else 1
+            input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+            freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+            grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+            input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+            input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+            grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            test_rope_sbhd_2c(input_x, input_y, freqs, grad, grad_y, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
 
     # Test sbhd format for cached with position (and offsets)
-    for (dtype, fdtype,
-         transpose_output,
-         rotate_style,
-         rotary_percent_and_reuse,
-         has_offsets,
-         b, s, h, d
-    ) in itertools.product(
-        dtype_, dtype_,
-        transpose_output_,
-        rotate_style_,
-        rotary_percent_and_reuse_,
-        (False, True),
-        batch_size_, seq_size_, head_size_, hidden_dim_
-    ):
-        rotary_percent = rotary_percent_and_reuse[0]
-        reuse_freqs_front_part = rotary_percent_and_reuse[1]
-        nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
-        freqs_ratio = 2 if reuse_freqs_front_part else 1
-        freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
-        positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
-        offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
-        input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        grad_x  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+    if not args.no_check:
+        for (dtype, fdtype,
+            transpose_output,
+            rotate_style,
+            rotary_percent_and_reuse,
+            has_offsets,
+            b, s, h, d
+        ) in itertools.product(
+            dtype_, dtype_,
+            transpose_output_,
+            rotate_style_,
+            rotary_percent_and_reuse_,
+            (False, True),
+            batch_size_, seq_size_, head_size_, hidden_dim_
+        ):
+            rotary_percent = rotary_percent_and_reuse[0]
+            reuse_freqs_front_part = rotary_percent_and_reuse[1]
+            nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
+            freqs_ratio = 2 if reuse_freqs_front_part else 1
+            freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+            positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
+            offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
+            input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+            input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
+            grad_x  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
 
     # Compare new with legacy
-    # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
-    rotary_percent_and_reuse_compare_ = (
-        (1.0, True, False),
-        (0.5, True, False),)
-    for (dtype, fdtype,
-         transpose_output,
-         rotate_style,
-         rotary_percent_and_reuse,
-         has_offsets,
-         b, s, h, d
-    ) in itertools.product(
-        dtype_, dtype_,
-        transpose_output_,
-        rotate_style_,
-        rotary_percent_and_reuse_compare_,
-        (False, True),
-        batch_size_, seq_size_, head_size_, hidden_dim_
-    ):
-        rotary_percent = rotary_percent_and_reuse[0]
-        reuse_freqs_front_part = rotary_percent_and_reuse[1]
-        nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
-        freqs_ratio = 2 if reuse_freqs_front_part else 1
-        freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
-        positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
-        offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
-        input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-        compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first)
-    exit()
+    if args.compare:
+        # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
+        rotary_percent_and_reuse_compare_ = (
+            (1.0, True, False),
+            (0.5, True, False),)
+        for (dtype, fdtype,
+            transpose_output,
+            rotate_style,
+            rotary_percent_and_reuse,
+            has_offsets,
+            b, s, h, d
+        ) in itertools.product(
+            dtype_, dtype_,
+            transpose_output_,
+            rotate_style_,
+            rotary_percent_and_reuse_compare_,
+            (False, True),
+            batch_size_, seq_size_, head_size_, hidden_dim_
+        ):
+            rotary_percent = rotary_percent_and_reuse[0]
+            reuse_freqs_front_part = rotary_percent_and_reuse[1]
+            nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
+            freqs_ratio = 2 if reuse_freqs_front_part else 1
+            freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+            positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
+            offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
+            input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first, args.compare_check)
 
     # Test thd format for uncached
-    cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
-                              dtype=torch.int32, device="cuda")
-    for (dtype, fdtype,
-         rotate_style,
-         rotary_percent_and_reuse,
-         h, d
-    ) in itertools.product(
-        dtype_, dtype_,
-        rotate_style_,
-        rotary_percent_and_reuse_,
-        head_size_, hidden_dim_
-    ):
-        rotary_percent = rotary_percent_and_reuse[0]
-        reuse_freqs_front_part = rotary_percent_and_reuse[1]
-        nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
-        freqs_ratio = 2 if reuse_freqs_front_part else 1
-        input = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs = torch.randn((cu_seqlens[-1], 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
-        grad  = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda")
-        test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first)
+    if not args.no_check:
+        cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
+                                dtype=torch.int32, device="cuda")
+        for (dtype, fdtype,
+            rotate_style,
+            rotary_percent_and_reuse,
+            h, d
+        ) in itertools.product(
+            dtype_, dtype_,
+            rotate_style_,
+            rotary_percent_and_reuse_,
+            head_size_, hidden_dim_
+        ):
+            rotary_percent = rotary_percent_and_reuse[0]
+            reuse_freqs_front_part = rotary_percent_and_reuse[1]
+            nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
+            freqs_ratio = 2 if reuse_freqs_front_part else 1
+            input = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda", requires_grad=True)
+            freqs = torch.randn((cu_seqlens[-1], 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+            grad  = torch.randn((cu_seqlens[-1], h, d), dtype=dtype, device="cuda")
+            test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first)
 
     # Test 2d image format for cached
-    for (dtype, fdtype,
-         b, h, d,
-         height, width, margin
-    ) in itertools.product(
-        dtype_, dtype_,
-        batch_size_, head_size_, hidden_dim_,
-        height_, width_, margin_
-    ):
-        input   = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda", requires_grad=True)
-        freqs_h = torch.randn((1, height + margin, 1, d // 2), dtype=fdtype, device="cuda")
-        freqs_w = torch.randn((1, width + margin, 1, d // 2), dtype=fdtype, device="cuda")
-        grad    = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda")
-        test_rope_2d(input, height, width, freqs_h, freqs_w, grad)
+    if not args.no_check:
+        for (dtype, fdtype,
+            b, h, d,
+            height, width, margin
+        ) in itertools.product(
+            dtype_, dtype_,
+            batch_size_, head_size_, hidden_dim_,
+            height_, width_, margin_
+        ):
+            input   = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda", requires_grad=True)
+            freqs_h = torch.randn((1, height + margin, 1, d // 2), dtype=fdtype, device="cuda")
+            freqs_w = torch.randn((1, width + margin, 1, d // 2), dtype=fdtype, device="cuda")
+            grad    = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda")
+            test_rope_2d(input, height, width, freqs_h, freqs_w, grad)
