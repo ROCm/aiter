@@ -7,7 +7,11 @@
 #include "mha_bwd.h"
 
 float fmha_bwd_router(fmha_bwd_traits_all traits, fmha_bwd_args args, const ck_tile::stream_config& stream_config) {
-    float r = fmha_bwd_v3(traits, args, stream_config);
+    float r = -1;
+// fmha bwd v3 asm kernel currently only support mi300
+#ifdef(__HIPCC__) && (defined(__gfx942__))
+    r = fmha_bwd_v3(traits, args, stream_config);
+#endif
     if (r == -1) {
         r = fmha_bwd(traits, args, stream_config);
     }

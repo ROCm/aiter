@@ -371,7 +371,6 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 10 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fa_bwd_v3_codegen.py -o {{}} --receipt 3'"
         ]
     },
     "module_mha_varlen_bwd": {

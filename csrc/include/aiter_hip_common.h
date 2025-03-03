@@ -24,6 +24,10 @@ struct p2
     unsigned int _p0;
     unsigned int _p1;
 };
+struct p1
+{
+    unsigned int _p0;
+};
 struct AiterAsmKernelArgs
 {
     void *args_ptr;
