@@ -115,8 +115,21 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
             }
             else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
             {
-                static AiterAsmKernel impl_a16w8_f16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_f16_2tg_g8_f8.co");
-                impl_ptr = &impl_a16w8_f16_f8;
+                if (high_precision.value() == 0)
+                {
+                    static AiterAsmKernel impl_a16w8_f16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_f16_2tg_g8_f8.co");
+                    impl_ptr = &impl_a16w8_f16_f8;
+                }
+                else if (high_precision.value() == 1)
+                {
+                    static AiterAsmKernel impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16("pa_a16w8_2tg_g8_f8_q_fp16_tail_bf16", "pa_a16w8_2tg_g8_f8_q_fp16_tail_bf16.co");
+                    impl_ptr = &impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16;
+                }
+                else
+                {
+                    TORCH_CHECK(false,
+                                __func__, ": high_precision value only support (0, 1) grades on fp16 asm pa for fp8 kv cache !!!");
+                }
             }
         }
         else if (Q.dtype() == at::ScalarType::BFloat16)
@@ -146,7 +159,7 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                 else
                 {
                     TORCH_CHECK(false,
-                                __func__, ": high_precision value only support (0, 1, 2) grades on asm pa for fp8 kv cache !!!");
+                                __func__, ": high_precision value only support (0, 1, 2) grades on bf16 asm pa for fp8 kv cache !!!");
                 }
             }
         }
