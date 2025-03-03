@@ -55,6 +55,15 @@ def perftest(num_iters=101, num_warmup=10, testGraph=False):
     return decorator
 
 
+def benchmark():
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            log_args(func, *args, **kwargs)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 def run_iters(num_iters, func, *args, **kwargs):
     for _ in range(num_iters):
         data = func(*args, **kwargs)
@@ -66,6 +75,20 @@ def run_perftest(func, *args, num_iters=101, num_warmup=10, **kwargs):
     def worker():
         return func(*args, **kwargs)
     return worker()
+
+
+def log_args(func, *args, **kwargs):
+    import inspect
+    callargs = inspect.getcallargs(func, *args, **kwargs)
+
+    def getTensorInfo(el):
+        if isinstance(el, torch.Tensor):
+            return f'{el.shape} {el.dtype}'
+        return el
+    callargs = [
+        f"\n                {el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
+    logger.info(
+        f"\ncalling {func.__name__}({', '.join(callargs)})")
 
 
 def get_trace_perf(prof, num_iters):
