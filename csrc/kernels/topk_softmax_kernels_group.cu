@@ -73,7 +73,8 @@ namespace aiter
         const int num_experts,
         const int topk,
         const int topk_group,
-        const int num_tokens)
+        const int num_tokens,
+        const float scale_factor)
     {
         static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
         // 256 E, 8->4 group, 32 e/group
@@ -110,11 +111,6 @@ namespace aiter
             float gating = gating_output[token_idx * num_experts + e];
             scores[e] = 1.0f / (1.0f + expf(-gating)) + correction_bias[e];
         }
-        // for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
-        // {
-        //     float gating = gating_output[token_idx * num_experts + e];
-        //     scores[e] = 1.0f / (1.0f + expf(-gating)) + correction_bias[e];
-        // }
 
 #pragma unroll
         for (int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
@@ -256,7 +252,7 @@ namespace aiter
 
         for (int k = threadIdx.x; k < topk; k += blockDim.x)
         {
-            topk_weights[token_idx * stride_tk + k] = need_renorm ? topk_values[k] / sum : topk_values[k];
+            topk_weights[token_idx * stride_tk + k] = (need_renorm ? topk_values[k] / sum : topk_values[k]) * scale_factor;
             topk_ids[token_idx * stride_tk + k] = topk_indices[k];
         }
     }
@@ -316,7 +312,7 @@ namespace aiter
                   stride_tk,                                                       \
                   num_experts,                                                     \
                   topk,                                                            \
-                  topk_grp, num_tokens); });
+                  topk_grp, num_tokens, scale_factor); });
 
 void biased_grouped_topk(
     torch::Tensor &gating_output,   // [num_tokens, num_experts]
@@ -325,7 +321,8 @@ void biased_grouped_topk(
     torch::Tensor &topk_ids,        // [num_tokens, topk]
     int num_expert_group,
     int topk_grp,
-    bool need_renorm)
+    bool need_renorm,
+    float scale_factor = 1.)
 {
     int num_tokens = gating_output.size(0);
     int num_experts = gating_output.size(1);
