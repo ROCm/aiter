@@ -52,7 +52,7 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      std::optional<torch::Tensor> &K_QScale,
                      std::optional<torch::Tensor> &V_QScale,
                      std::optional<torch::Tensor> &out_,
-                     std::optional<int> high_precision = 0)
+                     std::optional<int> high_precision = 1)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch = context_lens.size(0);
