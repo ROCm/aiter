@@ -15,5 +15,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("K_QScale") = std::nullopt,
           py::arg("V_QScale") = std::nullopt,
           py::arg("out_") = std::nullopt,
-          py::arg("high_precision") = 0);
+          py::arg("high_precision") = 1);
 }
