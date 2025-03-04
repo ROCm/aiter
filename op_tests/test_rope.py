@@ -288,7 +288,7 @@ nope_first: {nope_first}
         _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos_sin, positions, offsets, rotate_style, nope_first)
 
     color = '\033[91m' if hip_cached_fwd_avg > leg_cached_fwd_avg else '\033[92m' if hip_cached_fwd_avg < leg_cached_fwd_avg * 0.75 else '\033[93m'
-    print(f"{color}{input_msg}hip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us.\n{color}")
+    print(f"{color}{input_msg}hip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us. diff: {100*hip_cached_fwd_avg/leg_cached_fwd_avg}%.\n{color}")
 
 
 
@@ -429,18 +429,16 @@ if __name__ == "__main__":
             (1.0, True, False),
             (0.5, True, False),)
         for (dtype,
-            transpose_output,
             rotate_style,
             rotary_percent_and_reuse,
             has_offsets,
             b, s, h, d
         ) in itertools.product(
             dtype_, # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
-            transpose_output_,
             rotate_style_,
             rotary_percent_and_reuse_compare_,
             (False, True),
-            batch_size_[-1:], seq_size_[-1:], head_size_[-1:], hidden_dim_[-1:]
+            batch_size_, seq_size_, head_size_, hidden_dim_
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
