@@ -270,11 +270,11 @@ __device__ __forceinline__ void elementwise_copy_2c(
 // Kernel Functionalities
 //
 
-struct Op1cUncachedFwd
+struct OpUncachedFwd
 {
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
               typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
+    __device__ __forceinline__ static void apply_1c(
         scalar_t* __restrict__         p_output,
         const scalar_t* __restrict__   p_input,
         const scalar_f_t* __restrict__ p_freqs,
@@ -340,102 +340,10 @@ struct Op1cUncachedFwd
             }
         }
     }
-};
 
-struct Op1cUncachedBwd
-{
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
               typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
-        scalar_t* __restrict__         p_input_grads,
-        const scalar_t* __restrict__   p_output_grads,
-        const scalar_f_t* __restrict__ p_freqs,
-        const int32_t size_h, const int32_t size_d, const int32_t size_f,
-        const int32_t stride_o_h, const int32_t stride_o_d,
-        const int32_t stride_i_h, const int32_t stride_i_d)
-    {
-        // rotate count
-        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r     = size_r >> 1;
-        const int32_t offset_half_r_o = size_half_r * stride_o_d;
-        const int32_t offset_half_r_i = size_half_r * stride_i_d;
-        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
-
-        #pragma unroll
-        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-        {
-            // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
-            int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
-            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
-            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
-
-            float cos_0, sin_0, cos_1, sin_1;
-            get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
-
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-            {
-                const int32_t offset_o_h = hid * stride_o_h;
-                const int32_t offset_i_h = hid * stride_i_h;
-                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
-                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
-                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
-                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
-
-                const float output_grad_0 = float(p_output_grads[offset_o_0]);
-                const float output_grad_1 = float(p_output_grads[offset_o_1]);
-
-                p_input_grads[offset_i_0] = scalar_t(output_grad_0 * cos_0 + output_grad_1 * sin_0);
-                p_input_grads[offset_i_1] = scalar_t(output_grad_1 * cos_1 - output_grad_0 * sin_1);
-            }
-        }
-
-        // the rest are just forwarded
-        if (size_d > size_r)
-        {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-            {
-                const int32_t offset_o = hid * stride_o_h;
-                const int32_t offset_i = hid * stride_i_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_input_grads[offset_i + did * stride_i_d] = p_output_grads[offset_o + did * stride_o_d];
-                }
-            }
-        }
-
-        // the rest are just forwarded
-        if constexpr (!Inplace)
-        {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, 0, size_d - size_r,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
-            else
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, size_r, size_d,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
-        }
-    }
-};
-
-struct Op2cUncachedFwd
-{
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
-              typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
+    __device__ __forceinline__ static void apply_2c(
         scalar_t* __restrict__         p_output_x,
         scalar_t* __restrict__         p_output_y,
         const scalar_t* __restrict__   p_input_x,
@@ -542,11 +450,97 @@ struct Op2cUncachedFwd
     }
 };
 
-struct Op2cUncachedBwd
+struct OpUncachedBwd
 {
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
               typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
+    __device__ __forceinline__ static void apply_1c(
+        scalar_t* __restrict__         p_input_grads,
+        const scalar_t* __restrict__   p_output_grads,
+        const scalar_f_t* __restrict__ p_freqs,
+        const int32_t size_h, const int32_t size_d, const int32_t size_f,
+        const int32_t stride_o_h, const int32_t stride_o_d,
+        const int32_t stride_i_h, const int32_t stride_i_d)
+    {
+        // rotate count
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_o = size_half_r * stride_o_d;
+        const int32_t offset_half_r_i = size_half_r * stride_i_d;
+        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
+
+        #pragma unroll
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        {
+            // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
+            int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
+            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
+            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
+
+            float cos_0, sin_0, cos_1, sin_1;
+            get_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
+
+            #pragma unroll
+            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                const int32_t offset_o_h = hid * stride_o_h;
+                const int32_t offset_i_h = hid * stride_i_h;
+                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
+                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
+                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
+                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
+
+                const float output_grad_0 = float(p_output_grads[offset_o_0]);
+                const float output_grad_1 = float(p_output_grads[offset_o_1]);
+
+                p_input_grads[offset_i_0] = scalar_t(output_grad_0 * cos_0 + output_grad_1 * sin_0);
+                p_input_grads[offset_i_1] = scalar_t(output_grad_1 * cos_1 - output_grad_0 * sin_1);
+            }
+        }
+
+        // the rest are just forwarded
+        if (size_d > size_r)
+        {
+            #pragma unroll
+            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                const int32_t offset_o = hid * stride_o_h;
+                const int32_t offset_i = hid * stride_i_h;
+
+                #pragma unroll
+                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
+                {
+                    p_input_grads[offset_i + did * stride_i_d] = p_output_grads[offset_o + did * stride_o_d];
+                }
+            }
+        }
+
+        // the rest are just forwarded
+        if constexpr (!Inplace)
+        {
+            if constexpr (NopeFirst)
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, 0, size_d - size_r,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+            else
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, size_r, size_d,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+        }
+    }
+
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply_2c(
         scalar_t* __restrict__         p_input_grads_x,
         scalar_t* __restrict__         p_input_grads_y,
         const scalar_t* __restrict__   p_output_grads_x,
@@ -653,11 +647,11 @@ struct Op2cUncachedBwd
     }
 };
 
-struct Op1cCachedFwd
+struct OpCachedFwd
 {
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
               typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
+    __device__ __forceinline__ static void apply_1c(
         scalar_t* __restrict__         p_output,
         const scalar_t* __restrict__   p_input,
         const scalar_f_t* __restrict__ p_cos,
@@ -724,86 +718,10 @@ struct Op1cCachedFwd
             }
         }
     }
-};
 
-struct Op1cCachedBwd
-{
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
               typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
-        scalar_t* __restrict__         p_input_grads,
-        const scalar_t* __restrict__   p_output_grads,
-        const scalar_f_t* __restrict__ p_cos,
-        const scalar_f_t* __restrict__ p_sin,
-        const int32_t size_h, const int32_t size_d, const int32_t size_f,
-        const int32_t stride_o_h, const int32_t stride_o_d,
-        const int32_t stride_i_h, const int32_t stride_i_d)
-    {
-        // rotate count
-        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r     = size_r >> 1;
-        const int32_t offset_half_r_o = size_half_r * stride_o_d;
-        const int32_t offset_half_r_i = size_half_r * stride_i_d;
-        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
-
-        #pragma unroll
-        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
-        {
-            // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
-            int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
-            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
-            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
-
-            float cos_0, sin_0, cos_1, sin_1;
-            get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
-                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
-
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-            {
-                const int32_t offset_o_h = hid * stride_o_h;
-                const int32_t offset_i_h = hid * stride_i_h;
-                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
-                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
-                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
-                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
-
-                const float output_grad_0 = float(p_output_grads[offset_o_0]);
-                const float output_grad_1 = float(p_output_grads[offset_o_1]);
-
-                p_input_grads[offset_i_0] = scalar_t(output_grad_0 * cos_0 + output_grad_1 * sin_0);
-                p_input_grads[offset_i_1] = scalar_t(output_grad_1 * cos_1 - output_grad_0 * sin_1);
-            }
-        }
-
-        // the rest are just forwarded
-        if constexpr (!Inplace)
-        {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, 0, size_d - size_r,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
-            else
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, size_r, size_d,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
-        }
-    }
-};
-
-struct Op2cCachedFwd
-{
-    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
-              typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
+    __device__ __forceinline__ static void apply_2c(
         scalar_t* __restrict__         p_output_x,
         scalar_t* __restrict__         p_output_y,
         const scalar_t* __restrict__   p_input_x,
@@ -891,11 +809,81 @@ struct Op2cCachedFwd
     }
 };
 
-struct Op2cCachedBwd
+struct OpCachedBwd
 {
     template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
               typename scalar_t, typename scalar_f_t>
-    __device__ __forceinline__ static void apply(
+    __device__ __forceinline__ static void apply_1c(
+        scalar_t* __restrict__         p_input_grads,
+        const scalar_t* __restrict__   p_output_grads,
+        const scalar_f_t* __restrict__ p_cos,
+        const scalar_f_t* __restrict__ p_sin,
+        const int32_t size_h, const int32_t size_d, const int32_t size_f,
+        const int32_t stride_o_h, const int32_t stride_o_d,
+        const int32_t stride_i_h, const int32_t stride_i_d)
+    {
+        // rotate count
+        const int32_t size_r          = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r     = size_r >> 1;
+        const int32_t offset_half_r_o = size_half_r * stride_o_d;
+        const int32_t offset_half_r_i = size_half_r * stride_i_d;
+        const int32_t did_start       = NopeFirst ? (size_d - size_r) : 0;
+
+        #pragma unroll
+        for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
+        {
+            // i: Input grads, o: output grads, d: in hidden Dim, 0: former element, 1: latter element
+            int32_t offset_o_d_0, offset_o_d_1, offset_i_d_0, offset_i_d_1;
+            get_offset_d<RotateStyle>(&offset_o_d_0, &offset_o_d_1, did, stride_o_d, offset_half_r_o);
+            get_offset_d<RotateStyle>(&offset_i_d_0, &offset_i_d_1, did, stride_i_d, offset_half_r_i);
+
+            float cos_0, sin_0, cos_1, sin_1;
+            get_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
+                &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
+
+            #pragma unroll
+            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
+            {
+                const int32_t offset_o_h = hid * stride_o_h;
+                const int32_t offset_i_h = hid * stride_i_h;
+                const int32_t offset_o_0 = offset_o_h + offset_o_d_0;
+                const int32_t offset_o_1 = offset_o_h + offset_o_d_1;
+                const int32_t offset_i_0 = offset_i_h + offset_i_d_0;
+                const int32_t offset_i_1 = offset_i_h + offset_i_d_1;
+
+                const float output_grad_0 = float(p_output_grads[offset_o_0]);
+                const float output_grad_1 = float(p_output_grads[offset_o_1]);
+
+                p_input_grads[offset_i_0] = scalar_t(output_grad_0 * cos_0 + output_grad_1 * sin_0);
+                p_input_grads[offset_i_1] = scalar_t(output_grad_1 * cos_1 - output_grad_0 * sin_1);
+            }
+        }
+
+        // the rest are just forwarded
+        if constexpr (!Inplace)
+        {
+            if constexpr (NopeFirst)
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, 0, size_d - size_r,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+            else
+            {
+                elementwise_copy(
+                    p_input_grads, p_output_grads,
+                    size_h, size_r, size_d,
+                    stride_o_h, stride_o_d,
+                    stride_i_h, stride_i_d);
+            }
+        }
+    }
+
+    template <int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool Inplace,
+              typename scalar_t, typename scalar_f_t>
+    __device__ __forceinline__ static void apply_2c(
         scalar_t* __restrict__         p_input_grads_x,
         scalar_t* __restrict__         p_input_grads_y,
         const scalar_t* __restrict__   p_output_grads_x,
@@ -1004,7 +992,7 @@ __global__ void kn_entry_1c_sbhd_uncached(
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_o,
         p_input + offset_i,
         p_freqs + offset_f,
@@ -1027,7 +1015,7 @@ __global__ void kn_entry_1c_sbhd_uncached_inplace(
     const int32_t offset   = sid * stride_s + bid * stride_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
         p_inout + offset,
         p_inout + offset,
         p_freqs + offset_f,
@@ -1036,7 +1024,7 @@ __global__ void kn_entry_1c_sbhd_uncached_inplace(
         stride_h, stride_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_uncached(
     scalar_t* __restrict__         p_output_x,
@@ -1059,20 +1047,41 @@ __global__ void kn_entry_2c_sbhd_uncached(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f  = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
-        p_output_x + offset_ox,
-        p_output_y + offset_oy,
-        p_input_x + offset_ix,
-        p_input_y + offset_iy,
-        p_freqs + offset_f,
-        size_h, size_d, size_f,
-        stride_ix_h, stride_ix_d,
-        stride_iy_h, stride_iy_d,
-        stride_ox_h, stride_ox_d,
-        stride_oy_h, stride_oy_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_input_x + offset_ix,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_ox_h, stride_ox_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_y + offset_oy,
+            p_input_y + offset_iy,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_iy_h, stride_iy_d,
+            stride_oy_h, stride_oy_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_output_y + offset_oy,
+            p_input_x + offset_ix,
+            p_input_y + offset_iy,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_iy_h, stride_iy_d,
+            stride_ox_h, stride_ox_d,
+            stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_uncached_inplace(
     scalar_t* __restrict__         p_inout_x,
@@ -1089,17 +1098,38 @@ __global__ void kn_entry_2c_sbhd_uncached_inplace(
     const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_freqs + offset_f,
-        size_h, size_d, size_f,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_x + offset_x,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_x_h, stride_x_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_y + offset_y,
+            p_inout_y + offset_y,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_y_h, stride_y_d,
+            stride_y_h, stride_y_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_freqs + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d);
+    }
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1120,7 +1150,7 @@ __global__ void kn_entry_1c_sbhd_cached(
     const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_o,
         p_input + offset_i,
         p_cos + offset_f,
@@ -1145,7 +1175,7 @@ __global__ void kn_entry_1c_sbhd_cached_inplace(
     const int32_t offset   = sid * stride_s + bid * stride_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
         p_inout + offset,
         p_inout + offset,
         p_cos + offset_f,
@@ -1155,7 +1185,7 @@ __global__ void kn_entry_1c_sbhd_cached_inplace(
         stride_h, stride_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached(
     scalar_t* __restrict__         p_output_x,
@@ -1179,21 +1209,44 @@ __global__ void kn_entry_2c_sbhd_cached(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f  = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
-        p_output_x + offset_ox,
-        p_output_y + offset_oy,
-        p_input_x + offset_ix,
-        p_input_y + offset_iy,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_ix_h, stride_ix_d,
-        stride_iy_h, stride_iy_d,
-        stride_ox_h, stride_ox_d,
-        stride_oy_h, stride_oy_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_input_x + offset_ix,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_ox_h, stride_ox_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_y + offset_oy,
+            p_input_y + offset_iy,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_iy_h, stride_iy_d,
+            stride_oy_h, stride_oy_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_output_y + offset_oy,
+            p_input_x + offset_ix,
+            p_input_y + offset_iy,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_iy_h, stride_iy_d,
+            stride_ox_h, stride_ox_d,
+            stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_inplace(
     scalar_t* __restrict__         p_inout_x,
@@ -1211,21 +1264,44 @@ __global__ void kn_entry_2c_sbhd_cached_inplace(
     const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const int32_t offset_f = sid * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_x + offset_x,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_x_h, stride_x_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_y + offset_y,
+            p_inout_y + offset_y,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_y_h, stride_y_d,
+            stride_y_h, stride_y_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect(
     scalar_t* __restrict__         p_output_x,
@@ -1251,21 +1327,44 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f  = p_indirect_buffer[ib_idx] * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
-        p_output_x + offset_ox,
-        p_output_y + offset_oy,
-        p_input_x + offset_ix,
-        p_input_y + offset_iy,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_ix_h, stride_ix_d,
-        stride_iy_h, stride_iy_d,
-        stride_ox_h, stride_ox_d,
-        stride_oy_h, stride_oy_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_input_x + offset_ix,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_ox_h, stride_ox_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_y + offset_oy,
+            p_input_y + offset_iy,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_iy_h, stride_iy_d,
+            stride_oy_h, stride_oy_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_output_y + offset_oy,
+            p_input_x + offset_ix,
+            p_input_y + offset_iy,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_iy_h, stride_iy_d,
+            stride_ox_h, stride_ox_d,
+            stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
     scalar_t* __restrict__         p_inout_x,
@@ -1285,21 +1384,44 @@ __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_x + offset_x,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_x_h, stride_x_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_y + offset_y,
+            p_inout_y + offset_y,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_y_h, stride_y_d,
+            stride_y_h, stride_y_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect2(
     scalar_t* __restrict__         p_output_x,
@@ -1326,21 +1448,44 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
-        p_output_x + offset_ox,
-        p_output_y + offset_oy,
-        p_input_x + offset_ix,
-        p_input_y + offset_iy,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_ix_h, stride_ix_d,
-        stride_iy_h, stride_iy_d,
-        stride_ox_h, stride_ox_d,
-        stride_oy_h, stride_oy_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_input_x + offset_ix,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_ox_h, stride_ox_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_y + offset_oy,
+            p_input_y + offset_iy,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_iy_h, stride_iy_d,
+            stride_oy_h, stride_oy_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+            p_output_x + offset_ox,
+            p_output_y + offset_oy,
+            p_input_x + offset_ix,
+            p_input_y + offset_iy,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_ix_h, stride_ix_d,
+            stride_iy_h, stride_iy_d,
+            stride_ox_h, stride_ox_d,
+            stride_oy_h, stride_oy_d);
+    }
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
     scalar_t* __restrict__         p_inout_x,
@@ -1361,18 +1506,41 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_inout_x + offset_x,
-        p_inout_y + offset_y,
-        p_cos + offset_f,
-        p_sin + offset_f,
-        size_h, size_d, size_f,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d,
-        stride_x_h, stride_x_d,
-        stride_y_h, stride_y_d);
+    if constexpr (TwoPass)
+    {
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_x + offset_x,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_x_h, stride_x_d);
+
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_y + offset_y,
+            p_inout_y + offset_y,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_y_h, stride_y_d,
+            stride_y_h, stride_y_d);
+    }
+    else
+    {
+        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_inout_x + offset_x,
+            p_inout_y + offset_y,
+            p_cos + offset_f,
+            p_sin + offset_f,
+            size_h, size_d, size_f,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d,
+            stride_x_h, stride_x_d,
+            stride_y_h, stride_y_d);
+    }    
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1397,7 +1565,7 @@ __global__ void kn_entry_1c_thd_uncached(
         const int32_t offset_o = tid * stride_o_t;
         const int32_t offset_f = sid * size_f;
 
-        Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
             p_output + offset_o,
             p_input + offset_i,
             p_freqs + offset_f,
@@ -1426,7 +1594,7 @@ __global__ void kn_entry_1c_thd_uncached_inplace(
         const int32_t offset   = tid * stride_t;
         const int32_t offset_f = sid * size_f;
 
-        Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
             p_inout + offset,
             p_inout + offset,
             p_freqs + offset_f,
@@ -1458,7 +1626,7 @@ __global__ void kn_entry_1c_2d_cached(
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
     const int offset_h_f = Hid * size_half_d;
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_h_o,
         p_input + offset_h_i,
         p_cos_h + offset_h_f,
@@ -1470,7 +1638,7 @@ __global__ void kn_entry_1c_2d_cached(
     const int offset_w_i = offset_h_i + size_half_d * stride_i_d;
     const int offset_w_o = offset_h_o + size_half_d * stride_o_d;
     const int offset_w_f = Wid * size_half_d;
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false>(
         p_output + offset_w_o,
         p_input + offset_w_i,
         p_cos_w + offset_w_f,
@@ -1499,7 +1667,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
 
     const int offset_h   = bid * stride_b + sid * stride_s;
     const int offset_h_f = Hid * size_half_d;
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
         p_inout + offset_h,
         p_inout + offset_h,
         p_cos_h + offset_h_f,
@@ -1510,7 +1678,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
 
     const int offset_w   = offset_h + size_half_d * stride_d;
     const int offset_w_f = Wid * size_half_d;
-    Op::template apply<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true>(
         p_inout + offset_w,
         p_inout + offset_w,
         p_cos_w + offset_w_f,
@@ -1585,6 +1753,8 @@ void dispatch_2c_sbhd_uncached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
+    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
+
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -1596,27 +1766,57 @@ void dispatch_2c_sbhd_uncached(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_freqs,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_freqs,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_freqs,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
     }
     else
     {
-        kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_input_x,
-            p_input_y,
-            p_freqs,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_freqs,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_freqs,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
     }
 }
 
@@ -1683,6 +1883,8 @@ void dispatch_2c_sbhd_cached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
+    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
+
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -1694,27 +1896,57 @@ void dispatch_2c_sbhd_cached(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_cos, p_sin,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
     }
     else
     {
-        kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_input_x,
-            p_input_y,
-            p_cos, p_sin,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
     }
 }
 
@@ -1740,6 +1972,8 @@ void dispatch_2c_sbhd_cached_indirect(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
+    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
+
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -1751,29 +1985,61 @@ void dispatch_2c_sbhd_cached_indirect(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_cos, p_sin,
-            p_indirect_buffer,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
     }
     else
     {
-        kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_input_x,
-            p_input_y,
-            p_cos, p_sin,
-            p_indirect_buffer,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
     }
 }
 
@@ -1800,6 +2066,8 @@ void dispatch_2c_sbhd_cached_indirect2(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
+    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
+
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -1811,31 +2079,65 @@ void dispatch_2c_sbhd_cached_indirect2(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_cos, p_sin,
-            p_indirect_buffer_0,
-            p_indirect_buffer_1,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        }
     }
     else
     {
-        kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst><<<grid, block, 0, stream>>>(
-            p_output_x,
-            p_output_y,
-            p_input_x,
-            p_input_y,
-            p_cos, p_sin,
-            p_indirect_buffer_0,
-            p_indirect_buffer_1,
-            size_h, size_d, size_f,
-            stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-            stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-            stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-            stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        if (use_two_pass_pipeline)
+        {
+            kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
+        else
+        {
+            kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        }
     }
 }
 
@@ -2701,8 +3003,8 @@ void rope_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_sbhd_uncached<Op1cUncachedFwd, ...>",
-        dispatch_1c_sbhd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_sbhd_uncached<OpUncachedFwd, ...>",
+        dispatch_1c_sbhd_uncached<OpUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             freqs.data_ptr<scalar_t_1>(),
@@ -2743,8 +3045,8 @@ void rope_bwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_sbhd_uncached<Op1cUncachedBwd, ...>",
-        dispatch_1c_sbhd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_sbhd_uncached<OpUncachedBwd, ...>",
+        dispatch_1c_sbhd_uncached<OpUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             freqs.data_ptr<scalar_t_1>(),
@@ -2795,8 +3097,8 @@ void rope_2c_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_2c_sbhd_uncached<Op2cUncachedFwd, ...>",
-        dispatch_2c_sbhd_uncached<Op2cUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_2c_sbhd_uncached<OpUncachedFwd, ...>",
+        dispatch_2c_sbhd_uncached<OpUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -2851,8 +3153,8 @@ void rope_2c_bwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_2c_sbhd_uncached<Op2cUncachedBwd, ...>",
-        dispatch_2c_sbhd_uncached<Op2cUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_2c_sbhd_uncached<OpUncachedBwd, ...>",
+        dispatch_2c_sbhd_uncached<OpUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads_x.data_ptr<scalar_t_0>(),
             input_grads_y.data_ptr<scalar_t_0>(),
             output_grads_x.data_ptr<scalar_t_0>(),
@@ -2898,8 +3200,8 @@ void rope_cached_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_sbhd_cached<Op1cCachedFwd, ...>",
-        dispatch_1c_sbhd_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_sbhd_cached<OpCachedFwd, ...>",
+        dispatch_1c_sbhd_cached<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
@@ -2942,8 +3244,8 @@ void rope_cached_bwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_sbhd_cached<Op1cCachedBwd, ...>",
-        dispatch_1c_sbhd_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_sbhd_cached<OpCachedBwd, ...>",
+        dispatch_1c_sbhd_cached<OpCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cos.data_ptr<scalar_t_1>(),
@@ -2996,8 +3298,8 @@ void rope_cached_2c_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_2c_sbhd_cached<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_2c_sbhd_cached<OpCachedFwd, ...>",
+        dispatch_2c_sbhd_cached<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -3054,8 +3356,8 @@ void rope_cached_2c_bwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_2c_sbhd_cached<Op2cCachedBwd, ...>",
-        dispatch_2c_sbhd_cached<Op2cCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_2c_sbhd_cached<OpCachedBwd, ...>",
+        dispatch_2c_sbhd_cached<OpCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads_x.data_ptr<scalar_t_0>(),
             input_grads_y.data_ptr<scalar_t_0>(),
             output_grads_x.data_ptr<scalar_t_0>(),
@@ -3115,8 +3417,8 @@ void rope_cached_positions_2c_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_2c_sbhd_cached_indirect<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached_indirect<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_2c_sbhd_cached_indirect<OpCachedFwd, ...>",
+        dispatch_2c_sbhd_cached_indirect<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -3179,8 +3481,8 @@ void rope_cached_positions_offsets_2c_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_2c_sbhd_cached_indirect2<Op2cCachedFwd, ...>",
-        dispatch_2c_sbhd_cached_indirect2<Op2cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_2c_sbhd_cached_indirect2<OpCachedFwd, ...>",
+        dispatch_2c_sbhd_cached_indirect2<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output_x.data_ptr<scalar_t_0>(),
             output_y.data_ptr<scalar_t_0>(),
             input_x.data_ptr<scalar_t_0>(),
@@ -3227,8 +3529,8 @@ void rope_thd_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_thd_uncached<Op1cUncachedFwd, ...>",
-        dispatch_1c_thd_uncached<Op1cUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_thd_uncached<OpUncachedFwd, ...>",
+        dispatch_1c_thd_uncached<OpUncachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cu_seqlens.data_ptr<int32_t>(),
@@ -3269,8 +3571,8 @@ void rope_thd_bwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_thd_uncached<Op1cUncachedBwd, ...>",
-        dispatch_1c_thd_uncached<Op1cUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_thd_uncached<OpUncachedBwd, ...>",
+        dispatch_1c_thd_uncached<OpUncachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cu_seqlens.data_ptr<int32_t>(),
@@ -3318,8 +3620,8 @@ void rope_2d_fwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_2d_cached<Op1cCachedFwd, ...>",
-        dispatch_1c_2d_cached<Op1cCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_2d_cached<OpCachedFwd, ...>",
+        dispatch_1c_2d_cached<OpCachedFwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             output.data_ptr<scalar_t_0>(),
             input.data_ptr<scalar_t_0>(),
             cos_h.data_ptr<scalar_t_1>(),
@@ -3369,8 +3671,8 @@ void rope_2d_bwd_impl(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
-        "dispatch_1c_2d_cached<Op1cCachedBwd, ...>",
-        dispatch_1c_2d_cached<Op1cCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
+        "dispatch_1c_2d_cached<OpCachedBwd, ...>",
+        dispatch_1c_2d_cached<OpCachedBwd, RotateStyle, ReuseFreqsFrontPart, NopeFirst>(
             input_grads.data_ptr<scalar_t_0>(),
             output_grads.data_ptr<scalar_t_0>(),
             cos_h.data_ptr<scalar_t_1>(),
