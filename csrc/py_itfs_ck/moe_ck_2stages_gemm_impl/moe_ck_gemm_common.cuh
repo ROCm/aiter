@@ -92,6 +92,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     constexpr ck::index_t NumDTensor = DsDataType::Size();
 
     constexpr auto I0 = ck::Number<0>{};
+    constexpr auto I1 = ck::Number<1>{};
 
     // do GEMM
     auto device_op = DeviceOpInstance{};
@@ -113,7 +114,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                                K,
                                StrideA,
                                StrideB,
-                               std::array<ck::index_t, NumDTensor>{I0, I0},
+                               std::array<ck::index_t, NumDTensor>{I0, I1},
                                StrideE,
                                KBatch,
                                a_element_op,
@@ -242,6 +243,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     constexpr ck::index_t NumDTensor = DsDataType::Size();
 
     constexpr auto I0 = ck::Number<0>{};
+    constexpr auto I1 = ck::Number<1>{};
 
     // do GEMM
     auto device_op = DeviceOpInstance{};
@@ -264,7 +266,7 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                                K,
                                StrideA,
                                StrideB,
-                               std::array<ck::index_t, NumDTensor>{I0, I0, I0},
+                               std::array<ck::index_t, NumDTensor>{I0, I1, I0},
                                StrideE,
                                KBatch,
                                a_element_op,
