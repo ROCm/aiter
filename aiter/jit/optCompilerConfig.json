@@ -357,7 +357,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "isASM": "False",
-        "verbose": "True",
+        "verbose": "False",
         "blob_gen_cmd": "''"
     },
     "module_mha_fwd": {
