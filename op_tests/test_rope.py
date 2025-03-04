@@ -346,12 +346,12 @@ if __name__ == "__main__":
     parser.add_argument('--compare_check', action='store_true', help="Check correctness when compare with legacy implementation. Default: False")
     args = parser.parse_args()
 
-    dtype_ = (torch.float, torch.float16, torch.bfloat16)[1:2]
-    transpose_output_ = (False, True)[-1:]
-    batch_size_ = (1, 2, 4)[-1:]
-    seq_size_ = (1024, 2048, 4096)[-1:]
-    head_size_ = (32, 64)[-1:]
-    hidden_dim_ = (128, 256)[-1:]
+    dtype_ = (torch.float, torch.float16, torch.bfloat16)
+    transpose_output_ = (False, True)
+    batch_size_ = (1, 2, 4)
+    seq_size_ = (1024, 2048, 4096)
+    head_size_ = (32, 64)
+    hidden_dim_ = (128, 256)
     # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
     rotary_percent_and_reuse_ = ((1.0, True, False),
                                  (1.0, False, False),
@@ -423,17 +423,18 @@ if __name__ == "__main__":
     # Compare new with legacy
     if args.compare:
         # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
+        # reuse front part should always be True here since legacy implementation doesn't support the opposite setting.
         rotary_percent_and_reuse_compare_ = (
             (1.0, True, False),
             (0.5, True, False),)
-        for (dtype, fdtype,
+        for (dtype,
             transpose_output,
             rotate_style,
             rotary_percent_and_reuse,
             has_offsets,
             b, s, h, d
         ) in itertools.product(
-            dtype_, dtype_,
+            dtype_, # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
             transpose_output_,
             rotate_style_,
             rotary_percent_and_reuse_compare_,
@@ -444,7 +445,7 @@ if __name__ == "__main__":
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
             nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
             freqs_ratio = 2 if reuse_freqs_front_part else 1
-            freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
+            freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=dtype, device="cuda")
             positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
             offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
             input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
