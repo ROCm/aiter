@@ -16,6 +16,8 @@
 // sbhd:                Shape of tensor: [sequence length, batch size, head count, hidden dimension].
 // thd:                 Shape of tensor.
 // 2d:                  2D image.
+// NopeFirst:           [0, size_r(rotate dim)) is rotated and the rest is just copied if this value is false.
+//                      [size_d (size of d dim) - size_r, size_d) is rotated and the front part is just copied if true.
 //
 
 #define ROTATE_STYLE_NEOX 0
@@ -959,7 +961,7 @@ __global__ void kn_entry_1c_sbhd_uncached_inplace(
         stride_h, stride_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDOutXEq1, bool StrideDOutYEq1, bool StrideDInXEq1, bool StrideDInYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_uncached(
@@ -983,41 +985,20 @@ __global__ void kn_entry_2c_sbhd_uncached(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f  = sid * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDInXEq1>(
-            p_output_x + offset_ox,
-            p_input_x + offset_ix,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_ox_h, stride_ox_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutYEq1, StrideDInYEq1>(
-            p_output_y + offset_oy,
-            p_input_y + offset_iy,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_iy_h, stride_iy_d,
-            stride_oy_h, stride_oy_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
-            p_output_x + offset_ox,
-            p_output_y + offset_oy,
-            p_input_x + offset_ix,
-            p_input_y + offset_iy,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_iy_h, stride_iy_d,
-            stride_ox_h, stride_ox_d,
-            stride_oy_h, stride_oy_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
+        p_output_x + offset_ox,
+        p_output_y + offset_oy,
+        p_input_x + offset_ix,
+        p_input_y + offset_iy,
+        p_freqs + offset_f,
+        size_h, size_d, size_f,
+        stride_ix_h, stride_ix_d,
+        stride_iy_h, stride_iy_d,
+        stride_ox_h, stride_ox_d,
+        stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDXEq1, bool StrideDYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_uncached_inplace(
@@ -1035,38 +1016,17 @@ __global__ void kn_entry_2c_sbhd_uncached_inplace(
     const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const int32_t offset_f = sid * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDXEq1>(
-            p_inout_x + offset_x,
-            p_inout_x + offset_x,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_x_h, stride_x_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDYEq1, StrideDYEq1>(
-            p_inout_y + offset_y,
-            p_inout_y + offset_y,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_y_h, stride_y_d,
-            stride_y_h, stride_y_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_freqs + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_freqs + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1124,7 +1084,7 @@ __global__ void kn_entry_1c_sbhd_cached_inplace(
         stride_h, stride_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDOutXEq1, bool StrideDOutYEq1, bool StrideDInXEq1, bool StrideDInYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached(
@@ -1149,44 +1109,21 @@ __global__ void kn_entry_2c_sbhd_cached(
     const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
     const int32_t offset_f  = sid * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDInXEq1>(
-            p_output_x + offset_ox,
-            p_input_x + offset_ix,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_ox_h, stride_ox_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutYEq1, StrideDInYEq1>(
-            p_output_y + offset_oy,
-            p_input_y + offset_iy,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_iy_h, stride_iy_d,
-            stride_oy_h, stride_oy_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
-            p_output_x + offset_ox,
-            p_output_y + offset_oy,
-            p_input_x + offset_ix,
-            p_input_y + offset_iy,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_iy_h, stride_iy_d,
-            stride_ox_h, stride_ox_d,
-            stride_oy_h, stride_oy_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
+        p_output_x + offset_ox,
+        p_output_y + offset_oy,
+        p_input_x + offset_ix,
+        p_input_y + offset_iy,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_ix_h, stride_ix_d,
+        stride_iy_h, stride_iy_d,
+        stride_ox_h, stride_ox_d,
+        stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDXEq1, bool StrideDYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_inplace(
@@ -1205,44 +1142,21 @@ __global__ void kn_entry_2c_sbhd_cached_inplace(
     const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
     const int32_t offset_f = sid * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDXEq1>(
-            p_inout_x + offset_x,
-            p_inout_x + offset_x,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_x_h, stride_x_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDYEq1, StrideDYEq1>(
-            p_inout_y + offset_y,
-            p_inout_y + offset_y,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_y_h, stride_y_d,
-            stride_y_h, stride_y_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDOutXEq1, bool StrideDOutYEq1, bool StrideDInXEq1, bool StrideDInYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect(
@@ -1269,44 +1183,21 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f  = p_indirect_buffer[ib_idx] * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDInXEq1>(
-            p_output_x + offset_ox,
-            p_input_x + offset_ix,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_ox_h, stride_ox_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutYEq1, StrideDInYEq1>(
-            p_output_y + offset_oy,
-            p_input_y + offset_iy,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_iy_h, stride_iy_d,
-            stride_oy_h, stride_oy_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
-            p_output_x + offset_ox,
-            p_output_y + offset_oy,
-            p_input_x + offset_ix,
-            p_input_y + offset_iy,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_iy_h, stride_iy_d,
-            stride_ox_h, stride_ox_d,
-            stride_oy_h, stride_oy_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
+        p_output_x + offset_ox,
+        p_output_y + offset_oy,
+        p_input_x + offset_ix,
+        p_input_y + offset_iy,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_ix_h, stride_ix_d,
+        stride_iy_h, stride_iy_d,
+        stride_ox_h, stride_ox_d,
+        stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDXEq1, bool StrideDYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
@@ -1327,44 +1218,21 @@ __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDXEq1>(
-            p_inout_x + offset_x,
-            p_inout_x + offset_x,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_x_h, stride_x_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDYEq1, StrideDYEq1>(
-            p_inout_y + offset_y,
-            p_inout_y + offset_y,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_y_h, stride_y_d,
-            stride_y_h, stride_y_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDOutXEq1, bool StrideDOutYEq1, bool StrideDInXEq1, bool StrideDInYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect2(
@@ -1392,44 +1260,21 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDInXEq1>(
-            p_output_x + offset_ox,
-            p_input_x + offset_ix,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_ox_h, stride_ox_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutYEq1, StrideDInYEq1>(
-            p_output_y + offset_oy,
-            p_input_y + offset_iy,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_iy_h, stride_iy_d,
-            stride_oy_h, stride_oy_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
-            p_output_x + offset_ox,
-            p_output_y + offset_oy,
-            p_input_x + offset_ix,
-            p_input_y + offset_iy,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_ix_h, stride_ix_d,
-            stride_iy_h, stride_iy_d,
-            stride_ox_h, stride_ox_d,
-            stride_oy_h, stride_oy_d);
-    }
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
+        p_output_x + offset_ox,
+        p_output_y + offset_oy,
+        p_input_x + offset_ix,
+        p_input_y + offset_iy,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_ix_h, stride_ix_d,
+        stride_iy_h, stride_iy_d,
+        stride_ox_h, stride_ox_d,
+        stride_oy_h, stride_oy_d);
 }
 
-template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst, bool TwoPass,
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDXEq1, bool StrideDYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
@@ -1451,41 +1296,18 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
     const int32_t ib_idx    = sid * gridDim.y + bid;
     const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
-    if constexpr (TwoPass)
-    {
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDXEq1>(
-            p_inout_x + offset_x,
-            p_inout_x + offset_x,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_x_h, stride_x_d);
-
-        Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDYEq1, StrideDYEq1>(
-            p_inout_y + offset_y,
-            p_inout_y + offset_y,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_y_h, stride_y_d,
-            stride_y_h, stride_y_d);
-    }
-    else
-    {
-        Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_inout_x + offset_x,
-            p_inout_y + offset_y,
-            p_cos + offset_f,
-            p_sin + offset_f,
-            size_h, size_d, size_f,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d,
-            stride_x_h, stride_x_d,
-            stride_y_h, stride_y_d);
-    }    
+    Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_inout_x + offset_x,
+        p_inout_y + offset_y,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d,
+        stride_x_h, stride_x_d,
+        stride_y_h, stride_y_d);
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1641,184 +1463,203 @@ __global__ void kn_entry_1c_2d_cached_inplace(
 // Dispatches
 //
 
-#define LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(STRIDE_0, ...)                               \
-    if (STRIDE_0 == 1)                                                                      \
-    {                                                                                       \
-        constexpr bool Stride0Eq1 = true;                                                   \
-        __VA_ARGS__;                                                                        \
-    }                                                                                       \
-    else                                                                                    \
-    {                                                                                       \
-        constexpr bool Stride0Eq1 = false;                                                  \
-        __VA_ARGS__;                                                                        \
+#define LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(ROTATE_STYLE, STRIDE_0, ...)                                 \
+    if constexpr (ROTATE_STYLE != ROTATE_STYLE_GPTJ)                                                        \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = false;                                                                  \
+        __VA_ARGS__;                                                                                        \
+    }                                                                                                       \
+    else if (STRIDE_0 == 1)                                                                                 \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = true;                                                                   \
+        __VA_ARGS__;                                                                                        \
+    }                                                                                                       \
+    else                                                                                                    \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = false;                                                                  \
+        __VA_ARGS__;                                                                                        \
     }
 
-#define LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(STRIDE_0, STRIDE_1, ...)                     \
-    if (STRIDE_0 == 1)                                                                      \
-    {                                                                                       \
-        constexpr bool Stride0Eq1 = true;                                                   \
-        if (STRIDE_1 == 1)                                                                  \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = true;                                               \
-            __VA_ARGS__;                                                                    \
-        }                                                                                   \
-        else                                                                                \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = false;                                              \
-            __VA_ARGS__;                                                                    \
-        }                                                                                   \
-    }                                                                                       \
-    else                                                                                    \
-    {                                                                                       \
-        constexpr bool Stride0Eq1 = false;                                                  \
-        if (STRIDE_1 == 1)                                                                  \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = true;                                               \
-            __VA_ARGS__;                                                                    \
-        }                                                                                   \
-        else                                                                                \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = false;                                              \
-            __VA_ARGS__;                                                                    \
-        }                                                                                   \
+#define LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(ROTATE_STYLE, STRIDE_0, STRIDE_1, ...)                       \
+    if constexpr (ROTATE_STYLE != ROTATE_STYLE_GPTJ)                                                        \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = false;                                                                  \
+        constexpr bool Stride1Eq1 = false;                                                                  \
+        __VA_ARGS__;                                                                                        \
+    }                                                                                                       \
+    else if (STRIDE_0 == 1)                                                                                 \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = true;                                                                   \
+        if (STRIDE_1 == 1)                                                                                  \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = true;                                                               \
+            __VA_ARGS__;                                                                                    \
+        }                                                                                                   \
+        else                                                                                                \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = false;                                                              \
+            __VA_ARGS__;                                                                                    \
+        }                                                                                                   \
+    }                                                                                                       \
+    else                                                                                                    \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = false;                                                                  \
+        if (STRIDE_1 == 1)                                                                                  \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = true;                                                               \
+            __VA_ARGS__;                                                                                    \
+        }                                                                                                   \
+        else                                                                                                \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = false;                                                              \
+            __VA_ARGS__;                                                                                    \
+        }                                                                                                   \
     }
 
-#define LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(STRIDE_0, STRIDE_1, STRIDE_2, STRIDE_3, ...) \
-    if (STRIDE_0 == 1)                                                                      \
-    {                                                                                       \
-        constexpr bool Stride0Eq1 = true;                                                   \
-        if (STRIDE_1 == 1)                                                                  \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = true;                                               \
-            if (STRIDE_2 == 1)                                                              \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = true;                                           \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-            else                                                                            \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = false;                                          \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-        }                                                                                   \
-        else                                                                                \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = false;                                              \
-            if (STRIDE_2 == 1)                                                              \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = true;                                           \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-            else                                                                            \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = false;                                          \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-        }                                                                                   \
-    }                                                                                       \
-    else                                                                                    \
-    {                                                                                       \
-        constexpr bool Stride0Eq1 = false;                                                  \
-        if (STRIDE_1 == 1)                                                                  \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = true;                                               \
-            if (STRIDE_2 == 1)                                                              \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = true;                                           \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-            else                                                                            \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = false;                                          \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-        }                                                                                   \
-        else                                                                                \
-        {                                                                                   \
-            constexpr bool Stride1Eq1 = false;                                              \
-            if (STRIDE_2 == 1)                                                              \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = true;                                           \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-            else                                                                            \
-            {                                                                               \
-                constexpr bool Stride2Eq1 = false;                                          \
-                if (STRIDE_3 == 1)                                                          \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = true;                                       \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-                else                                                                        \
-                {                                                                           \
-                    constexpr bool Stride3Eq1 = false;                                      \
-                    __VA_ARGS__;                                                            \
-                }                                                                           \
-            }                                                                               \
-        }                                                                                   \
+#define LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(ROTATE_STYLE, STRIDE_0, STRIDE_1, STRIDE_2, STRIDE_3, ...)   \
+    if constexpr (ROTATE_STYLE != ROTATE_STYLE_GPTJ)                                                        \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = false;                                                                  \
+        constexpr bool Stride1Eq1 = false;                                                                  \
+        constexpr bool Stride2Eq1 = false;                                                                  \
+        constexpr bool Stride3Eq1 = false;                                                                  \
+        __VA_ARGS__;                                                                                        \
+    }                                                                                                       \
+    else if (STRIDE_0 == 1)                                                                                 \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = true;                                                                   \
+        if (STRIDE_1 == 1)                                                                                  \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = true;                                                               \
+            if (STRIDE_2 == 1)                                                                              \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = true;                                                           \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+            else                                                                                            \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = false;                                                          \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+        }                                                                                                   \
+        else                                                                                                \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = false;                                                              \
+            if (STRIDE_2 == 1)                                                                              \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = true;                                                           \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+            else                                                                                            \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = false;                                                          \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+        }                                                                                                   \
+    }                                                                                                       \
+    else                                                                                                    \
+    {                                                                                                       \
+        constexpr bool Stride0Eq1 = false;                                                                  \
+        if (STRIDE_1 == 1)                                                                                  \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = true;                                                               \
+            if (STRIDE_2 == 1)                                                                              \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = true;                                                           \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+            else                                                                                            \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = false;                                                          \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+        }                                                                                                   \
+        else                                                                                                \
+        {                                                                                                   \
+            constexpr bool Stride1Eq1 = false;                                                              \
+            if (STRIDE_2 == 1)                                                                              \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = true;                                                           \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+            else                                                                                            \
+            {                                                                                               \
+                constexpr bool Stride2Eq1 = false;                                                          \
+                if (STRIDE_3 == 1)                                                                          \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = true;                                                       \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+                else                                                                                        \
+                {                                                                                           \
+                    constexpr bool Stride3Eq1 = false;                                                      \
+                    __VA_ARGS__;                                                                            \
+                }                                                                                           \
+            }                                                                                               \
+        }                                                                                                   \
     }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1845,6 +1686,7 @@ void dispatch_1c_sbhd_uncached(
         assert(stride_i_d == stride_o_d);
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
+            RotateStyle,
             stride_i_d,
             kn_entry_1c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1><<<grid, block, 0, stream>>>(
                 p_output,
@@ -1855,6 +1697,7 @@ void dispatch_1c_sbhd_uncached(
     else
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
             stride_i_d,
             stride_o_d,
             kn_entry_1c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
@@ -1888,8 +1731,6 @@ void dispatch_2c_sbhd_uncached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
-
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -1901,77 +1742,39 @@ void dispatch_2c_sbhd_uncached(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_freqs,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_freqs,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            kn_entry_2c_sbhd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_freqs,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        );
     }
     else
     {
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_freqs,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_freqs,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            stride_ox_d,
+            stride_oy_d,
+            kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_freqs,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        );
     }
 }
 
@@ -2000,6 +1803,7 @@ void dispatch_1c_sbhd_cached(
         assert(stride_i_d == stride_o_d);
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
+            RotateStyle,
             stride_i_d,
             kn_entry_1c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1><<<grid, block, 0, stream>>>(
                 p_output,
@@ -2011,6 +1815,7 @@ void dispatch_1c_sbhd_cached(
     else
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
             stride_i_d,
             stride_o_d,
             kn_entry_1c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
@@ -2045,8 +1850,6 @@ void dispatch_2c_sbhd_cached(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
-
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -2058,77 +1861,39 @@ void dispatch_2c_sbhd_cached(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_cos, p_sin,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_cos, p_sin,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            kn_entry_2c_sbhd_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        );
     }
     else
     {
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_cos, p_sin,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_cos, p_sin,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            stride_ox_d,
+            stride_oy_d,
+            kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        );
     }
 }
 
@@ -2154,8 +1919,6 @@ void dispatch_2c_sbhd_cached_indirect(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
-
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -2167,81 +1930,41 @@ void dispatch_2c_sbhd_cached_indirect(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            kn_entry_2c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        );
     }
     else
     {
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            stride_ox_d,
+            stride_oy_d,
+            kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        );
     }
 }
 
@@ -2268,8 +1991,6 @@ void dispatch_2c_sbhd_cached_indirect2(
     const dim3 grid(size_s, size_b);
     const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
 
-    const bool use_two_pass_pipeline = (RotateStyle == ROTATE_STYLE_GPTJ);
-
     if ((p_output_x == p_input_x) && (p_output_y == p_input_y))
     {
         assert(stride_ix_s == stride_ox_s);
@@ -2281,85 +2002,43 @@ void dispatch_2c_sbhd_cached_indirect2(
         assert(stride_iy_h == stride_oy_h);
         assert(stride_iy_d == stride_oy_d);
 
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer_0,
-                    p_indirect_buffer_1,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer_0,
-                    p_indirect_buffer_1,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            kn_entry_2c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d);
+        );
     }
     else
     {
-        if (use_two_pass_pipeline)
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer_0,
-                    p_indirect_buffer_1,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
-        else
-        {
-            LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
-                stride_ix_d,
-                stride_iy_d,
-                stride_ox_d,
-                stride_oy_d,
-                kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
-                    p_output_x,
-                    p_output_y,
-                    p_input_x,
-                    p_input_y,
-                    p_cos, p_sin,
-                    p_indirect_buffer_0,
-                    p_indirect_buffer_1,
-                    size_h, size_d, size_f,
-                    stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
-                    stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
-                    stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
-                    stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
-            );
-        }
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
+            RotateStyle,
+            stride_ix_d,
+            stride_iy_d,
+            stride_ox_d,
+            stride_oy_d,
+            kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
+                p_output_x,
+                p_output_y,
+                p_input_x,
+                p_input_y,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_ix_s, stride_ix_b, stride_ix_h, stride_ix_d,
+                stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
+                stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
+                stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        );
     }
 }
 
@@ -2387,6 +2066,7 @@ void dispatch_1c_thd_uncached(
         assert(stride_i_d == stride_o_d);
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
+            RotateStyle,
             stride_i_d,
             kn_entry_1c_thd_uncached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1><<<grid, block, 0, stream>>>(
                 p_output,
@@ -2399,6 +2079,7 @@ void dispatch_1c_thd_uncached(
     else
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
             stride_i_d,
             stride_o_d,
             kn_entry_1c_thd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
@@ -2440,6 +2121,7 @@ void dispatch_1c_2d_cached(
         assert(stride_i_d == stride_o_d);
 
         LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
+            RotateStyle,
             stride_i_d,
             kn_entry_1c_2d_cached_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1><<<grid, block, 0, stream>>>(
                 p_output,
@@ -2452,6 +2134,7 @@ void dispatch_1c_2d_cached(
     else
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
             stride_i_d,
             stride_o_d,
             kn_entry_1c_2d_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
