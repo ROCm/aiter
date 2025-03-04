@@ -19,6 +19,7 @@ def mha_fwd(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ): ...
@@ -113,6 +114,7 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool
@@ -130,12 +132,15 @@ def _flash_attn_forward(
     elif q.dtype == torch.bfloat16:
         md_name += '_bf16'
         filter += 'bf16*'
-    if alibi_slopes is None:
-        md_name += '_nbias'
-        filter += '_nbias*'
-    else:
+    if bias is not None:
+        md_name += '_bias'
+        filter += '_bias*'
+    elif alibi_slopes is not None:
         md_name += '_alibi'
         filter += '_alibi*'
+    else:
+        md_name += '_nbias'
+        filter += '_nbias*'
     if not causal and window_size_left == -1 and window_size_right == -1:
         md_name += '_nmask'
         filter += '_nmask*'
@@ -171,6 +176,7 @@ def _flash_attn_forward(
         return_lse,
         return_softmax,
         None,
+        bias,
         alibi_slopes,
         None,
         custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
@@ -285,6 +291,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,
@@ -310,6 +317,7 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
@@ -320,6 +328,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
             ctx.window_size = window_size
+            ctx.bias = bias
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
@@ -374,6 +383,7 @@ def flash_attn_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    bias=None,
     alibi_slopes=None,
     deterministic=True,
     return_lse=False,
@@ -410,6 +420,7 @@ def flash_attn_func(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        bias: (seqlen_q, seqlen_k)
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
@@ -435,6 +446,7 @@ def flash_attn_func(
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,

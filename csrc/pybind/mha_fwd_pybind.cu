@@ -15,6 +15,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("return_softmax_lse"),
           py::arg("return_dropout_randval"),
           py::arg("out") = std::nullopt,
+          py::arg("bias") = std::nullopt,
           py::arg("alibi_slopes") = std::nullopt,
           py::arg("gen") = std::nullopt);
 }
