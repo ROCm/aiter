@@ -165,7 +165,7 @@ template torch::Tensor
    {                                                                                                                             \\"""
 
         LOOKUP_template = """
-       {{{bmnk},                                                                                                       \\
+       {{{mnk},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
         LOOKUP_end = """
@@ -175,13 +175,13 @@ template torch::Tensor
 """
         with open(os.path.join(self.working_path, "batched_gemm_a8w8_lookup.h"), "w") as f:
             f.write(LOOKUP_head)
-            for bmnk, k in kernels_dict.items():
-                # print((", ").join(map(lambda x: str(x), list(bmnk))), ":", k.name)
-                if not self.istune and (isinstance(bmnk, tuple) and bmnk[0] > 0):
-                    f.write(LOOKUP_template.format(bmnk="{"+(", ").join(
-                        map(lambda x: str(x), list(bmnk))) + "}", kernel_name=k.name))
-                elif self.istune and isinstance(bmnk, int):
-                    f.write(LOOKUP_template.format(bmnk=bmnk, kernel_name=k.name))
+            for mnk, k in kernels_dict.items():
+                #print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
+                if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
+                    f.write(LOOKUP_template.format(mnk="{"+(", ").join(
+                        map(lambda x: str(x), list(mnk))) + "}", kernel_name=k.name))
+                elif self.istune and isinstance(mnk, int):
+                    f.write(LOOKUP_template.format(mnk=mnk, kernel_name=k.name))
             f.write(LOOKUP_end)
 
     def gen_manifest_head(self, kernels_dict):
@@ -214,7 +214,7 @@ torch::Tensor
 
         with open(os.path.join(self.working_path, "batched_gemm_a8w8_manifest.h"), "w") as f:
             f.write(MAINFEST_head)
-            for bmnk, k in kernels_dict.items():
+            for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
             f.write(MAINFEST_end)
 
@@ -226,7 +226,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for bmnk, k in kernels_dict.items():
+        for mnk, k in kernels_dict.items():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)

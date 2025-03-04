@@ -24,10 +24,10 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
             return True
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    B = x.shape[0]
-    M = x.shape[1]
-    N = weight.shape[1]
-    out = torch.empty(B, M, N)
+    B = x.size(0)
+    M = x.size(1)
+    N = weight.size(1)
+    out = torch.empty(B, M, N, dtype=torch.bfloat16, device="cuda")
     for b in range(B):
         b_x = F.linear(x[b, :, :].to(torch.float32), weight[b, :, :].to(torch.float32))
         b_scale = torch.matmul(x_scale[b, :, :], w_scale[b, :, :])
@@ -86,6 +86,7 @@ def tune_batched_gemm(b, m, n, k, useSplitK = False):
                 else:
                     print(f"{str(dim):<20} kernelid:{i:<3d}\t No pass         , {kernel.name}, {splitK=}")
             except RuntimeError as e:
+                print(f"error = {e}")
                 print(f"{str(dim):<20} kernelid:{i:<3d}\t No support      , {kernel.name}, {splitK=}")
 
     best_kernelId, splitK = best_kernelConfig

@@ -111,7 +111,8 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
         return BatchedRowwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,B16)};
     } else {
         static_assert(false, "batched_rowwise_dispatch used with unsupported dtype!");
-    } }();
+    }
+  }();
   
   // First check if this shape(M,N,K) is available in the direct lookup.
   auto it = lookup.find({B, M, N, K});
@@ -142,7 +143,7 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
     return it->second;
   }
   // Otherwise, use heuristics.
-  return rowwise_heuristic_dispatch<DDataType, EDataType>(B, M, N, K);
+  return batched_rowwise_heuristic_dispatch<DDataType, EDataType>(B, M, N, K);
 }
 
 torch::Tensor batched_gemm_a8w8(
@@ -166,7 +167,7 @@ torch::Tensor batched_gemm_a8w8(
   int M = XQ.size(1);
   int N = WQ.size(1);
   int K = XQ.size(2);
-  int KBatch = std::pow(2, splitK);
+  int KBatch = 1;
 
   if (x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
   {
