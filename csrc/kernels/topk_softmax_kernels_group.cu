@@ -6,7 +6,7 @@
  * @Email: lingpeng.jin@amd.com
  * @Create At: 2025-03-01 12:16:14
  * @Last Modified By: valarLip
- * @Last Modified At: 2025-03-02 11:40:21
+ * @Last Modified At: 2025-03-04 22:27:28
  * @Description: This is description.
  */
 
@@ -19,7 +19,7 @@
 #define WARP_SIZE 64
 namespace aiter
 {
-    __device__ void warpReduceMax(float &val, int &idx)
+    __inline__ __device__ void warpReduceMax(float &val, int &idx)
     {
         static_assert(64 == WARP_SIZE, "WARP_SIZE == 64");
 #pragma unroll
@@ -65,15 +65,16 @@ namespace aiter
 
     template <typename DTYPE_I, typename fvec, int NUM_GRP, bool need_renorm>
     __global__ void biased_grouped_topk_kernel(
-        const DTYPE_I *__restrict__ gating_output, // [num_tokens, hidden_size]
-        const float *__restrict__ correction_bias, // [num_expert]
-        float *__restrict__ topk_weights,          // [num_tokens, topk]
-        int *__restrict__ topk_ids,                // [num_tokens, topk]
+        const DTYPE_I *__restrict__ gating_output,   // [num_tokens, hidden_size]
+        const DTYPE_I *__restrict__ correction_bias, // [num_expert]
+        float *__restrict__ topk_weights,            // [num_tokens, topk]
+        int *__restrict__ topk_ids,                  // [num_tokens, topk]
         const size_t stride_tk,
         const int num_experts,
         const int topk,
         const int topk_group,
-        const int num_tokens)
+        const int num_tokens,
+        const float routed_scaling_factor)
     {
         static_assert(NUM_GRP <= WARP_SIZE, "NUM_GRP must be <= WARP_SIZE");
         // 256 E, 8->4 group, 32 e/group
@@ -107,14 +108,10 @@ namespace aiter
 
         for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
-            float gating = gating_output[token_idx * num_experts + e];
-            scores[e] = 1.0f / (1.0f + expf(-gating)) + correction_bias[e];
+            float gating = static_cast<float>(gating_output[token_idx * num_experts + e]);
+            float score = 1.0f / (1.0f + expf(-gating));
+            scores[e] = score + correction_bias[e];
         }
-        // for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
-        // {
-        //     float gating = gating_output[token_idx * num_experts + e];
-        //     scores[e] = 1.0f / (1.0f + expf(-gating)) + correction_bias[e];
-        // }
 
 #pragma unroll
         for (int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
@@ -181,13 +178,12 @@ namespace aiter
 
             for (int e = threadIdx.x; e < num_experts / vec_size; e += blockDim.x)
             {
-                fvec s_vec = scores_vec[e];
                 union
                 {
                     fvec vec;
                     float f[vec_size];
                 } tmp;
-                tmp.vec = s_vec;
+                tmp.vec = scores_vec[e];
 #pragma unroll
                 for (size_t i = 0; i < vec_size; i++)
                 {
@@ -197,23 +193,22 @@ namespace aiter
                         max_idx = e * vec_size + i;
                     }
                 }
-                // for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
-                // {
-                //     if (scores[e] > max_val)
-                //     {
-                //         max_val = scores[e];
-                //         max_idx = e;
-                //     }
             }
 
             warpReduceMax(max_val, max_idx);
             // blockReduceMax(max_val, max_idx);
 
-            if (threadIdx.x == 0 && max_idx != -1)
+            if (threadIdx.x == 0)
             {
-                topk_values[k] = max_val;
-                topk_indices[k] = max_idx;
+                if (max_idx == -1)
+                {
+                    max_idx = k;
+                    max_val = scores[max_idx];
+                }
+                max_val -= correction_bias[max_idx];
                 scores[max_idx] = -INFINITY;
+                topk_indices[k] = max_idx;
+                topk_values[k] = max_val;
                 if (need_renorm)
                 {
                     sum += max_val;
@@ -226,37 +221,19 @@ namespace aiter
         {
             if (threadIdx.x == 0)
             {
-                scores[0] = sum; // reuse lds
+                scores[0] = routed_scaling_factor / sum; // reuse lds
             }
             __syncthreads();
             sum = scores[0];
         }
-
-        // if (threadIdx.x == 0)
-        // {
-        //     for (int k = 0; k < topk; k++)
-        //     {
-        //         int cur_ID = num_experts;
-        //         int local_k = 0;
-        //         for (size_t i = 0; i < topk; i++)
-        //         {
-        //             auto id = topk_indices[i];
-        //             if (id < cur_ID)
-        //             {
-        //                 cur_ID = id;
-        //                 local_k = i;
-        //             }
-        //         }
-        //         topk_indices[local_k] = num_experts;
-        //         topk_indices_f[k] = cur_ID;
-        //         topk_values_f[k] = topk_values[local_k];
-        //     }
-        // }
-        // __syncthreads();
+        else
+        {
+            sum = routed_scaling_factor;
+        }
 
         for (int k = threadIdx.x; k < topk; k += blockDim.x)
         {
-            topk_weights[token_idx * stride_tk + k] = need_renorm ? topk_values[k] / sum : topk_values[k];
+            topk_weights[token_idx * stride_tk + k] = need_renorm ? topk_values[k] * sum : topk_values[k];
             topk_ids[token_idx * stride_tk + k] = topk_indices[k];
         }
     }
@@ -310,13 +287,13 @@ namespace aiter
         { aiter::biased_grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm> \
               <<<grid, block, shared_mem_size, stream>>>(                          \
                   gating_output.data_ptr<scalar_t>(),                              \
-                  correction_bias.data_ptr<float>(),                               \
+                  correction_bias.data_ptr<scalar_t>(),                            \
                   topk_weights.data_ptr<float>(),                                  \
                   topk_ids.data_ptr<int>(),                                        \
                   stride_tk,                                                       \
                   num_experts,                                                     \
                   topk,                                                            \
-                  topk_grp, num_tokens); });
+                  topk_grp, num_tokens, routed_scaling_factor); });
 
 void biased_grouped_topk(
     torch::Tensor &gating_output,   // [num_tokens, num_experts]
@@ -325,13 +302,15 @@ void biased_grouped_topk(
     torch::Tensor &topk_ids,        // [num_tokens, topk]
     int num_expert_group,
     int topk_grp,
-    bool need_renorm)
+    bool need_renorm,
+    const float routed_scaling_factor)
 {
     int num_tokens = gating_output.size(0);
     int num_experts = gating_output.size(1);
     int topk = topk_ids.size(1);
     size_t stride_tk = topk_ids.stride(0);
     TORCH_CHECK(stride_tk == topk_weights.stride(0), "topk_ids.stride(0) == topk_weights.stride(0)");
+    TORCH_CHECK(gating_output.dtype() == correction_bias.dtype(), "gating_output.dtype() == correction_bias.dtype()");
 
     dim3 grid(num_tokens);
     dim3 block(64);

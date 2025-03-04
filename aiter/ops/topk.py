@@ -17,6 +17,7 @@ def biased_grouped_topk(
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
+    routed_scaling_factor: float  # mul to topk_weights
 ): ...
 
 
