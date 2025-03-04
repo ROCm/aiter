@@ -21,6 +21,7 @@
 #include "quant.h"
 #include "moe_ck.h"
 #include "rope.h"
+#include "speculative_sampling.h"
 // #include "mha_varlen_fwd.h"
 // #include "mha_varlen_bwd.h"
 // #include "mha_bwd.h"
@@ -117,6 +118,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
       m.def("allocate_meta_buffer", &allocate_meta_buffer);
       m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
+      m.def("tree_speculative_sampling_target_only", &tree_speculative_sampling_target_only);
 
       // ck staff start
       m.def("layernorm2d_fwd", &layernorm2d,

@@ -29,6 +29,7 @@ from .ops.communication import *
 from .ops.rope import *
 from .ops.topk import *
 from .ops.mha import *
+from .ops.speculative_sampling import *
 from . import mla
 
 def getLogger():
