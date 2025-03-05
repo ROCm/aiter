@@ -84,10 +84,11 @@ def grouped_topk_torch(
     topk_group: int = 0,
     scoring_func: str = "softmax",
 ):
+    gating_output = gating_output.to(torch.float)
     if scoring_func == "softmax":
         scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
-        scores = gating_output.to(torch.float).sigmoid()
+        scores = gating_output.sigmoid()
     else:
         raise ValueError(f"Scoring function '{scoring_func}' is not supported.")
 
