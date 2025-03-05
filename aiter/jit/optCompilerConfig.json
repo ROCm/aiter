@@ -25,6 +25,21 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_pa_sgl": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/attention_sgl_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/attention_sgl.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "isASM": "False",
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_attention_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_pa.cpp'",
