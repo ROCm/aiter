@@ -289,11 +289,11 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         dq = torch::empty_like(q);
     }
     if (dk_.has_value()) {
-    dk = dk_.value();
-    TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
-    CHECK_DEVICE(dk);
-    TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-    CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size);
+        dk = dk_.value();
+        TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
+        CHECK_DEVICE(dk);
+        TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
+        CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size);
     } else {
         dk = torch::empty_like(k);
     }
