@@ -96,6 +96,7 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    custom_build_args:Optional[dict]=None,
 ): ...
 
 
@@ -116,6 +117,47 @@ def _flash_attn_forward(
     return_lse: bool,
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    (_, seqlen_q, _, _) = q.shape
+    # causal=true is the same as causal=false in this case
+    if seqlen_q == 1 and alibi_slopes is None:
+        causal = False
+
+    md_name = 'mha_fwd'
+    filter = '*'
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter += 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter += 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter += '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter += '_alibi*'
+    if not causal and window_size_left == -1 and window_size_right == -1:
+        md_name += '_nmask'
+        filter += '_nmask*'
+    else:
+        md_name += '_mask'
+        filter += '_mask*'
+    if return_lse:
+        md_name += '_lse'
+        filter += '_lse*'
+    else:
+        md_name += '_nlse'
+        filter+= '_nlse*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter += '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter += '_dropout*'
+
+    blob_gen_cmd = f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
+        '--receipt 100 --filter {} --output_dir {{}}'.format(filter)
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_fwd(
         q,
@@ -131,6 +173,7 @@ def _flash_attn_forward(
         None,
         alibi_slopes,
         None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -154,6 +197,52 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    md_name = 'mha_bwd'
+    filter1 = '*'   # get_bwd_dot_do_o_blobs()
+    filter2 = '*'   # get_bwd_convert_dq_blobs()
+    filter3 = '*'   # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter1+= 'fp16*'
+        filter2+= 'fp16*'
+        filter3+= 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter1 += 'bf16*'
+        filter2 += 'bf16*'
+        filter3 += 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter3 += '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter3 += '_alibi*'
+    if not causal and window_size_left == -1 and window_size_right == -1:
+        md_name += '_nmask'
+        filter3 += '_nmask*'
+    else:
+        md_name += '_mask'
+        filter3 += '_mask*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter3 += '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter3 += '_dropout*'
+    if deterministic:
+        md_name += '_deterministic'
+        filter2 += '_deterministic*'
+        filter3 += '_deterministic*'
+    else:
+        md_name += '_ndeterministic'
+        filter2 += '_ndeterministic*'
+        filter3 += '_ndeterministic*'
+
+    filter = f'{filter1}@{filter2}@{filter3}'
+
+    blob_gen_cmd = f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd ' \
+        '--receipt 300 --filter {} --output_dir {{}}'.format(filter)
+
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -180,6 +269,7 @@ def _flash_attn_backward(
         alibi_slopes,
         rng_state,
         None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return softmax_d
 
@@ -372,6 +462,86 @@ def _flash_attn_varlen_forward(
     block_table: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # causal=true is the same as causal=false in this case
+    if max_seqlen_q == 1 and alibi_slopes is None:
+        causal = False
+
+    md_name = 'mha_varlen_fwd'
+    if block_table is None:
+        filter_fwd = '*'            # get_fwd_blobs()
+        if q.dtype == torch.float16:
+            md_name += '_fp16'
+            filter_fwd += 'fp16*'
+        elif q.dtype == torch.bfloat16:
+            md_name += '_bf16'
+            filter_fwd += 'bf16*'
+        if alibi_slopes is None:
+            md_name += '_nbias'
+            filter_fwd += '_nbias*'
+        else:
+            md_name += '_alibi'
+            filter_fwd+= '_alibi*'
+        if not causal and window_size_left == -1 and window_size_right == -1:
+            md_name += '_nmask'
+            filter_fwd += '_nmask*'
+        else:
+            md_name += '_mask'
+            filter_fwd += '_mask*'
+        if return_lse:
+            md_name += '_lse'
+            filter_fwd += '_lse*'
+        else:
+            md_name += '_nlse'
+            filter_fwd += '_nlse*'
+        if dropout_p == 0:
+            md_name += '_ndropout'
+            filter_fwd += '_ndropout*'
+        else:
+            md_name += '_dropout'
+            filter_fwd += '_dropout*'
+        blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
+            '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd)]
+        blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
+            '--receipt 200 --filter {} --output_dir {{}}'.format('" @ "'))
+    else:
+        filter_fwd_splitkv1 = '*'   # get_fwd_splitkv_combine_blobs()
+        filter_fwd_splitkv2 = '*'   # get_fwd_splitkv_blobs()
+        if q.dtype == torch.float16:
+            md_name += '_fp16'
+            filter_fwd_splitkv1+= 'fp16*'
+            filter_fwd_splitkv2+= 'fp16*'
+        elif q.dtype == torch.bfloat16:
+            md_name += '_bf16'
+            filter_fwd_splitkv1+= 'bf16*'
+            filter_fwd_splitkv2+= 'bf16*'
+        if alibi_slopes is None:
+            md_name += '_nbias'
+            filter_fwd_splitkv2+= '_nbias*'
+        else:
+            md_name += '_alibi'
+            filter_fwd_splitkv2+= '_alibi*'
+        if not causal and window_size_left == -1 and window_size_right == -1:
+            md_name += '_nmask'
+            filter_fwd_splitkv2 += '_nmask*'
+        else:
+            md_name += '_mask'
+            filter_fwd_splitkv2 += '_mask*'
+        if return_lse:
+            md_name += '_lse'
+            # filter_fwd_splitkv1+= '_lse*'
+            filter_fwd_splitkv2+= '_lse*'
+        else:
+            md_name += '_nlse'
+            # filter_fwd_splitkv1+= '_nlse*'
+            filter_fwd_splitkv2+= '_nlse*'
+        md_name += '_pagedkv'
+        filter_fwd_splitkv2 += '_pagedkv*'
+        filter_fwd_splitkv = f'{filter_fwd_splitkv1}@{filter_fwd_splitkv2}'
+        blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
+            '--receipt 200 --filter {} --output_dir {{}}'.format('" "')]
+        blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
+            '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd_splitkv))
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
         q,
@@ -392,7 +562,8 @@ def _flash_attn_varlen_forward(
         None,
         block_table,
         alibi_slopes,
-        None
+        None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -421,6 +592,51 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
+    md_name = 'mha_varlen_bwd'
+    filter1 = '*'   # get_bwd_dot_do_o_blobs()
+    filter2 = '*'   # get_bwd_convert_dq_blobs()
+    filter3 = '*'   # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == torch.float16:
+        md_name += '_fp16'
+        filter1 += 'fp16*'
+        filter2 += 'fp16*'
+        filter3 += 'fp16*'
+    elif q.dtype == torch.bfloat16:
+        md_name += '_bf16'
+        filter1 += 'bf16*'
+        filter2 += 'bf16*'
+        filter3 += 'bf16*'
+    if alibi_slopes is None:
+        md_name += '_nbias'
+        filter3 += '_nbias*'
+    else:
+        md_name += '_alibi'
+        filter3 += '_alibi*'
+    if not causal and window_size_left == -1 and window_size_right == -1:
+        md_name += '_nmask'
+        filter3 += '_nmask*'
+    else:
+        md_name += '_mask'
+        filter3 += '_mask*'
+    if dropout_p == 0:
+        md_name += '_ndropout'
+        filter3 += '_ndropout*'
+    else:
+        md_name += '_dropout'
+        filter3 += '_dropout*'
+    if deterministic:
+        md_name += '_deterministic'
+        filter2 += '_deterministic*'
+        filter3 += '_deterministic*'
+    else:
+        md_name += '_ndeterministic'
+        filter2 += '_ndeterministic*'
+        filter3 += '_ndeterministic*'
+    filter = f'{filter1}@{filter2}@{filter3}'
+
+    blob_gen_cmd = f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd ' \
+        '--receipt 400 --filter {} --output_dir {{}}'.format(filter)
+
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -452,6 +668,7 @@ def _flash_attn_varlen_backward(
         alibi_slopes,
         rng_state,
         None,
+        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
     )
     return softmax_d
 
