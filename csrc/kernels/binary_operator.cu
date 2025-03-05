@@ -657,6 +657,37 @@ namespace aiter
     }
   }
 
+  template <class _T, typename Operation, class _T0, class _T1>
+  __global__ void operator_element_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                          const int size, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T); // in bytes
+    constexpr uint32_t elements_in_16B = 16 / element_size;
+    uint64_t idx = ((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx * elements_in_16B < size)
+    {
+      int offset = idx * elements_in_16B;
+      const _T0 *pa = reinterpret_cast<const _T0 *>(a) + offset;
+      const _T1 *pb = reinterpret_cast<const _T1 *>(b) + offset;
+      _T *pc = reinterpret_cast<_T *>(c) + offset;
+#pragma unroll
+      for (uint32_t v = 0; v < elements_in_16B; v++)
+      {
+        if (types_match)
+        {
+          pc[v] = performOperation<_T, Operation, true>(static_cast<_T>(pa[v]), static_cast<_T>(pb[v]));
+        }
+        else
+        {
+          float t0 = static_cast<float>(pa[v]);
+          float t1 = static_cast<float>(pb[v]);
+          float t2 = performOperation<float, Operation, true>(t0, t1);
+          pc[v] = static_cast<_T>(t2);
+        }
+      }
+    }
+  }
+
   template <class _T, int _WG, int BIG_TILE_SIZE_N, int BIG_TILE_SIZE_K, int M_SWIZZLE, typename Operation, bool order_flag, class _T0, class _T1>
   __global__ void operator_contiguous_big_tile_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
                                                       const int N, const int K, bool types_match)
@@ -1001,27 +1032,54 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
     void *buf_c = reinterpret_cast<void *>(output.data_ptr());
     int num_elements = output.numel();
     int rem_dim_size = 1;
-    for (int i = 0; i < dim - 2; ++i)
+    int M, N, K;
+    if (dim == 1)
     {
-      rem_dim_size *= shape[i];
+      M = 1;
+      N = input.numel() / 128;
+      K = 128;
     }
-    int M = dim == 3 ? shape[0] : rem_dim_size;
-    int N = shape[dim - 2];
-    int K = shape[dim - 1];
-    if (N < rows) {
-      K = N * K;
-      N = M;
-      M = 1; 
+    else
+    {
+      for (int i = 0; i < dim - 2; ++i)
+      {
+        rem_dim_size *= shape[i];
+      }
+      M = dim == 3 ? shape[0] : rem_dim_size;
+      N = shape[dim - 2];
+      K = shape[dim - 1];
+      if (N < rows)
+      {
+        K = N * K;
+        N = M;
+        M = 1;
+      }
     }
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     bool types_match = typeid(_T0) == typeid(_T1);
-
     int vec = 16 / output.element_size();
-    if (N % rows == 0 && K % vec == 0)
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    hipGetDevice(&dev);
+    hipGetDeviceProperties(&dev_prop, dev);
+    uint32_t num_cu = dev_prop.multiProcessorCount;
+
+    if (num_elements % vec == 0 && num_elements < num_cu * 256 * vec)
     {
-      constexpr uint32_t wg = 64;
-      int grid_x = (num_elements / (rows * vec) + wg - 1) / wg;
+      constexpr uint32_t wg = 256;
+      const int grid_x = (num_elements / vec + wg - 1) / wg;
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+      VLLM_DISPATCH_FLOATING_TYPES(
+          output.scalar_type(), "operator_element_kernel", [&]
+          { aiter::operator_element_kernel<scalar_t, Operation, _T0, _T1>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, num_elements, types_match); });
+    }
+    else if (N % rows == 0 && K % vec == 0)
+    {
+      constexpr uint32_t wg = 256;
+      const int grid_x = (num_elements / (rows * vec) + wg - 1) / wg;
       const dim3 grid_dim(grid_x, 1, 1);
       const dim3 block_dim(wg, 1, 1);
 
@@ -1032,12 +1090,13 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
     }
     else
     {
+      constexpr uint32_t wg = 256;
       constexpr uint32_t BIG_TILE_SIZE_N = 64;
       constexpr uint32_t BIG_TILE_SIZE_K = 64;
       constexpr uint32_t M_SWIZZLE = 8;
       const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
       const dim3 grid_dim(grid_x, 1, 1);
-      const dim3 block_dim(256, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
 
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_contiguous_big_tile_kernel", [&]
@@ -1120,6 +1179,10 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     is_support &= (input.dim() == other.dim());
     is_support &= input.is_contiguous() == other.is_contiguous();
     is_support &= input.is_contiguous() == true;
+    if (input.dim() == 1)
+    {
+      is_support &= input.numel() % 128 == 0;
+    }
     for (int i = 0; i < input.dim() && is_support; ++i)
     {
       is_support &= (input.size(i) == other.size(i));
@@ -1244,8 +1307,4 @@ torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
 torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
   return binary_operation<aiter::DivOp>(input, other);
-}
-
-inline at::Tensor add(const at::Tensor &self, const at::Scalar &other)
-{
 }

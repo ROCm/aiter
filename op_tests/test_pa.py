@@ -375,7 +375,8 @@ def run_aiter_asm(query,
                   alibi_slopes,
                   max_num_blocks,
                   k_scale=None,
-                  v_scale=None):
+                  v_scale=None,
+                  high_precision=0):
     return aiter.pa_fwd_asm(
         query,
         k_cache,
@@ -384,7 +385,9 @@ def run_aiter_asm(query,
         seq_lens,
         max_num_blocks,
         k_scale,
-        v_scale
+        v_scale,
+        None,
+        high_precision
     )
 
 
@@ -650,6 +653,31 @@ def test_paged_attention(
             )
             checkAllclose(out_golden, out_aiter_asm,
                           msg=f'golden vs aiter_asm:{time_aiter_asm:.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})')
+
+            if dtype in [torch.bfloat16, torch.float16] and quant_algo_ == 2 and cache_type_ == torch.float8_e4m3fnuz:
+                if dtype == torch.bfloat16:
+                    high_precision_list = [1, 2]
+                else:
+                    high_precision_list = [1]
+                for high_precision in high_precision_list:
+                    out_aiter_asm, time_aiter_asm = run_aiter_asm(
+                        query,
+                        k_quant_,
+                        asm_V_shuffle(v_quant_),
+                        block_tables,
+                        seq_lens,
+                        max_seq_len,
+                        kv_cache_dtype,
+                        num_kv_heads,
+                        scale,
+                        alibi_slopes,
+                        max_num_blocks_per_seq,
+                        k_scale_asm,
+                        v_scale_asm,
+                        high_precision
+                    )
+                    checkAllclose(out_golden, out_aiter_asm,
+                                  msg=f'golden vs aiter_asm high_precision {high_precision}:{time_aiter_asm:.2f} us......(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_})')
 
             # if quant_algo == "KV_8BIT_PER_TENSOR":
             #     q_quant_, q_scale_ = aiter.per_tensor_quant(

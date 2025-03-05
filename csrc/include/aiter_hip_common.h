@@ -2,15 +2,15 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 
-#define HIP_CALL(call)                                                                      \
-    do                                                                                      \
-    {                                                                                       \
-        hipError_t err = call;                                                              \
-        if (err != hipSuccess)                                                              \
-        {                                                                                   \
+#define HIP_CALL(call)                                                                               \
+    do                                                                                               \
+    {                                                                                                \
+        hipError_t err = call;                                                                       \
+        if (err != hipSuccess)                                                                       \
+        {                                                                                            \
             printf("\n[AITER] fail to call %s... [HIP error](%s)\n", #call, hipGetErrorString(err)); \
-            exit(0);                                                                        \
-        }                                                                                   \
+            exit(0);                                                                                 \
+        }                                                                                            \
     } while (0)
 
 struct p3
@@ -50,6 +50,7 @@ private:
 public:
     AiterAsmKernel(const char *name, const char *hsaco)
     {
+        const char *AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         std::cout << "hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << name;
         HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));

@@ -85,10 +85,11 @@ def log_args(func, *args, **kwargs):
         if isinstance(el, torch.Tensor):
             return f'{el.shape} {el.dtype}'
         return el
-    callargs = [
-        f"\n                {el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
-    logger.info(
-        f"\ncalling {func.__name__}({', '.join(callargs)})")
+    prefix = f"calling {func.__name__}("
+    blanks = ' '*len(prefix)
+    callargs = [f"{el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
+    callargs = f',\n{blanks}'.join(callargs)
+    logger.info(f"\n{prefix}{callargs})")
 
 
 def get_trace_perf(prof, num_iters):
