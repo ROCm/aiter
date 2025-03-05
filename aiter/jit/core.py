@@ -49,7 +49,22 @@ AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
 os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
-bd_dir = f"{this_dir}/build"
+
+@functools.lru_cache(maxsize=None)
+def get_user_jit_dir():
+    if 'JIT_WORKSPACE_DIR' in os.environ:
+        path = os.getenv('JIT_WORKSPACE_DIR')
+        os.makedirs(path, exist_ok=True)
+        return path
+    else:
+        if os.access(this_dir, os.W_OK):
+            return this_dir
+    home_jit_dir = os.path.expanduser('~') + '/.aiter/' + os.path.basename(this_dir)
+    if not os.path.exists(home_jit_dir):
+        shutil.copytree(this_dir, home_jit_dir)
+    return home_jit_dir
+
+bd_dir = f'{get_user_jit_dir()}/build'
 # copy ck to build, thus hippify under bd_dir
 shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
 CK_DIR = f'{bd_dir}/ck'
@@ -134,8 +149,8 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         opbd_dir = f'{op_dir}/build'
         src_dir = f'{op_dir}/build/srcs'
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f'{this_dir}/{md_name}.so'):
-            os.remove(f'{this_dir}/{md_name}.so')
+        if os.path.exists(f'{get_user_jit_dir()}/{md_name}.so'):
+            os.remove(f'{get_user_jit_dir()}/{md_name}.so')
 
         sources = rename_cpp_to_cu(srcs, src_dir)
 
@@ -220,7 +235,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             with_cuda=True,
             is_python_module=True,
         )
-        shutil.copy(f'{opbd_dir}/{md_name}.so', f'{this_dir}')
+        shutil.copy(f'{opbd_dir}/{md_name}.so', f'{get_user_jit_dir()}')
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
             md_name,
