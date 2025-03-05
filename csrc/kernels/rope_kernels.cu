@@ -363,22 +363,13 @@ struct OpUncachedFwd
         // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy(
-                    p_output, p_input,
-                    size_h, 0, size_d - size_r,
-                    stride_i_h, stride_i_d,
-                    stride_o_h, stride_o_d);
-            }
-            else
-            {
-                elementwise_copy(
-                    p_output, p_input,
-                    size_h, size_r, size_d,
-                    stride_i_h, stride_i_d,
-                    stride_o_h, stride_o_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy(
+                p_output, p_input,
+                size_h, did_start, did_end,
+                stride_i_h, stride_i_d,
+                stride_o_h, stride_o_d);
         }
     }
 
@@ -430,44 +421,15 @@ struct OpUncachedFwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
-        {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-            {
-                const int32_t offset_ix = hid * stride_ix_h;
-                const int32_t offset_iy = hid * stride_iy_h;
-                const int32_t offset_ox = hid * stride_ox_h;
-                const int32_t offset_oy = hid * stride_oy_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
-                    p_output_y[offset_oy + did * stride_oy_d] = p_input_y[offset_iy + did * stride_iy_d];
-                }
-            }
-        }
-
-        // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy_2c(
-                    p_output_x, p_output_y, p_input_x, p_input_y,
-                    size_h, 0, size_d - size_r,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
-            }
-            else
-            {
-                elementwise_copy_2c(
-                    p_output_x, p_output_y, p_input_x, p_input_y,
-                    size_h, size_r, size_d,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy_2c(
+                p_output_x, p_output_y, p_input_x, p_input_y,
+                size_h, did_start, did_end,
+                stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
+                stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
         }
     }
 };
@@ -512,41 +474,15 @@ struct OpUncachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
-        {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-            {
-                const int32_t offset_o = hid * stride_o_h;
-                const int32_t offset_i = hid * stride_i_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_input_grads[offset_i + did * stride_i_d] = p_output_grads[offset_o + did * stride_o_d];
-                }
-            }
-        }
-
-        // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, 0, size_d - size_r,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
-            else
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, size_r, size_d,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy(
+                p_input_grads, p_output_grads,
+                size_h, did_start, did_end,
+                stride_o_h, stride_o_d,
+                stride_i_h, stride_i_d);
         }
     }
 
@@ -598,44 +534,15 @@ struct OpUncachedBwd
         }
 
         // the rest are just forwarded
-        if (size_d > size_r)
-        {
-            #pragma unroll
-            for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
-            {
-                const int32_t offset_ox = hid * stride_ox_h;
-                const int32_t offset_oy = hid * stride_oy_h;
-                const int32_t offset_ix = hid * stride_ix_h;
-                const int32_t offset_iy = hid * stride_iy_h;
-
-                #pragma unroll
-                for (int32_t did = threadIdx.x + size_r; did < size_d; did += blockDim.x)
-                {
-                    p_input_grads_x[offset_ix + did * stride_ix_d] = p_output_grads_x[offset_ox + did * stride_ox_d];
-                    p_input_grads_y[offset_iy + did * stride_iy_d] = p_output_grads_y[offset_oy + did * stride_oy_d];
-                }
-            }
-        }
-
-        // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy_2c(
-                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
-                    size_h, 0, size_d - size_r,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
-            }
-            else
-            {
-                elementwise_copy_2c(
-                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
-                    size_h, size_r, size_d,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy_2c(
+                p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
+                size_h, did_start, did_end,
+                stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
+                stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
         }
     }
 };
@@ -683,22 +590,13 @@ struct OpCachedFwd
         // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy(
-                    p_output, p_input,
-                    size_h, 0, size_d - size_r,
-                    stride_i_h, stride_i_d,
-                    stride_o_h, stride_o_d);
-            }
-            else
-            {
-                elementwise_copy(
-                    p_output, p_input,
-                    size_h, size_r, size_d,
-                    stride_i_h, stride_i_d,
-                    stride_o_h, stride_o_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy(
+                p_output, p_input,
+                size_h, did_start, did_end,
+                stride_i_h, stride_i_d,
+                stride_o_h, stride_o_d);
         }
     }
 
@@ -719,9 +617,9 @@ struct OpCachedFwd
         const int32_t stride_oy_h, const int32_t stride_oy_d)
     {
         // rotate count
-        const int32_t size_r           = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
-        const int32_t size_half_r      = size_r >> 1;
-        const int32_t did_start        = NopeFirst ? (size_d - size_r) : 0;
+        const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
+        const int32_t size_half_r = size_r >> 1;
+        const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
         #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
@@ -753,22 +651,13 @@ struct OpCachedFwd
         // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy_2c(
-                    p_output_x, p_output_y, p_input_x, p_input_y,
-                    size_h, 0, size_d - size_r,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
-            }
-            else
-            {
-                elementwise_copy_2c(
-                    p_output_x, p_output_y, p_input_x, p_input_y,
-                    size_h, size_r, size_d,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy_2c(
+                p_output_x, p_output_y, p_input_x, p_input_y,
+                size_h, did_start, did_end,
+                stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d,
+                stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d);
         }
     }
 };
@@ -816,22 +705,13 @@ struct OpCachedBwd
         // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, 0, size_d - size_r,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
-            else
-            {
-                elementwise_copy(
-                    p_input_grads, p_output_grads,
-                    size_h, size_r, size_d,
-                    stride_o_h, stride_o_d,
-                    stride_i_h, stride_i_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy(
+                p_input_grads, p_output_grads,
+                size_h, did_start, did_end,
+                stride_o_h, stride_o_d,
+                stride_i_h, stride_i_d);
         }
     }
 
@@ -886,22 +766,13 @@ struct OpCachedBwd
         // the rest are just forwarded
         if constexpr (!Inplace)
         {
-            if constexpr (NopeFirst)
-            {
-                elementwise_copy_2c(
-                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
-                    size_h, 0, size_d - size_r,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
-            }
-            else
-            {
-                elementwise_copy_2c(
-                    p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
-                    size_h, size_r, size_d,
-                    stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
-                    stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
-            }
+            const int32_t did_start = NopeFirst ? 0 : size_r;
+            const int32_t did_end   = NopeFirst ? (size_d - size_r) : size_d;
+            elementwise_copy_2c(
+                p_input_grads_x, p_input_grads_y, p_output_grads_x, p_output_grads_y,
+                size_h, did_start, did_end,
+                stride_ox_h, stride_ox_d, stride_oy_h, stride_oy_d,
+                stride_ix_h, stride_ix_d, stride_iy_h, stride_iy_d);
         }
     }
 };
@@ -1464,12 +1335,12 @@ __global__ void kn_entry_1c_2d_cached_inplace(
 //
 
 #define LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(ROTATE_STYLE, STRIDE_0, ...)                                 \
-    if constexpr (ROTATE_STYLE != ROTATE_STYLE_GPTJ)                                                        \
+    if constexpr ((ROTATE_STYLE) != ROTATE_STYLE_GPTJ)                                                      \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = false;                                                                  \
         __VA_ARGS__;                                                                                        \
     }                                                                                                       \
-    else if (STRIDE_0 == 1)                                                                                 \
+    else if ((STRIDE_0) == 1)                                                                               \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = true;                                                                   \
         __VA_ARGS__;                                                                                        \
@@ -1481,16 +1352,16 @@ __global__ void kn_entry_1c_2d_cached_inplace(
     }
 
 #define LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(ROTATE_STYLE, STRIDE_0, STRIDE_1, ...)                       \
-    if constexpr (ROTATE_STYLE != ROTATE_STYLE_GPTJ)                                                        \
+    if constexpr ((ROTATE_STYLE) != ROTATE_STYLE_GPTJ)                                                      \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = false;                                                                  \
         constexpr bool Stride1Eq1 = false;                                                                  \
         __VA_ARGS__;                                                                                        \
     }                                                                                                       \
-    else if (STRIDE_0 == 1)                                                                                 \
+    else if ((STRIDE_0) == 1)                                                                               \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = true;                                                                   \
-        if (STRIDE_1 == 1)                                                                                  \
+        if ((STRIDE_1) == 1)                                                                                \
         {                                                                                                   \
             constexpr bool Stride1Eq1 = true;                                                               \
             __VA_ARGS__;                                                                                    \
@@ -1504,7 +1375,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
     else                                                                                                    \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = false;                                                                  \
-        if (STRIDE_1 == 1)                                                                                  \
+        if ((STRIDE_1) == 1)                                                                                \
         {                                                                                                   \
             constexpr bool Stride1Eq1 = true;                                                               \
             __VA_ARGS__;                                                                                    \
@@ -1517,7 +1388,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
     }
 
 #define LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(ROTATE_STYLE, STRIDE_0, STRIDE_1, STRIDE_2, STRIDE_3, ...)   \
-    if constexpr (ROTATE_STYLE != ROTATE_STYLE_GPTJ)                                                        \
+    if constexpr ((ROTATE_STYLE) != ROTATE_STYLE_GPTJ)                                                      \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = false;                                                                  \
         constexpr bool Stride1Eq1 = false;                                                                  \
@@ -1525,16 +1396,16 @@ __global__ void kn_entry_1c_2d_cached_inplace(
         constexpr bool Stride3Eq1 = false;                                                                  \
         __VA_ARGS__;                                                                                        \
     }                                                                                                       \
-    else if (STRIDE_0 == 1)                                                                                 \
+    else if ((STRIDE_0) == 1)                                                                               \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = true;                                                                   \
-        if (STRIDE_1 == 1)                                                                                  \
+        if ((STRIDE_1) == 1)                                                                                \
         {                                                                                                   \
             constexpr bool Stride1Eq1 = true;                                                               \
-            if (STRIDE_2 == 1)                                                                              \
+            if ((STRIDE_2) == 1)                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = true;                                                           \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1548,7 +1419,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
             else                                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = false;                                                          \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1563,10 +1434,10 @@ __global__ void kn_entry_1c_2d_cached_inplace(
         else                                                                                                \
         {                                                                                                   \
             constexpr bool Stride1Eq1 = false;                                                              \
-            if (STRIDE_2 == 1)                                                                              \
+            if ((STRIDE_2) == 1)                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = true;                                                           \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1580,7 +1451,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
             else                                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = false;                                                          \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1596,13 +1467,13 @@ __global__ void kn_entry_1c_2d_cached_inplace(
     else                                                                                                    \
     {                                                                                                       \
         constexpr bool Stride0Eq1 = false;                                                                  \
-        if (STRIDE_1 == 1)                                                                                  \
+        if ((STRIDE_1) == 1)                                                                                \
         {                                                                                                   \
             constexpr bool Stride1Eq1 = true;                                                               \
-            if (STRIDE_2 == 1)                                                                              \
+            if ((STRIDE_2) == 1)                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = true;                                                           \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1616,7 +1487,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
             else                                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = false;                                                          \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1631,10 +1502,10 @@ __global__ void kn_entry_1c_2d_cached_inplace(
         else                                                                                                \
         {                                                                                                   \
             constexpr bool Stride1Eq1 = false;                                                              \
-            if (STRIDE_2 == 1)                                                                              \
+            if ((STRIDE_2) == 1)                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = true;                                                           \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -1648,7 +1519,7 @@ __global__ void kn_entry_1c_2d_cached_inplace(
             else                                                                                            \
             {                                                                                               \
                 constexpr bool Stride2Eq1 = false;                                                          \
-                if (STRIDE_3 == 1)                                                                          \
+                if ((STRIDE_3) == 1)                                                                        \
                 {                                                                                           \
                     constexpr bool Stride3Eq1 = true;                                                       \
                     __VA_ARGS__;                                                                            \
@@ -2150,20 +2021,20 @@ void dispatch_1c_2d_cached(
 }
 
 #define DISPATCH_ROPE_TYPES_PARAMS(TYPE0, TYPE1, ROTATE_STYLE, REUSE_FREQS_FRONT_PART, NOPE_FIRST, NAME, ...) \
-    switch(TYPE0) {                                                                                           \
+    switch ((TYPE0)) {                                                                                        \
         case at::ScalarType::Float: {                                                                         \
             using scalar_t_0 = float;                                                                         \
-            switch(TYPE1)                                                                                     \
+            switch ((TYPE1))                                                                                  \
             {                                                                                                 \
                 case at::ScalarType::Float: {                                                                 \
                     using scalar_t_1 = float;                                                                 \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2174,10 +2045,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2191,16 +2062,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2211,10 +2082,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2228,20 +2099,20 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 case at::ScalarType::Half: {                                                                  \
                     using scalar_t_1 = at::Half;                                                              \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2252,10 +2123,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2269,16 +2140,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2289,10 +2160,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2306,20 +2177,20 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 case at::ScalarType::BFloat16: {                                                              \
                     using scalar_t_1 = at::BFloat16;                                                          \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2330,10 +2201,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2347,16 +2218,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2367,10 +2238,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2384,30 +2255,30 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 default:                                                                                      \
                     TORCH_CHECK(false, NAME " does't support ",                                               \
-                        toString(TYPE0), " with ", toString(TYPE1), ".");                                     \
+                        toString((TYPE0)), " with ", toString((TYPE1)), ".");                                 \
             }                                                                                                 \
             break;                                                                                            \
         }                                                                                                     \
         case at::ScalarType::Half: {                                                                          \
             using scalar_t_0 = at::Half;                                                                      \
-            switch(TYPE1)                                                                                     \
+            switch ((TYPE1))                                                                                  \
             {                                                                                                 \
                 case at::ScalarType::Float: {                                                                 \
                     using scalar_t_1 = float;                                                                 \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2418,10 +2289,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2435,16 +2306,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2455,10 +2326,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2472,20 +2343,20 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 case at::ScalarType::Half: {                                                                  \
                     using scalar_t_1 = at::Half;                                                              \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2496,10 +2367,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2513,16 +2384,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2533,10 +2404,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2550,20 +2421,20 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 case at::ScalarType::BFloat16: {                                                              \
                     using scalar_t_1 = at::BFloat16;                                                          \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2574,10 +2445,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2591,16 +2462,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2611,10 +2482,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2628,30 +2499,30 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 default:                                                                                      \
                     TORCH_CHECK(false, NAME " does't support ",                                               \
-                        toString(TYPE0), " with ", toString(TYPE1), ".");                                     \
+                        toString((TYPE0)), " with ", toString((TYPE1)), ".");                                 \
             }                                                                                                 \
             break;                                                                                            \
         }                                                                                                     \
         case at::ScalarType::BFloat16: {                                                                      \
             using scalar_t_0 = at::BFloat16;                                                                  \
-            switch(TYPE1)                                                                                     \
+            switch ((TYPE1))                                                                                  \
             {                                                                                                 \
                 case at::ScalarType::Float: {                                                                 \
                     using scalar_t_1 = float;                                                                 \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2662,10 +2533,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2679,16 +2550,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2699,10 +2570,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2716,20 +2587,20 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 case at::ScalarType::Half: {                                                                  \
                     using scalar_t_1 = at::Half;                                                              \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2740,10 +2611,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2757,16 +2628,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2777,10 +2648,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2794,20 +2665,20 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 case at::ScalarType::BFloat16: {                                                              \
                     using scalar_t_1 = at::BFloat16;                                                          \
-                    if (REUSE_FREQS_FRONT_PART)                                                               \
+                    if ((REUSE_FREQS_FRONT_PART))                                                             \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = true;                                            \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2818,10 +2689,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2835,16 +2706,16 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     else                                                                                      \
                     {                                                                                         \
                         constexpr bool ReuseFreqsFrontPart = false;                                           \
-                        if (ROTATE_STYLE == ROTATE_STYLE_NEOX)                                                \
+                        if ((ROTATE_STYLE) == ROTATE_STYLE_NEOX)                                              \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_NEOX;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2855,10 +2726,10 @@ void dispatch_1c_2d_cached(
                                 __VA_ARGS__;                                                                  \
                             }                                                                                 \
                         }                                                                                     \
-                        else if (ROTATE_STYLE == ROTATE_STYLE_GPTJ)                                           \
+                        else if ((ROTATE_STYLE) == ROTATE_STYLE_GPTJ)                                         \
                         {                                                                                     \
                             constexpr int32_t RotateStyle = ROTATE_STYLE_GPTJ;                                \
-                            if (NOPE_FIRST)                                                                   \
+                            if ((NOPE_FIRST))                                                                 \
                             {                                                                                 \
                                 constexpr bool NopeFirst = true;                                              \
                                 __VA_ARGS__;                                                                  \
@@ -2872,19 +2743,19 @@ void dispatch_1c_2d_cached(
                         else                                                                                  \
                         {                                                                                     \
                             TORCH_CHECK(false, NAME " does't support rotate type ",                           \
-                                        std::to_string(ROTATE_STYLE), ".");                                   \
+                                        std::to_string((ROTATE_STYLE)), ".");                                 \
                         }                                                                                     \
                     }                                                                                         \
                     break;                                                                                    \
                 }                                                                                             \
                 default:                                                                                      \
                     TORCH_CHECK(false, NAME " does't support ",                                               \
-                        toString(TYPE0), " with ", toString(TYPE1), ".");                                     \
+                        toString((TYPE0)), " with ", toString((TYPE1)), ".");                                 \
             }                                                                                                 \
             break;                                                                                            \
         }                                                                                                     \
         default:                                                                                              \
-            TORCH_CHECK(false, NAME " does't support ", toString(TYPE0), ".");                                \
+            TORCH_CHECK(false, NAME " does't support ", toString((TYPE0)), ".");                              \
     }
 
 // =====================================================================================================================
