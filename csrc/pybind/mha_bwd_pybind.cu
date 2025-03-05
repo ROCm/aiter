@@ -19,6 +19,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("dq") = std::nullopt,
           py::arg("dk") = std::nullopt,
           py::arg("dv") = std::nullopt,
+          py::arg("dbias") = std::nullopt,
+          py::arg("bias") = std::nullopt,
           py::arg("alibi_slopes") = std::nullopt,
           py::arg("rng_state") = std::nullopt,
           py::arg("gen") = std::nullopt);
