@@ -6,7 +6,6 @@
 2. Tune batched_gemm a8w8: 
  First add batched_gemm shapes in `aiter/configs/a8w8_untuned_batched_gemm.csv`, then run the following cmd to start tuning, please wait a few minutes as it will build batched_gemm_a8w8_tune via jit:  
 `python3 csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py -i aiter/configs/a8w8_untuned_batched_gemm.csv -o aiter/configs/a8w8_tuned_batched_gemm.csv`  
-If you want to use split K kernels, you can add the `-k` parameter at the end, notice that should change `bias` to `bias/(2^k)`.
 You can find the results of the tuning in `aiter/configs/a8w8_tuned_batched_gemm.csv`.
 
 3. Test the performance, modify the test instance in `op_tests/test_batched_gemm_a8w8.py` and run it, please wait a few minutes as it will build batched_gemm_a8w8 kernels in `aiter/configs/a8w8_tuned_batched_gemm.csv` via jit：  
