@@ -338,7 +338,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
 
                 def getTensorInfo(el):
                     if isinstance(el, torch.Tensor):
-                        return f'{el.shape} {el.dtype}'
+                        return f'{el.shape} {el.dtype} {hex(el.data_ptr())}'
                     return el
 
                 callargs = [
