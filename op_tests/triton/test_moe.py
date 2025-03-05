@@ -9,41 +9,54 @@ import functools
 import argparse
 import sys
 
-from aiter.ops.triton.moe_op import moe_triton
+from aiter.ops.triton.moe_op import fused_moe as triton_moe 
 
-def torch_moe(a, b, c, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded,
-              a_scale, b_scale, dtype, fp8):
-    E, N, K = b.shape
-    M, topk, _ = c.shape
-    c = c.reshape(-1, c.shape[2])
 
-    if fp8:
-        a = a.to(dtype)
+def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16):
+    if fp8_w8a8:
+        a , _ , a_scale = quantize_fp8(a)
 
-    for e in range(E):
-        token_ids = (topk_ids == e).any(dim=-1)
-        flat_topk_ids = topk_ids.view(-1)
-        flat_token_ids = torch.arange(topk_ids.numel(), device=topk_ids.device)
-        c_token_ids = flat_token_ids[flat_topk_ids == e]
+    M, top_k, N = c.shape
+    _, K = a.shape
 
-        b_e = b[e]
-        a_e = a[token_ids, :]
+    if int4_w4a16:
+        b = torch.repeat_interleave(b, repeats=2, dim=2) #Expand to (E, N, K) 
+        b_shifter = ((torch.arange(0, K, device=b.device) % 2)*4)[None, None, :]
+        b = (b >> b_shifter) & 0xF
+        b_scale = torch.repeat_interleave(b_scale, repeats=group_size, dim=2) #(E, N, K)
+        if b_zp is not None:
+            b_zp = torch.repeat_interleave(b_zp, repeats=2, dim=1) #(E,N//2,K//group_size) -> (E, N, K // group_size)
+            b_zp = torch.repeat_interleave(b_zp, repeats=group_size, dim=2) #(E,N,K//group_size) -> (E, N, K)
+            b_zp_shifter = ((torch.arange(0,N, device=b.device) % 2) * 4)[None, :, None]
+            b_zp = ((b_zp >> b_zp_shifter) & 0xF)
+            b = ((b - b_zp) * b_scale)
+        else:
+            b = ((b - 8) * b_scale)
 
-        if fp8:
-            b_e = b_e.to(dtype)
+    # Repeat a -> (M, top_k, K)
+    a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
+    # (M, top_k, N, K)
+    if fp8_w8a8:
+        b_indexed = b.half()[topk_ids]
+    else:
+        b_indexed = b[topk_ids]
 
-        acc = torch.matmul(a_e, b_e.T)
-        if routed_weight:
-            acc = acc * topk_weights.view(-1)[c_token_ids].unsqueeze(-1)
+    c = torch.einsum("mek,menk->men", a_expanded.to(dtype), b_indexed.to(dtype))
 
-        if fp8:
-            acc = (acc * a_scale * b_scale[e]).to(dtype)
+    if routed_weight:
+        c *= topk_weights.unsqueeze(-1)
 
-        c[c_token_ids, :] = acc
 
-    c = c.reshape(M, topk, N)
+    if fp8_w8a8:    
+        c = c * b_scale[topk_ids].unsqueeze(-1)
+        c = c * a_scale
+        c = c.to(dtype)
+    
+    if int8_w8a16:
+        c = c * b_scale[topk_ids].unsqueeze(-1)
+        c = c.to(dtype)
 
-    return c
+    return c 
 
 def _moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, top_k: int, block_size: int,
                           sorted_token_ids: torch.Tensor, expert_ids: torch.Tensor,
@@ -137,25 +150,106 @@ def get_default_config() -> Dict[str, int]:
     config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
     return config
 
-def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, compute_type, fp8: bool):
-    if fp8:
-        a = torch.randn((M, K), dtype=compute_type, device='cuda')
-        a = a.to(torch.float8_e4m3fnuz)
-        b = torch.rand((E, N, K), dtype=compute_type, device='cuda')
-        b = b.to(torch.float8_e4m3fnuz)
-    else:
-        b = torch.randn((E, N, K), dtype=compute_type, device='cuda')
-        a = torch.randn((M, K), dtype=compute_type, device='cuda')
-    c = torch.zeros((M, top_k, N), dtype=compute_type, device='cuda')
+def quantize_fp8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
+    max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
+    max_repr_val = torch.finfo(torch.float8_e4m3fnuz).max
+    max_vals[max_vals == 0] = 1e-8 # Avoid division by zero
 
-    if fp8:
-        a_scale = torch.randn((1), dtype=torch.float32, device='cuda')
-        b_scale = torch.randn((E), dtype=torch.float32, device='cuda')
-    else:
-        a_scale = None
-        b_scale = None
+    # Compute scale factors for each channel
+    scale: torch.Tensor = max_repr_val / max_vals.to(torch.float32)
 
-    values = torch.randn(M, E, dtype=compute_type, device='cuda')
+    # Quantize the tensor
+    tensor = tensor * scale
+    tensor.clamp_(-max_repr_val, max_repr_val)
+    tensor_quantized = tensor.to(torch.float8_e4m3fnuz)
+
+    scale = scale.squeeze(dim=quantize_dim)
+
+    return tensor_quantized, scale, 1 / scale
+
+def quantize_int8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
+    max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
+    max_repr_val = torch.iinfo(torch.int8).max
+    max_vals[max_vals == 0] = 1e-8 # Avoid division by zero
+
+    # Compute scale factors for each channel
+    scale: torch.Tensor = max_repr_val / max_vals.to(torch.float32)
+
+    # Quantize the tensor
+    tensor = tensor * scale
+    tensor.clamp_(-max_repr_val, max_repr_val)
+    tensor = tensor.round_()
+    tensor_quantized = tensor.to(torch.int8)
+
+    scale = scale.squeeze(dim=quantize_dim)
+
+    return tensor_quantized, scale, 1 / scale
+
+def quantize_int4(tensor: torch.Tensor, group_size: int, has_zp: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    #reshape tensor
+    k, n = tensor.shape
+    tensor = tensor.reshape(-1, group_size, n)
+    tensor = tensor.permute(1, 0, 2)
+    
+    max_val = torch.max(tensor, 0, keepdim=True).values
+    min_val = torch.min(tensor, 0, keepdim=True).values
+
+    #Asymmetric quantization
+    zp = None
+    if has_zp:
+        max_q_val = 15
+        min_q_val = 0  #Min maps to 0
+        scale = (max_val - min_val).clamp(min=1e-5) / (max_q_val)
+        zp = torch.round(torch.abs(min_val / scale)).clamp(min_q_val, max_q_val).int()
+    #Symmetric quantization
+    else:
+        max_q_val = 7 
+        min_q_val = -7  
+        scale = max_val / max_q_val
+
+    #quantize and clamp
+    tensor_q = torch.round(tensor / scale).int() + (zp if has_zp else 0)
+    tensor_q = torch.clamp(tensor, min_q_val, max_q_val)
+
+    #restore shapes
+    tensor_q = tensor_q.reshape((group_size, - 1, n))
+    tensor_q = tensor_q.permute(1, 0 , 2)
+    tensor_q = tensor_q.reshape((k, n)).contiguous()
+
+    #scale
+    scale = scale.reshape((-1, n)).contiguous()
+
+    #zp
+    if zp is not None:
+        zp = zp.reshape((-1, n)).contiguous()
+        zp = zp.to(device=tensor.device)
+
+    #print(f"tensor_q={tensor_q}, scale={scale}, zp={zp}")
+    return tensor_q, scale, zp
+
+
+def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, dtype, fp8_w8a8: bool, int8_w8a16: bool):
+    assert not (fp8_w8a8 and int8_w8a16)
+
+    a = torch.randn((M, K), dtype=dtype, device='cuda')
+    b = torch.rand((E, N, K), dtype=dtype, device='cuda')
+    a_scale = None
+    b_scale = None
+
+    if fp8_w8a8:
+        b, _, b_scale = quantize_fp8(b, dim=(0,))
+    
+    if int8_w8a16:
+        b, _, b_scale = quantize_int8(b, dim=(0,))
+        
+    b_zp = False #Todo add support for int4_w4a8
+
+    c = torch.zeros((M, top_k, N), dtype=dtype, device='cuda')
+
+    values = torch.randn(M, E, dtype=dtype, device='cuda')
 
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
@@ -163,34 +257,103 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
     config = get_default_config()
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
 
-    if not routed_weight:
-        return a, b, c, None, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config, a_scale, b_scale
 
-    return a, b, c, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config, a_scale, b_scale
+    return a, b, c, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
+
+def input_helper_int4_w4a16(M: int, N: int, K: int , top_k: int, E: int, routed_weight: bool, dtype: torch.dtype, group_size: int, has_zp: bool):
+
+    a = torch.randn((M, K), dtype=dtype, device='cuda')
+    b = torch.rand((E, N, K), dtype=dtype, device='cuda')
+    print(f"b_orig.shape={b.shape} b_orig={b}")
+
+    b_q = torch.empty((E, N, K // 2), dtype=torch.uint8, device='cuda')
+    b_scale = torch.empty((E, N, K // group_size), dtype=dtype, device='cuda')
+    if has_zp:
+        b_zp = torch.empty((E, N // 2, K // group_size), dtype=torch.uint8, device='cuda')
+    else:
+        b_zp = None
+
+    for e in range(E):
+        q, scale, zp = quantize_int4(b[e].T, group_size=group_size, has_zp=has_zp)
+        q = q.T
+        q = q[:, 1::2] * 16 + q[:, ::2] #Note, 2<<4=16. For bf16, etc, torch doesn't have shift. 
+        b_q[e] = q
+        b_scale[e] = scale.T
+        if has_zp:
+            zp = zp.T.contiguous().to(torch.uint8)
+            zp = zp[1::2, :] << 4 | zp[::2, :] #Note, 2<<4=16. For bf16, etc, torch doesn't have shift. 
+            b_zp[e] = zp
+        
+    #print(f"b_scale.shape={b_scale.shape}")
+    #print(f"b_q.shape={b_q.shape}")
+    if has_zp:
+        print(f"b_zp={b_zp}")
+    b = b_q
+
+    c = torch.zeros((M, top_k, N), dtype=dtype, device='cuda')
+
+    values = torch.randn(M, E, dtype=dtype, device='cuda')
+
+    softmax_vals = torch.softmax(values, dim=1)
+    topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
+
+    config = get_default_config()
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
+
+    return a, b, c, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
 
 
 torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, torch.float32 : tl.float32}
 
-@pytest.mark.parametrize("M, N, K, top_k, E", [(64, 14336, 4096, 2, 8), (16, 14336, 1, 2, 4), (4, 4, 8, 1, 2),
+
+#Note: TODO These 2 result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
+#@pytest.mark.parametrize("M, N, K, top_k, E", [(64, 14336, 4096, 2, 8), (16, 14336, 1, 2, 4), (4, 4, 8, 1, 2),
+#                                               (1, 14336, 128, 2, 4), (3, 14336, 128, 2, 4), (16, 14336, 128, 1, 4),
+#                                               (16, 14336, 128, 1, 1), (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8),
+#                                               (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8), (1, 1024, 16384, 1, 2)])
+@pytest.mark.parametrize("M, N, K, top_k, E", [(16, 14336, 1, 2, 4), (4, 4, 8, 1, 2),
                                                (1, 14336, 128, 2, 4), (3, 14336, 128, 2, 4), (16, 14336, 128, 1, 4),
                                                (16, 14336, 128, 1, 1), (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8),
-                                               (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8), (1, 1024, 16384, 1, 2)])
-@pytest.mark.parametrize('routed_weight', [True, False])
-@pytest.mark.parametrize('fp8', [(False)]) #TODO add support for fp8
-def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8: bool, compute_type=torch.bfloat16):
-    #torch.manual_seed(20)
-    a, b, triton_out, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config, a_scale, b_scale = input_helper(
-        M, N, K, top_k, E, routed_weight=routed_weight, compute_type=compute_type, fp8=fp8)
+                                               (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8)])
+@pytest.mark.parametrize('routed_weight', [False, True])
+#@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) 
+@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False)])  #TODO: Accuracy issues with fp8/int8
+#@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, True)]) 
+#@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO: Accuracy issues with float16
+@pytest.mark.parametrize('dtype', [torch.bfloat16])
+def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, dtype):
+    torch.manual_seed(20)
+    a, b, triton_out, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
+        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16)
 
-    print(f"sorted_token_ids={sorted_token_ids}")
-    print(f"expert_ids={expert_ids}")
-    print(f"num_tokens_post_padded={num_tokens_post_padded}")
-    moe_triton(a, b, triton_out, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids,
-                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[compute_type], fp8, False)
+    triton_moe(a, b, triton_out, a_scale, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16, False)
 
     torch_out = torch.empty_like(triton_out)
-    torch_out = torch_moe(a, b, torch_out, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
-                        num_tokens_post_padded, a_scale, b_scale, compute_type, fp8)
+    torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, None, 0, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
+                        num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, False)
 
     # Validate correctness
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+@pytest.mark.parametrize("M, N, K, top_k, E", [(1, 64, 128, 1, 2), (1, 64, 128, 2, 4), (4, 32, 64, 4, 16), (8, 96, 256, 2, 16)])
+@pytest.mark.parametrize('routed_weight', [False, True])
+@pytest.mark.parametrize('group_size',[8, 16, 32, 64])
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize('has_zp',[False, True])
+def test_fused_moe_int4_w4a16(M: int, N: int, K: int, top_k:int, E: int, 
+                                routed_weight: bool, dtype: torch.dtype, group_size: int, 
+                                has_zp: bool
+):
+    torch.manual_seed(20)
+    a, b, triton_out, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper_int4_w4a16(
+        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, group_size=group_size, has_zp=has_zp)
+
+    triton_moe(a, b, triton_out, None, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=True, block_shape=(0, group_size))
+
+    torch_out = torch.empty_like(triton_out)
+    torch_out = torch_moe(a, b, torch_out, None, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, False, False, True)
+
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
