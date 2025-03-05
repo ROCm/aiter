@@ -53,12 +53,14 @@ def run_torch(
             reorder_ops=reorder_ops,
         )
 
-    return out, 0, 0, 0
-    # if dout == None:
-    #     return out
-    # else:
-    #     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-    #     return out, dq, dk, dv
+    if dout == None:
+        return out
+    elif bias is not None:
+        dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
+        return out, dq, dk, dv, dbias
+    else:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        return out, dq, dk, dv, None
 
 
 def run_ck(
@@ -108,12 +110,14 @@ def run_ck(
     else:
         dropout_mask = None
 
-    return out, dropout_mask, 0, 0, 0
-    # if dout == None:
-    #     return out, dropout_mask
-    # else:
-    #     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-    #     return out, dropout_mask, dq, dk, dv
+    if dout == None:
+        return out, dropout_mask
+    elif bias is not None:
+        dq, dk, dv, dbias = torch.autograd.grad(out, (q, k, v, bias), dout)
+        return out, dropout_mask, dq, dk, dv, dbias
+    else:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        return out, dropout_mask, dq, dk, dv, None
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -176,14 +180,14 @@ def test_flash_attn_output(
 
     dout = torch.randn_like(q)
 
-    out, dropout_mask, dq, dk, dv = run_ck(
+    out, dropout_mask, dq, dk, dv, dbias = run_ck(
         q, k, v, attn_bias, alibi_slopes, dout, dropout_p, causal,
         window_size, deterministic, return_lse, return_attn_probs)
 
-    out_ref, dq_ref, dk_ref, dv_ref = run_torch(
+    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q, k, v, attn_bias, alibi_slopes, dout, dropout_p, dropout_mask, causal, window_size)
 
-    out_pt, dq_pt, dk_pt, dv_pt = run_torch(
+    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
         q, k, v, attn_bias, alibi_slopes, dout, dropout_p, dropout_mask, causal, window_size,
         upcast=False, reorder_ops=True)
 
@@ -192,26 +196,31 @@ def test_flash_attn_output(
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
 
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    # print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    # print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    # print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    # print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    # print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    # print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-    # dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    # dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    # dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+    assert (dq - dq_ref).abs().max().item() <= dq_tol
+    assert (dk - dk_ref).abs().max().item() <= dk_tol
+    assert (dv - dv_ref).abs().max().item() <= dv_tol
 
-    # assert (dq - dq_ref).abs().max().item() <= dq_tol
-    # assert (dk - dk_ref).abs().max().item() <= dk_tol
-    # assert (dv - dv_ref).abs().max().item() <= dv_tol
+    if attn_bias is not None:
+        print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
+        print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
+        dbias_tol = max(2 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
+        assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
 if __name__ == '__main__':
-    batch_size = 1
-    nheads = 1
+    batch_size = 2
+    nheads = 5
     (seqlen_q, seqlen_k) = (4, 4)
     d = 64
     dropout_p = 0.5

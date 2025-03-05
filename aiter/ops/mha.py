@@ -66,6 +66,8 @@ def mha_bwd(
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
+    dbias: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
@@ -194,11 +196,13 @@ def _flash_attn_backward(
     dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
@@ -217,12 +221,21 @@ def _flash_attn_backward(
         filter1 += 'bf16*'
         filter2 += 'bf16*'
         filter3 += 'bf16*'
-    if alibi_slopes is None:
-        md_name += '_nbias'
-        filter3 += '_nbias*'
-    else:
+    if bias is not None:
+        md_name += '_bias'
+        filter3 += '_bias*'
+    elif alibi_slopes is not None:
         md_name += '_alibi'
         filter3 += '_alibi*'
+    else:
+        md_name += '_nbias'
+        filter3 += '_nbias*'
+    if dbias is not None:
+        md_name += '_dbias'
+        filter3 += '_dbias*'
+    else:
+        md_name += '_ndbias'
+        filter3 += '_ndbias*'
     if not causal and window_size_left == -1 and window_size_right == -1:
         md_name += '_nmask'
         filter3 += '_nmask*'
@@ -272,6 +285,8 @@ def _flash_attn_backward(
         dq,
         dk,
         dv,
+        dbias,
+        bias,
         alibi_slopes,
         rng_state,
         None,
@@ -346,6 +361,8 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        bias = ctx.bias
+        dbias = torch.empty_like(bias) if bias is not None else None
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -360,11 +377,13 @@ class FlashAttnFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
+            dbias,
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
             ctx.window_size[0],
             ctx.window_size[1],
+            ctx.bias,
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
@@ -372,7 +391,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
 
 
 def flash_attn_func(
