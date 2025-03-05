@@ -71,8 +71,8 @@ def paged_attention_rocm(
     partition_size: int,
 ): ...
 
-@compile_ops("module_pa_sgl")
-def paged_attention_sgl(
+@compile_ops("module_pa_ragged")
+def paged_attention_ragged(
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     query: torch.Tensor,

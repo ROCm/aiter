@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include "attention_sgl.h"
+#include "attention_ragged.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-    m.def("paged_attention_sgl", &paged_attention_sgl,
-          "paged_attention_sgl(Tensor! out, Tensor exp_sums,"
+    m.def("paged_attention_ragged", &paged_attention_ragged,
+          "paged_attention_ragged(Tensor! out, Tensor exp_sums,"
           "                Tensor max_logits, Tensor tmp_out,"
           "                Tensor query, Tensor key_cache,"
           "                Tensor value_cache, int num_kv_heads,"

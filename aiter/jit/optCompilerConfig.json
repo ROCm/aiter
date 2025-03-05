@@ -25,10 +25,10 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "module_pa_sgl": {
+    "module_pa_ragged": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/pybind/attention_sgl_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/attention_sgl.cu'"
+            "f'{AITER_CSRC_DIR}/pybind/attention_ragged_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/attention_ragged.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [

@@ -357,7 +357,7 @@ def run_aiter(query,
         output = torch.empty_like(output,
                                 dtype=torch.float8_e4m3fnuz)
         cpa_fp8_out = True
-    aiter.paged_attention_sgl(
+    aiter.paged_attention_ragged(
         output,
         workspace_buffer,
         query,

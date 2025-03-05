@@ -19,7 +19,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_bf16.h>
 #include "hip_compat.h"
-#include "attention_sgl.h"
+#include "attention_ragged.h"
 
 #include <algorithm>
 #include "dtype_fp8.cuh"
@@ -2166,7 +2166,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     case 128: CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 128); break;         \
     default: TORCH_CHECK(false, "Unsupported head size: ", head_size); break; \
     }
-void paged_attention_sgl(
+void paged_attention_ragged(
     torch::Tensor& out, // [num_seqs, num_heads, head_size]
     torch::Tensor& workspace_buffer,
     torch::Tensor& query,       // [num_seqs, num_heads, head_size]
