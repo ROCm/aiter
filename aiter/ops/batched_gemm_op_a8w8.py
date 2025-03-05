@@ -52,7 +52,7 @@ def get_CKBatchedGEMM_config(
         get_CKBatchedGEMM_config.ck_batched_gemm_dict = ck_batched_gemm_dict.set_index(['B','M','N','K']).to_dict('index')
     config = get_CKBatchedGEMM_config.ck_batched_gemm_dict.get((B,M,N,K), None)
     if config != None:
-        mnk = config['kernelName'].split('_')[2].split('x')[1:]
+        mnk = config['kernelName'].split('_')[3].split('x')[1:]
         config["tile_m"] = int(mnk[0])
         config["tile_n"] = int(mnk[1])
         config["tile_k"] = int(mnk[2])

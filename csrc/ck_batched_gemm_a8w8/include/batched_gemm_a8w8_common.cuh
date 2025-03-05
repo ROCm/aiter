@@ -304,6 +304,7 @@ __forceinline__ torch::Tensor batched_gemm_a8w8_rowwise_impl(
         a_element_op,
         b_element_op,
         cde_element_op);
+
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
     invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
