@@ -420,7 +420,7 @@ struct OpUncachedFwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t size_min_h  = size_h_x < size_h_y ? size_h_x : size_h_y;
+        const int32_t size_min_h  = min(size_h_x, size_h_y);
 
         #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
@@ -560,7 +560,7 @@ struct OpUncachedBwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t size_min_h  = size_h_x < size_h_y ? size_h_x : size_h_y;
+        const int32_t size_min_h  = min(size_h_x, size_h_y);
 
         #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
@@ -702,7 +702,7 @@ struct OpCachedFwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t size_min_h  = size_h_x < size_h_y ? size_h_x : size_h_y;
+        const int32_t size_min_h  = min(size_h_x, size_h_y);
 
         #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
@@ -844,7 +844,7 @@ struct OpCachedBwd
         const int32_t size_r      = ReuseFreqsFrontPart ? (size_f << 1) : size_f;
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
-        const int32_t size_min_h  = size_h_x < size_h_y ? size_h_x : size_h_y;
+        const int32_t size_min_h  = min(size_h_x, size_h_y);
 
         #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
@@ -3315,8 +3315,8 @@ void rope_cached_positions_2c_fwd_impl(
     const bool           nope_first)
 {
     // Get sizes of input and output
-    const int32_t size_s   = input_x.size(0);
-    const int32_t size_b   = input_x.size(1);
+    const int32_t size_s   = min(input_x.size(0), positions.size(0));
+    const int32_t size_b   = min(input_x.size(1), positions.size(1));
     const int32_t size_h_x = input_x.size(2);
     const int32_t size_h_y = input_y.size(2);
     const int32_t size_d   = input_x.size(3);
@@ -3379,8 +3379,8 @@ void rope_cached_positions_offsets_2c_fwd_impl(
     const bool           nope_first)
 {
     // Get sizes of input and output
-    const int32_t size_s   = input_x.size(0);
-    const int32_t size_b   = input_x.size(1);
+    const int32_t size_s   = min(min(input_x.size(0), positions.size(0)), offsets.size(0));
+    const int32_t size_b   = min(min(input_x.size(1), positions.size(1)), offsets.size(1));
     const int32_t size_h_x = input_x.size(2);
     const int32_t size_h_y = input_y.size(2);
     const int32_t size_d   = input_x.size(3);
