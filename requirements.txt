@@ -1,2 +1,5 @@
 pandas<=2.0.3
 pytest
+numpy<2.0.0
+psutil
+einops

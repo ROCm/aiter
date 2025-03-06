@@ -55,6 +55,15 @@ def perftest(num_iters=101, num_warmup=10, testGraph=False):
     return decorator
 
 
+def benchmark():
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            log_args(func, *args, **kwargs)
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
 def run_iters(num_iters, func, *args, **kwargs):
     for _ in range(num_iters):
         data = func(*args, **kwargs)
@@ -66,6 +75,21 @@ def run_perftest(func, *args, num_iters=101, num_warmup=10, **kwargs):
     def worker():
         return func(*args, **kwargs)
     return worker()
+
+
+def log_args(func, *args, **kwargs):
+    import inspect
+    callargs = inspect.getcallargs(func, *args, **kwargs)
+
+    def getTensorInfo(el):
+        if isinstance(el, torch.Tensor):
+            return f'{el.shape} {el.dtype}'
+        return el
+    prefix = f"calling {func.__name__}("
+    blanks = ' '*len(prefix)
+    callargs = [f"{el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
+    callargs = f',\n{blanks}'.join(callargs)
+    logger.info(f"\n{prefix}{callargs})")
 
 
 def get_trace_perf(prof, num_iters):
@@ -118,6 +142,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
     mask = ~isClose
     if isClose.all():
         logger.info(f'{msg}[checkAllclose {atol=} {rtol=} passed~]')
+        return True
     else:
         num = mask.sum()
         printNum = min(printNum, num)
@@ -136,6 +161,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
                 f'''{msg}[checkAllclose {atol=} {rtol=} waring!] a and b results are not all close''')
         logger.info(
             f'-->max delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements')
+        return False
 
 
 def tensor_dump(x: torch.tensor, name: str, dir='./'):

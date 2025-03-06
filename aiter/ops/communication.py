@@ -5,7 +5,7 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
 from ..dist.parallel_state import (ensure_model_parallel_initialized,
                                    init_distributed_environment,
                                    set_custom_all_reduce,

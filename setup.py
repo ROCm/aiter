@@ -73,7 +73,7 @@ if IS_ROCM:
 
     # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
     # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = [f'-DAITER_ASM_DIR="{this_dir}/hsa/"']
+    generator_flag = []
     torch_dir = torch.__path__[0]
     if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
         generator_flag.append("-DOLD_GENERATOR_PATH")
@@ -97,7 +97,20 @@ if IS_ROCM:
         "-Wno-switch-bool",
         "-Wno-vla-cxx-extension",
         "-Wno-undefined-func-template",
+        "-fgpu-flush-denormals-to-zero",
     ]
+
+    # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+    hip_version = get_hip_version()
+    if hip_version > Version('5.7.23302'):
+        cc_flag += ["-fno-offload-uniform-block"]
+    if hip_version > Version('6.1.40090'):
+        cc_flag += ["-mllvm", "-enable-post-misched=0"]
+    if hip_version > Version('6.2.41132'):
+        cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
+                    "-mllvm", "-amdgpu-function-calls=false"]
+    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -106,12 +119,16 @@ if IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
-        all_opts_args_build = core.get_args_of_build("all")
+        exclude_ops=["module_mha_fwd",
+                     "module_mha_varlen_fwd",
+                     "module_mha_bwd",
+                     "module_mha_varlen_bwd"]
+        all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list
 
-        core.build_module(md_name = "aiter_", 
+        core.build_module(md_name = "aiter_",
                     srcs = all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
                     flags_extra_cc = all_opts_args_build["flags_extra_cc"],
                     flags_extra_hip = all_opts_args_build["flags_extra_hip"],
@@ -169,6 +186,16 @@ else:
     raise NotImplementedError("Only ROCM is supported")
 
 
+if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+    shutil.rmtree("aiter_meta")
+## link "3rdparty", "hsa", "csrc" into "aiter_meta"
+shutil.copytree("3rdparty", "aiter_meta/3rdparty")
+shutil.copytree("hsa", "aiter_meta/hsa")
+shutil.copytree("csrc", "aiter_meta/csrc")
+os.chmod("aiter_meta", 0o777)
+
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # calculate the maximum allowed NUM_JOBS based on cores
@@ -192,18 +219,11 @@ class NinjaBuildExtension(BuildExtension):
 setup(
     name=PACKAGE_NAME,
     version="0.1.0",
-    packages=find_packages(
-        exclude=(
-            "build",
-            "csrc",
-            "include",
-            "tests",
-            "dist",
-            "docs",
-            "benchmarks",
-            "3rdparty",
-        )
-    ),
+    packages=["aiter_meta","aiter"],
+    include_package_data=True,
+    package_data={
+        '': ['*'],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
@@ -212,15 +232,18 @@ setup(
     ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
-    install_requires=[
-        "torch",
-    ],
+    # install_requires=[
+    #     "torch",
+    # ],
     setup_requires=[
         "packaging",
         "psutil",
         "ninja",
     ],
 )
+
+if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
+    shutil.rmtree("aiter_meta")
 # if os.path.exists(bd_dir):
 #     shutil.rmtree(bd_dir)
 # if os.path.exists(blob_dir):

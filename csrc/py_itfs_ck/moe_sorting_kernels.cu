@@ -27,7 +27,12 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts);
-    auto ws = torch::zeros({workspace_size}, torch::TensorOptions().dtype(dtype).device(device_of(topk_ids)));
+    void *ws_ptr = nullptr;
+    if (workspace_size > 0)
+    {
+        auto ws = torch::zeros({workspace_size}, torch::TensorOptions().dtype(dtype).device(device_of(topk_ids)));
+        ws_ptr = ws.data_ptr();
+    }
 
     moe_sorting({
                     dtype_str,                    // index_type
@@ -42,7 +47,7 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                  sorted_expert_ids.data_ptr(), // p_sorted_expert_ids
                  num_valid_ids.data_ptr(),     // p_total_tokens_post_pad
                  moe_buf.data_ptr(),           // p_moe_buf
-                 ws.data_ptr(),                    // p_workspace
+                 ws_ptr,                       // p_workspace
                  num_tokens, unit_size, num_experts, topk, (int)moe_buf.nbytes()},
                 {stream});
 }

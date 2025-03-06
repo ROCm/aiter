@@ -5,8 +5,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe_gelu import fused_topk
-from aiter.fused_moe_bf16_asm import moe_sorting_ck
+from aiter.fused_moe_bf16_asm import moe_sorting_ck, fused_topk
 
 BLOCK_SIZE_M = 32
 

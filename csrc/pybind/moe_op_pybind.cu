@@ -7,6 +7,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
       m.def("topk_softmax", &topk_softmax,
             "Apply topk softmax to the gating outputs.");
+      m.def("grouped_topk", &grouped_topk,
+            py::arg("gating_output"), 
+            py::arg("topk_weights"), py::arg("topk_ids"),
+            py::arg("num_expert_group"), py::arg("topk_grp"),
+            py::arg("need_renorm"), py::arg("scoring_func") = "softmax",
+            py::arg("routed_scaling_factor") = 1.0f,
+            "Apply grouped topk softmax/sigmodd to the gating outputs.");
+      m.def("biased_grouped_topk", &biased_grouped_topk,
+            py::arg("gating_output"), py::arg("correction_bias"),
+            py::arg("topk_weights"), py::arg("topk_ids"),
+            py::arg("num_expert_group"), py::arg("topk_grp"),
+            py::arg("need_renorm"), 
+            py::arg("routed_scaling_factor") = 1.0f,
+            "Apply biased grouped topk softmax to the gating outputs.");
       m.def("moe_align_block_size", &moe_align_block_size,
             "Aligning the number of tokens to be processed by each expert such "
             "that it is divisible by the block size.");

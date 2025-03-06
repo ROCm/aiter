@@ -58,6 +58,7 @@ def asm_moe(hidden_states,
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
     device = topk_ids.device
+    lastdim_mul = 8 if w1.dtype in {torch.int32, torch.uint32} else 1
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
                                                                                            model_dim, dtype, BLOCK_SIZE_M, expert_mask)
 
@@ -89,9 +90,10 @@ def asm_moe(hidden_states,
 
     else:
         # a8w8 fmoe, opt: smooth quant
+        a8_type = w1.dtype if w1.dtype != torch.int32 and w1.dtype != torch.uint32 else torch.float8_e4m3fnuz
         if fc1_smooth_scale is not None:
             a8 = torch.empty((topk * M, model_dim),
-                             dtype=w1.dtype, device=device)
+                             dtype=a8_type, device=device)
             a8_scale = torch.empty(
                 (topk * M), dtype=torch.float, device=device)
 
@@ -104,9 +106,9 @@ def asm_moe(hidden_states,
             aiter.moe_smoothquant_fwd(
                 a8, hidden_states, fc1_smooth_scale, topk_ids, a8_scale)
         else:
-            if w1.dtype == torch.float8_e4m3fnuz:
+            if w1.dtype == torch.float8_e4m3fnuz or w1.dtype == torch.int32 and w1.dtype == torch.uint32:
                 a8 = torch.empty(
-                    (M, model_dim), dtype=w1.dtype, device=device)
+                    (M, model_dim), dtype=a8_type, device=device)
                 a8_scale = torch.empty(M, dtype=torch.float, device=device)
                 if per_tensor_quant_scale is None:
                     aiter.dynamic_per_token_scaled_fp8_quant(
@@ -129,13 +131,13 @@ def asm_moe(hidden_states,
                 logger.warning(f'FMOE fall into pure torch quant...')
                 a8, a8_scale = aiter.pertoken_quant(
                     hidden_states, torch.float, quant_dtype=w1.dtype)
-
-        if w2.shape[2] == w1.shape[1]:
+        if w2.shape[2] * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_int8_g1u0
-        elif w2.shape[2]*2 == w1.shape[1]:
+        elif w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_g1u1
         else:
-            raise ValueError(f"Invalid MoE weight: {w1.shape=} {w2.shape=}")
+            raise ValueError(
+                f"Invalid MoE weight: {w1.shape=} {w2.shape=} {lastdim_mul}")
 
         fmoe_func(moe_buf, a8, w1, w2, sorted_ids,
                   sorted_weights, sorted_expert_ids, num_valid_ids,
@@ -230,9 +232,13 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
               fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
               fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
               expert_mask=None):
+    computeType = torch.float
+    dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(computeType)
+    w1 = w1.to(computeType)
+    w2 = w2.to(computeType)
     B, D = hidden_states.shape
     topk = topk_weight.shape[1]
-    dtype = hidden_states.dtype
     if expert_mask is not None:
         local_expert_hash = (expert_mask.cumsum(0, dtype=torch.int32) - 1)
         local_expert_hash[expert_mask == 0] = -1
@@ -242,37 +248,37 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
         B, -1, D).repeat(1, topk, 1)
     out = torch.zeros(
         (B, topk, D),
-        dtype=dtype,
+        dtype=computeType,
         device=hidden_states.device,
     )
-    # g1u1(w1 include gate and up)
+
+    inter_dim = w2.shape[2]
     if w2.shape[2]*2 == w1.shape[1]:
+        # g1u1(w1 include gate and up)
         moeType = "g1u1"
-        inter_dim = w2.shape[2]
-    # g1u0(w1 only include gate)
     else:
+        # g1u0(w1 only include gate)
         moeType = "g1u0"
-        inter_dim = w1.shape[1]
-    # gose to quant D_w8a8/w8a8
+
     if fc1_scale is not None:
+        # gose to quant D_w8a8/w8a8
         expert = w1.shape[0]
         w2D = w2.shape[-1]
-        w1 = (w1.view(-1, D).to(fc1_scale) *
-              fc1_scale.view(-1, 1)).to(dtype).view(expert, -1, D)
-        w2 = (w2.view(-1, w2D).to(fc2_scale) *
-              fc2_scale.view(-1, 1)).to(dtype).view(expert, -1, w2D)
+        w1 = (w1.view(-1, D)*fc1_scale.view(-1, 1)).view(expert, -1, D)
+        w2 = (w2.view(-1, w2D)*fc2_scale.view(-1, 1)).view(expert, -1, w2D)
+
     if fc1_smooth_scale is not None:
         expert = fc1_smooth_scale.shape[0]
-        fc1_smooth_scale = fc1_smooth_scale.view(expert, -1).to(dtype)
-        fc2_smooth_scale = fc2_smooth_scale.view(expert, -1).to(dtype)
+        fc1_smooth_scale = fc1_smooth_scale.view(expert, -1)
+        fc2_smooth_scale = fc2_smooth_scale.view(expert, -1)
 
     for E_id in range(w1.shape[0]):
         mask = topk_ids == E_id
         if mask.sum():
             sub_tokens = hidden_states[mask]
             if fc1_smooth_scale is not None:
-                sub_tokens = sub_tokens * (
-                    fc1_smooth_scale[E_id])
+                sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
+
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
             if moeType == "g1u1":
                 gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
@@ -280,10 +286,52 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             else:
                 act_out = F.gelu(act_input)
             if fc2_smooth_scale is not None:
-                act_out = act_out * (
-                    fc2_smooth_scale[E_id])
+                act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))
 
     return (
-        out * topk_weight.view(B, -1, 1).to(out.dtype)
-    ).sum(dim=1)
+        out * topk_weight.view(B, -1, 1)
+    ).sum(dim=1).to(dtype)
+
+
+def fused_topk(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+):
+    assert hidden_states.shape[0] == gating_output.shape[0], (
+        "Number of tokens mismatch")
+
+    M, _ = hidden_states.shape
+
+    if topk_weights is None:
+        topk_weights = torch.empty(M,
+                                   topk,
+                                   dtype=torch.float32,
+                                   device=hidden_states.device)
+    if topk_ids is None:
+        topk_ids = torch.empty(M,
+                               topk,
+                               dtype=torch.int32,
+                               device=hidden_states.device)
+    token_expert_indicies = torch.empty(M,
+                                        topk,
+                                        dtype=torch.int32,
+                                        device=hidden_states.device)
+
+    aiter.topk_softmax(
+        topk_weights,
+        topk_ids,
+        token_expert_indicies,
+        gating_output.float(),  # TODO(woosuk): Optimize this.
+        renormalize
+    )
+    del token_expert_indicies  # Not used. Will be used in the future.
+
+    # if renormalize:
+    #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids

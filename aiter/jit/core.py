@@ -15,6 +15,7 @@ from torch.utils.file_baton import FileBaton
 import logging
 import json
 import multiprocessing
+from packaging.version import parse, Version
 
 PREBUILD_KERNELS = False
 if os.path.exists(os.path.dirname(os.path.abspath(__file__))+"/aiter_.so"):
@@ -24,8 +25,29 @@ logger = logging.getLogger("aiter")
 
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
-AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
+
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+
+find_aiter = importlib.util.find_spec("aiter")
+if find_aiter is not None:
+    if find_aiter.submodule_search_locations:
+        package_path = find_aiter.submodule_search_locations[0]
+    elif find_aiter.origin:
+        package_path = find_aiter.origin
+    package_path = os.path.dirname(package_path)
+    import site
+    site_packages_dirs = site.getsitepackages()
+    # develop mode
+    if package_path not in site_packages_dirs:
+        AITER_ROOT_DIR = AITER_CORE_DIR
+    # install mode
+    else:
+        AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
+else:
+    print("aiter is not installed.")
+
 AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
+os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
@@ -77,6 +99,7 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     ret = []
     for el in els:
         if not os.path.exists(el):
+            logger.warning(f'---> {el} not exists!!!!!!')
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
@@ -92,8 +115,18 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+
+
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
+    numa_balance_set = os.popen(
+        "cat /proc/sys/kernel/numa_balancing").read().strip()
+    if numa_balance_set == "1":
+        logger.warning("WARNING: NUMA balancing is enabled, which may cause errors. "
+                       "It is recommended to disable NUMA balancing by running 'sudo sh -c echo 0 > /proc/sys/kernel/numa_balancing' "
+                       "for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing")
     return importlib.import_module(f'{__package__}.{md_name}')
 
 
@@ -113,23 +146,35 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         flags_cc = ["-O3", "-std=c++17"]
         flags_hip = [
+            "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
 
-            "-mllvm", "-enable-post-misched=0",
-            "-mllvm", "-amdgpu-early-inline-all=true",
-            "-mllvm", "-amdgpu-function-calls=false",
             "-mllvm", "--amdgpu-kernarg-preload-count=16",
-            "-mllvm", "-amdgpu-coerce-illegal-types=1",
             # "-v", "--save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
+
+            "-fgpu-flush-denormals-to-zero",
         ]
+
+        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+        hip_version = get_hip_version()
+        if hip_version > Version('5.7.23302'):
+            flags_hip += ["-fno-offload-uniform-block"]
+        if hip_version > Version('6.1.40090'):
+            flags_hip += ["-mllvm", "-enable-post-misched=0"]
+        if hip_version > Version('6.2.41132'):
+            flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
+                          "-mllvm", "-amdgpu-function-calls=false"]
+        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+            flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
+
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -192,7 +237,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
     return module
 
 
-def get_args_of_build(ops_name: str):
+def get_args_of_build(ops_name: str, exclue=[]):
     d_opt_build_args = {"srcs": [],
                         "md_name": "",
                         "flags_extra_cc": [],
@@ -205,9 +250,9 @@ def get_args_of_build(ops_name: str):
 
     def convert(d_ops: dict):
         # judge isASM
-        if d_ops["isASM"].lower() == "true":
-            d_ops["flags_extra_hip"].append(
-                "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
+        # if d_ops["isASM"].lower() == "true":
+        #     d_ops["flags_extra_hip"].append(
+        #         "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
         del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):
@@ -235,6 +280,9 @@ def get_args_of_build(ops_name: str):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
+                    # exclude
+                    if ops_name in exclue:
+                        continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
@@ -246,33 +294,40 @@ def get_args_of_build(ops_name: str):
                 return d_all_ops
             # no find opt_name in json.
             elif data.get(ops_name) == None:
-                print("Not found this operator in 'optCompilerConfig.json'. ")
+                logger.warning(
+                    "Not found this operator in 'optCompilerConfig.json'. ")
                 return d_opt_build_args
             # parser single opt
             else:
                 compile_ops_ = data.get(ops_name)
                 return convert(compile_ops_)
         else:
-            print("ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
+            logger.warning(
+                "ERROR: pls use dict_format to write 'optCompilerConfig.json'! ")
 
 
-def compile_ops(ops_name: str, fc_name: Optional[str] = None):
+def compile_ops(_md_name: str, fc_name: Optional[str] = None):
     def decorator(func):
-        def wrapper(*args, **kwargs):
+        def wrapper(*args, custom_build_args={}, **kwargs):
             loadName = fc_name
+            md_name = _md_name
             if fc_name is None:
                 loadName = func.__name__
-
             try:
                 module = None
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
                 if module is None:
-                    module = get_module(ops_name)
+                    module = get_module(custom_build_args.get('md_name',
+                                                              md_name))
             except Exception as e:
-                d_args = get_args_of_build(ops_name)
-                md_name = d_args["md_name"]
+                d_args = get_args_of_build(md_name)
+                d_args.update(custom_build_args)
+
+                # update module if we have coustom build
+                md_name = custom_build_args.get('md_name', md_name)
+
                 srcs = d_args["srcs"]
                 flags_extra_cc = d_args["flags_extra_cc"]
                 flags_extra_hip = d_args["flags_extra_hip"]
@@ -289,13 +344,13 @@ def compile_ops(ops_name: str, fc_name: Optional[str] = None):
 
                 def getTensorInfo(el):
                     if isinstance(el, torch.Tensor):
-                        return f'{el.shape} {el.dtype}'
+                        return f'{el.shape} {el.dtype} {hex(el.data_ptr())}'
                     return el
 
                 callargs = [
                     f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
                 logger.info(
-                    f"    calling {ops_name}::{loadName}({', '.join(callargs)})")
+                    f"    calling {md_name}::{loadName}({', '.join(callargs)})")
 
             return op(*args, **kwargs)
         return wrapper

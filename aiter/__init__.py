@@ -15,6 +15,7 @@ if importlib.util.find_spec('rocsolidxgemm_') is not None:
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
+from .ops.batched_gemm_op_a8w8 import *
 from .ops.aiter_operator import *
 from .ops.activation import *
 from .ops.attention import *
@@ -27,7 +28,9 @@ from .ops.cache import *
 from .ops.rmsnorm import *
 from .ops.communication import *
 from .ops.rope import *
-
+from .ops.topk import *
+from .ops.mha import *
+from . import mla
 
 def getLogger():
     global logger

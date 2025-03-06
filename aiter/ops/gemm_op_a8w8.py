@@ -6,7 +6,7 @@ from torch import Tensor
 from typing import List, Optional
 import functools
 import pandas as pd
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
 
 
 @compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8")
@@ -38,6 +38,15 @@ def gemm_a8w8_asm(
 ): ...
 
 
+@compile_ops("module_gemm_a8w8_blockscale", fc_name="gemm_a8w8_blockscale")
+def gemm_a8w8_blockscale(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+): ...
+
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(
         M: int,
@@ -64,7 +73,7 @@ def get_CKGEMM_config(
     K: int,
 ):
     if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
-        ckgemm_dict = pd.read_csv(f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv").drop_duplicates()
+        ckgemm_dict = pd.read_csv(f"{AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv").drop_duplicates()
         get_CKGEMM_config.ckgemm_dict = ckgemm_dict.set_index(['M','N','K']).to_dict('index')
     config = get_CKGEMM_config.ckgemm_dict.get((M,N,K), None)
     if config != None:
@@ -84,7 +93,7 @@ def get_ASMGEMM_config(
     dtype: torch.dtype
 ):
     if not hasattr(get_ASMGEMM_config, "asmgemm_dict"):
-        asmGemmDictDf = pd.read_csv(f"{AITER_ROOT_DIR}/aiter/configs/asm_a8w8_gemm.csv").drop_duplicates()
+        asmGemmDictDf = pd.read_csv(f"{AITER_CORE_DIR}/aiter/configs/asm_a8w8_gemm.csv").drop_duplicates()
         asmGemmDictDf.bias = asmGemmDictDf.bias.apply(lambda s: True if s in ['True',1,'true'] else False)
         get_ASMGEMM_config.asmgemm_dict = asmGemmDictDf.set_index(['M','N','K','bias','outdtype']).to_dict('index')
     return get_ASMGEMM_config.asmgemm_dict.get((M,N,K,bias,str(dtype)), None)
@@ -150,8 +159,37 @@ def gemm_a8w8_CK(
     return gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
+def gemm_a8w8_blockscale_CK(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype=torch.bfloat16
+):
+    assert dtype in [
+        torch.bfloat16,
+        torch.float16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, Y)
+
+
 @compile_ops("module_gemm_a8w8_tune",fc_name="gemm_a8w8_tune")
 def gemm_a8w8_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK = 0
+): ...
+
+@compile_ops("module_gemm_a8w8_blockscale_tune",fc_name="gemm_a8w8_blockscale_tune")
+def gemm_a8w8_blockscale_tune(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,

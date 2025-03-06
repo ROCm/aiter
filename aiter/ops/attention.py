@@ -4,7 +4,7 @@
 import os
 import torch
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
 MD_NAME = 'module_attention'
 
 
@@ -43,11 +43,9 @@ def pa_fwd_asm(
     max_num_blocks: int,
     K_QScale: Optional[torch.Tensor],
     V_QScale: Optional[torch.Tensor],
-    out_: Optional[torch.Tensor] = None
+    out_: Optional[torch.Tensor] = None,
+    high_precision: Optional[int] = 1   # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
 ) -> torch.Tensor: ...
-
-
-MD_NAME = "module_pa"
 
 
 @compile_ops("module_pa")
@@ -71,4 +69,27 @@ def paged_attention_rocm(
     v_scale: float,
     fp8_out_scale: Optional[torch.Tensor],
     partition_size: int,
+): ...
+
+
+MD_NAME = "module_mla_asm"
+
+
+@compile_ops(MD_NAME)
+def mla_stage1_asm_fwd(
+    # [num_seqs, num_heads, head_size]
+    Q: torch.Tensor,
+    # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    KV: torch.Tensor,
+    # [batch_size+1]
+    kv_indptr: torch.Tensor,
+    # [num_page_used]
+    kv_page_indices: torch.Tensor,
+    # [batch_size]
+    kv_last_page_lens: torch.Tensor,
+    softmax_scale: float,
+    # [batch_size, num_kv_splits, num_heads, v_head_dim]
+    splitData: torch.Tensor,
+    # [batch_size, num_kv_splits, num_heads,  1]
+    splitLse: torch.Tensor
 ): ...
