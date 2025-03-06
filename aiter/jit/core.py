@@ -172,7 +172,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         if hip_version > Version('6.2.41132'):
             flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
                           "-mllvm", "-amdgpu-function-calls=false"]
-        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        if hip_version > Version('6.2.41133'):
             flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         flags_cc += flags_extra_cc
