@@ -367,10 +367,11 @@ def rope_2c_fwd(
     nope_first : bool,
     transpose_output: bool = False
 ) -> Tensor :
-    s, b, h, d = input_x.shape
-    output_x = empty((b, s, h, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
+    s, b, h_x, d = input_x.shape
+    h_y = input_y.shape[2]
+    output_x = empty((b, s, h_x, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_x, requires_grad=False)
-    output_y = empty((b, s, h, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
+    output_y = empty((b, s, h_y, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_2c_fwd_impl(output_x, output_y, input_x, input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
@@ -394,10 +395,11 @@ def rope_2c_bwd(
     nope_first : bool,
     transpose_output: bool = False
 ) -> Tensor :
-    s, b, h, d = output_grads_x.shape
-    input_grads_x = empty((b, s, h, d), dtype=output_grads_x.dtype, device=output_grads_x.device, requires_grad=False).transpose(0, 1)\
+    s, b, h_x, d = output_grads_x.shape
+    h_y = output_grads_y.shape[2]
+    input_grads_x = empty((b, s, h_x, d), dtype=output_grads_x.dtype, device=output_grads_x.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads_x, requires_grad=False)
-    input_grads_y = empty((b, s, h, d), dtype=output_grads_y.dtype, device=output_grads_y.device, requires_grad=False).transpose(0, 1)\
+    input_grads_y = empty((b, s, h_y, d), dtype=output_grads_y.dtype, device=output_grads_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads_y, requires_grad=False)
     rope_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, freqs, rotate_style, reuse_freqs_front_part, nope_first)
     return input_grads_x, input_grads_y
@@ -452,10 +454,11 @@ def rope_cached_2c_fwd(
     nope_first : bool,
     transpose_output: bool = False
 ) -> Tensor :
-    s, b, h, d = input_x.shape
-    output_x = empty((b, s, h, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
+    s, b, h_x, d = input_x.shape
+    h_y = input_y.shape[2]
+    output_x = empty((b, s, h_x, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_x, requires_grad=False)
-    output_y = empty((b, s, h, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
+    output_y = empty((b, s, h_y, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_cached_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
@@ -481,10 +484,11 @@ def rope_cached_2c_bwd(
     nope_first : bool,
     transpose_output: bool = False
 ) -> Tensor :
-    s, b, h, d = output_grads_x.shape
-    input_grads_x = empty((b, s, h, d), dtype=output_grads_x.dtype, device=output_grads_x.device, requires_grad=False).transpose(0, 1)\
+    s, b, h_x, d = output_grads_x.shape
+    h_y = output_grads_y.shape[2]
+    input_grads_x = empty((b, s, h_x, d), dtype=output_grads_x.dtype, device=output_grads_x.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads_x, requires_grad=False)
-    input_grads_y = empty((b, s, h, d), dtype=output_grads_y.dtype, device=output_grads_y.device, requires_grad=False).transpose(0, 1)\
+    input_grads_y = empty((b, s, h_y, d), dtype=output_grads_y.dtype, device=output_grads_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(output_grads_y, requires_grad=False)
     rope_cached_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
     return input_grads_x, input_grads_y
@@ -500,10 +504,11 @@ def rope_cached_positions_2c_fwd(
     nope_first : bool,
     transpose_output: bool = False
 ) -> Tensor :
-    s, b, h, d = input_x.shape
-    output_x = empty((b, s, h, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
+    s, b, h_x, d = input_x.shape
+    h_y = input_y.shape[2]
+    output_x = empty((b, s, h_x, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_x, requires_grad=False)
-    output_y = empty((b, s, h, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
+    output_y = empty((b, s, h_y, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_cached_positions_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
@@ -532,10 +537,11 @@ def rope_cached_positions_offsets_2c_fwd(
     nope_first : bool,
     transpose_output: bool = False
 ) -> Tensor :
-    s, b, h, d = input_x.shape
-    output_x = empty((b, s, h, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
+    s, b, h_x, d = input_x.shape
+    h_y = input_y.shape[2]
+    output_x = empty((b, s, h_x, d), dtype=input_x.dtype, device=input_x.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_x, requires_grad=False)
-    output_y = empty((b, s, h, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
+    output_y = empty((b, s, h_y, d), dtype=input_y.dtype, device=input_y.device, requires_grad=False).transpose(0, 1)\
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_cached_positions_offsets_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y

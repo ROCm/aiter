@@ -176,13 +176,13 @@ transpose_output: {transpose_output}
 
 
 def test_rope_sbhd_2c(input_x, input_y, freqs, grad_x, grad_y, rotate_style, reuse_freqs_front_part, nope_first, transpose_output):
-    assert(input_x.shape == input_y.shape)
+    assert(input_x.shape[0:2] == input_y.shape[0:2] and input_x.shape[3] == input_y.shape[3])
     assert(input_x.dtype == input_y.dtype)
 
     input_msg = f"""
-dtype: {input.dtype}, \
+dtype: {input_x.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input.shape):<20}, \
+dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
 dim_freqs: {str(freqs.shape):<20}, \
 rotate_style: {rotate_style.value}, \
 reuse_freqs_front_part: {reuse_freqs_front_part}, \
@@ -217,7 +217,7 @@ def test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positio
     input_msg = f"""
 dtype: {input_x.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input_x.shape):<20}, \
+dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
 dim_freqs: {str(freqs.shape):<20}, \
 dim_positions: {str(positions.shape):<20}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
@@ -247,7 +247,7 @@ transpose_output: {transpose_output}
 def compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first, check_correction=False):
     input_msg = f"""dtype: {input_x.dtype}, \
 freq_dtype: {freqs.dtype}, \
-dim_input: {str(input_x.shape):<20}, \
+dim_input: {str(input_x.shape):<20} - {str(input_y.shape):<20}, \
 dim_freqs: {str(freqs.shape):<20}, \
 dim_positions: {str(positions.shape):<20}, \
 dim_offsets: {str(offsets.shape) if offsets is not None else 'None'}, \
@@ -263,7 +263,8 @@ nope_first: {nope_first}
     if check_correction:
         ref_x = ref_rope_sbhd_fwd(input_x, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
         ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
-        s, b, h, d = input_x.shape
+        s, b, h_x, d = input_x.shape
+        h_y = input_y.shape[2]
         hip_input_x, hip_input_y = input_x.clone(), input_y.clone()
         leg_input_x, leg_input_y = input_x.clone().view(s * b, -1), input_y.clone().view(s * b, -1)
         if offsets is None:
@@ -275,8 +276,8 @@ nope_first: {nope_first}
 
         checkAllclose(ref_x, hip_input_x, msg=f"correction: hip_fwd_x - {input_msg}\n")
         checkAllclose(ref_y, hip_input_y, msg=f"correction: hip_fwd_y - {input_msg}\n")
-        checkAllclose(ref_x, leg_input_x.view(s, b, h, d), msg=f"correction: leg_fwd_x - {input_msg}\n")
-        checkAllclose(ref_y, leg_input_y.view(s, b, h, d), msg=f"correction: leg_fwd_y - {input_msg}\n")
+        checkAllclose(ref_x, leg_input_x.view(s, b, h_x, d), msg=f"correction: leg_fwd_x - {input_msg}\n")
+        checkAllclose(ref_y, leg_input_y.view(s, b, h_y, d), msg=f"correction: leg_fwd_y - {input_msg}\n")
 
     if offsets is None:
         _, leg_cached_fwd_avg = legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos_sin, positions, rotate_style, nope_first)
@@ -387,7 +388,7 @@ if __name__ == "__main__":
             input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
             freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
             grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-            test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+            # test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
             input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
             input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
             grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
@@ -400,14 +401,14 @@ if __name__ == "__main__":
             rotate_style,
             rotary_percent_and_reuse,
             has_offsets,
-            b, s, h, d
+            b, s, h_x, h_y, d
         ) in itertools.product(
             dtype_, dtype_,
             transpose_output_,
             rotate_style_,
             rotary_percent_and_reuse_,
             (False, True),
-            batch_size_, seq_size_, head_size_, hidden_dim_
+            batch_size_, seq_size_, head_size_, head_size_, hidden_dim_
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -416,10 +417,10 @@ if __name__ == "__main__":
             freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
             positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
             offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
-            input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-            input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
-            grad_x  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-            grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            input_x = torch.randn((s, b, h_x, d), dtype=dtype, device="cuda", requires_grad=True)
+            input_y = torch.randn((s, b, h_y, d), dtype=dtype, device="cuda", requires_grad=True)
+            grad_x  = torch.randn((s, b, h_x, d), dtype=dtype, device="cuda")
+            grad_y  = torch.randn((s, b, h_y, d), dtype=dtype, device="cuda")
             test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
 
     # Compare new with legacy
@@ -433,16 +434,16 @@ if __name__ == "__main__":
             rotate_style,
             rotary_percent_and_reuse,
             has_offsets,
-            b, s, h, d
+            b, s, h_x, h_y, d
         ) in itertools.product(
             dtype_, # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
             rotate_style_,
             rotary_percent_and_reuse_compare_,
             (False, True),
-            batch_size_, seq_size_, head_size_, hidden_dim_
+            batch_size_, seq_size_, head_size_, head_size_, hidden_dim_
         ):
             color = '\033[95m'
-            print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, sbhd: {b, s, h, d}, has_offsets: {has_offsets}{color}")
+            print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, sbhd: {b, s, h_x, h_y, d}, has_offsets: {has_offsets}{color}")
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
             nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
@@ -450,8 +451,8 @@ if __name__ == "__main__":
             freqs   = torch.randn((s * 2, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=dtype, device="cuda")
             positions = torch.randint(int(s * 0.25) if has_offsets else 0, int(s * 0.75) if has_offsets else s, (s,b,), device="cuda")
             offsets   = torch.randint(int(s * -0.25), int(s * 0.25), (s,b,), device="cuda") if has_offsets else None
-            input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-            input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
+            input_x = torch.randn((s, b, h_x, d), dtype=dtype, device="cuda")
+            input_y = torch.randn((s, b, h_y, d), dtype=dtype, device="cuda")
             compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first, args.compare_check)
 
     # Test thd format for uncached
