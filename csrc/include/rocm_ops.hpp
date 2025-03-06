@@ -421,21 +421,25 @@
       m.def("rmsnorm2d_fwd_with_dynamicquant", &rmsnorm2d_with_dynamicquant);                             \
       m.def("rmsnorm2d_fwd_with_add_dynamicquant", &rmsnorm2d_with_add_dynamicquant);
 
-#define ROPE_PYBIND                                                                                   \
-      m.def("rope_fwd_impl", &rope_fwd_impl);                                                         \
-      m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);                                                   \
-      m.def("rope_bwd_impl", &rope_bwd_impl);                                                         \
-      m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);                                                   \
-      m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);                                           \
-      m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl);                                     \
-      m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);                                           \
-      m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl);                                     \
-      m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);                 \
-      m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl); \
-      m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);                                                 \
-      m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);                                                 \
-      m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);                                                   \
+#define ROPE_GENERAL_FWD_PYBIND                                   \
+      m.def("rope_fwd_impl", &rope_fwd_impl);                     \
+      m.def("rope_2c_fwd_impl", &rope_2c_fwd_impl);               \
+      m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);       \
+      m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl); \
+      m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);             \
+      m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);               \
+
+#define ROPE_GENERAL_BWD_PYBIND                                   \
+      m.def("rope_bwd_impl", &rope_bwd_impl);                     \
+      m.def("rope_2c_bwd_impl", &rope_2c_bwd_impl);               \
+      m.def("rope_cached_bwd_impl", &rope_cached_bwd_impl);       \
+      m.def("rope_cached_2c_bwd_impl", &rope_cached_2c_bwd_impl); \
+      m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);             \
       m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
+
+#define ROPE_POS_FWD_PYBIND                                                                           \
+      m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);                 \
+      m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
 #define SMOOTHQUANT_PYBIND                        \
       m.def("smoothquant_fwd", &smoothquant_fwd); \

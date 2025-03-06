@@ -10,7 +10,7 @@ from enum import IntEnum
 MD_NAME = "module_rope"
 
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_fwd")
 def rope_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -29,7 +29,7 @@ def rope_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_bwd")
 def rope_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -48,7 +48,7 @@ def rope_bwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_fwd")
 def rope_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -69,7 +69,7 @@ def rope_2c_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_bwd")
 def rope_2c_bwd_impl(
     input_grads_x: Tensor,
     input_grads_y: Tensor,
@@ -90,7 +90,7 @@ def rope_2c_bwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_fwd")
 def rope_cached_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -110,7 +110,7 @@ def rope_cached_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_bwd")
 def rope_cached_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -130,7 +130,7 @@ def rope_cached_bwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_fwd")
 def rope_cached_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -152,7 +152,7 @@ def rope_cached_2c_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_bwd")
 def rope_cached_2c_bwd_impl(
     input_grads_x: Tensor,
     input_grads_y: Tensor,
@@ -174,7 +174,7 @@ def rope_cached_2c_bwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_pos_fwd")
 def rope_cached_positions_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -198,7 +198,7 @@ def rope_cached_positions_2c_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_pos_fwd")
 def rope_cached_positions_offsets_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -223,7 +223,7 @@ def rope_cached_positions_offsets_2c_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_fwd")
 def rope_thd_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -244,7 +244,7 @@ def rope_thd_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_bwd")
 def rope_thd_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
@@ -265,7 +265,7 @@ def rope_thd_bwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_fwd")
 def rope_2d_fwd_impl(
     output: Tensor,
     input: Tensor,
@@ -292,7 +292,7 @@ def rope_2d_fwd_impl(
     '''
     ...
 
-@compile_ops("module_rope")
+@compile_ops("module_rope_general_bwd")
 def rope_2d_bwd_impl(
     input_grads: Tensor,
     output_grads: Tensor,
