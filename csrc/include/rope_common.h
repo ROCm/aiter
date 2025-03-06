@@ -1707,8 +1707,8 @@ void dispatch_1c_sbhd_uncached(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
             RotateStyle,
-            stride_i_d,
             stride_o_d,
+            stride_i_d,
             kn_entry_1c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
                 p_output,
                 p_input,
@@ -1768,10 +1768,10 @@ void dispatch_2c_sbhd_uncached(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
             RotateStyle,
-            stride_ix_d,
-            stride_iy_d,
             stride_ox_d,
             stride_oy_d,
+            stride_ix_d,
+            stride_iy_d,
             kn_entry_2c_sbhd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
                 p_output_x,
                 p_output_y,
@@ -1825,8 +1825,8 @@ void dispatch_1c_sbhd_cached(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
             RotateStyle,
-            stride_i_d,
             stride_o_d,
+            stride_i_d,
             kn_entry_1c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
                 p_output,
                 p_input,
@@ -1887,10 +1887,10 @@ void dispatch_2c_sbhd_cached(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
             RotateStyle,
-            stride_ix_d,
-            stride_iy_d,
             stride_ox_d,
             stride_oy_d,
+            stride_ix_d,
+            stride_iy_d,
             kn_entry_2c_sbhd_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
                 p_output_x,
                 p_output_y,
@@ -1957,10 +1957,10 @@ void dispatch_2c_sbhd_cached_indirect(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
             RotateStyle,
-            stride_ix_d,
-            stride_iy_d,
             stride_ox_d,
             stride_oy_d,
+            stride_ix_d,
+            stride_iy_d,
             kn_entry_2c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
                 p_output_x,
                 p_output_y,
@@ -2030,10 +2030,10 @@ void dispatch_2c_sbhd_cached_indirect2(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_4_STRIDES(
             RotateStyle,
-            stride_ix_d,
-            stride_iy_d,
             stride_ox_d,
             stride_oy_d,
+            stride_ix_d,
+            stride_iy_d,
             kn_entry_2c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1, Stride2Eq1, Stride3Eq1><<<grid, block, 0, stream>>>(
                 p_output_x,
                 p_output_y,
@@ -2089,8 +2089,8 @@ void dispatch_1c_thd_uncached(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
             RotateStyle,
-            stride_i_d,
             stride_o_d,
+            stride_i_d,
             kn_entry_1c_thd_uncached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
                 p_output,
                 p_input,
@@ -2144,8 +2144,8 @@ void dispatch_1c_2d_cached(
     {
         LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
             RotateStyle,
-            stride_i_d,
             stride_o_d,
+            stride_i_d,
             kn_entry_1c_2d_cached<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
                 p_output,
                 p_input,
