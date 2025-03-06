@@ -23,7 +23,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     ck::index_t StrideD = 0;
     ck::index_t StrideE = N;
     ck::index_t KBatch = 1;
-
+    static_assert(NSwizzle==false, "disabled. need other prs to be ready.");
     // using AccDataType = F32;
     using CShuffleDataType = F32;
     using DsDataType = ck::Tuple<F32, F32>;

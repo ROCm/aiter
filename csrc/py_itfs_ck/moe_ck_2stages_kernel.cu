@@ -89,22 +89,22 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         using CDEElementOp = MulABScale;
         if (out.dtype() == at::ScalarType::Half)
         {
-            if (N % 8 == 0 && N > 8192)
-            {
-                CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, F16, CDEElementOp, MPerBlock, true);
-            }
-            else
+            // if (N % 8 == 0 && N > 8192)
+            // {
+            //     CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, F16, CDEElementOp, MPerBlock, true);
+            // }
+            // else
             {
                 CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, F16, CDEElementOp, MPerBlock, false);
             }
         }
         else if (out.dtype() == at::ScalarType::BFloat16)
         {
-            if (N % 8 == 0 && N > 8192)
-            {
-                CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, B16, CDEElementOp, MPerBlock, true);
-            }
-            else
+            // if (N % 8 == 0 && N > 8192)
+            // {
+            //     CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, B16, CDEElementOp, MPerBlock, true);
+            // }
+            // else
             {
                 CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, B16, CDEElementOp, MPerBlock, false);
             }

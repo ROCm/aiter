@@ -49,7 +49,6 @@ def perftest(num_iters=101, num_warmup=10, testGraph=False):
                              #      './aiter_logs/'),
                              ) as prof:
                 data = run_iters(num_iters, func, *args, **kwargs)
-            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
             avg = get_trace_perf(prof, num_iters)
             return data, avg
         return wrapper
