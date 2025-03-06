@@ -118,10 +118,11 @@ def fmoe_fp8_g1u1_a16(
     fc2_smooth_scale: Tensor,
 ): ...
 
+
 @compile_ops("module_moe_asm")
 def fmoe_fp8_blockscale_g1u1(
     out: Tensor,
-    input: Tensor,  
+    input: Tensor,
     gate: Tensor,
     down: Tensor,
     sorted_token_ids: Tensor,
@@ -136,6 +137,7 @@ def fmoe_fp8_blockscale_g1u1(
     fc_scale_blkk: Optional[Tensor] = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
 ): ...
+
 
 @compile_ops("module_moe")
 def ck_moe(
@@ -179,6 +181,7 @@ def ck_moe_stage2(
     sorted_weights: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
+    topk: int,
     w2_scale: Optional[Tensor] = None,
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32
