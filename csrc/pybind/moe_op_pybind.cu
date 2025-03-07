@@ -30,7 +30,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("out"), py::arg("input"),
             py::arg("gate"), py::arg("down"),
             py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),
-            py::arg("sorted_expert_ids"), py::arg("num_tokens_post_padded"),
+            py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),
             py::arg("topk"), py::arg("input_scale"),
             py::arg("fc1_scale"), py::arg("fc2_scale"),
             py::arg("fc2_smooth_scale") = std::nullopt);

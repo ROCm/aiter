@@ -14,6 +14,7 @@ from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json
+import multiprocessing
 from packaging.version import parse, Version
 
 PREBUILD_KERNELS = False
@@ -50,8 +51,12 @@ os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 bd_dir = f"{this_dir}/build"
+
 # copy ck to build, thus hippify under bd_dir
-shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
+if multiprocessing.current_process().name == 'MainProcess':
+    shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
+    if os.path.exists(f'{bd_dir}/ck/library'):
+        shutil.rmtree(f'{bd_dir}/ck/library')
 CK_DIR = f'{bd_dir}/ck'
 
 
@@ -167,7 +172,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         if hip_version > Version('6.2.41132'):
             flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
                           "-mllvm", "-amdgpu-function-calls=false"]
-        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        if hip_version > Version('6.2.41133'):
             flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         flags_cc += flags_extra_cc
@@ -224,7 +229,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
             md_name,
-            ''.join(traceback.format_exception(*sys.exc_info()))
+            '-->'.join(traceback.format_exception(*sys.exc_info()))
         ))
         sys.exit()
     logger.info(

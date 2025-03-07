@@ -36,7 +36,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     auto sorted_ids = torch::empty({max_num_tokens_padded}, torch::TensorOptions().dtype(torch::kInt32).device(device));
     auto sorted_weights = torch::empty({max_num_tokens_padded}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
     auto sorted_expert_ids = torch::empty({max_num_m_blocks}, torch::TensorOptions().dtype(torch::kInt32).device(device));
-    auto num_tokens_post_pad = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt32).device(device));
+    auto num_valid_ids = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt32).device(device));
     auto out = torch::empty({tokens, hidden_size}, torch::TensorOptions().dtype(hidden_states.dtype()).device(device));
 
     auto prec_i = torchDTypeToStr(hidden_states.dtype());
@@ -91,7 +91,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
         activation,
         gate_only,
         fused_quant,
-        expert_mask.has_value(), 
+        expert_mask.has_value(),
     };
 
     fused_moe_args args{hidden_states.data_ptr(),
@@ -101,7 +101,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr,
                         w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr,
                         a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr,
-                        expert_mask.has_value() ? expert_mask.value().data_ptr() : nullptr, 
+                        expert_mask.has_value() ? expert_mask.value().data_ptr() : nullptr,
                         out.data_ptr(),
                         ws_ptr,
 
@@ -110,7 +110,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         sorted_ids.data_ptr(),
                         sorted_weights.data_ptr(),
                         sorted_expert_ids.data_ptr(),
-                        num_tokens_post_pad.data_ptr(),
+                        num_valid_ids.data_ptr(),
 
                         block_size,
                         hidden_size,
