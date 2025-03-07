@@ -414,7 +414,7 @@ class fmha_bwd_v3_kernel
     public:
     fmha_bwd_v3_kernel(const char *name, const char *hsaco)
     {
-        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
+        HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + "fmha_v3_bwd/" + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
     }
 
