@@ -27,7 +27,7 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype,
     sorted_expert_ids = torch.empty((max_num_m_blocks, ),
                                     dtype=torch.int32,
                                     device=device)
-    num_valid_ids = torch.empty((1 + num_experts + 1),
+    num_valid_ids = torch.empty((1),
                                 dtype=torch.int32,
                                 device=device)
     moe_buf = torch.empty((M, model_dim),
