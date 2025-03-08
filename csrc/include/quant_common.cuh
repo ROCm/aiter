@@ -67,6 +67,13 @@ __device__ __forceinline__ FP8_TYPE scaled_fp8_conversion(float const val,
 #endif
 }
 
+__global__ void initializeScale(float* d_data, int size, float value) {  
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;  
+    if (idx < size) {  
+        d_data[idx] = value;  
+    }  
+}  
+
 // Compute the absolute maximum m of the input tensor and store
 // m / float8_e4m3::max() in *scale. Each thread block performs a
 // reduction tree and the memory in scale is atomically updated.

@@ -14,7 +14,7 @@ from aiter.ops.shuffle import shuffle_weight
 def test_aiter_perTensorQuantFp8(input, scale=None):
     out = torch.empty(input.shape, dtype=torch.float8_e4m3fnuz, device=input.device)
     if scale is None:
-        scale = torch.zeros(1, dtype=torch.float32, device=input.device)
+        scale = torch.empty(1, dtype=torch.float32, device=input.device)
         aiter.dynamic_scaled_fp8_quant(out, input, scale)
     else:
         aiter.static_scaled_fp8_quant(out, input, scale)

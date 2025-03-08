@@ -12,8 +12,7 @@ from aiter import logger
 BLOCK_SIZE_M = 32
 
 
-def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask=None):
-    block_size = BLOCK_SIZE_M
+def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, block_size=BLOCK_SIZE_M, expert_mask=None):
     device = topk_ids.device
     M, topk = topk_ids.shape
     topk = topk_ids.shape[1]
@@ -28,16 +27,16 @@ def moe_sorting_ck(topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype,
     sorted_expert_ids = torch.empty((max_num_m_blocks, ),
                                     dtype=torch.int32,
                                     device=device)
-    num_tokens_post_pad = torch.empty((1),
-                                      dtype=torch.int32,
-                                      device=device)
+    num_valid_ids = torch.empty((1),
+                                dtype=torch.int32,
+                                device=device)
     moe_buf = torch.empty((M, model_dim),
                           dtype=moebuf_dtype,
                           device=device)
 
     aiter.moe_sorting_fwd(topk_ids, topk_weights, sorted_ids, sorted_weights,  sorted_expert_ids,
-                          num_tokens_post_pad, moe_buf, num_experts, BLOCK_SIZE_M, expert_mask)
-    return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad, moe_buf
+                          num_valid_ids, moe_buf, num_experts, block_size, expert_mask)
+    return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
 def asm_moe(hidden_states,
@@ -60,18 +59,18 @@ def asm_moe(hidden_states,
     dtype = hidden_states.dtype
     device = topk_ids.device
     lastdim_mul = 8 if w1.dtype in {torch.int32, torch.uint32} else 1
-    sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_padded, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
-                                                                                                    model_dim, dtype, expert_mask)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
+                                                                                           model_dim, dtype, BLOCK_SIZE_M, expert_mask)
 
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
-                   sorted_weights, sorted_expert_ids, num_tokens_post_padded, topk)
+                   sorted_weights, sorted_expert_ids, num_valid_ids, topk)
     elif a16:
         # a16w8 smooth quant fmoe
         if w1.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1.shape[1]:
             aiter.fmoe_fp8_g1u1_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
-                                    sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                                    sorted_weights, sorted_expert_ids, num_valid_ids,
                                     topk,
                                     fc1_scale,
                                     fc2_scale,
@@ -79,7 +78,7 @@ def asm_moe(hidden_states,
                                     fc2_smooth_scale)
         elif w1.dtype == torch.int8 and inter_dim == w1.shape[1]:
             aiter.fmoe_int8_g1u0_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
-                                     sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                                     sorted_weights, sorted_expert_ids, num_valid_ids,
                                      topk,
                                      fc1_scale,
                                      fc2_scale,
@@ -137,15 +136,92 @@ def asm_moe(hidden_states,
         elif w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_g1u1
         else:
-            raise ValueError(f"Invalid MoE weight: {w1.shape=} {w2.shape=} {lastdim_mul}")
+            raise ValueError(
+                f"Invalid MoE weight: {w1.shape=} {w2.shape=} {lastdim_mul}")
 
         fmoe_func(moe_buf, a8, w1, w2, sorted_ids,
-                  sorted_weights, sorted_expert_ids, num_tokens_post_padded,
+                  sorted_weights, sorted_expert_ids, num_valid_ids,
                   topk,
                   a8_scale,
                   fc1_scale,
                   fc2_scale,
                   fc2_smooth_scale)
+    return moe_buf
+
+
+def get_block_size(token, topk, expert):
+    token_per_expert = token * topk / expert
+    support_list = [32, 64, 128]
+    for el in support_list:
+        if token_per_expert <= el * 4:
+            return el
+    return support_list[-1]
+
+
+# Only support fp8 per tensor quant
+def ck_moe_2stages(a1,
+                   w1,  # [expert(local_expert:EP), inter_dim(*2), dim] N,K
+                   w2,  # [expert(local_expert:EP), dim, inter_dim]
+                   topk_weight, topk_ids,
+                   # following for int8 quant
+                   fc1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
+                   fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
+                   a1_scale=None,  # [1]
+                   a2_scale=None,  # [1]
+                   block_size=None,
+                   expert_mask=None
+                   ):
+    E, model_dim, inter_dim = w2.shape
+    global_E = E
+    if expert_mask is not None:
+        global_E = expert_mask.numel()
+    M, topk = topk_ids.shape
+    dtype = a1.dtype
+    device = topk_ids.device
+    if block_size is None:
+        block_size = get_block_size(M, topk, E)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, global_E,
+                                                                                           model_dim, dtype, block_size, expert_mask)
+
+    # print("block_size:", block_size, sorted_expert_ids)
+    if w1.dtype == torch.float8_e4m3fnuz:
+        a1, a1_scale = aiter.per_tensor_quant_fp8_hip(a1, a1_scale)
+        # a1, a1_scale = aiter.per_tensor_quant(a1, quant_dtype=w1.dtype)
+    else:
+        a1_scale = None
+
+    a2 = torch.zeros(
+        (M, topk, w1.shape[1]),
+        dtype=dtype,
+        device=device,
+    )
+
+    aiter.ck_moe_stage1(a1, w1, w2,
+                        sorted_ids, sorted_expert_ids, num_valid_ids,
+                        a2, topk,
+                        fc1_scale, a1_scale, block_size)
+
+    # g1u0
+    if w2.shape[2] == w1.shape[1]:
+        a2 = F.gelu(a2)
+    # g1u1
+    else:
+        tmp = torch.empty((M, topk, inter_dim), dtype=dtype, device=device)
+        aiter.silu_and_mul(tmp, a2)
+        a2 = tmp
+    if w2.dtype == torch.float8_e4m3fnuz:
+        a2, a2_scale = aiter.per_tensor_quant_fp8_hip(a2, a2_scale)
+        # a2, a2_scale = aiter.per_tensor_quant(a2, quant_dtype=w2.dtype)
+    else:
+        if not hasattr(ck_moe_2stages, "one_float_tensor"):
+            ck_moe_2stages.one_float_tensor = torch.tensor(
+                1.0, dtype=torch.float, device=device)
+        a2_scale = ck_moe_2stages.one_float_tensor
+
+    aiter.ck_moe_stage2(a2, w1, w2, sorted_ids,
+                        sorted_expert_ids, sorted_weights,
+                        num_valid_ids, moe_buf, topk, fc2_scale, a2_scale, block_size)
+
     return moe_buf
 
 
@@ -190,7 +266,7 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
         w2D = w2.shape[-1]
         w1 = (w1.view(-1, D)*fc1_scale.view(-1, 1)).view(expert, -1, D)
         w2 = (w2.view(-1, w2D)*fc2_scale.view(-1, 1)).view(expert, -1, w2D)
-        
+
     if fc1_smooth_scale is not None:
         expert = fc1_smooth_scale.shape[0]
         fc1_smooth_scale = fc1_smooth_scale.view(expert, -1)
