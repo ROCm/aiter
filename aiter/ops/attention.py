@@ -71,6 +71,29 @@ def paged_attention_rocm(
     partition_size: int,
 ): ...
 
+@compile_ops("module_pa_ragged")
+def paged_attention_ragged(
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    max_num_partitions: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    kv_cache_layout: str,
+    logits_soft_cap: float,
+    k_scale: float,
+    v_scale: float,
+    fp8_out_scale: Optional[torch.Tensor],
+    partition_size: int,
+): ...
+
 
 MD_NAME = "module_mla_asm"
 
