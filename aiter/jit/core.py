@@ -103,13 +103,17 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = max_jobs
 
 
+def do_rename_and_mv(name, src, dst, ret):
+    os.makedirs(dst, exist_ok=True)
+    newName = name
+    if name.endswith(".cpp") or name.endswith(".cu"):
+        newName = name.replace(".cpp", ".cu")
+        ret.append(f'{dst}/{newName}')
+    shutil.copy(f'{src}/{name}', f'{dst}/{newName}')
+
+
 def rename_cpp_to_cu(els, dst, recurisve=False):
-    def do_rename_and_mv(name, src, dst, ret):
-        newName = name
-        if name.endswith(".cpp") or name.endswith(".cu"):
-            newName = name.replace(".cpp", ".cu")
-            ret.append(f'{dst}/{newName}')
-        shutil.copy(f'{src}/{name}', f'{dst}/{newName}')
+
     ret = []
     for el in els:
         if not os.path.exists(el):
@@ -218,9 +222,9 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         bd_include_dir = f'{op_dir}/build/include'
-        os.makedirs(bd_include_dir, exist_ok=True)
+        # os.makedirs(bd_include_dir, exist_ok=True)
         rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include"],
-                         bd_include_dir)
+                         bd_include_dir, recurisve=True)
         extra_include_paths = [
             f"{CK_DIR}/include",
             f"{CK_DIR}/library/include",
