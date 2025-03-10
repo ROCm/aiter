@@ -194,7 +194,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),
             py::arg("topk"), py::arg("input_scale"),
             py::arg("fc1_scale"), py::arg("fc2_scale"),
-            py::arg("fc2_smooth_scale") = std::nullopt);
+            py::arg("fc2_smooth_scale") = std::nullopt,
+            py::arg("activation") = "silu");
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);
       m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,
@@ -257,7 +258,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
             py::arg("topk_weights"), py::arg("topk_ids"),
             py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt,
             py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt,
-            py::arg("block_m") = 32, py::arg("expert_mask") = std::nullopt);
+            py::arg("block_m") = 32, py::arg("expert_mask") = std::nullopt,
+            py::arg("acitvation") = std::nullopt);
       m.def("rope_fwd_impl", &rope_fwd_impl);
       m.def("rope_bwd_impl", &rope_bwd_impl);
       m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);
