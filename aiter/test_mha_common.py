@@ -299,9 +299,9 @@ def attention_ref(
 ):
     """
     Arguments:
-        q: (batch_size, seqlen_q, nheads, head_dim)
-        k: (batch_size, seqlen_k, nheads_k, head_dim)
-        v: (batch_size, seqlen_k, nheads_k, head_dim)
+        q: (batch_size, seqlen_q, nheads, head_dim_q)
+        k: (batch_size, seqlen_k, nheads_k, head_dim_q)
+        v: (batch_size, seqlen_k, nheads_k, head_dim_v)
         query_padding_mask: (batch_size, seqlen_q)
         key_padding_mask: (batch_size, seqlen_k)
         attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
@@ -315,7 +315,7 @@ def attention_ref(
             without changing the math. This is to estimate the numerical error from operation
             reordering.
     Output:
-        output: (batch_size, seqlen_q, nheads, head_dim)
+        output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
     """
     if causal:

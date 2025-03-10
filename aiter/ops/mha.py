@@ -507,11 +507,13 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(3)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        head_size_q_og = q.size(3)
+        head_size_v_og = v.size(3)
+        if head_size_q_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+        if head_size_v_og % 8 != 0:
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
@@ -535,7 +537,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic = deterministic
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
-        out = out_padded[..., :head_size_og]
+        out = out_padded[..., :head_size_v_og]
 
         result = [out]
         if return_lse:
@@ -550,10 +552,10 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
-        head_size_og = dout.size(3)
+        head_size_v_og = dout.size(3)
         dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+        if head_size_v_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
         _flash_attn_backward(
             dout_padded,
             q,
@@ -575,9 +577,9 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.is_v3_atomic_fp32,
             ctx.how_v3_bf16_cvt
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
@@ -617,12 +619,12 @@ def flash_attn_func(
     [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
 
     Arguments:
-        q: (batch_size, seqlen, nheads, headdim)
-        k: (batch_size, seqlen, nheads_k, headdim)
-        v: (batch_size, seqlen, nheads_k, headdim)
+        q: (batch_size, seqlen, nheads, headdim_q)
+        k: (batch_size, seqlen, nheads_k, headdim_q)
+        v: (batch_size, seqlen, nheads_k, headdim_v)
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
+            Default to 1 / sqrt(headdim_q).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
@@ -634,7 +636,7 @@ def flash_attn_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
     Return:
-        out: (batch_size, seqlen, nheads, headdim).
+        out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
@@ -915,11 +917,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        head_size_q_og = q.size(2)
+        head_size_v_og = q.size(2)
+        if head_size_q_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+        if head_size_v_og % 8 != 0:
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
         out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k,
@@ -951,7 +955,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
 
-        out = out_padded[..., :head_size_og]
+        out = out_padded[..., :head_size_v_og]
 
         result = [out]
         if return_lse:
@@ -965,10 +969,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        head_size_og = dout.size(2)
+        head_size_v_og = dout.size(2)
         dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+        if head_size_v_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
         _flash_attn_varlen_backward(
             dout_padded,
             q,
@@ -992,9 +996,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : dout.shape[-1]]
-        dv = dv[..., : dout.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
@@ -1039,9 +1043,9 @@ def flash_attn_varlen_func(
     [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
 
     Arguments:
-        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        q: (total_q, nheads, headdim_q), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim_q), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim_v), where total_k = total number of key tokens in the batch.
         cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
         cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
@@ -1050,7 +1054,7 @@ def flash_attn_varlen_func(
         max_seqlen_k: int. Maximum key sequence length in the batch.
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
+            Default to 1 / sqrt(headdim_q).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
@@ -1062,7 +1066,7 @@ def flash_attn_varlen_func(
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
     Return:
-        out: (total, nheads, headdim).
+        out: (total, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
