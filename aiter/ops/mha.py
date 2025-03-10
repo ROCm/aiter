@@ -918,7 +918,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(2)
-        head_size_v_og = q.size(2)
+        head_size_v_og = v.size(2)
         if head_size_q_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
