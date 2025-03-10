@@ -16,6 +16,7 @@ from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
 from .ops.batched_gemm_op_a8w8 import *
+from .ops.batched_gemm_op_bf16 import *
 from .ops.aiter_operator import *
 from .ops.activation import *
 from .ops.attention import *
