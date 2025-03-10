@@ -1159,7 +1159,7 @@ void dispatch_first(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 #undef DISPATCH_SECOND
 #undef DISPATCH_FIRST
 
-template <typename Operation>
+template <typename Operation, bool Inplace = false>
 torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
 {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
@@ -1263,7 +1263,16 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     std::vector<int64_t> out_shape = broadcastShapes(input, other);
     auto device = input.device();
     auto options = torch::TensorOptions().dtype(out_dtype).device(input.device());
-    auto output = torch::empty(out_shape, options);
+
+    torch::Tensor output;
+    if constexpr(Inplace)
+    {
+      output = input;
+    }
+    else
+    {
+      output = torch::empty(out_shape, options);
+    }
 
     if (pattern == PATTERN_TRANSPOSE)
     {
@@ -1291,20 +1300,41 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
 
 torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other)
 {
-  return binary_operation<aiter::AddOp>(input, other);
+  return binary_operation<aiter::AddOp, false>(input, other);
 }
 
 torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  return binary_operation<aiter::SubOp>(input, other);
+  return binary_operation<aiter::SubOp, false>(input, other);
 }
 
 torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  return binary_operation<aiter::MulOp>(input, other);
+  return binary_operation<aiter::MulOp, false>(input, other);
 }
 
 torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
-  return binary_operation<aiter::DivOp>(input, other);
+  return binary_operation<aiter::DivOp, false>(input, other);
+}
+
+// inp interface
+torch::Tensor aiter_add_(torch::Tensor &input, torch::Tensor &other)
+{
+  return binary_operation<aiter::AddOp, true>(input, other);
+}
+
+torch::Tensor aiter_sub_(torch::Tensor &input, torch::Tensor &other)
+{
+  return binary_operation<aiter::SubOp, true>(input, other);
+}
+
+torch::Tensor aiter_mul_(torch::Tensor &input, torch::Tensor &other)
+{
+  return binary_operation<aiter::MulOp, true>(input, other);
+}
+
+torch::Tensor aiter_div_(torch::Tensor &input, torch::Tensor &other)
+{
+  return binary_operation<aiter::DivOp, true>(input, other);
 }
