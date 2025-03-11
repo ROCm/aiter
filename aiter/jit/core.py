@@ -27,6 +27,7 @@ PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:
@@ -204,6 +205,9 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
                 baton = FileBaton(os.path.join(blob_dir, 'lock'))
                 if baton.try_acquire():
                     try:
+                        if AITER_LOG_MORE:
+                            logger.info(
+                                f'exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}')
                         os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
                     finally:
                         baton.release()
@@ -237,7 +241,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             extra_ldflags=extra_ldflags,
             extra_include_paths=extra_include_paths,
             build_directory=opbd_dir,
-            verbose=verbose or int(os.getenv("AITER_LOG_MORE", 0)) > 0,
+            verbose=verbose or AITER_LOG_MORE > 0,
             with_cuda=True,
             is_python_module=True,
         )
@@ -355,7 +359,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
             op = getattr(module, loadName)
 
-            if int(os.getenv("AITER_LOG_MORE", 0)) == 2:
+            if AITER_LOG_MORE == 2:
                 from ..test_common import log_args
                 log_args(func, *args, **kwargs)
 
