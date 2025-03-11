@@ -6,6 +6,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <memory>
+#include <cstdlib>
 
 
 template<typename T>
@@ -110,8 +111,13 @@ static std::unordered_map<std::string, std::unique_ptr<SharedLibrary>> libs;
 
 template<typename... Args>
 __inline__ void run_lib(std::string folder,Args... args) {
-    static auto build_dir = std::filesystem::absolute(std::filesystem::current_path().parent_path()/"build");
-    std::string lib_path = (build_dir/folder/"lib.so").string();
+    char* AITER_ROOT_DIR = std::getenv("AITER_ROOT_DIR");
+    if (!AITER_ROOT_DIR){
+        AITER_ROOT_DIR = "~/.aiter";
+    }
+    std::filesystem::path aiter_root_dir(AITER_ROOT_DIR);
+    // auto build_dir = aiter_root_dir/"build";
+    std::string lib_path = (aiter_root_dir/"build"/folder/"lib.so").string();
     if (libs.find(folder) == libs.end()) {
         libs[folder] = std::make_unique<SharedLibrary>(lib_path);
     }

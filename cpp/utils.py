@@ -7,32 +7,10 @@ import importlib
 from packaging.version import parse, Version
 import psutil
 from collections import OrderedDict
-# AITER_CACHE_DIR=os.environ.get("AITER_CACHE_DIR", "./")
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
-
-AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../")
-
-find_aiter = importlib.util.find_spec("aiter")
-if find_aiter is not None:
-    if find_aiter.submodule_search_locations:
-        package_path = find_aiter.submodule_search_locations[0]
-    elif find_aiter.origin:
-        package_path = find_aiter.origin
-    package_path = os.path.dirname(package_path)
-    import site
-    site_packages_dirs = site.getsitepackages()
-    ### develop mode
-    if package_path not in site_packages_dirs:
-        AITER_ROOT_DIR = AITER_CORE_DIR
-    ### install mode
-    else:
-        AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
-else:
-    print("aiter is not installed.")
-
+AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", "~/.aiter")
 BUILD_DIR=os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
-
+os.makedirs(BUILD_DIR, exist_ok=True)
 
 libs = {}
 
@@ -85,7 +63,7 @@ clean:
 def compile_lib(src_file, folder, includes=[], sources=[], cxxflags=[]):
     init_build_dir(os.path.join(BUILD_DIR, folder))
     os.makedirs(f"{BUILD_DIR}/include", exist_ok=True)
-    includes += [f"{AITER_ROOT_DIR}/csrc/include"]
+    # includes += [f"{AITER_ROOT_DIR}/csrc/include"]
     for include in includes:
         # if not os.path.exists(include):
         if os.path.isdir(include):

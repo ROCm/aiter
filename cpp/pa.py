@@ -2,6 +2,7 @@ from jinja2 import Template
 from utils import compile_template_op
 import ctypes
 
+MD_NAME = "pa_ragged"
 
 src_template = Template("""
 #include "pa.cuh"
@@ -159,7 +160,7 @@ void call(void* out_ptr,
 
 
 def compile(num_kv_heads, num_seqs, num_heads, head_size, max_num_partitions, dtype, kv_dtype, fp8_kv_dtype, out_dtype, block_size, alibi_enabled, enable_last_page_lens):
-    return compile_template_op(src_template, "pa_ragged", ["utils.h", "pa.cuh"], [], num_kv_heads=num_kv_heads, num_seqs=num_seqs, num_heads=num_heads, head_size=head_size, max_num_partitions=max_num_partitions, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled, enable_last_page_lens=enable_last_page_lens)
+    return compile_template_op(src_template, MD_NAME, ["utils.h", "pa.cuh", "../csrc/include"], [], num_kv_heads=num_kv_heads, num_seqs=num_seqs, num_heads=num_heads, head_size=head_size, max_num_partitions=max_num_partitions, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled, enable_last_page_lens=enable_last_page_lens)
 
 
 def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]

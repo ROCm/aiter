@@ -2,6 +2,7 @@
 #include <fmt/core.h>
 #include "pa.h"
 
+#define MD_NAME "pa_ragged"
 
 void paged_attention_ragged(
     torch::Tensor& out, // [num_seqs, num_heads, head_size]
@@ -108,7 +109,8 @@ void paged_attention_ragged(
         fp8_out_scale ? fp8_out_scale.value().data_ptr<float>() : nullptr;
     void* out_ptr = out.data_ptr();
     const float* alibi_slopes_ptr = alibi_slopes ? alibi_slopes.value().data_ptr<float>() : nullptr;
-    std::string folder = fmt::format("pa_ragged_{num_kv_heads}_{num_seqs}_{num_heads}_{head_size}_{max_num_partitions}_{dtype}_{kv_dtype}_{fp8_kv_dtype}_{out_dtype}_{block_size}_{alibi_enabled}_{enable_last_page_lens}",
+    std::string folder = fmt::format("{md_name}_{num_kv_heads}_{num_seqs}_{num_heads}_{head_size}_{max_num_partitions}_{dtype}_{kv_dtype}_{fp8_kv_dtype}_{out_dtype}_{block_size}_{alibi_enabled}_{enable_last_page_lens}",
+                fmt::arg("md_name", MD_NAME),
                 fmt::arg("num_kv_heads", num_kv_heads),
                 fmt::arg("num_seqs", num_seqs),
                 fmt::arg("num_heads", num_heads),
