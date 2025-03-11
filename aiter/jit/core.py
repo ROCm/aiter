@@ -51,6 +51,7 @@ os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 
+
 @functools.lru_cache(maxsize=None)
 def get_user_jit_dir():
     if 'JIT_WORKSPACE_DIR' in os.environ:
@@ -60,10 +61,11 @@ def get_user_jit_dir():
     else:
         if os.access(this_dir, os.W_OK):
             return this_dir
-    home_jit_dir = os.path.expanduser('~') + '/.aiter/' + os.path.basename(this_dir)
+    home_jit_dir = f"{os.path.expanduser('~')}/.aiter/{os.path.basename(this_dir)}"
     if not os.path.exists(home_jit_dir):
         shutil.copytree(this_dir, home_jit_dir)
     return home_jit_dir
+
 
 bd_dir = f'{get_user_jit_dir()}/build'
 # copy ck to build, thus hippify under bd_dir
@@ -352,19 +354,10 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
             op = getattr(module, loadName)
+
             if int(os.getenv("AITER_LOG_MORE", 0)) == 2:
-                import inspect
-                callargs = inspect.getcallargs(func, *args, **kwargs)
-
-                def getTensorInfo(el):
-                    if isinstance(el, torch.Tensor):
-                        return f'{el.shape} {el.dtype} {hex(el.data_ptr())}'
-                    return el
-
-                callargs = [
-                    f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
-                logger.info(
-                    f"    calling {md_name}::{loadName}({', '.join(callargs)})")
+                from ..test_common import log_args
+                log_args(func, *args, **kwargs)
 
             return op(*args, **kwargs)
         return wrapper

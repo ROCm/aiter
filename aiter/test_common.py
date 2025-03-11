@@ -81,12 +81,18 @@ def log_args(func, *args, **kwargs):
     import inspect
     callargs = inspect.getcallargs(func, *args, **kwargs)
 
-    def getTensorInfo(el):
-        if isinstance(el, torch.Tensor):
-            return f'{el.shape} {el.dtype}'
-        return el
     prefix = f"calling {func.__name__}("
     blanks = ' '*len(prefix)
+
+    def getTensorInfo(el):
+        if isinstance(el, torch.Tensor):
+            return f'{el.shape} {el.dtype} {hex(el.data_ptr())}'
+        elif isinstance(el, tuple):
+            viewNum = 5
+            if len(el) > viewNum:
+                el = list(el[:viewNum])+['...']
+            return f'\n{" "*(len(prefix)+31)}'.join(['(']+[f" {getTensorInfo(e)}" for e in el]+[')'])
+        return el
     callargs = [f"{el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
     callargs = f',\n{blanks}'.join(callargs)
     logger.info(f"\n{prefix}{callargs})")
@@ -133,6 +139,7 @@ def get_trace_perf(prof, num_iters):
     for el in timerList:
         df.at[avg_name, el] = df[el].sum()/num_iters
     if int(os.environ.get('AITER_LOG_MORE', 0)):
+        pd.set_option('display.max_colwidth', 180)
         logger.info(f'{df}')
     return df.at[avg_name, 'device_time_total']
 
