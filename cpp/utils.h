@@ -113,7 +113,7 @@ template<typename... Args>
 __inline__ void run_lib(std::string folder,Args... args) {
     char* AITER_ROOT_DIR = std::getenv("AITER_ROOT_DIR");
     if (!AITER_ROOT_DIR){
-        AITER_ROOT_DIR = "~/.aiter";
+        AITER_ROOT_DIR = std::getenv("HOME") + "/.aiter";
     }
     std::filesystem::path aiter_root_dir(AITER_ROOT_DIR);
     // auto build_dir = aiter_root_dir/"build";

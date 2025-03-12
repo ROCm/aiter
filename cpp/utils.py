@@ -8,7 +8,8 @@ from packaging.version import parse, Version
 import psutil
 from collections import OrderedDict
 
-AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", "~/.aiter")
+HOME_PATH = os.environ.get('HOME')
+AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR=os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 os.makedirs(BUILD_DIR, exist_ok=True)
 
