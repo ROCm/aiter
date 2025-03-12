@@ -21,8 +21,7 @@ import functools
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
-from aiter import rocb_create_extension, rocb_mm
+import aiter
 from aiter import logger
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +54,7 @@ class TunedGemm:
             self.bestsols = pd.read_csv(self.tune_path)
             if len(self.bestsols) > 0 and 'kernelName' in self.bestsols.columns:
                 hipblasltKernelNames = self.bestsols.apply(
-                    lambda s: getHipblasltKernelName(s.solidx) if s.libtype == 'hipblaslt' else "", axis=1)
+                    lambda s: aiter.getHipblasltKernelName(s.solidx) if s.libtype == 'hipblaslt' else "", axis=1)
                 pd.set_option('display.max_colwidth', 100)
                 assert hipblasltKernelNames.equals(
                     self.bestsols['kernelName'].fillna('')), "error: gradlib tune gemm not match the current environment, need re-tune!!!\n" + \
@@ -115,11 +114,11 @@ class TunedGemm:
     def apply_hipb_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         if otype is None:
             otype = inp.dtype
-        return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
+        return aiter.hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
     def apply_rocb_mm(self, inp, weights, solidx, bias=None, otype=None, scale_a=None, scale_b=None, scale_c=None):
         assert scale_a != None and scale_b != None and scale_c != None, "scale_a, scale_b, scale_c must be None for rocblas"
-        out = rocb_mm(inp, weights.t(), solidx)
+        out = aiter.rocb_mm(inp, weights.t(), solidx)
         if bias is not None:
             out = out + bias
         return out
@@ -163,8 +162,8 @@ class TunedGemm:
         # uses this for linear units. However, sampler
         # will use torch.matmul with 2 dimensions only
         if self.extensions_created == False:
-            rocb_create_extension()
-            hipb_create_extension()
+            aiter.rocb_create_extension()
+            aiter.hipb_create_extension()
             self.extensions_created = True
             self.load_best_sols()
             self.create_ds()

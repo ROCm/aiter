@@ -8,7 +8,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -21,7 +20,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -36,7 +34,6 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -49,7 +46,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -64,7 +60,6 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -77,7 +72,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -92,7 +86,6 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -106,7 +99,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -120,7 +112,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -134,7 +125,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv'"
     },
@@ -148,7 +138,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
     },
@@ -162,7 +151,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
     },
@@ -175,7 +163,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -191,7 +178,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -207,7 +193,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/15_fused_moe'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -222,7 +207,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -238,7 +222,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -254,7 +237,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/02_layernorm2d'"
         ],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
@@ -267,7 +249,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -283,7 +264,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
@@ -301,7 +281,6 @@
             "f'{CK_DIR}/example/ck_tile/12_smoothquant'",
             "f'{CK_DIR}/example/ck_tile/14_moe_smoothquant'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -315,7 +294,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune'"
     },
@@ -329,7 +307,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune'"
     },
@@ -343,7 +320,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune'"
     },
@@ -358,7 +334,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -373,7 +348,6 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -386,7 +360,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "True",
         "blob_gen_cmd": "''"
     },
@@ -404,7 +377,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 100 --output_dir {{}}'"
     },
@@ -422,7 +394,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 200 --output_dir {{}}'",
@@ -443,7 +414,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 300 --output_dir {{}}'"
     },
@@ -461,7 +431,6 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
-        "isASM": "True",
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 300 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'"
     },
@@ -479,8 +448,52 @@
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --output_dir {{}}'"
+    },
+    "rocsolidxgemm": {
+        "srcs": [
+            "f'{AITER_GRADLIB_DIR}/csrc/rocsolgemm.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-O3'",
+            "'-DLEGACY_HIPBLAS_DIRECT=ON'"
+        ],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-U__CUDA_NO_HALF_OPERATORS__'",
+            "'-U__CUDA_NO_HALF_CONVERSIONS__'",
+            "'-ftemplate-depth=1024'",
+            "'-DLEGACY_HIPBLAS_DIRECT=ON'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_GRADLIB_DIR}/include/'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
+    "hipbsolidxgemm": {
+        "srcs": [
+            "f'{AITER_GRADLIB_DIR}/csrc/hipbsolgemm.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-O3'",
+            "'-DLEGACY_HIPBLAS_DIRECT=ON'"
+        ],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-U__CUDA_NO_HALF_OPERATORS__'",
+            "'-U__CUDA_NO_HALF_CONVERSIONS__'",
+            "'-ftemplate-depth=1024'",
+            "'-DLEGACY_HIPBLAS_DIRECT=ON'",
+            "'-DENABLE_TORCH_FP8' if hasattr(torch, 'float8_e4m3fnuz') else '' "
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_GRADLIB_DIR}/include/'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
