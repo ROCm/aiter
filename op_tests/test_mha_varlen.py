@@ -175,6 +175,7 @@ def test_mha_varlen_fwd(
     seqlen_q,
     seqlen_k,
     d,
+    d_v,
     dropout_p,
     causal,
     local,
@@ -193,7 +194,7 @@ def test_mha_varlen_fwd(
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype, requires_grad=True)
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, "cuda", mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="random")
 
@@ -202,7 +203,7 @@ def test_mha_varlen_fwd(
     else:
         alibi_slopes = None
 
-    dout = torch.randn_like(q)
+    dout = torch.randn_like(v)
 
     out, dropout_mask, dq, dk, dv = run_ck(
         q, k, v, query_padding_mask, key_padding_mask, alibi_slopes,
@@ -243,7 +244,8 @@ if __name__ == '__main__':
     batch_size = 1
     nheads = 1
     (seqlen_q, seqlen_k) = (4, 4)
-    d = 64
+    d = 192
+    d_v = 128
     dropout_p = 0.5
     causal = False
     local = False
@@ -258,6 +260,7 @@ if __name__ == '__main__':
         seqlen_q,
         seqlen_k,
         d,
+        d_v,
         dropout_p,
         causal,
         local,
