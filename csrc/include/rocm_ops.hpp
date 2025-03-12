@@ -1,39 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "activation.h"
-#include "attention.h"
-#include "attention_ragged.h"
-#include "attention_ck.h"
-#include "attention_asm.h"
-#include "attention_asm_mla.h"
-#include "cache.h"
-#include "custom_all_reduce.h"
-#include "communication_asm.h"
-#include "gemm_a8w8_blockscale.h"
-#include "custom.h"
-#include "moe_op.h"
-#include "moe_sorting.h"
-#include "norm.h"
-#include "pos_encoding.h"
-#include "rmsnorm.h"
-#include "smoothquant.h"
-#include "aiter_operator.h"
-#include "asm_gemm_a8w8.h"
-#include <torch/extension.h>
-#include "gemm_a8w8.h"
-#include "batched_gemm_a8w8.h"
-#include "quant.h"
-#include "moe_ck.h"
-#include "rope.h"
-#include "rocsolgemm.cuh"
-#include "hipbsolgemm.cuh"
-
-// #include "mha_varlen_fwd.h"
-// #include "mha_varlen_bwd.h"
-// #include "mha_bwd.h"
-// #include "mha_fwd.h"
-
 #define ACTIVATION_PYBIND                                                          \
       m.def("silu_and_mul", &silu_and_mul, "Activation function used in SwiGLU."); \
       m.def("gelu_and_mul", &gelu_and_mul, "Activation function used in GELU.");   \
