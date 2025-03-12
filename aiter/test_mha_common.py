@@ -145,15 +145,16 @@ def generate_qkv(
     Arguments:
         q: (batch_size, seqlen_q, nheads, d)
         k: (batch_size, seqlen_k, nheads_k, d)
-        v: (batch_size, seqlen_k, nheads_k, d)
+        v: (batch_size, seqlen_k, nheads_k, d_v)
         query_padding_mask: (batch_size, seqlen), bool
         key_padding_mask: (batch_size, seqlen), bool
     """
     assert not (kvpacked and qkvpacked)
     batch_size, seqlen_q, nheads, d = q.shape
     _, seqlen_k, nheads_k, _ = k.shape
+    _, _, _, d_v = v.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)
-    assert v.shape == (batch_size, seqlen_k, nheads_k, d)
+    assert v.shape == (batch_size, seqlen_k, nheads_k, d_v)
 
     if query_padding_mask is not None:
         q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q, query_padding_mask)
@@ -184,6 +185,7 @@ def generate_qkv(
     if qkvpacked:
         assert (query_padding_mask == key_padding_mask).all()
         assert nheads == nheads_k
+        assert d == d_v
         qkv_unpad = torch.stack([q_unpad, k_unpad, v_unpad], dim=1)
         qkv = torch.stack([q, k, v], dim=2)
         if query_padding_mask is not None:
@@ -201,6 +203,7 @@ def generate_qkv(
             dqkv_pad_fn,
         )
     elif kvpacked:
+        assert d == d_v
         kv_unpad = torch.stack([k_unpad, v_unpad], dim=1)
         kv = torch.stack([k, v], dim=2)
         dq_pad_fn = output_pad_fn
@@ -299,9 +302,9 @@ def attention_ref(
 ):
     """
     Arguments:
-        q: (batch_size, seqlen_q, nheads, head_dim)
-        k: (batch_size, seqlen_k, nheads_k, head_dim)
-        v: (batch_size, seqlen_k, nheads_k, head_dim)
+        q: (batch_size, seqlen_q, nheads, head_dim_q)
+        k: (batch_size, seqlen_k, nheads_k, head_dim_q)
+        v: (batch_size, seqlen_k, nheads_k, head_dim_v)
         query_padding_mask: (batch_size, seqlen_q)
         key_padding_mask: (batch_size, seqlen_k)
         attn_bias: broadcastable to (batch_size, nheads, seqlen_q, seqlen_k)
@@ -315,7 +318,7 @@ def attention_ref(
             without changing the math. This is to estimate the numerical error from operation
             reordering.
     Output:
-        output: (batch_size, seqlen_q, nheads, head_dim)
+        output: (batch_size, seqlen_q, nheads, head_dim_v)
         attention: (batch_size, nheads, seqlen_q, seqlen_k), softmax after dropout
     """
     if causal:

@@ -11,13 +11,14 @@
 
 fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
                                               std::string dtype,
-                                              int head_size,
+                                              int head_size_q,
+                                              int head_size_v,
                                               bool has_dropout,
                                               bool has_lse,
                                               bool enable_alibi)
 {
-    return fmha_fwd_traits{head_size,
-                           head_size,
+    return fmha_fwd_traits{head_size_q,
+                           head_size_v,
                            dtype,
                            true, // is_group_mode
                            true, // is_v_rowmajor
@@ -30,12 +31,13 @@ fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
 
 fmha_fwd_splitkv_traits get_ck_fmha_varlen_fwd_splitkv_traits(const mask_info &mask,
                                                               std::string dtype,
-                                                              int head_size,
+                                                              int head_size_q,
+                                                              int head_size_v,
                                                               bool has_lse,
                                                               bool enable_alibi)
 {
-    return fmha_fwd_splitkv_traits{head_size,
-                                   head_size,
+    return fmha_fwd_splitkv_traits{head_size_q,
+                                   head_size_v,
                                    dtype,
                                    true, // is_group_mode
                                    true, // is_v_rowmajor
@@ -54,6 +56,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           const int h,
                                           const int h_k,
                                           const int d,
+                                          const int d_v,
                                           // device pointers
                                           const at::Tensor q,
                                           const at::Tensor k,
@@ -70,8 +73,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
 {
     // q: (total_q, nheads, d)
     // k: (total_k, nheads_k, d)
-    // v: (total_k, nheads_k, d)
-    // o: (total_q, nheads, d)
+    // v: (total_k, nheads_k, d_v)
+    // o: (total_q, nheads, d_v)
 
     // alibi_slopes:(batch, nheads) or (nhead)
     // lse: (nheads, total_q)
@@ -127,7 +130,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          b,
                          max_seqlen_q,
                          d,             // hdim_q
-                         d,             // hdim_v
+                         d_v,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
@@ -168,6 +171,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
                                                           const int h,
                                                           const int h_k,
                                                           const int d,
+                                                          const int d_v,
                                                           const int page_block_size,
                                                           const int num_splits,
                                                           float softmax_scale,
@@ -186,13 +190,13 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
 {
     // q: (total_q, nheads, d)
     // k: (num_blocks, page_block_size, num_heads_k, d)
-    // v: (num_blocks, page_block_size, num_heads_k, d)
-    // o: (total_q, nheads, d)
+    // v: (num_blocks, page_block_size, num_heads_k, d_v)
+    // o: (total_q, nheads, d_v)
 
     // alibi_slopes:(batch_size, nheads) or (nhead)
     // lse: (nheads, total_q)
     // lse_acc: (nheads, split, total_q)
-    // o_acc: (nheads, split, total_q, d)
+    // o_acc: (nheads, split, total_q, d_v)
     // block_table: (batch_size, max_num_blocks_per_seq)
 
     fmha_fwd_splitkv_args args;
@@ -229,7 +233,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.batch = b;
     args.max_seqlen_q = max_seqlen_q;
     args.hdim_q = d;
-    args.hdim_v = d;
+    args.hdim_v = d_v;
     args.nhead_q = h;
     args.nhead_k = h_k;
     args.num_splits = num_splits;
@@ -348,7 +352,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
 
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
-    const int head_size = sizes[2];
+    const int head_size_q = sizes[2];
+    const int head_size_v = v.size(2);
     const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
@@ -366,8 +371,10 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     const int total_q = q.size(0);
 
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
-    TORCH_CHECK(head_size <= 256, "CK only supports head dimension at most 256");
-    TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
+    TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
+    TORCH_CHECK(head_size_v <= 256, "CK only supports head dimension at most 256");
+    TORCH_CHECK(head_size_q % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
+    TORCH_CHECK(head_size_v % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
@@ -390,35 +397,36 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
     }
 
-    CHECK_SHAPE(q, total_q, num_heads, head_size);
+    CHECK_SHAPE(q, total_q, num_heads, head_size_q);
     if (!paged_KV) {
         const int total_k = k.size(0);
-        CHECK_SHAPE(k, total_k, num_heads_k, head_size);
-        CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+        CHECK_SHAPE(k, total_k, num_heads_k, head_size_q);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
     } else {
-        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
-        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
+        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_q);
+        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_v);
         CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+    auto opts = q.options();
+
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, total_q, num_heads, head_size);
+        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else {
-        out = torch::empty_like(q);
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
 
-    auto opts = q.options();
     bool has_lse = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
     if (has_dropout)
@@ -449,12 +457,12 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     int num_splits = 0;
-    num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size, 0, num_splits);
+    num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
     TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
     TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
 
     auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
-    auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size}, opts.dtype(at::kFloat));
+    auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
 
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
@@ -480,7 +488,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 get_ck_fmha_varlen_fwd_splitkv_traits(
                     mask,
                     q_dtype_str,
-                    head_size,
+                    head_size_q,
+                    head_size_v,
                     has_lse,
                     alibi_slopes_.has_value());
 
@@ -492,7 +501,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     max_seqlen_q,
                     num_heads,
                     num_heads_k,
-                    head_size,
+                    head_size_q,
+                    head_size_v,
                     page_block_size,
                     num_splits,
                     softmax_scale,
@@ -519,7 +529,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 get_ck_fmha_varlen_fwd_traits(
                     mask,
                     q_dtype_str,
-                    head_size,
+                    head_size_q,
+                    head_size_v,
                     has_dropout,
                     has_lse,
                     alibi_slopes_.has_value());
@@ -533,7 +544,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     max_seqlen_q,
                     num_heads,
                     num_heads_k,
-                    head_size,
+                    head_size_q,
+                    head_size_v,
                     q,
                     k,
                     v,
