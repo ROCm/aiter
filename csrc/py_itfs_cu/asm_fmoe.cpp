@@ -368,46 +368,65 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                                                fc2_smooth_scale);
 }
 
-void fmoe_g1u1(torch::Tensor &out,                                          // [token_cnt, dim]
-               torch::Tensor &input,                                        // [token_cnt, dim] M,K
-               torch::Tensor &gate,                                         // [expert, inter_dim*2, dim] N,K
-               torch::Tensor &down,                                         // [expert, dim, inter_dim]
-               torch::Tensor &sorted_token_ids,                             // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,                            // [max_num_tokens_padded]
-               torch::Tensor &sorted_expert_ids,                            // [max_num_m_blocks]
-               torch::Tensor &num_valid_ids,                                // [1]
-               uint32_t topk,                                               //
-               torch::Tensor &input_scale,                                  // [token_cnt, 1]
-               torch::Tensor &fc1_scale,                                    // [expert, 1, inter_dim]
-               torch::Tensor &fc2_scale,                                    // [expert, 1, dim]
-               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt // [expert, 1, inter_dim]
-)
+void fmoe_g1u1(torch::Tensor &out,                                           // [token_cnt, dim]
+               torch::Tensor &input,                                         // [token_cnt, dim] M,K
+               torch::Tensor &gate,                                          // [expert, inter_dim*2, dim] N,K
+               torch::Tensor &down,                                          // [expert, dim, inter_dim]
+               torch::Tensor &sorted_token_ids,                              // [max_num_tokens_padded]
+               torch::Tensor &sorted_weight_buf,                             // [max_num_tokens_padded]
+               torch::Tensor &sorted_expert_ids,                             // [max_num_m_blocks]
+               torch::Tensor &num_valid_ids,                                 // [1]
+               uint32_t topk,                                                //
+               torch::Tensor &input_scale,                                   // [token_cnt, 1]
+               torch::Tensor &fc1_scale,                                     // [expert, 1, inter_dim]
+               torch::Tensor &fc2_scale,                                     // [expert, 1, dim]
+               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt, // [expert, 1, inter_dim]
+               std::optional<std::string> activation = "silu")
 {
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
     if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
-        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
-        if (selectedTile == 512)
+        // int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128});
+        // fixme: not using heuristic_tile but this hack, todo coderfeli
+        if (activation.has_value() && activation.value() == "silu")
         {
-            static FMoeKernel impl_int4_512("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
-            impl_ptr = &impl_int4_512;
-        }
-        else if (selectedTile == 256)
-        {
-            static FMoeKernel impl_int4_256("fmoe_int4fp8_g1u1_subGU_256_gelu", "fmoe_int4fp8_g1u1_subGU_256_gelu.co", 256);
-            impl_ptr = &impl_int4_256;
-        }
-        else if (selectedTile == 128)
-        {
-            static FMoeKernel impl_int4_128("fmoe_int4fp8_g1u1_subGU_128_gelu", "fmoe_int4fp8_g1u1_subGU_128_gelu.co", 128);
-            impl_ptr = &impl_int4_128;
+            if (sub_X_cnt >= 16)
+            {
+                static FMoeKernel impl_int4_512_silu("fmoe_int4fp8_g1u1_subGU_512_silu", "fmoe_int4fp8_g1u1_subGU_512_silu.co", 512);
+                impl_ptr = &impl_int4_512_silu;
+            }
+            else if (sub_X_cnt >= 8)
+            {
+                static FMoeKernel impl_int4_256_silu("fmoe_int4fp8_g1u1_subGU_256_silu", "fmoe_int4fp8_g1u1_subGU_256_silu.co", 256);
+                impl_ptr = &impl_int4_256_silu;
+            }
+            else
+            {
+                static FMoeKernel impl_int4_128_silu("fmoe_int4fp8_g1u1_subGU_128_silu", "fmoe_int4fp8_g1u1_subGU_128_silu.co", 128);
+                impl_ptr = &impl_int4_128_silu;
+            }
         }
         else
         {
-            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 256, or 512");
+            if (sub_X_cnt >= 16)
+            {
+                static FMoeKernel impl_int4_512_gelu("fmoe_int4fp8_g1u1_subGU_512_gelu", "fmoe_int4fp8_g1u1_subGU_512_gelu.co", 512);
+                impl_ptr = &impl_int4_512_gelu;
+            }
+            else if (sub_X_cnt >= 8)
+            {
+                static FMoeKernel impl_int4_256_gelu("fmoe_int4fp8_g1u1_subGU_256_gelu", "fmoe_int4fp8_g1u1_subGU_256_gelu.co", 256);
+                impl_ptr = &impl_int4_256_gelu;
+            }
+            else
+            {
+                static FMoeKernel impl_int4_128_gelu("fmoe_int4fp8_g1u1_subGU_128_gelu", "fmoe_int4fp8_g1u1_subGU_128_gelu.co", 128);
+                impl_ptr = &impl_int4_128_gelu;
+            }
         }
+
         impl_ptr->set_int4(true);
     }
     else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
