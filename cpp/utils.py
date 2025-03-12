@@ -3,10 +3,9 @@ import os
 import subprocess
 from jinja2 import Template
 import ctypes
-import importlib
 from packaging.version import parse, Version
-import psutil
 from collections import OrderedDict
+
 
 HOME_PATH = os.environ.get('HOME')
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
@@ -14,19 +13,6 @@ BUILD_DIR=os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 os.makedirs(BUILD_DIR, exist_ok=True)
 
 libs = {}
-
-
-def get_max_jobs():
-    max_num_jobs_cores = int(max(1, os.cpu_count()*0.8))
-    # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / \
-        (1024 ** 3)  # free memory in GB
-    # each JOB peak memory cost is ~8-9GB when threads = 4
-    max_num_jobs_memory = int(free_memory_gb / 9)
-
-    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-    max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
-    return max_jobs
 
 
 def get_hip_version():
@@ -88,11 +74,7 @@ def compile_lib(src_file, folder, includes=[], sources=[], cxxflags=[]):
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm", "-enable-post-misched=0",
-            "-mllvm", "-amdgpu-early-inline-all=true",
-            "-mllvm", "-amdgpu-function-calls=false",
             "-mllvm", "--amdgpu-kernarg-preload-count=16",
-            "-mllvm", "-amdgpu-coerce-illegal-types=1",
             # "-v", "--save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -117,7 +99,7 @@ def compile_lib(src_file, folder, includes=[], sources=[], cxxflags=[]):
     makefile_file = makefile_template.render(includes=[f"-I{BUILD_DIR}/include"], sources=sources, cxxflags=cxxflags)
     with open(f"{BUILD_DIR}/{folder}/Makefile", "w") as f:
         f.write(makefile_file)
-    subprocess.run(f"cd {BUILD_DIR}/{folder} && make build -j{get_max_jobs()}", shell=True, check=True)
+    subprocess.run(f"cd {BUILD_DIR}/{folder} && make build -j8", shell=True, check=True)
 
 def run_lib(folder, *args):
     if folder in libs:
