@@ -14,6 +14,14 @@ os.makedirs(BUILD_DIR, exist_ok=True)
 
 libs = {}
 
+makefile_template = Template("""
+build:
+	hipcc -DUSE_ROCM -DENABLE_FP8 -fPIC -shared {{cxxflags | join(" ")}} {{includes | join(" ")}} {{sources | join(" ")}} -o lib.so
+
+clean:
+	rm -rf lib.so test
+""")
+
 
 def get_hip_version():
     version = subprocess.run(f"/opt/rocm/bin/hipconfig --version", shell=True, capture_output=True, text=True)
@@ -39,15 +47,14 @@ def init_build_dir(dir):
     else:
         subprocess.run(f"rm -rf {dir}/*", shell=True)
 
-makefile_template = Template("""
-build:
-	hipcc -DUSE_ROCM -DENABLE_FP8 -fPIC -shared {{cxxflags | join(" ")}} {{includes | join(" ")}} {{sources | join(" ")}} -o lib.so
 
-clean:
-	rm -rf lib.so test
-""")
-
-def compile_lib(src_file, folder, includes=[], sources=[], cxxflags=[]):
+def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
+    if includes is None:
+        includes = []
+    if sources is None:
+        sources = []
+    if cxxflags is None:
+        cxxflags = []
     init_build_dir(os.path.join(BUILD_DIR, folder))
     os.makedirs(f"{BUILD_DIR}/include", exist_ok=True)
     # includes += [f"{AITER_ROOT_DIR}/csrc/include"]
@@ -109,7 +116,13 @@ def run_lib(folder, *args):
         libs[folder] = lib
     lib.call(*args)
 
-def compile_template_op(src_template, md_name, includes=[], sources=[], cxxflags=[], **kwargs):
+def compile_template_op(src_template, md_name, includes=None, sources=None, cxxflags=None, **kwargs):
+    if includes is None:
+        includes = []
+    if sources is None:
+        sources = []
+    if cxxflags is None:
+        cxxflags = []
     kwargs = OrderedDict(kwargs)
     folder = f"{md_name}_{'_'.join([str(v) for v in kwargs.values()])}"
     src_file = src_template.render(**kwargs)
