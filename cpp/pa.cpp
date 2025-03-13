@@ -4,6 +4,10 @@
 
 #define MD_NAME "pa_ragged"
 
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
+
+#define warpSize 64
+
 void paged_attention_ragged(
     torch::Tensor& out, // [num_seqs, num_heads, head_size]
     torch::Tensor& workspace_buffer,
@@ -69,31 +73,44 @@ void paged_attention_ragged(
     int head_size       = query.size(2);
     int q_stride        = query.stride(0);
     int kv_block_stride = key_cache.stride(0);
+    const int gqa_ratio = num_heads / num_kv_heads;
     int kv_head_stride  = kv_cache_layout == "HND" ? key_cache.stride(1) : key_cache.stride(2);
     int kv_seq_stride   = kv_cache_layout == "HND" ? key_cache.stride(2) : key_cache.stride(1);
-    std::string cmd = fmt::format(R"(python3 pa.py --num_kv_heads={num_kv_heads} \
-                --num_seqs={num_seqs} \
-                --num_heads={num_heads} \
-                --head_size={head_size} \
-                --max_num_partitions={max_num_partitions} \
-                --dtype={dtype} \
-                --kv_dtype={kv_dtype} \
-                --fp8_kv_dtype={fp8_kv_dtype} \
-                --out_dtype={out_dtype} \
-                --block_size={block_size} \
-                --alibi_enabled={alibi_enabled})",
-                fmt::arg("num_kv_heads", num_kv_heads),
-                fmt::arg("num_seqs", num_seqs),
-                fmt::arg("num_heads", num_heads),
-                fmt::arg("head_size", head_size),
-                fmt::arg("max_num_partitions", max_num_partitions),
-                fmt::arg("dtype", dtype),
-                fmt::arg("kv_dtype", kv_dtype),
-                fmt::arg("fp8_kv_dtype", kv_cache_dtype), 
-                fmt::arg("out_dtype", dtype),
-                fmt::arg("block_size", block_size),
-                fmt::arg("alibi_enabled", alibi_slopes ? "true" : "false"));
-    executeCmd(cmd);
+    int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
+    init_root_dir();
+    std::string folder = fmt::format("{md_name}_{gqa_ratio}_{head_size}_{npar_loops}_{dtype}_{kv_dtype}_{fp8_kv_dtype}_{out_dtype}_{block_size}_{alibi_enabled}",
+                                    fmt::arg("md_name", MD_NAME),
+                                    fmt::arg("gqa_ratio", gqa_ratio),
+                                    fmt::arg("head_size", head_size),
+                                    fmt::arg("npar_loops", npar_loops),
+                                    fmt::arg("dtype", dtype),
+                                    fmt::arg("kv_dtype", kv_dtype),
+                                    fmt::arg("fp8_kv_dtype", kv_cache_dtype), 
+                                    fmt::arg("out_dtype", dtype),
+                                    fmt::arg("block_size", block_size),
+                                    fmt::arg("alibi_enabled", alibi_slopes ? "true" : "false"));
+    if(!std::filesystem::exists(get_root_dir()/"build"/folder/"lib.so")){
+        std::string cmd = fmt::format(R"(python3 pa.py --gqa_ratio={gqa_ratio} \
+                                    --head_size={head_size} \
+                                    --npar_loops={npar_loops} \
+                                    --dtype={dtype} \
+                                    --kv_dtype={kv_dtype} \
+                                    --fp8_kv_dtype={fp8_kv_dtype} \
+                                    --out_dtype={out_dtype} \
+                                    --block_size={block_size} \
+                                    --alibi_enabled={alibi_enabled})",
+                                    fmt::arg("gqa_ratio", gqa_ratio),
+                                    fmt::arg("head_size", head_size),
+                                    fmt::arg("npar_loops", npar_loops),
+                                    fmt::arg("dtype", dtype),
+                                    fmt::arg("kv_dtype", kv_dtype),
+                                    fmt::arg("fp8_kv_dtype", kv_cache_dtype), 
+                                    fmt::arg("out_dtype", dtype),
+                                    fmt::arg("block_size", block_size),
+                                    fmt::arg("alibi_enabled", alibi_slopes ? "true" : "false"));
+        executeCmd(cmd);
+    }
+
     void* query_ptr = query.data_ptr();
     void* key_cache_ptr = key_cache.data_ptr();
     void* value_cache_ptr = value_cache.data_ptr();
@@ -107,18 +124,6 @@ void paged_attention_ragged(
         fp8_out_scale ? fp8_out_scale.value().data_ptr<float>() : nullptr;
     void* out_ptr = out.data_ptr();
     const float* alibi_slopes_ptr = alibi_slopes ? alibi_slopes.value().data_ptr<float>() : nullptr;
-    std::string folder = fmt::format("{md_name}_{num_kv_heads}_{num_seqs}_{num_heads}_{head_size}_{max_num_partitions}_{dtype}_{kv_dtype}_{fp8_kv_dtype}_{out_dtype}_{block_size}_{alibi_enabled}",
-                fmt::arg("md_name", MD_NAME),
-                fmt::arg("num_kv_heads", num_kv_heads),
-                fmt::arg("num_seqs", num_seqs),
-                fmt::arg("num_heads", num_heads),
-                fmt::arg("head_size", head_size),
-                fmt::arg("max_num_partitions", max_num_partitions),
-                fmt::arg("dtype", dtype),
-                fmt::arg("kv_dtype", kv_dtype),
-                fmt::arg("fp8_kv_dtype", kv_cache_dtype), 
-                fmt::arg("out_dtype", dtype),
-                fmt::arg("block_size", block_size),
-                fmt::arg("alibi_enabled", alibi_slopes ? "true" : "false"));
-    run_lib(folder, out_ptr, workspace_buffer_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale, num_seqs, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, kv_indptr_ptr, kv_page_indices_ptr, kv_last_page_lens_ptr, alibi_slopes_ptr, logits_soft_cap, k_scale_ptr, v_scale_ptr, fp8_out_scale_ptr, stream);
+
+    run_lib(folder, out_ptr, workspace_buffer_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale, num_seqs, num_kv_heads, num_heads, max_num_partitions, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, kv_indptr_ptr, kv_page_indices_ptr, kv_last_page_lens_ptr, alibi_slopes_ptr, logits_soft_cap, k_scale_ptr, v_scale_ptr, fp8_out_scale_ptr, stream);
 }

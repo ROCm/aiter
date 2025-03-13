@@ -1,15 +1,17 @@
 from jinja2 import Template
 from utils import compile_template_op
 import ctypes
+import math
 
 
 MD_NAME = "pa_ragged"
+warpSize = 64
 with open("pa.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
 
-def compile(num_kv_heads, num_seqs, num_heads, head_size, max_num_partitions, dtype, kv_dtype, fp8_kv_dtype, out_dtype, block_size, alibi_enabled):
-    return compile_template_op(src_template, MD_NAME, ["utils.h", "pa.cuh", "../csrc/include"], [], num_kv_heads=num_kv_heads, num_seqs=num_seqs, num_heads=num_heads, head_size=head_size, max_num_partitions=max_num_partitions, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled)
+def compile(gqa_ratio: int, head_size: int, npar_loops: int, dtype: str, kv_dtype: str, fp8_kv_dtype: str, out_dtype: str, block_size: int, alibi_enabled: str, folder: str = None):
+    return compile_template_op(src_template, MD_NAME, ["utils.h", "pa.cuh", "../csrc/include"], [], gqa_ratio=gqa_ratio, head_size=head_size, npar_loops=npar_loops, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled, folder=folder)
 
 
 def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
@@ -19,7 +21,7 @@ def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
                            value_cache,  # [num_blocks, num_heads, head_size, block_size]
                            scale,
                            kv_indptr,
-                           kv_page_indices,  # [num_seqs, max_num_blocks_per_seq]
+                           kv_page_indices,  # [num_seqs, max_num_blocks_per_seq]dd
                            kv_last_page_lens,  # [num_seqs]
                            block_size, 
                            max_num_partitions,
@@ -67,8 +69,9 @@ def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
     kv_block_stride = key_cache.stride(0)
     kv_head_stride  = key_cache.stride(1) if kv_cache_layout == "HND" else key_cache.stride(2)
     kv_seq_stride   = key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
-
-    func = compile(num_kv_heads, num_seqs, num_heads, head_size, max_num_partitions, dtype, kv_dtype, kv_cache_dtype, out_dtype, block_size, "true" if alibi_slopes else "false")
+    gqa_ratio = int(num_heads / num_kv_heads)
+    npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    func = compile(gqa_ratio, head_size, npar_loops, dtype, kv_dtype, kv_cache_dtype, out_dtype, block_size, "true" if alibi_slopes else "false")
 
     out_ptr = ctypes.cast(out.data_ptr(), ctypes.c_void_p)
     alibi_slopes_ptr = ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float)) if alibi_slopes else ctypes.POINTER(ctypes.c_int)()
@@ -91,22 +94,21 @@ def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
     block_size = ctypes.c_int(block_size)
     max_num_partitions = ctypes.c_int(max_num_partitions)
 
-    func(out_ptr, workspace_buffer_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale, num_seqs, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, kv_indptr_ptr, kv_page_indices_ptr, kv_last_page_lens_ptr, alibi_slopes_ptr, logits_soft_cap, k_scale_ptr, v_scale_ptr, fp8_out_scale_ptr, stream)
+    func(out_ptr, workspace_buffer_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale, num_seqs, num_kv_heads, num_heads, max_num_partitions, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, kv_indptr_ptr, kv_page_indices_ptr, kv_last_page_lens_ptr, alibi_slopes_ptr, logits_soft_cap, k_scale_ptr, v_scale_ptr, fp8_out_scale_ptr, stream)
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num_kv_heads", type=int, required=True)
-    parser.add_argument("--num_seqs", type=int, required=True)
-    parser.add_argument("--num_heads", type=int, required=True)
+    parser.add_argument("--gqa_ratio", type=int, required=True)
     parser.add_argument("--head_size", type=int, required=True)
-    parser.add_argument("--max_num_partitions", type=int, required=True)
+    parser.add_argument("--npar_loops", type=int, required=True)
     parser.add_argument("--dtype", type=str, required=True)
     parser.add_argument("--kv_dtype", type=str, required=True)
     parser.add_argument("--fp8_kv_dtype", type=str, required=True)
     parser.add_argument("--out_dtype", type=str, required=True)
     parser.add_argument("--block_size", type=int, required=True)
     parser.add_argument("--alibi_enabled", type=str, required=True)
+    parser.add_argument("--folder", type=str, default=None)
     args = parser.parse_args()
     compile(**vars(args))

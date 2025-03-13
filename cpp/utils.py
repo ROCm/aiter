@@ -57,14 +57,11 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         cxxflags = []
     init_build_dir(os.path.join(BUILD_DIR, folder))
     os.makedirs(f"{BUILD_DIR}/include", exist_ok=True)
-    # includes += [f"{AITER_ROOT_DIR}/csrc/include"]
     for include in includes:
-        # if not os.path.exists(include):
         if os.path.isdir(include):
             shutil.copytree(include, f"{BUILD_DIR}/include", dirs_exist_ok=True)
         else:
             shutil.copy(include, f"{BUILD_DIR}/include")
-    # includes = [f"-I{BUILD_DIR}"]
     for source in sources:
         if os.path.isdir(source):
             shutil.copytree(source, os.path.join(BUILD_DIR, folder), dirs_exist_ok=True)
@@ -116,7 +113,7 @@ def run_lib(folder, *args):
         libs[folder] = lib
     lib.call(*args)
 
-def compile_template_op(src_template, md_name, includes=None, sources=None, cxxflags=None, **kwargs):
+def compile_template_op(src_template, md_name, includes=None, sources=None, cxxflags=None, folder=None, **kwargs):
     if includes is None:
         includes = []
     if sources is None:
@@ -124,7 +121,8 @@ def compile_template_op(src_template, md_name, includes=None, sources=None, cxxf
     if cxxflags is None:
         cxxflags = []
     kwargs = OrderedDict(kwargs)
-    folder = f"{md_name}_{'_'.join([str(v) for v in kwargs.values()])}"
+    if folder is None:
+        folder = f"{md_name}_{'_'.join([str(v) for v in kwargs.values()])}"
     src_file = src_template.render(**kwargs)
     if not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so") or os.environ.get("AITER_FORCE_COMPILE", "0") == "1":
         compile_lib(src_file, folder, includes, sources, cxxflags)

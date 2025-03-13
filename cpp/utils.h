@@ -8,6 +8,18 @@
 #include <memory>
 #include <cstdlib>
 
+static std::filesystem::path aiter_root_dir;
+__inline__ void init_root_dir(){
+    char* AITER_ROOT_DIR = std::getenv("AITER_ROOT_DIR");
+    if (!AITER_ROOT_DIR){
+        AITER_ROOT_DIR = std::getenv("HOME");
+    }
+    aiter_root_dir=std::filesystem::path(AITER_ROOT_DIR)/".aiter";
+}
+
+__inline__ std::filesystem::path get_root_dir(){
+    return aiter_root_dir;
+}
 
 template<typename T>
 class NamedArg {
@@ -111,12 +123,6 @@ static std::unordered_map<std::string, std::unique_ptr<SharedLibrary>> libs;
 
 template<typename... Args>
 __inline__ void run_lib(std::string folder,Args... args) {
-    char* AITER_ROOT_DIR = std::getenv("AITER_ROOT_DIR");
-    if (!AITER_ROOT_DIR){
-        AITER_ROOT_DIR = std::getenv("HOME") + "/.aiter";
-    }
-    std::filesystem::path aiter_root_dir(AITER_ROOT_DIR);
-    // auto build_dir = aiter_root_dir/"build";
     std::string lib_path = (aiter_root_dir/"build"/folder/"lib.so").string();
     if (libs.find(folder) == libs.end()) {
         libs[folder] = std::make_unique<SharedLibrary>(lib_path);
