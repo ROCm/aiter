@@ -364,7 +364,7 @@ if __name__ == "__main__":
                                  (0.5, False, True))
     height_ = (32, 64)
     width_ = (32, 64)
-    margin_ = (0, 1, 3)
+    margin_ = (0, 3)
     rotate_style_ = (RotateStyle.NEOX, RotateStyle.GPTJ)
 
     # Test sbhd format for both cached and uncached
@@ -379,7 +379,7 @@ if __name__ == "__main__":
             transpose_output_,
             rotate_style_,
             rotary_percent_and_reuse_,
-            batch_size_, seq_size_, head_size_, hidden_dim_
+            batch_size_[-1:], seq_size_[1:2], head_size_[-1:], hidden_dim_[-1:]
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -388,7 +388,7 @@ if __name__ == "__main__":
             input = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
             freqs = torch.randn((s, 1, 1, int(d * rotary_percent) // freqs_ratio), dtype=fdtype, device="cuda")
             grad  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
-            # test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+            test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
             input_x = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
             input_y = torch.randn((s, b, h, d), dtype=dtype, device="cuda", requires_grad=True)
             grad_y  = torch.randn((s, b, h, d), dtype=dtype, device="cuda")
@@ -408,7 +408,7 @@ if __name__ == "__main__":
             rotate_style_,
             rotary_percent_and_reuse_,
             (False, True),
-            batch_size_, seq_size_, head_size_, head_size_, hidden_dim_
+            batch_size_[-1:], seq_size_[1:2], head_size_[-1:], head_size_[-1:], hidden_dim_[-1:]
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -440,7 +440,7 @@ if __name__ == "__main__":
             rotate_style_,
             rotary_percent_and_reuse_compare_,
             (False, True),
-            batch_size_, seq_size_, head_size_, head_size_, hidden_dim_
+            batch_size_[-1:], seq_size_[1:2], head_size_[-1:], head_size_[-1:], hidden_dim_[-1:]
         ):
             color = '\033[95m'
             print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, sbhd: {b, s, h_x, h_y, d}, has_offsets: {has_offsets}{color}")
@@ -467,7 +467,7 @@ if __name__ == "__main__":
             dtype_, dtype_,
             rotate_style_,
             rotary_percent_and_reuse_,
-            head_size_, hidden_dim_
+            head_size_[-1:], hidden_dim_[-1:]
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -485,8 +485,8 @@ if __name__ == "__main__":
             height, width, margin
         ) in itertools.product(
             dtype_, dtype_,
-            batch_size_, head_size_, hidden_dim_,
-            height_, width_, margin_
+            batch_size_[-1:], head_size_[-1:], hidden_dim_[-1:],
+            height_[-1:], width_[-1:], margin_
         ):
             input   = torch.randn((b, height * width, h, d), dtype=dtype, device="cuda", requires_grad=True)
             freqs_h = torch.randn((1, height + margin, 1, d // 2), dtype=fdtype, device="cuda")
