@@ -45,6 +45,12 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
           uint32_t topk                     //
 );
 
+namespace py = pybind11;
+enum class ActivationType:int {
+    Silu,
+    Gelu
+};
+
 void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &input,             // [token_cnt, dim] M,K
                     torch::Tensor &gate,              // [expert, hidden_dim, dim] N,K
@@ -57,7 +63,8 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &input_scale,       // [token_cnt, 1]
                     torch::Tensor &fc1_scale,         // [expert, 1, hidden_dim]
                     torch::Tensor &fc2_scale,         // [expert, 1, dim]
-                    torch::Tensor &fc2_smooth_scale   // [expert, 1, hidden_dim]
+                    torch::Tensor &fc2_smooth_scale,   // [expert, 1, hidden_dim]
+                    py::object py_activation = py::none()
 );
 
 void fmoe_g1u1(torch::Tensor &out,                           // [token_cnt, dim]
@@ -72,7 +79,8 @@ void fmoe_g1u1(torch::Tensor &out,                           // [token_cnt, dim]
                torch::Tensor &input_scale,                   // [token_cnt, 1]
                torch::Tensor &fc1_scale,                     // [expert, 1, hidden_dim]
                torch::Tensor &fc2_scale,                     // [expert, 1, dim]
-               std::optional<torch::Tensor> fc2_smooth_scale // [expert, 1, hidden_dim]
+               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt, // [expert, 1, hidden_dim]
+               py::object py_activation = py::none()
 );
 
 void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]

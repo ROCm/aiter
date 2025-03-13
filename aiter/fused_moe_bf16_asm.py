@@ -9,6 +9,7 @@ import os
 from typing import Any, Callable, Dict, Optional, Tuple
 import aiter
 from aiter import logger
+from aiter import ActivationType
 BLOCK_SIZE_M = 32
 
 
@@ -50,7 +51,8 @@ def asm_moe(hidden_states,
             fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
             a16=False,
             per_tensor_quant_scale=None,
-            expert_mask=None
+            expert_mask=None,
+            activation = ActivationType.Silu
             ):
     E, model_dim, inter_dim = w2.shape
     if expert_mask is not None:
@@ -64,6 +66,7 @@ def asm_moe(hidden_states,
 
     if fc1_scale is None:
         # pure bf16
+        print("aiter.fmoe.------------------chefang")
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
                    sorted_weights, sorted_expert_ids, num_valid_ids, topk)
     elif a16:
@@ -89,6 +92,7 @@ def asm_moe(hidden_states,
                 f"Invalid args: {w1.dtype} {w1.shape=} {w2.shape=}")
 
     else:
+        print("------else-------")
         # a8w8 fmoe, opt: smooth quant
         a8_type = w1.dtype if w1.dtype != torch.int32 and w1.dtype != torch.uint32 else torch.float8_e4m3fnuz
         if fc1_smooth_scale is not None:
@@ -132,8 +136,10 @@ def asm_moe(hidden_states,
                 a8, a8_scale = aiter.pertoken_quant(
                     hidden_states, torch.float, quant_dtype=w1.dtype)
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
+            print("-------aiter.fmoe_int8_g1u0--------------")
             fmoe_func = aiter.fmoe_int8_g1u0
         elif w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
+            print("---------aiter.fmoe_g1u1------------------")
             fmoe_func = aiter.fmoe_g1u1
         else:
             raise ValueError(
@@ -145,7 +151,8 @@ def asm_moe(hidden_states,
                   a8_scale,
                   fc1_scale,
                   fc2_scale,
-                  fc2_smooth_scale)
+                  fc2_smooth_scale, activation)
+                #   fc2_smooth_scale)
     return moe_buf
 
 
