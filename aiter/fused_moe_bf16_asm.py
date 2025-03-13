@@ -53,13 +53,14 @@ def asm_moe(hidden_states,
             expert_mask=None
             ):
     E, model_dim, inter_dim = w2.shape
+    global_E = E
     if expert_mask is not None:
-        E = expert_mask.numel()
+        global_E = expert_mask.numel()
     M, topk = topk_ids.shape
     dtype = hidden_states.dtype
     device = topk_ids.device
     lastdim_mul = 8 if w1.dtype in {torch.int32, torch.uint32} else 1
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, E,
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, global_E,
                                                                                            model_dim, dtype, BLOCK_SIZE_M, expert_mask)
 
     if fc1_scale is None:
