@@ -52,7 +52,7 @@ TEST(PagedAttentionTest, BasicTest) {
     std::optional<torch::Tensor> fp8_out_scale = std::nullopt;
 
     // Call the function
-    paged_attention_ragged(
+    paged_attention_ragged_torch(
         out,
         workspace_buffer,
         query,
