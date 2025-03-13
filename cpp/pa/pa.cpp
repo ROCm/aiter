@@ -1,10 +1,8 @@
 #include <fmt/core.h>
 #include "pa.h"
-#include "utils.h"
+#include "../utils.h"
 
 #define MD_NAME "pa_ragged"
-
-#define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
 
 #define warpSize 64
 

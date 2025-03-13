@@ -13,6 +13,8 @@ def torch_to_c_types(*args):
     for arg in args:
         if isinstance(arg, torch.Tensor):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
+        elif isinstance(arg, torch.cuda.Stream):
+            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
         else:
             if type(arg) not in ctypes_map:
                 raise ValueError(f"Unsupported type: {type(arg)}")

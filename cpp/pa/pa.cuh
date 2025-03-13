@@ -39,7 +39,7 @@
 #define UNREACHABLE_CODE assert(false);
 #endif
 
-#define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
 #if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
 

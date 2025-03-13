@@ -1,5 +1,6 @@
 from jinja2 import Template
-from utils import compile_template_op
+from cpp.utils import compile_template_op
+from cpp.torch_utils import torch_to_c_types
 import ctypes
 import math
 
@@ -11,7 +12,7 @@ with open("pa.cpp.jinja", "r") as f:
 
 
 def compile(gqa_ratio: int, head_size: int, npar_loops: int, dtype: str, kv_dtype: str, fp8_kv_dtype: str, out_dtype: str, block_size: int, alibi_enabled: str, folder: str = None):
-    return compile_template_op(src_template, MD_NAME, ["utils.h", "pa.cuh", "../csrc/include"], [], gqa_ratio=gqa_ratio, head_size=head_size, npar_loops=npar_loops, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled, folder=folder)
+    return compile_template_op(src_template, MD_NAME, ["../utils.h", "pa.cuh", "../../csrc/include"], [], gqa_ratio=gqa_ratio, head_size=head_size, npar_loops=npar_loops, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled, folder=folder)
 
 
 def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
@@ -73,12 +74,7 @@ def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     func = compile(gqa_ratio, head_size, npar_loops, dtype, kv_dtype, kv_cache_dtype, out_dtype, block_size, "true" if alibi_slopes else "false")
 
-    out_ptr = ctypes.cast(out.data_ptr(), ctypes.c_void_p)
     alibi_slopes_ptr = ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float)) if alibi_slopes else ctypes.POINTER(ctypes.c_int)()
-
-    query_ptr = ctypes.cast(query.data_ptr(), ctypes.c_void_p)
-    key_cache_ptr = ctypes.cast(key_cache.data_ptr(), ctypes.c_void_p)
-    value_cache_ptr = ctypes.cast(value_cache.data_ptr(), ctypes.c_void_p)
     kv_indptr_ptr = ctypes.cast(kv_indptr.data_ptr(), ctypes.POINTER(ctypes.c_int))
     kv_page_indices_ptr = ctypes.cast(kv_page_indices.data_ptr(), ctypes.POINTER(ctypes.c_int))
     kv_last_page_lens_ptr = ctypes.cast(kv_last_page_lens.data_ptr(), ctypes.POINTER(ctypes.c_int)) if block_size > 1 else ctypes.POINTER(ctypes.c_int)()
@@ -87,12 +83,7 @@ def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
     v_scale_ptr = ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
     fp8_out_scale_ptr = ctypes.cast(fp8_out_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)) if fp8_out_scale else ctypes.POINTER(ctypes.c_int)()
 
-    stream = ctypes.cast(torch.cuda.current_stream().cuda_stream, ctypes.c_void_p)
-    workspace_buffer_ptr = ctypes.cast(workspace_buffer.data_ptr(), ctypes.c_void_p)
-    scale = ctypes.c_float(scale)
-    logits_soft_cap = ctypes.c_float(logits_soft_cap)
-    block_size = ctypes.c_int(block_size)
-    max_num_partitions = ctypes.c_int(max_num_partitions)
+    out_ptr, query_ptr, key_cache_ptr, value_cache_ptr, workspace_buffer_ptr, scale, logits_soft_cap, num_seqs, num_kv_heads, num_heads, max_num_partitions, stream = torch_to_c_types(out, query, key_cache, value_cache, workspace_buffer, scale, logits_soft_cap, num_seqs, num_kv_heads, num_heads, max_num_partitions, torch.cuda.current_stream())
 
     func(out_ptr, workspace_buffer_ptr, query_ptr, key_cache_ptr, value_cache_ptr, scale, num_seqs, num_kv_heads, num_heads, max_num_partitions, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, kv_indptr_ptr, kv_page_indices_ptr, kv_last_page_lens_ptr, alibi_slopes_ptr, logits_soft_cap, k_scale_ptr, v_scale_ptr, fp8_out_scale_ptr, stream)
 
