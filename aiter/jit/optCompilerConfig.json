@@ -451,7 +451,7 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --output_dir {{}}'"
     },
-    "rocsolidxgemm": {
+    "module_rocsolgemm": {
         "srcs": [
             "f'{AITER_GRADLIB_DIR}/csrc/rocsolgemm.cu'"
         ],
@@ -473,7 +473,7 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
-    "hipbsolidxgemm": {
+    "module_hipbsolgemm": {
         "srcs": [
             "f'{AITER_GRADLIB_DIR}/csrc/hipbsolgemm.cu'"
         ],
