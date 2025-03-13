@@ -360,7 +360,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -373,7 +372,6 @@
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
-        "isASM": "False",
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
