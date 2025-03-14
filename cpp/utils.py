@@ -5,6 +5,7 @@ from jinja2 import Template
 import ctypes
 from packaging.version import parse, Version
 from collections import OrderedDict
+from functools import partial
 
 
 HOME_PATH = os.environ.get('HOME')
@@ -55,21 +56,23 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         sources = []
     if cxxflags is None:
         cxxflags = []
-    init_build_dir(os.path.join(BUILD_DIR, folder))
-    os.makedirs(f"{BUILD_DIR}/include", exist_ok=True)
+    sub_build_dir = os.path.join(BUILD_DIR, folder)
+    init_build_dir(sub_build_dir)
+    include_dir = f"{sub_build_dir}/include"
+    os.makedirs(include_dir, exist_ok=True)
     for include in includes:
         if os.path.isdir(include):
-            shutil.copytree(include, f"{BUILD_DIR}/include", dirs_exist_ok=True)
+            shutil.copytree(include, include_dir, dirs_exist_ok=True)
         else:
-            shutil.copy(include, f"{BUILD_DIR}/include")
+            shutil.copy(include, include_dir)
     for source in sources:
         if os.path.isdir(source):
-            shutil.copytree(source, os.path.join(BUILD_DIR, folder), dirs_exist_ok=True)
+            shutil.copytree(source, sub_build_dir, dirs_exist_ok=True)
         else:
-            shutil.copy(source, os.path.join(BUILD_DIR, folder))
-    with open(f"{BUILD_DIR}/{folder}/call_lib.cpp", "w") as f:
+            shutil.copy(source, sub_build_dir)
+    with open(f"{sub_build_dir}/{folder}.cpp", "w") as f:
         f.write(src_file)
-    sources += ["call_lib.cpp"]
+    sources += [f"{folder}.cpp"]
     cxxflags += [
             "-O3", "-std=c++17",
             "-DLEGACY_HIPBLAS_DIRECT",
@@ -100,10 +103,10 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         cxxflags += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
     archs = validate_and_update_archs()
     cxxflags+=[f"--offload-arch={arch}" for arch in archs]
-    makefile_file = makefile_template.render(includes=[f"-I{BUILD_DIR}/include"], sources=sources, cxxflags=cxxflags)
-    with open(f"{BUILD_DIR}/{folder}/Makefile", "w") as f:
+    makefile_file = makefile_template.render(includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags)
+    with open(f"{sub_build_dir}/Makefile", "w") as f:
         f.write(makefile_file)
-    subprocess.run(f"cd {BUILD_DIR}/{folder} && make build -j8", shell=True, check=True)
+    subprocess.run(f"cd {sub_build_dir} && make build -j8", shell=True, check=True)
 
 def run_lib(folder, *args):
     if folder in libs:
@@ -126,6 +129,4 @@ def compile_template_op(src_template, md_name, includes=None, sources=None, cxxf
     src_file = src_template.render(**kwargs)
     if not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so") or os.environ.get("AITER_FORCE_COMPILE", "0") == "1":
         compile_lib(src_file, folder, includes, sources, cxxflags)
-    def wrapper(*args):
-        return run_lib(folder, *args)
-    return wrapper
+    return partial(run_lib, folder)

@@ -4,7 +4,7 @@
 #include <c10/hip/HIPGuard.h>
 #include <torch/all.h>
 
-void paged_attention_ragged_torch(
+void paged_attention_rocm_torch(
     torch::Tensor& out,  // [num_seqs, num_heads, head_size]
     torch::Tensor& workspace_buffer,
     torch::Tensor& query,  // [num_seqs, num_heads, head_size]
@@ -24,7 +24,7 @@ void paged_attention_ragged_torch(
     float logits_soft_cap, torch::Tensor& k_scale, torch::Tensor& v_scale,
     const c10::optional<torch::Tensor>& fp8_out_scale);
 
-void paged_attention_ragged(
+void paged_attention_rocm(
     int num_seqs, int num_kv_heads, int num_heads, int max_num_partitions,
     int q_stride, int kv_block_stride, int kv_head_stride, int kv_seq_stride,
     int gqa_ratio, int head_size, std::string dtype, std::string kv_dtype,

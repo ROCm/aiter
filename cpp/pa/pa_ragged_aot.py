@@ -1,7 +1,7 @@
 from collections import namedtuple
 import os
 import concurrent.futures
-from cpp.pa.pa import compile
+from cpp.pa.pa_ragged import compile
 
 PAConfig = namedtuple("PAConfig", ["gqa_ratio", "head_size", "npar_loops", "block_size", "dtype", "kv_dtype", "fp8_kv_dtype", "out_dtype", "alibi_enabled"])
 
