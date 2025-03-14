@@ -337,7 +337,19 @@
             "Aligning the number of tokens to be processed by each expert such " \
             "that it is divisible by the block size.");                          \
       m.def("fmoe", &fmoe);                                                      \
-      m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0);                                  \
+      py::enum_<ActivationType>(m, "ActivationType")                             \
+          .value("Silu", ActivationType::Silu)                                   \
+          .value("Gelu", ActivationType::Gelu)                                   \
+          .export_values();                                                      \
+      m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0,                                   \
+            py::arg("out"), py::arg("input"),                                    \
+            py::arg("gate"), py::arg("down"),                                    \
+            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
+            py::arg("topk"), py::arg("input_scale"),                             \
+            py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
+            py::arg("fc2_smooth_scale") = std::nullopt,                          \
+            py::arg("activation") = ActivationType::Silu);                       \
       m.def("fmoe_g1u1", &fmoe_g1u1,                                             \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
@@ -345,7 +357,8 @@
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
-            py::arg("fc2_smooth_scale") = std::nullopt);                         \
+            py::arg("fc2_smooth_scale") = std::nullopt,                          \
+            py::arg("activation") = ActivationType::Silu);                       \
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                          \
       m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);                            \
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,               \
@@ -427,7 +440,7 @@
       m.def("rope_cached_fwd_impl", &rope_cached_fwd_impl);       \
       m.def("rope_cached_2c_fwd_impl", &rope_cached_2c_fwd_impl); \
       m.def("rope_thd_fwd_impl", &rope_thd_fwd_impl);             \
-      m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);               \
+      m.def("rope_2d_fwd_impl", &rope_2d_fwd_impl);
 
 #define ROPE_GENERAL_BWD_PYBIND                                   \
       m.def("rope_bwd_impl", &rope_bwd_impl);                     \
@@ -437,8 +450,8 @@
       m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);             \
       m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
-#define ROPE_POS_FWD_PYBIND                                                                           \
-      m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);                 \
+#define ROPE_POS_FWD_PYBIND                                                           \
+      m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl); \
       m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
 #define SMOOTHQUANT_PYBIND                        \

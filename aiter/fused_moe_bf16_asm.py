@@ -9,6 +9,7 @@ import os
 from typing import Any, Callable, Dict, Optional, Tuple
 import aiter
 from aiter import logger
+from aiter import ActivationType
 BLOCK_SIZE_M = 32
 
 
@@ -50,7 +51,8 @@ def asm_moe(hidden_states,
             fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
             a16=False,
             per_tensor_quant_scale=None,
-            expert_mask=None
+            expert_mask=None,
+            activation = ActivationType.Silu
             ):
     E, model_dim, inter_dim = w2.shape
     global_E = E
@@ -146,7 +148,8 @@ def asm_moe(hidden_states,
                   a8_scale,
                   fc1_scale,
                   fc2_scale,
-                  fc2_smooth_scale)
+                  fc2_smooth_scale, activation)
+                #   fc2_smooth_scale)
     return moe_buf
 
 
@@ -232,7 +235,8 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
               fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
               fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
               fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-              expert_mask=None):
+              expert_mask=None,
+              activation = ActivationType.Silu):
     computeType = torch.float
     dtype = hidden_states.dtype
     hidden_states = hidden_states.to(computeType)
@@ -283,9 +287,15 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
             if moeType == "g1u1":
                 gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-                act_out = F.silu(gate) * up
+                if activation == ActivationType.Gelu:
+                    act_out = F.gelu(gate) * up
+                else:
+                    act_out = F.silu(gate) * up
             else:
-                act_out = F.gelu(act_input)
+                if activation == ActivationType.Gelu:
+                    act_out = F.gelu(act_input)
+                else:
+                    act_out = F.silu(act_input)
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))

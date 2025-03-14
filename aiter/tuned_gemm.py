@@ -168,9 +168,12 @@ class TunedGemm:
             self.extensions_created = True
             self.load_best_sols()
             self.create_ds()
-        if inp.dim() == 3:
-            inp_view = inp.view(-1, inp.size(-1))
-            batched = True
+        if inp.dim() >= 3:
+            try:
+                inp_view = inp.view(-1, inp.size(-1))
+                batched = True
+            except RuntimeError:
+                return F.linear(inp, weights, bias)
         else:
             inp_view = inp
             batched = False
@@ -187,7 +190,7 @@ class TunedGemm:
         out = self.solfuncs[soltype](
             inp_view, weights, solidx, bias, otype, scale_a, scale_b, scale_c)
         if batched:
-            out = out.view(inp.shape[0], inp.shape[1], weights.shape[0])
+            out = out.view(*inp.shape[:-1], weights.shape[0])
         return out
 
 
