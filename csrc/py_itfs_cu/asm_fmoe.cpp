@@ -302,11 +302,8 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
                     torch::Tensor &fc2_scale,         // [expert, 1, dim]
                     torch::Tensor &fc2_smooth_scale,  // [expert, 1, inter_dim],
-                    py::object py_activation)
+                    ActivationType activation)
 {
-    int activation_value = py_activation.attr("value").cast<int>();
-
-    ActivationType activation = static_cast<ActivationType>(activation_value);
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
 

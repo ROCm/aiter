@@ -65,7 +65,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &fc1_scale,         // [expert, 1, hidden_dim]
                     torch::Tensor &fc2_scale,         // [expert, 1, dim]
                     torch::Tensor &fc2_smooth_scale,  // [expert, 1, hidden_dim]
-                    py::object py_activation = py::none());
+                    ActivationType activation = ActivationType::Silu);
 
 void fmoe_g1u1(torch::Tensor &out,                                           // [token_cnt, dim]
                torch::Tensor &input,                                         // [token_cnt, dim] M,K
