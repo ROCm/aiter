@@ -5,7 +5,7 @@ from torch import Tensor
 from typing import List, Optional
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
 import torch.nn.functional as F
-from enum import Enum
+
 
 @compile_ops("module_moe_asm")
 def topk_softmax(
@@ -44,11 +44,16 @@ def fmoe(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     topk: int,
-): ... 
+): ...
 
-class ActivationType(Enum):
-    Silu = 0
-    Gelu = 1
+
+@compile_ops("module_moe_asm", fc_name='ActivationType')
+class _ActivationType():
+    ...
+
+
+ActivationType = _ActivationType(0)
+
 
 @compile_ops("module_moe_asm")
 def fmoe_int8_g1u0(
@@ -67,6 +72,7 @@ def fmoe_int8_g1u0(
     fc2_smooth_scale: Tensor,
     activation: Optional[ActivationType] = ActivationType.Silu,
 ): ...
+
 
 @compile_ops("module_moe_asm")
 def fmoe_g1u1(

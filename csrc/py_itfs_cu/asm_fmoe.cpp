@@ -385,7 +385,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
                torch::Tensor &fc2_scale,                      // [expert, 1, dim]
                std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
-               py::object py_activation)
+               ActivationType activation)
 {
     struct FMoeKernelConfig
     {
@@ -393,13 +393,13 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
         std::string co_name;
         int tile_size;
     };
-    if (py_activation.is_none())
-    {
-        py_activation = py::module_::import("aiter").attr("ActivationType").attr("SILU");
-    }
-    int activation_value = py_activation.attr("value").cast<int>();
+    // if (py_activation.is_none())
+    // {
+    //     py_activation = py::module_::import("aiter").attr("ActivationType").attr("SILU");
+    // }
+    // int activation_value = py_activation.attr("value").cast<int>();
 
-    ActivationType activation = static_cast<ActivationType>(activation_value);
+    // ActivationType activation = static_cast<ActivationType>(activation_value);
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
