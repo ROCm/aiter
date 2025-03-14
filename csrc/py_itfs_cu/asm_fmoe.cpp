@@ -6,6 +6,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
+#include "moe_op.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -231,7 +232,7 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int> &ava
         if ((inter_dim % tile) == 0)
         {
             tg_num = inter_dim / tile * sub_X_cnt;
-            uint32_t local_round = tg_num / num_cu + 1;
+            uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
             if (local_round < round)
             {
                 round = local_round;
@@ -300,8 +301,8 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &input_scale,       // [token_cnt, 1]
                     torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
                     torch::Tensor &fc2_scale,         // [expert, 1, dim]
-                    torch::Tensor &fc2_smooth_scale   // [expert, 1, inter_dim]
-)
+                    torch::Tensor &fc2_smooth_scale,  // [expert, 1, inter_dim],
+                    ActivationType activation)
 {
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
@@ -311,37 +312,37 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
 
         if ((inter_dim % 512) == 0)
         {
-            static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe_int8_g1u0_subGU_512.co", 512);
+            static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe/silu/fmoe_int8_g1u0_subGU_512.co", 512);
             impl_ptr = &impl_int8_512;
         }
         else if ((inter_dim % 448) == 0)
         {
-            static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe_int8_g1u0_subGU_448.co", 448);
+            static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe/silu/fmoe_int8_g1u0_subGU_448.co", 448);
             impl_ptr = &impl_int8_448;
         }
         else if ((inter_dim % 384) == 0)
         {
-            static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe_int8_g1u0_subGU_384.co", 384);
+            static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe/silu/fmoe_int8_g1u0_subGU_384.co", 384);
             impl_ptr = &impl_int8_384;
         }
         else if ((inter_dim % 320) == 0)
         {
-            static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe_int8_g1u0_subGU_320.co", 320);
+            static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe/silu/fmoe_int8_g1u0_subGU_320.co", 320);
             impl_ptr = &impl_int8_320;
         }
         else if ((inter_dim % 256) == 0)
         {
-            static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe_int8_g1u0_subGU_256.co", 256);
+            static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe/silu/fmoe_int8_g1u0_subGU_256.co", 256);
             impl_ptr = &impl_int8_256;
         }
         else if ((inter_dim % 192) == 0)
         {
-            static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe_int8_g1u0_subGU_192.co", 192);
+            static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe/silu/fmoe_int8_g1u0_subGU_192.co", 192);
             impl_ptr = &impl_int8_192;
         }
         else if ((inter_dim % 128) == 0)
         {
-            static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe_int8_g1u0_subGU_128.co", 128);
+            static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe/silu/fmoe_int8_g1u0_subGU_128.co", 128);
             impl_ptr = &impl_int8_128;
         }
         else
@@ -368,24 +369,32 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                                                fc2_smooth_scale);
 }
 
-void fmoe_g1u1(torch::Tensor &out,                                          // [token_cnt, dim]
-               torch::Tensor &input,                                        // [token_cnt, dim] M,K
-               torch::Tensor &gate,                                         // [expert, inter_dim*2, dim] N,K
-               torch::Tensor &down,                                         // [expert, dim, inter_dim]
-               torch::Tensor &sorted_token_ids,                             // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,                            // [max_num_tokens_padded]
-               torch::Tensor &sorted_expert_ids,                            // [max_num_m_blocks]
-               torch::Tensor &num_valid_ids,                                // [1]
-               uint32_t topk,                                               //
-               torch::Tensor &input_scale,                                  // [token_cnt, 1]
-               torch::Tensor &fc1_scale,                                    // [expert, 1, inter_dim]
-               torch::Tensor &fc2_scale,                                    // [expert, 1, dim]
-               std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt // [expert, 1, inter_dim]
-)
+void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim]
+               torch::Tensor &input,                          // [token_cnt, dim] M,K
+               torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
+               torch::Tensor &down,                           // [expert, dim, inter_dim]
+               torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
+               torch::Tensor &sorted_weight_buf,              // [max_num_tokens_padded]
+               torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
+               torch::Tensor &num_valid_ids,                  // [1]
+               uint32_t topk,                                 //
+               torch::Tensor &input_scale,                    // [token_cnt, 1]
+               torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
+               torch::Tensor &fc2_scale,                      // [expert, 1, dim]
+               std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
+               ActivationType activation)
 {
+    struct FMoeKernelConfig
+    {
+        std::string name;
+        std::string co_name;
+        int tile_size;
+    };
+
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
+    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
     if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
@@ -412,197 +421,141 @@ void fmoe_g1u1(torch::Tensor &out,                                          // [
     }
     else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
+        std::unordered_map<int, FMoeKernelConfig> multix_kernel_int8_configs = {
+            {512, {"fmoe_int8_g1u1_multix_subGU_512", "fmoe_int8_g1u1_multix_subGU_512.co", 512}},
+            {448, {"fmoe_int8_g1u1_multix_subGU_448", "fmoe_int8_g1u1_multix_subGU_448.co", 448}},
+            {384, {"fmoe_int8_g1u1_multix_subGU_384", "fmoe_int8_g1u1_multix_subGU_384.co", 384}},
+            {320, {"fmoe_int8_g1u1_multix_subGU_320", "fmoe_int8_g1u1_multix_subGU_320.co", 320}},
+            {256, {"fmoe_int8_g1u1_multix_subGU_256", "fmoe_int8_g1u1_multix_subGU_256.co", 256}},
+            {192, {"fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192}},
+            {128, {"fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128}}};
+
+        std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
+            {512, {"fmoe_int8_g1u1_subGU_512", "fmoe/silu/fmoe_int8_g1u1_subGU_512.co", 512}},
+            {448, {"fmoe_int8_g1u1_subGU_448", "fmoe/silu/fmoe_int8_g1u1_subGU_448.co", 448}},
+            {384, {"fmoe_int8_g1u1_subGU_384", "fmoe/silu/fmoe_int8_g1u1_subGU_384.co", 384}},
+            {320, {"fmoe_int8_g1u1_subGU_320", "fmoe/silu/fmoe_int8_g1u1_subGU_320.co", 320}},
+            {256, {"fmoe_int8_g1u1_subGU_256", "fmoe/silu/fmoe_int8_g1u1_subGU_256.co", 256}},
+            {192, {"fmoe_int8_g1u1_subGU_192", "fmoe/silu/fmoe_int8_g1u1_subGU_192.co", 192}},
+            {128, {"fmoe_int8_g1u1_subGU_128", "fmoe/silu/fmoe_int8_g1u1_subGU_128.co", 128}}};
+
+        std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
+            {512, {"fmoe_int8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_512_gelu.co", 512}},
+            {448, {"fmoe_int8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_448_gelu.co", 448}},
+            {384, {"fmoe_int8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_384_gelu.co", 384}},
+            {320, {"fmoe_int8_g1u1_subGU_320_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_320_gelu.co", 320}},
+            {256, {"fmoe_int8_g1u1_subGU_256_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_256_gelu.co", 256}},
+            {192, {"fmoe_int8_g1u1_subGU_192_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_192_gelu.co", 192}},
+            {128, {"fmoe_int8_g1u1_subGU_128_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_128_gelu.co", 128}}};
+
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); // todo,add tune interface here
-        if (selectedTile == 512)
+
+        std::unordered_map<int, FMoeKernelConfig> *config_map = nullptr;
+        if (fc2_smooth_scale.has_value())
         {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_int8_s_512("fmoe_int8_g1u1_multix_subGU_512", "fmoe_int8_g1u1_multix_subGU_512.co", 512);
-                impl_ptr = &impl_int8_s_512;
-            }
-            else
-            {
-                static FMoeKernel impl_int8_512("fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512);
-                impl_ptr = &impl_int8_512;
-            }
+            config_map = &multix_kernel_int8_configs;
         }
-        else if (selectedTile == 448)
+        else if (activation == ActivationType::Gelu)
         {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_int8_s_448("fmoe_int8_g1u1_multix_subGU_448", "fmoe_int8_g1u1_multix_subGU_448.co", 448);
-                impl_ptr = &impl_int8_s_448;
-            }
-            else
-            {
-                static FMoeKernel impl_int8_448("fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448);
-                impl_ptr = &impl_int8_448;
-            }
+            config_map = &gelu_kernel_int8_configs;
         }
-        else if (selectedTile == 384)
+        else if (activation == ActivationType::Silu)
         {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_int8_s_384("fmoe_int8_g1u1_multix_subGU_384", "fmoe_int8_g1u1_multix_subGU_384.co", 384);
-                impl_ptr = &impl_int8_s_384;
-            }
-            else
-            {
-                static FMoeKernel impl_int8_384("fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384);
-                impl_ptr = &impl_int8_384;
-            }
+            config_map = &silu_kernel_int8_configs;
         }
-        else if (selectedTile == 320)
+
+        if (config_map)
         {
-            if (fc2_smooth_scale.has_value())
+            auto it = config_map->find(selectedTile);
+            if (it != config_map->end())
             {
-                static FMoeKernel impl_int8_s_320("fmoe_int8_g1u1_multix_subGU_320", "fmoe_int8_g1u1_multix_subGU_320.co", 320);
-                impl_ptr = &impl_int8_s_320;
+                const auto &config = it->second;
+                const char *name = config.name.c_str();
+                const char *co_name = config.co_name.c_str();
+
+                auto result = impl_ptr_map.emplace(name, nullptr);
+                if (result.second)
+                {
+                    result.first->second = std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
+                }
+                impl_ptr = result.first->second.get();
             }
             else
-            {
-                static FMoeKernel impl_int8_320("fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320);
-                impl_ptr = &impl_int8_320;
-            }
-        }
-        else if (selectedTile == 256)
-        {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_int8_s_256("fmoe_int8_g1u1_multix_subGU_256", "fmoe_int8_g1u1_multix_subGU_256.co", 256);
-                impl_ptr = &impl_int8_s_256;
-            }
-            else
-            {
-                static FMoeKernel impl_int8_256("fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256);
-                impl_ptr = &impl_int8_256;
-            }
-        }
-        else if (selectedTile == 192)
-        {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_int8_s_192("fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192);
-                impl_ptr = &impl_int8_s_192;
-            }
-            else
-            {
-                static FMoeKernel impl_int8_192("fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192);
-                impl_ptr = &impl_int8_192;
-            }
-        }
-        else if (selectedTile == 128)
-        {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_int8_s_128("fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128);
-                impl_ptr = &impl_int8_s_128;
-            }
-            else
-            {
-                static FMoeKernel impl_int8_128("fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128);
-                impl_ptr = &impl_int8_128;
-            }
+                TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
         }
         else
-            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+        {
+            TORCH_CHECK(false, __func__, "No valid kernel selected!");
+        }
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
+        static std::unordered_map<int, FMoeKernelConfig> multix_kernel_fp8_configs = {
+            {512, {"fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512}},
+            {448, {"fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448}},
+            {384, {"fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384}},
+            {320, {"fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320}},
+            {256, {"fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256}},
+            {192, {"fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192}},
+            {128, {"fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128}}};
+
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
+            {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe/silu/fmoe_fp8_g1u1_subGU_512.co", 512}},
+            {448, {"fmoe_fp8_g1u1_subGU_448", "fmoe/silu/fmoe_fp8_g1u1_subGU_448.co", 448}},
+            {384, {"fmoe_fp8_g1u1_subGU_384", "fmoe/silu/fmoe_fp8_g1u1_subGU_384.co", 384}},
+            {320, {"fmoe_fp8_g1u1_subGU_320", "fmoe/silu/fmoe_fp8_g1u1_subGU_320.co", 320}},
+            {256, {"fmoe_fp8_g1u1_subGU_256", "fmoe/silu/fmoe_fp8_g1u1_subGU_256.co", 256}},
+            {192, {"fmoe_fp8_g1u1_subGU_192", "fmoe/silu/fmoe_fp8_g1u1_subGU_192.co", 192}},
+            {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe/silu/fmoe_fp8_g1u1_subGU_128.co", 128}}};
+
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_configs = {
+            {512, {"fmoe_fp8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_512_gelu.co", 512}},
+            {448, {"fmoe_fp8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_448_gelu.co", 448}},
+            {384, {"fmoe_fp8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_384_gelu.co", 384}},
+            {320, {"fmoe_fp8_g1u1_subGU_320_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_320_gelu.co", 320}},
+            {256, {"fmoe_fp8_g1u1_subGU_256_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_256_gelu.co", 256}},
+            {192, {"fmoe_fp8_g1u1_subGU_192_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_192_gelu.co", 192}},
+            {128, {"fmoe_fp8_g1u1_subGU_128_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_128_gelu.co", 128}}};
+
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
-        if (selectedTile == 512)
+
+        std::unordered_map<int, FMoeKernelConfig> *config_map = nullptr;
+        if (fc2_smooth_scale.has_value())
         {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_fp8_s_512("fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512);
-                impl_ptr = &impl_fp8_s_512;
-            }
-            else
-            {
-                static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512);
-                impl_ptr = &impl_fp8_512;
-            }
+            config_map = &multix_kernel_fp8_configs;
         }
-        else if (selectedTile == 448)
+        else if (activation == ActivationType::Gelu)
         {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_fp8_s_448("fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448);
-                impl_ptr = &impl_fp8_s_448;
-            }
-            else
-            {
-                static FMoeKernel impl_fp8_448("fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448);
-                impl_ptr = &impl_fp8_448;
-            }
+            config_map = &gelu_kernel_fp8_configs;
         }
-        else if (selectedTile == 384)
+        else if (activation == ActivationType::Silu)
         {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_fp8_s_384("fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384);
-                impl_ptr = &impl_fp8_s_384;
-            }
-            else
-            {
-                static FMoeKernel impl_fp8_384("fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384);
-                impl_ptr = &impl_fp8_384;
-            }
+            config_map = &silu_kernel_fp8_configs;
         }
-        else if (selectedTile == 320)
+
+        if (config_map)
         {
-            if (fc2_smooth_scale.has_value())
+            auto it = config_map->find(selectedTile);
+            if (it != config_map->end())
             {
-                static FMoeKernel impl_fp8_s_320("fmoe_fp8_g1u1_multix_subGU_320", "fmoe_fp8_g1u1_multix_subGU_320.co", 320);
-                impl_ptr = &impl_fp8_s_320;
+                const auto &config = it->second;
+                const char *name = config.name.c_str();
+                const char *co_name = config.co_name.c_str();
+
+                auto result = impl_ptr_map.emplace(name, nullptr);
+                if (result.second)
+                {
+                    result.first->second = std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
+                }
+                impl_ptr = result.first->second.get();
             }
             else
-            {
-                static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320);
-                impl_ptr = &impl_fp8_320;
-            }
-        }
-        else if (selectedTile == 256)
-        {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_fp8_s_256("fmoe_fp8_g1u1_multix_subGU_256", "fmoe_fp8_g1u1_multix_subGU_256.co", 256);
-                impl_ptr = &impl_fp8_s_256;
-            }
-            else
-            {
-                static FMoeKernel impl_fp8_256("fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256);
-                impl_ptr = &impl_fp8_256;
-            }
-        }
-        else if (selectedTile == 192)
-        {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_fp8_s_192("fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192);
-                impl_ptr = &impl_fp8_s_192;
-            }
-            else
-            {
-                static FMoeKernel impl_fp8_192("fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192);
-                impl_ptr = &impl_fp8_192;
-            }
-        }
-        else if (selectedTile == 128)
-        {
-            if (fc2_smooth_scale.has_value())
-            {
-                static FMoeKernel impl_fp8_s_128("fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128);
-                impl_ptr = &impl_fp8_s_128;
-            }
-            else
-            {
-                static FMoeKernel impl_fp8_128("fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128);
-                impl_ptr = &impl_fp8_128;
-            }
+                TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
         }
         else
-            TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+        {
+            TORCH_CHECK(false, __func__, "No valid kernel selected!");
+        }
     }
     else
     {

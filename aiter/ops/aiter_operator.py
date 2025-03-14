@@ -25,6 +25,22 @@ def div(input: Tensor, other: Tensor) -> Tensor: ...
 
 
 @compile_ops("module_aiter_operator")
+def add_(input: Tensor, other: Tensor) -> Tensor: ...
+
+
+@compile_ops("module_aiter_operator")
+def sub_(input: Tensor, other: Tensor) -> Tensor: ...
+
+
+@compile_ops("module_aiter_operator")
+def mul_(input: Tensor, other: Tensor) -> Tensor: ...
+
+
+@compile_ops("module_aiter_operator")
+def div_(input: Tensor, other: Tensor) -> Tensor: ...
+
+
+@compile_ops("module_aiter_operator")
 def sigmoid(input: Tensor) -> Tensor: ...
 
 

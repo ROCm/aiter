@@ -47,6 +47,14 @@ def fmoe(
 ): ...
 
 
+@compile_ops("module_moe_asm", fc_name='ActivationType')
+class _ActivationType():
+    ...
+
+
+ActivationType = _ActivationType(0)
+
+
 @compile_ops("module_moe_asm")
 def fmoe_int8_g1u0(
     out: Tensor,
@@ -62,6 +70,7 @@ def fmoe_int8_g1u0(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
+    activation: Optional[_ActivationType] = ActivationType.Silu,
 ): ...
 
 
@@ -80,6 +89,7 @@ def fmoe_g1u1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
+    activation: Optional[_ActivationType] = ActivationType.Silu,
 ): ...
 
 
