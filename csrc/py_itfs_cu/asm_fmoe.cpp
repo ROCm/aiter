@@ -232,7 +232,7 @@ int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int> &ava
         if ((inter_dim % tile) == 0)
         {
             tg_num = inter_dim / tile * sub_X_cnt;
-            uint32_t local_round = tg_num / num_cu + 1;
+            uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
             if (local_round < round)
             {
                 round = local_round;

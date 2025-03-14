@@ -250,33 +250,33 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
 
-# print('test test_fmoe 16 bit')
-# print('\ng1u0 no quant')
-# for dtype in [torch.float16, torch.bfloat16]:
-#     for m in [128, 256]:
-#         for dim in [4096, 8192]:
-#             for hdim in [1024]:
-#                 # test_fmoe(dtype, m, dim, hdim, 32, 5)
-#                 test_fmoe(dtype, m, dim, hdim, 32, 5, quant='No')
+print('test test_fmoe 16 bit')
+print('\ng1u0 no quant')
+for dtype in [torch.float16, torch.bfloat16]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
+                # test_fmoe(dtype, m, dim, hdim, 32, 5)
+                test_fmoe(dtype, m, dim, hdim, 32, 5, quant='No')
 
-# print('\ng1u1 no quant')
-# for dtype in [torch.float16, torch.bfloat16]:
-#     for m in [128, 256]:
-#         for dim in [4096, 8192]:
-#             for hdim in [1024]:
-#                 # test_fmoe(dtype, m, dim, hdim, 32, 5)
-#                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-#                           quant='No')
-#                         #   quant='No', use_g1u1=True)
+print('\ng1u1 no quant')
+for dtype in [torch.float16, torch.bfloat16]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
+                # test_fmoe(dtype, m, dim, hdim, 32, 5)
+                test_fmoe(dtype, m, dim, hdim, 32, 5,
+                          quant='No')
+                        #   quant='No', use_g1u1=True)
 
-# print('\ng1u1 int8quant')
-# for dtype in [torch.bfloat16]:
-#     for m in [128, 256]:
-#         for dim in [4096, 8192]:
-#             for hdim in [1024]:
-#                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-#                         #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
-#                           quant='int8quant', use_g1u1=True)
+print('\ng1u1 int8quant')
+for dtype in [torch.bfloat16]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5,
+                        #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
+                          quant='int8quant', use_g1u1=True)
 
 print('\ng1u1 fp8quant')
 for dtype in [torch.bfloat16]:
@@ -288,35 +288,35 @@ for dtype in [torch.bfloat16]:
                         #   quant='fp8quant', use_g1u1=True)
 
 
-# print('\ng1u0 int8smoothquant')
-# for dtype in [torch.bfloat16]:
-#     for m in [128]:
-#         for dim in [4096, 6144,  8192]:
-#             for hdim in [512, 1024]:
-#                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-#                           quant='int8smoothquant', use_g1u1=False)
+print('\ng1u0 int8smoothquant')
+for dtype in [torch.bfloat16]:
+    for m in [128]:
+        for dim in [4096, 6144,  8192]:
+            for hdim in [512, 1024]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5,
+                          quant='int8smoothquant', use_g1u1=False)
 
-# print('\ng1u1 int8smoothquant')
-# for dtype in [torch.bfloat16]:
-#     for m in [128]:
-#         for dim in [4096, 6144,  8192]:
-#             for hdim in [512, 1024, 1280]:
-#                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-#                           quant='int8smoothquant', use_g1u1=True)
+print('\ng1u1 int8smoothquant')
+for dtype in [torch.bfloat16]:
+    for m in [128]:
+        for dim in [4096, 6144,  8192]:
+            for hdim in [512, 1024, 1280]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5,
+                          quant='int8smoothquant', use_g1u1=True)
 
-# print('\ng1u1 fp8smoothquant')
-# for dtype in [torch.bfloat16]:
-#     for m in [128]:
-#         for dim in [4096, 6144,  8192]:
-#             for hdim in [512, 1024, 1280]:
-#                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-#                           quant='fp8smoothquant', use_g1u1=True)
+print('\ng1u1 fp8smoothquant')
+for dtype in [torch.bfloat16]:
+    for m in [128]:
+        for dim in [4096, 6144,  8192]:
+            for hdim in [512, 1024, 1280]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5,
+                          quant='fp8smoothquant', use_g1u1=True)
 
-# print('\ng1u1 int4')
-# for dtype in [torch.bfloat16]:
-#     for m in [32, 128]:
-#         # for dim in [1024]:
-#         for dim in [4096, 6144]:
-#             for hdim in [1024, 4096]:
-#                 test_fmoe(dtype, m, dim, hdim, 8, 3,
-#                           quant='wint4afp8smoothquant', use_g1u1=True)
+print('\ng1u1 int4')
+for dtype in [torch.bfloat16]:
+    for m in [32, 128]:
+        # for dim in [1024]:
+        for dim in [4096, 6144]:
+            for hdim in [1024, 4096]:
+                test_fmoe(dtype, m, dim, hdim, 8, 3,
+                          quant='wint4afp8smoothquant', use_g1u1=True)

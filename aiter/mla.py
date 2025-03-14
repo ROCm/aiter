@@ -29,7 +29,7 @@ def mla_decode_fwd(
     if num_kv_splits is None:
         device_properties = torch.cuda.get_device_properties(device)
         cu_num = device_properties.multi_processor_count
-        num_kv_splits = max(1, cu_num//bs)
+        num_kv_splits = min(16, max(1, cu_num//bs))
 
     logits = torch.empty(
         (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device)
