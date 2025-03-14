@@ -403,6 +403,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
+    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
     if (gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
@@ -429,7 +430,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
     }
     else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
-        std::unordered_map<int, FMoeKernelConfig> multix_kernel_configs = {
+        std::unordered_map<int, FMoeKernelConfig> multix_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_multix_subGU_512", "fmoe_int8_g1u1_multix_subGU_512.co", 512}},
             {448, {"fmoe_int8_g1u1_multix_subGU_448", "fmoe_int8_g1u1_multix_subGU_448.co", 448}},
             {384, {"fmoe_int8_g1u1_multix_subGU_384", "fmoe_int8_g1u1_multix_subGU_384.co", 384}},
@@ -438,7 +439,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {192, {"fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192}},
             {128, {"fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128}}};
 
-        std::unordered_map<int, FMoeKernelConfig> silu_kernel_configs = {
+        std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_subGU_512", "fmoe/silu/fmoe_int8_g1u1_subGU_512.co", 512}},
             {448, {"fmoe_int8_g1u1_subGU_448", "fmoe/silu/fmoe_int8_g1u1_subGU_448.co", 448}},
             {384, {"fmoe_int8_g1u1_subGU_384", "fmoe/silu/fmoe_int8_g1u1_subGU_384.co", 384}},
@@ -447,7 +448,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {192, {"fmoe_int8_g1u1_subGU_192", "fmoe/silu/fmoe_int8_g1u1_subGU_192.co", 192}},
             {128, {"fmoe_int8_g1u1_subGU_128", "fmoe/silu/fmoe_int8_g1u1_subGU_128.co", 128}}};
 
-        std::unordered_map<int, FMoeKernelConfig> gelu_kernel_configs = {
+        std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_512_gelu.co", 512}},
             {448, {"fmoe_int8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_448_gelu.co", 448}},
             {384, {"fmoe_int8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_384_gelu.co", 384}},
@@ -458,21 +459,28 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
 
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); // todo,add tune interface here
 
-        const auto &config_map = fc2_smooth_scale.has_value() ? multix_kernel_configs : activation == ActivationType::Gelu ? gelu_kernel_configs
-                                                                                                                           : silu_kernel_configs;
+        const auto &config_map = fc2_smooth_scale.has_value() ? multix_kernel_int8_configs : activation == ActivationType::Gelu ? gelu_kernel_int8_configs
+                                                                                                                                : silu_kernel_int8_configs;
         auto it = config_map.find(selectedTile);
         if (it != config_map.end())
         {
             const auto &config = it->second;
-            static FMoeKernel impl(config.name.c_str(), config.co_name.c_str(), config.tile_size);
-            impl_ptr = &impl;
+            const char *name = config.name.c_str();
+            const char *co_name = config.co_name.c_str();
+
+            auto result = impl_ptr_map.emplace(name, nullptr);
+            if (result.second)
+            {
+                result.first->second = std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
+            }
+            impl_ptr = result.first->second.get();
         }
         else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
     }
     else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
-        std::unordered_map<int, FMoeKernelConfig> multix_kernel_configs = {
+        std::unordered_map<int, FMoeKernelConfig> multix_kernel_fp8_configs = {
             {512, {"fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512}},
             {448, {"fmoe_fp8_g1u1_multix_subGU_448", "fmoe_fp8_g1u1_multix_subGU_448.co", 448}},
             {384, {"fmoe_fp8_g1u1_multix_subGU_384", "fmoe_fp8_g1u1_multix_subGU_384.co", 384}},
@@ -481,7 +489,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {192, {"fmoe_fp8_g1u1_multix_subGU_192", "fmoe_fp8_g1u1_multix_subGU_192.co", 192}},
             {128, {"fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128}}};
 
-        std::unordered_map<int, FMoeKernelConfig> silu_kernel_configs = {
+        std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
             {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe/silu/fmoe_fp8_g1u1_subGU_512.co", 512}},
             {448, {"fmoe_fp8_g1u1_subGU_448", "fmoe/silu/fmoe_fp8_g1u1_subGU_448.co", 448}},
             {384, {"fmoe_fp8_g1u1_subGU_384", "fmoe/silu/fmoe_fp8_g1u1_subGU_384.co", 384}},
@@ -490,7 +498,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {192, {"fmoe_fp8_g1u1_subGU_192", "fmoe/silu/fmoe_fp8_g1u1_subGU_192.co", 192}},
             {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe/silu/fmoe_fp8_g1u1_subGU_128.co", 128}}};
 
-        std::unordered_map<int, FMoeKernelConfig> gelu_kernel_configs = {
+        std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_configs = {
             {512, {"fmoe_fp8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_512_gelu.co", 512}},
             {448, {"fmoe_fp8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_448_gelu.co", 448}},
             {384, {"fmoe_fp8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_384_gelu.co", 384}},
@@ -501,15 +509,22 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
 
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
 
-        const auto &config_map = fc2_smooth_scale.has_value() ? multix_kernel_configs : activation == ActivationType::Gelu ? gelu_kernel_configs
-                                                                                                                           : silu_kernel_configs;
+        const auto &config_map = fc2_smooth_scale.has_value() ? multix_kernel_fp8_configs : activation == ActivationType::Gelu ? gelu_kernel_fp8_configs
+                                                                                                                               : silu_kernel_fp8_configs;
         auto it = config_map.find(selectedTile);
 
         if (it != config_map.end())
         {
             const auto &config = it->second;
-            static FMoeKernel impl(config.name.c_str(), config.co_name.c_str(), config.tile_size);
-            impl_ptr = &impl;
+            const char *name = config.name.c_str();
+            const char *co_name = config.co_name.c_str();
+
+            auto result = impl_ptr_map.emplace(name, nullptr);
+            if (result.second)
+            {
+                result.first->second = std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
+            }
+            impl_ptr = result.first->second.get();
         }
         else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");

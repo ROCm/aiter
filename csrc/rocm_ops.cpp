@@ -9,7 +9,6 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "moe_op.h"
-#include "moe_op.h"
 #include "moe_sorting.h"
 #include "norm.h"
 #include "pos_encoding.h"

@@ -291,7 +291,10 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
                 else:
                     act_out = F.silu(gate) * up
             else:
-                act_out = F.gelu(act_input)
+                if activation == ActivationType.Gelu:
+                    act_out = F.gelu(act_input)
+                else:
+                    act_out = F.silu(act_input)
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             out[mask] = act_out @ (w2[E_id].transpose(0, 1))
