@@ -315,37 +315,37 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
 
         if ((inter_dim % 512) == 0)
         {
-            static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe_int8_g1u0_subGU_512.co", 512);
+            static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe/silu/fmoe_int8_g1u0_subGU_512.co", 512);
             impl_ptr = &impl_int8_512;
         }
         else if ((inter_dim % 448) == 0)
         {
-            static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe_int8_g1u0_subGU_448.co", 448);
+            static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe/silu/fmoe_int8_g1u0_subGU_448.co", 448);
             impl_ptr = &impl_int8_448;
         }
         else if ((inter_dim % 384) == 0)
         {
-            static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe_int8_g1u0_subGU_384.co", 384);
+            static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe/silu/fmoe_int8_g1u0_subGU_384.co", 384);
             impl_ptr = &impl_int8_384;
         }
         else if ((inter_dim % 320) == 0)
         {
-            static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe_int8_g1u0_subGU_320.co", 320);
+            static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe/silu/fmoe_int8_g1u0_subGU_320.co", 320);
             impl_ptr = &impl_int8_320;
         }
         else if ((inter_dim % 256) == 0)
         {
-            static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe_int8_g1u0_subGU_256.co", 256);
+            static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe/silu/fmoe_int8_g1u0_subGU_256.co", 256);
             impl_ptr = &impl_int8_256;
         }
         else if ((inter_dim % 192) == 0)
         {
-            static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe_int8_g1u0_subGU_192.co", 192);
+            static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe/silu/fmoe_int8_g1u0_subGU_192.co", 192);
             impl_ptr = &impl_int8_192;
         }
         else if ((inter_dim % 128) == 0)
         {
-            static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe_int8_g1u0_subGU_128.co", 128);
+            static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe/silu/fmoe_int8_g1u0_subGU_128.co", 128);
             impl_ptr = &impl_int8_128;
         }
         else
@@ -393,7 +393,6 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
         std::string co_name;
         int tile_size;
     };
-    printf("chefang------fmoe_g1u1~\n");
     if (py_activation.is_none())
     {
         py_activation = py::module_::import("aiter").attr("ActivationType").attr("SILU");
@@ -440,22 +439,22 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {128, {"fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128}}};
 
         std::unordered_map<int, FMoeKernelConfig> silu_kernel_configs = {
-            {512, {"fmoe_int8_g1u1_subGU_512", "fmoe_int8_g1u1_subGU_512.co", 512}},
-            {448, {"fmoe_int8_g1u1_subGU_448", "fmoe_int8_g1u1_subGU_448.co", 448}},
-            {384, {"fmoe_int8_g1u1_subGU_384", "fmoe_int8_g1u1_subGU_384.co", 384}},
-            {320, {"fmoe_int8_g1u1_subGU_320", "fmoe_int8_g1u1_subGU_320.co", 320}},
-            {256, {"fmoe_int8_g1u1_subGU_256", "fmoe_int8_g1u1_subGU_256.co", 256}},
-            {192, {"fmoe_int8_g1u1_subGU_192", "fmoe_int8_g1u1_subGU_192.co", 192}},
-            {128, {"fmoe_int8_g1u1_subGU_128", "fmoe_int8_g1u1_subGU_128.co", 128}}};
+            {512, {"fmoe_int8_g1u1_subGU_512", "fmoe/silu/fmoe_int8_g1u1_subGU_512.co", 512}},
+            {448, {"fmoe_int8_g1u1_subGU_448", "fmoe/silu/fmoe_int8_g1u1_subGU_448.co", 448}},
+            {384, {"fmoe_int8_g1u1_subGU_384", "fmoe/silu/fmoe_int8_g1u1_subGU_384.co", 384}},
+            {320, {"fmoe_int8_g1u1_subGU_320", "fmoe/silu/fmoe_int8_g1u1_subGU_320.co", 320}},
+            {256, {"fmoe_int8_g1u1_subGU_256", "fmoe/silu/fmoe_int8_g1u1_subGU_256.co", 256}},
+            {192, {"fmoe_int8_g1u1_subGU_192", "fmoe/silu/fmoe_int8_g1u1_subGU_192.co", 192}},
+            {128, {"fmoe_int8_g1u1_subGU_128", "fmoe/silu/fmoe_int8_g1u1_subGU_128.co", 128}}};
 
         std::unordered_map<int, FMoeKernelConfig> gelu_kernel_configs = {
-            {512, {"fmoe_int8_g1u1_subGU_512_gelu", "gelu/fmoe_int8_g1u1_subGU_512_gelu.co", 512}},
-            {448, {"fmoe_int8_g1u1_subGU_448_gelu", "gelu/fmoe_int8_g1u1_subGU_448_gelu.co", 448}},
-            {384, {"fmoe_int8_g1u1_subGU_384_gelu", "gelu/fmoe_int8_g1u1_subGU_384_gelu.co", 384}},
-            {320, {"fmoe_int8_g1u1_subGU_320_gelu", "gelu/fmoe_int8_g1u1_subGU_320_gelu.co", 320}},
-            {256, {"fmoe_int8_g1u1_subGU_256_gelu", "gelu/fmoe_int8_g1u1_subGU_256_gelu.co", 256}},
-            {192, {"fmoe_int8_g1u1_subGU_192_gelu", "gelu/fmoe_int8_g1u1_subGU_192_gelu.co", 192}},
-            {128, {"fmoe_int8_g1u1_subGU_128_gelu", "gelu/fmoe_int8_g1u1_subGU_128_gelu.co", 128}}};
+            {512, {"fmoe_int8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_512_gelu.co", 512}},
+            {448, {"fmoe_int8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_448_gelu.co", 448}},
+            {384, {"fmoe_int8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_384_gelu.co", 384}},
+            {320, {"fmoe_int8_g1u1_subGU_320_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_320_gelu.co", 320}},
+            {256, {"fmoe_int8_g1u1_subGU_256_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_256_gelu.co", 256}},
+            {192, {"fmoe_int8_g1u1_subGU_192_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_192_gelu.co", 192}},
+            {128, {"fmoe_int8_g1u1_subGU_128_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_128_gelu.co", 128}}};
 
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128}); // todo,add tune interface here
 
@@ -483,22 +482,22 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {128, {"fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128}}};
 
         std::unordered_map<int, FMoeKernelConfig> silu_kernel_configs = {
-            {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe_fp8_g1u1_subGU_512.co", 512}},
-            {448, {"fmoe_fp8_g1u1_subGU_448", "fmoe_fp8_g1u1_subGU_448.co", 448}},
-            {384, {"fmoe_fp8_g1u1_subGU_384", "fmoe_fp8_g1u1_subGU_384.co", 384}},
-            {320, {"fmoe_fp8_g1u1_subGU_320", "fmoe_fp8_g1u1_subGU_320.co", 320}},
-            {256, {"fmoe_fp8_g1u1_subGU_256", "fmoe_fp8_g1u1_subGU_256.co", 256}},
-            {192, {"fmoe_fp8_g1u1_subGU_192", "fmoe_fp8_g1u1_subGU_192.co", 192}},
-            {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe_fp8_g1u1_subGU_128.co", 128}}};
+            {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe/silu/fmoe_fp8_g1u1_subGU_512.co", 512}},
+            {448, {"fmoe_fp8_g1u1_subGU_448", "fmoe/silu/fmoe_fp8_g1u1_subGU_448.co", 448}},
+            {384, {"fmoe_fp8_g1u1_subGU_384", "fmoe/silu/fmoe_fp8_g1u1_subGU_384.co", 384}},
+            {320, {"fmoe_fp8_g1u1_subGU_320", "fmoe/silu/fmoe_fp8_g1u1_subGU_320.co", 320}},
+            {256, {"fmoe_fp8_g1u1_subGU_256", "fmoe/silu/fmoe_fp8_g1u1_subGU_256.co", 256}},
+            {192, {"fmoe_fp8_g1u1_subGU_192", "fmoe/silu/fmoe_fp8_g1u1_subGU_192.co", 192}},
+            {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe/silu/fmoe_fp8_g1u1_subGU_128.co", 128}}};
 
         std::unordered_map<int, FMoeKernelConfig> gelu_kernel_configs = {
-            {512, {"fmoe_fp8_g1u1_subGU_512_gelu", "gelu/fmoe_fp8_g1u1_subGU_512_gelu.co", 512}},
-            {448, {"fmoe_fp8_g1u1_subGU_448_gelu", "gelu/fmoe_fp8_g1u1_subGU_448_gelu.co", 448}},
-            {384, {"fmoe_fp8_g1u1_subGU_384_gelu", "gelu/fmoe_fp8_g1u1_subGU_384_gelu.co", 384}},
-            {320, {"fmoe_fp8_g1u1_subGU_320_gelu", "gelu/fmoe_fp8_g1u1_subGU_320_gelu.co", 320}},
-            {256, {"fmoe_fp8_g1u1_subGU_256_gelu", "gelu/fmoe_fp8_g1u1_subGU_256_gelu.co", 256}},
-            {192, {"fmoe_fp8_g1u1_subGU_192_gelu", "gelu/fmoe_fp8_g1u1_subGU_192_gelu.co", 192}},
-            {128, {"fmoe_fp8_g1u1_subGU_128_gelu", "gelu/fmoe_fp8_g1u1_subGU_128_gelu.co", 128}}};
+            {512, {"fmoe_fp8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_512_gelu.co", 512}},
+            {448, {"fmoe_fp8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_448_gelu.co", 448}},
+            {384, {"fmoe_fp8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_384_gelu.co", 384}},
+            {320, {"fmoe_fp8_g1u1_subGU_320_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_320_gelu.co", 320}},
+            {256, {"fmoe_fp8_g1u1_subGU_256_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_256_gelu.co", 256}},
+            {192, {"fmoe_fp8_g1u1_subGU_192_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_192_gelu.co", 192}},
+            {128, {"fmoe_fp8_g1u1_subGU_128_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_128_gelu.co", 128}}};
 
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
 

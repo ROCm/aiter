@@ -38,12 +38,14 @@ def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    fc2_scale=None,  # [expert, model_dim, 1]
                    fc1_smooth_scale=None,  # [expert, 1, model_dim]
                    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+                   activation = ActivationType.Silu
                    ):
     return torch_moe(hidden_states,
                      w1,
                      w2,
                      topk_weight,
-                     topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+                     topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale,
+                     None, activation)
 
 
 @perftest()
@@ -203,7 +205,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         # ref2 implement
         ref2, avg_c = torch_moe_test(input, w1, w2, topk_weights, topk_ids,
                                      fc1_scale, fc2_scale,
-                                     fc1_smooth_scale, fc2_smooth_scale)
+                                     fc1_smooth_scale, fc2_smooth_scale, activation)
 
         # b implement
         if use_int4:
@@ -267,22 +269,23 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
 #                           quant='No')
 #                         #   quant='No', use_g1u1=True)
 
-print('\ng1u1 int8quant')
-for dtype in [torch.bfloat16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
-                        #   quant='int8quant', use_g1u1=True)
-
-# print('\ng1u1 fp8quant')
+# print('\ng1u1 int8quant')
 # for dtype in [torch.bfloat16]:
 #     for m in [128, 256]:
 #         for dim in [4096, 8192]:
 #             for hdim in [1024]:
 #                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-#                           quant='fp8quant', use_g1u1=True)
+#                         #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
+#                           quant='int8quant', use_g1u1=True)
+
+print('\ng1u1 fp8quant')
+for dtype in [torch.bfloat16]:
+    for m in [128, 256]:
+        for dim in [4096, 8192]:
+            for hdim in [1024]:
+                test_fmoe(dtype, m, dim, hdim, 32, 5,
+                          quant='fp8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
+                        #   quant='fp8quant', use_g1u1=True)
 
 
 # print('\ng1u0 int8smoothquant')

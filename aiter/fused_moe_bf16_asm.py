@@ -66,7 +66,6 @@ def asm_moe(hidden_states,
 
     if fc1_scale is None:
         # pure bf16
-        print("aiter.fmoe.------------------chefang")
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
                    sorted_weights, sorted_expert_ids, num_valid_ids, topk)
     elif a16:
@@ -92,7 +91,6 @@ def asm_moe(hidden_states,
                 f"Invalid args: {w1.dtype} {w1.shape=} {w2.shape=}")
 
     else:
-        print("------else-------")
         # a8w8 fmoe, opt: smooth quant
         a8_type = w1.dtype if w1.dtype != torch.int32 and w1.dtype != torch.uint32 else torch.float8_e4m3fnuz
         if fc1_smooth_scale is not None:
@@ -136,10 +134,8 @@ def asm_moe(hidden_states,
                 a8, a8_scale = aiter.pertoken_quant(
                     hidden_states, torch.float, quant_dtype=w1.dtype)
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
-            print("-------aiter.fmoe_int8_g1u0--------------")
             fmoe_func = aiter.fmoe_int8_g1u0
         elif w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
-            print("---------aiter.fmoe_g1u1------------------")
             fmoe_func = aiter.fmoe_g1u1
         else:
             raise ValueError(
@@ -238,7 +234,8 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
               fc2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
               fc1_smooth_scale=None,  # [expert(local_expert:EP), 1, model_dim]
               fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-              expert_mask=None):
+              expert_mask=None,
+              activation = ActivationType.Silu):
     computeType = torch.float
     dtype = hidden_states.dtype
     hidden_states = hidden_states.to(computeType)
@@ -289,7 +286,10 @@ def torch_moe(hidden_states, w1, w2, topk_weight, topk_ids,
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
             if moeType == "g1u1":
                 gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-                act_out = F.silu(gate) * up
+                if activation == ActivationType.Gelu:
+                    act_out = F.gelu(gate) * up
+                else:
+                    act_out = F.silu(gate) * up
             else:
                 act_out = F.gelu(act_input)
             if fc2_smooth_scale is not None:
