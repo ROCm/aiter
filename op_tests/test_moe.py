@@ -266,8 +266,7 @@ for dtype in [torch.float16, torch.bfloat16]:
             for hdim in [1024]:
                 # test_fmoe(dtype, m, dim, hdim, 32, 5)
                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='No')
-                        #   quant='No', use_g1u1=True)
+                          quant='No', use_g1u1=True)
 
 print('\ng1u1 int8quant')
 for dtype in [torch.bfloat16]:

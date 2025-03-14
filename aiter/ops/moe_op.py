@@ -70,7 +70,7 @@ def fmoe_int8_g1u0(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[ActivationType] = ActivationType.Silu,
+    activation: Optional[_ActivationType] = ActivationType.Silu,
 ): ...
 
 
@@ -89,7 +89,7 @@ def fmoe_g1u1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[ActivationType] = ActivationType.Silu,
+    activation: Optional[_ActivationType] = ActivationType.Silu,
 ): ...
 
 
