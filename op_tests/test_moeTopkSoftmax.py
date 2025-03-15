@@ -77,7 +77,7 @@ def test_topk_softmax(dtype, m, n, E, topk):
 
 
 @aiter.test_common.benchmark()
-def test_biased_grouped_topk(token, expert, group, topk, topk_group, need_renorm, dtype):
+def test_biased_grouped_topk(token, expert, group, topk, topk_group, need_renorm, dtype, scale_factor=1.0):
     gating_output = torch.randn((token, expert), dtype=dtype)
     correction_bias = torch.randn((expert,), dtype=dtype)
 
@@ -90,6 +90,7 @@ def test_biased_grouped_topk(token, expert, group, topk, topk_group, need_renorm
                                            topk_group,
                                            num_iters=2, num_warmup=1
                                            )
+    w_ref = w_ref * scale_factor
     w_aiter = torch.empty_strided((token, topk),
                                   (topk+10, 1),
                                   dtype=torch.float32)
@@ -104,7 +105,7 @@ def test_biased_grouped_topk(token, expert, group, topk, topk_group, need_renorm
                                group,
                                topk_group,
                                need_renorm,
-                               1.0
+                               scale_factor
                                )
     id_ref, _ref = torch.sort(id_ref)
     id_aiter, _aiter = torch.sort(id_aiter)
@@ -119,6 +120,43 @@ def test_biased_grouped_topk(token, expert, group, topk, topk_group, need_renorm
     checkAllclose(id_ref, id_aiter,
                   msg=f'topk_ids     [golden vs aiter]:{us_ref:.2f} us vs {us_aiter:.2f} us......')
 
+
+@benchmark()
+def test_grouped_topk(token, expert, group, topk, topk_group, need_renorm, dtype, scale_factor=1.0, scoring_func = "softmax"):
+    gating_output = torch.randn((token, expert), dtype=dtype)
+
+    (w_ref, id_ref), us_ref = run_perftest(aiter.grouped_topk_torch,
+                                           gating_output,
+                                           topk,
+                                           need_renorm,
+                                           group,
+                                           topk_group,
+                                           scoring_func,
+                                           num_iters=2, num_warmup=1
+                                           )
+    w_ref = w_ref * scale_factor
+    w_aiter = torch.empty_strided((token, topk),
+                                  (topk+10, 1),
+                                  dtype=torch.float32)
+    id_aiter = torch.empty_strided((token, topk),
+                                   (topk+10, 1),
+                                   dtype=torch.int32)
+    _, us_aiter = run_perftest(aiter.grouped_topk,
+                               gating_output,
+                               w_aiter,
+                               id_aiter,
+                               group,
+                               topk_group,
+                               need_renorm,
+                               scoring_func,
+                               scale_factor,
+                               )
+    id_ref, _ref = torch.sort(id_ref)
+    id_aiter, _aiter = torch.sort(id_aiter)
+    checkAllclose(w_ref.gather(1, _ref), w_aiter.gather(1, _aiter),
+                  msg=f'topk_weights [golden vs aiter]')
+    checkAllclose(id_ref, id_aiter,
+                  msg=f'topk_ids     [golden vs aiter]:{us_ref:.2f} us vs {us_aiter:.2f} us......')
 
 for dtype in [torch.float16, torch.bfloat16]:
     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256][-2:-1]:
@@ -137,3 +175,15 @@ for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000][:]
     need_renorm = True
     test_biased_grouped_topk(token, expert, group, topk,
                              topk_group, need_renorm, dtype)
+
+for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000]:
+    for scoring_func in ["softmax", "sigmoid"]:
+        # DeepSeek-R1
+        topk = 8
+        group = 8
+        topk_group = 4
+        expert = 256
+        dtype = torch.bfloat16
+        need_renorm = True
+        test_grouped_topk(token, expert, group, topk,
+                            topk_group, need_renorm, dtype,scale_factor=1.5, scoring_func=scoring_func)

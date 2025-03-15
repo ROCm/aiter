@@ -8,13 +8,15 @@ logger = logging.getLogger("aiter")
 import importlib.util
 if importlib.util.find_spec('aiter_') is not None:
     from aiter_ import *
-if importlib.util.find_spec('hipbsolidxgemm_') is not None:
-    from hipbsolidxgemm_ import *
-if importlib.util.find_spec('rocsolidxgemm_') is not None:
-    from rocsolidxgemm_ import *
+# if importlib.util.find_spec('hipbsolidxgemm_') is not None:
+#     from hipbsolidxgemm_ import *
+# if importlib.util.find_spec('rocsolidxgemm_') is not None:
+#     from rocsolidxgemm_ import *
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *
+from .ops.batched_gemm_op_a8w8 import *
+from .ops.batched_gemm_op_bf16 import *
 from .ops.aiter_operator import *
 from .ops.activation import *
 from .ops.attention import *
@@ -29,6 +31,7 @@ from .ops.communication import *
 from .ops.rope import *
 from .ops.topk import *
 from .ops.mha import *
+from .ops.gradlib import *
 from . import mla
 
 def getLogger():

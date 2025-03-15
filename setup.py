@@ -39,27 +39,6 @@ else:
 
 FORCE_CXX11_ABI = False
 
-
-def get_hip_version():
-    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
-
-def rename_cpp_to_cu(pths):
-    return core.rename_cpp_to_cu(pths, bd_dir)
-
-
-def validate_and_update_archs(archs):
-    # List of allowed architectures
-    allowed_archs = ["native", "gfx90a",
-                     "gfx940", "gfx941", "gfx942", "gfx1100"]
-
-    # Validate if each element in archs is in allowed_archs
-    assert all(
-        arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported"
-
-
-ext_modules = []
-
 if IS_ROCM:
     # use codegen get code dispatch
     if not os.path.exists(bd_dir):
@@ -71,50 +50,9 @@ if IS_ROCM:
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
-    # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
-    # See https://github.com/pytorch/pytorch/pull/70650
-    generator_flag = [f'-DAITER_ASM_DIR="{this_dir}/hsa/"']
-    torch_dir = torch.__path__[0]
-    if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
-        generator_flag.append("-DOLD_GENERATOR_PATH")
     assert os.path.exists(
         ck_dir), f'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
-    cc_flag = []
-
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
-    validate_and_update_archs(archs)
-
-    cc_flag = [f"--offload-arch={arch}" for arch in archs]
-    hip_version = get_hip_version()
-    cc_flag += [
-        "-mllvm", "-enable-post-misched=0",
-        "-mllvm", "-amdgpu-early-inline-all=true",
-        "-mllvm", "-amdgpu-function-calls=false",
-        "-mllvm", "--amdgpu-kernarg-preload-count=16",
-        "-mllvm", "-amdgpu-coerce-illegal-types=1",
-        "-Wno-unused-result",
-        "-Wno-switch-bool",
-        "-Wno-vla-cxx-extension",
-        "-Wno-undefined-func-template",
-        "-fgpu-flush-denormals-to-zero",
-    ]
-
-    # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-    hip_version = get_hip_version()
-    if hip_version > Version('5.7.23302'):
-        cc_flag += ["-fno-offload-uniform-block"]
-    if hip_version > Version('6.1.40090'):
-        cc_flag += ["-mllvm", "-enable-post-misched=0"]
-    if hip_version > Version('6.2.41132'):
-        cc_flag += ["-mllvm", "-amdgpu-early-inline-all=true",
-                    "-mllvm", "-amdgpu-function-calls=false"]
-    if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
-        cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
-
-    # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
-    # torch._C._GLIBCXX_USE_CXX11_ABI
-    # https://github.com/pytorch/pytorch/blob/8472c24e3b5b60150096486616d98b7bea01500b/torch/utils/cpp_extension.py#L920
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
@@ -130,58 +68,13 @@ if IS_ROCM:
 
         core.build_module(md_name = "aiter_",
                     srcs = all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
-                    flags_extra_cc = all_opts_args_build["flags_extra_cc"],
-                    flags_extra_hip = all_opts_args_build["flags_extra_hip"],
+                    flags_extra_cc = all_opts_args_build["flags_extra_cc"]+ ["-DPREBUILD_KERNELS"],
+                    flags_extra_hip = all_opts_args_build["flags_extra_hip"] + ["-DPREBUILD_KERNELS"],
                     blob_gen_cmd = all_opts_args_build["blob_gen_cmd"],
                     extra_include = all_opts_args_build["extra_include"],
                     extra_ldflags = None,
                     verbose = False,
         )
-
-    # ########## gradlib for tuned GEMM start here
-    renamed_sources = rename_cpp_to_cu([f"{this_dir}/gradlib/csrc"])
-    include_dirs = []
-    ext_modules.append(
-        CUDAExtension(
-            name='rocsolidxgemm_',
-            sources=[f'{bd_dir}/rocsolgemm.cu'],
-            include_dirs=include_dirs,
-            # add additional libraries argument for hipblaslt
-            libraries=['rocblas'],
-            extra_compile_args={
-                'cxx': [
-                    '-O3',
-                    '-DLEGACY_HIPBLAS_DIRECT=ON',
-                ],
-                'nvcc': [
-                    '-O3',
-                    '-U__CUDA_NO_HALF_OPERATORS__',
-                    '-U__CUDA_NO_HALF_CONVERSIONS__',
-                    "-ftemplate-depth=1024",
-                    '-DLEGACY_HIPBLAS_DIRECT=ON',
-                ] + cc_flag
-            }))
-    ext_modules.append(
-        CUDAExtension(
-            name='hipbsolidxgemm_',
-            sources=[f'{bd_dir}/hipbsolgemm.cu'],
-            include_dirs=include_dirs,
-            # add additional libraries argument for hipblaslt
-            libraries=['hipblaslt'],
-            extra_compile_args={
-                'cxx': [
-                    '-O3',
-                    '-DLEGACY_HIPBLAS_DIRECT=ON',
-                ],
-                'nvcc': [
-                    '-O3',
-                    '-U__CUDA_NO_HALF_OPERATORS__',
-                    '-U__CUDA_NO_HALF_CONVERSIONS__',
-                    "-ftemplate-depth=1024",
-                    '-DLEGACY_HIPBLAS_DIRECT=ON',
-                ] + cc_flag + ['-DENABLE_TORCH_FP8'] if hasattr(torch, 'float8_e4m3fnuz') else []
-            }))
-    # ########## gradlib for tuned GEMM end here
 else:
     raise NotImplementedError("Only ROCM is supported")
 
@@ -228,7 +121,7 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    ext_modules=ext_modules,
+    #ext_modules=ext_modules,
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     # install_requires=[
