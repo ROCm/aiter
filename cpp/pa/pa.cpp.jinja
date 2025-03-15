@@ -1,0 +1,115 @@
+#include "pa.cuh"
+                        
+                        
+extern "C" {
+void call(void* out_ptr,
+        void* exp_sums_ptr_,
+        void* max_logits_ptr_,
+        void* tmp_out_ptr_,
+        void* query_ptr,
+        void* key_cache_ptr,
+        void* value_cache_ptr,
+        float scale,
+        int* block_tables_ptr,
+        int* context_lens_ptr,
+        int max_context_len,
+        const int num_seqs,
+        const int num_kv_heads,
+        const int num_heads,
+        const int q_stride,
+        const int kv_block_stride,
+        const int kv_head_stride,
+        const float* alibi_slopes_ptr,
+        float k_scale,
+        float v_scale,
+        const float* fp8_out_scale_ptr,
+        void* stream);
+}
+                        
+void call(void* out_ptr,
+        void* exp_sums_ptr_,
+        void* max_logits_ptr_,
+        void* tmp_out_ptr_,
+        void* query_ptr,
+        void* key_cache_ptr,
+        void* value_cache_ptr,
+        float scale,
+        int* block_tables_ptr,
+        int* context_lens_ptr,
+        int max_context_len,
+        const int num_seqs,
+        const int num_kv_heads,
+        const int num_heads,
+        const int q_stride,
+        const int kv_block_stride,
+        const int kv_head_stride,
+        const float* alibi_slopes_ptr,
+        float k_scale,
+        float v_scale,
+        const float* fp8_out_scale_ptr,
+        void* stream)
+{
+    constexpr int block_size = {{block_size}};
+    constexpr int PARTITION_SIZE = 256;
+    const int max_num_blocks_per_seq = (max_context_len + block_size - 1) / block_size;
+    const int max_num_partitions =
+      DIVIDE_ROUND_UP(max_context_len, PARTITION_SIZE);
+    constexpr int head_size = {{head_size}};
+    const int max_ctx_blocks = DIVIDE_ROUND_UP(max_context_len, block_size);
+    
+    assert(num_heads % num_kv_heads == 0);
+
+    float* exp_sums_ptr   = reinterpret_cast<float*>(exp_sums_ptr_);
+    float* max_logits_ptr = reinterpret_cast<float*>(max_logits_ptr_);
+    {{dtype}}* tmp_out_ptr =
+        reinterpret_cast<{{dtype}}*>(tmp_out_ptr_);
+
+    constexpr int NTHR = 256;
+    dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
+    dim3 block(NTHR);
+
+    paged_attention_ll4mi_QKV_mfma16_kernel<{{dtype}},                       
+                                            {{kv_dtype}},
+                                            {% if fp8_kv_dtype == 'auto' %}
+                                            vllm::Fp8KVCacheDataType::kAuto,
+                                            {% else %}
+                                            vllm::Fp8KVCacheDataType::kFp8E4M3,
+                                            {% endif %}             
+                                            {{out_dtype}},                    
+                                            {{block_size}},              
+                                            head_size,               
+                                            NTHR,                    
+                                            {{gqa_ratio}}>               
+    <<<grid, block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{dtype}}*>(query_ptr),                      
+                                    reinterpret_cast<{{kv_dtype}}*>(key_cache_ptr),                  
+                                    reinterpret_cast<{{kv_dtype}}*>(value_cache_ptr),         
+                                    num_kv_heads,       
+                                    scale,                          
+                                    block_tables_ptr,                  
+                                    context_lens_ptr,            
+                                    max_num_blocks_per_seq,          
+                                    alibi_slopes_ptr,               
+                                    q_stride,                       
+                                    kv_block_stride,                
+                                    kv_head_stride,                             
+                                    exp_sums_ptr,                   
+                                    max_logits_ptr,                 
+                                    tmp_out_ptr,                    
+                                    reinterpret_cast<{{out_dtype}}*>(out_ptr),                        
+                                    max_ctx_blocks,                
+                                    k_scale,                    
+                                    v_scale,                    
+                                    fp8_out_scale_ptr);
+
+    dim3 reduce_grid(num_heads, num_seqs);
+    dim3 reduce_block(head_size);
+    paged_attention_ll4mi_reduce_kernel<{{dtype}}, {{out_dtype}}, head_size, head_size, PARTITION_SIZE, {{npar_loops}}> 
+    <<<reduce_grid, reduce_block, 0, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<{{out_dtype}}*>(out_ptr),                                        
+                                                                              exp_sums_ptr,        
+                                                                              max_logits_ptr,                                 
+                                                                              tmp_out_ptr,                                   
+                                                                              context_lens_ptr,                                 
+                                                                              max_num_partitions,                                               
+                                                                              fp8_out_scale_ptr);
+                                    
+}
