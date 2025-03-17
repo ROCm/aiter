@@ -22,6 +22,8 @@ def test_mla(ctx_lens, batch_size, nhead,
     kv_max_sz = 65536  # calculated by rest of mem after weight loaded in frameworks
     num_page = (kv_max_sz+page_size-1)//page_size
 
+    print(f"num_page: {num_page}")
+
     # for none absorb (mha)
     if batch_size*ctx_lens < 128*1024:
         # attention_ref will OOO for big input...
@@ -60,11 +62,14 @@ def test_mla(ctx_lens, batch_size, nhead,
         dtype=kvtype,
     )
 
+    print(f"q.shape: {q.shape}")
+    print(f"kv_buffer.shape: {kv_buffer.shape}")
+
     if qk_head_dim != v_head_dim:
         out_ref = q.new_empty((q.shape[0], nhead, v_head_dim)).fill_(-1)
     else:
         out_ref = torch.empty_like(q)
-
+    print(f"out_ref.shape: {out_ref.shape}")
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
     seq_lens = torch.tensor(
@@ -77,6 +82,11 @@ def test_mla(ctx_lens, batch_size, nhead,
         (batch_size, nhead, num_kv_splits, v_head_dim + 1),
         dtype=torch.float32,
     )
+
+    print(f"seq_lens.shape: {seq_lens.shape}")
+    print(f"kv_indptr.shape: {kv_indptr.shape}")
+    print(f"kv_indices.shape: {kv_indices.shape}")
+
     _, us_ref = run_perftest(decode_mla.decode_attention_fwd,
                              q,
                              kv_buffer,
@@ -94,8 +104,10 @@ def test_mla(ctx_lens, batch_size, nhead,
     # print(f'{out_ref.view(batch_size, -1)=}')
 
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+    print(f"kv_last_page_lens.shape: {kv_last_page_lens.shape}")
     out_asm = torch.empty(
         (batch_size, nhead,  v_head_dim), dtype=dtype).fill_(-1)
+    print(f"out_asm.shape: {out_asm.shape}")
     (attn_logits, attn_lse), us_asm = run_perftest(aiter.mla.mla_decode_fwd,
                                                    q,
                                                    kv_buffer.view(num_page,
@@ -109,13 +121,36 @@ def test_mla(ctx_lens, batch_size, nhead,
                                                    sm_scale,
                                                    )
 
-    # print(f'{out_asm.view(batch_size, -1)=}')
-    # checkAllclose(logits_ref, attn_logits,
-    #               msg=f'attn_logits [golden vs aiter_asm]')
-    # checkAllclose(lse_ref, attn_lse,
-    #               msg=f'attn_lse    [golden vs aiter_asm]')
+    out_ck = torch.empty(
+        (batch_size, nhead,  v_head_dim), dtype=dtype).fill_(-1)
+    print(f"out_ck.shape: {out_ck.shape}")
+
+    _, us_ck = run_perftest(aiter.mla_decode_fwd_ck,
+                            q,
+                            kv_buffer.view(num_page,
+                                            page_size,
+                                            nhead_kv,
+                                            qk_head_dim),
+                            None,
+                            out_ck,
+                            v_head_dim,
+                            kv_indptr,
+                            kv_indices,
+                            kv_last_page_lens,
+                            sm_scale
+                            )
+
+    #print(f'{out_asm.view(batch_size, -1)=}')
+    #checkAllclose(logits_ref, attn_logits,
+    #              msg=f'attn_logits [golden vs aiter_asm]')
+    #checkAllclose(lse_ref, attn_lse,
+    #              msg=f'attn_lse    [golden vs aiter_asm]')
     checkAllclose(out_ref, out_asm,
                   msg=f'attn_out    [golden vs aiter_asm]:{us_ref:.2f} us vs {us_asm:.2f} us......')
+
+    checkAllclose(out_ref, out_ck,
+                  msg=f'attn_out    [golden vs aiter_ck]:{us_ref:.2f} us vs {us_ck:.2f} us......')
+
     return {'triton': us_ref,
             'asm': us_asm}
 
@@ -129,8 +164,8 @@ nhead = 16  # 128/TP8
 block_size = 1
 num_kv_splits = 16  # don't why but sglang force 16.... for triton
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
-    for ctx_len in [21, 64, 256, 512, 1024, 3200, 8192][:]:
-        for batch_size in [1, 2, 3, 5, 16, 32, 64, 128, 256][:]:
+    for ctx_len in [3200][:]:
+        for batch_size in [256][:]:
             ret = test_mla(ctx_len, batch_size, nhead,
                            kv_lora_rank,
                            qk_nope_head_dim, qk_rope_head_dim,

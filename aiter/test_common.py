@@ -158,6 +158,11 @@ def get_trace_perf(prof, num_iters):
 
 
 def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg='', printNum=8):
+ 
+    if a.shape != b.shape:
+        logger.warning(f"{msg} [checkAllclose] Shape mismatch: {a.shape} vs {b.shape}")
+        return False
+
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = ~isClose
     if isClose.all():
