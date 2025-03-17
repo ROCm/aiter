@@ -94,10 +94,13 @@ class RotaryEmbedding(nn.Module):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        cache = self._compute_cos_sin_cache()
-        cache = cache.to(dtype)
-        self.cos_sin_cache: torch.Tensor
-        self.register_buffer("cos_sin_cache", cache, persistent=False)
+        cos, sin = self._compute_cos_sin_cache()
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
+        self.cos_cache: torch.Tensor
+        self.sin_cache: torch.Tensor
+        self.register_buffer("cos_cache", cos, persistent=False)
+        self.register_buffer("sin_cache", sin, persistent=False)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -115,10 +118,9 @@ class RotaryEmbedding(nn.Module):
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        cos = freqs.cos().unsqueeze(-2).unsqueeze(-2)
+        sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
+        return cos, sin
 
     def forward_native(
         self,
@@ -132,8 +134,10 @@ class RotaryEmbedding(nn.Module):
             positions = positions + offsets
         positions = positions.flatten()
         num_tokens = positions.shape[0]
-        cos_sin = self.cos_sin_cache.index_select(0, positions)
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        # cos_sin = self.cos_sin_cache.index_select(0, positions)
+        # cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = self.cos_cache.index_select(0, positions).squeeze(-2).squeeze(-2)
+        sin = self.sin_cache.index_select(0, positions).squeeze(-2).squeeze(-2)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
@@ -166,42 +170,69 @@ class RotaryEmbedding(nn.Module):
         # from vllm import _custom_ops as ops
         import aiter as ops
 
-        self.cos_sin_cache = self.cos_sin_cache.to(query.device,
-                                                   dtype=query.dtype)
+        self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
+        self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
         # ops.rotary_embedding()/batched_rotary_embedding()
         # are in-place operations that update the query and key tensors.
         if offsets is not None:
             ops.batched_rotary_embedding(positions, query, key, self.head_size,
-                                         self.cos_sin_cache,
+                                         self.cos_cache, self.sin_cache,
                                          self.is_neox_style, is_nope_first, self.rotary_dim,
                                          offsets)
         else:
             ops.rotary_embedding_fwd(positions, query, key, self.head_size,
-                                     self.cos_sin_cache, self.is_neox_style, is_nope_first)
+                                     self.cos_cache, self.sin_cache, self.is_neox_style, is_nope_first)
         return query, key
 
-    def forward_xpu(
+    def forward_new(
         self,
         positions: torch.Tensor,
+        # if     is_nope_first
+        # [num_tokens, num_heads, nope_size+rope_size]
+        # if NOT is_nope_first
+        # [num_tokens, num_heads, rope_size+nope_size],
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
+        is_nope_first=False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        from vllm._ipex_ops import ipex_ops as ops
+        import aiter as ops
+        self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
+        self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
+        cos, sin = self.cos_cache, self.sin_cache
+        
+        rotate_style = 0 if self.is_neox_style else 1
+        query_shape = query.shape
+        if key is not None:
+            key_shape = key.shape
+        if query.dim() == 3 and query.shape[-1] == self.head_size: # [num_tokens, num_heads, head_size]
+            query = query.unsqueeze(0)
+        elif query.dim() == 3: # [batch_size, seq_len, num_heads*head_size]
+            query = query.view(query.size(0), query.size(1), query.size(2)// self.head_size, self.head_size)
+        elif query.dim() == 2: # [num_tokens, num_heads*head_size]
+            query = query.view(1, query.size(0), query.size(1)// self.head_size, self.head_size)
 
-        self.cos_sin_cache = self.cos_sin_cache.to(positions.device,
-                                                   dtype=query.dtype)
-        # ops.rotary_embedding()/batched_rotary_embedding()
-        # are in-place operations that update the query and key tensors.
+        if key.dim() == 3 and key.shape[-1] == self.head_size: # [num_tokens, num_heads, head_size]
+            key = key.unsqueeze(0)
+        elif key.dim() == 3: # [batch_size, seq_len, num_heads*head_size]
+            key = key.view(key.size(0), key.size(1), key.size(2)// self.head_size, self.head_size)
+        elif key.dim() == 2: # [num_tokens, num_heads*head_size]
+            key = key.view(1, key.size(0), key.size(1)// self.head_size, self.head_size)
+
+        positions = positions.view(*query.shape[:2])
         if offsets is not None:
-            ops.batched_rotary_embedding(positions, query, key, self.head_size,
-                                         self.cos_sin_cache,
-                                         self.is_neox_style, self.rotary_dim,
-                                         offsets)
+            offsets = offsets.view(*query.shape[:2])
+    
+        if key is not None:
+            if offsets is None:
+                ops.rope_cached_positions_2c_fwd_inplace(query, key, cos, sin, positions, rotate_style, 
+                                                                reuse_freqs_front_part=True, nope_first=is_nope_first)
+            else:
+                ops.rope_cached_positions_offsets_2c_fwd_inplace(query, key, cos, sin, positions, offsets, rotate_style, 
+                                                                    reuse_freqs_front_part=True, nope_first=is_nope_first)
+            return query.view(query_shape), key.view(key_shape)
         else:
-            ops.rotary_embedding(positions, query, key, self.head_size,
-                                 self.cos_sin_cache, self.is_neox_style)
-        return query, key
+            return query, key
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"

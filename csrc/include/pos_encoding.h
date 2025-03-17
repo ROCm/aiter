@@ -19,10 +19,10 @@
 
 void rotary_embedding(torch::Tensor &positions, torch::Tensor &query,
                       torch::Tensor &key, int64_t head_size,
-                      torch::Tensor &cos_sin_cache, bool is_neox, bool is_nope_first);
+                      torch::Tensor &cos_cache, torch::Tensor &sin_cache, bool is_neox, bool is_nope_first);
 
 void batched_rotary_embedding(torch::Tensor &positions, torch::Tensor &query,
                               torch::Tensor &key, int64_t head_size,
-                              torch::Tensor &cos_sin_cache, bool is_neox, bool is_nope_first,
+                              torch::Tensor &cos_cache, torch::Tensor &sin_cache, bool is_neox, bool is_nope_first,
                               int64_t rot_dim,
                               torch::Tensor &cos_sin_cache_offsets);

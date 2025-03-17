@@ -74,16 +74,16 @@ def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, rot
     return aiter.rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, rotate_style, reuse_freqs_front_part, nope_first)
 
 @perftest()
-def legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos_sin, positions, rotate_style, nope_first):
+def legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos, sin, positions, rotate_style, nope_first):
     s, b, h, d = input_x.shape
-    aiter.rotary_embedding_fwd(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos_sin, rotate_style is RotateStyle.NEOX)
+    aiter.rotary_embedding_fwd(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first)
     return input_x, input_y
 
 @perftest()
-def legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos_sin, positions, offsets, rotate_style, nope_first):
+def legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, nope_first):
     s, b, h, d = input_x.shape
-    rotate_dim =  cos_sin.size(1)
-    aiter.batched_rotary_embedding(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos_sin, rotate_style is RotateStyle.NEOX, rotate_dim, offsets.view(-1))
+    rotate_dim = sin.size(-1) * 2
+    aiter.batched_rotary_embedding(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first, rotate_dim, offsets.view(-1))
     return input_x, input_y
 
 
@@ -257,7 +257,6 @@ nope_first: {nope_first}
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
-    cos_sin = torch.cat((cos, sin), dim=-1).squeeze(1,2)
 
     # perftest cannot test correction of inplace operators
     if check_correction:
@@ -269,10 +268,10 @@ nope_first: {nope_first}
         leg_input_x, leg_input_y = input_x.clone().view(s * b, -1), input_y.clone().view(s * b, -1)
         if offsets is None:
             aiter.rope_cached_positions_2c_fwd_inplace(hip_input_x, hip_input_y, cos, sin, positions, rotate_style, True, nope_first)
-            aiter.rotary_embedding_fwd(positions, leg_input_x, leg_input_y, d, cos_sin, rotate_style is RotateStyle.NEOX)
+            aiter.rotary_embedding_fwd(positions, leg_input_x, leg_input_y, d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first)
         else:
             aiter.rope_cached_positions_offsets_2c_fwd_inplace(hip_input_x, hip_input_y, cos, sin, positions, offsets, rotate_style, True, nope_first)
-            aiter.batched_rotary_embedding(positions, leg_input_x, leg_input_y, d, cos_sin, rotate_style is RotateStyle.NEOX, cos_sin.size(1), offsets.view(-1))
+            aiter.batched_rotary_embedding(positions, leg_input_x, leg_input_y, d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first, cos.size(-1)*2, offsets.view(-1))
 
         checkAllclose(ref_x, hip_input_x, msg=f"correction: hip_fwd_x - {input_msg}\n")
         checkAllclose(ref_y, hip_input_y, msg=f"correction: hip_fwd_y - {input_msg}\n")
@@ -280,11 +279,11 @@ nope_first: {nope_first}
         checkAllclose(ref_y, leg_input_y.view(s, b, h_y, d), msg=f"correction: leg_fwd_y - {input_msg}\n")
 
     if offsets is None:
-        _, leg_cached_fwd_avg = legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos_sin, positions, rotate_style, nope_first)
+        _, leg_cached_fwd_avg = legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos, sin, positions, rotate_style, nope_first)
         _, hip_cached_fwd_avg = hip_rope_cached_positions_2d_fwd_inplace(
             input_x, input_y, cos, sin, positions, rotate_style, True, nope_first)
     else:
-        _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos_sin, positions, offsets, rotate_style, nope_first)
+        _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, nope_first)
         _, hip_cached_fwd_avg = hip_rope_cached_positions_offsets_2d_fwd_inplace(
             input_x, input_y, cos, sin, positions, offsets, rotate_style, True, nope_first)
 
