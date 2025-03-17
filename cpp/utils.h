@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <filesystem>
 #include <sstream>
-#include <unordered_map>
+#include "lru_cache.h"
 #include <memory>
 #include <cstdlib>
 
@@ -50,11 +50,7 @@ __inline__ std::pair<std::string, int> executeCmd(const std::string& cmd) {
     std::string result;
     int exitCode;
     
-    #ifdef _WIN32
-        FILE* pipe = _popen(cmd.c_str(), "r");
-    #else
-        FILE* pipe = popen(cmd.c_str(), "r");
-    #endif
+    FILE* pipe = popen(cmd.c_str(), "r");
     
     if (!pipe) {
         throw std::runtime_error("popen() failed!");
@@ -65,19 +61,12 @@ __inline__ std::pair<std::string, int> executeCmd(const std::string& cmd) {
             result += buffer.data();
         }
     } catch (...) {
-        #ifdef _WIN32
-            _pclose(pipe);
-        #else
-            pclose(pipe);
-        #endif
+        pclose(pipe);
         throw;
     }
     
-    #ifdef _WIN32
-        exitCode = _pclose(pipe);
-    #else
-        exitCode = pclose(pipe);
-    #endif
+    exitCode = pclose(pipe);
+
     
     return {result, exitCode};
 }
@@ -119,13 +108,16 @@ public:
     }
 };
 
-static std::unordered_map<std::string, std::unique_ptr<SharedLibrary>> libs;
 
 template<typename... Args>
 __inline__ void run_lib(std::string folder,Args... args) {
-    std::string lib_path = (aiter_root_dir/"build"/folder/"lib.so").string();
-    if (libs.find(folder) == libs.end()) {
-        libs[folder] = std::make_unique<SharedLibrary>(lib_path);
+    auto AITER_MAX_CACHE_SIZE = getenv("AITER_MAX_CACHE_SIZE");
+    if(!AITER_MAX_CACHE_SIZE){
+        AITER_MAX_CACHE_SIZE = "-1";
     }
-    libs[folder]->call(std::forward<Args>(args)...);
+    int aiter_max_cache_size = atoi(AITER_MAX_CACHE_SIZE);
+    static LRUCache<std::string, std::shared_ptr<SharedLibrary>> libs(aiter_max_cache_size);
+    std::string lib_path = (aiter_root_dir/"build"/folder/"lib.so").string();
+    libs.put(folder, std::make_shared<SharedLibrary>(lib_path));
+    (*libs.get(folder))->call(std::forward<Args>(args)...);
 }

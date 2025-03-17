@@ -5,7 +5,7 @@ from jinja2 import Template
 import ctypes
 from packaging.version import parse, Version
 from collections import OrderedDict
-from functools import partial, lru_cache
+from functools import lru_cache
 
 
 HOME_PATH = os.environ.get('HOME')
@@ -14,7 +14,6 @@ AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR=os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 os.makedirs(BUILD_DIR, exist_ok=True)
 
-# libs = {}
 
 makefile_template = Template("""
 build:
