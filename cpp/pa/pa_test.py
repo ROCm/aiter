@@ -8,7 +8,7 @@ from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from aiter import pertoken_quant
 from enum import Enum
 from einops import rearrange
-from pa import paged_attention_ragged
+from cpp.pa.pa import paged_attention_rocm
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {

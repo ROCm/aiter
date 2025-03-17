@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <torch/torch.h>
-#include "pa.h"
+#include "pa_ragged_torch.h"
 
 
 TEST(PagedAttentionTest, BasicTest) {
