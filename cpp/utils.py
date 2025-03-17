@@ -5,15 +5,16 @@ from jinja2 import Template
 import ctypes
 from packaging.version import parse, Version
 from collections import OrderedDict
-from functools import partial
+from functools import partial, lru_cache
 
 
 HOME_PATH = os.environ.get('HOME')
+AITER_MAX_CACHE_SIZE = os.environ.get('AITER_MAX_CACHE_SIZE', None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR=os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 os.makedirs(BUILD_DIR, exist_ok=True)
 
-libs = {}
+# libs = {}
 
 makefile_template = Template("""
 build:
@@ -108,13 +109,12 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         f.write(makefile_file)
     subprocess.run(f"cd {sub_build_dir} && make build -j8", shell=True, check=True)
 
-def run_lib(folder, *args):
-    if folder in libs:
-        lib = libs[folder]
-    else:
-        lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
-        libs[folder] = lib
-    lib.call(*args)
+
+@lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
+def run_lib(folder):
+    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    return lib.call
+
 
 def compile_template_op(src_template, md_name, includes=None, sources=None, cxxflags=None, folder=None, **kwargs):
     if includes is None:
@@ -129,4 +129,4 @@ def compile_template_op(src_template, md_name, includes=None, sources=None, cxxf
     src_file = src_template.render(**kwargs)
     if not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so") or os.environ.get("AITER_FORCE_COMPILE", "0") == "1":
         compile_lib(src_file, folder, includes, sources, cxxflags)
-    return partial(run_lib, folder)
+    return run_lib(folder)
