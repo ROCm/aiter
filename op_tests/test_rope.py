@@ -264,7 +264,7 @@ nope_first: {nope_first}
         ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
         s, b, h_x, d = input_x.shape
         h_y = input_y.shape[2]
-        hip_input_x, hip_input_y = input_x.clone(), input_y.clone()
+        hip_input_x, hip_input_y = input_x, input_y
         leg_input_x, leg_input_y = input_x.clone().view(s * b, -1), input_y.clone().view(s * b, -1)
         if offsets is None:
             aiter.rope_cached_positions_2c_fwd_inplace(hip_input_x, hip_input_y, cos, sin, positions, rotate_style, True, nope_first)
@@ -442,7 +442,7 @@ if __name__ == "__main__":
             batch_size_[-1:], seq_size_[1:2], head_size_[-1:], head_size_[-1:], hidden_dim_[-1:]
         ):
             color = '\033[95m'
-            print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, sbhd: {b, s, h_x, h_y, d}, has_offsets: {has_offsets}{color}")
+            print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, (s,b,hx,hy,d): {s, b, h_x, h_y, d}, has_offsets: {has_offsets}{color}")
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
             nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]
