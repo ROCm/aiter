@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
 
 #Source:
-#MoE Kernel adapted from VLLM 
+#MoE Kernel adapted from rocm/triton 
 
 _PADDING_SIZE = 0 #TODO add support to set this
 
