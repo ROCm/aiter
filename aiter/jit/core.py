@@ -107,13 +107,17 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = max_jobs
 
 
+def do_rename_and_mv(name, src, dst, ret):
+    os.makedirs(dst, exist_ok=True)
+    newName = name
+    if name.endswith(".cpp") or name.endswith(".cu"):
+        newName = name.replace(".cpp", ".cu")
+        ret.append(f'{dst}/{newName}')
+    shutil.copy(f'{src}/{name}', f'{dst}/{newName}')
+
+
 def rename_cpp_to_cu(els, dst, recurisve=False):
-    def do_rename_and_mv(name, src, dst, ret):
-        newName = name
-        if name.endswith(".cpp") or name.endswith(".cu"):
-            newName = name.replace(".cpp", ".cu")
-            ret.append(f'{dst}/{newName}')
-        shutil.copy(f'{src}/{name}', f'{dst}/{newName}')
+
     ret = []
     for el in els:
         if not os.path.exists(el):
