@@ -48,6 +48,7 @@ else:
     print("aiter is not installed.")
 
 AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
+AITER_GRADLIB_DIR = f'{AITER_ROOT_DIR}/gradlib'
 os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
@@ -225,13 +226,13 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         bd_include_dir = f'{op_dir}/build/include'
         os.makedirs(bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include"],
+        rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include"] + extra_include,
                          bd_include_dir)
         extra_include_paths = [
             f"{CK_DIR}/include",
             f"{CK_DIR}/library/include",
             f"{bd_include_dir}",
-        ]+extra_include
+        ]
 
         module = cpp_extension.load(
             md_name,
@@ -273,7 +274,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
         # if d_ops["isASM"].lower() == "true":
         #     d_ops["flags_extra_hip"].append(
         #         "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
-        del d_ops["isASM"]
+        # del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):
                 for idx, el in enumerate(val):

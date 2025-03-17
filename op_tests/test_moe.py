@@ -14,6 +14,7 @@ from aiter.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
 from int4_utils import *
+from aiter import ActivationType
 
 BLOCK_SIZE_M = 32
 
@@ -37,12 +38,14 @@ def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    fc2_scale=None,  # [expert, model_dim, 1]
                    fc1_smooth_scale=None,  # [expert, 1, model_dim]
                    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
+                   activation = ActivationType.Silu
                    ):
     return torch_moe(hidden_states,
                      w1,
                      w2,
                      topk_weight,
-                     topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale)
+                     topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale,
+                     None, activation)
 
 
 @perftest()
@@ -53,12 +56,13 @@ def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                  fc1_smooth_scale=None,  # [expert, 1, model_dim]
                  fc2_smooth_scale=None,  # [expert, 1, inter_dim]
                  a16=False,
+                 activation = ActivationType.Silu
                  ):
     return asm_moe(hidden_states,
                    w1,
                    w2,
                    topk_weight,
-                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16)
+                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16, None, None, activation)
 
 
 @perftest()
@@ -97,7 +101,7 @@ quant_algo = [
 ]
 
 
-def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=False, shared_E=0):
+def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=False, shared_E=0, activation = ActivationType.Silu):
     quantAlgoId = quant_algo.index(quant)
     if quantAlgoId not in [0, 3] and not use_g1u1:
         print("g1u0 only could test no quant and int8smoothquant")
@@ -201,7 +205,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         # ref2 implement
         ref2, avg_c = torch_moe_test(input, w1, w2, topk_weights, topk_ids,
                                      fc1_scale, fc2_scale,
-                                     fc1_smooth_scale, fc2_smooth_scale)
+                                     fc1_smooth_scale, fc2_smooth_scale, activation)
 
         # b implement
         if use_int4:
@@ -211,7 +215,8 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         w2b = shuffle_weight(w2)
         out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                     fc1_scale, fc2_scale,
-                                    fc1_smooth_scale, fc2_smooth_scale)
+                                    fc1_smooth_scale, fc2_smooth_scale,
+                                    a16=False, activation=activation)
 
         def calculateTensorsSize(*args):
             num_btype = 0
@@ -232,7 +237,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
             (w1b.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1b.shape[1]) or
                 (w1b.dtype == torch.int8 and inter_dim == w1b.shape[1])):
             out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-                                          fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True)
+                                          fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True, activation=activation)
             msg = f'[perf] a8w8 asm: {avg_b:.2f} vs a16w8 asm: {avg_b2:.2f} ......'
             checkAllclose(ref2, out_b2, atol=100, msg=msg)
 
@@ -269,6 +274,7 @@ for dtype in [torch.bfloat16]:
         for dim in [4096, 8192]:
             for hdim in [1024]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5,
+                        #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
                           quant='int8quant', use_g1u1=True)
 
 print('\ng1u1 fp8quant')
@@ -277,7 +283,8 @@ for dtype in [torch.bfloat16]:
         for dim in [4096, 8192]:
             for hdim in [1024]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='fp8quant', use_g1u1=True)
+                          quant='fp8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
+                        #   quant='fp8quant', use_g1u1=True)
 
 
 print('\ng1u0 int8smoothquant')
