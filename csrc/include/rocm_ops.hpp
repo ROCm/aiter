@@ -29,6 +29,13 @@
             py::arg("splitData"),                                            \
             py::arg("splitLse"));
 
+#define EAGLE_UTILS_PYBIND                                                                               \
+      m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient"); \
+      m.def("build_tree_kernel", &build_tree_kernel, "build_tree_kernel");
+
+#define SPECULATIVE_SAMPLING_PYBIND                                                                      \
+      m.def("tree_speculative_sampling_target_only", &tree_speculative_sampling_target_only);
+
 #define ATTENTION_ASM_PYBIND                    \
       m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",    \
             py::arg("Q"),                       \
