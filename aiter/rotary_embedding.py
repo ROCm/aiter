@@ -131,7 +131,7 @@ class RotaryEmbedding(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
-            positions = positions + offsets
+            positions = positions + offsets.view_as(positions)
         positions = positions.flatten()
         num_tokens = positions.shape[0]
         # cos_sin = self.cos_sin_cache.index_select(0, positions)
