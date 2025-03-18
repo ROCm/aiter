@@ -1,10 +1,74 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # user interface
 
 import torch
 import aiter
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _fwd_kernel_stage2_asm(
+    Mid_O,
+    Mid_lse,
+    O,
+    kv_indptr,
+    stride_mid_ob,
+    stride_mid_oh,
+    stride_mid_os,
+    stride_obs,
+    stride_oh,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+    mgc: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
+        kv_indptr + cur_batch
+    )
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
+
+    offs_v = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) * Lv + offs_d
+    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+
+    for split_kv_id in range(0, NUM_KV_SPLITS):
+        kv_len_per_split = tl.maximum(mgc, tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS))
+        split_kv_start = kv_len_per_split * split_kv_id
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+
+        if split_kv_end > split_kv_start:
+            tv = tl.load(
+                Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
+                mask=mask_d,
+                other=0.0,
+            )
+            tlogic = tl.load(Mid_lse + offs_logic + split_kv_id * stride_mid_os)
+            n_e_max = tl.maximum(tlogic, e_max)
+
+            old_scale = tl.exp(e_max - n_e_max)
+            acc *= old_scale
+            exp_logic = tl.exp(tlogic - n_e_max)
+            acc += exp_logic * tv
+
+            e_sum = e_sum * old_scale + exp_logic
+            e_max = n_e_max
+
+    tl.store(
+        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        acc / e_sum,
+        mask=mask_d,
+    )
 
 
 def mla_decode_fwd(
@@ -29,12 +93,14 @@ def mla_decode_fwd(
     if num_kv_splits is None:
         device_properties = torch.cuda.get_device_properties(device)
         cu_num = device_properties.multi_processor_count
-        num_kv_splits = min(16, max(1, cu_num//bs))
+        num_kv_splits = min(16, max(1, cu_num // bs))
 
     logits = torch.empty(
-        (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device)
+        (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+    )
     attn_lse = torch.empty(
-        (bs, num_kv_splits, nhead,  1), dtype=torch.float, device=device)
+        (bs, num_kv_splits, nhead, 1), dtype=torch.float, device=device
+    )
 
     aiter.mla_stage1_asm_fwd(
         q,
@@ -47,14 +113,11 @@ def mla_decode_fwd(
         attn_lse,
     )
 
-    from aiter.ops.triton import decode_mla
-    import triton
     Lv = v_head_dim
     BLOCK_DV = triton.next_power_of_2(Lv)
     grid = (bs, nhead)
-    extra_kargs = {"waves_per_eu": 4,
-                   "matrix_instr_nonkdim": 16, "kpack": 2}
-    decode_mla._fwd_kernel_stage2_asm[grid](
+    extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+    _fwd_kernel_stage2_asm[grid](
         logits,
         attn_lse,
         o,
