@@ -231,11 +231,10 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         bw = num_tb * 1e6 / avg_b
         print(f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:.2f}TB/s")
 
-        if use_smooth and (inter_dim % 512 == 0 or
-                           inter_dim % 320 == 0
-                           ) and (
-            (w1b.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1b.shape[1]) or
-                (w1b.dtype == torch.int8 and inter_dim == w1b.shape[1])):
+        if use_smooth and \
+            (((inter_dim % 512 == 0 or inter_dim % 320 == 0) and (w1b.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1b.shape[1])) or
+             ((inter_dim % 320 == 0) and (w1b.dtype == torch.int8 and inter_dim*2 == w1b.shape[1])) or
+             ((inter_dim % 512 == 0) and (w1b.dtype == torch.int8 and inter_dim == w1b.shape[1]))):
             out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                           fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True, activation=activation)
             msg = f'[perf] a8w8 asm: {avg_b:.2f} vs a16w8 asm: {avg_b2:.2f} ......'

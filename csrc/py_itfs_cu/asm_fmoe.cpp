@@ -610,38 +610,51 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                                                 fc2_smooth_scale);
 }
 
-void fmoe_fp8_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
-                       torch::Tensor &input,             // [token_cnt, dim] M,K
-                       torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
-                       torch::Tensor &down,              // [expert, dim, inter_dim]
-                       torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                       torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
-                       torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-                       torch::Tensor &num_valid_ids,     // [1]
-                       uint32_t topk,                    //
-                       torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
-                       torch::Tensor &fc2_scale,         // [expert, 1, dim]
-                       torch::Tensor &fc1_smooth_scale,  // [expert, 1, dim]
-                       torch::Tensor &fc2_smooth_scale   // [expert, 1, inter_dim]
+void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
+                   torch::Tensor &input,             // [token_cnt, dim] M,K
+                   torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
+                   torch::Tensor &down,              // [expert, dim, inter_dim]
+                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                   torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                   torch::Tensor &num_valid_ids,     // [1]
+                   uint32_t topk,                    //
+                   torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
+                   torch::Tensor &fc2_scale,         // [expert, 1, dim]
+                   torch::Tensor &fc1_smooth_scale,  // [expert, 1, dim]
+                   torch::Tensor &fc2_smooth_scale   // [expert, 1, inter_dim]
 )
 {
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
 
-    if (selectedTile == 512)
+    if (gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
     {
-        static FMoeKernel impl_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
-        impl_ptr = &impl_512;
+        TORCH_CHECK(inter_dim % 320 == 0, __func__, "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320");
+        static FMoeKernel impl_int8_320("fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
+        impl_ptr = &impl_int8_320;
     }
-    else if (selectedTile == 320)
+    else if (gate.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
-        static FMoeKernel impl_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
-        impl_ptr = &impl_320;
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
+        if (selectedTile == 512)
+        {
+            static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
+            impl_ptr = &impl_fp8_512;
+        }
+        else if (selectedTile == 320)
+        {
+            static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
+            impl_ptr = &impl_fp8_320;
+        }
+        else
+            TORCH_CHECK(false, __func__, "fp8 quant Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
     }
     else
-        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
+    {
+        TORCH_CHECK(false, __func__, " gate/down weight only supput Int8/Fp8!");
+    }
 
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,

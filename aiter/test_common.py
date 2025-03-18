@@ -152,7 +152,7 @@ def get_trace_perf(prof, num_iters):
     for el in timerList:
         df.at[avg_name, el] = df[el].sum()/num_iters
     if int(os.environ.get('AITER_LOG_MORE', 0)):
-        pd.set_option('display.max_colwidth', 180)
+        pd.set_option('display.max_colwidth', 120)
         logger.info(f'{df}')
     return df.at[avg_name, 'device_time_total']
 
