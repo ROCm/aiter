@@ -7,15 +7,15 @@ import torch
 import torch.distributed as dist
 
 from aiter.dist.parallel_state import (ensure_model_parallel_initialized,
-                                      init_distributed_environment,
-                                      set_custom_all_reduce,
-                                      get_tp_group,
-                                      graph_capture,
-                                      destroy_model_parallel,
-                                      destroy_distributed_environment)
+                                       init_distributed_environment,
+                                       set_custom_all_reduce,
+                                       get_tp_group,
+                                       graph_capture,
+                                       destroy_model_parallel,
+                                       destroy_distributed_environment)
 from aiter.dist.utils import (get_open_port,
-                             get_distributed_init_method,
-                             get_ip)
+                              get_distributed_init_method,
+                              get_ip)
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from multiprocessing import set_start_method, Pool, freeze_support
@@ -46,17 +46,17 @@ def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
     torch.cuda.synchronize()
 
     if withGraph:
-        @perftest()
-        def run_ca(graph):
-            graph.replay()
-
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
                 out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
-        _, us = run_ca(graph)
+        @perftest()
+        def run_ca():
+            graph.replay()
+
+        _, us = run_ca()
         out = (out, us)
     else:
         @perftest()
