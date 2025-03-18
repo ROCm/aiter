@@ -68,12 +68,14 @@ def benchmark():
 
 
 def run_iters(num_iters, func, *args, **kwargs):
+    data = None
     for _ in range(num_iters):
         data = func(*args, **kwargs)
     return data
 
 
 def run_iters_rotate(num_iters, func, rotate_args):
+    data = None
     num_rotate_args = len(rotate_args)
     for _ in range(num_iters):
         args, kwargs = rotate_args[_ % num_rotate_args]
