@@ -56,3 +56,15 @@ def rearrange_4bit_elements(tensor):
         (t_ & 0x0000000F)            # e7 (bits 0-3)
     ).view(dtype=torch.uint32)
 
+def unpack_int4(packed_tensor):
+    packed = packed_tensor.view(torch.int32)
+    elements = []
+    for i in range(8):
+        # 提取4位段并移动到低位
+        segment = ((packed >> ((7-i) * 4)) & 0xf).to(torch.int8)
+        sign_bit = (segment & 0x8)  # 检查符号位
+        segment = torch.where(sign_bit!=0, segment | 0xf0, segment)  # 符号扩展
+        # 符号扩展
+        elements.append(segment)
+    
+    return torch.stack(elements, dim=-1).flatten()

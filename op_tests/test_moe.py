@@ -62,7 +62,7 @@ def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    w1,
                    w2,
                    topk_weight,
-                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16, None, None, activation)
+                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16, None, None, None, activation = activation)
 
 
 @perftest()
@@ -97,7 +97,7 @@ quant_algo = [
     "fp8quant",  # g1u1 support
     "int8smoothquant",  # g1u1/g1u0 support
     "fp8smoothquant",  # g1u1 support
-    "wint4afp8smoothquant", # g1u1 support
+    "wint4afp8quant", # g1u1 support
 ]
 
 
@@ -318,4 +318,4 @@ for dtype in [torch.bfloat16]:
         for dim in [4096, 6144]:
             for hdim in [1024, 4096]:
                 test_fmoe(dtype, m, dim, hdim, 8, 3,
-                          quant='wint4afp8smoothquant', use_g1u1=True)
+                          quant='wint4afp8quant', use_g1u1=True)

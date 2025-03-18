@@ -143,11 +143,10 @@ def fmoe_fp8_blockscale_g1u1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     input_scale: Optional[Tensor] = None,
-    fc_scale_blkn: Optional[Tensor] = 128,
-    fc_scale_blkk: Optional[Tensor] = 128,
+    fc_scale_blkn: Optional[int] = 128,
+    fc_scale_blkk: Optional[int] = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
 ): ...
-
 
 @compile_ops("module_moe")
 def ck_moe(
@@ -161,7 +160,8 @@ def ck_moe(
     fc1_smooth_scale: Optional[Tensor] = None,
     fc2_smooth_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
-    expert_mask: Optional[Tensor] = None
+    expert_mask: Optional[Tensor] = None,
+    activation: Optional[str] = None,
 ): ...
 
 

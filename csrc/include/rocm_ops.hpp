@@ -321,7 +321,8 @@
             py::arg("w1_scale") = std::nullopt, py::arg("w2_scale") = std::nullopt, \
             py::arg("a1_scale") = std::nullopt, py::arg("a2_scale") = std::nullopt, \
             py::arg("block_m") = 32,                                                \
-            py::arg("expert_mask") = std::nullopt);
+            py::arg("expert_mask") = std::nullopt,                                  \
+            py::arg("acitvation") = std::nullopt);
 
 #define MOE_OP_PYBIND                                                            \
       m.def("topk_softmax", &topk_softmax,                                       \

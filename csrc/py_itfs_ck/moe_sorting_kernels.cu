@@ -48,6 +48,6 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                  num_valid_ids.data_ptr(),     // p_total_tokens_post_pad
                  moe_buf.data_ptr(),           // p_moe_buf
                  ws_ptr,                       // p_workspace
-                 num_tokens, unit_size, num_experts, topk, (int)moe_buf.nbytes()},
+                 num_tokens, unit_size, num_experts, topk, static_cast<int64_t>(moe_buf.nbytes())},
                 {stream});
 }

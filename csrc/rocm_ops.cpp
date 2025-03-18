@@ -25,7 +25,7 @@
 #include "quant.h"
 #include "moe_ck.h"
 #include "rope.h"
-#include "speculative_sampling.h"
+// #include "speculative_sampling.h"
 #include "eagle_utils.h"
 #include "rocsolgemm.cuh"
 #include "hipbsolgemm.cuh"
@@ -49,7 +49,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       SMOOTHQUANT_PYBIND;
       BATCHED_GEMM_A8W8_PYBIND;
       MOE_CK_PYBIND;
-      SPECULATIVE_SAMPLING_PYBIND;
       EAGLE_UTILS_PYBIND;
       // BATCHED_GEMM_A8W8_TUNE_PYBIND;
       GEMM_A8W8_ASM_PYBIND;
