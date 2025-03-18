@@ -169,7 +169,7 @@ def run_ck(
         (2048, 2048),
     ],
 )
-def test_mha_varlen_fwd(
+def test_flash_attn_varlen_func(
     batch_size,
     nheads,
     seqlen_q,
@@ -252,7 +252,7 @@ if __name__ == '__main__':
     mha_type = 'mha'
     dtype = torch.bfloat16
 
-    test_mha_varlen_fwd(
+    test_flash_attn_varlen_func(
         batch_size,
         nheads,
         seqlen_q,
