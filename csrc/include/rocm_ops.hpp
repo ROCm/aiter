@@ -3,6 +3,7 @@
 
 #define ACTIVATION_PYBIND                                                          \
       m.def("silu_and_mul", &silu_and_mul, "Activation function used in SwiGLU."); \
+      m.def("scaled_silu_and_mul", &scaled_silu_and_mul, "Activation function used in scaled SwiGLU."); \
       m.def("gelu_and_mul", &gelu_and_mul, "Activation function used in GELU.");   \
       m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Activation function used in GELU tanh.");
 
