@@ -32,7 +32,6 @@ from .ops.rope import *
 from .ops.topk import *
 from .ops.mha import *
 from .ops.gradlib import *
-from .aot.norm import *
 from . import mla
 
 def getLogger():
