@@ -207,9 +207,6 @@ def ck_moe_2stages(a1,
 
     # g1u0
     if (w2.shape[2] != w1.shape[1]) and (w2.dtype == torch.float8_e4m3fnuz):
-      #d = a2.shape[-1] // 2
-      #output_shape = (a2.shape[:-1] + (d, ))
-      #tmp = torch.empty(output_shape, dtype=torch.float8_e4m3fnuz, device=a2.device)
       tmp = torch.empty((M, topk, inter_dim), dtype=torch.float8_e4m3fnuz, device=device)
       if a2_scale == None:
         a2_scale = torch.empty(1, dtype=torch.float, device=device)
