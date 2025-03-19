@@ -106,7 +106,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     makefile_file = makefile_template.render(includes=[f"-I{include_dir}"], sources=sources, cxxflags=cxxflags)
     with open(f"{sub_build_dir}/Makefile", "w") as f:
         f.write(makefile_file)
-    subprocess.run(f"cd {sub_build_dir} && make build -j8", shell=True, check=True)
+    subprocess.run(f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True)
 
 
 @lru_cache(maxsize=AITER_MAX_CACHE_SIZE)
