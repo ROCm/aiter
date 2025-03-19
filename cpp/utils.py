@@ -16,11 +16,20 @@ os.makedirs(BUILD_DIR, exist_ok=True)
 
 
 makefile_template = Template("""
-build:
-	hipcc -DUSE_ROCM -DENABLE_FP8 -fPIC -shared {{cxxflags | join(" ")}} {{includes | join(" ")}} {{sources | join(" ")}} -o lib.so
+CXX=hipcc
+TARGET=lib.so
+
+SRCS = {{sources | join(" ")}}
+OBJS = $(SRCS:.cpp=.o)
+
+build: $(OBJS)
+	$(CXX) -shared $(OBJS) -o $(TARGET)
+
+%.o: %.cpp
+	$(CXX) -fPIC {{cxxflags | join(" ")}} {{includes | join(" ")}} -c $< -o $@
 
 clean:
-	rm -rf lib.so test
+	rm -f $(TARGET) $(OBJS)
 """)
 
 
@@ -74,6 +83,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         f.write(src_file)
     sources += [f"{folder}.cpp"]
     cxxflags += [
+            "-DUSE_ROCM", "-DENABLE_FP8",
             "-O3", "-std=c++17",
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
