@@ -157,7 +157,7 @@ class TunedGemm:
             except RuntimeError:
                 out = F.linear(inp.to(torch.float32), weights.to(torch.float32)) * scale_a * scale_b
                 out = (out.to(otype) + bias) if bias is not None else out.to(otype)
-                return out
+            return out
         out = F.linear(inp, weights, bias)
         if otype is not None:
             out = out.to(otype)
