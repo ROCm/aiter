@@ -15,8 +15,10 @@ def rotary_embedding_fwd(
     query: Tensor,
     key: Tensor,
     head_size: int,
-    cos_sin_cache: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
     is_neox: bool,
+    is_nope_first: bool,
 ): ...
 
 
@@ -26,8 +28,10 @@ def batched_rotary_embedding(
     query: Tensor,
     key: Tensor,
     head_size: int,
-    cos_sin_cache: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
     is_neox: bool,
+    is_nope_first: bool,
     rot_dim: int,
     cos_sin_cache_offsets: Tensor,
 ): ...

@@ -7,32 +7,7 @@
 // default in hip_fp16.h #undef __HIP_NO_HALF_OPERATORS__ #undef
 // __HIP_NO_HALF_CONVERSIONS__ #endif
 
-#include <torch/torch.h>
-#include <torch/extension.h>
-#include <ATen/ATen.h>
-#include <ATen/autocast_mode.h>
-#include <ATen/cuda/CUDABlas.h>
-#include <ATen/cuda/Exceptions.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAFunctions.h>
-// #include <c10/cuda/CUDACachingAllocator.h>
-#include <c10/hip/HIPStream.h>
-#include <c10/macros/Export.h>
-#include <c10/util/irange.h>
-#include <ATen/cuda/CUDAEvent.h>
-
-#include <hip/hip_runtime.h>
-#include <hipblaslt/hipblaslt.h>
-#include <hipblaslt/hipblaslt-ext.hpp>
-
-#include <iostream>
-#include <algorithm>
-#include <limits>
-#include <map>
-#include <string>
-#include <tuple>
-#include <assert.h>
-#include "nvToolsExt.h"
+#include "hipbsolgemm.cuh"
 
 // #include <rocblas/rocblas.h>
 
@@ -350,11 +325,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
-                      std::optional<torch::Tensor> bias = std::nullopt,
-                      std::optional<py::object> out_dtype = std::nullopt,
-                      std::optional<torch::Tensor> scaleA = std::nullopt,
-                      std::optional<torch::Tensor> scaleB = std::nullopt,
-                      std::optional<torch::Tensor> scaleOut = std::nullopt)
+                      std::optional<torch::Tensor> bias,
+                      std::optional<py::object> out_dtype,
+                      std::optional<torch::Tensor> scaleA,
+                      std::optional<torch::Tensor> scaleB,
+                      std::optional<torch::Tensor> scaleOut)
 {
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
@@ -469,11 +444,11 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
 // find all hipblas solutions and return them to python land
 std::vector<int> hipb_findallsols(
     const torch::Tensor &mat1, const torch::Tensor &mat2,
-    std::optional<torch::Tensor> bias = std::nullopt,
-    std::optional<py::object> out_dtype = std::nullopt,
-    std::optional<torch::Tensor> scaleA = std::nullopt,
-    std::optional<torch::Tensor> scaleB = std::nullopt,
-    std::optional<torch::Tensor> scaleC = std::nullopt)
+    std::optional<torch::Tensor> bias,
+    std::optional<py::object> out_dtype,
+    std::optional<torch::Tensor> scaleA,
+    std::optional<torch::Tensor> scaleB,
+    std::optional<torch::Tensor> scaleC)
 {
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
@@ -555,13 +530,13 @@ std::vector<int> hipb_findallsols(
 
   auto bias_ptr =
       bias.has_value() ? static_cast<void *>(bias.value().data_ptr()) : nullptr;
-  
+
   auto scaleA_ptr =
       scaleA.has_value() ? static_cast<void *>(scaleA.value().data_ptr()) : nullptr;
 
   auto scaleB_ptr =
       scaleB.has_value() ? static_cast<void *>(scaleB.value().data_ptr()) : nullptr;
-  
+
   auto scaleC_ptr =
       scaleC.has_value() ? static_cast<void *>(scaleC.value().data_ptr()) : nullptr;
 
@@ -618,6 +593,7 @@ std::string getHipblasltKernelName(int solution_index)
   return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
 }
 
+#ifndef PREBUILD_KERNELS
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("hipb_create_extension", &hipb_create_extension, "create_extension");
@@ -632,3 +608,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt);
   m.def("getHipblasltKernelName", &getHipblasltKernelName);
 }
+#endif

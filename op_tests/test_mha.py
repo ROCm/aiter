@@ -94,6 +94,7 @@ def run_ck(
     if dropout_p > 0.0:
         (_, seqlen_q, _, d) = q.shape
         (_, seqlen_k, _, d) = k.shape
+        (_, seqlen_k, _, d_v) = v.shape
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
@@ -129,7 +130,22 @@ def run_ck(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [5])
 @pytest.mark.parametrize("nheads", [6])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (96, 96),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 192),
+        (224, 224),
+        (256, 256),
+    ],
+)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -151,6 +167,7 @@ def test_flash_attn_output(
     seqlen_q,
     seqlen_k,
     d,
+    d_v,
     dropout_p,
     causal,
     local,
@@ -169,7 +186,7 @@ def test_flash_attn_output(
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype, requires_grad=True)
 
     attn_bias = None
     alibi_slopes = None
@@ -178,7 +195,7 @@ def test_flash_attn_output(
     elif bias_type == 'alibi':
         alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=torch.float32)
 
-    dout = torch.randn_like(q)
+    dout = torch.randn(batch_size, seqlen_q, nheads, d_v, device="cuda", dtype=dtype, requires_grad=True)
 
     out, dropout_mask, dq, dk, dv, dbias = run_ck(
         q, k, v, attn_bias, alibi_slopes, dout, dropout_p, causal,
@@ -222,7 +239,8 @@ if __name__ == '__main__':
     batch_size = 2
     nheads = 5
     (seqlen_q, seqlen_k) = (4, 4)
-    d = 64
+    d = 192
+    d_v = 192
     dropout_p = 0.5
     causal = False
     local = False
@@ -237,6 +255,7 @@ if __name__ == '__main__':
         seqlen_q,
         seqlen_k,
         d,
+        d_v,
         dropout_p,
         causal,
         local,

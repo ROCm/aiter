@@ -11,14 +11,15 @@
 
 fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                                        std::string dtype,
-                                       int head_size,
+                                       int head_size_q,
+                                       int head_size_v,
                                        bool has_dropout,
                                        bias_enum bias_type,
                                        bool has_dbias,
                                        bool deterministic)
 {
-    return fmha_bwd_traits{head_size,
-                           head_size,
+    return fmha_bwd_traits{head_size_q,
+                           head_size_v,
                            dtype,
                            false, // is_group_mode
                            mask.type,
@@ -36,7 +37,8 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                                    const int seqlen_k,
                                    const int h,
                                    const int h_k,
-                                   const int hdim,
+                                   const int hdim_q,
+                                   const int hdim_v,
                                    // device pointers
                                    const at::Tensor q,
                                    const at::Tensor k,
@@ -56,22 +58,22 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                                    float p_dropout,
                                    std::pair<uint64_t*, uint64_t*> drop_seed_offset)
 {
-    // q: (batch_size, seqlen_q, nheads, hdim)
+    // q: (batch_size, seqlen_q, nheads, hdim_q)
     ck_tile::index_t batch_stride_q = q.stride(0);
     ck_tile::index_t stride_q = q.stride(1);
     ck_tile::index_t nhead_stride_q = q.stride(2);
 
-    // k: (batch_size, seqlen_k, nheads_k, hdim)
+    // k: (batch_size, seqlen_k, nheads_k, hdim_q)
     ck_tile::index_t batch_stride_k = k.stride(0);
     ck_tile::index_t stride_k = k.stride(1);
     ck_tile::index_t nhead_stride_k = k.stride(2);
 
-    // v: (batch_size, seqlen_k, nheads_k, hdim)
+    // v: (batch_size, seqlen_k, nheads_k, hdim_v)
     ck_tile::index_t batch_stride_v = v.stride(0);
     ck_tile::index_t stride_v = v.stride(1);
     ck_tile::index_t nhead_stride_v = v.stride(2);
 
-    // o: (batch_size, seqlen_q, nheads, hdim)
+    // o: (batch_size, seqlen_q, nheads, hdim_v)
     ck_tile::index_t batch_stride_o = out.stride(0);
     ck_tile::index_t stride_o = out.stride(1);
     ck_tile::index_t nhead_stride_o = out.stride(2);
@@ -80,7 +82,7 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
     ck_tile::index_t batch_stride_lse = softmax_lse.stride(0);
     ck_tile::index_t nhead_stride_lse = softmax_lse.stride(1);
 
-    // do: (batch_size, seqlen_q, nheads, hdim)
+    // do: (batch_size, seqlen_q, nheads, hdim_v)
     ck_tile::index_t batch_stride_do = dout.stride(0);
     ck_tile::index_t stride_do = dout.stride(1);
     ck_tile::index_t nhead_stride_do = dout.stride(2);
@@ -88,22 +90,22 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
     // d: (batch_size, nheads, seqlen_q)
     // CK assume d share the same stride with lse
 
-    // dq: (batch_size, seqlen_q, nheads, hdim)
+    // dq: (batch_size, seqlen_q, nheads, hdim_q)
     ck_tile::index_t batch_stride_dq = dq.stride(0);
     ck_tile::index_t stride_dq = dq.stride(1);
     ck_tile::index_t nhead_stride_dq = dq.stride(2);
 
-    // dk_expanded: (batch_size, seqlen_k, nheads, hdim)
+    // dk_expanded: (batch_size, seqlen_k, nheads, hdim_q)
     ck_tile::index_t batch_stride_dk = dk.stride(0);
     ck_tile::index_t stride_dk = dk.stride(1);
     ck_tile::index_t nhead_stride_dk = dk.stride(2);
 
-    // dv_expanded: (batch_size, seqlen_k, nheads, hdim)
+    // dv_expanded: (batch_size, seqlen_k, nheads, hdim_v)
     ck_tile::index_t batch_stride_dv = dv.stride(0);
     ck_tile::index_t stride_dv = dv.stride(1);
     ck_tile::index_t nhead_stride_dv = dv.stride(2);
 
-    // dq_acc: (split, batch_size, seqlen_q, nheads, hdim)
+    // dq_acc: (split, batch_size, seqlen_q, nheads, hdim_q)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
     ck_tile::index_t batch_stride_dq_acc = dq_acc.stride(1);
     ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
@@ -171,8 +173,8 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                          b,
                          seqlen_q, // max_seqlen_q
                          seqlen_k, // max_seqlen_k
-                         hdim, // hdim_q
-                         hdim, // hdim_v
+                         hdim_q, // hdim_q
+                         hdim_v, // hdim_v
                          h, // nhead
                          h_k, // nhead_k
                          softmax_scale,
@@ -224,11 +226,11 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
 }
 
 std::vector<at::Tensor>
-mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
+mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         const at::Tensor &q,            // [b, sq, hq, d]
         const at::Tensor &k,            // [b, sk, hk, d]
-        const at::Tensor &v,            // [b, sk, hk, d]
-        const at::Tensor &out,          // [b, sq, hq, d]
+        const at::Tensor &v,            // [b, sk, hk, d_v]
+        const at::Tensor &out,          // [b, sq, hq, d_v]
         const at::Tensor &softmax_lse,  // [b, hq, sq]
         float p_dropout,
         float softmax_scale,
@@ -275,12 +277,15 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
     const int batch_size = sizes[0];
     const int seqlen_q = sizes[1];
     const int num_heads = sizes[2];
-    const int head_size = sizes[3];
+    const int head_size_q = sizes[3];
+    const int head_size_v = v.size(3);
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size <= 256, "CK FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(head_size_q % 8 == 0, "head_size_q should be a multiple of 8");
+    TORCH_CHECK(head_size_v % 8 == 0, "head_size_v should be a multiple of 8");
+    TORCH_CHECK(head_size_q <= 256, "CK FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(head_size_v <= 256, "CK FlashAttention backward only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
@@ -302,11 +307,11 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
 
     // q, k, v, out had been padded in mha_fwd
     // dq_, dk_, dv_ are also padded tensor
-    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
-    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
-    CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
-    CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_q);
+    CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q);
+    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
+    CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
+    CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_v);
 
     at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
@@ -314,16 +319,16 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
         CHECK_DEVICE(dq);
         TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
-        CHECK_SHAPE(dq, batch_size, seqlen_q, num_heads, head_size);
+        CHECK_SHAPE(dq, batch_size, seqlen_q, num_heads, head_size_q);
     } else {
         dq = torch::empty_like(q);
     }
     if (dk_.has_value()) {
-    dk = dk_.value();
-    TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
-    CHECK_DEVICE(dk);
-    TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
-    CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size);
+        dk = dk_.value();
+        TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
+        CHECK_DEVICE(dk);
+        TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
+        CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size_q);
     } else {
         dk = torch::empty_like(k);
     }
@@ -332,7 +337,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
         CHECK_DEVICE(dv);
         TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
-        CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
+        CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size_v);
     } else {
         dv = torch::empty_like(v);
     }
@@ -344,17 +349,17 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
     } else {
-        const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
+        const ck_tile::index_t kN0 = head_size_v <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({nsplits, batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
-        dk_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
-        dv_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts);
+        dk_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size_q}, opts);
+        dv_expanded = torch::empty({batch_size, seqlen_k, num_heads, head_size_v}, opts);
     } else {
         dk_expanded = dk;
         dv_expanded = dv;
@@ -398,7 +403,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout,
+            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size_q, head_size_v, is_dropout,
                 bias_type, has_dbias, deterministic);
 
         auto args =
@@ -409,7 +414,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
                 seqlen_k,
                 num_heads,
                 num_heads_k,
-                head_size,
+                head_size_q,
+                head_size_v,
                 q,
                 k,
                 v,
@@ -439,8 +445,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d]
 
     // For MQA/GQA we need to sum dK and dV across the groups
     if (num_heads_k != num_heads) {
-        at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
-        at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
+        at::sum_out(dk, at::reshape(dk_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size_q}), {3});
+        at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size_v}), {3});
     }
 
     // Assume dbias = [b, sq, h, sk] and bias = [sq, sk], we need to sum dbias across batch_size and num_heads

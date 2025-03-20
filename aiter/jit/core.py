@@ -14,6 +14,7 @@ from torch.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json
+import multiprocessing
 from packaging.version import parse, Version
 
 PREBUILD_KERNELS = False
@@ -26,6 +27,7 @@ PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 
 find_aiter = importlib.util.find_spec("aiter")
 if find_aiter is not None:
@@ -46,11 +48,33 @@ else:
     print("aiter is not installed.")
 
 AITER_CSRC_DIR = f'{AITER_ROOT_DIR}/csrc'
+AITER_GRADLIB_DIR = f'{AITER_ROOT_DIR}/gradlib'
+os.environ["AITER_ASM_DIR"] = f'{AITER_ROOT_DIR}/hsa/'
 CK_DIR = os.environ.get("CK_DIR",
                         f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
-bd_dir = f"{this_dir}/build"
+
+
+@functools.lru_cache(maxsize=None)
+def get_user_jit_dir():
+    if 'JIT_WORKSPACE_DIR' in os.environ:
+        path = os.getenv('JIT_WORKSPACE_DIR')
+        os.makedirs(path, exist_ok=True)
+        return path
+    else:
+        if os.access(this_dir, os.W_OK):
+            return this_dir
+    home_jit_dir = f"{os.path.expanduser('~')}/.aiter/{os.path.basename(this_dir)}"
+    if not os.path.exists(home_jit_dir):
+        shutil.copytree(this_dir, home_jit_dir)
+    return home_jit_dir
+
+
+bd_dir = f'{get_user_jit_dir()}/build'
 # copy ck to build, thus hippify under bd_dir
-shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
+if multiprocessing.current_process().name == 'MainProcess':
+    shutil.copytree(CK_DIR, f'{bd_dir}/ck', dirs_exist_ok=True)
+    if os.path.exists(f'{bd_dir}/ck/library'):
+        shutil.rmtree(f'{bd_dir}/ck/library')
 CK_DIR = f'{bd_dir}/ck'
 
 
@@ -133,8 +157,8 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         opbd_dir = f'{op_dir}/build'
         src_dir = f'{op_dir}/build/srcs'
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f'{this_dir}/{md_name}.so'):
-            os.remove(f'{this_dir}/{md_name}.so')
+        if os.path.exists(f'{get_user_jit_dir()}/{md_name}.so'):
+            os.remove(f'{get_user_jit_dir()}/{md_name}.so')
 
         sources = rename_cpp_to_cu(srcs, src_dir)
 
@@ -153,7 +177,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
-
+            "-Wno-macro-redefined",
             "-fgpu-flush-denormals-to-zero",
         ]
 
@@ -166,7 +190,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         if hip_version > Version('6.2.41132'):
             flags_hip += ["-mllvm", "-amdgpu-early-inline-all=true",
                           "-mllvm", "-amdgpu-function-calls=false"]
-        if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
+        if hip_version > Version('6.2.41133'):
             flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         flags_cc += flags_extra_cc
@@ -182,6 +206,9 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
                 baton = FileBaton(os.path.join(blob_dir, 'lock'))
                 if baton.try_acquire():
                     try:
+                        if AITER_LOG_MORE:
+                            logger.info(
+                                f'exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}')
                         os.system(f'{PY} {blob_gen_cmd.format(blob_dir)}')
                     finally:
                         baton.release()
@@ -199,13 +226,13 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
 
         bd_include_dir = f'{op_dir}/build/include'
         os.makedirs(bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include"],
+        rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include"] + extra_include,
                          bd_include_dir)
         extra_include_paths = [
             f"{CK_DIR}/include",
             f"{CK_DIR}/library/include",
             f"{bd_include_dir}",
-        ]+extra_include
+        ]
 
         module = cpp_extension.load(
             md_name,
@@ -215,17 +242,17 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             extra_ldflags=extra_ldflags,
             extra_include_paths=extra_include_paths,
             build_directory=opbd_dir,
-            verbose=verbose or int(os.getenv("AITER_LOG_MORE", 0)) > 0,
+            verbose=verbose or AITER_LOG_MORE > 0,
             with_cuda=True,
             is_python_module=True,
         )
-        shutil.copy(f'{opbd_dir}/{md_name}.so', f'{this_dir}')
+        shutil.copy(f'{opbd_dir}/{md_name}.so', f'{get_user_jit_dir()}')
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
             md_name,
-            ''.join(traceback.format_exception(*sys.exc_info()))
+            '-->'.join(traceback.format_exception(*sys.exc_info()))
         ))
-        sys.exit()
+        raise Exception(f"failed build jit [{md_name}]...")
     logger.info(
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module
@@ -244,10 +271,10 @@ def get_args_of_build(ops_name: str, exclue=[]):
 
     def convert(d_ops: dict):
         # judge isASM
-        if d_ops["isASM"].lower() == "true":
-            d_ops["flags_extra_hip"].append(
-                "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
-        del d_ops["isASM"]
+        # if d_ops["isASM"].lower() == "true":
+        #     d_ops["flags_extra_hip"].append(
+        #         "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
+        # del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):
                 for idx, el in enumerate(val):
@@ -332,19 +359,10 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
             op = getattr(module, loadName)
-            if int(os.getenv("AITER_LOG_MORE", 0)) == 2:
-                import inspect
-                callargs = inspect.getcallargs(func, *args, **kwargs)
 
-                def getTensorInfo(el):
-                    if isinstance(el, torch.Tensor):
-                        return f'{el.shape} {el.dtype}'
-                    return el
-
-                callargs = [
-                    f"\n        {el} = {getTensorInfo(callargs[el])}" for el in callargs]
-                logger.info(
-                    f"    calling {md_name}::{loadName}({', '.join(callargs)})")
+            if AITER_LOG_MORE == 2:
+                from ..test_common import log_args
+                log_args(func, *args, **kwargs)
 
             return op(*args, **kwargs)
         return wrapper

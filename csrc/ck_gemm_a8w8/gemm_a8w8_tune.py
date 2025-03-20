@@ -89,7 +89,7 @@ def tune_gemm(m, n, k, useSplitK = False):
     else:
         best_time = round(best_time, 4)
         
-        print(f"Tuning result for M:{m}, N:{n}, K:{k} is kernelId={best_kernelId} {kernel.name} {splitK=}, {best_time}us")
+        print(f"Tuning result for M:{m}, N:{n}, K:{k} is kernelId={best_kernelId} {kernels_list[best_kernelId].name} {splitK=}, {best_time}us")
     print(f"*******************M:{m} X N:{n} X K{k}**************************")
     
     return best_kernelId, splitK, best_time
