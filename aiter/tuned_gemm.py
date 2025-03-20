@@ -190,7 +190,7 @@ class TunedGemm:
                                          k=k,
                                          bias=use_bias,
                                          dtype=inp.dtype,
-                                         otype=otype,
+                                         otype=otype if otype is not None else inp.dtype,
                                          scaleAB=scale_a is not None or scale_b is not None)
         out = self.solfuncs[soltype](
             inp_view, weights, solidx, bias, otype, scale_a, scale_b, scale_c)
