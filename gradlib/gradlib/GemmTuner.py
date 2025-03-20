@@ -106,7 +106,7 @@ class Gemm:
                                     out_dtype=self.outdtype)
             except RuntimeError as e:
                 ref = F.linear(self.inp.to(torch.float32), self.weights.to(torch.float32)) * scaleA * scaleB
-                ref = ref.to(self.outdtype) + self.bias
+                ref = (ref.to(self.outdtype) + self.bias) if self.bias is not None else ref.to(self.outdtype)
             if type(ref) is tuple and len(ref) == 2:
                 ref = ref[0]
         else:
