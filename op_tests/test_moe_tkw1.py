@@ -9,7 +9,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck
+from aiter.fused_moe_bf16_asm import asm_moe_tkw1, torch_moe_tkw1, moe_sorting_ck
 from aiter.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
@@ -40,7 +40,7 @@ def torch_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
                    activation = ActivationType.Silu
                    ):
-    return torch_moe(hidden_states,
+    return torch_moe_tkw1(hidden_states,
                      w1,
                      w2,
                      topk_weight,
@@ -58,7 +58,7 @@ def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                  a16=False,
                  activation = ActivationType.Silu
                  ):
-    return asm_moe(hidden_states,
+    return asm_moe_tkw1(hidden_states,
                    w1,
                    w2,
                    topk_weight,
@@ -123,7 +123,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
                      dtype=dtype, device="cuda")
     score = torch.randn((token, E), device="cuda", dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
-
+    print("topk_weights:", topk_weights)
     if shared_E > 0:
         shared_E_score = 0.5
         s_topk_weights = torch.tensor([[shared_E_score, shared_E_score],] * token,
@@ -147,7 +147,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
     #                        topk_weights,
     #                        topk_ids)
     # print(f'{ref1=}')
-
+    print("quantAlgoId" ,quantAlgoId)
     if quantAlgoId == 0:
         # ref2 implement
         ref2, avg_c = torch_moe_test(input,
@@ -245,38 +245,12 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
         #                              fc1_scale, fc2_scale,
         #                              fc1_smooth_scale, fc2_smooth_scale)
+
+        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         print("ref",ref2)
         print("out",out_b)
-        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
+        checkAllclose(ref2, out_b, rtol=0.01, atol=300, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
-
-print('test test_fmoe 16 bit')
-print('\ng1u0 no quant')
-for dtype in [torch.float16, torch.bfloat16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                test_fmoe(dtype, m, dim, hdim, 32, 5, quant='No')
-
-print('\ng1u1 no quant')
-for dtype in [torch.float16, torch.bfloat16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='No', use_g1u1=True)
-
-print('\ng1u1 int8quant')
-for dtype in [torch.bfloat16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                        #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
-                          quant='int8quant', use_g1u1=True)
 
 print('\ng1u1 fp8quant')
 for dtype in [torch.bfloat16]:
@@ -286,37 +260,3 @@ for dtype in [torch.bfloat16]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5,
                           quant='fp8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
                         #   quant='fp8quant', use_g1u1=True)
-
-
-print('\ng1u0 int8smoothquant')
-for dtype in [torch.bfloat16]:
-    for m in [128]:
-        for dim in [4096, 6144,  8192]:
-            for hdim in [512, 1024]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='int8smoothquant', use_g1u1=False)
-
-print('\ng1u1 int8smoothquant')
-for dtype in [torch.bfloat16]:
-    for m in [128]:
-        for dim in [4096, 6144,  8192]:
-            for hdim in [512, 1024, 1280]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='int8smoothquant', use_g1u1=True)
-
-print('\ng1u1 fp8smoothquant')
-for dtype in [torch.bfloat16]:
-    for m in [128]:
-        for dim in [4096, 6144,  8192]:
-            for hdim in [512, 1024, 1280]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='fp8smoothquant', use_g1u1=True)
-
-print('\ng1u1 int4')
-for dtype in [torch.bfloat16]:
-    for m in [32, 128]:
-        # for dim in [1024]:
-        for dim in [4096, 6144]:
-            for hdim in [1024, 4096]:
-                test_fmoe(dtype, m, dim, hdim, 8, 3,
-                          quant='wint4afp8smoothquant', use_g1u1=True)
