@@ -175,6 +175,28 @@ def rope_cached_2c_bwd_impl(
     ...
 
 @compile_ops("module_rope_pos_fwd")
+def rope_cached_positions_fwd_impl(
+    output: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool
+):
+    '''
+    Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
+    on one channel. Offsets here is optional. Both positions and offsets should be in [s, b].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
+    rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
+    When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
+    if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
+    '''
+    ...
+
+@compile_ops("module_rope_pos_fwd")
 def rope_cached_positions_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -190,6 +212,29 @@ def rope_cached_positions_2c_fwd_impl(
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
     on two channels. Offsets here is optional. Both positions and offsets should be in [s, b].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
+    rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
+    When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
+    if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
+    '''
+    ...
+
+@compile_ops("module_rope_pos_fwd")
+def rope_cached_positions_offsets_fwd_impl(
+    output: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool
+):
+    '''
+    Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
+    on one channel. Offsets here is optional. Both positions and offsets should be in [s, b].
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
     if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
