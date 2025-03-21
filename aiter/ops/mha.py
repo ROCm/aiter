@@ -280,7 +280,7 @@ def _flash_attn_backward(
     batch_stride_k = k.stride(0)
     stride_k = k.stride(1)
     nhead_stride_k = k.stride(2)
-    
+
     batch_stride_v = v.stride(0)
     stride_v = v.stride(1)
     nhead_stride_v = v.stride(2)
@@ -300,7 +300,7 @@ def _flash_attn_backward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = (causal == True and window_size_left == -1) # causal mask
     nmask = (causal == False and window_size_left == -1 and window_size_right == -1) # no mask
-    
+
     def np():
         # bwd_v3_bf16_a16_rtne
         # bwd_v3_bf16_a16_rtna
@@ -376,7 +376,7 @@ def _flash_attn_backward(
         # bwd_v3_fp16_causal_a16_pddv
         ret = is_v3_atomic_fp32 == False
         ret &= hdim_q > 64 and hdim_q < 128
-        ret &= seqlen_q == seqlen_k 
+        ret &= seqlen_q == seqlen_k
         ret &= seqlen_k % 64 == 0
         ret &= stride_q == stride_do
         ret &= nhead_stride_q == nhead_stride_do
@@ -390,7 +390,7 @@ def _flash_attn_backward(
         ret &= (batch_stride_dv / batch_stride_v) == (nhead_q / nhead_k)
 
         return ret
-    
+
     def psskddv():
         # only for a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
         # bwd_v3_bf16_a32_rtne_psskddv
@@ -535,6 +535,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
+            ctx.head_size_q_og = head_size_q_og
             ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
         out = out_padded[..., :head_size_v_og]
@@ -552,6 +553,7 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        head_size_q_og = ctx.head_size_q_og
         head_size_v_og = dout.size(3)
         dout_padded = dout
         if head_size_v_og % 8 != 0:
@@ -577,9 +579,9 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.is_v3_atomic_fp32,
             ctx.how_v3_bf16_cvt
         )
-        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k.shape[-1]]
-        dv = dv[..., : v.shape[-1]]
+        dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
+        dk = dk[..., : head_size_q_og]
+        dv = dv[..., : head_size_v_og]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
@@ -954,6 +956,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
+            ctx.head_size_q_og = head_size_q_og
 
         out = out_padded[..., :head_size_v_og]
 
@@ -969,6 +972,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        head_size_q_og = ctx.head_size_q_og
         head_size_v_og = dout.size(2)
         dout_padded = dout
         if head_size_v_og % 8 != 0:
@@ -996,9 +1000,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k.shape[-1]]
-        dv = dv[..., : v.shape[-1]]
+        dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
+        dk = dk[..., : head_size_q_og]
+        dv = dv[..., : head_size_v_og]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 

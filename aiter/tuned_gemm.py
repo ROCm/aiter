@@ -147,12 +147,17 @@ class TunedGemm:
             if scale_b is None:
                 scale_b = torch.ones(1, dtype=torch.float, device=inp.device)
 
-            return torch._scaled_mm(inp,
-                                    weights.t(),
-                                    out_dtype=otype,
-                                    scale_a=scale_a,
-                                    scale_b=scale_b,
-                                    bias=bias)
+            try:
+                out = torch._scaled_mm(inp,
+                                        weights.t(),
+                                        out_dtype=otype,
+                                        scale_a=scale_a,
+                                        scale_b=scale_b,
+                                        bias=bias)
+            except RuntimeError:
+                out = F.linear(inp.to(torch.float32), weights.to(torch.float32)) * scale_a * scale_b
+                out = (out.to(otype) + bias) if bias is not None else out.to(otype)
+            return out
         out = F.linear(inp, weights, bias)
         if otype is not None:
             out = out.to(otype)
@@ -185,7 +190,7 @@ class TunedGemm:
                                          k=k,
                                          bias=use_bias,
                                          dtype=inp.dtype,
-                                         otype=otype,
+                                         otype=otype if otype is not None else inp.dtype,
                                          scaleAB=scale_a is not None or scale_b is not None)
         out = self.solfuncs[soltype](
             inp_view, weights, solidx, bias, otype, scale_a, scale_b, scale_c)

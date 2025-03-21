@@ -177,7 +177,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
-
+            "-Wno-macro-redefined",
             "-fgpu-flush-denormals-to-zero",
         ]
 
@@ -252,7 +252,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             md_name,
             '-->'.join(traceback.format_exception(*sys.exc_info()))
         ))
-        sys.exit()
+        raise Exception(f"failed build jit [{md_name}]...")
     logger.info(
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module

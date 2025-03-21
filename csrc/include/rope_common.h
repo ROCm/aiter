@@ -931,11 +931,11 @@ __global__ void kn_entry_1c_sbhd_uncached(
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
-    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
-    const int32_t offset_f = sid * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutEq1, StrideDInEq1>(
         p_output + offset_o,
@@ -956,10 +956,10 @@ __global__ void kn_entry_1c_sbhd_uncached_inplace(
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_s, const int32_t stride_b, const int32_t stride_h, const int32_t stride_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset   = sid * stride_s + bid * stride_b;
-    const int32_t offset_f = sid * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset   = sid * stride_s + bid * stride_b;
+    const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDEq1, StrideDEq1>(
         p_inout + offset,
@@ -986,13 +986,13 @@ __global__ void kn_entry_2c_sbhd_uncached(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid       = blockIdx.x;
-    const int32_t bid       = blockIdx.y;
-    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_f  = sid * size_f;
+    const uint64_t sid       = blockIdx.x;
+    const uint64_t bid       = blockIdx.y;
+    const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+    const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+    const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+    const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+    const uint64_t offset_f  = sid * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
         p_output_x + offset_ox,
@@ -1019,11 +1019,11 @@ __global__ void kn_entry_2c_sbhd_uncached_inplace(
     const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
     const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
-    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
-    const int32_t offset_f = sid * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const uint64_t offset_f = sid * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
         p_inout_x + offset_x,
@@ -1051,11 +1051,11 @@ __global__ void kn_entry_1c_sbhd_cached(
     const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset_i = sid * stride_i_s + bid * stride_i_b;
-    const int32_t offset_o = sid * stride_o_s + bid * stride_o_b;
-    const int32_t offset_f = sid * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutEq1, StrideDInEq1>(
         p_output + offset_o,
@@ -1078,10 +1078,10 @@ __global__ void kn_entry_1c_sbhd_cached_inplace(
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_s, const int32_t stride_b, const int32_t stride_h, const int32_t stride_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset   = sid * stride_s + bid * stride_b;
-    const int32_t offset_f = sid * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset   = sid * stride_s + bid * stride_b;
+    const uint64_t offset_f = sid * size_f;
 
     Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDEq1, StrideDEq1>(
         p_inout + offset,
@@ -1110,13 +1110,13 @@ __global__ void kn_entry_2c_sbhd_cached(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid       = blockIdx.x;
-    const int32_t bid       = blockIdx.y;
-    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t offset_f  = sid * size_f;
+    const uint64_t sid       = blockIdx.x;
+    const uint64_t bid       = blockIdx.y;
+    const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+    const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+    const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+    const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+    const uint64_t offset_f  = sid * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
         p_output_x + offset_ox,
@@ -1145,11 +1145,11 @@ __global__ void kn_entry_2c_sbhd_cached_inplace(
     const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
     const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
-    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
-    const int32_t offset_f = sid * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const uint64_t offset_f = sid * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
         p_inout_x + offset_x,
@@ -1183,14 +1183,14 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid       = blockIdx.x;
-    const int32_t bid       = blockIdx.y;
-    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t ib_idx    = sid * gridDim.y + bid;
-    const int64_t offset_f  = p_indirect_buffer[ib_idx] * size_f;
+    const uint64_t sid       = blockIdx.x;
+    const uint64_t bid       = blockIdx.y;
+    const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+    const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+    const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+    const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+    const uint64_t ib_idx    = sid * gridDim.y + bid;
+    const uint64_t offset_f  = p_indirect_buffer[ib_idx] * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
         p_output_x + offset_ox,
@@ -1220,12 +1220,12 @@ __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
     const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
     const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
 {
-    const int32_t sid      = blockIdx.x;
-    const int32_t bid      = blockIdx.y;
-    const int32_t offset_x = sid * stride_x_s + bid * stride_x_b;
-    const int32_t offset_y = sid * stride_y_s + bid * stride_y_b;
-    const int32_t ib_idx    = sid * gridDim.y + bid;
-    const int64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_x = sid * stride_x_s + bid * stride_x_b;
+    const uint64_t offset_y = sid * stride_y_s + bid * stride_y_b;
+    const uint64_t ib_idx    = sid * gridDim.y + bid;
+    const uint64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
         p_inout_x + offset_x,
@@ -1260,14 +1260,14 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
     const int32_t stride_ox_s, const int32_t stride_ox_b, const int32_t stride_ox_h, const int32_t stride_ox_d,
     const int32_t stride_oy_s, const int32_t stride_oy_b, const int32_t stride_oy_h, const int32_t stride_oy_d)
 {
-    const int32_t sid       = blockIdx.x;
-    const int32_t bid       = blockIdx.y;
-    const int32_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
-    const int32_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
-    const int32_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
-    const int32_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
-    const int32_t ib_idx    = sid * gridDim.y + bid;
-    const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
+    const uint64_t sid       = blockIdx.x;
+    const uint64_t bid       = blockIdx.y;
+    const uint64_t offset_ix = sid * stride_ix_s + bid * stride_ix_b;
+    const uint64_t offset_iy = sid * stride_iy_s + bid * stride_iy_b;
+    const uint64_t offset_ox = sid * stride_ox_s + bid * stride_ox_b;
+    const uint64_t offset_oy = sid * stride_oy_s + bid * stride_oy_b;
+    const uint64_t ib_idx    = sid * gridDim.y + bid;
+    const uint64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutXEq1, StrideDOutYEq1, StrideDInXEq1, StrideDInYEq1>(
         p_output_x + offset_ox,
@@ -1298,12 +1298,12 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2_inplace(
     const int32_t stride_x_s, const int32_t stride_x_b, const int32_t stride_x_h, const int32_t stride_x_d,
     const int32_t stride_y_s, const int32_t stride_y_b, const int32_t stride_y_h, const int32_t stride_y_d)
 {
-    const int32_t sid       = blockIdx.x;
-    const int32_t bid       = blockIdx.y;
-    const int32_t offset_x  = sid * stride_x_s + bid * stride_x_b;
-    const int32_t offset_y  = sid * stride_y_s + bid * stride_y_b;
-    const int32_t ib_idx    = sid * gridDim.y + bid;
-    const int64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
+    const uint64_t sid       = blockIdx.x;
+    const uint64_t bid       = blockIdx.y;
+    const uint64_t offset_x  = sid * stride_x_s + bid * stride_x_b;
+    const uint64_t offset_y  = sid * stride_y_s + bid * stride_y_b;
+    const uint64_t ib_idx    = sid * gridDim.y + bid;
+    const uint64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
 
     Op::template apply_2c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDXEq1, StrideDYEq1, StrideDXEq1, StrideDYEq1>(
         p_inout_x + offset_x,
@@ -1332,9 +1332,9 @@ __global__ void kn_entry_1c_thd_uncached(
     const int32_t stride_i_t, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_t, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t tid = sid + p_cu_seqlens[bid];
+    const uint64_t sid = blockIdx.x;
+    const uint64_t bid = blockIdx.y;
+    const uint64_t tid = sid + p_cu_seqlens[bid];
 
     if (tid < p_cu_seqlens[bid + 1])
     {
@@ -1363,9 +1363,9 @@ __global__ void kn_entry_1c_thd_uncached_inplace(
     const int32_t size_f,   // size of last dimension of freqs.
     const int32_t stride_t, const int32_t stride_h, const int32_t stride_d)
 {
-    const int32_t sid = blockIdx.x;
-    const int32_t bid = blockIdx.y;
-    const int32_t tid = sid + p_cu_seqlens[bid];
+    const uint64_t sid = blockIdx.x;
+    const uint64_t bid = blockIdx.y;
+    const uint64_t tid = sid + p_cu_seqlens[bid];
 
     if (tid < p_cu_seqlens[bid + 1])
     {
@@ -1396,11 +1396,11 @@ __global__ void kn_entry_1c_2d_cached(
     const int32_t stride_i_b, const int32_t stride_i_s, const int32_t stride_i_h, const int32_t stride_i_d,
     const int32_t stride_o_b, const int32_t stride_o_s, const int32_t stride_o_h, const int32_t stride_o_d)
 {
-    const int Hid = blockIdx.x;
-    const int Wid = blockIdx.y;
-    const int sid = Hid * img_width + Wid;
-    const int bid = blockIdx.z;
-    const int size_half_d = size_d >> 1;
+    const uint64_t Hid = blockIdx.x;
+    const uint64_t Wid = blockIdx.y;
+    const uint64_t sid = Hid * img_width + Wid;
+    const uint64_t bid = blockIdx.z;
+    const uint64_t size_half_d = size_d >> 1;
 
     const int offset_h_i = bid * stride_i_b + sid * stride_i_s;
     const int offset_h_o = bid * stride_o_b + sid * stride_o_s;
@@ -1439,11 +1439,11 @@ __global__ void kn_entry_1c_2d_cached_inplace(
     const int32_t img_width, const int32_t size_h, const int32_t size_d,
     const int32_t stride_b, const int32_t stride_s, const int32_t stride_h, const int32_t stride_d)
 {
-    const int Hid = blockIdx.x;
-    const int Wid = blockIdx.y;
-    const int sid = Hid * img_width + Wid;
-    const int bid = blockIdx.z;
-    const int size_half_d = size_d >> 1;
+    const uint64_t Hid = blockIdx.x;
+    const uint64_t Wid = blockIdx.y;
+    const uint64_t sid = Hid * img_width + Wid;
+    const uint64_t bid = blockIdx.z;
+    const uint64_t size_half_d = size_d >> 1;
 
     const int offset_h   = bid * stride_b + sid * stride_s;
     const int offset_h_f = Hid * size_half_d;
