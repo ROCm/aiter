@@ -13,7 +13,7 @@ if 1:
     from aiter.tuned_gemm import tgemm
 
 
-@perftest()
+@perftest(num_iters=10)
 def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     if x.dtype == torch.float8_e4m3fnuz:
         if scaleA is None:
@@ -21,12 +21,17 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
         if scaleB is None:
             scaleB = torch.ones(1, dtype=torch.float, device = x.device)
         
-        return torch._scaled_mm(x,
-                                weight.t(),
-                                out_dtype=otype,
-                                scale_a=scaleA,
-                                scale_b=scaleB,
-                                bias=bias)
+        try:
+            out = torch._scaled_mm(x,
+                                    weight.t(),
+                                    out_dtype=otype,
+                                    scale_a=scaleA,
+                                    scale_b=scaleB,
+                                    bias=bias)
+        except RuntimeError:
+            out = F.linear(x.to(torch.float32), weight.to(torch.float32)) * scaleA * scaleB
+            out = (out.to(otype) + bias) if bias is not None else out.to(otype)
+        return out
     if scaleA is not None:
         x = x * scaleA
     if scaleB is not None:

@@ -119,7 +119,22 @@ def run_ck(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [5])
 @pytest.mark.parametrize("nheads", [6])
-@pytest.mark.parametrize("d", [32, 40, 59, 64, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (96, 96),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 192),
+        (224, 224),
+        (256, 256),
+    ],
+)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -167,7 +182,7 @@ def test_flash_attn_output(
     else:
         alibi_slopes = None
 
-    dout = torch.randn_like(v)
+    dout = torch.randn(batch_size, seqlen_q, nheads, d_v, device="cuda", dtype=dtype, requires_grad=True)
 
     out, dropout_mask, dq, dk, dv = run_ck(
         q, k, v, alibi_slopes, dout, dropout_p, causal,

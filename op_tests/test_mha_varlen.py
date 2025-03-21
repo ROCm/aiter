@@ -152,7 +152,22 @@ def run_ck(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("nheads", [9])
-@pytest.mark.parametrize("d", [32, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
+@pytest.mark.parametrize(
+    "d,d_v",
+    [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (96, 96),
+        (111, 111),
+        (128, 128),
+        (160, 160),
+        (192, 192),
+        (224, 224),
+        (256, 256),
+    ],
+)
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -203,7 +218,7 @@ def test_mha_varlen_fwd(
     else:
         alibi_slopes = None
 
-    dout = torch.randn_like(v)
+    dout = torch.randn(batch_size, seqlen_q, nheads, d_v, device="cuda", dtype=dtype, requires_grad=True)
 
     out, dropout_mask, dq, dk, dv = run_ck(
         q, k, v, query_padding_mask, key_padding_mask, alibi_slopes,

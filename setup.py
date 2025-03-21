@@ -8,7 +8,11 @@ import shutil
 
 from setuptools import setup, find_packages
 from packaging.version import parse, Version
-from aiter.jit import core
+# !!!!!!!!!!!!!!!! never import aiter
+# from aiter.jit import core
+this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, f'{this_dir}/aiter/')
+from jit import core
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
@@ -19,10 +23,7 @@ from torch.utils.cpp_extension import (
 )
 
 
-this_dir = os.path.dirname(os.path.abspath(__file__))
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
-bd_dir = f"{this_dir}/build"
-blob_dir = f"{bd_dir}/blob"
 PACKAGE_NAME = 'aiter'
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
@@ -40,12 +41,6 @@ else:
 FORCE_CXX11_ABI = False
 
 if IS_ROCM:
-    # use codegen get code dispatch
-    if not os.path.exists(bd_dir):
-        os.makedirs(bd_dir)
-    if not os.path.exists(blob_dir):
-        os.makedirs(blob_dir)
-
     print(f"\n\ntorch.__version__  = {torch.__version__}\n\n")
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
     TORCH_MINOR = int(torch.__version__.split(".")[1])

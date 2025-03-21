@@ -4,16 +4,19 @@
 import torch
 import torch.profiler as tpf
 import os
+import copy
 import numpy as np
 import pandas as pd
 from aiter import logger
 
 
-def perftest(num_iters=101, num_warmup=10, testGraph=False):
+def perftest(num_iters=101, num_warmup=5, testGraph=False, num_rotate_args=3):
     def decorator(func):
         def wrapper(*args, **kwargs):
-            for _ in range(num_warmup):
-                data = func(*args, **kwargs)
+            run_iters(num_warmup, func, *args, **kwargs)
+            rotate_args = [(copy.deepcopy(args),
+                            copy.deepcopy(kwargs))
+                           for _ in range(num_rotate_args)]
 
             if int(os.environ.get('AITER_LOG_MORE', 0)):
                 latencies = []
@@ -31,13 +34,13 @@ def perftest(num_iters=101, num_warmup=10, testGraph=False):
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    data = func(*args, **kwargs)
+                    data = run_iters_rotate(num_iters, func, rotate_args)
                 with tpf.profile(activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                                  profile_memory=True,
                                  with_stack=True,
                                  with_modules=True,
                                  ) as prof:
-                    run_iters(num_iters, graph.replay)
+                    run_iters(1, graph.replay)
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f'avg: {avg} us/iter with hipgraph')
             with tpf.profile(activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
@@ -48,7 +51,7 @@ def perftest(num_iters=101, num_warmup=10, testGraph=False):
                              #  on_trace_ready=tpf.tensorboard_trace_handler(
                              #      './aiter_logs/'),
                              ) as prof:
-                data = run_iters(num_iters, func, *args, **kwargs)
+                data = run_iters_rotate(num_iters, func, rotate_args)
             avg = get_trace_perf(prof, num_iters)
             return data, avg
         return wrapper
@@ -65,7 +68,17 @@ def benchmark():
 
 
 def run_iters(num_iters, func, *args, **kwargs):
+    data = None
     for _ in range(num_iters):
+        data = func(*args, **kwargs)
+    return data
+
+
+def run_iters_rotate(num_iters, func, rotate_args):
+    data = None
+    num_rotate_args = len(rotate_args)
+    for _ in range(num_iters):
+        args, kwargs = rotate_args[_ % num_rotate_args]
         data = func(*args, **kwargs)
     return data
 
@@ -139,7 +152,7 @@ def get_trace_perf(prof, num_iters):
     for el in timerList:
         df.at[avg_name, el] = df[el].sum()/num_iters
     if int(os.environ.get('AITER_LOG_MORE', 0)):
-        pd.set_option('display.max_colwidth', 180)
+        pd.set_option('display.max_colwidth', 120)
         logger.info(f'{df}')
     return df.at[avg_name, 'device_time_total']
 
