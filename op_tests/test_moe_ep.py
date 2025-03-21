@@ -77,7 +77,9 @@ def test_fmoe_ep(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1
     # This gpu id in EP, this example use the last id
     ep_id = ep -1
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask) 
-    expert_mask = torch.randint(0, 2, (E+shared_E+1,), dtype=torch.int32, device="cuda")
+    # expert_mask = torch.randint(0, 2, (E+shared_E+1,), dtype=torch.int32, device="cuda")
+    expert_mask = torch.zeros((E+shared_E+1,), dtype=torch.int32, device="cuda")
+    expert_mask[:E//ep]=1
     # The last expert 
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
@@ -209,11 +211,10 @@ def test_fmoe_ep(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1
         bw = num_tb * 1e6 / avg_b
         print(f"[BW  ] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, asm_bandwidth: {bw:.2f}TB/s")
 
-        if use_smooth and (inter_dim % 512 == 0 or
-                           inter_dim % 320 == 0
-                           ) and (
-            (w1b.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1b.shape[1]) or
-                (w1b.dtype == torch.int8 and inter_dim == w1b.shape[1])):
+        if use_smooth and \
+            (((inter_dim % 512 == 0 or inter_dim % 320 == 0) and (w1b.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1b.shape[1])) or
+             ((inter_dim % 320 == 0) and (w1b.dtype == torch.int8 and inter_dim*2 == w1b.shape[1])) or
+             ((inter_dim % 512 == 0) and (w1b.dtype == torch.int8 and inter_dim == w1b.shape[1]))):
             out_b2, avg_b2 = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids,
                                           fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16=True, expert_mask=expert_mask)
             msg = f'[perf] a8w8 asm: {avg_b:.2f} vs a16w8 asm: {avg_b2:.2f} ......'
@@ -275,14 +276,14 @@ for dtype in [torch.bfloat16]:
                     test_fmoe_ep(dtype, m, dim, hdim, 32, 5,
                             quant='int8smoothquant', use_g1u1=False, shared_E=2, ep=ep)
 
-# print('\ng1u1 int8smoothquant not supported')
-# for dtype in [torch.bfloat16]:
-#     for m in [128]:
-#         for dim in [4096, 6144,  8192]:
-#             for hdim in [512, 1024, 1280]:
-#                 for ep in [1, 2, 4, 8]:
-#                     test_fmoe_ep(dtype, m, dim, hdim, 32, 5,
-#                             quant='int8smoothquant', use_g1u1=True, shared_E=2, ep=ep)
+print('\ng1u1 int8smoothquant')
+for dtype in [torch.bfloat16]:
+    for m in [128]:
+        for dim in [4096]:
+            for hdim in [1280]:
+                for ep in [8]:
+                    test_fmoe_ep(dtype, m, dim, hdim, 128, 6,
+                            quant='int8smoothquant', use_g1u1=True, shared_E=2, ep=ep)
 
 print('\ng1u1 fp8smoothquant')
 for dtype in [torch.bfloat16]:

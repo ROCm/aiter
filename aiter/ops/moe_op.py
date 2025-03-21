@@ -129,7 +129,7 @@ def fmoe_int8_g1u0_a16(
 
 
 @compile_ops("module_moe_asm")
-def fmoe_fp8_g1u1_a16(
+def fmoe_g1u1_a16(
     out: Tensor,
     input: Tensor,  # bf16
     gate: Tensor,

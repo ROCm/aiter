@@ -50,7 +50,7 @@ torch::Tensor flatmm_a8w8_blockscale_asm(
 
     TORCH_CHECK(out.dtype() == torch::ScalarType::Half,
                 "flatmm a8w8 blockscale asm only support Half output now!");
-    TORCH_CHECK(m % TileM == 0 && n % TileN == 0 && k % TileK == 0, 
+    TORCH_CHECK(n % TileN == 0 && k % TileK == 0, 
                 "flatmm a8w8 blockscale asm only suuport 128x256x128 tile now!");
 
     KernelArgs args;
@@ -75,8 +75,8 @@ torch::Tensor flatmm_a8w8_blockscale_asm(
     static AiterAsmKernel impl_kenrel("flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32", "flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32.co");
     impl_ptr = &impl_kenrel;
 
-    int gdx = n / TileN;
-    int gdy = m / TileM;
+    int gdx = (n + TileN - 1) / TileN;
+    int gdy = (m + TileM - 1) / TileM;
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

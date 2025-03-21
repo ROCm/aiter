@@ -72,8 +72,8 @@ def asm_moe(hidden_states,
                    sorted_weights, sorted_expert_ids, num_valid_ids, topk)
     elif a16:
         # a16w8 smooth quant fmoe
-        if w1.dtype == torch.float8_e4m3fnuz and inter_dim*2 == w1.shape[1]:
-            aiter.fmoe_fp8_g1u1_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
+        if w1.dtype in [torch.float8_e4m3fnuz, torch.int8] and inter_dim*2 == w1.shape[1]:
+            aiter.fmoe_g1u1_a16(moe_buf, hidden_states, w1, w2, sorted_ids,
                                     sorted_weights, sorted_expert_ids, num_valid_ids,
                                     topk,
                                     fc1_scale,

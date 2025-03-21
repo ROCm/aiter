@@ -107,17 +107,13 @@ def check_and_set_ninja_worker():
         os.environ["MAX_JOBS"] = max_jobs
 
 
-def do_rename_and_mv(name, src, dst, ret):
-    os.makedirs(dst, exist_ok=True)
-    newName = name
-    if name.endswith(".cpp") or name.endswith(".cu"):
-        newName = name.replace(".cpp", ".cu")
-        ret.append(f'{dst}/{newName}')
-    shutil.copy(f'{src}/{name}', f'{dst}/{newName}')
-
-
 def rename_cpp_to_cu(els, dst, recurisve=False):
-
+    def do_rename_and_mv(name, src, dst, ret):
+        newName = name
+        if name.endswith(".cpp") or name.endswith(".cu"):
+            newName = name.replace(".cpp", ".cu")
+            ret.append(f'{dst}/{newName}')
+        shutil.copy(f'{src}/{name}', f'{dst}/{newName}')
     ret = []
     for el in els:
         if not os.path.exists(el):
@@ -181,7 +177,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
-
+            "-Wno-macro-redefined",
             "-fgpu-flush-denormals-to-zero",
         ]
 
@@ -256,7 +252,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             md_name,
             '-->'.join(traceback.format_exception(*sys.exc_info()))
         ))
-        sys.exit()
+        raise Exception(f"failed build jit [{md_name}]...")
     logger.info(
         f'finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s')
     return module

@@ -306,53 +306,80 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
 {
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
+    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+
+    struct FMoeKernelConfig
+    {
+        std::string name;
+        std::string co_name;
+        int tile_size;
+    };
 
     if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
+            {512, {"fmoe_int8_g1u0_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_512_gelu.co", 512}},
+            {448, {"fmoe_int8_g1u0_subGU_448_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_448_gelu.co", 448}},
+            {384, {"fmoe_int8_g1u0_subGU_384_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_384_gelu.co", 384}},
+            {320, {"fmoe_int8_g1u0_subGU_320_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_320_gelu.co", 320}},
+            {256, {"fmoe_int8_g1u0_subGU_256_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_256_gelu.co", 256}},
+            {192, {"fmoe_int8_g1u0_subGU_192_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_192_gelu.co", 192}},
+            {128, {"fmoe_int8_g1u0_subGU_128_gelu", "fmoe/gelu/fmoe_int8_g1u0_subGU_128_gelu.co", 128}}};
 
-        if ((inter_dim % 512) == 0)
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
+            {512, {"fmoe_int8_g1u0_subGU_512", "fmoe/silu/fmoe_int8_g1u0_subGU_512.co", 512}},
+            {448, {"fmoe_int8_g1u0_subGU_448", "fmoe/silu/fmoe_int8_g1u0_subGU_448.co", 448}},
+            {384, {"fmoe_int8_g1u0_subGU_384", "fmoe/silu/fmoe_int8_g1u0_subGU_384.co", 384}},
+            {320, {"fmoe_int8_g1u0_subGU_320", "fmoe/silu/fmoe_int8_g1u0_subGU_320.co", 320}},
+            {256, {"fmoe_int8_g1u0_subGU_256", "fmoe/silu/fmoe_int8_g1u0_subGU_256.co", 256}},
+            {192, {"fmoe_int8_g1u0_subGU_192", "fmoe/silu/fmoe_int8_g1u0_subGU_192.co", 192}},
+            {128, {"fmoe_int8_g1u0_subGU_128", "fmoe/silu/fmoe_int8_g1u0_subGU_128.co", 128}}};
+
+        std::unordered_map<int, FMoeKernelConfig> *config_map = nullptr;
+        if (activation == ActivationType::Gelu)
         {
-            static FMoeKernel impl_int8_512("fmoe_int8_g1u0_subGU_512", "fmoe/silu/fmoe_int8_g1u0_subGU_512.co", 512);
-            impl_ptr = &impl_int8_512;
+            config_map = &gelu_kernel_int8_configs;
         }
-        else if ((inter_dim % 448) == 0)
+        else if (activation == ActivationType::Silu)
         {
-            static FMoeKernel impl_int8_448("fmoe_int8_g1u0_subGU_448", "fmoe/silu/fmoe_int8_g1u0_subGU_448.co", 448);
-            impl_ptr = &impl_int8_448;
+            config_map = &silu_kernel_int8_configs;
         }
-        else if ((inter_dim % 384) == 0)
+
+        if (!config_map)
         {
-            static FMoeKernel impl_int8_384("fmoe_int8_g1u0_subGU_384", "fmoe/silu/fmoe_int8_g1u0_subGU_384.co", 384);
-            impl_ptr = &impl_int8_384;
+            TORCH_CHECK(false, __func__, " Input only supput Int8!");
         }
-        else if ((inter_dim % 320) == 0)
+
+        const int tiles[] = {512, 448, 384, 320, 256, 192, 128};
+        int selectedTile = 0;
+        for (int tile : tiles)
         {
-            static FMoeKernel impl_int8_320("fmoe_int8_g1u0_subGU_320", "fmoe/silu/fmoe_int8_g1u0_subGU_320.co", 320);
-            impl_ptr = &impl_int8_320;
+            if (inter_dim % tile == 0)
+            {
+                selectedTile = tile;
+                break;
+            }
         }
-        else if ((inter_dim % 256) == 0)
+        if (selectedTile == 0)
         {
-            static FMoeKernel impl_int8_256("fmoe_int8_g1u0_subGU_256", "fmoe/silu/fmoe_int8_g1u0_subGU_256.co", 256);
-            impl_ptr = &impl_int8_256;
-        }
-        else if ((inter_dim % 192) == 0)
-        {
-            static FMoeKernel impl_int8_192("fmoe_int8_g1u0_subGU_192", "fmoe/silu/fmoe_int8_g1u0_subGU_192.co", 192);
-            impl_ptr = &impl_int8_192;
-        }
-        else if ((inter_dim % 128) == 0)
-        {
-            static FMoeKernel impl_int8_128("fmoe_int8_g1u0_subGU_128", "fmoe/silu/fmoe_int8_g1u0_subGU_128.co", 128);
-            impl_ptr = &impl_int8_128;
-        }
-        else
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
-    }
-    else
-    {
-        TORCH_CHECK(false, __func__, " Input only supput Int8!");
-    }
+        }
 
+        auto it = config_map->find(selectedTile);
+        if (it != config_map->end())
+        {
+            const auto &config = it->second;
+            const char *name = config.name.c_str();
+            const char *co_name = config.co_name.c_str();
+
+            auto result = impl_ptr_map.emplace(name, nullptr);
+            if (result.second)
+            {
+                result.first->second = std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
+            }
+            impl_ptr = result.first->second.get();
+        }
+    }
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
                                                input,
                                                gate,
@@ -368,7 +395,6 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                                                fc2_scale,
                                                fc2_smooth_scale);
 }
-
 void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim]
                torch::Tensor &input,                          // [token_cnt, dim] M,K
                torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
@@ -421,7 +447,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
     }
     else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
-        std::unordered_map<int, FMoeKernelConfig> multix_kernel_int8_configs = {
+        static std::unordered_map<int, FMoeKernelConfig> multix_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_multix_subGU_512", "fmoe_int8_g1u1_multix_subGU_512.co", 512}},
             {448, {"fmoe_int8_g1u1_multix_subGU_448", "fmoe_int8_g1u1_multix_subGU_448.co", 448}},
             {384, {"fmoe_int8_g1u1_multix_subGU_384", "fmoe_int8_g1u1_multix_subGU_384.co", 384}},
@@ -430,7 +456,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {192, {"fmoe_int8_g1u1_multix_subGU_192", "fmoe_int8_g1u1_multix_subGU_192.co", 192}},
             {128, {"fmoe_int8_g1u1_multix_subGU_128", "fmoe_int8_g1u1_multix_subGU_128.co", 128}}};
 
-        std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_subGU_512", "fmoe/silu/fmoe_int8_g1u1_subGU_512.co", 512}},
             {448, {"fmoe_int8_g1u1_subGU_448", "fmoe/silu/fmoe_int8_g1u1_subGU_448.co", 448}},
             {384, {"fmoe_int8_g1u1_subGU_384", "fmoe/silu/fmoe_int8_g1u1_subGU_384.co", 384}},
@@ -439,7 +465,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {192, {"fmoe_int8_g1u1_subGU_192", "fmoe/silu/fmoe_int8_g1u1_subGU_192.co", 192}},
             {128, {"fmoe_int8_g1u1_subGU_128", "fmoe/silu/fmoe_int8_g1u1_subGU_128.co", 128}}};
 
-        std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_int8_configs = {
             {512, {"fmoe_int8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_512_gelu.co", 512}},
             {448, {"fmoe_int8_g1u1_subGU_448_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_448_gelu.co", 448}},
             {384, {"fmoe_int8_g1u1_subGU_384_gelu", "fmoe/gelu/fmoe_int8_g1u1_subGU_384_gelu.co", 384}},
@@ -717,38 +743,51 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                                                 fc2_smooth_scale);
 }
 
-void fmoe_fp8_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
-                       torch::Tensor &input,             // [token_cnt, dim] M,K
-                       torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
-                       torch::Tensor &down,              // [expert, dim, inter_dim]
-                       torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                       torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
-                       torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-                       torch::Tensor &num_valid_ids,     // [1]
-                       uint32_t topk,                    //
-                       torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
-                       torch::Tensor &fc2_scale,         // [expert, 1, dim]
-                       torch::Tensor &fc1_smooth_scale,  // [expert, 1, dim]
-                       torch::Tensor &fc2_smooth_scale   // [expert, 1, inter_dim]
+void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
+                   torch::Tensor &input,             // [token_cnt, dim] M,K
+                   torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
+                   torch::Tensor &down,              // [expert, dim, inter_dim]
+                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                   torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                   torch::Tensor &num_valid_ids,     // [1]
+                   uint32_t topk,                    //
+                   torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
+                   torch::Tensor &fc2_scale,         // [expert, 1, dim]
+                   torch::Tensor &fc1_smooth_scale,  // [expert, 1, dim]
+                   torch::Tensor &fc2_smooth_scale   // [expert, 1, inter_dim]
 )
 {
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
-    int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
 
-    if (selectedTile == 512)
+    if (gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
     {
-        static FMoeKernel impl_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
-        impl_ptr = &impl_512;
+        TORCH_CHECK(inter_dim % 320 == 0, __func__, "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320");
+        static FMoeKernel impl_int8_320("fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
+        impl_ptr = &impl_int8_320;
     }
-    else if (selectedTile == 320)
+    else if (gate.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
-        static FMoeKernel impl_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
-        impl_ptr = &impl_320;
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
+        if (selectedTile == 512)
+        {
+            static FMoeKernel impl_fp8_512("fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
+            impl_ptr = &impl_fp8_512;
+        }
+        else if (selectedTile == 320)
+        {
+            static FMoeKernel impl_fp8_320("fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
+            impl_ptr = &impl_fp8_320;
+        }
+        else
+            TORCH_CHECK(false, __func__, "fp8 quant Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
     }
     else
-        TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 320 or 512");
+    {
+        TORCH_CHECK(false, __func__, " gate/down weight only supput Int8/Fp8!");
+    }
 
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,

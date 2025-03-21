@@ -75,15 +75,13 @@ def hip_rope_2d_bwd(output_grads, height, width, cos_h, sin_h, cos_w, sin_w, rot
 
 @perftest()
 def legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos, sin, positions, rotate_style, nope_first):
-    s, b, h, d = input_x.shape
-    aiter.rotary_embedding_fwd(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first)
+    aiter.rotary_embedding_fwd(positions, input_x, input_y, d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first)
     return input_x, input_y
 
 @perftest()
 def legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, nope_first):
-    s, b, h, d = input_x.shape
     rotate_dim = sin.size(-1) * 2
-    aiter.batched_rotary_embedding(positions, input_x.view(s * b, -1), input_y.view(s * b, -1), d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first, rotate_dim, offsets.view(-1))
+    aiter.batched_rotary_embedding(positions, input_x, input_y, d, cos, sin, rotate_style is RotateStyle.NEOX, nope_first, rotate_dim, offsets.view(-1))
     return input_x, input_y
 
 
@@ -255,6 +253,8 @@ rotate_style: {rotate_style.value}, \
 nope_first: {nope_first}
 """
 
+    s, b, h_x, d = input_x.shape
+
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
@@ -262,9 +262,8 @@ nope_first: {nope_first}
     if check_correction:
         ref_x = ref_rope_sbhd_fwd(input_x, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
         ref_y = ref_rope_sbhd_fwd(input_y, freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2), rotate_style, True, nope_first)
-        s, b, h_x, d = input_x.shape
         h_y = input_y.shape[2]
-        hip_input_x, hip_input_y = input_x.clone(), input_y.clone()
+        hip_input_x, hip_input_y = input_x, input_y
         leg_input_x, leg_input_y = input_x.clone().view(s * b, -1), input_y.clone().view(s * b, -1)
         if offsets is None:
             aiter.rope_cached_positions_2c_fwd_inplace(hip_input_x, hip_input_y, cos, sin, positions, rotate_style, True, nope_first)
@@ -278,17 +277,22 @@ nope_first: {nope_first}
         checkAllclose(ref_x, leg_input_x.view(s, b, h_x, d), msg=f"correction: leg_fwd_x - {input_msg}\n")
         checkAllclose(ref_y, leg_input_y.view(s, b, h_y, d), msg=f"correction: leg_fwd_y - {input_msg}\n")
 
+    leg_cached_fwd_avg = 0.0001
+    hip_cached_fwd_avg = 0.0001
     if offsets is None:
-        _, leg_cached_fwd_avg = legacy_rope_cached_positions_2d_fwd(input_x, input_y, cos, sin, positions, rotate_style, nope_first)
+        _, leg_cached_fwd_avg = legacy_rope_cached_positions_2d_fwd(
+            input_x.view(s * b, -1), input_y.view(s * b, -1), cos, sin, positions, rotate_style, nope_first)
         _, hip_cached_fwd_avg = hip_rope_cached_positions_2d_fwd_inplace(
             input_x, input_y, cos, sin, positions, rotate_style, True, nope_first)
     else:
-        _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(input_x, input_y, cos, sin, positions, offsets, rotate_style, nope_first)
+        _, leg_cached_fwd_avg = legacy_rope_cached_positions_offsets_2d_fwd(
+            input_x.view(s * b, -1), input_y.view(s * b, -1), cos, sin, positions, offsets, rotate_style, nope_first)
         _, hip_cached_fwd_avg = hip_rope_cached_positions_offsets_2d_fwd_inplace(
             input_x, input_y, cos, sin, positions, offsets, rotate_style, True, nope_first)
 
     color = '\033[91m' if hip_cached_fwd_avg > leg_cached_fwd_avg else '\033[92m' if hip_cached_fwd_avg < leg_cached_fwd_avg * 0.75 else '\033[93m'
-    print(f"{color}{input_msg}hip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us. diff: {100*hip_cached_fwd_avg/leg_cached_fwd_avg}%.\n{color}")
+    endc = '\033[0m'
+    print(f"{color}{input_msg}hip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us. diff: {100*hip_cached_fwd_avg/leg_cached_fwd_avg}%.\n{endc}")
 
 
 
@@ -441,8 +445,8 @@ if __name__ == "__main__":
             (False, True),
             batch_size_[-1:], seq_size_[1:2], head_size_[-1:], head_size_[-1:], hidden_dim_[-1:]
         ):
-            color = '\033[95m'
-            print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, sbhd: {b, s, h_x, h_y, d}, has_offsets: {has_offsets}{color}")
+            color, endc = '\033[95m', '\033[0m'
+            print(f"{color}dtype: {dtype}, rotate_style: {rotate_style}, rpar: {rotary_percent_and_reuse}, (s,b,hx,hy,d): {s, b, h_x, h_y, d}, has_offsets: {has_offsets}{endc}")
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
             nope_first = (rotary_percent >= 1.0) and rotary_percent_and_reuse[2]

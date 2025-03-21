@@ -29,13 +29,6 @@
             py::arg("splitData"),                                            \
             py::arg("splitLse"));
 
-#define EAGLE_UTILS_PYBIND                                                                               \
-      m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient"); \
-      m.def("build_tree_kernel", &build_tree_kernel, "build_tree_kernel");
-
-#define SPECULATIVE_SAMPLING_PYBIND                                                                      \
-      m.def("tree_speculative_sampling_target_only", &tree_speculative_sampling_target_only);
-
 #define ATTENTION_ASM_PYBIND                    \
       m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",    \
             py::arg("Q"),                       \
@@ -376,7 +369,7 @@
             py::arg("fc2_smooth_scale") = std::nullopt,                          \
             py::arg("activation") = ActivationType::Silu);                       \
       m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                          \
-      m.def("fmoe_fp8_g1u1_a16", &fmoe_fp8_g1u1_a16);                            \
+      m.def("fmoe_g1u1_a16", &fmoe_g1u1_a16);                                    \
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,               \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \

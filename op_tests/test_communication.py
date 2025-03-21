@@ -34,10 +34,6 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, input, withGraph=False):
         dist.barrier()
 
         if withGraph:
-            @perftest()
-            def run_ca(graph):
-                return graph.replay()
-
             graph = torch.cuda.CUDAGraph()
             with graph_capture() as gc:
                 with torch.cuda.graph(graph, stream=gc.stream):
@@ -48,7 +44,11 @@ def run_commun_fwd(tp_size, pp_size,  gpuID, input, withGraph=False):
             out.fill_(0)
             dist.barrier()
 
-            _, us = run_ca(graph)
+            @perftest()
+            def run_ca():
+                return graph.replay()
+
+            _, us = run_ca()
         else:
             @perftest()
             def run_ca(x):
