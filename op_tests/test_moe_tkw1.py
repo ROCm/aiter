@@ -9,7 +9,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe_bf16_asm import asm_moe_tkw1, torch_moe_tkw1, moe_sorting_ck
+from aiter.fused_moe_bf16_asm import asm_moe_tkw1, torch_moe_tkw1, moe_sorting_ck,torch_moe
 from aiter.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
@@ -115,15 +115,14 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
     if use_g1u1:
         w1 = torch.randn((E+shared_E, inter_dim*2, model_dim),
-                         dtype=dtype, device="cuda") / 10.0
+                         dtype=dtype, device="cuda") /10
     else:
         w1 = torch.randn((E+shared_E, inter_dim, model_dim),
                          dtype=dtype, device="cuda")
     w2 = torch.randn((E+shared_E, model_dim, inter_dim),
-                     dtype=dtype, device="cuda")
+                     dtype=dtype, device="cuda") 
     score = torch.randn((token, E), device="cuda", dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
-    print("topk_weights:", topk_weights)
     if shared_E > 0:
         shared_E_score = 0.5
         s_topk_weights = torch.tensor([[shared_E_score, shared_E_score],] * token,
@@ -147,7 +146,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
     #                        topk_weights,
     #                        topk_ids)
     # print(f'{ref1=}')
-    print("quantAlgoId" ,quantAlgoId)
+    #print("quantAlgoId" ,quantAlgoId)
     if quantAlgoId == 0:
         # ref2 implement
         ref2, avg_c = torch_moe_test(input,
@@ -247,16 +246,14 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
         #                              fc1_smooth_scale, fc2_smooth_scale)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
-        print("ref",ref2)
-        print("out",out_b)
-        checkAllclose(ref2, out_b, rtol=0.01, atol=300, msg=msg)
+        checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
 
 print('\ng1u1 fp8quant')
 for dtype in [torch.bfloat16]:
-    for m in [128]:
-        for dim in [8192]:
-            for hdim in [2048]:
+    for m in [128,256]:
+        for dim in [4096,8192]:
+            for hdim in [1024,2048]:
                 test_fmoe(dtype, m, dim, hdim, 32, 5,
                           quant='fp8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
                         #   quant='fp8quant', use_g1u1=True)

@@ -9,6 +9,7 @@ import os
 from typing import Any, Callable, Dict, Optional, Tuple
 import aiter
 from aiter import logger
+from aiter import pertoken_quant
 from aiter import ActivationType
 BLOCK_SIZE_M = 32
 
@@ -176,7 +177,7 @@ def asm_moe_tkw1(hidden_states,
     lastdim_mul = 8 if w1.dtype in {torch.int32, torch.uint32} else 1
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, global_E,
                                                                                            model_dim, dtype, BLOCK_SIZE_M, expert_mask)
-
+    
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
@@ -248,6 +249,8 @@ def asm_moe_tkw1(hidden_states,
                     hidden_states, torch.float, quant_dtype=w1.dtype)
         if w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_g1u1_tkw1
+            #print("right")
+
         else:
             raise ValueError(
                 f"Invalid MoE weight: {w1.shape=} {w2.shape=} {lastdim_mul}")
@@ -476,7 +479,9 @@ def torch_moe_tkw1(hidden_states, w1, w2, topk_weight, topk_ids,
                 # print("helo hidden_states", hidden_states.shape)
                 # print("helo sub_tokens", sub_tokens.shape)
                 # print("helo topk_weight",topk_weight.shape)
+               # print("topk_weight.view(B, -1, 1)[mask]",topk_weight.view(B, -1, 1)[mask])
                 gate = gate * (topk_weight.view(B, -1, 1)[mask])
+                up = up * (topk_weight.view(B, -1, 1)[mask])
                 if activation == ActivationType.Gelu:
                     act_out = F.gelu(gate) * up
                 else:
@@ -488,7 +493,9 @@ def torch_moe_tkw1(hidden_states, w1, w2, topk_weight, topk_ids,
                     act_out = F.silu(act_input)
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
-            out[mask] = act_out @ (w2[E_id].transpose(0, 1))
+            act_out, act_out_scale =  pertoken_quant(
+                 act_out, torch.float, quant_dtype = torch.float8_e4m3fnuz, dtypeMax=None)
+            out[mask] = act_out.to(computeType) @ (w2[E_id].transpose(0, 1))*act_out_scale.view(-1, 1)
 
     return out.sum(dim=1).to(dtype) 
 
