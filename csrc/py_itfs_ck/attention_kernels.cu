@@ -2,8 +2,8 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "py_itfs_common.h"
 #include "ck_tile/ref/naive_attention.hpp"
 
@@ -25,8 +25,8 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
                            const int quant_algo, // 0: no quant, 1: per-token FP8 quant
                            std::optional<torch::Tensor> &out_)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     TORCH_CHECK(block_tables.dtype() == torch::kInt32, "block_tables must be int32");
     TORCH_CHECK(context_lens.dtype() == torch::kInt32, "context_lens must be int32");
     torch::Tensor out = out_.value_or(torch::empty_like(Q));

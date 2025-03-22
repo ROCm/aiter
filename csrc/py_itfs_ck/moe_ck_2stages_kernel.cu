@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "py_itfs_common.h"
 
 #include "moe_ck_gemm.hpp"
 
 #define CK_MOE_STAGE1_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, MPerBlock, NSwizzle)                                                                                                                                                                                                                \
     if (MPerBlock == 32)                                                                                                                                                                                                                                                                                                \
-        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 32, 256/sizeof(A0DataType), 1, 1, NSwizzle>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
+        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 32, 256/sizeof(A0DataType), 1, 1, NSwizzle>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
     else if (MPerBlock == 64)                                                                                                                                                                                                                                                                                           \
-        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 64, 256/sizeof(A0DataType), 2, 1, NSwizzle>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
+        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 64, 256/sizeof(A0DataType), 2, 1, NSwizzle>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
     else if (MPerBlock == 128)                                                                                                                                                                                                                                                                                          \
-        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 128, 128/sizeof(A0DataType), 2, 2, NSwizzle>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);
+        ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 128, 128/sizeof(A0DataType), 2, 2, NSwizzle>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);
 
 
 void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
@@ -28,8 +28,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    at::cuda::getCurrentCUDAStream().stream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
     TORCH_CHECK(hidden_states.dtype() == w1.dtype(),
                 "Weights and activations should both be same dtype!");
 
@@ -134,11 +134,11 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
 
 #define CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, MPerBlock)                                                                                                                                                                                                                                   \
     if (MPerBlock == 32)                                                                                                                                                                                                                                                                                                                   \
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 32>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr); \
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 32>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream(), tokens, sorted_size, N, K, topk, inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr); \
     else if (MPerBlock == 64)                                                                                                                                                                                                                                                                                                              \
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 64>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr); \
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 64>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream(), tokens, sorted_size, N, K, topk, inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr); \
     else if (MPerBlock == 128)                                                                                                                                                                                                                                                                                                             \
-        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 128>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr);
+        ck_moe_stage2_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, 128>(at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream(), tokens, sorted_size, N, K, topk, inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr);
 
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
+#include "hip/hip_runtime.h"
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
@@ -231,7 +232,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     if (is_causal) { window_size_right = 0; }
 
     bool is_dropout = p_dropout > 0.0;
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -330,7 +331,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         dv = torch::empty_like(v);
     }
 
-    at::cuda::CUDAGuard device_guard{q.device()};
+    at::hip::HIPGuardMasqueradingAsCUDA device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));

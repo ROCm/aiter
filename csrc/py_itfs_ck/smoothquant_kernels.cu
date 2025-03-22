@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "py_itfs_common.h"
 
 #include "smoothquant.hpp"
@@ -22,8 +22,8 @@ void smoothquant_fwd(torch::Tensor &out,     // [m ,n]
     int m = input.numel() / n;
     int stride = n;
     int out_stride = out.stride(0);
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     smoothquant({
                     dtype_str // input  dtype
@@ -57,8 +57,8 @@ void moe_smoothquant_fwd(torch::Tensor &out,      // [topk * tokens, hidden_size
     int experts = x_scale.size(0);
     int topk = topk_ids.size(1);
     int stride = n;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     moe_smoothquant({
                         dtype_str, // input  dtype

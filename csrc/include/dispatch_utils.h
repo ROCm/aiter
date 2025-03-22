@@ -20,7 +20,7 @@
  */
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 #define VLLM_DISPATCH_CASE_FLOATING_TYPES(...)         \
   AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \

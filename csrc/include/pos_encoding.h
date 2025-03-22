@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 void rotary_embedding(torch::Tensor &positions, torch::Tensor &query,
                       torch::Tensor &key, int64_t head_size,

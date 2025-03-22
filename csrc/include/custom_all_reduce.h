@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 // all reduce
 using fptr_t = int64_t;

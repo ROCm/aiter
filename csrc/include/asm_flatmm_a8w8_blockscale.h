@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 torch::Tensor flatmm_a8w8_blockscale_asm(
     torch::Tensor &XQ,      // [M, K]

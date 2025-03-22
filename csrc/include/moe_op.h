@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
                   torch::Tensor &token_expert_indices,

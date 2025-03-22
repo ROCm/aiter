@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "aiter_hip_common.h"
 
 struct __attribute__((packed)) KernelArgs
@@ -78,8 +78,8 @@ void mla_stage1_asm_fwd(torch::Tensor &Q,                 //   [num_seqs, num_he
     args.s_log2_plen = log2_page;
     // std::cout << "scalar: " << args.scalar << " s_MQA:" << args.s_MQA << " s_kv_split:" << args.s_kv_split << " s_Q_Bs:" << args.s_Q_Bs << " s_Bs:" << args.s_Bs << " s_log2_plen:" << args.s_log2_plen << std::endl;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Q));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     AiterAsmKernel *impl_ptr = nullptr;
     TORCH_CHECK(Q.is_contiguous(),

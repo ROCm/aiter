@@ -15,7 +15,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 void rms_norm(torch::Tensor &out, torch::Tensor &input, torch::Tensor &weight,
               double epsilon);

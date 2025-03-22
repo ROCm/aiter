@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 void rope_fwd_impl(
     torch::Tensor&       output,                    // [s, b, h, d]

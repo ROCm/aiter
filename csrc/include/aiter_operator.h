@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 torch::Tensor aiter_add(torch::Tensor &input0, torch::Tensor &input1);
 torch::Tensor aiter_mul(torch::Tensor &input0, torch::Tensor &input1);

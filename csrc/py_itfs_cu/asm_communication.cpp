@@ -3,8 +3,8 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 
 #include "communication_asm.h"
 #include "aiter_hip_common.h"
@@ -14,8 +14,8 @@ torch::Tensor all_reduce_asm(torch::Tensor &input,
                              int64_t _ca,
                              torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    auto stream = c10::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream();
 
     auto input_size = input.numel() * input.element_size();
 
@@ -24,8 +24,8 @@ torch::Tensor all_reduce_asm(torch::Tensor &input,
     {
         TORCH_CHECK(input_size <= reg_buffer.numel() * reg_buffer.element_size(),
                     "registered buffer is too small to contain the input", input_size, ">", reg_buffer.numel() * reg_buffer.element_size());
-        AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
-                                      input_size, cudaMemcpyDeviceToDevice, stream));
+        AT_CUDA_CHECK(hipMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
+                                      input_size, hipMemcpyDeviceToDevice, stream));
         inp_ptr = reg_buffer.data_ptr();
     }
 
@@ -117,8 +117,8 @@ std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor &input
                                                             int64_t _ca,
                                                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    auto stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto size_input = input.numel() * input.element_size();
     auto size_pad = (size_input + 4095) & 0xfffff000;
 
@@ -133,8 +133,8 @@ std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor &input
     uint64_t res_offset = (uint64_t)size_pad * 2;
     if (!isGraph)
     {
-        AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
-                                      size_input, cudaMemcpyDeviceToDevice, stream));
+        AT_CUDA_CHECK(hipMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
+                                      size_input, hipMemcpyDeviceToDevice, stream));
         inp_ptr = reg_buffer.data_ptr();
     }
 
@@ -261,8 +261,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> all_reduce_rmsnorm_quant
                                                                                  int64_t _ca,
                                                                                  torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-    auto stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(input));
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto size_input = input.numel() * input.element_size();
     auto size_pad = (size_input + 4095) & 0xfffff000;
 
@@ -275,8 +275,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> all_reduce_rmsnorm_quant
 
     if (!isGraph)
     {
-        AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
-                                      size_input, cudaMemcpyDeviceToDevice, stream));
+        AT_CUDA_CHECK(hipMemcpyAsync(reg_buffer.data_ptr(), inp_ptr,
+                                      size_input, hipMemcpyDeviceToDevice, stream));
         inp_ptr = reg_buffer.data_ptr();
     }
 

@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_size]
                            torch::Tensor &K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]

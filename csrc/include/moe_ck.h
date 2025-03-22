@@ -2,7 +2,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input token
                      torch::Tensor &w1,                     // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])

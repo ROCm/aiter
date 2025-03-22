@@ -1,7 +1,8 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include <torch/torch.h>
+
 
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
