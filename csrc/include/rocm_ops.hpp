@@ -338,7 +338,7 @@
             "Aligning the number of tokens to be processed by each expert such " \
             "that it is divisible by the block size.");                          \
       m.def("fmoe", &fmoe);                                                      \
-      py::enum_<ActivationType>(m, "ActivationType")                             \
+      py::enum_<ActivationType>(m, "ActivationType")                            \
           .value("Silu", ActivationType::Silu)                                   \
           .value("Gelu", ActivationType::Gelu)                                   \
           .export_values();                                                      \
@@ -372,6 +372,17 @@
             py::arg("input_scale"),                                              \
             py::arg("fc_scale_blkn") = 128, py::arg("fc_scale_blkk") = 128,      \
             py::arg("fc2_smooth_scale") = std::nullopt);                         \
+      m.def("moe_stage1_fp8_g1u1", &moe_stage1_fp8_g1u1,                         \
+            py::arg("input"),                                                    \
+            py::arg("w1"), py::arg("w2"),                                        \
+            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
+            py::arg("out"),                                                      \
+            py::arg("kernelName"),                                               \
+            py::arg("block_size"),                                               \
+            py::arg("a1_scale") = std::nullopt,                                  \
+            py::arg("w1_scale") = std::nullopt);                                 \
+      \            
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_SORTING_PYBIND                                          \
@@ -419,6 +430,12 @@
       m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
 #define QUANT_PYBIND                                                                   \
+      py::enum_<QuantType>(m, "QuantType")                                            \
+          .value("No", QuantType::No)                                                  \
+          .value("per_Tensor", QuantType::per_Tensor)                                  \
+          .value("per_Token", QuantType::per_Token)                                    \
+          .value("per_128x128", QuantType::per_128x128)                                \
+          .export_values();                                                            \
       m.def("static_scaled_fp8_quant", &static_scaled_fp8_quant);                      \
       m.def("dynamic_scaled_fp8_quant", &dynamic_scaled_fp8_quant);                    \
       m.def("dynamic_per_token_scaled_fp8_quant", &dynamic_per_token_scaled_fp8_quant, \

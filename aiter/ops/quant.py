@@ -4,12 +4,12 @@
 import torch
 from torch import Tensor
 from typing import List, Optional
+from enum import Enum
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
 
 
 @compile_ops("module_smoothquant")
-def smoothquant_fwd(input: Tensor, out: Tensor,
-                    x_scale: Tensor, y_scale: Tensor): ...
+def smoothquant_fwd(input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor): ...
 
 
 @compile_ops("module_smoothquant")
@@ -27,18 +27,17 @@ def get_dtype_max(dtype):
     return dtypeMax
 
 
-def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8, dtypeMax=None):
+def pertoken_quant(
+    x, x_scale=None, scale_dtype=torch.float, quant_dtype=torch.int8, dtypeMax=None
+):
+    x = x.to(torch.float)
     if x_scale is None:
         hidden_states = x
     else:
         # smooth quant
         hidden_states = x * x_scale
     # [m, 1]
-    per_token_amax, _ = torch.max(
-        input=torch.abs(hidden_states),
-        dim=-1,
-        keepdim=True
-    )
+    per_token_amax, _ = torch.max(input=torch.abs(hidden_states), dim=-1, keepdim=True)
 
     if not dtypeMax:
         dtypeMax = get_dtype_max(quant_dtype)
@@ -48,7 +47,7 @@ def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch
 
     # quant hidden_states
     y = (hidden_states / per_token_scale).to(dtype=quant_dtype)
-    y_scale = per_token_scale.to(y_scale_dtype)
+    y_scale = per_token_scale.to(scale_dtype)
     return y, y_scale
 
 
@@ -57,9 +56,18 @@ def per_tensor_quant(x, scale=None, scale_dtype=torch.float, quant_dtype=torch.i
     if scale is None:
         dtypeMax = get_dtype_max(quant_dtype)
         scale = torch.abs(x).max() / dtypeMax
-    y = x/scale
+    y = x / scale
 
     return y.to(quant_dtype), scale.to(scale_dtype)
+
+
+def get_torch_quant(qType):
+    tmp = {
+        QuantType.No: lambda *a, **k: (a[0], None),
+        QuantType.per_Tensor: per_tensor_quant,
+        QuantType.per_Token: pertoken_quant,
+    }
+    return tmp.get(qType, NotImplementedError)
 
 
 def per_tensor_quant_fp8_hip(x, scale=None):
@@ -72,16 +80,19 @@ def per_tensor_quant_fp8_hip(x, scale=None):
     return y, scale
 
 
-@compile_ops("module_quant")
-def static_scaled_fp8_quant(
-    out: Tensor, input: Tensor, scale: Tensor
-): ...
+@compile_ops("module_quant", "QuantType")
+class _QuantType: ...
+
+
+QuantType = _QuantType(0)
 
 
 @compile_ops("module_quant")
-def dynamic_scaled_fp8_quant(
-    out: Tensor, input: Tensor, scale: Tensor
-):...
+def static_scaled_fp8_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+
+
+@compile_ops("module_quant")
+def dynamic_scaled_fp8_quant(out: Tensor, input: Tensor, scale: Tensor): ...
 
 
 @compile_ops("module_quant")
