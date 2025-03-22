@@ -41,7 +41,8 @@
             py::arg("K_QScale") = std::nullopt, \
             py::arg("V_QScale") = std::nullopt, \
             py::arg("out_") = std::nullopt,     \
-            py::arg("high_precision") = 1);
+            py::arg("high_precision") = 1,      \
+            py::arg("block_shape") = std::nullopt);
 
 #define ATTENTION_CK_PYBIND                                \
       m.def("pa_fwd_naive", &pa_fwd_naive, "pa_fwd_naive", \
