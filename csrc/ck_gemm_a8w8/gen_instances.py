@@ -8,7 +8,9 @@ from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
-from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
+from gemm_a8w8_common import kernelInstance, common_kernels_list, default_kernels_dict
+
+from gemm_a8w8_autogen_instances import autogen_instances
 
 
 
@@ -18,7 +20,7 @@ class gemm_a8w8_fwd_codegen:
         self.impl_path = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
         self.istune = istune
-    
+
     def gen_instance(self, k: kernelInstance):
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -57,7 +59,7 @@ torch::Tensor
     }}}}
 }}}}
 
-"""     
+"""
         INSTANCE_CONTENT_bias = f"""if (bias != std::nullopt)
         {{{{
             using DeviceGemmInstance = DeviceGemmHelperMMA<
@@ -106,7 +108,7 @@ torch::Tensor
             // Run kernel instance.
             return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
         }}}}
-""" 
+"""
         INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelper<
             DDataType, EDataType,
             {k.BLOCK_SIZE},
@@ -128,7 +130,7 @@ torch::Tensor
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
         return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
-""" 
+"""
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
                                                      INSTANCE_CONTENT_nopad=(INSTANCE_CONTENT_nobias.format(GemmSpec="Default")))
@@ -138,7 +140,7 @@ torch::Tensor
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
                 INSTANCE_IMPL_str)
-        
+
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -256,7 +258,7 @@ torch::Tensor
         self.gen_manifest_head(kernels_dict)
 
 
-def get_tune_dict(tune_dict_csv):
+def get_tune_dict(tune_dict_csv, useAutoGen = False):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
@@ -265,7 +267,11 @@ def get_tune_dict(tune_dict_csv):
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
             kid = tune_df.loc[i, "kernelId"]
-            tune_dict[(M, N, K)] = kernels_list[kid] 
+            if useAutoGen:
+                kernels_list = autogen_instances().gen_list()
+            else:
+                kernels_list = common_kernels_list
+            tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict
 
 if __name__ == "__main__":
@@ -290,7 +296,14 @@ if __name__ == "__main__":
         required=False,
         help="tune_file include the result after run gemm_a8w8_tune.py"
     )
-    
+
+    parser.add_argument(
+        "--autogen",
+        default=False,
+        required=False,
+        help="generated tune instanses"
+    )
+
     parser.add_argument(
         "--tune",
         action='store_true',
@@ -320,7 +333,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     codegen = gemm_a8w8_fwd_codegen(args.working_path, args.tune)
 
+    if args.autogen:
+        kernels_list = autogen_instances().gen_list()
+    else:
+        kernels_list = common_kernels_list
+
     if args.tune:
         codegen.gen_instances(kernels_list)
     else:
-        codegen.gen_instances(get_tune_dict(args.tune_file))
+        codegen.gen_instances(get_tune_dict(args.tune_file, args.autogen))

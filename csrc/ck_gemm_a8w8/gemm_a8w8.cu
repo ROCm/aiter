@@ -34,6 +34,7 @@ using RowwiseKernelMap = std::unordered_map<
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
+#if 0
   // Apply shape heuristics to find a suitable kernel implementation.
   if (M < 64 && N < 2048 && K < 2048)
   {
@@ -81,6 +82,7 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
     return a8w8_rowwise_256x256x128x64_32x32_4x2_4x64x1_4x64x1_1x32x1x8_8x8x1_1x1_interwave_v1<DDataType, EDataType>;
   }
   else
+#endif
   {
     // Fallback large kernel.
     return a8w8_rowwise_256x224x256x128_16x16_7x8_8x32x1_8x32x1_1x32x1x8_8x8x1_1x2_intrawave_v3<DDataType, EDataType>;
@@ -110,8 +112,10 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
         return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,B16)};
     } else {
         static_assert(false, "rowwise_dispatch used with unsupported dtype!");
-    } }();
+    } 
+  }();
   
+#if 0
   // First check if this shape(M,N,K) is available in the direct lookup.
   auto it = lookup.find({M, N, K});
   // If we found an optimal kernel, use it.
@@ -140,6 +144,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
   {
     return it->second;
   }
+#endif
   // Otherwise, use heuristics.
   return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
