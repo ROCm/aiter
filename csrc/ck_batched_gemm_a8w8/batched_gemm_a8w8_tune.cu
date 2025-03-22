@@ -6,6 +6,7 @@
 #include "batched_gemm_a8w8_lookup.h"
 #include <string>
 
+namespace aiter{
 using BatchedRowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &, 
@@ -100,4 +101,5 @@ torch::Tensor batched_gemm_a8w8_tune(
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
   return Y;
+}
 }

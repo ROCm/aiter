@@ -6,6 +6,7 @@
 #include "batched_gemm_bf16_lookup.h"
 #include <string>
 
+namespace aiter{
 using BatchedKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, std::optional<torch::Tensor>,
@@ -76,4 +77,5 @@ torch::Tensor batched_gemm_bf16_tune(
     TORCH_CHECK(false, "Unsupported output dtype!");
   }
   return Y;
+}
 }

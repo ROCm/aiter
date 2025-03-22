@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, head_size]
                      torch::Tensor &K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
                      torch::Tensor &V,            //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
@@ -13,3 +14,4 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      std::optional<torch::Tensor> &V_QScale,
                      std::optional<torch::Tensor> &out_,
                      std::optional<int> high_precision = 1);
+}

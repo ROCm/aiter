@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
+namespace aiter{
 struct __attribute__((packed)) KernelArgs
 {
     void *ptr_O;
@@ -194,4 +195,5 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                              1,            // bdz
                              stream});
     return output;
+}
 }

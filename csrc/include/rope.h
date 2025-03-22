@@ -5,6 +5,7 @@
 
 #include <torch/extension.h>
 
+namespace aiter{
 void rope_fwd_impl(
     torch::Tensor&       output,                    // [s, b, h, d]
     const torch::Tensor& input,                     // [s, b, h, d]
@@ -163,3 +164,4 @@ void rope_2d_bwd_impl(
     const bool           reuse_freqs_front_part,
     const bool           nope_first
 );
+}

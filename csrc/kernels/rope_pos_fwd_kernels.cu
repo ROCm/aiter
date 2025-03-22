@@ -6,7 +6,7 @@
 // =====================================================================================================================
 // Interfaces
 //
-
+namespace aiter{
 void rope_cached_positions_2c_fwd_impl(
     torch::Tensor&       output_x,      // [s, b, h, d]
     torch::Tensor&       output_y,      // [s, b, h, d]
@@ -134,4 +134,5 @@ void rope_cached_positions_offsets_2c_fwd_impl(
             stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
             stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
             stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d););
+}
 }

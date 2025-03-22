@@ -2153,6 +2153,8 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     case 128: CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 128); break;         \
     default: TORCH_CHECK(false, "Unsupported head size: ", head_size); break; \
     }
+
+namespace aiter{
 void paged_attention_ragged(
     torch::Tensor& out, // [num_seqs, num_heads, head_size]
     torch::Tensor& workspace_buffer,
@@ -2213,6 +2215,7 @@ void paged_attention_ragged(
     {
         TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
     }
+}
 }
 
 #undef WARP_SIZE

@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,       // [b, sq, hq, d]
         const at::Tensor &k, // [b, sk, hk, d]
@@ -17,3 +18,4 @@ mha_fwd(at::Tensor &q,       // [b, sq, hq, d]
         std::optional<at::Tensor> out,                // [b, sq, hq, d]
         std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
         std::optional<at::Generator> gen);
+}

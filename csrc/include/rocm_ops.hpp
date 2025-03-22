@@ -317,6 +317,14 @@
             py::arg("block_m") = 32,                                                \
             py::arg("expert_mask") = std::nullopt);
 
+#define EAGLE_UTILS_PYBIND                                                                               \
+       m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "build_tree_kernel_efficient"); \
+       m.def("build_tree_kernel", &build_tree_kernel, "build_tree_kernel");
+ 
+ #define SPECULATIVE_SAMPLING_PYBIND \
+       m.def("tree_speculative_sampling_target_only", &tree_speculative_sampling_target_only);
+ 
+
 #define MOE_OP_PYBIND                                                            \
       m.def("topk_softmax", &topk_softmax,                                       \
             "Apply topk softmax to the gating outputs.");                        \

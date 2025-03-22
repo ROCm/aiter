@@ -12,6 +12,8 @@ if importlib.util.find_spec('aiter_') is not None:
 #     from hipbsolidxgemm_ import *
 # if importlib.util.find_spec('rocsolidxgemm_') is not None:
 #     from rocsolidxgemm_ import *
+from .ops.speculative_sampling import *
+from .ops.eagle_utils import *
 from .ops.norm import *
 from .ops.quant import *
 from .ops.gemm_op_a8w8 import *

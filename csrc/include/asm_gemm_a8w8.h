@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
                             torch::Tensor &B,       //  B:[N, K] i8 -> shuffle layout(32,16)
                             torch::Tensor &A_scale, // A_scale:[M, 1] f32
@@ -15,3 +16,4 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
                             std::optional<int> pad_b = 0,
                             std::optional<int> pad_c = 0,
                             std::optional<int> splitK = 0);
+}

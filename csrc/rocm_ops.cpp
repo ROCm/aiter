@@ -34,6 +34,8 @@
 // #include "mha_fwd.h"
 #include "rocm_ops.hpp"
 
+using namespace aiter;
+
 #ifdef PREBUILD_KERNELS
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {

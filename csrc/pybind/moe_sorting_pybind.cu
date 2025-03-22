@@ -3,6 +3,7 @@
 #include "rocm_ops.hpp"
 #include "moe_sorting.h"
 
+using namespace aiter;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     MOE_SORTING_PYBIND;

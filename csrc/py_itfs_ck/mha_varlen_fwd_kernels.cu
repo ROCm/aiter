@@ -9,6 +9,7 @@
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
 
+namespace aiter{
 fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
                                               std::string dtype,
                                               int head_size_q,
@@ -570,4 +571,5 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     return {out, softmax_lse, p, rng_state};
+}
 }

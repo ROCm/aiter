@@ -7,6 +7,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
+
+namespace aiter{
+
 struct __attribute__((packed)) KernelArgs
 {
     void *ptr_O;
@@ -133,4 +136,5 @@ void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
                         1,                         // bdy
                         1,                         // bdz
                         stream});
+}
 }

@@ -6,6 +6,8 @@
 #include "gemm_a8w8_lookup.h"
 #include <string>
 
+namespace aiter{
+
 using RowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &, 
@@ -99,4 +101,5 @@ torch::Tensor gemm_a8w8_tune(
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
   return Y;
+}
 }

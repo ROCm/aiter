@@ -3,6 +3,8 @@
 #include "rocm_ops.hpp"
 #include "mha_fwd.h"
 
+using namespace aiter;
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     MHA_FWD_PYBIND;

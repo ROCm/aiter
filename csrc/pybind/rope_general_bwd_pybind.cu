@@ -3,7 +3,7 @@
 
 #include "rocm_ops.hpp"
 #include "rope.h"
-
+using namespace aiter;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     ROPE_GENERAL_BWD_PYBIND;

@@ -6,7 +6,8 @@
 #include "gemm_a8w8_blockscale_lookup.h"
 #include <cmath>
 
-   
+namespace aiter{
+
 using BlockwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &, 
@@ -114,4 +115,5 @@ torch::Tensor gemm_a8w8_blockscale(
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
   return Y;
+}
 }

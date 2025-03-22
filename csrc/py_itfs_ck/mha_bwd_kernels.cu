@@ -8,7 +8,7 @@
 
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
-
+namespace aiter{
 fmha_bwd_traits get_ck_fmha_bwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size_q,
@@ -403,4 +403,5 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     }
 
     return { dq, dk, dv, softmax_d };
+}
 }

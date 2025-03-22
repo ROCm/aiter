@@ -3,6 +3,8 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
 #include <torch/extension.h>
+
+namespace aiter{
 torch::Tensor gemm_a8w8_blockscale(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
@@ -18,3 +20,4 @@ torch::Tensor gemm_a8w8_blockscale_tune(
     torch::Tensor &Y,
     int kernelId,
     int splitK);
+}

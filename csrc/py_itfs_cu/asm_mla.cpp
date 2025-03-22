@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
+namespace aiter {
 struct __attribute__((packed)) KernelArgs
 {
     void *ptr_R;
@@ -105,4 +106,5 @@ void mla_stage1_asm_fwd(torch::Tensor &Q,                 //   [num_seqs, num_he
                              1,                     // bdy
                              1,                     // bdz
                              stream});
+}
 }

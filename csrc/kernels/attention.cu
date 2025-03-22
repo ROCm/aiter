@@ -2366,6 +2366,8 @@ void paged_attention_custom_launcher(
       CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 64);           \
       break;                                                    \
 */
+
+namespace aiter{
 void paged_attention(
     torch::Tensor& out,         // [num_seqs, num_heads, head_size]
     torch::Tensor& exp_sums,    // [num_seqs, num_heads, max_num_partitions]
@@ -2408,6 +2410,7 @@ void paged_attention(
   } else {
     TORCH_CHECK(false, "Unsupported KV cache dtype: ", kv_cache_dtype);
   }
+}
 }
 
 #undef WARP_SIZE

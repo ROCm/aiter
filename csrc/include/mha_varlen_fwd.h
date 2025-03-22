@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
@@ -23,3 +24,4 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> block_table,  // [hq] or [b, hq]
                std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                std::optional<at::Generator> gen);
+}

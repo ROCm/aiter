@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 void paged_attention(
     torch::Tensor &out, torch::Tensor &exp_sums, torch::Tensor &max_logits,
     torch::Tensor &tmp_out, torch::Tensor &query, torch::Tensor &key_cache,
@@ -12,3 +13,4 @@ void paged_attention(
     const std::optional<torch::Tensor> &alibi_slopes,
     const std::string &kv_cache_dtype, double k_scale, double v_scale,
     const std::optional<torch::Tensor> &fp8_out_scale, int64_t partition_size);
+}

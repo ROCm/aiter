@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 
+namespace aiter{
 // start to prepare the input and output buffer
 struct __attribute__((packed)) KernelArgs
 {
@@ -100,4 +101,5 @@ torch::Tensor gemm_a8w8_asm(torch::Tensor &A,       // A:[M, K] i8
                              1,                             // bdz
                              stream});
     return out;
+}
 }

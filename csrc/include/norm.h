@@ -4,6 +4,8 @@
 #include <torch/extension.h>
 
 // void layernorm2d(torch::Tensor &out, torch::Tensor &input, torch::Tensor &weight, torch::Tensor &bias, double epsilon);
+namespace aiter{
+
 torch::Tensor layernorm2d(torch::Tensor &input,
                           torch::Tensor &weight,
                           torch::Tensor &bias,
@@ -72,3 +74,4 @@ void layernorm2d_with_add_smoothquant_asm(torch::Tensor &out,          // [m ,n]
                                           torch::Tensor &weight,       // [1 ,n]
                                           torch::Tensor &bias,         // [1 ,n]
                                           float epsilon);
+}

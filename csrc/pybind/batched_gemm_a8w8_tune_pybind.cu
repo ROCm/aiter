@@ -3,6 +3,7 @@
 #include "rocm_ops.hpp"
 #include "batched_gemm_a8w8.h"
 
+using namespace aiter;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     BATCHED_GEMM_A8W8_TUNE_PYBIND;

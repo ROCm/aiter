@@ -7,6 +7,7 @@
 
 #include "moe_sorting_api.hpp"
 
+namespace aiter{
 void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                      torch::Tensor &topk_weights,      // [m, topk]
                      torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
@@ -50,4 +51,5 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                  ws_ptr,                       // p_workspace
                  num_tokens, unit_size, num_experts, topk, (int)moe_buf.nbytes()},
                 {stream});
+}
 }

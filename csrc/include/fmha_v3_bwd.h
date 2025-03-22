@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 std::vector<at::Tensor>
 fmha_v3_bwd(const at::Tensor &dout, // [b, sq, hq, d]
         const at::Tensor &q,    // [b, sq, hq, d]
@@ -24,3 +25,4 @@ fmha_v3_bwd(const at::Tensor &dout, // [b, sq, hq, d]
         std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
         std::optional<const at::Tensor> rng_state,
         std::optional<at::Generator> gen);
+}

@@ -8,6 +8,7 @@
 
 #include "layernorm2d_fwd.hpp"
 
+namespace aiter{
 void layernorm2d(torch::Tensor &out,    // [m, n]
                  torch::Tensor &input,  // [m, n]
                  torch::Tensor &weight, // [1, n]
@@ -325,4 +326,5 @@ void layernorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
                      nullptr,                 // p_invStd
                      static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                     {stream});
+}
 }

@@ -3,6 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter{
 void paged_attention_ragged(
     torch::Tensor& out, // [num_seqs, num_heads, head_size]
     torch::Tensor& workspace_buffer,
@@ -25,3 +26,4 @@ void paged_attention_ragged(
     torch::Tensor& v_scale,
     const c10::optional<torch::Tensor>& fp8_out_scale,
     int64_t partition_size);
+}

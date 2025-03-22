@@ -7,6 +7,8 @@
 #include "py_itfs_common.h"
 #include "ck_tile/ref/naive_attention.hpp"
 
+namespace aiter{
+    
 torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_heads, head_size]
                            torch::Tensor &K,            //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
                                                         // or[num_batch, seqlen, num_kv_heads, head_size]
@@ -79,4 +81,5 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
 
     naive_attention_fwd(naive_t, naive_a, naive_s);
     return out;
+}
 }

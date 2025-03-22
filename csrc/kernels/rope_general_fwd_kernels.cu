@@ -6,7 +6,7 @@
 // =====================================================================================================================
 // Interfaces
 //
-
+namespace aiter{
 void rope_fwd_impl(
     torch::Tensor&       output,        // [s, b, h, d]
     const torch::Tensor& input,         // [s, b, h, d]
@@ -300,4 +300,5 @@ void rope_2d_fwd_impl(
             size_b, size_h, size_d,
             stride_i_b, stride_i_s, stride_i_h, stride_i_d,
             stride_o_b, stride_o_s, stride_o_h, stride_o_d););
+}
 }

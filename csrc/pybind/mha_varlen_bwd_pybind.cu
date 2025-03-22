@@ -6,6 +6,8 @@
 #include "mha_bwd.h"
 #include "mha_varlen_bwd.h"
 
+using namespace aiter;
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     MHA_VARLEN_BWD_PYBIND;

@@ -3,6 +3,7 @@
 #include "rocm_ops.hpp"
 #include "gemm_a8w8_blockscale.h"
 
+using namespace aiter;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     GEMM_A8W8_BLOCKSCALE_PYBIND;
