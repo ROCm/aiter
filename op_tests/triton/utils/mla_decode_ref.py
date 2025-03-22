@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+# Copyright (C) 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -20,14 +20,15 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
-import logging
-
 import triton
 import triton.language as tl
 
 
-is_hip_ = True
+def is_hip():
+    return triton.runtime.driver.active.get_current_target().backend == "hip"
 
+
+is_hip_ = is_hip()
 
 
 @triton.jit
@@ -75,16 +76,14 @@ def _fwd_kernel_stage1(
     mask_dv = offs_dv < Lv
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    cur_batch_seq_len = tl.load(
-        kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
     q = tl.load(Q + off_q, mask=mask_d, other=0.0)
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = tl.minimum(
-        split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
     e_max = -float("inf")
     e_sum = 0.0
@@ -275,20 +274,16 @@ def _fwd_grouped_kernel_stage1(
     mask_dv = offs_dv < Lv
 
     cur_batch_kv_start_idx = tl.load(kv_indptr + cur_batch)
-    cur_batch_seq_len = tl.load(
-        kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
+    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - cur_batch_kv_start_idx
 
-    offs_q = cur_batch * stride_qbs + \
-        cur_head[:, None] * stride_qh + offs_d[None, :]
-    q = tl.load(Q + offs_q, mask=(mask_h[:, None])
-                & (mask_d[None, :]), other=0.0)
+    offs_q = cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
+    q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
 
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         mask_dpe = offs_dpe < Lk
         off_qpe = (
-            cur_batch * stride_qbs +
-            cur_head[:, None] * stride_qh + offs_dpe[None, :]
+            cur_batch * stride_qbs + cur_head[:, None] * stride_qh + offs_dpe[None, :]
         )
         qpe = tl.load(
             Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -296,8 +291,7 @@ def _fwd_grouped_kernel_stage1(
 
     kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
     split_kv_start = kv_len_per_split * split_kv_id
-    split_kv_end = tl.minimum(
-        split_kv_start + kv_len_per_split, cur_batch_seq_len)
+    split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
     e_max = tl.zeros([BLOCK_H], dtype=tl.float32) - float("inf")
     e_sum = tl.zeros([BLOCK_H], dtype=tl.float32)
@@ -330,8 +324,7 @@ def _fwd_grouped_kernel_stage1(
                 )
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (
-                        mask_dpe[:, None]),
+                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
                     other=0.0,
                 )
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
@@ -341,8 +334,7 @@ def _fwd_grouped_kernel_stage1(
                 qk = logit_cap * tanh(qk / logit_cap)
 
             qk = tl.where(
-                mask_h[:, None] & (
-                    offs_n[None, :] < split_kv_end), qk, float("-inf")
+                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
 
             offs_buf_v = (
@@ -438,8 +430,7 @@ def _decode_grouped_att_m_fwd(
     if is_hip_:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1,
-                       "matrix_instr_nonkdim": 16, "kpack": 2}
+        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
@@ -510,8 +501,7 @@ def _fwd_kernel_stage2(
     for split_kv_id in range(0, NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(
-            split_kv_start + kv_len_per_split, cur_batch_seq_len)
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
         if split_kv_end > split_kv_start:
             tv = tl.load(
@@ -535,69 +525,6 @@ def _fwd_kernel_stage2(
     )
 
 
-@triton.jit
-def _fwd_kernel_stage2_asm(
-    Mid_O,
-    Mid_lse,
-    O,
-    kv_indptr,
-    stride_mid_ob,
-    stride_mid_oh,
-    stride_mid_os,
-    stride_obs,
-    stride_oh,
-    NUM_KV_SPLITS: tl.constexpr,
-    BLOCK_DV: tl.constexpr,
-    Lv: tl.constexpr,
-    mgc: tl.constexpr,
-):
-    cur_batch = tl.program_id(0)
-    cur_head = tl.program_id(1)
-
-    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
-        kv_indptr + cur_batch
-    )
-
-    offs_d = tl.arange(0, BLOCK_DV)
-    mask_d = offs_d < Lv
-
-    e_sum = 0.0
-    e_max = -float("inf")
-    acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
-
-    offs_v = (cur_batch * stride_mid_ob + cur_head *
-              stride_mid_oh)*Lv + offs_d
-    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
-
-    for split_kv_id in range(0, NUM_KV_SPLITS):
-        kv_len_per_split = tl.maximum(mgc,
-            tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS))
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(
-            split_kv_start + kv_len_per_split, cur_batch_seq_len)
-
-        if split_kv_end > split_kv_start:
-            tv = tl.load(
-                Mid_O + offs_v + split_kv_id * stride_mid_os*Lv, mask=mask_d, other=0.0
-            )
-            tlogic = tl.load(Mid_lse + offs_logic +
-                             split_kv_id * stride_mid_os)
-            n_e_max = tl.maximum(tlogic, e_max)
-
-            old_scale = tl.exp(e_max - n_e_max)
-            acc *= old_scale
-            exp_logic = tl.exp(tlogic - n_e_max)
-            acc += exp_logic * tv
-
-            e_sum = e_sum * old_scale + exp_logic
-            e_max = n_e_max
-
-    tl.store(
-        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum,
-        mask=mask_d,
-    )
-
 def _decode_softmax_reducev_fwd(
     logits,
     q,
@@ -616,8 +543,7 @@ def _decode_softmax_reducev_fwd(
     if is_hip_:
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 4,
-                       "matrix_instr_nonkdim": 16, "kpack": 2}
+        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
@@ -661,8 +587,7 @@ def decode_attention_fwd_normal(
         sm_scale,
         logit_cap,
     )
-    _decode_softmax_reducev_fwd(
-        attn_logits, q, o, v_buffer, kv_indptr, num_kv_splits)
+    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, kv_indptr, num_kv_splits)
 
 
 def decode_attention_fwd_grouped(
@@ -688,8 +613,7 @@ def decode_attention_fwd_grouped(
         sm_scale,
         logit_cap,
     )
-    _decode_softmax_reducev_fwd(
-        attn_logits, q, o, v_buffer, kv_indptr, num_kv_splits)
+    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, kv_indptr, num_kv_splits)
 
 
 def decode_attention_fwd(
