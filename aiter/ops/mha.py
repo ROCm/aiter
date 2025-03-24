@@ -437,10 +437,7 @@ def _flash_attn_backward(
         ret &= hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= mask or nmask
         ret &= np() or pssk() or pddv() or psskddv()
-        # TODO: enable this when GPU_ARCH distinguishable
-        # fmha v3 backward ASM kernel only support gfx942
-        # archs = validate_and_update_archs()
-        # ret &= archs == ["gfx942"]
+        ret &= 'gfx942' in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
 
     # dq, dk, dv are allocated by us so they should already be contiguous
