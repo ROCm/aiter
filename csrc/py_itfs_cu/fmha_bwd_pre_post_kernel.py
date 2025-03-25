@@ -39,7 +39,6 @@ FMHA_BWD_API="""
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include "py_itfs_common.h"
-#include "mha_common.h"
 #include "aiter_fmha_bwd.h"
 
 #define HSA_KERNEL "kernel_func"
@@ -1867,7 +1866,7 @@ class FmhaBwdOGradDotOKernel:
     def filename(self) -> str:
         return self.name + ".cpp"
 
-def get_bwd_dot_do_o_blobs(kernel_filter : Optional[str], receipt) -> List[FmhaBwdOGradDotOKernel]:
+def get_bwd_dot_do_o_blobs(kernel_filter : Optional[str]) -> List[FmhaBwdOGradDotOKernel]:
     # TODO: we don't support tuning yet, so pick up one value for pad/occupancy
     #       support this in future
     def get_occupancy(dtype, hdim):
@@ -1889,18 +1888,6 @@ def get_bwd_dot_do_o_blobs(kernel_filter : Optional[str], receipt) -> List[FmhaB
             if kernel_filter != '':
                 if not fnmatch.fnmatch(k.name, kernel_filter):
                     continue
-            # Aiter (mha_bwd) integration
-            if receipt == 300:
-                    cond = dtype in ['fp16', 'bf16']
-                    cond &= mode == "batch"
-                    if not cond:
-                        continue
-            # Aiter (mha_varlen_bwd) integration
-            elif receipt == 400:
-                    cond = dtype in ['fp16', 'bf16']
-                    cond &= mode == "group"
-                    if not cond:
-                        continue
             gen.append(k)
 
     return gen
@@ -2019,7 +2006,7 @@ class FmhaBwdConvertQGradKernel:
     def filename(self) -> str:
         return self.name + ".cpp"
 
-def get_bwd_convert_dq_blobs(kernel_filter : Optional[str], receipt) -> List[FmhaBwdConvertQGradKernel]:
+def get_bwd_convert_dq_blobs(kernel_filter : Optional[str]) -> List[FmhaBwdConvertQGradKernel]:
     # TODO: we don't support tuning yet, so pick up one value for pad/occupancy
     #       support this in future
     def get_occupancy(dtype, hdim):
@@ -2041,18 +2028,6 @@ def get_bwd_convert_dq_blobs(kernel_filter : Optional[str], receipt) -> List[Fmh
             if kernel_filter != '':
                 if not fnmatch.fnmatch(k.name, kernel_filter):
                     continue
-            # Aiter (mha_bwd) integration
-            if receipt == 300:
-                    cond = dtype in ['fp16', 'bf16']
-                    cond &= mode == "batch"
-                    if not cond:
-                        continue
-            # Aiter (mha_varlen_bwd) integration
-            elif receipt == 400:
-                    cond = dtype in ['fp16', 'bf16']
-                    cond &= mode == "group"
-                    if not cond:
-                        continue
             gen.append(k)
 
     return gen
@@ -2066,33 +2041,33 @@ def write_single_bwd_convert_dq_kernel(kernel: FmhaBwdConvertQGradKernel, autoge
 def write_bwd_api(api_pool : FmhaBwdApiPool, autogen_dir: Path) -> None:
     (autogen_dir / FMHA_BWD_API_FILENAME).write_text(api_pool.api)
 
-def write_bwd_blobs(output_dir : Path, filter_list : str, receipt) -> None:
+def write_bwd_blobs(output_dir : Path, filter_list : str) -> None:
     filter_list = filter_list.split('@')
     filter_list.extend([''] * (3 - len(filter_list)))
 
-    kernels = get_bwd_dot_do_o_blobs(filter_list[0], receipt)
+    kernels = get_bwd_dot_do_o_blobs(filter_list[0])
     for kernel in kernels:
         write_single_bwd_dot_do_o_kernel(kernel, output_dir)
-    kernels = get_bwd_convert_dq_blobs(filter_list[1], receipt)
+    kernels = get_bwd_convert_dq_blobs(filter_list[1])
     for kernel in kernels:
         write_single_bwd_convert_dq_kernel(kernel, output_dir)
     api_pool = FmhaBwdApiPool()
     write_bwd_api(api_pool, output_dir)
 
-def list_bwd_blobs(file_path : Path, filter_list : str, receipt) -> None:
+def list_bwd_blobs(file_path : Path, filter_list : str) -> None:
     filter_list = filter_list.split('@')
     filter_list.extend([''] * (3 - len(filter_list)))
 
     with file_path.open('a') as f:
-        kernels = get_bwd_dot_do_o_blobs(filter_list[0], receipt)
+        kernels = get_bwd_dot_do_o_blobs(filter_list[0])
         for kernel in kernels:
             f.write(str(file_path.parent / GEN_DIR / kernel.filename) + "\n")
-        kernels = get_bwd_convert_dq_blobs(filter_list[1], receipt)
+        kernels = get_bwd_convert_dq_blobs(filter_list[1])
         for kernel in kernels:
             f.write(str(file_path.parent / GEN_DIR / kernel.filename) + "\n")
         f.write(str(file_path.parent / GEN_DIR / FMHA_BWD_API_FILENAME) + "\n")
 
-def write_blobs(output_dir: Optional[str], filters_list : List[str], receipt) -> None:
+def write_blobs(output_dir: Optional[str], filters_list : List[str]) -> None:
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:
@@ -2101,10 +2076,10 @@ def write_blobs(output_dir: Optional[str], filters_list : List[str], receipt) ->
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for kernel_filter in filters_list:
-        write_bwd_blobs(output_dir, kernel_filter, receipt)
+        write_bwd_blobs(output_dir, kernel_filter)
 
 # list all the files that will be generated
-def list_blobs(output_file : Optional[str], filters_list : List[str], receipt) -> None:
+def list_blobs(output_file : Optional[str], filters_list : List[str]) -> None:
     assert output_file is not None
     file_path = Path(output_file)
 
@@ -2112,7 +2087,7 @@ def list_blobs(output_file : Optional[str], filters_list : List[str], receipt) -
     open(file_path, "w").close()
 
     for kernel_filter in filters_list:
-        list_bwd_blobs(file_path, kernel_filter, receipt)
+        list_bwd_blobs(file_path, kernel_filter)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -2140,27 +2115,12 @@ if __name__ == "__main__":
         help="filter out kernels that need to generate, using fnmatch module"
     )
 
-    parser.add_argument(
-        "-r",
-        "--receipt",
-        default=0,
-        required=False,
-        help="codegen receipt. 0: generate only 8xhdim coverage\n"  + \
-             "  1: generate more instance to cover all hdim\n"  + \
-             "  2: Only generate instance for Flash attention integration\n"  + \
-             "  4: Only generate instance for PyTorch integration\n" + \
-             "  100-199: Only generate instance for Aiter(mha_fwd) integration\n" + \
-             "  200-299: Only generate instance for Aiter(mha_varlen_fwd) integration\n" + \
-             "  300-399: Only generate instance for Aiter(mha_bwd) integration\n" + \
-             "  400-499: Only generate instance for Aiter(mha_varlen_bwd) integration"
-    )
-
     args = parser.parse_args()
     api_list = ["bwd"]
     filter_list = args.filter.split(',')
     filter_list.extend([''] * (len(api_list) - len(filter_list)))
 
     if args.list_blobs is not None:
-        list_blobs(args.list_blobs, filter_list, int(args.receipt))
+        list_blobs(args.list_blobs, filter_list)
     else:
-        write_blobs(args.output_dir, filter_list, int(args.receipt))
+        write_blobs(args.output_dir, filter_list)
