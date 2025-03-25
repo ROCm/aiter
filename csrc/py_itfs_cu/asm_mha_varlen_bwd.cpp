@@ -183,7 +183,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
 }
 
 std::vector<at::Tensor>
-mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
+fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                const at::Tensor &q,            // [total_q, hq, d_q]
                const at::Tensor &k,            // [total_k, hk, d_q]
                const at::Tensor &v,            // [total_k, hk, d_v]
@@ -200,6 +200,8 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                int window_size_left,
                int window_size_right,
                const bool deterministic,
+               bool is_v3_atomic_fp32,
+               int how_v3_bf16_cvt,
                std::optional<at::Tensor> dq_,                 // [total_q, hq, d_q]
                std::optional<at::Tensor> dk_,                 // [total_k, hk, d_q]
                std::optional<at::Tensor> dv_,                 // [total_k, hk, d_v]
@@ -399,9 +401,9 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 true,  //is_group_mode
                 alibi_slopes_.has_value(),
                 deterministic,
-                false,  // use_ext_asm
-                false,  // is_v3_atomic_fp32
-                0);     // how_v3_bf16_cvt
+                true,  // use_ext_asm
+                is_v3_atomic_fp32,
+                how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.

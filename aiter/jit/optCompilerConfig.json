@@ -474,14 +474,18 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/aiter_fmha_bwd.h'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 300 --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 300 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 1 --output_dir {{}}'"
+        ]
     },
     "module_fmha_v3_bwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_bwd_v3_new.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -491,10 +495,14 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/aiter_fmha_bwd.h'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 300 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 300 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 2 --output_dir {{}}'"
+        ]
     },
     "module_mha_varlen_bwd": {
         "srcs": [
@@ -511,7 +519,31 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 400 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 1 --output_dir {{}}'"
+            ]
+    },
+    "module_fmha_v3_varlen_bwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/aiter_fmha_bwd.h'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 300 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 2 --output_dir {{}}'"
+        ]
     },
     "module_rocsolgemm": {
         "srcs": [
