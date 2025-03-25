@@ -568,7 +568,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if return_softmax:
             result.append(S_dmask)
 
-        return tuple(result)
+        return result[0] if len(result) == 1 else tuple(result)
 
 
     @staticmethod
@@ -995,7 +995,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if return_softmax:
             result.append(S_dmask)
 
-        return tuple(result)
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, dout, *args):
