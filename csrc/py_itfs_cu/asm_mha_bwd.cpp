@@ -184,7 +184,6 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     const at::Tensor &v,            // [b, sk, hk, d_v]
     const at::Tensor &out,          // [b, sq, hq, d_v]
     const at::Tensor &softmax_lse,  // [b, hq, sq]
-    std::optional<
     float p_dropout,
     float softmax_scale,
     bool is_causal,
