@@ -33,8 +33,9 @@ void rmsnorm2d(torch::Tensor &out,    // [m, n]
                       dtype_str, // x-scale, used for [1*N] input smooth quant
                       dtype_str, // y-scale, used for [M*1] output for next layer
                       SaveRms,
-                      0, // fused_add
-                      0  // fused_quant
+                      false, // save_unquant
+                      0,     // fused_add
+                      0      // fused_quant
                   },
                   {input.data_ptr(),
                    nullptr, // p_x_residual
@@ -43,6 +44,7 @@ void rmsnorm2d(torch::Tensor &out,    // [m, n]
                    nullptr, // p_y_residual
                    nullptr, // p_y_scale
                    nullptr, // p_invRms
+                   nullptr, // p_y_unquant
                    static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                   {stream});
 }
@@ -85,8 +87,9 @@ void rmsnorm2d_with_add(torch::Tensor &out,          // [m ,n]
                       dtype_str, // x-scale, used for [1*N] input smooth quant
                       dtype_str, // y-scale, used for [M*1] output for next layer
                       SaveRms,
-                      1, // fused_add
-                      0  // fused_quant
+                      false, // save_unquant
+                      1,     // fused_add
+                      0      // fused_quant
                   },
                   {input.data_ptr(),        // p_x
                    residual_in.data_ptr(),  // p_x_residual
@@ -96,6 +99,7 @@ void rmsnorm2d_with_add(torch::Tensor &out,          // [m ,n]
                    residual_out.data_ptr(), // p_y_residual
                    nullptr,                 // p_y_scale
                    nullptr,                 // p_invRms
+                   nullptr,                 // p_y_unquant
                    static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                   {stream});
 }
@@ -131,8 +135,9 @@ void rmsnorm2d_with_smoothquant(torch::Tensor &out,    // [m ,n]
                       xscale_dtype_str, // x-scale, used for [1*N] input smooth quant
                       yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                       SaveRms,
-                      0, // fused_add
-                      1  // fused_quant
+                      false, // save_unquant
+                      0,     // fused_add
+                      1      // fused_quant
                   },
                   {input.data_ptr(),  // p_x
                    nullptr,           // p_x_residual
@@ -142,6 +147,7 @@ void rmsnorm2d_with_smoothquant(torch::Tensor &out,    // [m ,n]
                    nullptr,           // p_y_residual
                    yscale.data_ptr(), // p_y_scale
                    nullptr,           // p_invRms
+                   nullptr,           // p_y_unquant
                    static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                   {stream});
 }
@@ -153,7 +159,8 @@ void rmsnorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
                                     torch::Tensor &xscale,       // [1 ,n]
                                     torch::Tensor &yscale,       // [m ,1]
                                     torch::Tensor &weight,       // [1 ,n]
-                                    double epsilon)
+                                    double epsilon,
+                                    std::optional<torch::Tensor> out_before_quant)
 {
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
@@ -179,17 +186,19 @@ void rmsnorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
                       xscale_dtype_str, // x-scale, used for [1*N] input smooth quant
                       yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                       SaveRms,
-                      1, // fused_add
-                      1  // fused_quant
+                      out_before_quant.has_value(), // save_unquant
+                      1,                            // fused_add
+                      1                             // fused_quant
                   },
-                  {input.data_ptr(),        // p_x
-                   residual_in.data_ptr(),  // p_x_residual
-                   xscale.data_ptr(),       // p_x_scale
-                   weight.data_ptr(),       // p_gamma
-                   out.data_ptr(),          // p_y
-                   residual_out.data_ptr(), // p_y_residual
-                   yscale.data_ptr(),       // p_y_scale
-                   nullptr,                 // p_invRms
+                  {input.data_ptr(),                                                             // p_x
+                   residual_in.data_ptr(),                                                       // p_x_residual
+                   xscale.data_ptr(),                                                            // p_x_scale
+                   weight.data_ptr(),                                                            // p_gamma
+                   out.data_ptr(),                                                               // p_y
+                   residual_out.data_ptr(),                                                      // p_y_residual
+                   yscale.data_ptr(),                                                            // p_y_scale
+                   nullptr,                                                                      // p_invRms
+                   out_before_quant.has_value() ? out_before_quant.value().data_ptr() : nullptr, // p_y_unquant
                    static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                   {stream});
 }
@@ -223,8 +232,9 @@ void rmsnorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
                       dtype_str,        // x-scale, used for [1*N] input smooth quant
                       yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                       SaveRms,
-                      0, // fused_add
-                      2  // fused_quant
+                      false, // save_unquant
+                      0,     // fused_add
+                      2      // fused_quant
                   },
                   {input.data_ptr(),  // p_x
                    nullptr,           // p_x_residual
@@ -234,6 +244,7 @@ void rmsnorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
                    nullptr,           // p_y_residual
                    yscale.data_ptr(), // p_y_scale
                    nullptr,           // p_invRms
+                   nullptr,           // p_y_unquant
                    static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                   {stream});
 }
@@ -269,8 +280,9 @@ void rmsnorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
                       dtype_str,        // x-scale, used for [1*N] input smooth quant
                       yscale_dtype_str, // y-scale, used for [M*1] output for next layer
                       SaveRms,
-                      1, // fused_add
-                      2  // fused_quant
+                      false, // save_unquant
+                      1,     // fused_add
+                      2      // fused_quant
                   },
                   {input.data_ptr(),        // p_x
                    residual_in.data_ptr(),  // p_x_residual
@@ -280,6 +292,7 @@ void rmsnorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
                    residual_out.data_ptr(), // p_y_residual
                    yscale.data_ptr(),       // p_y_scale
                    nullptr,                 // p_invRms
+                   nullptr,                 // p_y_unquant
                    static_cast<float>(epsilon), m, n, stride, xr_stride, y_stride, yr_stride},
                   {stream});
 }

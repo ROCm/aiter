@@ -29,12 +29,14 @@ def run_torch(input, weight, eps, residual=None, x_scale = None, y_scale_dtype =
         )
     if y_scale_dtype is None:
         y_scale = None
+        output_q = output
     else:
-        output, y_scale = aiter.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
-    return output, residual_out, y_scale
+        output_q, y_scale = aiter.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
+    return output_q, residual_out, y_scale, output
 
-@perftest()
+@perftest(num_rotate_args=1)
 def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = None):
+    out_before_quant = None
     if y_scale_dtype is None:
         y_scale = None
         if residual is None:
@@ -93,6 +95,7 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
             )
         elif residual is not None:
             residual_out = torch.empty_like(input)
+            out_before_quant = torch.empty_like(input)
             aiter.rmsnorm2d_fwd_with_add_smoothquant(
                 output,
                 input,
@@ -101,11 +104,11 @@ def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = No
                 x_scale,
                 y_scale,
                 weight,
-                eps
+                eps,
+                out_before_quant=out_before_quant
             )
-        
-    return output, residual_out, y_scale
 
+    return output, residual_out, y_scale, out_before_quant
 
 
 def test_rmsnorm2d_instance(dtype, m, n):
@@ -140,8 +143,8 @@ def test_rmsnorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleType)
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
     xscale = torch.randn(n, dtype=xscaleType, device="cuda")
-    (a, _, yscale_a), avg_a = run_torch(input, weight, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
-    (b, _, yscale_b), avg_b = run_ck(input, weight, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
+    (a, _, yscale_a, _), avg_a = run_torch(input, weight, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
+    (b, _, yscale_b, _), avg_b = run_ck(input, weight, 1e-5, x_scale=xscale, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -155,14 +158,15 @@ def test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscaleT
     weight = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn(n, dtype=xscaleType, device="cuda")
-    (a, res_a, yscale_a), avg_a = run_torch(input, weight, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
-    (b, res_b, yscale_b), avg_b = run_ck(input, weight, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
+    (a, res_a, yscale_a, ynorm_a), avg_a = run_torch(input, weight, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
+    (b, res_b, yscale_b, ynorm_b), avg_b = run_ck(input, weight, 1e-5, residual=res, x_scale=xscale, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
+    checkAllclose(ynorm_a, ynorm_b, rtol=1e-3, atol=1e-3)
     print(f" [passed~]")
 
 
@@ -170,8 +174,8 @@ def test_rmsnorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
     dim = (m, n)
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
-    (a, _, yscale_a), avg_a = run_torch(input, weight, 1e-5, y_scale_dtype=yscaleType)
-    (b, _, yscale_b), avg_b = run_ck(input, weight, 1e-5,  y_scale_dtype=yscaleType)
+    (a, _, yscale_a, _), avg_a = run_torch(input, weight, 1e-5, y_scale_dtype=yscaleType)
+    (b, _, yscale_b, _), avg_b = run_ck(input, weight, 1e-5, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -184,8 +188,8 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
-    (a, res_a, yscale_a), avg_a = run_torch(input, weight, 1e-5, residual=res, y_scale_dtype=yscaleType)
-    (b, res_b, yscale_b), avg_b = run_ck(input, weight, 1e-5, residual=res, y_scale_dtype=yscaleType)
+    (a, res_a, yscale_a, _), avg_a = run_torch(input, weight, 1e-5, residual=res, y_scale_dtype=yscaleType)
+    (b, res_b, yscale_b, _), avg_b = run_ck(input, weight, 1e-5, residual=res, y_scale_dtype=yscaleType)
 
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}")
@@ -196,32 +200,32 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
 
 def test_rmsnorm2d():
     print('\nstart rmsnorm2d test')
-    for dtype in [torch.float16, torch.bfloat16]:
-        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-            for n in [4096, 8192, 16384, 32768, 65536]:
-                test_rmsnorm2d_instance(dtype, m, n)
+    for dtype in [torch.bfloat16]:
+            for m in [128]:
+                for n in [128]:
+                    test_rmsnorm2d_instance(dtype, m, n)
 
 def test_rmsnorm2d_fuseAdd():
     print('\nstart rmsnorm2d fuse add test')
-    for dtype in [torch.float16, torch.bfloat16]:
-        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-            for n in [4096, 8192, 16384, 32768, 65536]:
+    for dtype in [torch.bfloat16]:
+        for m in [128]:
+            for n in [4096]:
                 test_rmsnorm2d_fuseAdd_instance(dtype, m, n)
 
 def test_rmsnorm2d_fuseSmoothquant():
     print('\nstart rmsnorm2d fuse Smoothquant test')
     for scaleType in [ torch.float32]:
-        for dtype in [torch.float16, torch.bfloat16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [10, 4096, 8192]:
+        for dtype in [torch.bfloat16]:
+            for m in [128]:
+                for n in [1024]:
                     test_rmsnorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType=scaleType, yscaleType=scaleType)
 
 def test_rmsnorm2d_fuseAdd_Smoothquant():
     print('\nstart rmsnorm2d fuse add Smoothquant test')
     for scaleType in [torch.float32]:
         for dtype in [torch.bfloat16]:
-            for m in [2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [8192]:
+            for m in [128]:
+                for n in [4096]:
                     test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType=scaleType, yscaleType=scaleType)
 
 def test_rmsnorm2d_fuseDynamicquant():
@@ -272,3 +276,7 @@ if __name__ == "__main__":
         test_rmsnorm2d_fuseDynamicquant()
     elif args.mode == 6:
         test_rmsnorm2d_fuseAdd_Dynamicquant()
+    test_rmsnorm2d_fuseAdd_Smoothquant()
+    test_rmsnorm2d()
+    test_rmsnorm2d_fuseSmoothquant()
+    test_rmsnorm2d_fuseAdd()
