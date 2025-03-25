@@ -97,11 +97,16 @@ class Gemm:
         scaleA = HALF if self.scaleAB else ONE
         scaleB = HALF if self.scaleAB else ONE
         if self.indtype == torch.float8_e4m3fnuz:
-            ref = torch._scaled_mm(self.inp,
-                                   self.weights.t(),
-                                   scale_a=scaleA,
-                                   scale_b=scaleB,
-                                   out_dtype=self.outdtype)
+            try:
+                ref = torch._scaled_mm(self.inp,
+                                    self.weights.t(),
+                                    bias=self.bias,
+                                    scale_a=scaleA,
+                                    scale_b=scaleB,
+                                    out_dtype=self.outdtype)
+            except RuntimeError as e:
+                ref = F.linear(self.inp.to(torch.float32), self.weights.to(torch.float32)) * scaleA * scaleB
+                ref = (ref.to(self.outdtype) + self.bias) if self.bias is not None else ref.to(self.outdtype)
             if type(ref) is tuple and len(ref) == 2:
                 ref = ref[0]
         else:
