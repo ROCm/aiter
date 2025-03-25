@@ -218,6 +218,8 @@
             py::arg("dq") = std::nullopt,             \
             py::arg("dk") = std::nullopt,             \
             py::arg("dv") = std::nullopt,             \
+            py::arg("dbias") = std::nullopt,          \
+            py::arg("bias") = std::nullopt,           \
             py::arg("alibi_slopes") = std::nullopt,   \
             py::arg("rng_state") = std::nullopt,      \
             py::arg("gen") = std::nullopt);
@@ -233,6 +235,7 @@
             py::arg("return_softmax_lse"),            \
             py::arg("return_dropout_randval"),        \
             py::arg("out") = std::nullopt,            \
+            py::arg("bias") = std::nullopt,           \
             py::arg("alibi_slopes") = std::nullopt,   \
             py::arg("gen") = std::nullopt);
 
