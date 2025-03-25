@@ -500,7 +500,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 300 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
@@ -541,7 +541,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 300 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
