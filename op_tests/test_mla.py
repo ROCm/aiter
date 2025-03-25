@@ -40,7 +40,7 @@ def test_mla(
         (out_ref, *_), us_ref = run_perftest(
             attention_ref, q, k, v, causal=True, num_warmup=1, num_iters=2
         )
-        (out_aiter, *_), us_aiter = run_perftest(
+        out_aiter, us_aiter = run_perftest(
             aiter.flash_attn_func, q, k, v, causal=True
         )
         flop = (
