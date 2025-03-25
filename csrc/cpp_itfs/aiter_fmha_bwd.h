@@ -41,3 +41,5 @@ float fmha_bwd_aiter(fmha_bwd_args args,
     bool use_ext_asm,
     bool is_v3_atomic_fp32,
     int how_v3_bf16_cvt);
+
+float fmha_bwd_v3(fmha_bwd_traits_all t, fmha_bwd_args a, const ck_tile::stream_config& s);

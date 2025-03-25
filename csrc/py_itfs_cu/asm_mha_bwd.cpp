@@ -6,7 +6,7 @@
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
-#include "fmha_bwd.h"
+#include "aiter_fmha_bwd.h"
 
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
     // sizes

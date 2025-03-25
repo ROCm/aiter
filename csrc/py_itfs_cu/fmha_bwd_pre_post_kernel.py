@@ -40,7 +40,7 @@ FMHA_BWD_API="""
 #include <hip/hip_fp16.h>
 #include "py_itfs_common.h"
 #include "mha_common.h"
-#include "asm_fmha_bwd.h"
+#include "aiter_fmha_bwd.h"
 
 #define HSA_KERNEL "kernel_func"
 
