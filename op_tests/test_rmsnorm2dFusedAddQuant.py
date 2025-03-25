@@ -34,7 +34,7 @@ def run_torch(input, weight, eps, residual=None, x_scale = None, y_scale_dtype =
         output_q, y_scale = aiter.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
     return output_q, residual_out, y_scale, output
 
-@perftest(num_rotate_args=1)
+@perftest()
 def run_ck(input, weight, eps, residual=None, x_scale = None, y_scale_dtype = None):
     out_before_quant = None
     if y_scale_dtype is None:
@@ -166,7 +166,7 @@ def test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscaleT
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
-    checkAllclose(ynorm_a, ynorm_b, rtol=1e-3, atol=1e-3)
+    checkAllclose(ynorm_a, ynorm_b)
     print(f" [passed~]")
 
 
@@ -201,31 +201,31 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
 def test_rmsnorm2d():
     print('\nstart rmsnorm2d test')
     for dtype in [torch.bfloat16]:
-            for m in [128]:
-                for n in [128]:
-                    test_rmsnorm2d_instance(dtype, m, n)
+        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+            for n in [1024, 2048]:
+                test_rmsnorm2d_instance(dtype, m, n)
 
 def test_rmsnorm2d_fuseAdd():
     print('\nstart rmsnorm2d fuse add test')
     for dtype in [torch.bfloat16]:
-        for m in [128]:
-            for n in [4096]:
+        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+            for n in [1024, 2048]:
                 test_rmsnorm2d_fuseAdd_instance(dtype, m, n)
 
 def test_rmsnorm2d_fuseSmoothquant():
     print('\nstart rmsnorm2d fuse Smoothquant test')
     for scaleType in [ torch.float32]:
         for dtype in [torch.bfloat16]:
-            for m in [128]:
-                for n in [1024]:
+            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+                for n in [1024, 2048]:
                     test_rmsnorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType=scaleType, yscaleType=scaleType)
 
 def test_rmsnorm2d_fuseAdd_Smoothquant():
     print('\nstart rmsnorm2d fuse add Smoothquant test')
     for scaleType in [torch.float32]:
         for dtype in [torch.bfloat16]:
-            for m in [128]:
-                for n in [4096]:
+            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
+                for n in [1024, 2048]:
                     test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType=scaleType, yscaleType=scaleType)
 
 def test_rmsnorm2d_fuseDynamicquant():
@@ -276,7 +276,3 @@ if __name__ == "__main__":
         test_rmsnorm2d_fuseDynamicquant()
     elif args.mode == 6:
         test_rmsnorm2d_fuseAdd_Dynamicquant()
-    test_rmsnorm2d_fuseAdd_Smoothquant()
-    test_rmsnorm2d()
-    test_rmsnorm2d_fuseSmoothquant()
-    test_rmsnorm2d_fuseAdd()
