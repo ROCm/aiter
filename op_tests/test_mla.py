@@ -38,9 +38,11 @@ def test_mla(
         k = torch.randn((batch_size, ctx_lens, nhead, qk_head_dim), dtype=dtype)
         v = torch.randn((batch_size, ctx_lens, nhead, v_head_dim), dtype=dtype)
         (out_ref, *_), us_ref = run_perftest(
-            attention_ref, q, k, v, num_warmup=1, num_iters=2
+            attention_ref, q, k, v, causal=True, num_warmup=1, num_iters=2
         )
-        (out_aiter, *_), us_aiter = run_perftest(aiter.flash_attn_func, q, k, v)
+        out_aiter, us_aiter = run_perftest(
+            aiter.flash_attn_func, q, k, v, causal=True
+        )
         flop = (
             batch_size
             * nhead
