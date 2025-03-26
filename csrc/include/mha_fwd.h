@@ -15,5 +15,6 @@ mha_fwd(at::Tensor &q,       // [b, sq, hq, d]
         bool return_softmax_lse,
         bool return_dropout_randval,
         std::optional<at::Tensor> out,                // [b, sq, hq, d]
+        std::optional<const at::Tensor> bias,         // [sq, sk]
         std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
         std::optional<at::Generator> gen);

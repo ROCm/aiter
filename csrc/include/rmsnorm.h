@@ -48,7 +48,8 @@ void rmsnorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
                                     torch::Tensor &xscale,       // [1 ,n]
                                     torch::Tensor &yscale,       // [m ,1]
                                     torch::Tensor &weight,       // [1 ,n]
-                                    double epsilon);
+                                    double epsilon,
+                                    std::optional<torch::Tensor> out_before_quant);
 
 void rmsnorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
                                  torch::Tensor &input,  // [m ,n]
