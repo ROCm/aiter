@@ -206,17 +206,24 @@ def ck_moe_2stages(a1,
                         fc1_scale, a1_scale, block_size)
 
     # g1u0
-    if w2.shape[2] == w1.shape[1]:
-        a2 = F.gelu(a2)
-    # g1u1
+    if (w2.shape[2] != w1.shape[1]) and (w2.dtype == torch.float8_e4m3fnuz):
+      tmp = torch.empty((M, topk, inter_dim), dtype=torch.float8_e4m3fnuz, device=device)
+      if a2_scale == None:
+        a2_scale = torch.empty(1, dtype=torch.float, device=device)
+      aiter.scaled_silu_and_mul(tmp, a2, a2_scale)
+      a2 = tmp
     else:
+      if w2.shape[2] == w1.shape[1]:
+        a2 = F.gelu(a2)
+      # g1u1
+      else:
         tmp = torch.empty((M, topk, inter_dim), dtype=dtype, device=device)
         aiter.silu_and_mul(tmp, a2)
         a2 = tmp
-    if w2.dtype == torch.float8_e4m3fnuz:
+      if w2.dtype == torch.float8_e4m3fnuz:
         a2, a2_scale = aiter.per_tensor_quant_fp8_hip(a2, a2_scale)
         # a2, a2_scale = aiter.per_tensor_quant(a2, quant_dtype=w2.dtype)
-    else:
+      else:
         if not hasattr(ck_moe_2stages, "one_float_tensor"):
             ck_moe_2stages.one_float_tensor = torch.tensor(
                 1.0, dtype=torch.float, device=device)
