@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#define ACTIVATION_PYBIND                                                          \
-      m.def("silu_and_mul", &silu_and_mul, "Activation function used in SwiGLU."); \
+#define ACTIVATION_PYBIND                                                                               \
+      m.def("silu_and_mul", &silu_and_mul, "Activation function used in SwiGLU.");                      \
       m.def("scaled_silu_and_mul", &scaled_silu_and_mul, "Activation function used in scaled SwiGLU."); \
-      m.def("gelu_and_mul", &gelu_and_mul, "Activation function used in GELU.");   \
+      m.def("gelu_and_mul", &gelu_and_mul, "Activation function used in GELU.");                        \
       m.def("gelu_tanh_and_mul", &gelu_tanh_and_mul, "Activation function used in GELU tanh.");
 
 #define AITER_OPERATOR_PYBIND                                                     \
@@ -460,7 +460,10 @@
       m.def("rmsnorm2d_fwd", &rmsnorm2d);                                                                 \
       m.def("rmsnorm2d_fwd_with_add", &rmsnorm2d_with_add);                                               \
       m.def("rmsnorm2d_fwd_with_smoothquant", &rmsnorm2d_with_smoothquant);                               \
-      m.def("rmsnorm2d_fwd_with_add_smoothquant", &rmsnorm2d_with_add_smoothquant);                       \
+      m.def("rmsnorm2d_fwd_with_add_smoothquant", &rmsnorm2d_with_add_smoothquant,                        \
+            py::arg("out"), py::arg("input"), py::arg("residual_in"), py::arg("residual_out"),            \
+            py::arg("xscale"), py::arg("yscale"), py::arg("weight"), py::arg("epsilon"),                  \
+            py::arg("out_before_quant") = std::nullopt);                              \
       m.def("rmsnorm2d_fwd_with_dynamicquant", &rmsnorm2d_with_dynamicquant);                             \
       m.def("rmsnorm2d_fwd_with_add_dynamicquant", &rmsnorm2d_with_add_dynamicquant);
 
