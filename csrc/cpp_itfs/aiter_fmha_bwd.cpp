@@ -64,3 +64,22 @@ float fmha_bwd_aiter(fmha_bwd_args args,
     t = fmha_bwd(traits, args, stream_config);
     return t;
 }
+
+// v2 v3 combined api
+float fmha_bwd_aiter(fmha_bwd_args args,
+    const ck_tile::stream_config& stream_config,
+    mask_info mask,
+    std::string q_dtype_str,
+    bool enable_alibi,
+    bool deterministic)
+{
+    int head_size_q = args.hdim_q;
+    int head_size_v = args.hdim_v;
+    bool is_dropout = args.p_drop > 0;
+    // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
+    auto traits = get_ck_fmha_bwd_traits_all(mask, q_dtype_str, head_size_q, head_size_v, is_dropout, enable_alibi, deterministic, false, false, 0);
+    float t = -1;
+    t = fmha_bwd_v3(traits, args, stream_config);
+    if (t == -1) { t = fmha_bwd(traits, args, stream_config); }
+    return t;
+}

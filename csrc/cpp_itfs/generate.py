@@ -58,10 +58,24 @@ float fmha_bwd_aiter(fmha_bwd_args args,
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
     auto traits = get_ck_fmha_bwd_traits_all(mask, q_dtype_str, head_size_q, head_size_v, has_dropout, is_group_mode, bias_type, deterministic, has_dbias, use_ext_asm, is_v3_atomic_fp32, how_v3_bf16_cvt);
     float t = -1;
-    t = {F_fmha_bwd_api}(traits, args, stream_config);
+    {F_dispatch}
     return t;
 }}
 """
+
+V2_API = "    t = fmha_bwd(traits, args, stream_config);"
+
+V3_API = "    t = fmha_bwd_v3(traits, args, stream_config);"
+
+COMBINED_API = """    t = fmha_bwd_v3(traits, args, stream_config);
+    if (t == -1) { t = fmha_bwd(traits, args, stream_config); }
+"""
+
+API_MAP = {
+    1: V2_API,
+    2: V3_API,
+    3: COMBINED_API
+}
 
 def write_blobs(output_dir: Optional[str], receipt) -> None:
     if output_dir is None:
@@ -71,8 +85,7 @@ def write_blobs(output_dir: Optional[str], receipt) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fmha_bwd_api_name = "fmha_bwd" if receipt == 1 else "fmha_bwd_v3"
-    api = AITER_CPP_API.format(F_fmha_bwd_api = fmha_bwd_api_name)
+    api = AITER_CPP_API.format(F_dispatch = API_MAP[receipt])
     (output_dir / AITER_API_FILENAME).write_text(api)
 
 if __name__ == "__main__":
@@ -92,7 +105,8 @@ if __name__ == "__main__":
         default=0,
         required=False,
         help="codegen receipt. 1: generate fmha v2 c++ api\n"  + \
-             "  2: generate fmha v3 c++ api"
+             "  2: generate fmha v3 c++ api\n"                 + \
+             "  3: generate v2 v3 combined api for PREBUILD mode"
     )
 
     args = parser.parse_args()
