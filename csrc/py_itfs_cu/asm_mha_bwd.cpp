@@ -380,7 +380,7 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                  true,  // use_ext_asm
                                  is_v3_atomic_fp32,
                                  how_v3_bf16_cvt);
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
         dk_expanded.zero_();
