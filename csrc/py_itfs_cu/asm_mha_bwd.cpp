@@ -317,6 +317,8 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         dv_expanded = dv;
     }
 
+    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
+
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
     gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
@@ -367,7 +369,17 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_bwd_aiter(args, stream_config, mask, q_dtype_str, alibi_slopes_.has_value(), false, deterministic, true, is_v3_atomic_fp32, how_v3_bf16_cvt);
+        float t = fmha_bwd_aiter(args,
+                                 stream_config,
+                                 mask,
+                                 q_dtype_str,
+                                 false, // is_group_mode
+                                 bias_type,
+                                 deterministic,
+                                 false, // has_dbias
+                                 true,  // use_ext_asm
+                                 is_v3_atomic_fp32,
+                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.

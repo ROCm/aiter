@@ -19,8 +19,9 @@ fmha_bwd_traits_all get_ck_fmha_bwd_traits_all(const mask_info &mask,
     int head_size_v,
     bool has_dropout,
     bool is_group_mode,
-    bool enable_alibi,
+    bias_enum bias_type,
     bool deterministic,
+    bool has_dbias,
     bool use_ext_asm,
     bool is_v3_atomic_fp32,
     int how_v3_bf16_cvt)
@@ -31,8 +32,9 @@ fmha_bwd_traits_all get_ck_fmha_bwd_traits_all(const mask_info &mask,
             head_size_v,
             has_dropout,
             is_group_mode,
-            enable_alibi,
+            bias_type,
             deterministic,
+            has_dbias,
             use_ext_asm,
             is_v3_atomic_fp32,
             how_v3_bf16_cvt);
@@ -43,8 +45,9 @@ float fmha_bwd_aiter(fmha_bwd_args args,
         mask_info mask,
         std::string q_dtype_str,
         bool is_group_mode,
-        bool enable_alibi,
+        bias_enum bias_type,
         bool deterministic,
+        bool has_dbias,
         bool use_ext_asm,
         bool is_v3_atomic_fp32,
         int how_v3_bf16_cvt)
@@ -53,7 +56,7 @@ float fmha_bwd_aiter(fmha_bwd_args args,
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0;
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
-    auto traits = get_ck_fmha_bwd_traits_all(mask, q_dtype_str, head_size_q, head_size_v, has_dropout, is_group_mode, enable_alibi, deterministic, use_ext_asm, is_v3_atomic_fp32, how_v3_bf16_cvt);
+    auto traits = get_ck_fmha_bwd_traits_all(mask, q_dtype_str, head_size_q, head_size_v, has_dropout, is_group_mode, bias_type, deterministic, has_dbias, use_ext_asm, is_v3_atomic_fp32, how_v3_bf16_cvt);
     float t = -1;
     t = {F_fmha_bwd_api}(traits, args, stream_config);
     return t;

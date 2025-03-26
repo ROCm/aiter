@@ -87,6 +87,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(0);
     ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
+    // TODO: layout of this?
     // dq_acc: (split, total_q, nheads, hdim_v)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
     ck_tile::index_t batch_stride_dq_acc = 0;
@@ -341,6 +342,8 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         softmax_d.zero_();
     }
 
+    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
+
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
         gen_, at::cuda::detail::getDefaultCUDAGenerator());
 
@@ -395,15 +398,16 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                 drop_seed_offset);
 
         float t = fmha_bwd_aiter(args,
-                stream_config,
-                mask,
-                q_dtype_str,
-                true,  //is_group_mode
-                alibi_slopes_.has_value(),
-                deterministic,
-                true,  // use_ext_asm
-                is_v3_atomic_fp32,
-                how_v3_bf16_cvt);
+                                 stream_config,
+                                 mask,
+                                 q_dtype_str,
+                                 true,  // is_group_mode
+                                 bias_type,
+                                 deterministic,
+                                 false, // has_dbias
+                                 true,  // use_ext_asm
+                                 is_v3_atomic_fp32,
+                                 how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
