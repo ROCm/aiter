@@ -347,7 +347,7 @@ def _flash_attn_backward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = (causal == True and window_size_left == -1) # causal mask
+    mask = (causal == True and window_size_left == -1 and window_size_right == 0) # causal mask
     nmask = (causal == False and window_size_left == -1 and window_size_right == -1) # no mask
 
     def np():
@@ -398,7 +398,6 @@ def _flash_attn_backward(
 
     def pssk():
         # only for hd64 a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
-        # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         # bwd_v3_hd64_bf16_a32_rtne_pssk
         # bwd_v3_hd64_bf16_a32_rtna_pssk
         # bwd_v3_hd64_bf16_a32_rtz_pssk
@@ -407,7 +406,7 @@ def _flash_attn_backward(
         # bwd_v3_hd64_bf16_causal_a32_rtz_pssk
         # bwd_v3_hd64_fp16_a32_pssk
         # bwd_v3_hd64_fp16_causal_a32_pssk
-        ret = is_v3_atomic_fp32 == True
+        ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64
         ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
@@ -918,8 +917,8 @@ def _flash_attn_varlen_backward(
         '--receipt 400 --filter {} --output_dir {{}}'.format(filter),
         f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 1 --output_dir {{}}']
 
-    (total_q, nhead_q, hdim_q) = q.shape
-    (total_k, nhead_k, hdim_v) = v.shape
+    (_, nhead_q, hdim_q) = q.shape
+    (_, nhead_k, hdim_v) = v.shape
 
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
@@ -940,7 +939,7 @@ def _flash_attn_varlen_backward(
         # bwd_v3_hd64_fp16_causal_a32_pssk_group
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q == 64
-        ret &= nmask or (mask and total_q == total_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= nmask or (mask) # and mask_type == mask_enum::mask_top_left)
 
         return ret
 
