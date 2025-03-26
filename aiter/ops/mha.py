@@ -918,12 +918,12 @@ def _flash_attn_varlen_backward(
         '--receipt 400 --filter {} --output_dir {{}}'.format(filter),
         f'{AITER_CSRC_DIR}/cpp_itfs/generate.py --receipt 1 --output_dir {{}}']
 
-    (_, seqlen_q, nhead_q, hdim_q) = q.shape
-    (_, seqlen_k, nhead_k, hdim_v) = v.shape
+    (total_q, nhead_q, hdim_q) = q.shape
+    (total_k, nhead_k, hdim_v) = v.shape
 
     # mask
-    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
-    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
+    window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
     mask = (causal == True and window_size_left == -1) # causal mask
     nmask = (causal == False and window_size_left == -1 and window_size_right == -1) # no mask
 
@@ -940,7 +940,7 @@ def _flash_attn_varlen_backward(
         # bwd_v3_hd64_fp16_causal_a32_pssk_group
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q == 64
-        ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= nmask or (mask and total_q == total_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
 

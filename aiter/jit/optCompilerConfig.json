@@ -516,7 +516,8 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/aiter_fmha_bwd.h'"
         ],
         "verbose": "False",
         "blob_gen_cmd": [
