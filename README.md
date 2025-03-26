@@ -8,21 +8,27 @@ AITER is AMD’s centralized repository that support various of high performance
 Some summary of the features:
 * C++ level API
 * Python level API
-* The underneath kernel could from triton/ck/asm
-* Not only inference kernels, but also training kernels and gemm+comm kerenls (so can do any kerne+framework dirty WAs for any arch limit)
+* The underneath kernel could come from triton/ck/asm
+* Not just inference kernels, but also training kernels and GEMM+communication kernels—allowing for workarounds in any kernel-framework combination for any architecture limitation.
 
 
 
-## clone
+## Installation
 `git clone --recursive https://github.com/ROCm/aiter.git`
+
 or
+
 `git submodule sync ; git submodule update --init --recursive`
 
-## install into python
-under aiter root dir run: `python3 setup.py develop`
+Then
+```
+cd aiter
+python3 setup.py develop
+```
 
-## run operators supported by aiter
-there are number of op test, you can run them like this: `python3 op_tests/test_layernorm2d.py`
+## Run operators supported by aiter
+
+There are number of op test, you can run them with: `python3 op_tests/test_layernorm2d.py`
 |  **Ops**   | **Description**                                                                             |
 |------------|---------------------------------------------------------------------------------------------|
 |GEMM        | D=AxB+C                                                                                     |
