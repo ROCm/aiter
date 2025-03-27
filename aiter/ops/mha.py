@@ -1013,11 +1013,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        bias = ctx.bias
+        dbias = torch.empty_like(bias) if bias is not None else None
         head_size_q_og = ctx.head_size_q_og
         head_size_v_og = dout.size(2)
         dout_padded = dout
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
+        # TODO - dbias
         _flash_attn_varlen_backward(
             dout_padded,
             q,
@@ -1044,7 +1047,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., : head_size_q_og]
         dv = dv[..., : head_size_v_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, dbias, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(

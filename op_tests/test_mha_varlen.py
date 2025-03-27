@@ -60,12 +60,11 @@ def run_torch(
             reorder_ops=reorder_ops,
         )
 
-    return out, None, None, None
-    # if dout == None:
-    #     return out
-    # else:
-    #     dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
-    #     return out, dq, dk, dv
+    if dout == None:
+        return out
+    else:
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), dout)
+        return out, dq, dk, dv
 
 
 def run_ck(
@@ -103,6 +102,8 @@ def run_ck(
         # TODO - implement generate_bias() to unpad
         total_q = q_unpad.shape[0]
         assert (total_q == batch_size * max_seqlen_q)
+        assert (q.shape[1] == max_seqlen_q)
+        assert (k.shape[1] == max_seqlen_k)
         bias_unpad = bias.reshape(batch_size * max_seqlen_q, max_seqlen_k)
     else:
         bias_unpad = None
@@ -146,15 +147,14 @@ def run_ck(
     else:
         dropout_mask = None
 
-    return out, dropout_mask, 0, 0, 0
-    # if dout == None:
-    #     return out, dropout_mask
-    # else:
-    #     dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), dout)
-    #     dq = dq_pad_fn(dq_unpad)
-    #     dk = dk_pad_fn(dk_unpad)
-    #     dv = dk_pad_fn(dv_unpad)
-    #     return out, dropout_mask, dq, dk, dv
+    if dout == None:
+        return out, dropout_mask
+    else:
+        dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), dout)
+        dq = dq_pad_fn(dq_unpad)
+        dk = dk_pad_fn(dk_unpad)
+        dv = dk_pad_fn(dv_unpad)
+        return out, dropout_mask, dq, dk, dv
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -225,17 +225,18 @@ def test_flash_attn_varlen_func(
     k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype, requires_grad=True)
     if bias_type == 'bias':
-        # TODO- We need to implement unpad bias [batch_size, seqlen_q, seqlen_k] -> [total_q, seqlen_k]
+        # TODO - We need to implement unpad bias [batch_size, seqlen_q, seqlen_k] -> [total_q, max_seqlen_k]
         # Let total_q = batch_size * seqlen_q to pass the test for now
         query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, "cuda", mode="full")
+        key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="full")
     else:
         query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, "cuda", mode="random")
-    key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="random")
+        key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="random")
 
     attn_bias = None
     alibi_slopes = None
     if bias_type == 'bias':
-        attn_bias = torch.randn(batch_size, seqlen_q, seqlen_k, device="cuda", dtype=dtype)
+        attn_bias = torch.randn(batch_size, seqlen_q, seqlen_k, device="cuda", dtype=dtype, requires_grad=True)
     elif bias_type == 'alibi':
         alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=torch.float32)
 
@@ -259,20 +260,20 @@ def test_flash_attn_varlen_func(
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
 
-    # print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    # print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    # print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    # print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    # print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    # print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    # dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    # dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    # dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-    # assert (dq - dq_ref).abs().max().item() <= dq_tol
-    # assert (dk - dk_ref).abs().max().item() <= dk_tol
-    # assert (dv - dv_ref).abs().max().item() <= dv_tol
+    assert (dq - dq_ref).abs().max().item() <= dq_tol
+    assert (dk - dk_ref).abs().max().item() <= dk_tol
+    assert (dv - dv_ref).abs().max().item() <= dv_tol
 
 
 if __name__ == '__main__':
@@ -280,12 +281,12 @@ if __name__ == '__main__':
     nheads = 4
     (seqlen_q, seqlen_k) = (4, 4)
     d = 192
-    d_v = 128
-    dropout_p = 0
+    d_v = 192
+    dropout_p = 0.5
     causal = False
     local = False
-    bias_type = 'bias'
-    deterministic = False
+    bias_type = 'no'
+    deterministic = True
     mha_type = 'mha'
     dtype = torch.bfloat16
 
