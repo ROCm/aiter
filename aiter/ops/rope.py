@@ -175,6 +175,28 @@ def rope_cached_2c_bwd_impl(
     ...
 
 @compile_ops("module_rope_pos_fwd")
+def rope_cached_positions_fwd_impl(
+    output: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool
+):
+    '''
+    Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
+    on one channel. Offsets here is optional. Both positions and offsets should be in [s, b].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
+    rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
+    When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
+    if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
+    '''
+    ...
+
+@compile_ops("module_rope_pos_fwd")
 def rope_cached_positions_2c_fwd_impl(
     output_x: Tensor,
     output_y: Tensor,
@@ -190,6 +212,29 @@ def rope_cached_positions_2c_fwd_impl(
     '''
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
     on two channels. Offsets here is optional. Both positions and offsets should be in [s, b].
+    Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
+    if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
+    rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
+    When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
+    if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
+    '''
+    ...
+
+@compile_ops("module_rope_pos_fwd")
+def rope_cached_positions_offsets_fwd_impl(
+    output: Tensor,
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool
+):
+    '''
+    Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
+    on one channel. Offsets here is optional. Both positions and offsets should be in [s, b].
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
     if reuse_freqs_front_part is true. Otherwise, they should be in [s, 1, 1, d].
     rotate_style: 0 - NEOX style which rotates the 2nd half of elements, 1 - GPT-J style which rotates odd part.
@@ -493,6 +538,22 @@ def rope_cached_2c_bwd(
     rope_cached_2c_bwd_impl(input_grads_x, input_grads_y, output_grads_x, output_grads_y, cos, sin, rotate_style, reuse_freqs_front_part, nope_first)
     return input_grads_x, input_grads_y
 
+def rope_cached_positions_fwd(
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+    transpose_output: bool = False
+) -> Tensor :
+    s, b, h, d = input.shape
+    output = empty((b, s, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)\
+        if transpose_output else empty_like(input, requires_grad=False)
+    rope_cached_positions_fwd_impl(output, input, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
+    return output
+
 def rope_cached_positions_2c_fwd(
     input_x: Tensor,
     input_y: Tensor,
@@ -513,6 +574,17 @@ def rope_cached_positions_2c_fwd(
     rope_cached_positions_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
 
+def rope_cached_positions_fwd_inplace(
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_cached_positions_fwd_impl(input, input, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
+
 def rope_cached_positions_2c_fwd_inplace(
     input_x: Tensor,
     input_y: Tensor,
@@ -524,6 +596,23 @@ def rope_cached_positions_2c_fwd_inplace(
     nope_first : bool,
 ) -> Tensor :
     rope_cached_positions_2c_fwd_impl(input_x, input_y, input_x, input_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first)
+
+def rope_cached_positions_offsets_fwd(
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+    transpose_output: bool = False
+) -> Tensor :
+    s, b, h, d = input.shape
+    output = empty((b, s, h, d), dtype=input.dtype, device=input.device, requires_grad=False).transpose(0, 1)\
+        if transpose_output else empty_like(input, requires_grad=False)
+    rope_cached_positions_offsets_fwd_impl(output, input, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
+    return output
 
 def rope_cached_positions_offsets_2c_fwd(
     input_x: Tensor,
@@ -545,6 +634,18 @@ def rope_cached_positions_offsets_2c_fwd(
         if transpose_output else empty_like(input_y, requires_grad=False)
     rope_cached_positions_offsets_2c_fwd_impl(output_x, output_y, input_x, input_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
     return output_x, output_y
+
+def rope_cached_positions_offsets_fwd_inplace(
+    input: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+    positions: Tensor,
+    offsets: Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+) -> Tensor :
+    rope_cached_positions_offsets_fwd_impl(input, input, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first)
 
 def rope_cached_positions_offsets_2c_fwd_inplace(
     input_x: Tensor,

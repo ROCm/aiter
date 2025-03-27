@@ -158,7 +158,7 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
     # def forward_cuda(
-    def forward(
+    def forward_old(
         self,
         positions: torch.Tensor,
         # if     is_nope_first
@@ -187,7 +187,7 @@ class RotaryEmbedding(nn.Module):
                                      self.cos_cache, self.sin_cache, self.is_neox_style, is_nope_first)
         return query, key
 
-    def forward_new(
+    def forward(
         self,
         positions: torch.Tensor,
         # if     is_nope_first
@@ -215,12 +215,13 @@ class RotaryEmbedding(nn.Module):
         elif query.dim() == 2: # [num_tokens, num_heads*head_size]
             query = query.view(1, query.size(0), query.size(1)// self.head_size, self.head_size)
 
-        if key.dim() == 3 and key.shape[-1] == self.head_size: # [num_tokens, num_heads, head_size]
-            key = key.unsqueeze(0)
-        elif key.dim() == 3: # [batch_size, seq_len, num_heads*head_size]
-            key = key.view(key.size(0), key.size(1), key.size(2)// self.head_size, self.head_size)
-        elif key.dim() == 2: # [num_tokens, num_heads*head_size]
-            key = key.view(1, key.size(0), key.size(1)// self.head_size, self.head_size)
+        if key is not None:
+            if key.dim() == 3 and key.shape[-1] == self.head_size: # [num_tokens, num_heads, head_size]
+                key = key.unsqueeze(0)
+            elif key.dim() == 3: # [batch_size, seq_len, num_heads*head_size]
+                key = key.view(key.size(0), key.size(1), key.size(2)// self.head_size, self.head_size)
+            elif key.dim() == 2: # [num_tokens, num_heads*head_size]
+                key = key.view(1, key.size(0), key.size(1)// self.head_size, self.head_size)
 
         positions = positions.view(*query.shape[:2])
         if offsets is not None:
@@ -235,7 +236,13 @@ class RotaryEmbedding(nn.Module):
                                                                     reuse_freqs_front_part=True, nope_first=is_nope_first)
             return query.view(query_shape), key.view(key_shape)
         else:
-            return query, key
+            if offsets is None:
+                ops.rope_cached_positions_fwd_inplace(query, cos, sin, positions, rotate_style, 
+                                                                reuse_freqs_front_part=True, nope_first=is_nope_first)
+            else:
+                ops.rope_cached_positions_offsets_fwd_inplace(query, cos, sin, positions, offsets, rotate_style, 
+                                                                    reuse_freqs_front_part=True, nope_first=is_nope_first)
+            return query.view(query_shape)
 
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
