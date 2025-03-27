@@ -3,13 +3,14 @@
 #include <unordered_map>
 #include <list>
 #include <iostream>
+#include <mutex>
 
 template<typename K, typename V>
 class LRUCache {
 private:
     // Capacity of cache
     int m_capacity;
-    
+    std::mutex m;
     // List to store key-value pairs in order of use
     // Most recently used at front, least recently used at back
     std::list<std::pair<K, V>> m_items;
@@ -24,6 +25,7 @@ public:
     
     // Get value by key. Returns nullptr if not found
     V* get(const K& key) {
+        std::lock_guard<std::mutex> guard(m);
         auto it = m_item_map.find(key);
         if (it == m_item_map.end()) {
             return nullptr;
@@ -36,6 +38,7 @@ public:
     
     // Put key-value pair into cache
     void put(const K& key, const V& value) {
+        std::lock_guard<std::mutex> guard(m);
         auto it = m_item_map.find(key);
         
         if (it != m_item_map.end()) {
@@ -60,6 +63,7 @@ public:
     
     // Clear the cache
     void clear() {
+        std::lock_guard<std::mutex> guard(m);
         m_items.clear();
         m_item_map.clear();
     }
