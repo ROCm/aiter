@@ -249,7 +249,6 @@ def asm_moe_tkw1(hidden_states,
                     hidden_states, torch.float, quant_dtype=w1.dtype)
         if w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_g1u1_tkw1
-            #print("right")
 
         else:
             raise ValueError(
@@ -475,11 +474,6 @@ def torch_moe_tkw1(hidden_states, w1, w2, topk_weight, topk_ids,
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
             if moeType == "g1u1":
                 gate, up = act_input.split([inter_dim, inter_dim], dim=-1)
-                # print("helo topk_ids", topk_ids.shape)
-                # print("helo hidden_states", hidden_states.shape)
-                # print("helo sub_tokens", sub_tokens.shape)
-                # print("helo topk_weight",topk_weight.shape)
-               # print("topk_weight.view(B, -1, 1)[mask]",topk_weight.view(B, -1, 1)[mask])
                 gate = gate * (topk_weight.view(B, -1, 1)[mask])
                 up = up * (topk_weight.view(B, -1, 1)[mask])
                 if activation == ActivationType.Gelu:

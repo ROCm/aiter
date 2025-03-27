@@ -625,7 +625,6 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
         std::string co_name;
         int tile_size;
     };
-   // print("right")
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
