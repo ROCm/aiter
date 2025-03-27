@@ -63,11 +63,11 @@ float fmha_bwd_aiter(fmha_bwd_args args,
 }}
 """
 
-V2_API = "    t = fmha_bwd(traits, args, stream_config);"
+V2_API = "t = fmha_bwd(traits, args, stream_config);"
 
-V3_API = "    t = fmha_bwd_v3(traits, args, stream_config);"
+V3_API = "t = fmha_bwd_v3(traits, args, stream_config);"
 
-COMBINED_API = """    t = fmha_bwd_v3(traits, args, stream_config);
+COMBINED_API = """t = fmha_bwd_v3(traits, args, stream_config);
     if (t == -1) { t = fmha_bwd(traits, args, stream_config); }
 """
 

@@ -375,7 +375,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
     }
 
-    // TODO: maybe move this to aiter cpp api
     if (seqlen_q > 0) {
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
