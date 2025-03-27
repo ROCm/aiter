@@ -18,6 +18,7 @@ AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR=os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 os.makedirs(BUILD_DIR, exist_ok=True)
 
+CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
 makefile_template = Template("""
 CXX=hipcc
