@@ -134,14 +134,14 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          nhead_stride_q,
                          nhead_stride_k,
                          nhead_stride_v,
-                         0, // nhead_stride_bias, FA without bias
+                         0, // nhead_stride_bias
                          nhead_stride_randval,
                          nhead_stride_lse,
                          nhead_stride_o,
                          batch_stride_q,
                          batch_stride_k,
                          batch_stride_v,
-                         0, // batch_stride_bias, FA without bias
+                         0, // batch_stride_bias
                          batch_stride_randval,
                          batch_stride_lse,
                          batch_stride_o,
