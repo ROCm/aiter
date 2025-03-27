@@ -457,8 +457,10 @@
       m.def("rope_thd_bwd_impl", &rope_thd_bwd_impl);             \
       m.def("rope_2d_bwd_impl", &rope_2d_bwd_impl);
 
-#define ROPE_POS_FWD_PYBIND                                                           \
-      m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl); \
+#define ROPE_POS_FWD_PYBIND                                                                           \
+      m.def("rope_cached_positions_fwd_impl", &rope_cached_positions_fwd_impl);                       \
+      m.def("rope_cached_positions_2c_fwd_impl", &rope_cached_positions_2c_fwd_impl);                 \
+      m.def("rope_cached_positions_offsets_fwd_impl", &rope_cached_positions_offsets_fwd_impl);       \
       m.def("rope_cached_positions_offsets_2c_fwd_impl", &rope_cached_positions_offsets_2c_fwd_impl);
 
 #define SMOOTHQUANT_PYBIND                        \
