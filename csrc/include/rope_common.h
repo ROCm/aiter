@@ -1166,6 +1166,37 @@ __global__ void kn_entry_2c_sbhd_cached_inplace(
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          bool StrideDOutEq1, bool StrideDInEq1,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_sbhd_cached_indirect(
+    scalar_t* __restrict__         p_output,
+    const scalar_t* __restrict__   p_input,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const uint64_t ib_idx   = sid * gridDim.y + bid;
+    const uint64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
+
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutEq1, StrideDInEq1>(
+        p_output + offset_o,
+        p_input + offset_i,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_i_h, stride_i_d,
+        stride_o_h, stride_o_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDOutXEq1, bool StrideDOutYEq1, bool StrideDInXEq1, bool StrideDInYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect(
@@ -1207,6 +1238,34 @@ __global__ void kn_entry_2c_sbhd_cached_indirect(
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          bool StrideDEq1,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_sbhd_cached_indirect_inplace(
+    scalar_t* __restrict__         p_inout,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_s, const int32_t stride_b, const int32_t stride_h, const int32_t stride_d)
+{
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset   = sid * stride_s + bid * stride_b;
+    const uint64_t ib_idx   = sid * gridDim.y + bid;
+    const uint64_t offset_f = p_indirect_buffer[ib_idx] * size_f;
+
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDEq1, StrideDEq1>(
+        p_inout + offset,
+        p_inout + offset,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_h, stride_d,
+        stride_h, stride_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           bool StrideDXEq1, bool StrideDYEq1,
           typename scalar_t, typename scalar_f_t>
 __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
@@ -1239,6 +1298,38 @@ __global__ void kn_entry_2c_sbhd_cached_indirect_inplace(
         stride_y_h, stride_y_d,
         stride_x_h, stride_x_d,
         stride_y_h, stride_y_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          bool StrideDOutEq1, bool StrideDInEq1,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_sbhd_cached_indirect2(
+    scalar_t* __restrict__         p_output,
+    const scalar_t* __restrict__   p_input,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer_0,
+    const int64_t* __restrict__    p_indirect_buffer_1,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset_i = sid * stride_i_s + bid * stride_i_b;
+    const uint64_t offset_o = sid * stride_o_s + bid * stride_o_b;
+    const uint64_t ib_idx   = sid * gridDim.y + bid;
+    const uint64_t offset_f = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
+
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, false, StrideDOutEq1, StrideDInEq1>(
+        p_output + offset_o,
+        p_input + offset_i,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_i_h, stride_i_d,
+        stride_o_h, stride_o_d);
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1281,6 +1372,35 @@ __global__ void kn_entry_2c_sbhd_cached_indirect2(
         stride_iy_h, stride_iy_d,
         stride_ox_h, stride_ox_d,
         stride_oy_h, stride_oy_d);
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          bool StrideDEq1,
+          typename scalar_t, typename scalar_f_t>
+__global__ void kn_entry_1c_sbhd_cached_indirect2_inplace(
+    scalar_t* __restrict__         p_inout,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer_0,
+    const int64_t* __restrict__    p_indirect_buffer_1,
+    const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_s, const int32_t stride_b, const int32_t stride_h, const int32_t stride_d)
+{
+    const uint64_t sid      = blockIdx.x;
+    const uint64_t bid      = blockIdx.y;
+    const uint64_t offset   = sid * stride_s + bid * stride_b;
+    const uint64_t ib_idx   = sid * gridDim.y + bid;
+    const uint64_t offset_f  = (p_indirect_buffer_0[ib_idx] + p_indirect_buffer_1[ib_idx]) * size_f;
+
+    Op::template apply_1c<RotateStyle, ReuseFreqsFrontPart, NopeFirst, true, StrideDEq1, StrideDEq1>(
+        p_inout + offset,
+        p_inout + offset,
+        p_cos + offset_f,
+        p_sin + offset_f,
+        size_h, size_d, size_f,
+        stride_h, stride_d,
+        stride_h, stride_d);
 }
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
@@ -1908,6 +2028,60 @@ void dispatch_2c_sbhd_cached(
 
 template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
           typename scalar_t, typename scalar_f_t>
+void dispatch_1c_sbhd_cached_indirect(
+    scalar_t* __restrict__         p_output,
+    const scalar_t* __restrict__   p_input,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer,
+    const int32_t size_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 grid(size_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+
+    if (p_output == p_input)
+    {
+        assert(stride_i_s == stride_o_s);
+        assert(stride_i_b == stride_o_b);
+        assert(stride_i_h == stride_o_h);
+        assert(stride_i_d == stride_o_d);
+
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
+            RotateStyle,
+            stride_i_d,
+            kn_entry_1c_sbhd_cached_indirect_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1><<<grid, block, 0, stream>>>(
+                p_output,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_i_s, stride_i_b, stride_i_h, stride_i_d);
+        );
+    }
+    else
+    {
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_o_d,
+            stride_i_d,
+            kn_entry_1c_sbhd_cached_indirect<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
+                p_output,
+                p_input,
+                p_cos, p_sin,
+                p_indirect_buffer,
+                size_h, size_d, size_f,
+                stride_i_s, stride_i_b, stride_i_h, stride_i_d,
+                stride_o_s, stride_o_b, stride_o_h, stride_o_d);
+        );
+    }
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
 void dispatch_2c_sbhd_cached_indirect(
     scalar_t* __restrict__         p_output_x,
     scalar_t* __restrict__         p_output_y,
@@ -1973,6 +2147,63 @@ void dispatch_2c_sbhd_cached_indirect(
                 stride_iy_s, stride_iy_b, stride_iy_h, stride_iy_d,
                 stride_ox_s, stride_ox_b, stride_ox_h, stride_ox_d,
                 stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d);
+        );
+    }
+}
+
+template <typename Op, int32_t RotateStyle, bool ReuseFreqsFrontPart, bool NopeFirst,
+          typename scalar_t, typename scalar_f_t>
+void dispatch_1c_sbhd_cached_indirect2(
+    scalar_t* __restrict__         p_output,
+    const scalar_t* __restrict__   p_input,
+    const scalar_f_t* __restrict__ p_cos,
+    const scalar_f_t* __restrict__ p_sin,
+    const int64_t* __restrict__    p_indirect_buffer_0,
+    const int64_t* __restrict__    p_indirect_buffer_1,
+    const int32_t size_s, const int32_t size_b, const int32_t size_h, const int32_t size_d,
+    const int32_t size_f,       // size of last dimension of freqs.
+    const int32_t stride_i_s, const int32_t stride_i_b, const int32_t stride_i_h, const int32_t stride_i_d,
+    const int32_t stride_o_s, const int32_t stride_o_b, const int32_t stride_o_h, const int32_t stride_o_d)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const dim3 grid(size_s, size_b);
+    const dim3 block(C10_WARP_SIZE, size_h < 16 ? 4 : 8);
+
+    if (p_output == p_input)
+    {
+        assert(stride_i_s == stride_o_s);
+        assert(stride_i_b == stride_o_b);
+        assert(stride_i_h == stride_o_h);
+        assert(stride_i_d == stride_o_d);
+
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_1_STRIDES(
+            RotateStyle,
+            stride_i_d,
+            kn_entry_1c_sbhd_cached_indirect2_inplace<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1><<<grid, block, 0, stream>>>(
+                p_output,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_i_s, stride_i_b, stride_i_h, stride_i_d);
+        );
+    }
+    else
+    {
+        LAUNCH_KERNEL_STRIDE_EQUAL_1_2_STRIDES(
+            RotateStyle,
+            stride_o_d,
+            stride_i_d,
+            kn_entry_1c_sbhd_cached_indirect2<Op, RotateStyle, ReuseFreqsFrontPart, NopeFirst, Stride0Eq1, Stride1Eq1><<<grid, block, 0, stream>>>(
+                p_output,
+                p_input,
+                p_cos, p_sin,
+                p_indirect_buffer_0,
+                p_indirect_buffer_1,
+                size_h, size_d, size_f,
+                stride_i_s, stride_i_b, stride_i_h, stride_i_d,
+                stride_o_s, stride_o_b, stride_o_h, stride_o_d);
         );
     }
 }
