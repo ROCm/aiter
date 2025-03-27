@@ -158,7 +158,7 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
     # def forward_cuda(
-    def forward(
+    def forward_old(
         self,
         positions: torch.Tensor,
         # if     is_nope_first
@@ -187,7 +187,7 @@ class RotaryEmbedding(nn.Module):
                                      self.cos_cache, self.sin_cache, self.is_neox_style, is_nope_first)
         return query, key
 
-    def forward_new(
+    def forward(
         self,
         positions: torch.Tensor,
         # if     is_nope_first
