@@ -341,7 +341,6 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
-        stream_config.log_level_ = 1;
 
         auto args =
         get_ck_fmha_bwd_args(
