@@ -604,6 +604,112 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                                                fc2_smooth_scale);
 }
 
+void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt, dim]
+               torch::Tensor &input,                          // [token_cnt, dim] M,K
+               torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
+               torch::Tensor &down,                           // [expert, dim, inter_dim]
+               torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
+               torch::Tensor &sorted_weight_buf,              // [max_num_tokens_padded]
+               torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
+               torch::Tensor &num_valid_ids,                  // [1]
+               uint32_t topk,                                 //
+               torch::Tensor &input_scale,                    // [token_cnt, 1]
+               torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
+               torch::Tensor &fc2_scale,                      // [expert, 1, dim]
+               std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
+               ActivationType activation)
+{
+    struct FMoeKernelConfig
+    {
+        std::string name;
+        std::string co_name;
+        int tile_size;
+    };
+    FMoeKernel *impl_ptr = nullptr;
+    int inter_dim = down.size(2);
+    int sub_X_cnt = sorted_expert_ids.size(0);
+    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+    if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
+    {
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
+            {512, {"fmoe_fp8_g1u1_subGU_512_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_512_silu_tkw1.co", 512}},
+            {448, {"fmoe_fp8_g1u1_subGU_448_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_448_silu_tkw1.co", 448}},
+            {384, {"fmoe_fp8_g1u1_subGU_384_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_384_silu_tkw1.co", 384}},
+            {320, {"fmoe_fp8_g1u1_subGU_320_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_320_silu_tkw1.co", 320}},
+            {256, {"fmoe_fp8_g1u1_subGU_256_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_256_silu_tkw1.co", 256}},
+            {192, {"fmoe_fp8_g1u1_subGU_192_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_192_silu_tkw1.co", 192}},
+            {128, {"fmoe_fp8_g1u1_subGU_128_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_128_silu_tkw1.co", 128}}};
+
+        static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_configs = {
+            {512, {"fmoe_fp8_g1u1_subGU_512_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_512_gelu_tkw1.co", 512}},
+            {448, {"fmoe_fp8_g1u1_subGU_448_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_448_gelu_tkw1.co", 448}},
+            {384, {"fmoe_fp8_g1u1_subGU_384_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_384_gelu_tkw1.co", 384}},
+            {320, {"fmoe_fp8_g1u1_subGU_320_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_320_gelu_tkw1.co", 320}},
+            {256, {"fmoe_fp8_g1u1_subGU_256_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_256_gelu_tkw1.co", 256}},
+            {192, {"fmoe_fp8_g1u1_subGU_192_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_192_gelu_tkw1.co", 192}},
+            {128, {"fmoe_fp8_g1u1_subGU_128_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_128_gelu_tkw1.co", 128}}};
+
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
+
+        std::unordered_map<int, FMoeKernelConfig> *config_map = nullptr;
+        if (fc2_smooth_scale.has_value())
+        {
+            TORCH_CHECK(false, __func__, " Only supput non-smooth tkw1!");
+        }
+        else if (activation == ActivationType::Gelu)
+        {
+            config_map = &gelu_kernel_fp8_configs;
+        }
+        else if (activation == ActivationType::Silu)
+        {
+            config_map = &silu_kernel_fp8_configs;
+        }
+
+        if (config_map)
+        {
+            auto it = config_map->find(selectedTile);
+            if (it != config_map->end())
+            {
+                const auto &config = it->second;
+                const char *name = config.name.c_str();
+                const char *co_name = config.co_name.c_str();
+
+                auto result = impl_ptr_map.emplace(name, nullptr);
+                if (result.second)
+                {
+                    result.first->second = std::make_unique<FMoeKernel>(name, co_name, config.tile_size);
+                }
+                impl_ptr = result.first->second.get();
+            }
+            else
+                TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 192, 256, 320, 384, 448 or 512");
+        }
+        else
+        {
+            TORCH_CHECK(false, __func__, "No valid kernel selected!");
+        }
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, " Input only supput Fp8!");
+    }
+
+    impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
+                                               input,
+                                               gate,
+                                               down,
+                                               sorted_token_ids,
+                                               sorted_weight_buf,
+                                               sorted_expert_ids,
+                                               num_valid_ids,
+                                               topk,
+                                               // quant args
+                                               input_scale,
+                                               fc1_scale,
+                                               fc2_scale,
+                                               fc2_smooth_scale);
+}
+
 void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                         torch::Tensor &input,             // [token_cnt, dim] M,K
                         torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
