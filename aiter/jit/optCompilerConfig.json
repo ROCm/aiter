@@ -242,7 +242,7 @@
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": ["'-DCK_TILE_WA_ISSUE_2028=0'"],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
