@@ -11,7 +11,9 @@ ctypes_map = {
 def torch_to_c_types(*args):
     c_args = []
     for arg in args:
-        if isinstance(arg, torch.Tensor):
+        if arg is None:
+            c_args.append(ctypes.POINTER(ctypes.c_int)())
+        elif isinstance(arg, torch.Tensor):
             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
         elif isinstance(arg, torch.cuda.Stream):
             c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
