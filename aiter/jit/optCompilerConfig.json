@@ -557,6 +557,7 @@
     "module_fmla_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/fmla_fwd_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fmla_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/fmla_fwd_pybind.cu'"
         ],
         "flags_extra_cc": [],
