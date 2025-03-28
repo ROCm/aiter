@@ -59,6 +59,9 @@ def asm_mla_decode_fwd(q,         # [num_seqs, num_heads, head_size]
     if logit_cap > 0:
         raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support logit_cap==0 for now")
     
+    if num_heads / num_kv_heads > 16:
+        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support num_heads / num_kv_heads <= 16 for now")
+    
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_size**0.5)
 
