@@ -128,4 +128,18 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,                           // [
                               std::optional<torch::Tensor> fc2_smooth_scale // [expert, 1, inter_dim]
 );
 
+void moe_stage1_fp8_g1u1(torch::Tensor &input,             // [token_cnt, model_dim] M,K
+                         torch::Tensor &w1,                // [expert, inter_dim*2, model_dim] N,K
+                         torch::Tensor &w2,                // [expert, model_dim, inter_dim]
+                         torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                         torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                         torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                         torch::Tensor &num_valid_ids,     // [1]
+                         torch::Tensor &out,               // [token_cnt, topk, inter_dim]
+                         std::string &kernelName,
+                         int block_size,
+                         std::optional<torch::Tensor> a1_scale = std::nullopt, // [token_cnt, 1], token scale
+                         std::optional<torch::Tensor> w1_scale = std::nullopt  // [expert, 1, inter_dim], gate(up) scale
+);
+
 void moe_sum(torch::Tensor &input, torch::Tensor &output);
