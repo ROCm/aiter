@@ -94,4 +94,45 @@ inline int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen
     return num_splits;
 }
 
-} // namespace flash
+template<typename ARG>
+inline void print_fmha_fwd_args(ARG args)
+{
+    printf("seqlen_q = %d\n", args.seqlen_q);
+    printf("seqlen_k = %d\n", args.seqlen_k);
+    printf("batch = %d\n", args.batch);
+    printf("max_seqlen_q = %d\n", args.max_seqlen_q);
+    printf("hdim_q = %d\n", args.hdim_q);
+    printf("hdim_v = %d\n", args.hdim_v);
+    printf("nhead_q = %d\n", args.nhead_q);
+    printf("nhead_k = %d\n", args.nhead_k);
+    printf("scale_s = %f\n", args.scale_s);
+    printf("scale_p = %f\n", args.scale_p);
+    printf("scale_o = %f\n", args.scale_o);
+    printf("stride_q = %d\n", args.stride_q);
+    printf("stride_k = %d\n", args.stride_k);
+    printf("stride_v = %d\n", args.stride_v);
+    printf("stride_bias = %d\n", args.stride_bias);
+    printf("stride_randval = %d\n", args.stride_randval);
+    printf("stride_o = %d\n", args.stride_o);
+    printf("nhead_stride_q = %d\n", args.nhead_stride_q);
+    printf("nhead_stride_k = %d\n", args.nhead_stride_k);
+    printf("nhead_stride_v = %d\n", args.nhead_stride_v);
+    printf("nhead_stride_bias = %d\n", args.nhead_stride_bias);
+    printf("nhead_stride_randval = %d\n", args.nhead_stride_randval);
+    printf("nhead_stride_lse = %d\n", args.nhead_stride_lse);
+    printf("nhead_stride_o = %d\n", args.nhead_stride_o);
+    printf("batch_stride_q = %d\n", args.batch_stride_q);
+    printf("batch_stride_k = %d\n", args.batch_stride_k);
+    printf("batch_stride_v = %d\n", args.batch_stride_v);
+    printf("batch_stride_bias = %d\n", args.batch_stride_bias);
+    printf("batch_stride_randval = %d\n", args.batch_stride_randval);
+    printf("batch_stride_lse = %d\n", args.batch_stride_lse);
+    printf("batch_stride_o = %d\n", args.batch_stride_o);
+    printf("window_size_left = %d\n", args.window_size_left);
+    printf("window_size_right = %d\n", args.window_size_right);
+    printf("mask_type = %d\n", args.mask_type);
+    printf("p_drop = %f\n", args.p_drop);
+    printf("s_randval = %d\n", args.s_randval);
+}
+
+} // namespace aiter
