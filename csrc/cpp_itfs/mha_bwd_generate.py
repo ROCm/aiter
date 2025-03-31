@@ -8,12 +8,13 @@ from typing import List, Optional
 
 GEN_DIR = ""    # in Cmake, have to generate files in same folder
 
-AITER_API_FILENAME = "aiter_fmha_bwd.cpp"
+AITER_API_FILENAME = "mha_bwd.cpp"
 
 AITER_CPP_API = """#include <iostream>
-#include "aiter_fmha_bwd.h"
+#include "mha_bwd.h"
 
-fmha_bwd_traits_all get_ck_fmha_bwd_traits_all(const mask_info &mask,
+namespace aiter {{
+mha_bwd_traits get_mha_bwd_traits(const mask_info &mask,
     std::string dtype,
     int head_size_q,
     int head_size_v,
@@ -26,7 +27,7 @@ fmha_bwd_traits_all get_ck_fmha_bwd_traits_all(const mask_info &mask,
     bool is_v3_atomic_fp32,
     int how_v3_bf16_cvt)
 {{
-    return fmha_bwd_traits_all(mask,
+    return mha_bwd_traits(mask,
             dtype,
             head_size_q,
             head_size_v,
@@ -40,7 +41,8 @@ fmha_bwd_traits_all get_ck_fmha_bwd_traits_all(const mask_info &mask,
             how_v3_bf16_cvt);
 }}
 
-float fmha_bwd_aiter(fmha_bwd_args args,
+// share with varlen(group mode) api
+float mha_bwd(mha_bwd_args args,
         const ck_tile::stream_config& stream_config,
         mask_info mask,
         std::string q_dtype_str,
@@ -56,11 +58,13 @@ float fmha_bwd_aiter(fmha_bwd_args args,
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0;
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
-    auto traits = get_ck_fmha_bwd_traits_all(mask, q_dtype_str, head_size_q, head_size_v, has_dropout, is_group_mode, bias_type, deterministic, has_dbias, use_ext_asm, is_v3_atomic_fp32, how_v3_bf16_cvt);
+    auto traits = get_mha_bwd_traits(mask, q_dtype_str, head_size_q, head_size_v, has_dropout, is_group_mode, bias_type, deterministic, has_dbias, use_ext_asm, is_v3_atomic_fp32, how_v3_bf16_cvt);
     float t = -1;
     {F_dispatch}
     return t;
 }}
+}} // namespace aiter
+
 """
 
 V2_API = "t = fmha_bwd(traits, args, stream_config);"

@@ -6,7 +6,7 @@
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
-#include "aiter_fmha_bwd.h"
+#include "mha_bwd.h"
 
 namespace aiter {
 namespace torch_itfs {
@@ -410,7 +410,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_bwd_aiter(args,
+        float t = aiter::mha_bwd(args,
                                  stream_config,
                                  mask,
                                  q_dtype_str,
