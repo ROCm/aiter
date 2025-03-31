@@ -5,12 +5,6 @@ MD_NAME = "asm_moe"
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/moe/asm_moe.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
-def clz(x):
-    if x == 0:
-        return 0  # or handle differently if needed
-    return (x.bit_length() - 1).bit_length() - x.bit_length()
-
-
 def get_heuristic_tile(inter_dim: int, max_num_m_blocks: int, available_tiles:list, num_cu: int):
     empty_cu = num_cu
     tg_num = 0
