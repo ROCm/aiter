@@ -10,48 +10,6 @@ def clz(x):
         return 0  # or handle differently if needed
     return (x.bit_length() - 1).bit_length() - x.bit_length()
 
-def check_moe_sorting_is_oneshot(num_tokens, num_experts):
-    smem_cols = num_experts + 1
-    smem_cols = 1
-    target_occupancy_ = 2
-    total_ = 65536 // 4
-    sub_unroll = 8
-    cumsum_bufs = 2  # 1 for cumsum, 1 for cnt
-    # at lease 2 lines, one for sub_token unroll, one for cumsum
-    # should be enough
-    if (total_ // target_occupancy_) < ((cumsum_bufs+sub_unroll) * smem_cols):
-        if (total_ // 1) < ((cumsum_bufs+sub_unroll) * smem_cols):
-            raise ValueError("too many num_experts, can't allocate smem")
-        target_occupancy_ = 1
-    
-    r = total_ // target_occupancy_ // smem_cols
-
-    # round to sub_unroll multipl
-    r_for_sub_token = r - cumsum_bufs
-    r_for_sub_token = min(r_for_sub_token, num_tokens)
-    r_for_sub_token = (r_for_sub_token + sub_unroll - 1) // sub_unroll * sub_unroll
-    r_for_sub_token = max(r_for_sub_token, 1)
-
-    if r_for_sub_token > 1:
-        r_unroll_ = r_for_sub_token // sub_unroll
-        
-        # round to 1x/2x/4x/8x number of sub_unroll
-        clz_ = clz(r_unroll_) # 0b1:31 0b2:30, 0b3:30, 0b4:29
-        mask_ = (1 << (31 - clz_)) - 1
-
-        
-        mask_ = 0b111 if mask_ > 0b111 else mask_  #clamp to 8x at most
-        mask_ = ~mask_
-
-        r_for_sub_token = (r_unroll_ & mask_) * sub_unroll
-    
-
-    # final check
-    if (r_for_sub_token + cumsum_bufs * smem_cols *  target_occupancy_ ) >= total_:
-        raise ValueError("can't run this kernel, request LDS over size")
-    
-    return num_tokens <= r_for_sub_token
-
 
 def get_heuristic_tile(inter_dim: int, max_num_m_blocks: int, available_tiles:list, num_cu: int):
     empty_cu = num_cu
@@ -169,14 +127,14 @@ def select_hsaco(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:st
     raise ValueError("Unsupported condition")
 
 
-def compile(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:str, selected_tile:int, is_smooth_scale=False, a16=False, enable_vskip=False, is_local_expert_masking=False, block_size=32, moe_sorting_is_oneshot=False, func_name=None):
+def compile(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:str, selected_tile:int, is_smooth_scale=False, a16=False, enable_vskip=False, block_size=32, func_name=None):
     if func_name is None:
-        func_name = get_default_func_name(MD_NAME, (input_dtype, gate_fusion, gate_dtype, activation, selected_tile, is_smooth_scale, a16, enable_vskip, is_local_expert_masking, block_size, moe_sorting_is_oneshot))
+        func_name = get_default_func_name(MD_NAME, (input_dtype, gate_fusion, gate_dtype, activation, selected_tile, is_smooth_scale, a16, enable_vskip, block_size))
 
     if not_built(func_name):
         kernel_name, co_name, input_dtype, output_dtype, switch_gxy = select_hsaco(input_dtype, gate_fusion, gate_dtype, activation, selected_tile, is_smooth_scale, a16, enable_vskip)
         bin_size, bin_data = transfer_hsaco(f"{AITER_CORE_DIR}/hsa/{co_name}")
-        return compile_template_op(src_template, MD_NAME, [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h", f"{AITER_CORE_DIR}/csrc/include", f"{CK_DIR}/include", f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.hpp"], [f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.cpp"], bin_size=bin_size, bin_data=bin_data, input_dtype=input_dtype, output_dtype=output_dtype, kernel_name=kernel_name, selected_tile=selected_tile, switch_gxy=switch_gxy, moe_sorting_is_oneshot=moe_sorting_is_oneshot, is_local_expert_masking=is_local_expert_masking, block_size=block_size, func_name=func_name)
+        return compile_template_op(src_template, MD_NAME, [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h", f"{AITER_CORE_DIR}/csrc/include", f"{CK_DIR}/include", f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.hpp"], [f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.cpp"], bin_size=bin_size, bin_data=bin_data, input_dtype=input_dtype, output_dtype=output_dtype, kernel_name=kernel_name, selected_tile=selected_tile, switch_gxy=switch_gxy, block_size=block_size, func_name=func_name)
     else:
         return run_lib(func_name)
 
@@ -268,14 +226,10 @@ def asm_moe(hidden_states, # [num_tokens, dim] M,K
         output = torch.empty((num_tokens, dim),
                             dtype=hidden_states.dtype,
                             device=device)
-    moe_sorting_is_oneshot = check_moe_sorting_is_oneshot(num_tokens, global_E)
-    if workspace is None:
-        if not moe_sorting_is_oneshot:
-            raise ValueError("workspace is required for non-oneshot sorting")
         
     num_cu = torch.cuda.get_device_properties().multi_processor_count
     selected_tile = select_tile(input_dtype, gate_fusion, gate_dtype, inter_dim, max_num_m_blocks, num_cu, a16)
-    func = compile(input_dtype, gate_fusion, gate_dtype, activation, selected_tile, bool(fc2_smooth_scale), a16, block_size=block_size, moe_sorting_is_oneshot=moe_sorting_is_oneshot, is_local_expert_masking=bool(expert_mask))
+    func = compile(input_dtype, gate_fusion, gate_dtype, activation, selected_tile, bool(fc2_smooth_scale), a16, block_size=block_size)
 
     if fc1_smooth_scale is None:
         func(*torch_to_c_types(output, hidden_states, w1, w2, topk_weight, topk_ids, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, num_tokens, dim, inter_dim, topk, global_E, max_num_m_blocks, output.nbytes, hidden_states.stride(0), expert_mask, workspace, torch.cuda.current_stream()))
