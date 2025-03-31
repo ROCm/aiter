@@ -41,6 +41,7 @@ FMHA_BWD_API="""
 #include "py_itfs_common.h"
 #include "mha_bwd.h"
 
+namespace aiter {
 #define HSA_KERNEL "kernel_func"
 
 struct __attribute__((packed)) fmha_bwd_v3_args
@@ -1699,6 +1700,7 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
     }
     return r;
 }
+} // namespace aiter
 """
 
 # GEMM0: Q@K=S^T

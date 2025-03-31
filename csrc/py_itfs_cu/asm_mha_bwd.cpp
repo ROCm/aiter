@@ -9,7 +9,7 @@
 #include "mha_bwd.h"
 
 namespace aiter {
-namespace torch {
+namespace torch_itfs {
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
     // sizes
     const int b,
@@ -398,5 +398,5 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
     return { dq, dk, dv, softmax_d };
 }
 
-} // namespace torch
+} // namespace torch_itfs
 } // namespace aiter
