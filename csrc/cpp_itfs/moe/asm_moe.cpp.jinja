@@ -2,119 +2,8 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
 #include <hip/hip_runtime.h>
-#include "ck_tile/core.hpp"
-#include "ck_tile/host.hpp"
-#include "ck_tile/ops/fused_moe.hpp"
+#include "moe_sorting_api.hpp"
 #include <memory>
-
-using index_t = ck_tile::index_t;
-using ms_index_t = ck_tile::index_t;
-using ms_weight_type = float;
-
-#define MOE_SORTING_DISPATCH(sub_token_tile_, sub_token_onshot_, local_expert_masking_)                \
-    constexpr ck_tile::index_t sub_token_tile = sub_token_tile_;                                        \
-    constexpr bool sub_token_onshot           = sub_token_onshot_;                                      \
-    constexpr bool local_expert_masking       = local_expert_masking_;                                  \
-    using ms_problem                          = ck_tile::MoeSortingProblemEx<index_t,                   \
-                                                    ms_weight_type,            \
-                                                    sub_token_tile,            \
-                                                    sub_token_onshot,          \
-                                                    local_expert_masking>;     \
-    using kernel                              = ck_tile::MoeSortingKernel<ms_problem>;                  \
-    auto kargs                                = kernel::MakeKargs(a);                                   \
-    const dim3 grids                          = kernel::GridSize(a);                                    \
-    const dim3 blocks                         = kernel::BlockSize(a);                                   \
-    const auto lds_bytes                      = kernel::GetSmemSize(a);                                 \
-    ck_tile::launch_kernel(s, ck_tile::make_kernel(kernel{}, grids, blocks, lds_bytes, kargs)); \
-
-#define MOE_SORTING_MP_0(unroll_num_, expert_masking_)                                            \
-    [&]() {                                                                                       \
-        constexpr ck_tile::index_t unroll_num = unroll_num_;                                      \
-        constexpr bool expert_masking         = expert_masking_;                                  \
-        using ms_problem =                                                                        \
-            ck_tile::MoeSortingProblemMp<ms_index_t, ms_weight_type, unroll_num, expert_masking>; \
-        using kernel      = ck_tile::MoeSortingMultiPhaseKernel_P0<ms_problem>;                   \
-        auto kargs        = kernel::MakeKargs(a);                                                 \
-        const dim3 grids  = kernel::GridSize(a);                                                  \
-        const dim3 blocks = kernel::BlockSize(a);                                                 \
-        return ck_tile::make_kernel(kernel{}, grids, blocks, 0, kargs);                           \
-    }()
-
-#define MOE_SORTING_MP_1(unroll_num_, expert_masking_)                                            \
-    [&]() {                                                                                       \
-        constexpr ck_tile::index_t unroll_num = unroll_num_;                                      \
-        constexpr bool expert_masking         = expert_masking_;                                  \
-        using ms_problem =                                                                        \
-            ck_tile::MoeSortingProblemMp<ms_index_t, ms_weight_type, unroll_num, expert_masking>; \
-        using kernel      = ck_tile::MoeSortingMultiPhaseKernel_P1<ms_problem>;                   \
-        auto kargs        = kernel::MakeKargs(a);                                                 \
-        const dim3 grids  = kernel::GridSize(a);                                                  \
-        const dim3 blocks = kernel::BlockSize(a);                                                 \
-        return ck_tile::make_kernel(kernel{}, grids, blocks, 0, kargs);                           \
-    }()
-
-#define MOE_SORTING_MP_2(unroll_num_, expert_masking_)                                            \
-    [&]() {                                                                                       \
-        constexpr ck_tile::index_t unroll_num = unroll_num_;                                      \
-        constexpr bool expert_masking         = expert_masking_;                                  \
-        using ms_problem =                                                                        \
-            ck_tile::MoeSortingProblemMp<ms_index_t, ms_weight_type, unroll_num, expert_masking>; \
-        using kernel      = ck_tile::MoeSortingMultiPhaseKernel_P2<ms_problem>;                   \
-        auto kargs        = kernel::MakeKargs(a);                                                 \
-        const dim3 grids  = kernel::GridSize(a);                                                  \
-        const dim3 blocks = kernel::BlockSize(a);                                                 \
-        return ck_tile::make_kernel(kernel{}, grids, blocks, 0, kargs);                           \
-    }()
-
-#define MOE_SORTING_MP_3(unroll_num_, expert_masking_)                                            \
-    [&]() {                                                                                       \
-        constexpr ck_tile::index_t unroll_num = unroll_num_;                                      \
-        constexpr bool expert_masking         = expert_masking_;                                  \
-        using ms_problem =                                                                        \
-            ck_tile::MoeSortingProblemMp<ms_index_t, ms_weight_type, unroll_num, expert_masking>; \
-        using kernel      = ck_tile::MoeSortingMultiPhaseKernel_P3<ms_problem>;                   \
-        auto kargs        = kernel::MakeKargs(a);                                                 \
-        const dim3 grids  = kernel::GridSize(a);                                                  \
-        const dim3 blocks = kernel::BlockSize(a);                                                 \
-        return ck_tile::make_kernel(kernel{}, grids, blocks, 0, kargs);                           \
-    }()
-
-float moe_sorting_mp(ck_tile::MoeSortingHostArgs a, ck_tile::stream_config s)
-{
-        float ave_time = ck_tile::launch_kernel(s,
-                                                MOE_SORTING_MP_0(1, {{"true" if is_local_expert_masking else "false"}}),
-                                                MOE_SORTING_MP_1(1, {{"true" if is_local_expert_masking else "false"}}),
-                                                MOE_SORTING_MP_2(1, {{"true" if is_local_expert_masking else "false"}}),
-                                                MOE_SORTING_MP_3(1, {{"true" if is_local_expert_masking else "false"}}));
-        return ave_time;
-}
-
-
-void moe_sorting(ck_tile::MoeSortingHostArgs a, ck_tile::stream_config s)
-{
-
-    {% if not moe_sorting_is_oneshot %}
-    moe_sorting_mp(a, s);
-    {% else %}
-    auto sub_token_ = ck_tile::moe_sorting_get_sub_token(a.tokens, a.num_experts);
-    if(sub_token_ % 8 == 0)                                                                   
-    {                                                                                  
-        MOE_SORTING_DISPATCH(8, {{"true" if moe_sorting_is_oneshot else "false"}}, {{"true" if is_local_expert_masking else "false"}});             
-    }                                                                                   
-    else if(sub_token_ % 4 == 0)                                                              
-    {                                                                                   
-        MOE_SORTING_DISPATCH(4, {{"true" if moe_sorting_is_oneshot else "false"}}, {{"true" if is_local_expert_masking else "false"}});             
-    }                                                                                   
-    else if(sub_token_ % 2 == 0)                                                              
-    {                                                                                   
-        MOE_SORTING_DISPATCH(2, {{"true" if moe_sorting_is_oneshot else "false"}}, {{"true" if is_local_expert_masking else "false"}});             
-    }                                                                                   
-    else                                                                                
-    {                                                                                   
-        MOE_SORTING_DISPATCH(1, {{"true" if moe_sorting_is_oneshot else "false"}}, {{"true" if is_local_expert_masking else "false"}});             
-    }
-    {% endif %}
-}
 
 
 struct __attribute__((packed)) KernelArgs
@@ -348,7 +237,18 @@ void {{func_name}}(void* out,               // [num_tokens, dim]
                    void* expert_mask,
                    void* workspace,
                    void* stream){
-    moe_sorting({topk_ids, topk_weight, expert_mask, sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out, workspace, num_tokens, {{block_size}}, num_experts, topk, out_bytes}, {reinterpret_cast<hipStream_t>(stream)});
+    int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts);
+    if (workspace_size > 0 && workspace==nullptr)
+    {
+        hipMalloc(&workspace, workspace_size);
+    }
+    moe_sorting({
+                    "int32",                    // index_type
+                    "fp32",                       // weight_type; // currently always float
+                    expert_mask!=nullptr          // if mask experts as local expert
+                },
+                {topk_ids, topk_weight, expert_mask, sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out, workspace, num_tokens, {{block_size}}, num_experts, topk, out_bytes}, {reinterpret_cast<hipStream_t>(stream)});
+
     static FMoeKernel impl{};
 
     impl.launch_kernel<{{input_dtype}}, {{output_dtype}}, {{switch_gxy}}>(out,

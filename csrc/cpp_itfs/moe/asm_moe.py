@@ -176,7 +176,7 @@ def compile(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:str, se
     if not_built(func_name):
         kernel_name, co_name, input_dtype, output_dtype, switch_gxy = select_hsaco(input_dtype, gate_fusion, gate_dtype, activation, selected_tile, is_smooth_scale, a16, enable_vskip)
         bin_size, bin_data = transfer_hsaco(f"{AITER_CORE_DIR}/hsa/{co_name}")
-        return compile_template_op(src_template, MD_NAME, [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h", f"{AITER_CORE_DIR}/csrc/include", f"{CK_DIR}/include"], [], bin_size=bin_size, bin_data=bin_data, input_dtype=input_dtype, output_dtype=output_dtype, kernel_name=kernel_name, selected_tile=selected_tile, switch_gxy=switch_gxy, moe_sorting_is_oneshot=moe_sorting_is_oneshot, is_local_expert_masking=is_local_expert_masking, block_size=block_size, func_name=func_name)
+        return compile_template_op(src_template, MD_NAME, [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h", f"{AITER_CORE_DIR}/csrc/include", f"{CK_DIR}/include", f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.hpp"], [f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.cpp"], bin_size=bin_size, bin_data=bin_data, input_dtype=input_dtype, output_dtype=output_dtype, kernel_name=kernel_name, selected_tile=selected_tile, switch_gxy=switch_gxy, moe_sorting_is_oneshot=moe_sorting_is_oneshot, is_local_expert_masking=is_local_expert_masking, block_size=block_size, func_name=func_name)
     else:
         return run_lib(func_name)
 
