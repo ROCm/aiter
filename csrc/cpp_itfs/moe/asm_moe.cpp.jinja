@@ -322,7 +322,17 @@ void {{func_name}}(void* out,               // [num_tokens, dim]
                    void* expert_mask,
                    void* workspace,
                    const void* stream){
-    moe_sorting({topk_ids, topk_weight, expert_mask, sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out, workspace, num_tokens, {{block_size}}, num_experts, topk, out_bytes}, {reinterpret_cast<const hipStream_t>(stream)});
+    int workspace_size = moe_sorting_get_workspace_size(num_tokens, num_experts);
+    if (workspace_size > 0 && workspace==nullptr)
+    {
+        hipMalloc(&workspace, workspace_size);
+    }
+    moe_sorting({
+                    "int32",                    // index_type
+                    "fp32",                       // weight_type; // currently always float
+                    expert_mask!=nullptr          // if mask experts as local expert
+                },
+                {topk_ids, topk_weight, expert_mask, sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out, workspace, num_tokens, {{block_size}}, num_experts, topk, out_bytes}, {reinterpret_cast<hipStream_t>(stream)});
     static FMoeKernel impl{};
     {% if input_dtype=="uint32_t" or input_dtype=="int32_t" %}
     impl->set_int4(true);
