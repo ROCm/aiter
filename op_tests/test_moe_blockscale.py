@@ -218,7 +218,7 @@ def test_fmoe(dtype, token, model_dim, inter_dim, scale_blks, E, topk, quant='No
 
 
 for dtype in [torch.bfloat16]:
-    for m in [1, 2, 5, 16, 32]:
+    for m in [1, 2, 5, 16, 32, 163840]:
         for dim in [7168]:
             for idim in [256]:
                 scale_blks = (128, 128)
