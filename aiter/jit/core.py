@@ -224,14 +224,20 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         else:
             sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
-        bd_include_dir = f'{op_dir}/build/include'
-        os.makedirs(bd_include_dir, exist_ok=True)
+        # TODO: Move all torch api into torch folder
+        old_bd_include_dir = f'{op_dir}/build/include'
+        os.makedirs(old_bd_include_dir, exist_ok=True)
         rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include"] + extra_include,
+                         old_bd_include_dir)
+
+        bd_include_dir = f'{op_dir}/build/include/torch'
+        os.makedirs(bd_include_dir, exist_ok=True)
+        rename_cpp_to_cu([f"{AITER_CSRC_DIR}/include/torch"] + extra_include,
                          bd_include_dir)
         extra_include_paths = [
             f"{CK_DIR}/include",
             f"{CK_DIR}/library/include",
-            f"{bd_include_dir}",
+            f"{old_bd_include_dir}",
         ]
 
         module = cpp_extension.load(

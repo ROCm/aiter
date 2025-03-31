@@ -182,55 +182,55 @@
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), py::arg("kernelId") = 0,   \
             py::arg("splitK") = 0);
 
-#define MHA_BWD_ASM_PYBIND                            \
-      m.def("fmha_v3_bwd", &fmha_v3_bwd,              \
-            py::arg("dout"),                          \
-            py::arg("q"), py::arg("k"), py::arg("v"), \
-            py::arg("out"),                           \
-            py::arg("softmax_lse"),                   \
-            py::arg("dropout_p"),                     \
-            py::arg("softmax_scale"),                 \
-            py::arg("is_causal"),                     \
-            py::arg("window_size_left"),              \
-            py::arg("window_size_right"),             \
-            py::arg("deterministic"),                 \
-            py::arg("is_v3_atomic_fp32"),             \
-            py::arg("how_v3_bf16_cvt"),               \
-            py::arg("dq") = std::nullopt,             \
-            py::arg("dk") = std::nullopt,             \
-            py::arg("dv") = std::nullopt,             \
-            py::arg("alibi_slopes") = std::nullopt,   \
-            py::arg("rng_state") = std::nullopt,      \
+#define MHA_BWD_ASM_PYBIND                                  \
+      m.def("fmha_v3_bwd", &aiter::torch_itfs::fmha_v3_bwd, \
+            py::arg("dout"),                                \
+            py::arg("q"), py::arg("k"), py::arg("v"),       \
+            py::arg("out"),                                 \
+            py::arg("softmax_lse"),                         \
+            py::arg("dropout_p"),                           \
+            py::arg("softmax_scale"),                       \
+            py::arg("is_causal"),                           \
+            py::arg("window_size_left"),                    \
+            py::arg("window_size_right"),                   \
+            py::arg("deterministic"),                       \
+            py::arg("is_v3_atomic_fp32"),                   \
+            py::arg("how_v3_bf16_cvt"),                     \
+            py::arg("dq") = std::nullopt,                   \
+            py::arg("dk") = std::nullopt,                   \
+            py::arg("dv") = std::nullopt,                   \
+            py::arg("alibi_slopes") = std::nullopt,         \
+            py::arg("rng_state") = std::nullopt,            \
             py::arg("gen") = std::nullopt);
 
-#define MHA_VARLEN_BWD_ASM_PYBIND                     \
-      m.def("fmha_v3_varlen_bwd", &fmha_v3_varlen_bwd,\
-            py::arg("dout"),                          \
-            py::arg("q"), py::arg("k"), py::arg("v"), \
-            py::arg("out"),                           \
-            py::arg("softmax_lse"),                   \
-            py::arg("cu_seqlens_q"),                  \
-            py::arg("cu_seqlens_k"),                  \
-            py::arg("max_seqlen_q"),                  \
-            py::arg("max_seqlen_k"),                  \
-            py::arg("dropout_p"),                     \
-            py::arg("softmax_scale"),                 \
-            py::arg("zero_tensors"),                  \
-            py::arg("is_causal"),                     \
-            py::arg("window_size_left"),              \
-            py::arg("window_size_right"),             \
-            py::arg("deterministic"),                 \
-            py::arg("is_v3_atomic_fp32"),             \
-            py::arg("how_v3_bf16_cvt"),               \
-            py::arg("dq") = std::nullopt,             \
-            py::arg("dk") = std::nullopt,             \
-            py::arg("dv") = std::nullopt,             \
-            py::arg("alibi_slopes") = std::nullopt,   \
-            py::arg("rng_state") = std::nullopt,      \
+#define MHA_VARLEN_BWD_ASM_PYBIND                                   \
+      m.def("fmha_v3_varlen_bwd", &aiter::torch_itfs::fmha_v3_varlen_bwd,\
+            py::arg("dout"),                                        \
+            py::arg("q"), py::arg("k"), py::arg("v"),               \
+            py::arg("out"),                                         \
+            py::arg("softmax_lse"),                                 \
+            py::arg("cu_seqlens_q"),                                \
+            py::arg("cu_seqlens_k"),                                \
+            py::arg("max_seqlen_q"),                                \
+            py::arg("max_seqlen_k"),                                \
+            py::arg("dropout_p"),                                   \
+            py::arg("softmax_scale"),                               \
+            py::arg("zero_tensors"),                                \
+            py::arg("is_causal"),                                   \
+            py::arg("window_size_left"),                            \
+            py::arg("window_size_right"),                           \
+            py::arg("deterministic"),                               \
+            py::arg("is_v3_atomic_fp32"),                           \
+            py::arg("how_v3_bf16_cvt"),                             \
+            py::arg("dq") = std::nullopt,                           \
+            py::arg("dk") = std::nullopt,                           \
+            py::arg("dv") = std::nullopt,                           \
+            py::arg("alibi_slopes") = std::nullopt,                 \
+            py::arg("rng_state") = std::nullopt,                    \
             py::arg("gen") = std::nullopt);
 
 #define MHA_BWD_PYBIND                                \
-      m.def("mha_bwd", &mha_bwd,                      \
+      m.def("mha_bwd", &aiter::torch_itfs::mha_bwd,        \
             py::arg("dout"),                          \
             py::arg("q"), py::arg("k"), py::arg("v"), \
             py::arg("out"),                           \
@@ -251,7 +251,7 @@
             py::arg("gen") = std::nullopt);
 
 #define MHA_FWD_PYBIND                                \
-      m.def("mha_fwd", &mha_fwd,                      \
+      m.def("mha_fwd", &aiter::torch_itfs::mha_fwd,        \
             py::arg("q"), py::arg("k"), py::arg("v"), \
             py::arg("dropout_p"),                     \
             py::arg("softmax_scale"),                 \
@@ -265,48 +265,48 @@
             py::arg("alibi_slopes") = std::nullopt,   \
             py::arg("gen") = std::nullopt);
 
-#define MHA_VARLEN_BWD_PYBIND                         \
-      m.def("mha_varlen_bwd", &mha_varlen_bwd,        \
-            py::arg("dout"),                          \
-            py::arg("q"), py::arg("k"), py::arg("v"), \
-            py::arg("out"),                           \
-            py::arg("softmax_lse"),                   \
-            py::arg("cu_seqlens_q"),                  \
-            py::arg("cu_seqlens_k"),                  \
-            py::arg("max_seqlen_q"),                  \
-            py::arg("max_seqlen_k"),                  \
-            py::arg("dropout_p"),                     \
-            py::arg("softmax_scale"),                 \
-            py::arg("zero_tensors"),                  \
-            py::arg("is_causal"),                     \
-            py::arg("window_size_left"),              \
-            py::arg("window_size_right"),             \
-            py::arg("deterministic"),                 \
-            py::arg("dq") = std::nullopt,             \
-            py::arg("dk") = std::nullopt,             \
-            py::arg("dv") = std::nullopt,             \
-            py::arg("alibi_slopes") = std::nullopt,   \
-            py::arg("rng_state") = std::nullopt,      \
+#define MHA_VARLEN_BWD_PYBIND                                \
+      m.def("mha_varlen_bwd", &aiter::torch_itfs::mha_varlen_bwd, \
+            py::arg("dout"),                                 \
+            py::arg("q"), py::arg("k"), py::arg("v"),        \
+            py::arg("out"),                                  \
+            py::arg("softmax_lse"),                          \
+            py::arg("cu_seqlens_q"),                         \
+            py::arg("cu_seqlens_k"),                         \
+            py::arg("max_seqlen_q"),                         \
+            py::arg("max_seqlen_k"),                         \
+            py::arg("dropout_p"),                            \
+            py::arg("softmax_scale"),                        \
+            py::arg("zero_tensors"),                         \
+            py::arg("is_causal"),                            \
+            py::arg("window_size_left"),                     \
+            py::arg("window_size_right"),                    \
+            py::arg("deterministic"),                        \
+            py::arg("dq") = std::nullopt,                    \
+            py::arg("dk") = std::nullopt,                    \
+            py::arg("dv") = std::nullopt,                    \
+            py::arg("alibi_slopes") = std::nullopt,          \
+            py::arg("rng_state") = std::nullopt,             \
             py::arg("gen") = std::nullopt);
 
-#define MHA_VARLEN_FWD_PYBIND                         \
-      m.def("mha_varlen_fwd", &mha_varlen_fwd,        \
-            py::arg("q"), py::arg("k"), py::arg("v"), \
-            py::arg("cu_seqlens_q"),                  \
-            py::arg("cu_seqlens_k"),                  \
-            py::arg("max_seqlen_q"),                  \
-            py::arg("max_seqlen_k"),                  \
-            py::arg("dropout_p"),                     \
-            py::arg("softmax_scale"),                 \
-            py::arg("zero_tensors"),                  \
-            py::arg("is_causal"),                     \
-            py::arg("window_size_left"),              \
-            py::arg("window_size_right"),             \
-            py::arg("return_softmax_lse"),            \
-            py::arg("return_dropout_randval"),        \
-            py::arg("out") = std::nullopt,            \
-            py::arg("block_table") = std::nullopt,    \
-            py::arg("alibi_slopes") = std::nullopt,   \
+#define MHA_VARLEN_FWD_PYBIND                                \
+      m.def("mha_varlen_fwd", &aiter::torch_itfs::mha_varlen_fwd, \
+            py::arg("q"), py::arg("k"), py::arg("v"),        \
+            py::arg("cu_seqlens_q"),                         \
+            py::arg("cu_seqlens_k"),                         \
+            py::arg("max_seqlen_q"),                         \
+            py::arg("max_seqlen_k"),                         \
+            py::arg("dropout_p"),                            \
+            py::arg("softmax_scale"),                        \
+            py::arg("zero_tensors"),                         \
+            py::arg("is_causal"),                            \
+            py::arg("window_size_left"),                     \
+            py::arg("window_size_right"),                    \
+            py::arg("return_softmax_lse"),                   \
+            py::arg("return_dropout_randval"),               \
+            py::arg("out") = std::nullopt,                   \
+            py::arg("block_table") = std::nullopt,           \
+            py::arg("alibi_slopes") = std::nullopt,          \
             py::arg("gen") = std::nullopt);
 
 #define MOE_CK_2STAGES_PYBIND                   \

@@ -8,6 +8,8 @@
 
 #include "aiter_fmha_bwd.h"
 
+namespace aiter {
+namespace torch {
 fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           // sizes
                                           const int b,
@@ -424,3 +426,6 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
     return { dq, dk, dv, softmax_d };
 }
+
+} // namespace torch
+} // namespace aiter

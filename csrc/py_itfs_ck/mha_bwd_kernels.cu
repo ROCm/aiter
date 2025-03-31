@@ -8,6 +8,8 @@
 
 #include "aiter_fmha_bwd.h"
 
+namespace aiter {
+namespace torch_itfs {
 fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                                    // sizes
                                    const int b,
@@ -379,7 +381,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
-        
+
         auto args =
             get_ck_fmha_bwd_args(
                 mask,
@@ -441,3 +443,6 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
 
     return { dq, dk, dv, softmax_d };
 }
+
+} // namespace torch_itfs
+} // namespace aiter

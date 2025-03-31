@@ -28,10 +28,10 @@
 #include "rocsolgemm.cuh"
 #include "hipbsolgemm.cuh"
 
-// #include "mha_varlen_fwd.h"
-// #include "mha_varlen_bwd.h"
-// #include "mha_bwd.h"
-// #include "mha_fwd.h"
+// #include "torch/mha_varlen_fwd.h"
+// #include "torch/mha_varlen_bwd.h"
+// #include "torch/mha_bwd.h"
+// #include "torch/mha_fwd.h"
 #include "rocm_ops.hpp"
 
 #ifdef PREBUILD_KERNELS
