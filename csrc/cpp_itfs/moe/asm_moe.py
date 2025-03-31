@@ -1,5 +1,6 @@
 from jinja2 import Template
 from csrc.cpp_itfs.utils import compile_template_op, transfer_hsaco, AITER_CORE_DIR, get_default_func_name, not_built, run_lib, CK_DIR
+import ctypes
 
 MD_NAME = "asm_moe"
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/moe/asm_moe.cpp.jinja", "r") as f:
@@ -121,16 +122,19 @@ def select_hsaco(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:st
     raise ValueError("Unsupported condition")
 
 
-def compile(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:str, selected_tile:int, is_smooth_scale=False, a16=False, enable_vskip=False, block_size=32, func_name=None):
+def compile(input_dtype:str, gate_fusion:str, gate_dtype:str, activation:str, selected_tile:int, is_smooth_scale=False, a16=False, enable_vskip=False, block_size=32, func_name=None, folder=None):
     if func_name is None:
         func_name = get_default_func_name(MD_NAME, (input_dtype, gate_fusion, gate_dtype, activation, selected_tile, is_smooth_scale, a16, enable_vskip, block_size))
 
-    if not_built(func_name):
+    if folder is None:
+        folder = func_name
+
+    if not_built(folder):
         kernel_name, co_name, input_dtype, output_dtype, switch_gxy = select_hsaco(input_dtype, gate_fusion, gate_dtype, activation, selected_tile, is_smooth_scale, a16, enable_vskip)
         bin_size, bin_data = transfer_hsaco(f"{AITER_CORE_DIR}/hsa/{co_name}")
-        return compile_template_op(src_template, MD_NAME, [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h", f"{AITER_CORE_DIR}/csrc/include", f"{CK_DIR}/include", f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.hpp"], [f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.cpp"], bin_size=bin_size, bin_data=bin_data, input_dtype=input_dtype, output_dtype=output_dtype, kernel_name=kernel_name, selected_tile=selected_tile, switch_gxy=switch_gxy, block_size=block_size, func_name=func_name)
+        return compile_template_op(src_template, MD_NAME, [f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h", f"{AITER_CORE_DIR}/csrc/include", f"{CK_DIR}/include", f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.hpp"], [f"{CK_DIR}/example/ck_tile/13_moe_sorting/moe_sorting_api.cpp"], bin_size=bin_size, bin_data=bin_data, input_dtype=input_dtype, output_dtype=output_dtype, kernel_name=kernel_name, selected_tile=selected_tile, switch_gxy=switch_gxy, block_size=block_size, func_name=func_name, folder=folder)
     else:
-        return run_lib(func_name)
+        return run_lib(func_name, folder)
 
 
 def asm_moe(hidden_states, # [num_tokens, dim] M,K
@@ -224,8 +228,13 @@ def asm_moe(hidden_states, # [num_tokens, dim] M,K
     num_cu = torch.cuda.get_device_properties().multi_processor_count
     selected_tile = select_tile(input_dtype, gate_fusion, gate_dtype, inter_dim, max_num_m_blocks, num_cu, a16)
     func = compile(input_dtype, gate_fusion, gate_dtype, activation, selected_tile, bool(fc2_smooth_scale), a16, block_size=block_size)
-
-    if fc1_smooth_scale is None:
+    workspace_size_func = run_lib("moe_sorting_get_workspace_size", func.__name__)
+    workspace_size = ctypes.c_int(0)
+    workspace_size_func(*torch_to_c_types(num_tokens, global_E), ctypes.pointer(workspace_size))
+    workspace_size = workspace_size.value
+    if workspace_size > 0 and workspace is None:
+        workspace = torch.zeros(workspace_size, dtype=topk_ids.dtype, device=device)
+    if fc2_smooth_scale is None:
         func(*torch_to_c_types(output, hidden_states, w1, w2, topk_weight, topk_ids, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, num_tokens, dim, inter_dim, topk, global_E, max_num_m_blocks, output.nbytes, hidden_states.stride(0), expert_mask, workspace, torch.cuda.current_stream()))
     else:
         func(*torch_to_c_types(output, hidden_states, w1, w2, topk_weight, topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16, per_tensor_quant_scale, expert_mask, activation))

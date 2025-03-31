@@ -59,11 +59,13 @@ def asm_moe_test(hidden_states, w1, w2, topk_weight, topk_ids,
                  a16=False,
                  activation = ActivationType.Silu
                  ):
+    workspace = torch.zeros(65536, dtype=topk_ids.dtype, device="cuda")
+    # workspace = None
     return asm_moe(hidden_states,
                    w1,
                    w2,
                    topk_weight,
-                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16, None, None, activation)
+                   topk_ids, fc1_scale, fc2_scale, fc1_smooth_scale, fc2_smooth_scale, a16, None, None, activation, workspace=workspace)
 
 
 @perftest()

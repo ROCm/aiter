@@ -141,16 +141,17 @@ def get_default_func_name(md_name, args: tuple):
     signature = '_'.join([str(arg) for arg in args])
     return f"{md_name}_{hash_signature(signature)}"
 
-def not_built(func_name):
-    return not os.path.exists(f"{BUILD_DIR}/{func_name}/lib.so") or os.environ.get("AITER_FORCE_COMPILE", "0") == "1"
+def not_built(folder):
+    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so") or os.environ.get("AITER_FORCE_COMPILE", "0") == "1"
 
 
-def compile_template_op(src_template, md_name, includes=None, sources=None, cxxflags=None, func_name=None,**kwargs):
+def compile_template_op(src_template, md_name, includes=None, sources=None, cxxflags=None, func_name=None, folder=None, **kwargs):
     kwargs = OrderedDict(kwargs)
     if func_name is None:
         func_name = get_default_func_name(md_name, tuple(kwargs.values()))
-
-    if not_built(func_name):
+    if folder is None:
+        folder = func_name
+    if not_built(folder):
         if includes is None:
             includes = []
         if sources is None:
@@ -158,8 +159,8 @@ def compile_template_op(src_template, md_name, includes=None, sources=None, cxxf
         if cxxflags is None:
             cxxflags = []
         src_file = src_template.render(func_name=func_name, **kwargs)
-        compile_lib(src_file, func_name, includes, sources, cxxflags)
-    return run_lib(func_name)
+        compile_lib(src_file, folder, includes, sources, cxxflags)
+    return run_lib(func_name, folder)
 
 
 def transfer_hsaco(hsaco_path):
