@@ -168,3 +168,6 @@ def transfer_hsaco(hsaco_path):
         hsaco = f.read()
     hsaco_hex = binascii.hexlify(hsaco).decode('utf-8')
     return len(hsaco_hex), ", ".join([f"0x{x}{y}" for x, y in zip(hsaco_hex[::2], hsaco_hex[1::2])])
+
+def str_to_bool(s):
+    return True if s.lower() == "true" else False

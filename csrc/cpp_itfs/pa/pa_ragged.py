@@ -1,5 +1,5 @@
 from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
+from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import ctypes
 import math
 
@@ -10,7 +10,7 @@ with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
 
-def compile(gqa_ratio: int, head_size: int, npar_loops: int, dtype: str, kv_dtype: str, fp8_kv_dtype: str, out_dtype: str, block_size: int, alibi_enabled: str, func_name: str = None):
+def compile(gqa_ratio: int, head_size: int, npar_loops: int, dtype: str, kv_dtype: str, fp8_kv_dtype: str, out_dtype: str, block_size: int, alibi_enabled: bool = False, func_name: str = None):
     return compile_template_op(src_template, MD_NAME, ["../utils.h", "pa.cuh", "../../include"], [], gqa_ratio=gqa_ratio, head_size=head_size, npar_loops=npar_loops, dtype=dtype, kv_dtype=kv_dtype, fp8_kv_dtype=fp8_kv_dtype, out_dtype=out_dtype, block_size=block_size, alibi_enabled=alibi_enabled, func_name=func_name)
 
 
@@ -72,7 +72,7 @@ def paged_attention_ragged(out,         # [num_seqs, num_heads, head_size]
     kv_seq_stride   = key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     gqa_ratio = int(num_heads / num_kv_heads)
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
-    func = compile(gqa_ratio, head_size, npar_loops, dtype, kv_dtype, kv_cache_dtype, out_dtype, block_size, "true" if alibi_slopes else "false")
+    func = compile(gqa_ratio, head_size, npar_loops, dtype, kv_dtype, kv_cache_dtype, out_dtype, block_size, bool(alibi_slopes))
 
     alibi_slopes_ptr = ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float)) if alibi_slopes else ctypes.POINTER(ctypes.c_int)()
     kv_indptr_ptr = ctypes.cast(kv_indptr.data_ptr(), ctypes.POINTER(ctypes.c_int))
@@ -99,7 +99,7 @@ if __name__ == "__main__":
     parser.add_argument("--fp8_kv_dtype", type=str, required=True)
     parser.add_argument("--out_dtype", type=str, required=True)
     parser.add_argument("--block_size", type=int, required=True)
-    parser.add_argument("--alibi_enabled", type=str, required=True)
+    parser.add_argument("--alibi_enabled", type=str_to_bool, required=True)
     parser.add_argument("--func_name", type=str, default=None)
     args = parser.parse_args()
     compile(**vars(args))
