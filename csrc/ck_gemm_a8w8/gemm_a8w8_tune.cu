@@ -26,7 +26,7 @@ static constexpr int nextPow2(unsigned int num)
   return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
 }
 
-template <typename DDataType, typename EDataType = DDataType>
+template <typename ABDataType, typename DDataType, typename EDataType=DDataType>
 RowwiseKernel rowwise_dispatch(int id)
 {
   // For a given shape, either find the best kernel via lookup or heuristic.
@@ -36,13 +36,8 @@ RowwiseKernel rowwise_dispatch(int id)
   // First check if this shape is available in the direct lookup.
   static const auto lookup = []
   {
-    if constexpr (std::is_same_v<EDataType, F16>) {
-        return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,F16)};
-    } else if constexpr (std::is_same_v<EDataType, B16>) {
-        return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,B16)};
-    } else {
-        static_assert(false, "rowwise_dispatch used with unsupported dtype!");
-    } }();
+    return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType)};
+  }();
 
   TORCH_CHECK(id < lookup.size(),
               "Kernel id " + std::to_string(id)  +" is out of range!");
@@ -92,7 +87,7 @@ torch::Tensor gemm_a8w8_tune(
   // else 
   if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    rowwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+    rowwise_dispatch<I8, B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
   }
   else
   {

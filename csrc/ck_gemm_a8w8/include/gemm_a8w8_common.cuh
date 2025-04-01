@@ -36,6 +36,7 @@ template <ck::index_t... Is>
 using S = ck::Sequence<Is...>;
 
 using I8 = int8_t;
+using F8 = ck::f8_t;
 using I32 = int;
 using F16 = ck::half_t;
 using B16 = ck::bhalf_t;
@@ -45,11 +46,11 @@ using F32 = float;
 using Row = ck::tensor_layout::gemm::RowMajor;
 using Col = ck::tensor_layout::gemm::ColumnMajor;
 
-using ADataType = I8;
-using BDataType = I8;
-using AccDataType = I32;
-using CShuffleDataType = I32;
-using ComputeDataType = I8;
+// using ADataType = I8;
+// using BDataType = I8;
+// using AccDataType = I32;
+// using CShuffleDataType = F32;
+// using ComputeDataType = I8;
 
 using ALayout = Row;
 using BLayout = Col;
@@ -65,6 +66,7 @@ using PassThrough = ck::tensor_operation::element_wise::PassThrough;
 using AElementOp = PassThrough;
 using BElementOp = PassThrough;
 
+template <typename AccDataType, typename DDataType, typename EDataType>
 struct RowwiseScale
 {
     template <typename E, typename C, typename D0, typename D1>
@@ -72,46 +74,17 @@ struct RowwiseScale
     operator()(E &e, const C &c, const D0 &d0, const D1 &d1) const;
 
     template <>
-    __host__ __device__ constexpr void operator()<F16, AccDataType, F16, F16>(
-        F16 &e, const AccDataType &c, const F16 &d0, const F16 &d1) const
+    __host__ __device__ constexpr void operator()<EDataType, AccDataType, DDataType, DDataType>(
+        EDataType &e, const AccDataType &c, const DDataType &d0, const DDataType &d1) const
     {
         const F32 x0_f =
             ck::type_convert<F32>(c) * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1);
 
-        e = ck::type_convert<F16>(x0_f);
-    }
-
-    template <>
-    __host__ __device__ constexpr void operator()<B16, AccDataType, B16, B16>(
-        B16 &e, const AccDataType &c, const B16 &d0, const B16 &d1) const
-    {
-        const F32 x0_f =
-            ck::type_convert<F32>(c) * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1);
-
-        e = ck::type_convert<B16>(x0_f);
-    }
-
-    template <>
-    __host__ __device__ constexpr void operator()<F16, AccDataType, F32, F32>(
-        F16 &e, const AccDataType &c, const F32 &d0, const F32 &d1) const
-    {
-        const F32 x0_f =
-            ck::type_convert<F32>(c) * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1);
-
-        e = ck::type_convert<F16>(x0_f);
-    }
-
-    template <>
-    __host__ __device__ constexpr void operator()<B16, AccDataType, F32, F32>(
-        B16 &e, const AccDataType &c, const F32 &d0, const F32 &d1) const
-    {
-        const F32 x0_f =
-            ck::type_convert<F32>(c) * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1);
-
-        e = ck::type_convert<B16>(x0_f);
+        e = ck::type_convert<EDataType>(x0_f);
     }
 };
 
+template <typename AccDataType, typename DDataType, typename EDataType>
 struct MultiplyMultiplyAdd
 {
     template <typename E, typename C, typename D0, typename D1, typename D2>
@@ -119,48 +92,18 @@ struct MultiplyMultiplyAdd
     operator()(E &e, const C &c, const D0 &d0, const D1 &d1, const D2 &d2) const;
 
     template <>
-    __host__ __device__ constexpr void operator()<ck::half_t, int, float, float, ck::half_t>(
-        ck::half_t &e, const int &c, const float &d0, const float &d1, const ck::half_t &d2) const
+    __host__ __device__ constexpr void operator()<EDataType, AccDataType, DDataType, DDataType, EDataType>(
+        EDataType &e, const AccDataType &c, const DDataType &d0, const DDataType &d1, const EDataType &d2) const
     {
         const float x0_f =
             ck::type_convert<float>(c) * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1) + ck::type_convert<F32>(d2);
 
-        e = ck::type_convert<ck::half_t>(x0_f);
-    }
-
-    template <>
-    __host__ __device__ constexpr void operator()<ck::bhalf_t, int, float, float, ck::bhalf_t>(
-        ck::bhalf_t &e, const int &c, const float &d0, const float &d1, const ck::bhalf_t &d2) const
-    {
-        const float x0_f =
-            ck::type_convert<float>(c) * ck::type_convert<F32>(d0) * ck::type_convert<F32>(d1) + ck::type_convert<F32>(d2);
-
-        e = ck::type_convert<ck::bhalf_t>(x0_f);
-    }
-
-    template <>
-    __host__ __device__ constexpr void operator()<ck::half_t, int, ck::half_t, ck::half_t, ck::half_t>(
-        ck::half_t &e, const int &c, const ck::half_t &d0, const ck::half_t &d1, const ck::half_t &d2) const
-    {
-        const float x0_f =
-            ck::type_convert<float>(c) * ck::type_convert<float>(d0) * ck::type_convert<float>(d1) + ck::type_convert<F32>(d2);
-
-        e = ck::type_convert<ck::half_t>(x0_f);
-    }
-
-    template <>
-    __host__ __device__ constexpr void operator()<ck::bhalf_t, int, ck::bhalf_t, ck::bhalf_t, ck::bhalf_t>(
-        ck::bhalf_t &e, const int &c, const ck::bhalf_t &d0, const ck::bhalf_t &d1, const ck::bhalf_t &d2) const
-    {
-        const float x0_f =
-            ck::type_convert<float>(c) * ck::type_convert<float>(d0) * ck::type_convert<float>(d1) + ck::type_convert<F32>(d2);
-
-        e = ck::type_convert<ck::bhalf_t>(x0_f);
+        e = ck::type_convert<EDataType>(x0_f);
     }
 };
 
-using CDEElementOp = RowwiseScale;
-using CDEElementOp2 = MultiplyMultiplyAdd;
+// using CDEElementOp = RowwiseScale;
+// using CDEElementOp2 = MultiplyMultiplyAdd;
 
 template <typename DDataType>
 using DsDataType = ck::Tuple<DDataType, DDataType>;
@@ -184,7 +127,11 @@ using DeviceOpInstance = ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShu
 #endif
 
 template <
-    typename DDataType, typename EDataType,
+    typename ABDataType,
+    typename AccDataType,
+    typename DDataType, 
+    typename EDataType,
+    typename CDEElementOp,
     int BLOCK_SIZE,
     int MBLOCK,
     int NBLOCK,
@@ -207,28 +154,28 @@ using DeviceGemmHelper =
     ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShuffle_V3<
         ALayout,
         BLayout,
-        DsLayout,
+        std::conditional_t<ck::is_same_v<CDEElementOp, RowwiseScale<AccDataType, DDataType, EDataType>>, DsLayout, DsLayout2>,
         ELayout,
-        ADataType,
-        BDataType,
-        DsDataType<DDataType>,
+        ABDataType,
+        ABDataType,
+        std::conditional_t<ck::is_same_v<CDEElementOp, RowwiseScale<AccDataType, DDataType, EDataType>>, DsDataType<DDataType>, DsDataType2<DDataType, EDataType>>,
         EDataType,
         AccDataType,
-        CShuffleDataType,
+        AccDataType,
         AElementOp,
         BElementOp,
         CDEElementOp,
         GEMM_SPEC,
-        BLOCK_SIZE,                      // Block Size
-        MBLOCK,                          // M per Block
-        NBLOCK,                          // N per Block
-        KBLOCK,                          // K per Block
+        BLOCK_SIZE,                       // Block Size
+        MBLOCK,                           // M per Block
+        NBLOCK,                           // N per Block
+        KBLOCK,                           // K per Block
         KBLOCK / ABLOCK_TRANSFER{}.At(0), // AK1
-        16,                              // BK1
-        WAVE_TILE_M,                     // M per Xdl
-        WAVE_TILE_N,                     // N per Xdl
-        WAVE_MAP_M,                      // Mxdl per Wave
-        WAVE_MAP_N,                      // Nxdl per Wave
+        16,                               // BK1
+        WAVE_TILE_M,                      // M per Xdl
+        WAVE_TILE_N,                      // N per Xdl
+        WAVE_MAP_M,                       // Mxdl per Wave
+        WAVE_MAP_N,                       // Nxdl per Wave
         ABLOCK_TRANSFER,
         S<1, 0, 2>,
         S<1, 0, 2>,
@@ -249,77 +196,10 @@ using DeviceGemmHelper =
         CBLOCK_SPV,
         LOOP_SCHED,
         PIPELINE_VERSION,
-        ComputeDataType>;
+        ABDataType>;
 
-template <
-    typename DDataType, typename EDataType,
-    int BLOCK_SIZE,
-    int MBLOCK,
-    int NBLOCK,
-    int KBLOCK,
-    int WAVE_TILE_M,
-    int WAVE_TILE_N,
-    int WAVE_MAP_M,
-    int WAVE_MAP_N,
-    typename ABLOCK_TRANSFER,
-    typename BBLOCK_TRANSFER,
-    typename CBLOCK_TRANSFER,
-    typename CBLOCK_SPV,
-    int CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
-    int CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
-    ck::BlockGemmPipelineScheduler LOOP_SCHED,
-    ck::BlockGemmPipelineVersion PIPELINE_VERSION,
-    auto GEMM_SPEC =
-        ck::tensor_operation::device::GemmSpecialization::MNPadding>
-using DeviceGemmHelperMMA =
-    ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShuffle_V3<
-        ALayout,
-        BLayout,
-        DsLayout2,
-        ELayout,
-        ADataType,
-        BDataType,
-        DsDataType2<DDataType, EDataType>,
-        EDataType,
-        AccDataType,
-        CShuffleDataType,
-        AElementOp,
-        BElementOp,
-        CDEElementOp2,
-        GEMM_SPEC,
-        BLOCK_SIZE,                      // Block Size
-        MBLOCK,                          // M per Block
-        NBLOCK,                          // N per Block
-        KBLOCK,                          // K per Block
-        KBLOCK / ABLOCK_TRANSFER{}.At(0), // AK1
-        16,                              // BK1
-        WAVE_TILE_M,                     // M per Xdl
-        WAVE_TILE_N,                     // N per Xdl
-        WAVE_MAP_M,                      // Mxdl per Wave
-        WAVE_MAP_N,                      // Nxdl per Wave
-        ABLOCK_TRANSFER,
-        S<1, 0, 2>,
-        S<1, 0, 2>,
-        2,
-        KBLOCK / ABLOCK_TRANSFER{}.At(0),
-        KBLOCK / ABLOCK_TRANSFER{}.At(0),
-        0,
-        BBLOCK_TRANSFER,
-        S<1, 0, 2>,
-        S<1, 0, 2>,
-        2,
-        16,
-        16,
-        0,
-        CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
-        CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
-        CBLOCK_TRANSFER,
-        CBLOCK_SPV,
-        LOOP_SCHED,
-        PIPELINE_VERSION,
-        ComputeDataType>;
 
-template <typename DDataType, typename EDataType,
+template <typename ABDataType, typename DDataType, typename EDataType, bool has_bias,
           typename DeviceGemmInstance>
 __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
     torch::Tensor &XQ,
@@ -344,85 +224,58 @@ __forceinline__ torch::Tensor gemm_a8w8_rowwise_impl(
 
     auto a_element_op = AElementOp{};
     auto b_element_op = BElementOp{};
-    auto cde_element_op = CDEElementOp{};
+    using AccDataType = std::conditional_t<ck::is_same_v<ABDataType, I8>, I32, F32>;
+    if constexpr(has_bias)
+    {
+        auto cde_element_op = MultiplyMultiplyAdd<AccDataType, DDataType, EDataType>{};
 
-    constexpr ck::index_t NumDTensor = DeviceGemmInstance::NumDTensor;
+        auto argument = device_gemm.MakeArgument(
+            reinterpret_cast<ABDataType *>(XQ.data_ptr()),
+            reinterpret_cast<ABDataType *>(WQ.data_ptr()),
+            std::array<const void *, 3>{reinterpret_cast<DDataType *>(w_scale.data_ptr()),
+                                            reinterpret_cast<DDataType *>(x_scale.data_ptr()),
+                                            reinterpret_cast<EDataType *>(bias.value().data_ptr())},
+            reinterpret_cast<EDataType *>(Y.data_ptr()),
+            M,
+            N,
+            K,
+            StrideA,
+            StrideB,
+            std::array<ck::index_t, 3>{0, 0, 0},
+            StrideE,
+            KBatch,
+            a_element_op,
+            b_element_op,
+            cde_element_op);
+        TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-    auto argument = device_gemm.MakeArgument(
-        reinterpret_cast<ADataType *>(XQ.data_ptr()),
-        reinterpret_cast<BDataType *>(WQ.data_ptr()),
-        std::array<const void *, NumDTensor>{
-            reinterpret_cast<DDataType *>(w_scale.data_ptr()),
-            reinterpret_cast<DDataType *>(x_scale.data_ptr())},
-        reinterpret_cast<EDataType *>(Y.data_ptr()),
-        M,
-        N,
-        K,
-        StrideA,
-        StrideB,
-        std::array<ck::index_t, NumDTensor>{0, 0},
-        StrideE,
-        KBatch,
-        a_element_op,
-        b_element_op,
-        cde_element_op);
-    TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
+        invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()});
+    }
+    else
+    {
+        auto cde_element_op = RowwiseScale<AccDataType, DDataType, EDataType>{};
 
-    invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
-    return Y;
-}
+        auto argument = device_gemm.MakeArgument(
+            reinterpret_cast<ABDataType *>(XQ.data_ptr()),
+            reinterpret_cast<ABDataType *>(WQ.data_ptr()),
+            std::array<const void *, 2>{reinterpret_cast<DDataType *>(w_scale.data_ptr()),
+                                            reinterpret_cast<DDataType *>(x_scale.data_ptr())},
+            reinterpret_cast<EDataType *>(Y.data_ptr()),
+            M,
+            N,
+            K,
+            StrideA,
+            StrideB,
+            std::array<ck::index_t, 2>{0, 0},
+            StrideE,
+            KBatch,
+            a_element_op,
+            b_element_op,
+            cde_element_op);
+        TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
-template <typename DDataType, typename EDataType,
-          typename DeviceGemmInstance>
-__forceinline__ torch::Tensor gemm_a8w8_mma_impl(
-    torch::Tensor &XQ,
-    torch::Tensor &WQ,
-    torch::Tensor &x_scale,
-    torch::Tensor &w_scale,
-    torch::Tensor &Y,
-    std::optional<torch::Tensor> bias,
-    int KBatch)
-{
-    int M = XQ.size(0);
-    int N = WQ.size(0);
-    int K = XQ.size(1);
-
-    int StrideA = K;
-    int StrideB = K;
-    int StrideE = N;
-
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
-    auto device_gemm = DeviceGemmInstance{};
-    auto invoker = device_gemm.MakeInvoker();
-
-    auto a_element_op = AElementOp{};
-    auto b_element_op = BElementOp{};
-    auto cde_element_op2 = CDEElementOp2{};
-
-    constexpr ck::index_t NumDTensor = DeviceGemmInstance::NumDTensor;
-
-    auto argument = device_gemm.MakeArgument(
-        reinterpret_cast<ADataType *>(XQ.data_ptr()),
-        reinterpret_cast<BDataType *>(WQ.data_ptr()),
-        std::array<const void *, NumDTensor>{
-            reinterpret_cast<DDataType *>(w_scale.data_ptr()),
-            reinterpret_cast<DDataType *>(x_scale.data_ptr()),
-            reinterpret_cast<EDataType *>(bias.value().data_ptr())},
-        reinterpret_cast<EDataType *>(Y.data_ptr()),
-        M,
-        N,
-        K,
-        StrideA,
-        StrideB,
-        std::array<ck::index_t, NumDTensor>{0, 0, 0},
-        StrideE,
-        KBatch,
-        a_element_op,
-        b_element_op,
-        cde_element_op2);
-    TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
-
-    invoker.Run(argument, StreamConfig{at::cuda::getCurrentCUDAStream().stream()});
+        invoker.Run(argument, StreamConfig{at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()});
+    }
     return Y;
 }
 

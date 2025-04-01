@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
 import aiter
-from aiter.ops.triton import decode_mla
+from op_tests.triton.utils import mla_decode_ref
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.test_mha_common import attention_ref
 from einops import rearrange
@@ -40,7 +40,7 @@ def test_mla(
         (out_ref, *_), us_ref = run_perftest(
             attention_ref, q, k, v, causal=True, num_warmup=1, num_iters=2
         )
-        (out_aiter, *_), us_aiter = run_perftest(
+        out_aiter, us_aiter = run_perftest(
             aiter.flash_attn_func, q, k, v, causal=True
         )
         flop = (
@@ -84,7 +84,7 @@ def test_mla(
         dtype=torch.float32,
     )
     _, us_ref = run_perftest(
-        decode_mla.decode_attention_fwd,
+        mla_decode_ref.decode_attention_fwd,
         q,
         kv_buffer,
         kv_buffer[..., :kv_lora_rank],

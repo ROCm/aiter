@@ -9,6 +9,8 @@
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
 
+namespace aiter {
+namespace torch_itfs {
 fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                                        std::string dtype,
                                        int head_size_q,
@@ -352,3 +354,6 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
     }
     return {out, softmax_lse, p, rng_state};
 }
+
+} // namespace torch_itfs
+} // namespace aiter

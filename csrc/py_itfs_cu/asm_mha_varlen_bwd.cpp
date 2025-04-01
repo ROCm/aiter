@@ -89,11 +89,12 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(0);
     ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
+    // TODO: layout of this?
     // dq_acc: (split, total_q, nheads, hdim_v)
     ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
     ck_tile::index_t batch_stride_dq_acc = 0;
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(2);
+    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(1);
+    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -148,11 +149,11 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          stride_dq,
                          stride_dk,
                          stride_dv,
-                         0, // stride_dbias
+                         0, // stride_dbias, FA without bias
                          nhead_stride_q,
                          nhead_stride_k,
                          nhead_stride_v,
-                         0, // nhead_stride_bias
+                         0, // nhead_stride_bias, FA without bias
                          nhead_stride_o,
                          0, // nhead_stride_randval
                          nhead_stride_do,
@@ -161,11 +162,11 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          nhead_stride_dq,
                          nhead_stride_dk,
                          nhead_stride_dv,
-                         0, // nhead_stride_dbias
+                         0, // nhead_stride_dbias, FA without dbias
                          batch_stride_q,
                          batch_stride_k,
                          batch_stride_v,
-                         0  , // batch_stride_bias
+                         0  , // batch_stride_bias, FA without bias
                          batch_stride_o,
                          0, // batch_stride_randval
                          batch_stride_do,
@@ -185,29 +186,31 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
 }
 
 std::vector<at::Tensor>
-mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
-               const at::Tensor &q,            // [total_q, hq, d_q]
-               const at::Tensor &k,            // [total_k, hk, d_q]
-               const at::Tensor &v,            // [total_k, hk, d_v]
-               const at::Tensor &out,          // [total_q, hq, d_v]
-               const at::Tensor &softmax_lse,  // [b, hq, sq]
-               const at::Tensor &cu_seqlens_q, // [b+1]
-               const at::Tensor &cu_seqlens_k, // [b+1]
-               const int max_seqlen_q,
-               const int max_seqlen_k,
-               const float p_dropout,
-               const float softmax_scale,
-               const bool zero_tensors,
-               const bool is_causal,
-               int window_size_left,
-               int window_size_right,
-               const bool deterministic,
-               std::optional<at::Tensor> dq_,                 // [total_q, hq, d_q]
-               std::optional<at::Tensor> dk_,                 // [total_k, hk, d_q]
-               std::optional<at::Tensor> dv_,                 // [total_k, hk, d_v]
-               std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-               std::optional<const at::Tensor> rng_state_,
-               std::optional<at::Generator> gen_)
+fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
+                   const at::Tensor &q,            // [total_q, hq, d_q]
+                   const at::Tensor &k,            // [total_k, hk, d_q]
+                   const at::Tensor &v,            // [total_k, hk, d_v]
+                   const at::Tensor &out,          // [total_q, hq, d_v]
+                   const at::Tensor &softmax_lse,  // [b, hq, sq]
+                   const at::Tensor &cu_seqlens_q, // [b+1]
+                   const at::Tensor &cu_seqlens_k, // [b+1]
+                   const int max_seqlen_q,
+                   const int max_seqlen_k,
+                   const float p_dropout,
+                   const float softmax_scale,
+                   const bool zero_tensors,
+                   const bool is_causal,
+                   int window_size_left,
+                   int window_size_right,
+                   const bool deterministic,
+                   bool is_v3_atomic_fp32,
+                   int how_v3_bf16_cvt,
+                   std::optional<at::Tensor> dq_,                 // [total_q, hq, d_q]
+                   std::optional<at::Tensor> dk_,                 // [total_k, hk, d_q]
+                   std::optional<at::Tensor> dv_,                 // [total_k, hk, d_v]
+                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+                   std::optional<const at::Tensor> rng_state_,
+                   std::optional<at::Generator> gen_)
 {
     if (is_causal) { window_size_right = 0; }
 
@@ -318,11 +321,11 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
     at::Tensor dq_accum;
 
     if (!deterministic) {
-        dq_accum = torch::zeros({1, total_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({1, num_heads, total_q, head_size_v}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size_q <= 128 ? 128 : 64;
         const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size_v}, opts.dtype(at::kFloat));
+        dq_accum = torch::zeros({nsplits, num_heads, total_q, head_size_v}, opts.dtype(at::kFloat));
     }
 
     at::Tensor dk_expanded, dv_expanded;
@@ -400,14 +403,14 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                  stream_config,
                                  mask,
                                  q_dtype_str,
-                                 true,  //is_group_mode
+                                 true,  // is_group_mode
                                  bias_type,
                                  deterministic,
-                                 false,  // has_dbias
-                                 false,  // use_ext_asm
-                                 false,  // is_v3_atomic_fp32
-                                 0);     // how_v3_bf16_cvt
-        TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
+                                 false, // has_dbias
+                                 true,  // use_ext_asm
+                                 is_v3_atomic_fp32,
+                                 how_v3_bf16_cvt);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
         dk_expanded.zero_();

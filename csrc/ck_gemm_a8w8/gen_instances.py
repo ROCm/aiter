@@ -25,7 +25,7 @@ class gemm_a8w8_fwd_codegen:
 
 #include "gemm_a8w8_common.cuh"
 
-template <typename DDataType, typename EDataType = DDataType>
+template <typename ABDataType, typename DDataType, typename EDataType = DDataType>
 torch::Tensor
 {k.name}(
     torch::Tensor &XQ,
@@ -43,6 +43,7 @@ torch::Tensor
     int N = WQ.size(0);
     int K = WQ.size(1);
     bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK} * KBatch) != 0);
+    using AccDataType = std::conditional_t<ck::is_same_v<ABDataType, I8>, I32, F32>;
     if (pad)
     {{{{
         // pad
@@ -60,8 +61,11 @@ torch::Tensor
 """     
         INSTANCE_CONTENT_bias = f"""if (bias != std::nullopt)
         {{{{
-            using DeviceGemmInstance = DeviceGemmHelperMMA<
+            using DeviceGemmInstance = DeviceGemmHelper<
+                ABDataType,
+                AccDataType,
                 DDataType, EDataType,
+                MultiplyMultiplyAdd<AccDataType, DDataType, EDataType>,
                 {k.BLOCK_SIZE},
                 {k.MPerBLOCK},
                 {k.NPerBLOCK},
@@ -80,12 +84,15 @@ torch::Tensor
                 ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
                 ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
             // Run kernel instance.
-            return gemm_a8w8_mma_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+            return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, true, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
         }}}}
         else
         {{{{
-           using DeviceGemmInstance = DeviceGemmHelper<
+            using DeviceGemmInstance = DeviceGemmHelper<
+                ABDataType,
+                AccDataType,
                 DDataType, EDataType,
+                RowwiseScale<AccDataType, DDataType, EDataType>,
                 {k.BLOCK_SIZE},
                 {k.MPerBLOCK},
                 {k.NPerBLOCK},
@@ -104,11 +111,14 @@ torch::Tensor
                 ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
                 ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
             // Run kernel instance.
-            return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+            return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
         }}}}
 """ 
         INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelper<
+            ABDataType,
+            AccDataType,
             DDataType, EDataType,
+            RowwiseScale<AccDataType, DDataType, EDataType>,
             {k.BLOCK_SIZE},
             {k.MPerBLOCK},
             {k.NPerBLOCK},
@@ -127,7 +137,7 @@ torch::Tensor
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a8w8_rowwise_impl<DDataType, EDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
+        return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
 """ 
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
@@ -155,27 +165,18 @@ template torch::Tensor
     int KBatch);
 
 """
-        INSTANCE_dBF16_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="B16")
-        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(
-            name=k.name, dtypes="F32, B16")
-        INSTANCE_dFP16_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="F16")
-        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(
-            name=k.name, dtypes="F32, F16")
-
         if self.istune:
-            Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
-                INSTANCE_dBF16_eBF16)
+            INSTANCE_abI8_dBF16_eBF16 = INSTANCE_template.format(
+                name=k.name, dtypes="I8, B16")
+            Path(os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")).write_text(
+                INSTANCE_abI8_dBF16_eBF16)
         else:
-            Path(os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")).write_text(
-                INSTANCE_dBF16_eBF16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")).write_text(
-                INSTANCE_dFP32_eBF16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP16_eFP16.cpp")).write_text(
-                INSTANCE_dFP16_eFP16)
-            Path(os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")).write_text(
-                INSTANCE_dFP32_eFP16)
+            for EDtype in ['B16', 'F16']:
+                for ABDtype in ['I8', 'F8']:
+                    for DDtype in ['F32', EDtype]:
+                        intsance = INSTANCE_template.format(
+                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}")
+                        Path(os.path.join(self.instances_path, f"{k.name}_ab{ABDtype}_d{DDtype}_e{EDtype}.cpp")).write_text(intsance)
 
     def gen_lookup_dict(self, kernels_dict):
         LOOKUP_head = """#pragma once
@@ -184,12 +185,12 @@ template torch::Tensor
 
 #ifdef USE_ROCM
 
-#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+#define GENERATE_LOOKUP_TABLE(ABTYPE, DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
         LOOKUP_template = """
        {{{MNK},                                                                                                       \\
-        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+        {kernel_name}<ABTYPE, DTYPE, ETYPE>}},                       \\"""
 
         LOOKUP_end = """
    }
@@ -219,7 +220,7 @@ template torch::Tensor
 #include <torch/extension.h>
 """
         MAINFEST_template = """
-template <typename DDataType, typename EDataType>
+template <typename ABDataType, typename DDataType, typename EDataType>
 torch::Tensor
 {kernel_name}(
     torch::Tensor &XQ,
