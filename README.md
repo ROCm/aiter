@@ -29,8 +29,18 @@ python3 setup.py develop
 ## Run operators supported by aiter
 
 There are number of op test, you can run them with: `python3 op_tests/test_layernorm2d.py`
-|  **Ops**   | **Description**                                                                             |
-|------------|---------------------------------------------------------------------------------------------|
-|GEMM        | D=AxB+C                                                                                     |
-|FusedMoE    | bf16 balabala                                                                               |
-|WIP         | coming soon...                                                                              |
+|  **Ops**                      | **Description**                                                                                                                                                   |
+|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|ELEMENT WISE                   | ops: + - * /                                                                                                                                                      |
+|SIGMOID                        | (x) = 1 / (1 + e^-x)                                                                                                                                              |
+|AllREDUCE                      | Reduce + Broadcast                                                                                                                                                |
+|KVCACHE                        | W_K W_V                                                                                                                                                           |
+|MHA                            | Multi-Head Attention                                                                                                                                              |
+|MLA                            | Multi-head Latent Attention with [KV-Cache layout](https://docs.flashinfer.ai/tutorials/kv_layout.html#page-table-layout )                                        |
+|PA                             | Paged Attention                                                                                                                                                   |
+|FusedMoe                       | Mixture of Experts                                                                                                                                                |
+|QUANT                          | BF16/FP16 -> FP8/INT4                                                                                                                                             |
+|RMSNORM                        | root mean square                                                                                                                                                  |
+|LAYERNORM                      | x = (x - u) / (σ2 + ϵ) e*0.5                                                                                                                                      |
+|ROPE                           | Rotary Position Embedding                                                                                                                                         |
+|GEMM                           | D=αAB+βC                                                                                                                                                          |
