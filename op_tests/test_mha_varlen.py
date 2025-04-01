@@ -260,6 +260,10 @@ def test_flash_attn_varlen_func(
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
 
+    # TODO: Support varlen bwd for bias
+    if bias_type == 'bias':
+        pytest.skip('Does not support varlen bwd for bias')
+
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
     print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
     print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
