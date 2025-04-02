@@ -306,6 +306,7 @@
             py::arg("return_dropout_randval"),               \
             py::arg("out") = std::nullopt,                   \
             py::arg("block_table") = std::nullopt,           \
+            py::arg("bias") = std::nullopt,                  \
             py::arg("alibi_slopes") = std::nullopt,          \
             py::arg("gen") = std::nullopt);
 

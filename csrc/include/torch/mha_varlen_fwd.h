@@ -23,6 +23,7 @@ mha_varlen_fwd(at::Tensor& q,                  // [total_q, hq, d]
                bool return_dropout_randval,
                std::optional<at::Tensor> out,                // [total_q, hq, d]
                std::optional<const at::Tensor> block_table,  // [hq] or [b, hq]
+               std::optional<const at::Tensor> bias,         // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                std::optional<at::Generator> gen);
 } // namespace torch_itfs

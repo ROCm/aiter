@@ -17,7 +17,7 @@ fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
                                               int head_size_v,
                                               bool has_dropout,
                                               bool has_lse,
-                                              bool enable_alibi)
+                                              bias_enum bias_type)
 {
     return fmha_fwd_traits{head_size_q,
                            head_size_v,
@@ -25,7 +25,7 @@ fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
                            true, // is_group_mode
                            true, // is_v_rowmajor
                            mask.type,
-                           enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
+                           bias_type,
                            has_lse,
                            has_dropout,
                            false}; // do_fp8_static_quant
@@ -36,7 +36,7 @@ fmha_fwd_splitkv_traits get_ck_fmha_varlen_fwd_splitkv_traits(const mask_info &m
                                                               int head_size_q,
                                                               int head_size_v,
                                                               bool has_lse,
-                                                              bool enable_alibi)
+                                                              bias_enum bias_type)
 {
     return fmha_fwd_splitkv_traits{head_size_q,
                                    head_size_v,
@@ -44,7 +44,7 @@ fmha_fwd_splitkv_traits get_ck_fmha_varlen_fwd_splitkv_traits(const mask_info &m
                                    true, // is_group_mode
                                    true, // is_v_rowmajor
                                    mask.type,
-                                   enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
+                                   bias_type,
                                    has_lse,
                                    false}; // do_fp8_static_quant
 }
@@ -65,6 +65,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           const at::Tensor v,
                                           const at::Tensor seqlens_q,
                                           const at::Tensor seqlens_k,
+                                          std::optional<const at::Tensor> &bias_,
                                           std::optional<const at::Tensor> &alibi_slopes_,
                                           at::Tensor out,
                                           at::Tensor softmax_lse,
@@ -78,6 +79,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     // v: (total_k, nheads_k, d_v)
     // o: (total_q, nheads, d_v)
 
+    // bias:(total_q, max_seqlen_k)
     // alibi_slopes:(batch, nheads) or (nhead)
     // lse: (nheads, total_q)
     // randval: (nheads, total_q, max_seqlen_k)
@@ -105,22 +107,33 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t batch_stride_lse = 0;
     ck_tile::index_t batch_stride_randval = 0;
 
-    void *alibi_slopes_ptr = nullptr;
-    ck_tile::index_t stride_alibi_slopes = 0;
+    void *bias_ptr = nullptr;
+    ck_tile::index_t stride_bias = 0;
+    ck_tile::index_t nhead_stride_bias = 0;
+    ck_tile::index_t batch_stride_bias = 0;
 
-    if (alibi_slopes_.has_value()) {
+    if (bias_.has_value()) {
+        auto bias = bias_.value();
+        CHECK_DEVICE(bias);
+        TORCH_CHECK(bias.stride(-1) == 1, "bias tensor must have contiguous last dimension");
+        TORCH_CHECK(bias.dim() == 2, "only support 2d bias");
+        bias_ptr = bias.data_ptr();
+        if (bias.dim() == 2)
+            stride_bias = bias.stride(0);
+    }
+    else if (alibi_slopes_.has_value()) {
         auto alibi_slopes = alibi_slopes_.value();
         CHECK_DEVICE(alibi_slopes);
         TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
         TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({h}) || alibi_slopes.sizes() == torch::IntArrayRef({b, h}));
-        alibi_slopes_ptr = alibi_slopes.data_ptr();
-        stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+        bias_ptr = alibi_slopes.data_ptr();
+        stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
     return fmha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
-                         alibi_slopes_ptr, // bias
+                         bias_ptr,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
@@ -141,20 +154,20 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          stride_q,
                          stride_k,
                          stride_v,
-                         stride_alibi_slopes,
+                         stride_bias,
                          stride_randval,
                          stride_o,
                          nhead_stride_q,
                          nhead_stride_k,
                          nhead_stride_v,
-                         0, // nhead_stride_bias, FA without bias
+                         nhead_stride_bias,
                          nhead_stride_randval,
                          nhead_stride_lse,
                          nhead_stride_o,
                          batch_stride_q,
                          batch_stride_k,
                          batch_stride_v,
-                         0, // batch_stride_bias, FA without bias
+                         batch_stride_bias,
                          batch_stride_randval,
                          batch_stride_lse,
                          batch_stride_o,
@@ -184,6 +197,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
                                                           const at::Tensor seqlens_q,
                                                           const at::Tensor seqlens_k,
                                                           std::optional<const at::Tensor> &block_table_,
+                                                          std::optional<const at::Tensor> &bias_,
                                                           std::optional<const at::Tensor> &alibi_slopes_,
                                                           at::Tensor out,
                                                           at::Tensor lse,
@@ -195,6 +209,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     // v: (num_blocks, page_block_size, num_heads_k, d_v)
     // o: (total_q, nheads, d_v)
 
+    // bias:(total_q, max_seqlen_k)
     // alibi_slopes:(batch_size, nheads) or (nhead)
     // lse: (nheads, total_q)
     // lse_acc: (nheads, split, total_q)
@@ -282,6 +297,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
         args.nhead_stride_lse = lse.stride(0);
     }
 
+    TORCH_CHECK(!bias_.has_value(), "Page attention does not supports bias for now");
     if (alibi_slopes_.has_value()) {
         auto alibi_slopes = alibi_slopes_.value();
         CHECK_DEVICE(alibi_slopes);
@@ -317,6 +333,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                bool return_dropout_randval,
                std::optional<at::Tensor> out_,                // [total_q, hq, d]
                std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
+               std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
                std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
                std::optional<at::Generator> gen_)
 {
@@ -364,6 +381,10 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(!paged_KV || page_block_size % 128 == 0, "Paged KV cache block size must be divisible by 128");
 
     if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
+
+    TORCH_CHECK(!(bias_.has_value() && alibi_slopes_.has_value()), "cannot apply bias and alibi at the same time");
+    bias_enum bias_type = bias_.has_value() ? bias_enum::elementwise_bias :
+        alibi_slopes_.has_value() ? bias_type = bias_enum::alibi : bias_enum::no_bias;
 
     // TODO
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
@@ -493,7 +514,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     head_size_q,
                     head_size_v,
                     has_lse,
-                    alibi_slopes_.has_value());
+                    bias_type);
 
             auto args =
                 get_ck_fmha_varlen_fwd_splitkv_args(
@@ -514,6 +535,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     cu_seqlens_q,
                     cu_seqlens_k,
                     block_table_,
+                    bias_,
                     alibi_slopes_,
                     out,
                     softmax_lse,
@@ -535,7 +557,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     head_size_v,
                     has_dropout,
                     has_lse,
-                    alibi_slopes_.has_value());
+                    bias_type);
 
             auto args =
                 get_ck_fmha_varlen_fwd_args(
@@ -553,6 +575,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     v,
                     cu_seqlens_q,
                     cu_seqlens_k,
+                    bias_,
                     alibi_slopes_,
                     out,
                     softmax_lse,

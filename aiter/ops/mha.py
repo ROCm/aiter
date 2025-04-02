@@ -44,6 +44,7 @@ def mha_varlen_fwd(
     return_dropout_randval: bool,
     out: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ): ...
@@ -736,6 +737,7 @@ def _flash_attn_varlen_forward(
     causal: bool,
     window_size_left: int = -1,
     window_size_right: int = -1,
+    bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
@@ -755,12 +757,15 @@ def _flash_attn_varlen_forward(
         elif q.dtype == torch.bfloat16:
             md_name += '_bf16'
             filter_fwd += 'bf16*'
-        if alibi_slopes is None:
-            md_name += '_nbias'
-            filter_fwd += '_nbias*'
-        else:
+        if bias is not None:
+            md_name += '_bias'
+            filter_fwd += '_bias*'
+        elif alibi_slopes is not None:
             md_name += '_alibi'
             filter_fwd+= '_alibi*'
+        else:
+            md_name += '_nbias'
+            filter_fwd += '_nbias*'
         if not causal and window_size_left == -1 and window_size_right == -1:
             md_name += '_nmask'
             filter_fwd += '_nmask*'
@@ -794,12 +799,15 @@ def _flash_attn_varlen_forward(
             md_name += '_bf16'
             filter_fwd_splitkv1+= 'bf16*'
             filter_fwd_splitkv2+= 'bf16*'
-        if alibi_slopes is None:
-            md_name += '_nbias'
-            filter_fwd_splitkv2+= '_nbias*'
-        else:
+        if bias is not None:
+            md_name += '_bias'
+            filter_fwd_splitkv2 += '_bias*'
+        elif alibi_slopes is not None:
             md_name += '_alibi'
             filter_fwd_splitkv2+= '_alibi*'
+        else:
+            md_name += '_nbias'
+            filter_fwd_splitkv2 += '_nbias*'
         if not causal and window_size_left == -1 and window_size_right == -1:
             md_name += '_nmask'
             filter_fwd_splitkv2 += '_nmask*'
@@ -808,11 +816,11 @@ def _flash_attn_varlen_forward(
             filter_fwd_splitkv2 += '_mask*'
         if return_lse:
             md_name += '_lse'
-            # filter_fwd_splitkv1+= '_lse*'
+            filter_fwd_splitkv1+= '_lse*'
             filter_fwd_splitkv2+= '_lse*'
         else:
             md_name += '_nlse'
-            # filter_fwd_splitkv1+= '_nlse*'
+            filter_fwd_splitkv1+= '_nlse*'
             filter_fwd_splitkv2+= '_nlse*'
         md_name += '_pagedkv'
         filter_fwd_splitkv2 += '_pagedkv*'
@@ -841,6 +849,7 @@ def _flash_attn_varlen_forward(
         return_softmax,
         None,
         block_table,
+        bias,
         alibi_slopes,
         None,
         custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
@@ -1047,6 +1056,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,
@@ -1081,6 +1091,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             causal=causal,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
+            bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
@@ -1096,6 +1107,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
             ctx.window_size = window_size
+            ctx.bias = bias
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
             ctx.head_size_q_og = head_size_q_og
@@ -1116,11 +1128,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        bias = ctx.bias
+        dbias = torch.empty_like(bias) if bias is not None else None
         head_size_q_og = ctx.head_size_q_og
         head_size_v_og = dout.size(2)
         dout_padded = dout
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
+        # TODO - dbias
         _flash_attn_varlen_backward(
             dout_padded,
             q,
@@ -1149,7 +1164,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., : head_size_q_og]
         dv = dv[..., : head_size_v_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, dbias, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -1164,6 +1179,7 @@ def flash_attn_varlen_func(
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    bias=None,
     alibi_slopes=None,
     deterministic=False,
     return_lse=False,
@@ -1207,6 +1223,7 @@ def flash_attn_varlen_func(
             Default to 1 / sqrt(headdim_q).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        bias: (seqlen_q, seqlen_k)
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
@@ -1236,6 +1253,7 @@ def flash_attn_varlen_func(
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,
