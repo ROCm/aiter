@@ -9,7 +9,7 @@ import functools
 import argparse
 import sys
 
-from aiter.ops.triton.moe_op import fused_moe as triton_moe 
+from aiter.ops.triton.moe_op import fused_moe as triton_moe
 
 
 def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16):
@@ -264,7 +264,6 @@ def input_helper_int4_w4a16(M: int, N: int, K: int , top_k: int, E: int, routed_
 
     a = torch.randn((M, K), dtype=dtype, device='cuda')
     b = torch.rand((E, N, K), dtype=dtype, device='cuda')
-    print(f"b_orig.shape={b.shape} b_orig={b}")
 
     b_q = torch.empty((E, N, K // 2), dtype=torch.uint8, device='cuda')
     b_scale = torch.empty((E, N, K // group_size), dtype=dtype, device='cuda')

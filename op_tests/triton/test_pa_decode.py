@@ -57,6 +57,53 @@ def paged_attention_decode_ref(
 
 tl_to_torch_dtype = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
 
+def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, num_blocks=4):
+    """Helper function to generate input tensors for paged attention testing."""
+    # Query tensor generation
+    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        query = torch.randn(B, H_Q, D, dtype=torch.float16, device="cuda")
+        query = query.to(dtype=dtype, device="cuda")
+    else:
+        query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
+
+    # Key/Value cache generation
+    if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        x = min(D, 16 // torch.tensor([], dtype=torch.float16).element_size())
+        key_cache = torch.randn(
+            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
+        )
+        value_cache = torch.randn(
+            num_blocks, H_KV, D, KV_BLK_SZ, dtype=torch.float16, device="cuda"
+        )
+        key_cache = key_cache.to(dtype=kv_cache_dtype)
+        value_cache = value_cache.to(dtype=kv_cache_dtype)
+    else:
+        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
+        key_cache = torch.randn(
+            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=kv_cache_dtype, device="cuda"
+        )
+        value_cache = torch.randn(
+            num_blocks, H_KV, D, KV_BLK_SZ, dtype=kv_cache_dtype, device="cuda"
+        )
+
+    # Transform key/value caches for Triton
+    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
+    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
+
+    # Context lengths and block tables
+    context_lens = torch.full((B,), SEQ_LEN, device="cuda")
+    max_context_len = max(context_lens)
+    max_num_blks_per_seq = (max_context_len + KV_BLK_SZ - 1) // KV_BLK_SZ
+
+    block_tables = []
+    for i in range(B):
+        block_table = [
+            random.randint(0, num_blocks - 1) for _ in range(max_num_blks_per_seq)
+        ]
+        block_tables.append(block_table)
+    block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
+
+    return query, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len
 
 @pytest.mark.parametrize(
     "B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN",
@@ -162,50 +209,13 @@ def test_paged_attn(
     torch.set_printoptions(threshold=100000)
     num_blocks = 4
 
-    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        query = torch.randn(
-            B, H_Q, D, dtype=torch.float16, device="cuda"
-        )  # assumption dtype is 8bits or lower
-        query = query.to(dtype=dtype, device="cuda")
-    else:
-        query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
+    # Generate inputs using helper function
+    query, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, num_blocks)
 
-    if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        x = min(D, 16 // torch.tensor([], dtype=torch.float16).element_size())
-        key_cache = torch.randn(
-            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
-        )
-        value_cache = torch.randn(
-            num_blocks, H_KV, D, KV_BLK_SZ, dtype=torch.float16, device="cuda"
-        )
-        # torch doesn't have randn for fp8 data type, so we convert here
-        key_cache = key_cache.to(dtype=kv_cache_dtype)
-        value_cache = value_cache.to(dtype=kv_cache_dtype)
-    else:
-        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
-        key_cache = torch.randn(
-            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=kv_cache_dtype, device="cuda"
-        )
-        value_cache = torch.randn(
-            num_blocks, H_KV, D, KV_BLK_SZ, dtype=kv_cache_dtype, device="cuda"
-        )
-
-    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
-    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
-
-    context_lens = torch.full((B,), SEQ_LEN, device="cuda")
-    max_context_len = max(context_lens)
-    max_num_blks_per_seq = (max_context_len + KV_BLK_SZ - 1) // KV_BLK_SZ
-
-    block_tables = []
-    for i in range(B):
-        block_table = [
-            random.randint(0, num_blocks - 1) for _ in range(max_num_blks_per_seq)
-        ]
-        block_tables.append(block_table)
-    block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
+    # Attention scale
     attn_scale = 1.0 / (D**0.5)
 
+    # Triton computation
     triton_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
     paged_attention_decode(
         triton_output,
@@ -219,16 +229,21 @@ def test_paged_attn(
         compute_type,
     )
 
-    # torch doesn't have support for fp8 data type, so we convert here
+    # Convert types for reference computation if needed
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = query.to(tl_to_torch_dtype[compute_type])
 
     if kv_cache_dtype not in (torch.bfloat16, torch.float16):
         key_cache = key_cache.to(dtype=tl_to_torch_dtype[compute_type])
         value_cache = value_cache.to(dtype=tl_to_torch_dtype[compute_type])
+
+    # Reference computation
     torch_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
     paged_attention_decode_ref(
         torch_output, query, key_cache, value_cache, block_tables, context_lens
     )
 
+    # Compare results
     triton.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
+
+
