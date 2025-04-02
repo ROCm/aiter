@@ -6,49 +6,10 @@
 #include "py_itfs_common.h"
 #include "mha_common.h"
 
-#include "fmha_fwd.hpp"
-#include "mask.hpp"
+#include "mha_fwd.h"
 
 namespace aiter {
 namespace torch_itfs {
-fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
-                                              std::string dtype,
-                                              int head_size_q,
-                                              int head_size_v,
-                                              bool has_dropout,
-                                              bool has_lse,
-                                              bias_enum bias_type)
-{
-    return fmha_fwd_traits{head_size_q,
-                           head_size_v,
-                           dtype,
-                           true, // is_group_mode
-                           true, // is_v_rowmajor
-                           mask.type,
-                           bias_type,
-                           has_lse,
-                           has_dropout,
-                           false}; // do_fp8_static_quant
-}
-
-fmha_fwd_splitkv_traits get_ck_fmha_varlen_fwd_splitkv_traits(const mask_info &mask,
-                                                              std::string dtype,
-                                                              int head_size_q,
-                                                              int head_size_v,
-                                                              bool has_lse,
-                                                              bias_enum bias_type)
-{
-    return fmha_fwd_splitkv_traits{head_size_q,
-                                   head_size_v,
-                                   dtype,
-                                   true, // is_group_mode
-                                   true, // is_v_rowmajor
-                                   mask.type,
-                                   bias_type,
-                                   has_lse,
-                                   false}; // do_fp8_static_quant
-}
-
 fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
@@ -507,15 +468,6 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
 
         if (paged_KV)
         {
-            auto traits =
-                get_ck_fmha_varlen_fwd_splitkv_traits(
-                    mask,
-                    q_dtype_str,
-                    head_size_q,
-                    head_size_v,
-                    has_lse,
-                    bias_type);
-
             auto args =
                 get_ck_fmha_varlen_fwd_splitkv_args(
                     has_lse,
@@ -542,22 +494,18 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     softmax_lse_accum,
                     out_accum);
 
-            float t = fmha_fwd_splitkv(traits, args, stream_config);
+            float t = aiter::mha_fwd_splitkv(args,
+                                             stream_config,
+                                             mask,
+                                             q_dtype_str,
+                                             true, //is_group_mode
+                                             bias_type,
+                                             has_lse);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
         }
         else
         {
             auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-
-            auto traits =
-                get_ck_fmha_varlen_fwd_traits(
-                    mask,
-                    q_dtype_str,
-                    head_size_q,
-                    head_size_v,
-                    has_dropout,
-                    has_lse,
-                    bias_type);
 
             auto args =
                 get_ck_fmha_varlen_fwd_args(
@@ -584,7 +532,13 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     p_dropout,
                     drop_seed_offset);
 
-            float t = fmha_fwd(traits, args, stream_config);
+            float t = aiter::mha_fwd(args,
+                                     stream_config,
+                                     mask,
+                                     q_dtype_str,
+                                     true, //is_group_mode
+                                     bias_type,
+                                     has_lse);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }
