@@ -615,6 +615,286 @@ namespace aiter
     }
   }
 
+  // (m, n, k), (k,)
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastK_unroll_vectorize_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < (m * n * k); index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+        uint64_t other_start = (index + block_offset) % k;
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t input_offset = index + block_offset + vec_index;
+          uint64_t other_offset = other_start + vec_index;
+          if (types_match)
+          {
+            _T t0 = static_cast<_T>(a_ptr[input_offset]);
+            _T t1 = static_cast<_T>(b_ptr[other_offset]);
+            *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+          }
+          else
+          {
+            float t0 = static_cast<float>(a_ptr[input_offset]);
+            float t1 = static_cast<float>(b_ptr[other_offset]);
+            float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+            *(c_ptr + input_offset) = static_cast<_T>(t2);
+          }
+        }
+      }
+    }
+  }
+
+  // (m, n, k), (1)
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcast_scalar_unroll_vectorize_naive(const void *__restrict a, const void *__restrict b, void *__restrict c, const int n)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1 b_val = *reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    _T b_T = static_cast<_T>(b_val);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < n; index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t input_offset = index + block_offset + vec_index;
+          _T t0 = static_cast<_T>(a_ptr[input_offset]);
+          *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, b_T);
+        }
+      }
+    }
+  }
+
+  // (m, n, k), (m, 1, k)
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastM1K_unroll_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < (m * n * k); index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+        uint64_t other_m_index = (index + block_offset) / (n * k);
+        uint64_t other_k_index = (index + block_offset) % k;
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t input_offset = index + block_offset + vec_index;
+          uint64_t other_offset = other_m_index * k + other_k_index + vec_index;
+          if (types_match)
+          {
+            _T t0 = static_cast<_T>(a_ptr[input_offset]);
+            _T t1 = static_cast<_T>(b_ptr[other_offset]);
+            *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+          }
+          else
+          {
+            float t0 = static_cast<float>(a_ptr[input_offset]);
+            float t1 = static_cast<float>(b_ptr[other_offset]);
+            float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+            *(c_ptr + input_offset) = static_cast<_T>(t2);
+          }
+        }
+      }
+    }
+  }
+
+  // (m, n, k), (m, n, 1)
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastMN1_unroll_vec_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int forward_dim, const int bcast_dim, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < (forward_dim * bcast_dim); index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+        uint64_t other_offset = (index + block_offset) / bcast_dim;
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t input_offset = index + block_offset + vec_index;
+          if (types_match)
+          {
+            _T t0 = static_cast<_T>(a_ptr[input_offset]);
+            _T t1 = static_cast<_T>(b_ptr[other_offset]);
+            *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+          }
+          else
+          {
+            float t0 = static_cast<float>(a_ptr[input_offset]);
+            float t1 = static_cast<float>(b_ptr[other_offset]);
+            float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+            *(c_ptr + input_offset) = static_cast<_T>(t2);
+          }
+        }
+      }
+    }
+  }
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastMN1_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int forward_dim, const int bcast_dim, bool types_match)
+  {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index < forward_dim * bcast_dim; index += blockDim.x * gridDim.x)
+    {
+      if (types_match)
+      {
+        _T t0 = static_cast<_T>(a_ptr[index]);
+        _T t1 = static_cast<_T>(b_ptr[index / bcast_dim]);
+        *(c_ptr + index) = performOperation<_T, Operation, order_flag>(t0, t1);
+      }
+      else
+      {
+        float t0 = static_cast<float>(a_ptr[index]);
+        float t1 = static_cast<float>(b_ptr[index / bcast_dim]);
+        float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+        *(c_ptr + index) = static_cast<_T>(t2);
+      }
+    }
+  }
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcast1N1_unroll_vec_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < (m * n * k); index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+        uint64_t other_offset = (index + block_offset) % (n * k) / k;
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t input_offset = index + block_offset + vec_index;
+          if (types_match)
+          {
+            _T t0 = static_cast<_T>(a_ptr[input_offset]);
+            _T t1 = static_cast<_T>(b_ptr[other_offset]);
+            *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+          }
+          else
+          {
+            float t0 = static_cast<float>(a_ptr[input_offset]);
+            float t1 = static_cast<float>(b_ptr[other_offset]);
+            float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+            *(c_ptr + input_offset) = static_cast<_T>(t2);
+          }
+        }
+      }
+    }
+  }
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcast1N1_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, bool types_match)
+  {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index < m * n * k; index += blockDim.x * gridDim.x)
+    {
+      if (types_match)
+      {
+        _T t0 = static_cast<_T>(a_ptr[index]);
+        _T t1 = static_cast<_T>(b_ptr[index % (n * k) / k]);
+        *(c_ptr + index) = performOperation<_T, Operation, order_flag>(t0, t1);
+      }
+      else
+      {
+        float t0 = static_cast<float>(a_ptr[index]);
+        float t1 = static_cast<float>(b_ptr[index % (n * k) / k]);
+        float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+        *(c_ptr + index) = static_cast<_T>(t2);
+      }
+    }
+  }
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_contiguous_kernel_naive(const void* __restrict a, const void* __restrict b, void* __restrict c,
+                                                   const int n, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)(_rows - 1) * blockDim.x * vec_size < n; index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t offset = index + block_offset + vec_index;
+          if (types_match)
+          {
+            _T t0 = static_cast<_T>(a_ptr[offset]);
+            _T t1 = static_cast<_T>(b_ptr[offset]);
+            *(c_ptr + offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+          }
+          else
+          {
+            float t0 = static_cast<float>(a_ptr[offset]);
+            float t1 = static_cast<float>(b_ptr[offset]);
+            float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+            *(c_ptr + offset) = static_cast<_T>(t2);
+          }
+        }
+      }
+    }
+  }
+
   template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
   __global__ void operator_contiguous_kernel(const void *__restrict a, const void *__restrict b, void *__restrict c,
                                              const int M, const int N, const int K, bool types_match)
@@ -924,7 +1204,68 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
 
     const uint32_t rows = 8;
     int vec = 16 / output.element_size();
-    if (N % rows == 0 && K % vec == 0)
+
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    hipGetDevice(&dev);
+    hipGetDeviceProperties(&dev_prop, dev);
+    uint32_t num_cu = dev_prop.multiProcessorCount;
+
+    bool bcast_k_dim = (input.dim() == 1 && input.size(0) == K) || (other.dim() == 1 && other.size(0) == K);
+    bool bcast_scalar = (input.dim() == 1 && input.size(0) == 1) || (other.dim() == 1 && other.size(0) == 1);
+    bool vec_unroll_able = num_elements % (rows * vec * 256) == 0 && K % vec == 0;
+
+    //  (m,n,k), (k,)
+    if (bcast_k_dim && vec_unroll_able)
+    {
+      int grid_x = (num_elements / (rows * vec) + 256 - 1) / 256;
+      int occupancy;
+      auto kernel_ptr = aiter::operator_bcastK_unroll_vectorize_naive<_T0, rows, Operation, true, _T0, _T1>;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), 256, 0);
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+      const dim3 block_dim(256, 1, 1);
+      const dim3 grid_dim(grid_x, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastK_unroll_vectorize_naive", [&]
+            { aiter::operator_bcastK_unroll_vectorize_naive<scalar_t, rows, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastK_unroll_vectorize_naive", [&]
+            { aiter::operator_bcastK_unroll_vectorize_naive<scalar_t, rows, Operation, true, _T1, _T0>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K, types_match); });
+      }
+    }
+    // (m, n, k), (1)
+    else if (bcast_scalar && num_elements % (rows * vec * 256) == 0)
+    {
+      int grid_x = (num_elements / (rows * vec) + 256 - 1) / 256;
+      int occupancy;
+      auto kernel_ptr = aiter::operator_bcast_scalar_unroll_vectorize_naive<_T0, rows, Operation, true, _T0, _T1>;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), 256, 0);
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+      const dim3 block_dim(256, 1, 1);
+      const dim3 grid_dim(grid_x, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast_scalar_unroll_vectorize_naive", [&]
+            { aiter::operator_bcast_scalar_unroll_vectorize_naive<scalar_t, rows, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, num_elements); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast_scalar_unroll_vectorize_naive", [&]
+            { aiter::operator_bcast_scalar_unroll_vectorize_naive<scalar_t, rows, Operation, true, _T1, _T0>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, num_elements); });
+      }
+    }
+    else if (N % rows == 0 && K % vec == 0)
     {
       constexpr uint32_t wg = 64;
       int grid_x = (num_elements / (rows * vec) + wg - 1) / wg;
@@ -991,28 +1332,225 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
     int N = shape[dim - 2];
     int K = shape[dim - 1];
 
+    // (m, n, p, q), (m, 1, p, q)
+    if (dim == 4 && input.size(1) != other.size(1) && (input.size(1) == 1 || other.size(1)))
+    {
+      M = shape[0];
+      N = shape[1];
+      K = shape[2] * shape[3];
+    }
+
     constexpr uint32_t BIG_TILE_SIZE_N = 64;
     constexpr uint32_t BIG_TILE_SIZE_K = 64;
     constexpr uint32_t M_SWIZZLE = 8;
-    const int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
+    int grid_x = M * ((N + BIG_TILE_SIZE_N - 1) / BIG_TILE_SIZE_N) * ((K + BIG_TILE_SIZE_K - 1) / BIG_TILE_SIZE_K);
     const dim3 grid_dim(grid_x, 1, 1);
     const dim3 block_dim(256, 1, 1);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     bool types_match = typeid(_T0) == typeid(_T1);
-
-    if (order_flag)
+    constexpr int rows = 8;
+    int vec_size = 16 / output.element_size();
+    if (K % vec_size == 0 && num_elements % (256 * rows * vec_size) == 0)
     {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, _T0, _T1>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, types_match); });
+      hipDevice_t dev;
+      hipDeviceProp_t dev_prop;
+      hipGetDevice(&dev);
+      hipGetDeviceProperties(&dev_prop, dev);
+      uint32_t num_cu = dev_prop.multiProcessorCount;
+      grid_x = (num_elements / (rows * vec_size) + 256 - 1) / 256;
+      int occupancy;
+      auto kernel_ptr = aiter::operator_bcastM1K_unroll_kernel<_T0, rows, Operation, true, _T0, _T1>;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), 256, 0);
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(256, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastM1K_unroll_kernel", [&]
+            { aiter::operator_bcastM1K_unroll_kernel<scalar_t, rows, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, M, N, K, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastM1K_unroll_kernel", [&]
+            { aiter::operator_bcastM1K_unroll_kernel<scalar_t, rows, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K, types_match); });
+      }
     }
     else
     {
-      VLLM_DISPATCH_FLOATING_TYPES(
-          output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
-          { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, _T1, _T0>
-                <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, types_match); });
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, K, N, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast1_big_tile_kernel", [&]
+            { aiter::operator_bcast1_big_tile_kernel<scalar_t, 256, BIG_TILE_SIZE_N, BIG_TILE_SIZE_K, M_SWIZZLE, Operation, false, _T1, _T0>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, K, N, types_match); });
+      }
+    }
+  }
+};
+
+// PATTERN_BROADCAST_2
+template <typename Operation, class _T0, class _T1>
+struct BinaryOperationPattern<5, Operation, _T0, _T1>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  {
+    int dim = input.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int bcast_dim = order_flag ? input.numel() / other.numel() : other.numel() / input.numel();
+    int forward_dim = order_flag ? other.numel() : input.numel();
+
+    int num_elements = output.numel();
+    int vec_size = 16 / output.element_size();
+    constexpr uint32_t row = 8;
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bool types_match = typeid(_T0) == typeid(_T1);
+
+    // optimize kernel
+    if (bcast_dim % vec_size == 0 && forward_dim % row == 0 && num_elements % (256 * vec_size * row) == 0)
+    {
+      hipDevice_t dev;
+      hipDeviceProp_t dev_prop;
+      hipGetDevice(&dev);
+      hipGetDeviceProperties(&dev_prop, dev);
+      uint32_t num_cu = dev_prop.multiProcessorCount;
+
+      constexpr uint32_t wg = 256;
+      int grid_x = (num_elements / (row * vec_size) + wg - 1) / wg;
+      int occupancy;
+      auto kernel_ptr = aiter::operator_bcastMN1_unroll_vec_naive<_T0, row, Operation, true, _T0, _T1>;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), wg, 0);
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastMN1_unroll_vec_naive", [&]
+            { aiter::operator_bcastMN1_unroll_vec_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, forward_dim, bcast_dim, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastMN1_unroll_vec_naive", [&]
+            { aiter::operator_bcastMN1_unroll_vec_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, forward_dim, bcast_dim, types_match); });
+      }
+    }
+    // fallback
+    else
+    {
+      const dim3 block_dim(256, 1, 1);
+      const dim3 grid_dim((num_elements + 256 - 1) / 256, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastMN1_naive", [&]
+            { aiter::operator_bcastMN1_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, forward_dim, bcast_dim, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastMN1_naive", [&]
+            { aiter::operator_bcastMN1_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, forward_dim, bcast_dim, types_match); });
+      }
+    }
+  }
+};
+
+// PATTERN_BROADCAST_3
+template <typename Operation, class _T0, class _T1>
+struct BinaryOperationPattern<6, Operation, _T0, _T1>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  {
+    int dim = output.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int m = output.size(0);
+    int n = output.size(1);
+    int k = output.size(2);
+
+    int num_elements = output.numel();
+    int vec_size = 16 / output.element_size();
+    constexpr uint32_t row = 8;
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bool types_match = typeid(_T0) == typeid(_T1);
+
+    // optimize kernel
+    if (k % vec_size == 0 && num_elements % (256 * vec_size * row) == 0)
+    {
+      hipDevice_t dev;
+      hipDeviceProp_t dev_prop;
+      hipGetDevice(&dev);
+      hipGetDeviceProperties(&dev_prop, dev);
+      uint32_t num_cu = dev_prop.multiProcessorCount;
+
+      constexpr uint32_t wg = 256;
+      int grid_x = (num_elements / (row * vec_size) + wg - 1) / wg;
+      int occupancy;
+      auto kernel_ptr = aiter::operator_bcast1N1_unroll_vec_naive<_T0, row, Operation, true, _T0, _T1>;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), wg, 0);
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast1N1_unroll_vec_naive", [&]
+            { aiter::operator_bcast1N1_unroll_vec_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, m, n, k, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast1N1_unroll_vec_naive", [&]
+            { aiter::operator_bcast1N1_unroll_vec_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, m, n, k, types_match); });
+      }
+    }
+    // fallback
+    else
+    {
+      const dim3 block_dim(256, 1, 1);
+      const dim3 grid_dim((num_elements + 256 - 1) / 256, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast1N1_naive", [&]
+            { aiter::operator_bcast1N1_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, m, n, k, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcast1N1_naive", [&]
+            { aiter::operator_bcast1N1_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, m, n, k, types_match); });
+      }
     }
   }
 };
@@ -1074,6 +1612,21 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
       VLLM_DISPATCH_FLOATING_TYPES(
           output.scalar_type(), "operator_element_kernel", [&]
           { aiter::operator_element_kernel<scalar_t, Operation, _T0, _T1>
+                <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, num_elements, types_match); });
+    }
+    else if (num_elements % (rows * vec * 256) == 0)
+    {
+      constexpr uint32_t wg = 256;
+      int grid_x = (num_elements / (rows * vec) + wg - 1) / wg;
+      int occupancy;
+      auto kernel_ptr = aiter::operator_contiguous_kernel_naive<_T0, rows, Operation, true, _T0, _T1>;
+      hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), wg, 0);
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+      const dim3 grid_dim(grid_x, 1, 1);
+      const dim3 block_dim(wg, 1, 1);
+      VLLM_DISPATCH_FLOATING_TYPES(
+          output.scalar_type(), "operator_contiguous_kernel_naive", [&]
+          { aiter::operator_contiguous_kernel_naive<scalar_t, rows, Operation, true, _T0, _T1>
                 <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, num_elements, types_match); });
     }
     else if (N % rows == 0 && K % vec == 0)
@@ -1169,10 +1722,13 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
   bool order_flag = true;
   int pattern = 0;
   constexpr uint32_t PATTERN_TRANSPOSE = 1;
-  constexpr uint32_t PATTERN_BROADCAST_0 = 2;
-  constexpr uint32_t PATTERN_BROADCAST_1 = 3;
+  constexpr uint32_t PATTERN_BROADCAST_0 = 2;   // (m, n, k), (1, n, k)
+  constexpr uint32_t PATTERN_BROADCAST_1 = 3;   // (m, n, k), (m, 1, k)
   constexpr uint32_t PATTERN_CONTIGUOUS = 4;
+  constexpr uint32_t PATTERN_BROADCAST_2 = 5;   // (m, n, k), (m, n, 1)
+  constexpr uint32_t PATTERN_BROADCAST_3 = 6;   // (m, n, k), (   n, 1)
 
+  // contiguous case
   if (!is_support)
   {
     is_support = true;
@@ -1190,8 +1746,9 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     pattern = is_support ? PATTERN_CONTIGUOUS : 0;
   }
 
-  if (!is_support && dim == 3)
+  if (!is_support && (dim == 3 || other.dim() == 3))
   {
+    // transpose case
     if (input.is_contiguous() != other.is_contiguous())
     {
       auto tensor_not_conti = input.is_contiguous() ? other : input;
@@ -1205,54 +1762,108 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       is_support &= tensor_not_conti.stride(1) == 1;
       pattern = is_support ? PATTERN_TRANSPOSE : 0;
     }
+    // broadcast case
     else if (input.is_contiguous() && other.is_contiguous())
     {
       is_support = false;
-
-      if (!is_support && other.size(0) == 1)
+      // input tensor dim and other tensor dim both equal to 3
+      if (input.dim() == other.dim())
       {
-        is_support = true;
-        is_support &= input.dim() == other.dim();
-        is_support &= input.size(0) > 1;
-        is_support &= input.size(1) == other.size(1);
-        is_support &= input.size(2) == other.size(2);
-        pattern = is_support ? PATTERN_BROADCAST_0 : 0;
-        order_flag = true;
+        // broadcast at dim0 or dim1 or dim2
+        auto broadcast_3d_case = [&] (int bcast_dim)
+        {
+          constexpr int bcast_pattern[3] = {PATTERN_BROADCAST_0, PATTERN_BROADCAST_1, PATTERN_BROADCAST_2};
+          if (!is_support && (input.size(bcast_dim) == 1 || other.size(bcast_dim)) && input.size(bcast_dim) != other.size(bcast_dim))
+          {
+            is_support = true;
+            for (int i = 0; i < 3; ++i)
+            {
+              if (bcast_dim != i) is_support &= input.size(i) == other.size(i);
+            }
+            is_support &= input.size(bcast_dim) == 1 ? other.size(bcast_dim) != 1 : true;
+            pattern = is_support ? bcast_pattern[bcast_dim] : 0;
+            order_flag = input.size(bcast_dim) != 1 ? true : false;
+            if (bcast_dim == 1) order_flag = !order_flag;
+          }
+        };
+        // (m, n, k), (1, n, k) or (1, n, k), (m, n, k)
+        broadcast_3d_case(0);
+        // (m, n, k), (m, 1, k) or (m, 1, k), (m, n, k)
+        broadcast_3d_case(1);
+        // (m, n, k), (m, n, 1) or (m, n, 1), (m, n, k)
+        broadcast_3d_case(2);
       }
-
-      if (!is_support && input.size(0) == 1)
+      // (m, n, k), (n, 1) or (n, 1), (m, n, k)
+      else if (input.dim() == 2 || other.dim() == 2)
       {
         is_support = true;
-        is_support &= input.dim() == other.dim();
-        is_support &= other.size(0) > 1;
-        is_support &= input.size(1) == other.size(1);
-        is_support &= input.size(2) == other.size(2);
-        pattern = is_support ? PATTERN_BROADCAST_0 : 0;
-        order_flag = false;
+        if (input.dim() == 2)
+        {
+          is_support &= input.size(0) == other.size(1);
+          is_support &= input.size(1) == 1;
+          pattern = is_support ? PATTERN_BROADCAST_3 : 0;
+          order_flag = false;
+        }
+        else
+        {
+          is_support &= other.size(0) == input.size(1);
+          is_support &= other.size(1) == 1;
+          pattern = is_support ? PATTERN_BROADCAST_3 : 0;
+          order_flag = true;
+        }
       }
-
-      if (!is_support && input.size(1) == 1)
+      // (m, n, k), (k) or (k), (m, n, k)
+      // (m, n, k), (1) or (1), (m, n, k)
+      else if (input.dim() == 1 || other.dim() == 1)
       {
-        is_support = true;
-        is_support &= input.dim() == other.dim();
-        is_support &= other.size(1) > 1;
-        is_support &= input.size(0) == other.size(0);
-        is_support &= input.size(2) == other.size(2);
-        pattern = is_support ? PATTERN_BROADCAST_1 : 0;
-        order_flag = true;
-      }
-
-      if (!is_support && other.size(1) == 1)
-      {
-        is_support = true;
-        is_support &= input.dim() == other.dim();
-        is_support &= input.size(1) > 1;
-        is_support &= input.size(0) == other.size(0);
-        is_support &= input.size(2) == other.size(2);
-        pattern = is_support ? PATTERN_BROADCAST_1 : 0;
-        order_flag = false;
+        if (other.dim() == 1)
+        {
+          if (other.size(0) == 1 || other.size(0) == input.size(2))
+          {
+            is_support = true;
+            pattern = PATTERN_BROADCAST_0;
+            order_flag = true;
+          }
+        }
+        else
+        {
+          if (input.size(0) == 1 || input.size(0) == other.size(2))
+          {
+            is_support = true;
+            pattern = PATTERN_BROADCAST_0;
+            order_flag = false;
+          }
+        }
       }
     }
+  }
+
+  if (!is_support && input.dim() != 3 && other.dim() != 3)
+  {
+    if (input.dim() == other.dim())
+    {
+      std::vector<int> bcast_dim_index = {};
+      for (int i = 0; i < input.dim(); ++i)
+      {
+        // broadcast condition
+        if (input.size(i) != other.size(i) && (input.size(i) == 1 || other.size(i) == 1))
+        {
+          bcast_dim_index.push_back(i);
+        }
+      }
+      if (bcast_dim_index.size() == 1 && bcast_dim_index[0] != 0 && bcast_dim_index[0] != input.dim() - 1)
+      {
+        is_support = true;
+        pattern = PATTERN_BROADCAST_1;
+        order_flag = other.size(bcast_dim_index[0]) == 1 ? true : false;
+      }
+    }
+  }
+
+  // hip does not support double
+  if (input.dtype() == torch::kDouble || other.dtype() == torch::kDouble)
+  {
+    is_support = false;
   }
 
   if (is_support)
@@ -1267,6 +1878,7 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
     torch::Tensor output;
     if constexpr(Inplace)
     {
+      input = input.to(out_dtype);
       output = input;
     }
     else
@@ -1274,21 +1886,28 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       output = torch::empty(out_shape, options);
     }
 
-    if (pattern == PATTERN_TRANSPOSE)
+    switch (pattern)
     {
-      dispatch_first<1, Operation>(input, other, output, order_flag);
-    }
-    else if (pattern == PATTERN_BROADCAST_0)
-    {
-      dispatch_first<2, Operation>(input, other, output, order_flag);
-    }
-    else if (pattern == PATTERN_BROADCAST_1)
-    {
-      dispatch_first<3, Operation>(input, other, output, order_flag);
-    }
-    else if (pattern == PATTERN_CONTIGUOUS)
-    {
-      dispatch_first<4, Operation>(input, other, output, order_flag);
+      case PATTERN_TRANSPOSE:
+        dispatch_first<1, Operation>(input, other, output, order_flag);
+        break;
+      case PATTERN_BROADCAST_0:
+        dispatch_first<2, Operation>(input, other, output, order_flag);
+        break;
+      case PATTERN_BROADCAST_1:
+        dispatch_first<3, Operation>(input, other, output, order_flag);
+        break;
+      case PATTERN_CONTIGUOUS:
+        dispatch_first<4, Operation>(input, other, output, order_flag);
+        break;
+      case PATTERN_BROADCAST_2:
+        dispatch_first<5, Operation>(input, other, output, order_flag);
+        break;
+      case PATTERN_BROADCAST_3:
+        dispatch_first<6, Operation>(input, other, output, order_flag);
+        break;
+      default:
+        printf("[aiter/csrc/kernels/%s]: line %d break, unsupported type\n", __FILE__, __LINE__);
     }
     return output;
   }
