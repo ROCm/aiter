@@ -100,10 +100,11 @@ def test_mla(ctx_lens, batch_size, nhead,
     out_asm = torch.empty(
         (batch_size, nhead,  v_head_dim), dtype=dtype).fill_(-1)
     nhead_splits = nhead // 16
+    us_asm = 0
     for nhead_split in range(nhead_splits):
         logits = torch.empty((batch_size, num_kv_splits, 16, v_head_dim), dtype=torch.float32)
         attn_lse = torch.empty((batch_size, num_kv_splits, 16, 1), dtype=torch.float32)
-        (_, _), us_asm = run_perftest(asm_mla_decode_fwd,
+        (_, _), us_asm_ = run_perftest(asm_mla_decode_fwd,
                                                 q[:, nhead_split*16:(nhead_split+1)*16, :],
                                                 kv_buffer.view(num_page,
                                                                 page_size,
@@ -118,6 +119,8 @@ def test_mla(ctx_lens, batch_size, nhead,
                                                 logits=logits,
                                                 attn_lse=attn_lse
                                                 )
+        us_asm += us_asm_
+        
     checkAllclose(out_ref, out_asm,
                   msg=f'attn_out    [golden vs aiter_asm]:{us_ref:.2f} us vs {us_asm:.2f} us......')
     return {'triton': us_ref,
