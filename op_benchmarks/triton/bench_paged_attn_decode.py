@@ -47,7 +47,7 @@ def run_benchmark(args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ['model', 'batch_size', 'HQ', 'HK', 'SEQ_LEN', "HEAD_DIM"]
 
-    model_name = "paged_attn"
+    model_name = "paged-attn-decode"
 
     line_names = ['Time (ms)', 'TFLOPS', 'Bandwidth (GB/s)']
     line_vals = ['time', 'tflops', 'bandwidth']
@@ -58,7 +58,7 @@ def run_benchmark(args):
                 ('yellow', '-')], ylabel='ms / TFLOPS / GB/s', plot_name=f'{model_name}-benchmark', args={})
 
     @triton.testing.perf_report([benchmark])
-    def bench_moe_gemm(batch_size, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
+    def bench_paged_attn_decode(batch_size, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
         # TODO tune this
         KV_BLK_SZ = 128
         num_blocks = 4
@@ -92,12 +92,12 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_gemm.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path=".", print_data=True)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        prog="Benchmark MoE GEMM",
+        prog="Benchmark Paged Attention decode",
         allow_abbrev=False,
     )
     parser.add_argument('-model_configs', type=str, default="utils/model_configs.json", help="Model config json file.")
