@@ -21,7 +21,7 @@ def test_mla(ctx_lens, batch_size, nhead,
              dtype, kvtype, page_size, num_kv_splits):
     kv_max_sz = 65536  # calculated by rest of mem after weight loaded in frameworks
     num_page = (kv_max_sz+page_size-1)//page_size
-
+    
     # for none absorb (mha)
     if batch_size*ctx_lens < 128*1024:
         # attention_ref will OOO for big input...
@@ -91,7 +91,7 @@ def test_mla(ctx_lens, batch_size, nhead,
     logits_ref, lse_ref = attn_logits.split([v_head_dim, 1], dim=-1)
     logits_ref = rearrange(logits_ref, 'bs h sp d -> bs sp h d')
     lse_ref = rearrange(lse_ref, 'bs h sp d -> bs sp h d')
-    attn_logits = torch.empty_like(attn_logits.transpose(1,2).contiguous())
+    attn_logits = torch.empty_like(attn_logits.transpose(1, 2).contiguous())
     # print(f'{out_ref.view(batch_size, -1)=}')
     logits, attn_lse = attn_logits.split([v_head_dim, 1], dim=-1)
     logits = logits.contiguous()
@@ -99,27 +99,25 @@ def test_mla(ctx_lens, batch_size, nhead,
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty(
         (batch_size, nhead,  v_head_dim), dtype=dtype).fill_(-1)
-    (attn_logits, attn_lse), us_asm = run_perftest(asm_mla_decode_fwd,
-                                                   q,
-                                                   kv_buffer.view(num_page,
-                                                                  page_size,
-                                                                  nhead_kv,
-                                                                  qk_head_dim),
-                                                   out_asm,
-                                                   kv_indptr,
-                                                   kv_indices,
-                                                   kv_last_page_lens,
-                                                   sm_scale,
-                                                   num_kv_splits=num_kv_splits,
-                                                   logits=logits,
-                                                   attn_lse=attn_lse
-                                                   )
-
-    # print(f'{out_asm.view(batch_size, -1)=}')
-    # checkAllclose(logits_ref, attn_logits,
-    #               msg=f'attn_logits [golden vs aiter_asm]')
-    # checkAllclose(lse_ref, attn_lse,
-    #               msg=f'attn_lse    [golden vs aiter_asm]')
+    nhead_splits = nhead // 16
+    for nhead_split in range(nhead_splits):
+        logits = torch.empty((batch_size, num_kv_splits, 16, v_head_dim), dtype=torch.float32)
+        attn_lse = torch.empty((batch_size, num_kv_splits, 16, 1), dtype=torch.float32)
+        (_, _), us_asm = run_perftest(asm_mla_decode_fwd,
+                                                q[:, nhead_split*16:(nhead_split+1)*16, :],
+                                                kv_buffer.view(num_page,
+                                                                page_size,
+                                                                nhead_kv,
+                                                                qk_head_dim),
+                                                out_asm[:, nhead_split*16:(nhead_split+1)*16, :],
+                                                kv_indptr,
+                                                kv_indices,
+                                                kv_last_page_lens,
+                                                sm_scale,
+                                                num_kv_splits=num_kv_splits,
+                                                logits=logits,
+                                                attn_lse=attn_lse
+                                                )
     checkAllclose(out_ref, out_asm,
                   msg=f'attn_out    [golden vs aiter_asm]:{us_ref:.2f} us vs {us_asm:.2f} us......')
     return {'triton': us_ref,
@@ -131,7 +129,7 @@ kv_lora_rank = 512
 qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
-nhead = 16  # 128/TP8
+nhead = 32  # 128/TP8
 block_size = 1
 num_kv_splits = 16  # don't why but sglang force 16.... for triton
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
