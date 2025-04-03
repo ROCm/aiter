@@ -1589,25 +1589,25 @@ int bench_mha_fwd(int argc, std::vector<std::string> argv)
     return run<FmhaFwdFp16>(arg_parser) ? 0 : -2;
 }
 
-// int main(int argc, char* argv[])
-// {
-//     auto [result, arg_parser] = create_args(argc, argv);
-//     if(!result)
-//         return -1;
+int main(int argc, char* argv[])
+{
+    auto [result, arg_parser] = create_args(argc, argv);
+    if(!result)
+        return -1;
 
-//     const std::string data_type = arg_parser.get_str("prec");
-//     if(data_type == "fp16")
-//     {
-//         return run<FmhaFwdFp16>(arg_parser) ? 0 : -2;
-//     }
-//     else if(data_type == "bf16")
-//     {
-//         return run<FmhaFwdBf16>(arg_parser) ? 0 : -2;
-//     }
-//     else if(data_type == "fp8")
-//     {
-//         return run<FmhaFwdFp8>(arg_parser) ? 0 : -2;
-//     }
+    const std::string data_type = arg_parser.get_str("prec");
+    if(data_type == "fp16")
+    {
+        return run<FmhaFwdFp16>(arg_parser) ? 0 : -2;
+    }
+    else if(data_type == "bf16")
+    {
+        return run<FmhaFwdBf16>(arg_parser) ? 0 : -2;
+    }
+    else if(data_type == "fp8")
+    {
+        return run<FmhaFwdFp8>(arg_parser) ? 0 : -2;
+    }
 
-//     return -3;
-// }
+    return -3;
+}
