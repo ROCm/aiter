@@ -365,19 +365,16 @@ def run_benchmark(custom, args):
         if mode == "bwd":
             total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
 
-
         input_bytes = 1 if args.fp8 else q.element_size() # size of element in q,k,v in bytes
         output_bytes = q.element_size()
         if varlen:
-            total_num_tokens_q = cu_seqlens_q[-1]
-            total_num_tokens_k = cu_seqlens_k[-1]
+            total_num_tokens_q = cu_seqlens_q[-1].item()
+            total_num_tokens_k = cu_seqlens_k[-1].item()
             mem = total_num_tokens_q * HQ * D_HEAD * input_bytes + 2 * total_num_tokens_k * HK * D_HEAD * input_bytes + total_num_tokens_q * HQ * D_HEAD * output_bytes
         else:
             total_num_tokens_q = BATCH * N_CTX_Q
             total_num_tokens_k = BATCH * N_CTX_K
             mem = total_num_tokens_q * HQ * D_HEAD * input_bytes + 2 * total_num_tokens_k * HK * D_HEAD * input_bytes + total_num_tokens_q * HQ * D_HEAD * output_bytes
-
-        # return ms, total_flops / ms * 1e-9,  mem / ms * 1e-9
 
         if "ms" in provider:
             return ms

@@ -62,7 +62,7 @@ def get_model_configs(config_path='./utils/model_configs.json', models="llama3,m
     return filtered_configs
 
 
-def get_available_models(config_file='utils/model_configs.json'):
+def get_available_models(config_file='utils/model_configs.json', filter=None):
     """
     Load model names from the configuration file.
 
@@ -78,7 +78,7 @@ def get_available_models(config_file='utils/model_configs.json'):
     with open(config_path, 'r') as f:
         configs = json.load(f)
 
-    models = [f"{family}-{model}" for family in configs for model in configs[family]]
+    models = [f"{family}-{model}" for family in configs for model in configs[family] if filter is None or filter in f"{family}-{model}"]
 
     return models
 
