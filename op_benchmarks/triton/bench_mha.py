@@ -376,7 +376,6 @@ def run_benchmark(custom, args):
             total_num_tokens_q = BATCH * N_CTX_Q
             total_num_tokens_k = BATCH * N_CTX_K
             mem = total_num_tokens_q * HQ * D_HEAD * input_bytes + 2 * total_num_tokens_k * HK * D_HEAD * input_bytes + total_num_tokens_q * HQ * D_HEAD * output_bytes
-        
 
         # return ms, total_flops / ms * 1e-9,  mem / ms * 1e-9
 
@@ -442,8 +441,6 @@ def parse_args():
     parser.add_argument("-test_correctness", action='store_true', default=False,
                          help="Tests correctness of the Triton provider comparing the output to the Torch sdpa.")
     parser.add_argument("-layout", type=str, default=None, help=supported_layouts())
-    
-
     parser.add_argument(
         "-persistent", nargs='?', const='fixed', choices=['fixed', 'dynamic'], default=None,
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.")

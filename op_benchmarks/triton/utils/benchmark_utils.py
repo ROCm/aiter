@@ -2,6 +2,13 @@ import os
 import json
 import torch
 import triton.language as tl
+import sys
+import time
+import os
+import tempfile
+import re
+from prettytable import PrettyTable
+
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
@@ -76,15 +83,6 @@ def get_available_models(config_file='utils/model_configs.json'):
     return models
 
 
-
-import sys
-import time
-import os
-import tempfile
-
-import re
-from prettytable import PrettyTable
-
 def parse_vgpr_usage(file_path, table_start="result-table-name"):
     with open(file_path, "r") as f:
         lines = f.readlines()
@@ -149,3 +147,19 @@ def print_vgpr(fun, table_start="result-table-name"):
 
     # Remove the temporary file
     os.unlink(output_file)
+
+def get_dtype_bytes(dtype):
+    if dtype in [torch.float16, tl.float16]:
+        return 2
+    elif dtype in [torch.bfloat16, tl.bfloat16]:
+        return 2
+    elif dtype in [torch.float32, tl.float32]:
+        return 4
+    elif dtype == torch.int32:
+        return 4
+    elif dtype == torch.int64:
+        return 8
+    elif dtype in [torch.float8_e4m3fnuz, torch.float8_e5m2fnuz, tl.float8e4, tl.float8e5]:
+        return 1
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")

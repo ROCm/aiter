@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-from utils.benchmark_utils import get_model_configs, get_available_models
+from utils.benchmark_utils import get_model_configs, get_available_models, get_dtype_bytes, torch_to_tl_dtype
 from op_tests.triton.test_pa_decode import input_helper
 import torch
 import argparse
@@ -9,32 +9,21 @@ import sys
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="mistral")
-    moe_configs = []
-    M = args.M if args.M else 4096  # check size
-    # M, K, N, E, top_k
+    configs = get_model_configs(config_path=config_file, models="llama3" if args.model == None else args.model)
+    fa_configs = []
+    batch_size = args.b if args.b else 1024
 
     for model_name, config in configs.items():
-        N1 = config["intermediate_size"]
-        K1 = config["hidden_size"]
+        HQ = config["num_attention_heads"]
+        HK = HQ if config["num_key_value_heads"] is None else config["num_key_value_heads"]
+        SEQ_LEN = args.sq if args.sq else 8192
+        HEAD_DIM = config["hidden_size"] // HQ
+        fa_configs.append((model_name, batch_size, HQ, HK, SEQ_LEN, HEAD_DIM))
 
-        N2 = config["hidden_size"]
-        K2 = config["intermediate_size"] // 2
+    return fa_configs
 
-        E = 8
-        top_k = 2
-
-        moe_configs.append((model_name, M, N1, K1, E, top_k))
-        moe_configs.append((model_name, M, N2, K2, E, top_k))
-
-    return moe_configs
-
-
-def paged_attn(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, compute_type, output_type):
-    num_blocks = 4
-
-    query, _, _, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, num_blocks)
-    triton_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
+def paged_attn(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, num_blocks, dtype, kv_cache_dtype, compute_type, output_type):
+    query, triton_output, _, _, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
     attn_scale = 1.0 / (D**0.5)
 
     return lambda: paged_attention_decode(
@@ -50,21 +39,15 @@ def paged_attn(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, compu
     )
 
 def run_benchmark(args):
-    routed_weight = args.routed_weight
-    int8_w8a16 = args.int8_w8a16
-    fp8_w8a8 = args.fp8_w8a8
-    int4_w4a16 = args.int4_w4a16
-    group_size = args.group_size
-    has_zp = args.has_zp
     dtype = arg_to_torch_dtype[args.dtype]
-    fp8_type = arg_to_torch_dtype[args.fp8_type]
-
-    x_names = ['M', 'N', 'K', 'E', 'top_k']
-
+    kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
+    compute_type = torch_to_tl_dtype[arg_to_torch_dtype[args.compute_type]]
+    output_type = arg_to_torch_dtype[args.output_type]
 
     x_vals_list = model_benchmark_configs(args)
-    x_names = ['model', 'M', 'N', 'K', 'E', 'top_k']
+    x_names = ['model', 'batch_size', 'HQ', 'HK', 'SEQ_LEN', "HEAD_DIM"]
 
+    model_name = "paged_attn"
 
     line_names = ['Time (ms)', 'TFLOPS', 'Bandwidth (GB/s)']
     line_vals = ['time', 'tflops', 'bandwidth']
@@ -72,39 +55,31 @@ def run_benchmark(args):
     benchmark = triton.testing.Benchmark(
         x_names=x_names, x_vals=x_vals_list, line_arg='metric', line_vals=line_vals, line_names=line_names,
         styles=[('red', '-'), ('blue', '-'),
-                ('yellow', '-')], ylabel='ms / TFLOPS / GB/s', plot_name='moe-gemm-benchmark', args={})
+                ('yellow', '-')], ylabel='ms / TFLOPS / GB/s', plot_name=f'{model_name}-benchmark', args={})
 
     @triton.testing.perf_report([benchmark])
-    def bench_moe_gemm(M, N, K, E, top_k, metric, model=None):
-
-        # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
-        flops = 2.0 * M * top_k * K * N
-        # The weight is applied on the gemm product which has the shape of (M, top_k, N)
-        if routed_weight:
-            flops += M * top_k * N
-
-        if fp8_w8a8:
-            a_bytes = b_bytes = torch.tensor([], dtype=fp8_type).element_size()
-            c_bytes = torch.tensor([], dtype=dtype).element_size()
-        elif int8_w8a16:
-            b_bytes = torch.tensor([], dtype=torch.int8).element_size()
-            a_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
-        else:
-            a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
-        # TODO add the int4 case
-
-        # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
-        mem_read = (M * K) * a_bytes + (E * N * K) * b_bytes
-
-        mem_write = (M * top_k * N) * c_bytes
-        mem = mem_read + mem_write
-
-        fn = fused_moe(M, N, K, top_k, E, routed_weight=routed_weight, dtype=torch.float16, int4_w4a16=int4_w4a16,
-                fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16, group_size=group_size, has_zp=has_zp)
+    def bench_moe_gemm(batch_size, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
+        # TODO tune this
+        KV_BLK_SZ = 128
+        num_blocks = 4
+        fn = paged_attn(batch_size, HQ, HK, HEAD_DIM, KV_BLK_SZ, SEQ_LEN, num_blocks, dtype, kv_cache_dtype, compute_type, output_type)
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 
+        # query and output
+        mem = (batch_size * HQ * HEAD_DIM) * (get_dtype_bytes(dtype) + get_dtype_bytes(output_type))
+        # kv_cache
+        mem += (num_blocks * HK * KV_BLK_SZ * HEAD_DIM * get_dtype_bytes(kv_cache_dtype) * 2)
+        # block_tables int32
+        mem += batch_size * ((SEQ_LEN + KV_BLK_SZ - 1) // KV_BLK_SZ) * 4
+        # context_lens fp32
+        mem += batch_size * 4
+
+        # bhd bhsd => bhs bhsd => bhs, 2 for multiplication and accumulation. and there are 2 gemms
+        flops = (2.0 * batch_size * HQ * SEQ_LEN * HEAD_DIM) * 2
+
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+        # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active
@@ -130,15 +105,14 @@ def parse_args():
     model_help = ("Model name to benchmark. Select from: [" + ", ".join(available_models) +
                   "]. Use 'all' to benchmark all models or leave blank for the default benchmark script.")
     parser.add_argument('-model', type=str, default=None, help=model_help)
-    parser.add_argument("-M", type=int, default=0, help="M dimension")
-    parser.add_argument("-group_size", type=int, default=16, help="group_size for in4")
-    parser.add_argument("-routed_weight", action='store_true', default=False)
-    parser.add_argument("-int8_w8a16", action='store_true', default=False)
-    parser.add_argument("-fp8_w8a8", action='store_true', default=False)
-    parser.add_argument("-int4_w4a16", action='store_true', default=False)
-    parser.add_argument("-has_zp", action='store_true', default=False)
+    parser.add_argument("-b", type=int, default=0)
+    parser.add_argument("-hq", type=int, default=0)
+    parser.add_argument("-hk", type=int, default=0)
+    parser.add_argument("-sq", type=int, default=0)
     parser.add_argument("-dtype", default='fp16')
-    parser.add_argument("-fp8_type", default='e5m2fnuz')
+    parser.add_argument("-kv_cache_dtype", default='fp16')
+    parser.add_argument("-compute_type", default='fp16')
+    parser.add_argument("-output_type", default='fp16')
     args = parser.parse_args()
     return args
 

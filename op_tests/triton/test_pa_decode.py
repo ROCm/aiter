@@ -57,7 +57,7 @@ def paged_attention_decode_ref(
 
 tl_to_torch_dtype = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
 
-def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, num_blocks=4):
+def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks=4):
     """Helper function to generate input tensors for paged attention testing."""
     # Query tensor generation
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -103,7 +103,9 @@ def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, num
         block_tables.append(block_table)
     block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
 
-    return query, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len
+    output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
+
+    return query, output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len
 
 @pytest.mark.parametrize(
     "B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN",
@@ -210,13 +212,13 @@ def test_paged_attn(
     num_blocks = 4
 
     # Generate inputs using helper function
-    query, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, num_blocks)
+    query, triton_output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len \
+        = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
 
     # Attention scale
     attn_scale = 1.0 / (D**0.5)
 
     # Triton computation
-    triton_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
     paged_attention_decode(
         triton_output,
         query,
