@@ -72,7 +72,7 @@ float mha_fwd(mha_fwd_args args,
 }"""
 
 FMHA_VARLEN_FWD_API = """
-float mha_fwd_splitkv(fmha_fwd_splitkv_args args,
+float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       const ck_tile::stream_config& stream_config,
                       mask_info mask,
                       std::string q_dtype_str,

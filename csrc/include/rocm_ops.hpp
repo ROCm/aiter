@@ -512,3 +512,6 @@
       m.def("rocb_destroy_extension", &rocb_destroy_extension, "destroy_extension"); \
       m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
       m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
+
+#define BENCH_MHA_FWD_PYBIND                                                         \
+      m.def("bench_mha_fwd", &bench_mha_fwd, py::arg("argc"), py::arg("argv"));
