@@ -23,9 +23,7 @@ void mla_decode_fwd(
 ){
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
     const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
-    if (!q.is_contiguous()) {
-        throw std::invalid_argument("mla_decode_fwd: only support Q.is_contiguous() for now");
-    }
+
     if (q.dtype() != torch::kBFloat16) {
         throw std::invalid_argument("mla_decode_fwd: only support dtype == torch.bfloat16 for now");
     }

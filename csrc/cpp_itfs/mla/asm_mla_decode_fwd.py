@@ -37,8 +37,6 @@ def asm_mla_decode_fwd(q,         # [num_seqs, num_heads, head_size]
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
-    if not q.is_contiguous():
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support Q.is_contiguous() for now")
     
     if q.dtype != torch.bfloat16:
         raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support dtype == torch.bfloat16 for now")
@@ -81,6 +79,7 @@ def asm_mla_decode_fwd(q,         # [num_seqs, num_heads, head_size]
         raise ValueError(f"{asm_mla_decode_fwd.__name__}: num_kv_splits != logits.size(1)")
 
     func = compile(f"{AITER_CORE_DIR}/hsa/mla_stage1_a16w16_bf16.co", page_size, "__hip_bfloat16", "__hip_bfloat16", num_kv_splits, v_head_dim)
+
     func(*torch_to_c_types(q, kv_buffer, kv_indptr, kv_page_indices, kv_last_page_lens, softmax_scale, logits, attn_lse, output, num_seqs, num_heads, num_kv_heads, q.stride(0), kv_buffer.stride(0), attn_lse.stride(0), attn_lse.stride(1), attn_lse.stride(2), output.stride(0), output.stride(1), torch.cuda.current_stream()))
     return logits, attn_lse 
 
