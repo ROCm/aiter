@@ -1,51 +1,34 @@
 import triton
 import triton.language as tl
 from utils.benchmark_utils import get_model_configs, get_available_models, get_dtype_bytes, torch_to_tl_dtype
-from op_tests.triton.test_pa_decode import input_helper
+from op_tests.triton.test_pa_prefill import input_helper, STR_DTYPE_TO_TORCH_DTYPE
 import torch
 import argparse
-from aiter.ops.triton.pa_decode import paged_attention_decode
+from aiter.ops.triton.pa_prefill import context_attention_fwd
 import sys
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="llama3" if args.model == None else args.model)
+    configs = get_model_configs(config_path=config_file, models="llama3,deepseek" if args.model == None else args.model)
     fa_configs = []
-    batch_size = args.b if args.b else 1024
+    BS = args.b if args.b else 16
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
         HK = HQ if config["num_key_value_heads"] is None else config["num_key_value_heads"]
-        SEQ_LEN = args.sq if args.sq else 8192
+        SEQ_LEN = args.sq if args.sq else 1024
         HEAD_DIM = config["hidden_size"] // HQ
-        fa_configs.append((model_name, batch_size, HQ, HK, SEQ_LEN, HEAD_DIM))
+        fa_configs.append((model_name, BS, HQ, HK, SEQ_LEN, HEAD_DIM))
 
     return fa_configs
 
-def paged_attn(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, num_blocks, dtype, kv_cache_dtype, compute_type, output_type):
-    query, triton_output, _, _, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
-    attn_scale = 1.0 / (D**0.5)
-
-    return lambda: paged_attention_decode(
-        triton_output,
-        query,
-        key_cache_tri,
-        value_cache_tri,
-        context_lens,
-        block_tables,
-        attn_scale,
-        max_context_len,
-        compute_type,
-    )
-
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
-    kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
-    compute_type = torch_to_tl_dtype[arg_to_torch_dtype[args.compute_type]]
-    output_type = arg_to_torch_dtype[args.output_type]
+    kv_cache_dtype = args.kv_cache_dtype
+    use_alibi_slope = args.use_alibi_slope
 
     x_vals_list = model_benchmark_configs(args)
-    x_names = ['model', 'batch_size', 'HQ', 'HK', 'SEQ_LEN', "HEAD_DIM"]
+    x_names = ['model', 'BS', 'HQ', 'HK', 'MAX_SEQ_LEN', "HEAD_DIM"]
 
     model_name = "paged-attn-decode"
 
@@ -58,25 +41,74 @@ def run_benchmark(args):
                 ('yellow', '-')], ylabel='ms / TFLOPS / GB/s', plot_name=f'{model_name}-benchmark', args={})
 
     @triton.testing.perf_report([benchmark])
-    def bench_paged_attn_decode(batch_size, HQ, HK, SEQ_LEN, HEAD_DIM, metric, model=None):
+    def bench_paged_attn_decode(BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM, metric, model=None):
         # TODO tune this
-        KV_BLK_SZ = 128
-        num_blocks = 4
-        fn = paged_attn(batch_size, HQ, HK, HEAD_DIM, KV_BLK_SZ, SEQ_LEN, num_blocks, dtype, kv_cache_dtype, compute_type, output_type)
+        MAX_CTX_LEN = MAX_SEQ_LEN
+        max_block_per_request = 1024
 
+        block_size = MAX_SEQ_LEN // max_block_per_request
+
+        cache_size = max_block_per_request * BS
+
+        if kv_cache_dtype == "auto":
+            torch_kv_cache_dtype = dtype
+        else:
+            torch_kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+
+        num_queries_per_kv = HQ // HK
+
+        query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, alibi_slopes = input_helper(
+            BS=BS,
+            MAX_SEQ_LEN=MAX_SEQ_LEN,
+            MAX_CTX_LEN=MAX_CTX_LEN,
+            cache_size=cache_size,
+            block_size=block_size,
+            max_block_per_request=max_block_per_request,
+            num_heads=HQ,
+            head_size=HEAD_DIM,
+            num_queries_per_kv=num_queries_per_kv,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            device=[f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)][0],
+            use_alibi_slope=use_alibi_slope,
+        )
+
+        num_tokens = query.shape[0]
+        fn = lambda: context_attention_fwd(
+            query,
+            k,
+            v,
+            output,
+            kv_cache_dtype,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            alibi_slopes=alibi_slopes,
+        )
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 
         # query and output
-        mem = (batch_size * HQ * HEAD_DIM) * (get_dtype_bytes(dtype) + get_dtype_bytes(output_type))
+        mem = (num_tokens * HQ * HEAD_DIM) * get_dtype_bytes(dtype) * 2
         # kv_cache
-        mem += (num_blocks * HK * KV_BLK_SZ * HEAD_DIM * get_dtype_bytes(kv_cache_dtype) * 2)
+        mem += (cache_size * block_size * HK * HEAD_DIM * get_dtype_bytes(torch_kv_cache_dtype) * 2)
+        # k, v
+        mem += (num_tokens * HK * HEAD_DIM * get_dtype_bytes(dtype) * 2)
         # block_tables int32
-        mem += batch_size * ((SEQ_LEN + KV_BLK_SZ - 1) // KV_BLK_SZ) * 4
-        # context_lens fp32
-        mem += batch_size * 4
+        mem += BS * max_block_per_request * 4
+        # b_seq_len int32
+        mem += BS * 4
+        # b_start_loc int32
+        mem += BS * 4
 
-        # bhd bhsd => bhs bhsd => bhs, 2 for multiplication and accumulation. and there are 2 gemms
-        flops = (2.0 * batch_size * HQ * SEQ_LEN * HEAD_DIM) * 2
+        # cache
+        flops = (2.0 * BS * HQ * (num_tokens // BS) * (num_tokens // BS) * HEAD_DIM) * 2
+        # casual
+        flops += (2.0 * BS * HQ * max_block_per_request * (num_tokens // BS) * HEAD_DIM) * 2 // 2
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
@@ -109,10 +141,11 @@ def parse_args():
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sq", type=int, default=0)
+    parser.add_argument("-use_alibi_slope", action='store_true', default=False)
     parser.add_argument("-dtype", default='fp16')
-    parser.add_argument("-kv_cache_dtype", default='fp16')
+    parser.add_argument("-kv_cache_dtype", default='auto')
     parser.add_argument("-compute_type", default='fp16')
-    parser.add_argument("-output_type", default='fp16')
+
     args = parser.parse_args()
     return args
 
