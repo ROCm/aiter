@@ -189,7 +189,7 @@ def ck_moe_2stages(a1,
 
     # print("block_size:", block_size, sorted_expert_ids)
     if w1.dtype == torch.float8_e4m3fnuz:
-        a1, a1_scale = aiter.per_tensor_quant_fp8_hip(a1, a1_scale)
+        a1, a1_scale = aiter.per_tensor_quant_hip(a1, a1_scale, quant_dtype=w1.dtype)
         # a1, a1_scale = aiter.per_tensor_quant(a1, quant_dtype=w1.dtype)
     else:
         a1_scale = None
@@ -221,7 +221,7 @@ def ck_moe_2stages(a1,
         aiter.silu_and_mul(tmp, a2)
         a2 = tmp
       if w2.dtype == torch.float8_e4m3fnuz:
-        a2, a2_scale = aiter.per_tensor_quant_fp8_hip(a2, a2_scale)
+        a2, a2_scale = aiter.per_tensor_quant_hip(a2, a2_scale, quant_dtype=w2.dtype)
         # a2, a2_scale = aiter.per_tensor_quant(a2, quant_dtype=w2.dtype)
       else:
         if not hasattr(ck_moe_2stages, "one_float_tensor"):
