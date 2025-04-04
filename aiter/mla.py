@@ -136,3 +136,50 @@ def mla_decode_fwd(
         **extra_kargs,
     )
     return logits, attn_lse
+
+
+def mla_prefill_fwd(
+    q,  # [num_seqs, num_heads, head_size]
+    kv_buffer,  # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    o,  # [num_seqs, num_heads, v_head_dim]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    kv_last_page_lens,
+    max_seqlen_q,
+    sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
+    logit_cap=0.0,
+    num_kv_splits=None,  # for experts only!!!
+):
+    device = q.device
+    assert logit_cap <= 0, f"{logit_cap=} is not support yet"
+    if sm_scale is None:
+        sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
+    bs, nhead, v_head_dim = o.shape
+
+    num_kv_splits = 1
+
+    # logits = o.view(bs, num_kv_splits, nhead, v_head_dim)
+    logits = torch.empty(
+        (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+    )
+    attn_lse = torch.empty(
+        (bs, num_kv_splits, nhead, 1), dtype=torch.float, device=device
+    )
+
+    aiter.mla_prefill_asm_fwd(
+        q,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_last_page_lens,
+        max_seqlen_q,
+        sm_scale,
+        logits,
+        attn_lse,
+    )
+
+    return logits.view(bs, nhead, v_head_dim).to(o.dtype), attn_lse
