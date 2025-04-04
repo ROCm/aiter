@@ -71,7 +71,7 @@ float mha_fwd(mha_fwd_args args,
     return fmha_fwd(traits, args, stream_config);
 }"""
 
-FMHA_VARLEN_FWD_API = """
+FMHA_FWD_SPLITKV_API = """
 float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       const ck_tile::stream_config& stream_config,
                       mask_info mask,
@@ -88,7 +88,8 @@ float mha_fwd_splitkv(mha_fwd_splitkv_args args,
 
 API_MAP = {
     1: FMHA_FWD_API,
-    2: FMHA_FWD_API + FMHA_VARLEN_FWD_API,
+    2: FMHA_FWD_SPLITKV_API,
+    3: FMHA_FWD_API + FMHA_FWD_SPLITKV_API,
 }
 
 def write_blobs(output_dir: Optional[str], receipt) -> None:
@@ -118,8 +119,9 @@ if __name__ == "__main__":
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt. 1: generate fmha fwd c++ api\n"  + \
-             "  2: generate fmha varlen fwd c++ api, also can be use for PREBUILD"
+        help="codegen receipt. 1: generate mha_fwd c++ api\n"  + \
+             "  2. generate mha_fwd_splitkv c++ api\n"  + \
+             "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD"
     )
 
     args = parser.parse_args()

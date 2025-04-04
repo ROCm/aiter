@@ -1101,7 +1101,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    bias.type,
                                    lse);
         }
-#endif
+#else
         // fmha_fwd_traits fmha_traits;
         // init_traits(fmha_traits);
 
@@ -1115,6 +1115,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                        mode == mode_enum::group,
                        bias.type,
                        lse);
+#endif
     }();
 
     if(appendkv_ave_time < 0.0f || fwd_ave_time < 0.0f)

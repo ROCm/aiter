@@ -270,4 +270,6 @@ if __name__ == '__main__':
     # )
     # args = sys.argv[1:]
     # print("Received arguments:", args)
-    aiter.bench_mha_fwd()
+    # aiter.bench_mha_fwd()
+    # aiter.bench_mha_fwd_splitkv()
+    aiter.bench_mha_bwd()
