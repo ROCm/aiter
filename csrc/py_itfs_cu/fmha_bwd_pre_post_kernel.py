@@ -2047,7 +2047,7 @@ def write_bwd_blobs(output_dir : Path, filter_list : str, receipt: int) -> None:
     api_pool = FmhaBwdApiPool()
     write_bwd_api(api_pool, output_dir)
 
-    if receipt == 2:
+    if receipt == 0:
         filter_list = filter_list.split('@')
         filter_list.extend([''] * (3 - len(filter_list)))
 
@@ -2086,8 +2086,8 @@ if __name__ == "__main__":
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt. 1: only generate mha_bwd dqdkdv kernel \n"  + \
-             "  2. generate dot_do_o, dqdkdv and convert_dq kernels \n"
+        help="codegen receipt.  0. generate dot_do_o, dqdkdv and convert_dq kernels \n"  + \
+             " 1: only generate mha_bwd dqdkdv kernels \n"
     )
     # TODO: if using filter, must apply same value to output_dir and list_blobs
     parser.add_argument(
