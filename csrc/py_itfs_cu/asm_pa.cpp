@@ -52,7 +52,8 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      std::optional<torch::Tensor> &K_QScale,
                      std::optional<torch::Tensor> &V_QScale,
                      std::optional<torch::Tensor> &out_,
-                     std::optional<int> high_precision = 1)
+                     std::optional<int> high_precision = 1,
+                     std::optional<std::tuple<int, int>> block_shape = std::nullopt)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch = context_lens.size(0);
@@ -106,7 +107,25 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     AiterAsmKernel *impl_ptr = nullptr;
     if (K_QScale)
     {
-        if (Q.dtype() == at::ScalarType::Half)
+        if (block_shape.has_value())
+        {
+            if (block_shape.value() == std::make_tuple(128, 128) && Q.dtype() == at::ScalarType::BFloat16 && K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            {
+                static AiterAsmKernel impl_a16w16_b16_f8_blockscale128("pa_a16w8_2tg_g8_f8_kv128_bf16", "pa_a16w8_2tg_g8_f8_kv128_bf16.co");
+                impl_ptr = &impl_a16w16_b16_f8_blockscale128;
+            }
+            else if (block_shape.value() == std::make_tuple(256, 128) && Q.dtype() == at::ScalarType::BFloat16 && K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            {
+                static AiterAsmKernel impl_a16w16_b16_f8_blockscale256("pa_a16w8_2tg_g8_f8_kv256_bf16", "pa_a16w8_2tg_g8_f8_kv256_bf16.co");
+                impl_ptr = &impl_a16w16_b16_f8_blockscale256;
+            }
+            else
+            {
+                TORCH_CHECK(false,
+                            __func__, ": only support block_shape == (128, 128) | (256, 128), Q dtype == BFloat16 and quantType == fp8 for now");
+            }
+        }
+        else if (Q.dtype() == at::ScalarType::Half)
         {
             if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
             {
