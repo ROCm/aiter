@@ -12,17 +12,20 @@ def bench_mha_fwd(
     argv
 ): ...
 
+
 @compile_ops("module_bench_mha_fwd_splitkv", fc_name="bench_mha_fwd_splitkv")
 def bench_mha_fwd_splitkv(
     argc,
     argv
 ): ...
 
+
 @compile_ops("module_bench_mha_bwd", fc_name="bench_mha_bwd")
 def bench_mha_bwd(
     argc,
     argv
 ): ...
+
 
 @compile_ops("module_mha_fwd", fc_name="mha_fwd")
 def mha_fwd(
@@ -175,8 +178,6 @@ def fmha_v3_varlen_bwd(
     gen: Optional[Generator] = None,
 ): ...
 
-# def _bench(argc, argv):
-#     res = bench(argc, argv)
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x

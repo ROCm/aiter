@@ -240,36 +240,35 @@ def test_flash_attn_output(
 
 
 if __name__ == '__main__':
-    # batch_size = 2
-    # nheads = 5
-    # (seqlen_q, seqlen_k) = (128, 128)
-    # d = 64
-    # d_v = 64
-    # dropout_p = 0.0
-    # causal = False
-    # local = False
-    # bias_type = 'no'
-    # deterministic = False
-    # mha_type = 'mha'
-    # dtype = torch.bfloat16
+    batch_size = 2
+    nheads = 5
+    (seqlen_q, seqlen_k) = (128, 128)
+    d = 64
+    d_v = 64
+    dropout_p = 0.0
+    causal = False
+    local = False
+    bias_type = 'no'
+    deterministic = False
+    mha_type = 'mha'
+    dtype = torch.bfloat16
 
-    # test_flash_attn_output(
-    #     batch_size,
-    #     nheads,
-    #     seqlen_q,
-    #     seqlen_k,
-    #     d,
-    #     d_v,
-    #     dropout_p,
-    #     causal,
-    #     local,
-    #     bias_type,
-    #     deterministic,
-    #     mha_type,
-    #     dtype
-    # )
-    # args = sys.argv[1:]
-    # print("Received arguments:", args)
-    aiter.bench_mha_fwd()
+    test_flash_attn_output(
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        d,
+        d_v,
+        dropout_p,
+        causal,
+        local,
+        bias_type,
+        deterministic,
+        mha_type,
+        dtype
+    )
+
+    # aiter.bench_mha_fwd()
     # aiter.bench_mha_fwd_splitkv()
     # aiter.bench_mha_bwd()

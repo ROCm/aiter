@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# This file origins from pytorch: 
+# https://github.com/pytorch/pytorch/blob/main/torch/utils/cpp_extension.py
+# We make slight changes to enable ninja response file 
 # mypy: allow-untyped-defs
 import copy
 import glob
@@ -37,9 +42,7 @@ CLIB_EXT = '.dll' if IS_WINDOWS else '.so'
 SHARED_FLAG = '/DLL' if IS_WINDOWS else '-shared'
 
 # fix torch path
-_HERE = os.path.abspath(__file__)
 _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
-print("============================================", _TORCH_PATH)
 TORCH_LIB_PATH = os.path.join(_TORCH_PATH, 'lib')
 
 

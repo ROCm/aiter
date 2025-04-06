@@ -5,6 +5,7 @@ import os
 import sys
 import shutil
 import time
+import types
 import importlib
 import functools
 import traceback
@@ -391,7 +392,11 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 verbose = d_args["verbose"]
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
-            op = getattr(module, loadName)
+                
+            if isinstance(module, types.ModuleType):
+                op = getattr(module, loadName)
+            else:
+                return None
 
             if AITER_LOG_MORE == 2:
                 from ..test_common import log_args
