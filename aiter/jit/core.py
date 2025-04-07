@@ -10,8 +10,8 @@ import importlib
 import functools
 import traceback
 from typing import List, Optional
+from . import cpp_extension
 import torch
-from aiter.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json

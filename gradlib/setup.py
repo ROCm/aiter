@@ -15,10 +15,15 @@
  * limitations under the License.
  '''
 import os
-
+import sys
 import torch
 from setuptools import setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+aiter_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, f'{aiter_dir}/aiter/')
+from jit.cpp_extension import (
+    BuildExtension,
+    CUDAExtension,
+)
 from torch.utils.hipify import hipify_python
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
