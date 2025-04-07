@@ -13,14 +13,14 @@ from packaging.version import parse, Version
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f'{this_dir}/aiter/')
 from jit import core
-import torch
-from aiter.utils.cpp_extension import (
+from utils.cpp_extension import (
     BuildExtension,
     CppExtension,
     CUDAExtension,
     ROCM_HOME,
     IS_HIP_EXTENSION,
 )
+import torch
 
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
