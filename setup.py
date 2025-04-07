@@ -57,7 +57,10 @@ if IS_ROCM:
                      "module_mha_bwd",
                      "module_mha_varlen_bwd",
                      "module_fmha_v3_bwd",
-                     "module_fmha_v3_varlen_bwd"]
+                     "module_fmha_v3_varlen_bwd",
+                     "module_bench_mha_fwd",
+                     "module_bench_mha_fwd_splitkv",
+                     "module_bench_mha_bwd"]
         all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list=[el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
@@ -101,27 +104,8 @@ class NinjaBuildExtension(BuildExtension):
             max_jobs = int(
                 max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
             os.environ["MAX_JOBS"] = str(max_jobs)
-        # print("\n=======================hack to build module_bench_xxx=============================\n")
 
         super().__init__(*args, **kwargs)
-
-    # def build_extension(self, ext):
-    #     print("\n=======================hack to build module_bench_xxx=============================\n")
-    #     if ext.name in ["module_bench_mha_fwd", "module_bench_mha_fwd_splitkv", "module_bench_mha_bwd"]:
-    #         ext.is_python = False
-        
-    #         super().build_extension(ext)
-
-    #         build_dir = self.get_ext_fullpath(ext.name)
-    #         with open(os.path.join(build_dir, 'build.ninja'), 'r+') as f:
-    #             content = f.read()
-    #             content = content.replace('-shared', '')
-    #             f.seek(0)
-    #             f.write(content)
-    #             f.truncate()
-        
-    #     else:
-    #         super().build_extension(ext)
 
 setup(
     name=PACKAGE_NAME,
