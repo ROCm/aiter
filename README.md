@@ -14,16 +14,15 @@ Some summary of the features:
 
 
 ## Installation
-`git clone --recursive https://github.com/ROCm/aiter.git`
-
-or
-
-`git submodule sync ; git submodule update --init --recursive`
-
-Then
 ```
+git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
 python3 setup.py develop
+```
+
+If you happen to forget the `--recursive` during `clone`, you can use the following command after `cd aiter`
+```
+git submodule sync && git submodule update --init --recursive
 ```
 
 ## Run operators supported by aiter
