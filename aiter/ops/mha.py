@@ -810,7 +810,7 @@ def _flash_attn_varlen_forward(
             '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd)]
         blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
             '--receipt 200 --filter {} --output_dir {{}}'.format('" @ "'))
-        blob_gen_cmd.append(f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}')
+        blob_gen_cmd.append(f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}')
     else:
         filter_fwd_splitkv1 = '*'   # get_fwd_splitkv_combine_blobs()
         filter_fwd_splitkv2 = '*'   # get_fwd_splitkv_blobs()
@@ -852,7 +852,7 @@ def _flash_attn_varlen_forward(
             '--receipt 200 --filter {} --output_dir {{}}'.format('" "')]
         blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
             '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd_splitkv))
-        blob_gen_cmd.append(f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}')
+        blob_gen_cmd.append(f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}')
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
