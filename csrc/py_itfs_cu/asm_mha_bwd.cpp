@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
+fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
     // sizes
     const int b,
     const int seqlen_q,
@@ -345,7 +345,7 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         ck_tile::stream_config stream_config{stream};
 
         auto args =
-        get_ck_fmha_bwd_args(
+            get_asm_fmha_bwd_args(
                 mask,
                 batch_size,
                 seqlen_q,

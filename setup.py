@@ -52,13 +52,7 @@ if IS_ROCM:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
-        exclude_ops=["module_mha_fwd",
-                     "module_mha_varlen_fwd",
-                     "module_mha_bwd",
-                     "module_mha_varlen_bwd",
-                     "module_fmha_v3_bwd",
-                     "module_fmha_v3_varlen_bwd",
-                     "module_bench_mha_fwd",
+        exclude_ops=["module_bench_mha_fwd",
                      "module_bench_mha_fwd_splitkv",
                      "module_bench_mha_bwd"]
         all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)

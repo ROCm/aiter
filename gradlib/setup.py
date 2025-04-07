@@ -38,7 +38,7 @@ extra_args = ["--offload-arch=" + g for g in gpus]
 #sets_rocm_pytorch = False
 maj_ver, min_ver, *_ = torch.__version__.split('.')
 if int(maj_ver) > 1 or (int(maj_ver) == 1 and int(min_ver) >= 5):
-    from torch.utils.cpp_extension import ROCM_HOME
+    from jit.cpp_extension import ROCM_HOME
     is_rocm_pytorch = bool(torch.version.hip is not None
                            and ROCM_HOME is not None)
 
