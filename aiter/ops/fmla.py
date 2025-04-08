@@ -42,6 +42,20 @@ def flash_mla_fwd_with_kvcache_impl(
 ) -> Tuple[Tensor, Tensor]:
     ...
 
+@compile_ops("module_fmla_fwd")
+def flash_mla_fwd_prefill_with_kvcache_impl(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    head_dim_v: int,
+    cache_seqlens: Tensor,
+    block_table: Tensor,
+    softmax_scale: float,
+    causal: bool,
+) -> Tuple[Tensor, Tensor]:
+    ...
+
+
 def flash_mla_fwd_with_kvcache(
     q: Tensor,
     k_cache: Tensor,
@@ -83,4 +97,29 @@ def flash_mla_fwd_with_kvcache(
         tile_scheduler_metadata,
         num_splits,
     )
+    return out, softmax_lse
+
+
+def flash_mla_fwd_prefill_with_kvcache(
+    q: Tensor,
+    k_cache: Tensor,
+    block_table: Tensor,
+    cache_seqlens: Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: Tensor,
+    num_splits: Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+) -> Tuple[Tensor, Tensor]:
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    out, softmax_lse = flash_mla_fwd_prefill_with_kvcache_impl(
+        q,
+        k_cache,
+        k_cache,
+        head_dim_v,
+        cache_seqlens,
+        block_table,
+        softmax_scale,
+        causal)
     return out, softmax_lse

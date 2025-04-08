@@ -29,3 +29,13 @@ std::vector<torch::Tensor> flash_mla_fwd_with_kvcache_impl(
     const torch::Tensor& tile_scheduler_metadata,   // [num cu parts, metadata size]
     const torch::Tensor& num_splits                 // [batch size + 1]
 );
+
+std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
+    torch::Tensor& query,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    const int32_t        head_size_v,
+    const torch::Tensor& cache_seqlens,
+    const torch::Tensor& block_table,
+    const float          softmax_scale,
+    const bool           is_causal);
