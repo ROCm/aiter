@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-# This file origins from pytorch: 
+# This file origins from pytorch:
 # https://github.com/pytorch/pytorch/blob/main/torch/utils/cpp_extension.py
-# We make slight changes to enable ninja response file 
+# We make slight changes to enable ninja response file
 # mypy: allow-untyped-defs
 import copy
 import glob
@@ -1668,6 +1668,19 @@ def load_inline(name,
         keep_intermediates=keep_intermediates)
 
 
+def get_args(func):
+    import inspect
+
+    sig = inspect.signature(func)
+    params = sig.parameters
+    args = {}
+
+    for param in params.values():
+        args[param.name] = None
+
+    return args
+
+
 def _jit_compile(name,
                  sources,
                  extra_cflags,
@@ -1687,15 +1700,25 @@ def _jit_compile(name,
         with_cuda = any(map(_is_cuda_file, sources))
     with_cudnn = any('cudnn' in f for f in extra_ldflags or [])
     old_version = JIT_EXTENSION_VERSIONER.get_version(name)
-    version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(
-        name,
-        sources,
-        build_arguments=[extra_cflags, extra_cuda_cflags, extra_ldflags, extra_include_paths],
-        build_directory=build_directory,
-        with_cuda=with_cuda,
-        is_python_module=is_python_module,
-        is_standalone=is_standalone,
+
+    args = get_args(JIT_EXTENSION_VERSIONER.bump_version_if_changed)
+    args.update(
+        {
+            "name": name,
+            "source_files": sources,
+            "build_arguments": [
+                extra_cflags,
+                extra_cuda_cflags,
+                extra_ldflags,
+                extra_include_paths,
+            ],
+            "build_directory": build_directory,
+            "with_cuda": with_cuda,
+            "is_python_module": is_python_module,
+            "is_standalone": is_standalone,
+        }
     )
+    version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(**args)
     if version > 0:
         if version != old_version and verbose:
             print(f'The input conditions for extension module {name} have changed. ' +
