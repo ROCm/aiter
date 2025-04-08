@@ -133,7 +133,13 @@ def test_mla(
     max_seqlen_kv = seq_lens_kv.max().item()
     total_qo = qo_indptr[-1].item()
     total_kv = kv_indptr[-1].item()
-
+    kv_buffer = torch.randn(
+        (num_page * page_size, 1, kv_lora_rank + qk_rope_head_dim),
+        dtype=kvtype,
+    )
+    us_aiter = None
+    us_triton = None
+    us_asm = None
     # for none absorb (mha)
     if batch_size * ctx_lens < 128 * 8192:
         # attention_ref will OOO for big input...
@@ -143,6 +149,7 @@ def test_mla(
         q = torch.randn((total_qo, nhead, qk_head_dim), dtype=dtype)
         k = torch.randn((total_kv, nhead, qk_head_dim), dtype=dtype)
         v = torch.randn((total_kv, nhead, v_head_dim), dtype=dtype)
+
         out_ref, us_ref = run_perftest(
             torch_mha_extend,
             q,
@@ -185,11 +192,6 @@ def test_mla(
     nhead_kv = 1
     v_head_dim = kv_lora_rank
     sm_scale = 1.0 / (qk_head_dim**0.5)
-
-    kv_buffer = torch.randn(
-        (num_page * page_size, nhead_kv, qk_head_dim),
-        dtype=kvtype,
-    )
 
     # test prefill
     if batch_size * ctx_lens < 32 * 8192:
@@ -322,7 +324,7 @@ def test_mla(
         out_asm,
         msg=f"mla_decode-absorb    [golden vs aiter_asm]:{us_ref:.2f} us vs {us_asm:.2f} us......",
     )
-    return {"triton": us_ref, "asm": us_asm}
+    return {"ck_576": us_aiter, "triton_576": us_triton, "asm_576": us_asm}
 
 
 kv_lora_rank = 512
@@ -331,6 +333,7 @@ qk_rope_head_dim = 64
 v_head_dim = 128
 nhead = 16  # 128/TP8
 block_size = 1
+df = []
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
     for ctx_len in [21, 64, 256, 512, 1024, 3200, 8192][:]:
         for batch_size in [1, 2, 3, 5, 16, 32, 64, 128, 256][:]:
@@ -345,5 +348,11 @@ for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
                 dtype,
                 kvtype,
                 block_size,
-                varlen=True,
+                varlen=False,
             )
+            df.append(ret)
+import pandas as pd
+
+df = pd.DataFrame(df)
+# df.to_csv("mla_prefill.csv")
+print(df)

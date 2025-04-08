@@ -61,8 +61,11 @@ def perftest(num_iters=101, num_warmup=5, testGraph=False, num_rotate_args=3):
 def benchmark():
     def decorator(func):
         def wrapper(*args, **kwargs):
-            log_args(func, *args, **kwargs)
-            return func(*args, **kwargs)
+            callargs=log_args(func, *args, **kwargs)
+            ret = func(*args, **kwargs)
+            if ret is not None:
+                callargs.update(ret)
+            return callargs
         return wrapper
     return decorator
 
@@ -106,9 +109,10 @@ def log_args(func, *args, **kwargs):
                 el = list(el[:viewNum])+['...']
             return f'\n{" "*(len(prefix)+31)}'.join(['(']+[f" {getTensorInfo(e)}" for e in el]+[')'])
         return el
-    callargs = [f"{el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
-    callargs = f',\n{blanks}'.join(callargs)
-    logger.info(f"\n{prefix}{callargs})")
+    info = [f"{el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
+    info = f",\n{blanks}".join(info)
+    logger.info(f"\n{prefix}{info})")
+    return callargs
 
 
 def get_trace_perf(prof, num_iters):
