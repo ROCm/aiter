@@ -350,7 +350,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
             # no find opt_name in json.
             elif data.get(ops_name) == None:
                 logger.warning(
-                    "Not found this operator in 'optCompilerConfig.json'. ")
+                    "Not found this operator ("+ ops_name + ") in 'optCompilerConfig.json'. ")
                 return d_opt_build_args
             # parser single opt
             else:
