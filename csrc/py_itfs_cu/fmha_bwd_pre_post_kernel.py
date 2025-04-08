@@ -2043,33 +2043,23 @@ def write_single_bwd_convert_dq_kernel(kernel: FmhaBwdConvertQGradKernel, autoge
 def write_bwd_api(api_pool : FmhaBwdApiPool, autogen_dir: Path) -> None:
     (autogen_dir / FMHA_BWD_API_FILENAME).write_text(api_pool.api)
 
-def write_bwd_blobs(output_dir : Path, filter_list : str) -> None:
-    filter_list = filter_list.split('@')
-    filter_list.extend([''] * (3 - len(filter_list)))
-
-    kernels = get_bwd_dot_do_o_blobs(filter_list[0])
-    for kernel in kernels:
-        write_single_bwd_dot_do_o_kernel(kernel, output_dir)
-    kernels = get_bwd_convert_dq_blobs(filter_list[1])
-    for kernel in kernels:
-        write_single_bwd_convert_dq_kernel(kernel, output_dir)
+def write_bwd_blobs(output_dir : Path, filter_list : str, receipt: int) -> None:
     api_pool = FmhaBwdApiPool()
     write_bwd_api(api_pool, output_dir)
 
-def list_bwd_blobs(file_path : Path, filter_list : str) -> None:
-    filter_list = filter_list.split('@')
-    filter_list.extend([''] * (3 - len(filter_list)))
+    if receipt == 0:
+        filter_list = filter_list.split('@')
+        filter_list.extend([''] * (3 - len(filter_list)))
 
-    with file_path.open('a') as f:
         kernels = get_bwd_dot_do_o_blobs(filter_list[0])
         for kernel in kernels:
-            f.write(str(file_path.parent / GEN_DIR / kernel.filename) + "\n")
+            write_single_bwd_dot_do_o_kernel(kernel, output_dir)
         kernels = get_bwd_convert_dq_blobs(filter_list[1])
         for kernel in kernels:
-            f.write(str(file_path.parent / GEN_DIR / kernel.filename) + "\n")
-        f.write(str(file_path.parent / GEN_DIR / FMHA_BWD_API_FILENAME) + "\n")
+            write_single_bwd_convert_dq_kernel(kernel, output_dir)
 
-def write_blobs(output_dir: Optional[str], filters_list : List[str]) -> None:
+
+def write_blobs(output_dir: Optional[str], filters_list : List[str], receipt: int) -> None:
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:
@@ -2078,18 +2068,7 @@ def write_blobs(output_dir: Optional[str], filters_list : List[str]) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for kernel_filter in filters_list:
-        write_bwd_blobs(output_dir, kernel_filter)
-
-# list all the files that will be generated
-def list_blobs(output_file : Optional[str], filters_list : List[str]) -> None:
-    assert output_file is not None
-    file_path = Path(output_file)
-
-    # create an empty file / drop its contents if it exists
-    open(file_path, "w").close()
-
-    for kernel_filter in filters_list:
-        list_bwd_blobs(file_path, kernel_filter)
+        write_bwd_blobs(output_dir, kernel_filter, receipt)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -2103,10 +2082,12 @@ if __name__ == "__main__":
         help="write all the blobs into a directory"
     )
     parser.add_argument(
-        "-l",
-        "--list_blobs",
+        "-r",
+        "--receipt",
+        default=0,
         required=False,
-        help="list all the kernels to a file"
+        help="codegen receipt.  0. generate dot_do_o, dqdkdv and convert_dq kernels \n"  + \
+             " 1: only generate mha_bwd dqdkdv kernels \n"
     )
     # TODO: if using filter, must apply same value to output_dir and list_blobs
     parser.add_argument(
@@ -2122,7 +2103,5 @@ if __name__ == "__main__":
     filter_list = args.filter.split(',')
     filter_list.extend([''] * (len(api_list) - len(filter_list)))
 
-    if args.list_blobs is not None:
-        list_blobs(args.list_blobs, filter_list)
-    else:
-        write_blobs(args.output_dir, filter_list)
+
+    write_blobs(args.output_dir, filter_list, int(args.receipt))

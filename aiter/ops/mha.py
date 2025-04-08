@@ -6,6 +6,27 @@ from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
 import torch
 
+@compile_ops("module_bench_mha_fwd", fc_name="bench_mha_fwd")
+def bench_mha_fwd(
+    argc,
+    argv
+): ...
+
+
+@compile_ops("module_bench_mha_fwd_splitkv", fc_name="bench_mha_fwd_splitkv")
+def bench_mha_fwd_splitkv(
+    argc,
+    argv
+): ...
+
+
+@compile_ops("module_bench_mha_bwd", fc_name="bench_mha_bwd")
+def bench_mha_bwd(
+    argc,
+    argv
+): ...
+
+
 @compile_ops("module_mha_fwd", fc_name="mha_fwd")
 def mha_fwd(
     q: Tensor,

@@ -5,12 +5,13 @@ import os
 import sys
 import shutil
 import time
+import types
 import importlib
 import functools
 import traceback
 from typing import List, Optional
 import torch
-from torch.utils import cpp_extension
+from aiter.utils import cpp_extension
 from torch.utils.file_baton import FileBaton
 import logging
 import json
@@ -240,19 +241,46 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             f"{old_bd_include_dir}",
         ]
 
-        module = cpp_extension.load(
-            md_name,
-            sources,
-            extra_cflags=flags_cc,
-            extra_cuda_cflags=flags_hip,
-            extra_ldflags=extra_ldflags,
-            extra_include_paths=extra_include_paths,
-            build_directory=opbd_dir,
-            verbose=verbose or AITER_LOG_MORE > 0,
-            with_cuda=True,
-            is_python_module=True,
-        )
-        shutil.copy(f'{opbd_dir}/{md_name}.so', f'{get_user_jit_dir()}')
+        if md_name in ["module_bench_mha_fwd", "module_bench_mha_fwd_splitkv", "module_bench_mha_bwd"]:
+            module = cpp_extension.load(
+                md_name,
+                sources,
+                extra_cflags=flags_cc,
+                extra_cuda_cflags=flags_hip,
+                extra_ldflags=extra_ldflags,
+                extra_include_paths=extra_include_paths,
+                build_directory=opbd_dir,
+                verbose=verbose or AITER_LOG_MORE > 0,
+                with_cuda=True,
+                is_python_module=False,
+                is_standalone=True,
+            )
+            shutil.copy(f'{opbd_dir}/{md_name}', f'{get_user_jit_dir()}')
+        else:
+            module = cpp_extension.load(
+                md_name,
+                sources,
+                extra_cflags=flags_cc,
+                extra_cuda_cflags=flags_hip,
+                extra_ldflags=extra_ldflags,
+                extra_include_paths=extra_include_paths,
+                build_directory=opbd_dir,
+                verbose=verbose or AITER_LOG_MORE > 0,
+                with_cuda=True,
+                is_python_module=True,
+            )
+            shutil.copy(f'{opbd_dir}/{md_name}.so', f'{get_user_jit_dir()}')
+
+        # setup(
+        #     name=md_name,
+        #     ext_modules=[
+        #         CppExtension(
+        #             name=md_name,
+        #             sources=sources,
+        #             ex
+        #         )
+        #     ]
+        # )
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
             md_name,
@@ -364,7 +392,11 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 verbose = d_args["verbose"]
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
                                       blob_gen_cmd, extra_include, extra_ldflags, verbose)
-            op = getattr(module, loadName)
+                
+            if isinstance(module, types.ModuleType):
+                op = getattr(module, loadName)
+            else:
+                return None
 
             if AITER_LOG_MORE == 2:
                 from ..test_common import log_args
