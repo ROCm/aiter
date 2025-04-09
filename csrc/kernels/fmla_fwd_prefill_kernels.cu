@@ -16,8 +16,7 @@ template <int32_t kSizeD_,
           int32_t kBlockM_,
           int32_t kBlockN0_,
           int32_t kBlockN1_,
-          int32_t kNumWarps_,
-          bool    kMergeNumHeadGroupsSeqLenQ_>
+          int32_t kNumWarps_>
 struct FlashMlaPrefillKernelTrait
 {
     static constexpr int32_t kSizeD                     = kSizeD_;    // hidden dimension size of query and key
@@ -29,15 +28,124 @@ struct FlashMlaPrefillKernelTrait
     static constexpr int32_t kBlockM                    = kBlockM_;
     static constexpr int32_t kBlockN0                   = kBlockN0_;
     static constexpr int32_t kBlockN1                   = kBlockN1_;
+    static constexpr int32_t kBlockK0                   = 32;
+    static constexpr int32_t kBlockK1                   = 32;
     static constexpr int32_t kFixedOverheadNumBlocks    = 5;
     static constexpr int32_t kMaxBatchSize              = 4096;
     static constexpr int32_t kCuReuse                   = 2;
-    static constexpr bool    kMergeNumHeadGroupsSeqLenQ = kMergeNumHeadGroupsSeqLenQ_;
 
     static_assert(kSizeD % 64 == 0);
     static_assert(kSizeDV % 64 == 0);
     static_assert(kSizeD >= kSizeDV);
 };
+
+template<typename Traits, bool kIsSameKV_, typename scalar_t, typename acc_t>
+struct FlashMlaPrefillPolicy
+{
+    static constexpr bool kIsSameKV = kIsSameKV_;
+
+    // For QS+QR mixed implementation, VGPR always store 256 elements in row/along M.
+    // So the rest are stored in SMEM.
+    static constexpr uint32_t kMPerReg = 256;
+    static constexpr uint32_t kNumPrefetchKV = 1;
+
+    CK_TILE_HOST_DEVICE static constexpr auto GetAlignmentQ()
+    {
+        constexpr index_t kBlockSize = Traits::kNumThreads;
+        constexpr index_t kMPerBlock = Traits::kBlockM0;
+        constexpr index_t kKPerBlock = Traits::kBlockK0;
+
+        constexpr index_t MaxVectorSize = 16 / sizeof(scalar_t);
+
+        // this should align with MakeQDramTileDistribution()
+        constexpr index_t ElemPerThread = (kMPerBlock * kKPerBlock) / kBlockSize;
+        static_assert(0 < ElemPerThread);
+        return min(ElemPerThread, MaxVectorSize);
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr auto MakeQLdsBlockDescriptor()
+    {
+        constexpr uint32_t kMPerBlock = Traits::kBlockM;
+        // #elements store in SMEM along K0 for query.
+        constexpr uint32_t kKPerBlock = Traits::kSizeD - kMPerReg;
+        constexpr uint32_t kKPack     = 16 / sizeof(scalar_t);
+
+        constexpr auto q_lds_block_desc_0 = ck_tile::make_naive_tensor_descriptor(
+            ck_tile::make_tuple(number<kKPerBlock / kKPack>{}, number<kMPerBlock>{}, number<kKPack>{}),
+            ck_tile::make_tuple(number<(kMPerBlock + 1) * kKPack>{}, number<kKPack>{}, number<1>{}),
+            number<8>{},
+            number<1>{});
+
+        constexpr auto q_lds_block_desc = transform_tensor_descriptor(
+            q_lds_block_desc_0,
+            ck_tile::make_tuple(ck_tile::make_pass_through_transform(kMPerBlock),
+                                ck_tile::make_merge_transform(make_tuple(kKPerBlock / kKPack, kKPack))),
+            ck_tile::make_tuple(sequence<1>{}, sequence<0, 2>{}),
+            ck_tile::make_tuple(sequence<0>{}, sequence<1>{}));
+
+        return q_lds_block_desc;
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr auto MakeKLdsBlockDescriptor()
+    {
+        constexpr uint32_t kNPerBlock = Traits::kBlockN0;
+        constexpr uint32_t kKPerBlock = Traits::kBlockK0;
+        constexpr uint32_t kKPack     = 16 / sizeof(scalar_t);
+
+        constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor(
+            make_tuple(number<kKPerBlock / kKPack>{}, number<kNPerBlock>{}, number<kKPack>{}),
+            make_tuple(number<(kNPerBlock + 1) * kKPack>{}, number<kKPack>{}, number<1>{}),
+            number<8>{},
+            number<1>{});
+
+        constexpr auto k_lds_block_desc = transform_tensor_descriptor(
+            k_lds_block_desc_0,
+            make_tuple(
+                make_pass_through_transform(number<kNPerBlock>{}),
+                make_merge_transform(make_tuple(number<kKPerBlock / kKPack>{}, number<kKPack>{}))),
+            make_tuple(sequence<1>{}, sequence<0, 2>{}),
+            make_tuple(sequence<0>{}, sequence<1>{}));
+
+        return k_lds_block_desc;
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr uint32_t GetSmemSizeQ()
+    {
+        constexpr uint32_t lds_alignment = 16; // optional
+        constexpr uint32_t q_smem_size =
+            ck_tile::integer_divide_ceil(
+                sizeof(scalar_t) * MakeQLdsBlockDescriptor().get_element_space_size(),
+                lds_alignment) *
+            lds_alignment;
+        return q_smem_size;
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr uint32_t GetSmemSizeSingleKV()
+    {
+        constexpr uint32_t SingleKSize = MakeKLdsBlockDescriptor().get_element_space_size();
+        constexpr uint32_t SingleVSize =[&]() {
+            // TODO: Check correctness
+            constexpr index_t Banks        = 32; // TODO: need change based on arch
+            constexpr index_t PixelsPerRow = Banks * 4 / sizeof(scalar_t);
+            constexpr index_t kKPack       = 16 / sizeof(scalar_t);
+            static_assert(PixelsPerRow % kKPack == 0);
+            constexpr index_t NPerRow    = PixelsPerRow / kKPack;
+            constexpr index_t kNPerBlock = Traits::kBlockN1;
+            constexpr index_t kKPerBlock = Traits::kBlockK1;
+            static_assert(kNPerBlock % NPerRow == 0);
+            static_assert(kKPerBlock % kKPack == 0);
+
+            return (kKPerBlock / kKPack) * (kNPerBlock / NPerRow) * (PixelsPerRow + kKPack);
+        }();
+
+        return ck_tile::max(SingleKSize, SingleVSize) * sizeof(scalar_t):
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr uint32_t GetSmemSize()
+    {
+        return GetSmemSizeQ() + kNumPrefetchKV * GetSmemSizeSingleKV();
+    }
+}
 
 union TileSchedulerMetaData
 {
@@ -55,8 +163,8 @@ constexpr size_t TileSchedulerMetaDataSizeInDw = sizeof(TileSchedulerMetaData) /
 
 struct FlashMlaPrefillFwdParams
 {
-    int32_t* __restrict__ p_cu_seqlens_k;
-    int32_t* __restrict__ p_block_table;
+    int32_t* __restrict__ p_cu_seqlens_k;   // [b+1]
+    int32_t* __restrict__ p_block_table;    // [b, max_seqlen_pad // block_size]
     
     void* __restrict__ p_query;
     void* __restrict__ p_key;
@@ -79,61 +187,120 @@ struct FlashMlaPrefillFwdParams
     // spill table.
     using index_t = int32_t;
 
-    index_t stride_b_q;     // stride in batch of query
-    index_t stride_s_q;     //    ... in sequence ...
-    index_t stride_h_q;     //    ... in head ...
-    index_t stride_b_k;     // stride in batch of key
-    index_t stride_s_k;     //    ... in sequence ...
-    index_t stride_h_k;     //    ... in head ...
-    index_t stride_b_v;     // stride in batch of value
-    index_t stride_s_v;     //    ... in sequence ...
-    index_t stride_h_v;     //    ... in head ...
-    index_t stride_b_o;     // stride in batch of output
-    index_t stride_s_o;     //    ... in sequence ...
-    index_t stride_h_o;     //    ... in head ...
+    index_t stride_b_q;         // stride in batch of query
+    index_t stride_s_q;         //    ... in sequence ...
+    index_t stride_h_q;         //    ... in head ...
+    index_t stride_b_k;         // stride in batch of key
+    index_t stride_s_k;         //    ... in sequence ...
+    index_t stride_h_k;         //    ... in head ...
+    index_t stride_b_v;         // stride in batch of value
+    index_t stride_s_v;         //    ... in sequence ...
+    index_t stride_h_v;         //    ... in head ...
+    index_t stride_b_o;         // stride in batch of output
+    index_t stride_s_o;         //    ... in sequence ...
+    index_t stride_h_o;         //    ... in head ...
+    index_t stride_b_lseacc;
+    index_t stride_h_lseacc;
+    index_t stride_sp_lseacc;   //    ... in split ...
+    index_t stride_b_oacc;
+    index_t stride_h_oacc;
+    index_t stride_sp_oacc;     //    ... in split ...
+    index_t stride_s_oacc;
 };
 
 // =====================================================================================================================
 // Kernel Functions
 //
 
+template <typename Traits>
+CK_TILE_DEVICE static auto GetTileIndex()
+{
+    constexpr uint32_t num_tile_n1 = ck_tile::integer_divide_ceil(Traits::kSizeDV, Traits::kBlockN1);
+
+    const auto f = [](index_t dividend, index_t divisor) {
+        index_t quotient = dividend / divisor;
+        index_t modulus  = dividend - quotient * divisor;
+        return ck_tile::make_tuple(quotient, modulus);
+    };
+
+    const auto [mnid, split_id] = f(blockIdx.x, kargs.num_splits);
+    const auto [mid, nid]       = f(mnid, num_tile_n1);
+    const index_t hid           = blockIdx.y;
+    const index_t bid           = blockIdx.z;
+
+    return ck_tile::make_tuple(mid, nid, split_id, hid, bid);
+}
+
 // =====================================================================================================================
 // Kernel Entry
 //
 
-template <typename Traits, typename scalar_t, typename acc_t, bool kIsCausal, bool kDoSplit>
+template <typename Traits, typename scalar_t, typename acc_t, bool kIsCausal, bool kIsSameKV, bool kDoSplit>
 __global__ kn_fmla_fwd_splictkv_prefill(
     const FlashMlaPrefillFwdParams params)
 {
+    using Policy = FlashMlaPrefillPolicy<Traits, kIsSameKV, scalar_t, acc_t>;
 
+    // allocate LDS
+    __shared__ uint8_t smem_ptr[Policy::GetSmemSize()];
+
+    const auto [mid, nid, split_id, hqid, bid] = GetTileIndex();
+    const auto hkid = hqid / params.hq_hk_ratio;
+    const uint32_t offset_m = __builtin_amdgcn_readfirstlane(mid * Traits::kBlockM0);
+    const uint32_t offset_n = __builtin_amdgcn_readfirstlane(nid * Traits::kBlockN1);
+
+    const uint64_t key_start_seq       = params.p_cu_seqlens_k[bid];
+    const uint64_t seqlen_k            = params.p_cu_seqlens_k[bid+1] - key_start_seq;
+    const uint64_t batch_offset_q      = bid * params.stride_b_q;
+    const uint64_t batch_offset_k      = key_start_seq * params.stride_s_k;
+    // TODO: this is row major code. May not currect
+    const uint64_t batch_offset_v      = key_start_seq * params.stride_s_v;
+    const uint64_t batch_offset_lseacc = bid * params.stride_b_o;
+    const uint64_t batch_offset_oacc   = bid * params.stride_b_oacc;
+
+    const scalar_t* p_query = reinterpret_cast<const scalar_t*>(params.p_query) +
+                              hqid * params.stride_h_q +
+                              batch_offset_q;
+    const scalar_t* p_key   = reinterpret_cast<const scalar_t*>(params.p_key) +
+                              hkid * params.stride_h_k +
+                              batch_offset_k;
+    const scalar_t* p_value = reinterpret_cast<const scalar_t*>(params.p_value) +
+                              hkid * params.stride_h_v +
+                              batch_offset_v;
+    scalar_t* p_oacc        = reinterpret_cast<scalar_t*>(params.p_output_accum) +
+                              hqid * params.stride_h_oacc +
+                              batch_offset_oacc +
+                              split_id * params.stride_sp_oacc;
+
+    const auto q_dram = [&] {
+        return ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+            p_query,
+            ck_tile::make_tuple(params.size_s, Traits::kSizeD),
+            ck_tile::make_tuple(params.stride_s_q, 1),
+            ck_tile::number<Policy::GetAlignmentQ()>{},
+            ck_tile::number<1>{});
+    }();
 }
 
 // =====================================================================================================================
 // Dispatch
 //
 
-template <typename Traits, typename scalar_t, typename acc_t, bool kIsCausal>
+template <typename Traits, typename scalar_t, typename acc_t, bool kIsCausal, bool kIsSameKv>
 void dispatch_fmla_fwd_splictkv_prefill(
     const FlashMlaPrefillFwdParams& params,
     const int32_t                   num_splits)
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const int32_t num_blk  = ck_tile::integer_divide_ceil(params.size_s, Traits::kBlockM) *
+    const int32_t num_blk  = ck_tile::integer_divide_ceil(params.size_s,  Traits::kBlockM) *
                              ck_tile::integer_divide_ceil(params.size_dv, Traits::kBlockN1) *
                              num_splits;
-    const int32_t num_head = Traits::kMergeNumHeadGroupsSeqLenQ ? (params.size_h * params.hq_hk_ratio) : params.size_h;
-    const dim3 grid = dim3(num_blk, num_head, params.size_b);
+    const dim3 grid = dim3(num_blk, params.size_h, params.size_b);
 
-    if (num_splits > 1)
-    {
-        kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, kIsCausal, true><<<grid, Traits::kNumThreads, 0, stream>>>(params);
-        // TODO: dispatch combine kernel
-    }
-    else
-    {
-        kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, kIsCausal, false><<<grid, Traits::kNumThreads, 0, stream>>>(params);
-    }
+    auto kernel = (num_splits > 1) ? kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, kIsCausal, kIsSameKv, true> :
+                                     kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, kIsCausal, kIsSameKv, false>;
+    kernel<<<grid, Traits::kNumThreads, 0, stream>>>(params);
 }
 
 // =====================================================================================================================
@@ -263,7 +430,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    using Traits = FlashMlaPrefillKernelTrait<576, 512, 32, 32, 32, 4, false>;
+    using Traits = FlashMlaPrefillKernelTrait<576, 512, 32, 32, 32, 4>;
 
     torch::Tensor vcache = value_cache.data_ptr() ? value_cache : key_cache;
 
@@ -327,24 +494,38 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.stride_s_q = query.stride(1);
     params.stride_h_q = query.stride(2);
     params.stride_b_k = key_cache.stride(0);
-    params.stride_s_k = key_cache.stride(1);
+    params.stride_s_k = key_cache.stride(1); // size_hk * size_d
     params.stride_h_k = key_cache.stride(2);
     params.stride_b_v = vcache.stride(0);
-    params.stride_s_v = vcache.stride(1);
+    params.stride_s_v = vcache.stride(1);    // size_hk * size_d
     params.stride_h_v = vcache.stride(2);
     params.stride_b_o = output.stride(0);
     params.stride_s_o = output.stride(1);
     params.stride_h_o = output.stride(2);
+    // TODO: not all of the following params are required?
+    params.stride_b_lseacc = softmax_lseaccum.stride(0);
+    params.stride_h_lseacc = softmax_lseaccum.stride(1);
+    params.stride_sp_lseacc = softmax_lseaccum.stride(2);
+    params.stride_b_oacc = output_accum.stride(0);
+    params.stride_h_oacc = output_accum.stride(1);
+    params.stride_sp_oacc = output_accum.stride(2);
+    params.stride_s_oacc = output_accum.stride(3);
 
-	using acc_t = float;
-    DISPATCH_FMLA_TYPES(
-        query.scalar_type(),
-        is_causal,
-        "fmla_fwd",
-        [&](){
-            dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, Is_causal>(params, num_splits);
-        }();
-    );
+    TORCH_CHECK(params.p_key == params.p_value, "Key and value are expected as the same thing for now.");
+
+    // TODO: Replace the follow code with DISPATCH_FMLA_TYPES!
+    TORCH_CHECK(query.scalar_type() == at::ScalarType::Half, "Only support fp16 inputs!")
+    dispatch_fmla_fwd_splictkv_prefill<Traits, ck_tile::fp16_t, float, Is_causal, true>(params, num_splits);
+
+	// using acc_t = float;
+    // DISPATCH_FMLA_TYPES(
+    //     query.scalar_type(),
+    //     is_causal,
+    //     "fmla_fwd",
+    //     [&](){
+    //         dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, Is_causal, true>(params, num_splits);
+    //     }();
+    // );
 
     // TODO: transpose before return!!!
     return {output, softmax_lse};
