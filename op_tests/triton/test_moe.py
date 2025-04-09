@@ -13,10 +13,12 @@ from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe_op import moe_set_use_persistent_kernel
 from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
 from aiter import silu_and_mul
+from aiter.ops.triton.moe_op_gelu import fused_moe_gelu as triton_moe_gelu
+from aiter.ops.triton.moe_op_gelu import moe_set_use_persistent_kernel as moe_set_use_persistent_kernel_gelu
 
 DEBUG_MODE = False
 
-def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16):
+def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16, gelu=False):
     if fp8_w8a8:
         a , _ , a_scale = quantize_fp8(a)
 
@@ -49,6 +51,10 @@ def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weight
 
     if routed_weight:
         c *= topk_weights.unsqueeze(-1)
+
+
+    if not routed_weight and gelu:
+        c = 0.5 * c * (1.0 + torch.tanh(0.7978845608 * (c + 0.044715 * c * c * c)))
 
 
     if fp8_w8a8:    
@@ -394,3 +400,47 @@ def test_fused_moe_int4_w4a16(M: int, N: int, K: int, top_k:int, E: int,
     else:
         torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
+
+#Note: TODO These 2 result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
+@pytest.mark.parametrize("M, N, K, top_k, E", [(64, 14336, 4096, 2, 8), (16, 14336, 1, 2, 4), (4, 4, 8, 1, 2),
+                                               (1, 14336, 128, 2, 4), (3, 14336, 128, 2, 4), (16, 14336, 128, 1, 4),
+                                               (16, 14336, 128, 1, 1), (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8),
+                                               (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8), (1, 1024, 16384, 1, 2)])
+@pytest.mark.parametrize('routed_weight', [False, True])
+#@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) #TODO: Accuracy issues with fp8
+@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False)])  
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('persistent',[False, True])
+def test_moe_fused_gelu(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, persistent: bool, dtype,):
+    torch.manual_seed(20)
+    torch.set_printoptions(threshold=100000)
+    if persistent:
+        moe_set_use_persistent_kernel(True)
+    else:
+        moe_set_use_persistent_kernel(False)
+
+    a, b, triton_out, triton_out_silu, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
+        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16)
+
+    if DEBUG_MODE:
+        print(f"M={M}, N={N}, K={K}, top_K={top_k}, E={E}")
+        print(f"config={config}")
+        print(f"a.shape={a.shape} a={a}")
+        print(f"b.shape={b.shape} b={b}")
+        print(f"sorted_token_ids.shape={sorted_token_ids.shape}")
+        print(f"sorted_token_ids={sorted_token_ids}")
+        print(f"expert_ids.shape={expert_ids.shape}")
+        print(f"expert_ids={expert_ids}")
+        print(f"num_tokens_post_padded={num_tokens_post_padded}")
+    triton_moe_gelu(a, b, triton_out, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16)
+
+    torch_out = torch.empty_like(triton_out)
+    torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, None, 0, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
+                        num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, False, gelu=True)
+
+    if DEBUG_MODE:
+        print(f"triton_out={triton_out}")
+        print(f"torch_out={torch_out}")
+    # Validate correctness
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
