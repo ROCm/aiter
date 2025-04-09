@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.
-#include "bench_mha_fwd.h"
+#include "mha_fwd.h"
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
 #include "rotary.hpp"
@@ -15,10 +15,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
-// #if CK_TILE_FMHA_FWD_APPENDKV_API && !CK_TILE_FMHA_FWD_SPLITKV_API
-// #error "we should enable fmha_fwd_splitkv() api in order to cooperate with fmha_fwd_appendkv()"
-// #endif
 
 template <typename T>
 std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
@@ -291,14 +287,12 @@ bool run(const ck_tile::ArgParser& arg_parser)
         hdim_v = hdim_q;
 
     ck_tile::index_t seqlen_knew = arg_parser.get_int("s_knew");
-#if !CK_TILE_FMHA_FWD_APPENDKV_API
     if(seqlen_knew != 0)
     {
         std::cerr << "fmha_fwd_appendkv() is not enabled. ignoring the 's_knew' option"
                   << std::endl;
         seqlen_knew = 0;
     }
-#endif
     if(seqlen_knew < 0)
     {
         seqlen_knew = randint<ck_tile::index_t>(1, arg_parser.get_int("s"), seed);
@@ -314,14 +308,12 @@ bool run(const ck_tile::ArgParser& arg_parser)
             return false;
         }
     }
-#if !CK_TILE_FMHA_FWD_APPENDKV_API
     else if(0 < rotary_dim)
     {
         std::cerr << "rotary embedding is not supported. ignoring the 'rotary_dim' option"
                   << std::endl;
         rotary_dim = 0;
     }
-#endif
     // to use fmha_fwd_appendkv(), make sure it's in batch mode
     const bool need_append_kvcache = (0 < seqlen_knew || 0 < rotary_dim);
     if(need_append_kvcache && mode == mode_enum::group)
@@ -341,7 +333,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
 
     ck_tile::index_t page_block_size = arg_parser.get_int("page_block_size");
-#if !CK_TILE_FMHA_FWD_APPENDKV_API && !CK_TILE_FMHA_FWD_SPLITKV_API
+#if !CK_TILE_FMHA_FWD_SPLITKV_API
     if(0 < page_block_size)
     {
         std::cerr << "paged-kvcache is not supported. ignoring the 'page_block_size' option"
@@ -357,7 +349,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
 
     bool use_cache_batch_idx = arg_parser.get_bool("cache_batch_idx");
-#if !CK_TILE_FMHA_FWD_APPENDKV_API && !CK_TILE_FMHA_FWD_SPLITKV_API
+#if !CK_TILE_FMHA_FWD_SPLITKV_API
     if(use_cache_batch_idx)
     {
         std::cerr << "split-kv is not supported. ignoring the 'cache_batch_idx' option"
@@ -811,13 +803,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
               << ", d:" << hdim_q << "/" << hdim_v << ", scale_s:" << scale_s << ", bias:" << bias
               << ", p_drop:" << p_drop << ", lse:" << lse << ", squant:" << squant
               << ", mask:" << mask << ", v:" << vlayout;
-// #if CK_TILE_FMHA_FWD_APPENDKV_API
-//     if(0 < rotary_dim)
-//     {
-//         std::cout << ", rotary_dim:" << rotary_dim << "("
-//                   << (is_rotary_interleaved ? "inter" : "half") << ")";
-//     }
-// #endif
+
 #if CK_TILE_FMHA_FWD_SPLITKV_API
     if(1 < num_splits)
     {
@@ -833,33 +819,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
 #endif
     std::cout << std::flush;
-
-    // const auto init_traits = [&](auto& traits) {
-    //     traits.hdim_q        = hdim_q;
-    //     traits.hdim_v        = hdim_v;
-    //     traits.data_type     = data_type;
-    //     traits.is_v_rowmajor = is_v_rowmajor;
-
-    //     if constexpr(std::is_same_v<fmha_fwd_appendkv_traits, std::decay_t<decltype(traits)>>)
-    //     {
-    //         traits.rope_type = (0 < rotary_dim ? (is_rotary_interleaved ? rope_enum::interleaved
-    //                                                                     : rope_enum::half_rotated)
-    //                                            : rope_enum::none);
-    //     }
-    //     else // fmha_fwd_traits or fmha_splitkv_traits
-    //     {
-    //         traits.is_group_mode       = (mode == mode_enum::group);
-    //         traits.mask_type           = mask.type;
-    //         traits.bias_type           = bias.type;
-    //         traits.has_lse             = lse;
-    //         traits.do_fp8_static_quant = squant;
-
-    //         if constexpr(std::is_same_v<fmha_fwd_traits, std::decay_t<decltype(traits)>>)
-    //         {
-    //             traits.has_dropout = (p_drop > 0.0f);
-    //         }
-    //     }
-    // };
 
     const auto init_args = [&, k_paddings_ = seqlen_kpads](auto& args) {
         assert(nhead % nhead_k == 0);
@@ -1067,29 +1026,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
         }
     };
 
-    const float appendkv_ave_time = [&] {
-#if CK_TILE_FMHA_FWD_APPENDKV_API
-        // if(need_append_kvcache)
-        // {
-        //     fmha_fwd_appendkv_traits fwd_appendkv_traits;
-        //     init_traits(fwd_appendkv_traits);
-
-        //     fmha_fwd_appendkv_args fwd_appendkv_args;
-        //     init_args(fwd_appendkv_args);
-
-        //     return fmha_fwd_appendkv(fwd_appendkv_traits, fwd_appendkv_args, stream_config);
-        // }
-#endif
-        return 0.0f;
-    }();
-
     const float fwd_ave_time = [&] {
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(1 < num_splits || use_kvcache)
         {
-            // fmha_fwd_splitkv_traits fmha_splitkv_traits;
-            // init_traits(fmha_splitkv_traits);
-
             aiter::mha_fwd_splitkv_args fmha_splitkv_args;
             init_args(fmha_splitkv_args);
 
@@ -1101,10 +1041,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                    bias.type,
                                    lse);
         }
-#else
-        // fmha_fwd_traits fmha_traits;
-        // init_traits(fmha_traits);
-
+#endif
         aiter::mha_fwd_args fmha_args;
         init_args(fmha_args);
 
@@ -1115,16 +1052,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
                        mode == mode_enum::group,
                        bias.type,
                        lse);
-#endif
     }();
 
-    if(appendkv_ave_time < 0.0f || fwd_ave_time < 0.0f)
+    if(fwd_ave_time < 0.0f)
     {
         std::cout << ", not supported yet" << std::flush << std::endl;
         return false;
     }
 
-    const float ave_time = (appendkv_ave_time + fwd_ave_time);
+    const float ave_time = fwd_ave_time;
 
     float tflops = static_cast<float>(flop) / 1.E9 / ave_time;
 
@@ -1247,22 +1183,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
         if(i_perm) q_host_ref.ForEach([&](auto& self, auto i) { self(i) = q_host(b_idx, i[0], i[1] + query_offset, i[2]); });
         else       q_host_ref.ForEach([&](auto& self, auto i) { self(i) = q_host(b_idx, i[1] + query_offset, i[0], i[2]); });
 
-#if CK_TILE_FMHA_FWD_APPENDKV_API
-        // // optionally apply RoPE to the q_host_ref
-        // if(0 < rotary_dim)
-        // {
-        //     decltype(q_host_ref) q_host_ref_ro(q_host_ref.get_lengths());
-
-        //     auto [rotary_cos_slice, rotary_sin_slice] =
-        //         slice_rotary_cos_sin(rotary_cos_host, rotary_sin_host, cache_seqlen_ks[wb], real_seqlen_q);
-
-        //     ck_tile::reference_batched_rotary_position_embedding(
-        //         q_host_ref, rotary_cos_slice, rotary_sin_slice, is_rotary_interleaved, q_host_ref_ro,
-        //         /*use_1_row_sin_cos=*/mask.type == mask_enum::no_mask);
-
-        //     q_host_ref.ForEach([&](auto& self, auto i) { self(i) = q_host_ref_ro(i); });
-        // }
-#endif
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(0 < page_block_size) {
             if(i_perm) {
@@ -1281,39 +1201,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             else       k_host_ref.ForEach([&](auto& self, auto i) { self(i) = k_host(cache_b_idx, i[1] + key_offset, i[0] / nr, i[2]); });
         }
 
-// #if CK_TILE_FMHA_FWD_APPENDKV_API
-//         // copy Knew to the end of K
-//         if(0 < seqlen_knew)
-//         {
-//             ck_tile::HostTensor<KDataType> knew_host_ref({nhead, seqlen_knew, hdim_q});
-//             if(i_perm) knew_host_ref.ForEach([&](auto& self, auto i) { self(i) = knew_host(wb, i[0] / nr, i[1], i[2]); });
-//             else       knew_host_ref.ForEach([&](auto& self, auto i) { self(i) = knew_host(wb, i[1], i[0] / nr, i[2]); });
-
-//             // optionally apply RoPE to the knew_host_ref
-//             auto* real_knew_host_ref = &knew_host_ref;
-//             std::optional<decltype(knew_host_ref)> knew_host_ref_ro;
-//             if(0 < rotary_dim)
-//             {
-//                 knew_host_ref_ro.emplace(knew_host_ref.get_lengths());
-
-//                 auto [rotary_cos_slice, rotary_sin_slice] =
-//                     slice_rotary_cos_sin(rotary_cos_host, rotary_sin_host, cache_seqlen_ks[wb], seqlen_knew);
-
-//                 ck_tile::reference_batched_rotary_position_embedding(
-//                     knew_host_ref,
-//                     rotary_cos_slice,
-//                     rotary_sin_slice,
-//                     is_rotary_interleaved,
-//                     knew_host_ref_ro.value());
-
-//                 real_knew_host_ref = &knew_host_ref_ro.value();
-//             }
-
-//             (*real_knew_host_ref).ForEach([&](auto& self, auto i) {
-//                 k_host_ref(i[0], i[1] + cache_seqlen_ks[wb], i[2]) = self(i);
-//             });
-//         }
-// #endif
 #if CK_TILE_FMHA_FWD_SPLITKV_API
         if(0 < page_block_size) {
             if(is_v_rowmajor) {
@@ -1355,27 +1242,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             }
         }
 
-// #if CK_TILE_FMHA_FWD_APPENDKV_API
-//         // copy Vnew to the end of V
-//         if(0 < seqlen_knew)
-//         {
-//             ck_tile::HostTensor<VDataType> vnew_host_ref({nhead, hdim_v, seqlen_knew});
-//             if(is_v_rowmajor)
-//             {
-//                 if(i_perm) vnew_host_ref.ForEach([&](auto& self, auto i) { self(i) = vnew_host(wb, i[0] / nr, i[2], i[1]); });
-//                 else       vnew_host_ref.ForEach([&](auto& self, auto i) { self(i) = vnew_host(wb, i[2], i[0] / nr, i[1]); });
-//             }
-//             else
-//             {
-//                 if(i_perm) vnew_host_ref.ForEach([&](auto& self, auto i) { self(i) = vnew_host(wb, i[0] / nr, i[1], i[2]); });
-//                 else       vnew_host_ref.ForEach([&](auto& self, auto i) { self(i) = vnew_host(wb, i[1], i[0] / nr, i[2]); });
-//             }
-
-//             vnew_host_ref.ForEach([&](auto& self, auto i) {
-//                 v_host_ref(i[0], i[1], i[2] + cache_seqlen_ks[wb]) = self(i);
-//             });
-//         }
-// #endif
         // clang-format on
 
         // reference
@@ -1571,23 +1437,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
     std::cout << ", valid:" << (pass ? "y" : "n") << std::flush << std::endl;
 
     return pass;
-}
-
-int bench_mha_fwd(int argc, std::vector<std::string> argv)
-{
-    std::vector<char*> argv_;
-    for (auto arg: argv) {
-        argv_.push_back(const_cast<char*>(arg.c_str()));
-    }
-    argv_.push_back(nullptr);
-
-    char** argv_ptr = argv_.data();
-
-    auto [result, arg_parser] = create_args(argc, argv_ptr);
-    if(!result)
-        return -1;
-
-    return run<FmhaFwdFp16>(arg_parser) ? 0 : -2;
 }
 
 int main(int argc, char* argv[])

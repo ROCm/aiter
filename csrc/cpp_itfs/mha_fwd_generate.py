@@ -15,13 +15,13 @@ AITER_CPP_API = """#include <iostream>
 
 namespace aiter {{
 mha_fwd_traits get_mha_fwd_traits(const mask_info &mask,
-    std::string dtype,
-    bool is_group_mode,
-    int head_size_q,
-    int head_size_v,
-    bool has_dropout,
-    bool has_lse,
-    bias_enum bias_type)
+                                  std::string dtype,
+                                  bool is_group_mode,
+                                  int head_size_q,
+                                  int head_size_v,
+                                  bool has_dropout,
+                                  bool has_lse,
+                                  bias_enum bias_type)
 {{
     return mha_fwd_traits(head_size_q,
                           head_size_v,
@@ -120,8 +120,8 @@ if __name__ == "__main__":
         default=0,
         required=False,
         help="codegen receipt. 1: generate mha_fwd c++ api\n"  + \
-             "  2. generate mha_fwd_splitkv c++ api\n"  + \
-             "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD"
+                            "  2: generate mha_fwd_splitkv c++ api\n"  + \
+                            "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD"
     )
 
     args = parser.parse_args()

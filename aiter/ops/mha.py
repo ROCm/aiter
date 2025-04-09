@@ -10,10 +10,6 @@ import torch
 def compile_mha_fwd(): ...
 
 
-@compile_ops("bench_mha_fwd_splitkv", fc_name="compile_mha_fwd_splitkv")
-def compile_mha_fwd_splitkv(): ...
-
-
 @compile_ops("bench_mha_bwd", fc_name="compile_mha_bwd")
 def compile_mha_bwd(): ...
 

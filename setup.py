@@ -53,7 +53,6 @@ if IS_ROCM:
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
         exclude_ops=["bench_mha_fwd",
-                     "bench_mha_fwd_splitkv",
                      "bench_mha_bwd"]
         all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt

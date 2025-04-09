@@ -109,8 +109,8 @@ if __name__ == "__main__":
         default=0,
         required=False,
         help="codegen receipt. 1: generate fmha v2 c++ api\n"  + \
-             "  2: generate fmha v3 c++ api\n"                 + \
-             "  3: generate v2 v3 combined api for PREBUILD mode"
+                            "  2: generate fmha v3 c++ api\n"                 + \
+                            "  3: generate v2 v3 combined api for PREBUILD mode"
     )
 
     args = parser.parse_args()

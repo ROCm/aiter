@@ -2086,8 +2086,8 @@ if __name__ == "__main__":
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt.  0. generate dot_do_o, dqdkdv and convert_dq kernels \n"  + \
-             " 1: only generate mha_bwd dqdkdv kernels \n"
+        help="codegen receipt.  0: generate dot_do_o, dqdkdv and convert_dq kernels \n"  + \
+                              " 1: only generate mha_bwd dqdkdv kernels"
     )
     # TODO: if using filter, must apply same value to output_dir and list_blobs
     parser.add_argument(

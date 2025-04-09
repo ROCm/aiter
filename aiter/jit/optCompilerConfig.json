@@ -442,7 +442,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 500 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
@@ -463,8 +463,8 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 500 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
@@ -559,25 +559,6 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
-        ],
-        "extra_ldflags": "None",
-        "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
-        ],
-        "verbose": "False",
-        "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 500 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'"
-        ]
-    },
-    "bench_mha_fwd_splitkv": {
-        "srcs": [
-            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_fwd.cpp'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'",
             "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'"
         ],
@@ -587,8 +568,9 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
     "bench_mha_bwd": {
