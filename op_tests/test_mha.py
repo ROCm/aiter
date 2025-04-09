@@ -268,7 +268,3 @@ if __name__ == '__main__':
         mha_type,
         dtype
     )
-
-    # aiter.bench_mha_fwd()
-    # aiter.bench_mha_fwd_splitkv()
-    # aiter.bench_mha_bwd()

@@ -241,7 +241,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             f"{old_bd_include_dir}",
         ]
 
-        if md_name in ["module_bench_mha_fwd", "module_bench_mha_fwd_splitkv", "module_bench_mha_bwd"]:
+        if md_name in ["bench_mha_fwd", "bench_mha_fwd_splitkv", "bench_mha_bwd"]:
             module = cpp_extension.load(
                 md_name,
                 sources,
@@ -255,7 +255,7 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
                 is_python_module=False,
                 is_standalone=True,
             )
-            shutil.copy(f'{opbd_dir}/{md_name}', f'{get_user_jit_dir()}')
+            shutil.copy(f'{opbd_dir}/{md_name}', f'{AITER_CORE_DIR}/op_tests/cpp/mha')
         else:
             module = cpp_extension.load(
                 md_name,

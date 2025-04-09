@@ -552,9 +552,9 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
             ]
     },
-    "module_bench_mha_fwd": {
+    "bench_mha_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/benchmark_mha_fwd.cpp'"
+            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_fwd.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -571,9 +571,9 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'"
         ]
     },
-    "module_bench_mha_fwd_splitkv": {
+    "bench_mha_fwd_splitkv": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/benchmark_mha_fwd.cpp'"
+            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_fwd.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
@@ -591,9 +591,9 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
-    "module_bench_mha_bwd": {
+    "bench_mha_bwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/benchmark_mha_bwd.cpp'"
+            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_bwd.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
