@@ -18,22 +18,12 @@
 #include "vectorization.cuh"
 
 #include <cmath>
-#include <c10/core/ScalarType.h>
+#include "hip_float8.h"
 
-#ifdef USE_CUDA_FP8_FORMAT
-  #include <c10/util/Float8_e4m3fn.h>
-using FP8_TYPE = c10::Float8_e4m3fn;
-C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX =
-    std::numeric_limits<FP8_TYPE>::max();
-#else
-  #include <c10/util/Float8_e4m3fnuz.h>
-  #include "hip_float8.h"
-using FP8_TYPE = c10::Float8_e4m3fnuz;
 // Using the default max value from pytorch (240.0) will cause accuracy
 // issue when running dynamic quantization. Here use 224.0f for rocm.
+using FP8_TYPE = __hip_fp8_e4m3_fnuz;
 constexpr auto FP8_E4M3_MAX = 240.0f;
-#endif
-constexpr static auto kFp8Type = c10::CppTypeToScalarType<FP8_TYPE>::value;
 
 namespace vllm {
 
@@ -58,13 +48,8 @@ __device__ __forceinline__ FP8_TYPE scaled_fp8_conversion(float const val,
   }
 
   float r = fmax(-FP8_E4M3_MAX, fmin(x, FP8_E4M3_MAX));
-#ifdef USE_CUDA_FP8_FORMAT
-  return static_cast<c10::Float8_e4m3fn>(r);
-#else
   // Use hardware cvt instruction for fp8 on rocm
-  return c10::Float8_e4m3fnuz(hip_fp8(r).data,
-                              c10::Float8_e4m3fnuz::from_bits());
-#endif
+  return static_cast<FP8_TYPE>(r);
 }
 
 __global__ void initializeScale(float* d_data, int size, float value) {  
