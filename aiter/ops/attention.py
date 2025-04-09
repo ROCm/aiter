@@ -116,3 +116,19 @@ def mla_stage1_asm_fwd(
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor
 ): ...
+
+@compile_ops("module_mla_hip")
+def mla_decode_fwd_hip(
+    # [batch_size, num_heads, kv_lora_rank + qk_rope_head_dim]
+    Q: torch.Tensor,
+    # [num_page * page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    KV: torch.Tensor,
+    head_size_v: int,
+    # [batch_size+1]
+    kv_indptr: torch.Tensor,
+    # [num_page_used]
+    kv_page_indices: torch.Tensor,
+    # [batch_size]
+    kv_last_page_lens: torch.Tensor,
+    softmax_scale: float
+) -> torch.Tensor: ...
