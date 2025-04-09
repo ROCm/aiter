@@ -37,6 +37,87 @@
 typedef __hip_bfloat16 __nv_bfloat16;
 #endif
 
+template <typename T, typename F>
+__device__ constexpr T wave_reduce(T local, F reduce_f)
+{
+  constexpr int reduce_stage = 6; // 1<<6=64
+  T v_local = local;
+#pragma unroll
+  for (int i_stage = 0; i_stage < reduce_stage; i_stage++)
+  {
+    int src_lane = __lane_id() ^ (1 << i_stage);
+    int32_t v_remote_tmp =
+        __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
+    T v_remote = __builtin_bit_cast(T, v_remote_tmp);
+    v_local = reduce_f(v_local, v_remote);
+  }
+  return v_local;
+}
+
+
+template <typename T, typename F>
+__device__ constexpr T cross_wave_reduce(T local, F reduce_f, T* smem)
+{
+    int blockSize = blockDim.x;
+    int waves     = blockDim.x / WARP_SIZE;
+    int wave_size = WARP_SIZE;
+    int lane_id   = threadIdx.x % wave_size;
+    
+    __syncthreads();
+    smem[threadIdx.x] = local;
+    __syncthreads();
+
+    // the data within single wave is the same
+    // but for simplicity, we still use data from each lane.
+    T v_local = smem[lane_id];
+#pragma unroll
+    for(int i_stage = 1; i_stage < waves; i_stage++)
+    {
+        T v_remote = smem[i_stage * wave_size + lane_id];
+        v_local    = reduce_f(v_local, v_remote);
+    } 
+    return v_local;
+}
+
+template <typename T, typename F>
+__device__ constexpr T block_reduce(T val, F reduce_f)
+{
+  __shared__ T smem[256];
+  T wave_local = wave_reduce(val, reduce_f);
+  T v_local = cross_wave_reduce(wave_local, reduce_f, smem);
+
+  // __shared__ float shared_vals[32];
+
+  // int lane = threadIdx.x % WARP_SIZE;
+  // int wid = threadIdx.x / WARP_SIZE;
+
+  // T v_local = wave_reduce(val, reduce_f);
+
+  // if (lane == 0)
+  // {
+  //   shared_vals[wid] = v_local;
+  // }
+  // __syncthreads();
+
+  // if (wid == 0)
+  // {
+  //   val = (lane < (blockDim.x + WARP_SIZE - 1) / WARP_SIZE) ? shared_vals[lane] : 0;
+  //   v_local = wave_reduce(val, reduce_f);
+  // }
+  // __syncthreads();
+  // if constexpr (broadcast)
+  // {
+  //   if (threadIdx.x == 0)
+  //   {
+  //     shared_vals[0] = v_local;
+  //   }
+  //   __syncthreads();
+  //   v_local = shared_vals[0];
+  //   __syncthreads();
+  // }
+  return v_local;
+}
+
 void swap_blocks(torch::Tensor &src, torch::Tensor &dst,
                  const torch::Tensor &block_mapping)
 {
@@ -331,11 +412,25 @@ namespace vllm
       hip_fp8 f8{x};
       return f8;
     }
+
+    template <>
+    __device__ float type_convert<float, hip_fp8>(hip_fp8 x)
+    {
+      return float(x);
+    }
+
     template <>
     __device__ int8_t type_convert<int8_t, float>(float x)
     {
       return static_cast<int8_t>(x);
     }
+
+    template <>
+    __device__ float type_convert<float, int8_t>(int8_t x)
+    {
+      return static_cast<float>(x);
+    }
+
     template <>
     __device__ float type_convert<float, float>(float x)
     {
@@ -530,6 +625,238 @@ namespace vllm
       value_cache[tgt_value_idx] = impl::type_convert<cache_t>(v_local_dim[i]);
     }
   }
+
+  // TODO: this is for kv pertoken quant
+  template <typename scalar_t, typename cache_t, typename dequant_scale_t, bool asmLayout = false, int wg_size = 256>
+  __global__ void reshape_and_cache_with_block_quant_kernel(
+      const scalar_t *__restrict__ key,               // [num_tokens, num_heads, head_size]
+      const scalar_t *__restrict__ value,             // [num_tokens, num_heads, head_size]
+      cache_t *__restrict__ key_cache,                // [num_blocks, num_heads, head_size/x, block_size, x]
+      cache_t *__restrict__ value_cache,              // [num_blocks, num_heads, head_size, block_size]
+      dequant_scale_t *__restrict__ k_dequant_scales, // [num_heads, num_blocks]
+      dequant_scale_t *__restrict__ v_dequant_scales, // [num_heads, num_blocks]
+      const int64_t *__restrict__ slot_mapping,       // [num_tokens]
+      const int key_stride, const int value_stride, const int num_heads, const int num_blocks,
+      const int head_size, const int block_size, const int x,
+      const int num_tokens, float dtypeMax)
+  {
+    const int64_t first_token_idx = static_cast<int64_t>(blockIdx.x);
+    const int32_t head_idx = blockIdx.y;
+    const int64_t slot_idx = slot_mapping[first_token_idx];
+
+    if (first_token_idx >= num_tokens || slot_idx < 0)
+    {
+      // Padding token that should be ignored.
+      return;
+    }
+
+    const int64_t block_idx = slot_idx / block_size;
+    const int64_t block_offset = slot_idx % block_size;
+
+    if (first_token_idx != 0)
+    {
+      const int64_t pre_block_idx = slot_mapping[first_token_idx - 1] / block_size;
+      if (block_idx == pre_block_idx)
+      {
+        return;
+      }
+    }
+
+    int tokens_in_block = 0;
+    if (first_token_idx + threadIdx.x < num_tokens)
+    {
+      tokens_in_block = slot_mapping[first_token_idx + threadIdx.x] / block_size;
+      tokens_in_block = tokens_in_block == block_idx ? 1 : 0;
+    }
+    int numtokens_in_block = block_reduce(tokens_in_block, [](float a, float b)
+                                          { return a + b; });
+
+    auto f_absmax_f32 = [](float v_0_, float v_1_)
+    {
+      return __builtin_fmaxf(impl::abs(v_0_), impl::abs(v_1_));
+    };
+    auto f_max_f32 = [](float v_0_, float v_1_)
+    {
+      return __builtin_fmaxf(v_0_, v_1_);
+    };
+    
+    float k_max_val = 1e-6;
+    float v_max_val = 1e-6;
+
+    for (int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
+    {
+      if ((id + threadIdx.x) < numtokens_in_block * head_size)
+      {
+        int token_idx = (id + threadIdx.x) / head_size + first_token_idx;
+        int current_d = (id + threadIdx.x) % head_size;
+
+        const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
+        const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
+
+        k_max_val = f_absmax_f32(k_max_val, impl::type_convert<float>(key[src_k_idx]));
+        v_max_val = f_absmax_f32(v_max_val, impl::type_convert<float>(value[src_v_idx]));
+      }
+    }
+
+    k_max_val = block_reduce(k_max_val, f_max_f32);
+    v_max_val = block_reduce(v_max_val, f_max_f32);
+
+    float k_block_scale = k_max_val / dtypeMax;
+    float v_block_scale = v_max_val / dtypeMax;
+    // if (wave_id == 0  && threadIdx.x == 0)
+    // {
+    //   printf("1--- block_idx: %d, k_block_scale: %f, v_block_scale: %f, k_max_val: %f, v_max_val: %f\n", block_idx, k_block_scale, v_block_scale, k_max_val, v_max_val);
+    // }
+    // if (blockIdx.x == 0)
+    // {
+    //   printf("1--- threadIdx.x: %d, numtokens_in_block: %d, k_block_scale: %f, v_block_scale: %f, k_max_val: %f, v_max_val: %f\n", threadIdx.x, numtokens_in_block, k_block_scale, v_block_scale, k_max_val, v_max_val);
+    // }
+    int64_t scale_idx;
+    if constexpr (asmLayout)
+    {
+      scale_idx = block_idx * num_heads + head_idx;
+    }
+    else
+    {
+      scale_idx = head_idx * num_blocks + block_idx;
+    }
+
+    if (block_offset > 0)
+    {
+      float k_block_scale_global = k_dequant_scales[scale_idx];
+      float v_block_scale_global = v_dequant_scales[scale_idx];
+
+      if (k_block_scale_global < k_block_scale)
+      {
+        int64_t tgt_value_idx =
+            block_idx * num_heads * head_size * block_size +
+            head_idx * head_size * block_size;
+#pragma unroll
+        for (int id = 0; id < block_offset * head_size; id += blockDim.x)
+        {
+          if (id + threadIdx.x < block_offset * head_size)
+          {
+            int block_offset_local = (id + threadIdx.x) / head_size;
+            int x_idx = (id + threadIdx.x) % head_size / x;
+            int x_offset = (id + threadIdx.x) % x;
+            int64_t cache_idx = tgt_value_idx + 
+                                x_idx * block_size * x + 
+                                block_offset_local * x + 
+                                x_offset;
+            float tmp = impl::type_convert<float>(key_cache[cache_idx]);
+            tmp = tmp * k_block_scale_global / k_block_scale;
+            key_cache[cache_idx] = impl::type_convert<cache_t>(tmp);
+          }
+        }
+        k_dequant_scales[scale_idx] = k_block_scale;
+      }
+      else
+      {
+        k_block_scale = k_block_scale_global;
+      }
+
+      if (v_block_scale_global < v_block_scale)
+      {
+        int64_t tgt_value_idx =
+            block_idx * num_heads * head_size * block_size +
+            head_idx * head_size * block_size;
+#pragma unroll
+        for (int id = 0; id < block_offset * head_size; id += blockDim.x)
+        {
+          if (id + threadIdx.x < block_offset * head_size)
+          {
+            int64_t cache_idx;
+            if constexpr (asmLayout)
+            {
+              int block_offset_local = (id + threadIdx.x) / head_size;
+              int head_offset = (id + threadIdx.x) % head_size;
+              int block_offset_local_divX = block_offset_local / x;
+              int x_idx = block_offset_local % x;
+              cache_idx = tgt_value_idx + 
+                          block_offset_local_divX * head_size * x +
+                          head_offset * x +
+                          x_idx;
+            }
+            else
+            {
+              int block_offset_local = (id + threadIdx.x) / head_size;
+              int head_offset = (id + threadIdx.x) % head_size;
+              cache_idx = tgt_value_idx + 
+                          head_offset * block_size +
+                          block_offset_local;
+            }
+            float tmp = impl::type_convert<float>(value_cache[cache_idx]);
+            tmp = tmp * v_block_scale_global / v_block_scale;
+            value_cache[cache_idx] = impl::type_convert<cache_t>(tmp);
+          }
+        }
+        v_dequant_scales[scale_idx] = v_block_scale;
+      }
+      else
+      {
+        v_block_scale = v_block_scale_global;
+      }
+    }
+    else
+    {
+      k_dequant_scales[scale_idx] = k_block_scale;
+      v_dequant_scales[scale_idx] = v_block_scale;
+    }
+
+    // if (threadIdx.x == 0)
+    // {
+    //   printf("2--- block_idx: %d, block_offset: %d, scale_idx: %d, k_block_scale: %f, v_block_scale: %f, k_max_val: %f, v_max_val: %f\n", block_idx, block_offset, scale_idx, k_block_scale, v_block_scale, k_max_val, v_max_val);
+    // }
+
+    // now let's store out
+    for (int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
+    {
+      if ((id + threadIdx.x) < numtokens_in_block * head_size)
+      {
+        int token_idx = (id + threadIdx.x) / head_size + first_token_idx;
+        int current_d = (id + threadIdx.x) % head_size;
+        int block_offset_local = token_idx - first_token_idx + block_offset;
+
+        const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
+        const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
+        float tmp_k = impl::type_convert<float>(key[src_k_idx]) / k_block_scale;
+        float tmp_v = impl::type_convert<float>(value[src_v_idx]) / v_block_scale;
+      
+        const int x_idx = current_d / x;
+        const int x_offset = current_d % x;
+        //[num_blocks, num_heads, head_size/X, block_size, X]
+        const int64_t tgt_key_idx =
+            block_idx * num_heads * head_size * block_size +
+            head_idx * head_size * block_size +
+            x_idx * block_size * x +
+            block_offset_local * x +
+            x_offset;
+        
+        int64_t tgt_value_idx;
+        if constexpr (asmLayout)
+        { //[num_blocks, num_heads, block_size/X, head_size, X]
+          const int x_idx = block_offset_local / x;
+          const int x_offset = block_offset_local % x;
+          tgt_value_idx =
+              block_idx * num_heads * head_size * block_size +
+              head_idx * head_size * block_size +
+              x_idx * head_size * x +
+              current_d * x +
+              x_offset;
+        }
+        else
+        { //[num_blocks, num_heads, head_size, block_size]
+          tgt_value_idx =
+              block_idx * num_heads * head_size * block_size +
+              head_idx * head_size * block_size +
+              current_d * block_size +
+              block_offset_local;
+        }
+        key_cache[tgt_key_idx] = impl::type_convert<cache_t>(tmp_k);
+        value_cache[tgt_value_idx] = impl::type_convert<cache_t>(tmp_v);
+      }
+    }
+  }
 } // namespace vllm
 
 // KV_T is the stored data type of kv-cache.
@@ -666,6 +993,34 @@ void reshape_and_cache_flash(
             num_heads, head_size, block_size, x, num_tokens, max_kv_tokens, dtypeMax);        \
   }
 
+#define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(KV_T, CACHE_T, dequant_scale_t)           \
+  if (asm_layout)                                                                         \
+  {                                                                                       \
+    vllm::reshape_and_cache_with_block_quant_kernel<KV_T, CACHE_T, dequant_scale_t, true> \
+        <<<grid, block, 0, stream>>>(                                                     \
+            reinterpret_cast<KV_T *>(key.data_ptr()),                                     \
+            reinterpret_cast<KV_T *>(value.data_ptr()),                                   \
+            reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                            \
+            reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                          \
+            reinterpret_cast<dequant_scale_t *>(k_dequant_scales.data_ptr()),             \
+            reinterpret_cast<dequant_scale_t *>(v_dequant_scales.data_ptr()),             \
+            slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,                   \
+            num_heads, num_blocks, head_size, block_size, x, num_tokens, dtypeMax);    \
+  }                                                                                       \
+  else                                                                                    \
+  {                                                                                       \
+    vllm::reshape_and_cache_with_block_quant_kernel<KV_T, CACHE_T, dequant_scale_t>       \
+        <<<grid, block, 0, stream>>>(                                                     \
+            reinterpret_cast<KV_T *>(key.data_ptr()),                                     \
+            reinterpret_cast<KV_T *>(value.data_ptr()),                                   \
+            reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),                            \
+            reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),                          \
+            reinterpret_cast<dequant_scale_t *>(k_dequant_scales.data_ptr()),             \
+            reinterpret_cast<dequant_scale_t *>(v_dequant_scales.data_ptr()),             \
+            slot_mapping.data_ptr<int64_t>(), key_stride, value_stride,                   \
+            num_heads, num_blocks, head_size, block_size, x, num_tokens, dtypeMax);    \
+  }
+
 void reshape_and_cache_with_pertoken_quant(
     torch::Tensor &key,   // [num_tokens, num_heads, head_size]
     torch::Tensor &value, // [num_tokens, num_heads, head_size]
@@ -731,6 +1086,85 @@ void reshape_and_cache_with_pertoken_quant(
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
       CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__nv_bfloat16, int8_t, dequant_scale_t);
+    }
+    else
+    {
+      TORCH_CHECK(false,
+                  "Unsupported input type of kv: ", key.dtype(), " kv cache: ", key_cache.dtype());
+    }
+  }
+  else
+  {
+    TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
+  }
+}
+
+void reshape_and_cache_with_block_quant(
+    torch::Tensor &key,   // [num_tokens, num_heads, head_size]
+    torch::Tensor &value, // [num_tokens, num_heads, head_size]
+    torch::Tensor &
+        key_cache, // [num_blocks, num_heads, head_size/x, block_size, x]
+    torch::Tensor &
+        value_cache,                 // [num_blocks, num_heads, head_size, block_size]
+    torch::Tensor &k_dequant_scales, // [num_heads, num_blocks]
+    torch::Tensor &v_dequant_scales, // [num_heads, num_blocks]
+    torch::Tensor &slot_mapping,     // [num_tokens]
+    const bool asm_layout)
+{
+  int num_tokens = key.size(0);
+  int num_heads = key.size(1);
+  int head_size = key.size(2);
+  int num_blocks = key_cache.size(0);
+  int block_size = key_cache.size(3);
+  int x = key_cache.size(4);
+  // int max_kv_tokens = k_dequant_scales.size(1);
+
+  int key_stride = key.stride(0);
+  int value_stride = value.stride(0);
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(256);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
+
+  float dtypeMax;
+  if (key_cache.dtype() == at::ScalarType::Float8_e4m3fnuz)
+  {
+    dtypeMax = std::numeric_limits<c10::Float8_e4m3fnuz>::max();
+    if (key.dtype() == at::ScalarType::Float)
+    {
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, hip_fp8, dequant_scale_t);
+    }
+    else if (key.dtype() == at::ScalarType::Half)
+    {
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__half, hip_fp8, dequant_scale_t);
+    }
+    else if (key.dtype() == at::ScalarType::BFloat16)
+    {
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__nv_bfloat16, hip_fp8, dequant_scale_t);
+    }
+    else
+    {
+      TORCH_CHECK(false,
+                  "Unsupported input type of kv: ", key.dtype());
+    }
+  }
+  else if (key_cache.dtype() == at::ScalarType::Char)
+  {
+    dtypeMax = 127;
+    if (key.dtype() == at::ScalarType::Float)
+    {
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, int8_t, dequant_scale_t);
+    }
+    else if (key.dtype() == at::ScalarType::Half)
+    {
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__half, int8_t, dequant_scale_t);
+    }
+    else if (key.dtype() == at::ScalarType::BFloat16)
+    {
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__nv_bfloat16, int8_t, dequant_scale_t);
     }
     else
     {

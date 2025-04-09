@@ -28,6 +28,7 @@ def get_dtype_max(dtype):
 
 
 def pertoken_quant(x, y_scale_dtype=torch.float, x_scale=None, quant_dtype=torch.int8, dtypeMax=None):
+    x = x.to(torch.float)
     if x_scale is None:
         hidden_states = x
     else:
