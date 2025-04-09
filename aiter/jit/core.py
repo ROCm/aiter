@@ -271,16 +271,6 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             )
             shutil.copy(f'{opbd_dir}/{md_name}.so', f'{get_user_jit_dir()}')
 
-        # setup(
-        #     name=md_name,
-        #     ext_modules=[
-        #         CppExtension(
-        #             name=md_name,
-        #             sources=sources,
-        #             ex
-        #         )
-        #     ]
-        # )
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
             md_name,
