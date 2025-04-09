@@ -227,20 +227,27 @@ class RotaryEmbedding(nn.Module):
         if offsets is not None:
             offsets = offsets.view(*query.shape[:2])
     
-        if key is not None:
+        if not is_nope_first:
+            query_ = query[..., :self.rotary_dim]
+            key_ = key[..., :self.rotary_dim] if key is not None else None
+        else:
+            query_ = query[..., -self.rotary_dim:]
+            key_ = key[..., -self.rotary_dim:] if key is not None else None
+
+        if key_ is not None:
             if offsets is None:
-                ops.rope_cached_positions_2c_fwd_inplace(query, key, cos, sin, positions, rotate_style, 
+                ops.rope_cached_positions_2c_fwd_inplace(query_, key_, cos, sin, positions, rotate_style, 
                                                                 reuse_freqs_front_part=True, nope_first=is_nope_first)
             else:
-                ops.rope_cached_positions_offsets_2c_fwd_inplace(query, key, cos, sin, positions, offsets, rotate_style, 
+                ops.rope_cached_positions_offsets_2c_fwd_inplace(query_, key_, cos, sin, positions, offsets, rotate_style, 
                                                                     reuse_freqs_front_part=True, nope_first=is_nope_first)
             return query.view(query_shape), key.view(key_shape)
         else:
             if offsets is None:
-                ops.rope_cached_positions_fwd_inplace(query, cos, sin, positions, rotate_style, 
+                ops.rope_cached_positions_fwd_inplace(query_, cos, sin, positions, rotate_style, 
                                                                 reuse_freqs_front_part=True, nope_first=is_nope_first)
             else:
-                ops.rope_cached_positions_offsets_fwd_inplace(query, cos, sin, positions, offsets, rotate_style, 
+                ops.rope_cached_positions_offsets_fwd_inplace(query_, cos, sin, positions, offsets, rotate_style, 
                                                                     reuse_freqs_front_part=True, nope_first=is_nope_first)
             return query.view(query_shape)
 
