@@ -161,10 +161,10 @@ def mla_prefill_fwd(
 
     num_kv_splits = 1
 
-    # logits = o.view(bs, num_kv_splits, nhead, v_head_dim)
-    logits = torch.empty(
-        (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
-    )
+    logits = o.view(bs, num_kv_splits, nhead, v_head_dim)
+    # logits = torch.empty(
+    #     (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+    # )
     attn_lse = torch.empty(
         (bs, num_kv_splits, nhead, 1), dtype=torch.float, device=device
     )
@@ -182,4 +182,5 @@ def mla_prefill_fwd(
         attn_lse,
     )
 
-    return logits.view(bs, nhead, v_head_dim).to(o.dtype), attn_lse
+    # return logits.view(bs, nhead, v_head_dim).to(o.dtype), attn_lse
+    return o.view(bs, nhead, v_head_dim), attn_lse
