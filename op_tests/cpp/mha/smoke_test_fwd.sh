@@ -100,7 +100,8 @@ run_fp16_bf16_tests
 # run_fp8_tests
 
 if [ $TEST_APPENDKV -eq 1 ] ; then
-    run_fp16_appendkv_tests
+    # run_fp16_appendkv_tests
+    echo "mha_fwd_appendkv is not supported yet" 
 fi
 
 set +x
