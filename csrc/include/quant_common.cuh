@@ -47,9 +47,8 @@ __device__ __forceinline__ FP8_TYPE scaled_fp8_conversion(float const val,
     x = val / scale;
   }
 
-  float r = fmax(-FP8_E4M3_MAX, fmin(x, FP8_E4M3_MAX));
   // Use hardware cvt instruction for fp8 on rocm
-  return static_cast<FP8_TYPE>(r);
+  return __hip_fp8_e4m3_fnuz(x);
 }
 
 __global__ void initializeScale(float* d_data, int size, float value) {  
