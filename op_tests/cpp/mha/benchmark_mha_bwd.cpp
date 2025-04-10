@@ -574,12 +574,13 @@ bool run(const ck_tile::ArgParser& arg_parser)
 
     float ave_time = aiter::mha_bwd(fmha_args,
                                     stream_config,
-                                    mask,
                                     data_type,
                                     mode == mode_enum::group,
+                                    mask,
                                     bias.type,
-                                    deterministic,
                                     use_dbias,
+                                    s_randval,
+                                    deterministic,
                                     bwd_v3,
                                     v3_atomic_fp32,
                                     v3_bf16_cvt);
@@ -821,12 +822,13 @@ bool run(const ck_tile::ArgParser& arg_parser)
         nullptr, true, 0, 0, 1, arg_parser.get_str("timer") == std::string("gpu")};
     aiter::mha_bwd(fmha_args,
                    stream_config_v,
-                   mask,
                    data_type,
                    mode == mode_enum::group,
+                   mask,
                    bias.type,
-                   deterministic,
                    use_dbias,
+                   s_randval,
+                   deterministic,
                    bwd_v3,
                    v3_atomic_fp32,
                    v3_bf16_cvt);

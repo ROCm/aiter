@@ -307,9 +307,9 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
 
         float t = aiter::mha_fwd(args,
                                  stream_config,
-                                 mask,
                                  q_dtype_str,
                                  false, // is_group_mode
+                                 mask,
                                  bias_type,
                                  has_lse);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
