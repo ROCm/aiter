@@ -106,7 +106,7 @@ def test_mla(
     varlen,
 ):
     kv_max_sz = (
-        65536 * 16
+        65536 * 32
     )  # calculated by rest of mem after weight loaded in frameworks
     num_page = (kv_max_sz + page_size - 1) // page_size
 
@@ -273,6 +273,22 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
 
+    # troch implementation
+    out_torch_decode, us_torch_decode = run_perftest(
+        torch_mla_extend,
+        q,
+        kv_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype=dtype,
+        num_iters=3,
+        num_warmup=1,
+    )
+
     # Triton implementation
     if qk_head_dim != v_head_dim:
         out_ref = q.new_empty((total_q, nhead, v_head_dim)).fill_(-1)
@@ -299,6 +315,11 @@ def test_mla(
     # logits_ref, lse_ref = attn_logits.split([v_head_dim, 1], dim=-1)
     # logits_ref = rearrange(logits_ref, "bs h sp d -> bs sp h d")
     # lse_ref = rearrange(lse_ref, "bs h sp d -> bs sp h d")
+    checkAllclose(
+        out_torch_decode,
+        out_ref,
+        msg=f"mla_decode-absorb    [golden vs    triton]:{us_torch_decode:.2f} us vs {us_ref:.2f} us......",
+    )
 
     # aiter implementation
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
@@ -320,9 +341,9 @@ def test_mla(
     # checkAllclose(lse_ref, attn_lse,
     #               msg=f'attn_lse    [golden vs aiter_asm]')
     checkAllclose(
-        out_ref,
+        out_torch_decode,
         out_asm,
-        msg=f"mla_decode-absorb    [golden vs aiter_asm]:{us_ref:.2f} us vs {us_asm:.2f} us......",
+        msg=f"mla_decode-absorb    [golden vs aiter_asm]:{us_torch_decode:.2f} us vs {us_asm:.2f} us......",
     )
     return {"ck_576": us_aiter, "triton_576": us_triton, "asm_576": us_asm}
 
@@ -335,7 +356,7 @@ nhead = 16  # 128/TP8
 block_size = 1
 df = []
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
-    for ctx_len in [21, 64, 256, 512, 1024, 3200, 8192][:]:
+    for ctx_len in [21, 64, 256, 512, 1200, 2200, 3200, 4200, 5200, 6200, 8192][:]:
         for batch_size in [1, 2, 3, 5, 16, 32, 64, 128, 256][:]:
             ret = test_mla(
                 ctx_len,
