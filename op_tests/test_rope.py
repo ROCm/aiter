@@ -125,6 +125,8 @@ def ref_rope_sbhd_fwd(x, freqs, rotate_style, reuse_freqs_front_part, nope_first
     if nope_first:
         d = x.shape[-1]
         x, x_forward = x[..., d - rotate_dim:], x[..., :d - rotate_dim]
+        print(f"x.shape={x.shape} x={x}")
+        print(f"x_forward.shape={x_forward.shape} x_forward={x_forward}")
     else:
         x, x_forward = x[..., :rotate_dim], x[..., rotate_dim:]
     if reuse_freqs_front_part:
