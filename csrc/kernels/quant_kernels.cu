@@ -114,7 +114,7 @@ void static_scaled_fp8_quant(torch::Tensor& out,          // [..., d]
   VLLM_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "scaled_fp8_quant_kernel", [&] {
         vllm::scaled_fp8_quant_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            out.data_ptr<FP8_TYPE>(), input.data_ptr<scalar_t>(),
+            reinterpret_cast<FP8_TYPE*>(out.data_ptr()), input.data_ptr<scalar_t>(),
             scale.data_ptr<float>(), num_elems);
       });
 }
@@ -136,8 +136,8 @@ void dynamic_scaled_fp8_quant(torch::Tensor& out,          // [..., d]
         vllm::segmented_max_reduction<scalar_t><<<grid, block, 0, stream>>>(
             scale.data_ptr<float>(), input.data_ptr<scalar_t>(), num_elems);
         vllm::scaled_fp8_quant_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            out.data_ptr<FP8_TYPE>(), input.data_ptr<scalar_t>(),
-            scale.data_ptr<float>(), num_elems);
+            reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
+            input.data_ptr<scalar_t>(), scale.data_ptr<float>(), num_elems);
       });
 }
 
@@ -159,7 +159,7 @@ void dynamic_per_token_scaled_fp8_quant(
       input.scalar_type(), "dynamic_per_token_scaled_fp8_quant_kernel", [&] {
         vllm::dynamic_per_token_scaled_fp8_quant_kernel<scalar_t>
             <<<grid, block, 0, stream>>>(
-                out.data_ptr<FP8_TYPE>(), scales.data_ptr<float>(),
+                reinterpret_cast<FP8_TYPE*>(out.data_ptr()), scales.data_ptr<float>(),
                 input.data_ptr<scalar_t>(),
                 scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
                 hidden_size);
