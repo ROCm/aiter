@@ -4,11 +4,12 @@ import triton.language as tl
 from typing import Any, Dict, Optional, List
 
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 #Source:
-#MoE Kernel adapted from VLLM 
+#MoE Kernel adapted from VLLM
 
-_PADDING_SIZE = 0 
+_PADDING_SIZE = 0
 
 _MOE_A_QUANT_FUNC = dynamic_per_tensor_fp8_quant
 
@@ -133,38 +134,8 @@ def _fused_moe_kernel_gptq_awq(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     NUM_XCDS: tl.constexpr = 8
-
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -289,6 +260,7 @@ def _fused_moe_kernel_gptq_awq(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
+
 @triton.jit
 def _fused_moe_persistent_kernel_gptq_awq(
         # Pointers to matrices
@@ -337,6 +309,7 @@ def _fused_moe_persistent_kernel_gptq_awq(
         has_zp: tl.constexpr,
         use_int4_w4a16: tl.constexpr,
         use_int8_w8a16: tl.constexpr,
+        GRID_MN: tl.constexpr
     ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -368,6 +341,10 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     start_pid = tl.program_id(axis=0)
+    NUM_XCDS: tl.constexpr = 8
+    # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
+    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
+    # The new pid logic has better affinity with the xcd remapping
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     tile_id = start_pid
@@ -392,15 +369,7 @@ def _fused_moe_persistent_kernel_gptq_awq(
 
 
     for _ in range(0, num_valid_tiles):
-        if GROUP_SIZE_M == 1:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
-        else:
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+        pid_m, pid_n = pid_grid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
@@ -597,38 +566,9 @@ def _fused_moe_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     NUM_XCDS: tl.constexpr = 8
+    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
@@ -736,7 +676,6 @@ def _fused_moe_kernel(
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
-
 @triton.heuristics({
     'EVEN_K': lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0,
 })
@@ -788,6 +727,7 @@ def _fused_moe_persistent_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    GRID_MN: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -819,6 +759,10 @@ def _fused_moe_persistent_kernel(
     # -----------------------------------------------------------
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
+    NUM_XCDS: tl.constexpr = 8
+    # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
+    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
+    # The new pid logic has better affinity with the xcd remapping
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     # num_tiles = num_pid_m * num_pid_n
@@ -845,15 +789,7 @@ def _fused_moe_persistent_kernel(
         pid_m = first_pid_m + ((tile_id2 % num_pid_in_group) % group_size_m)
 
     for _ in range(0, num_valid_tiles):
-        if GROUP_SIZE_M == 1:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
-        else:
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+        pid_m, pid_n = pid_grid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
@@ -1013,6 +949,7 @@ def fused_moe(A: torch.Tensor,
                 NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
                                     triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])), )
 
+            GRID_MN = grid(config)[0]
             _fused_moe_persistent_kernel_gptq_awq[grid](
                     A,
                     B,
@@ -1049,6 +986,7 @@ def fused_moe(A: torch.Tensor,
                     has_zp=B_zp is not None,
                     use_int4_w4a16=use_int4_w4a16,
                     use_int8_w8a16=use_int8_w8a16,
+                    GRID_MN=GRID_MN,
                     **config,
                 )
         else:
@@ -1095,9 +1033,11 @@ def fused_moe(A: torch.Tensor,
     else:
         if _USE_MOE_PERSISTENT_KERNEL:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
+
             grid = lambda META: (min(
                 NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
                                     triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])), )
+            GRID_MN = grid(config)[0]
 
             _fused_moe_persistent_kernel[grid](
                 A,
@@ -1138,6 +1078,7 @@ def fused_moe(A: torch.Tensor,
                 compute_type=compute_type,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
+                GRID_MN=GRID_MN,
                 **config,
             )
         else:
