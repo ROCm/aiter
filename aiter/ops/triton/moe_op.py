@@ -342,7 +342,9 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # This is done in a grouped ordering to promote L2 data reuse.
     start_pid = tl.program_id(axis=0)
     NUM_XCDS: tl.constexpr = 8
-    start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
+    # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
+    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
+    # The new pid logic has better affinity with the xcd remapping
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     tile_id = start_pid
@@ -758,7 +760,9 @@ def _fused_moe_persistent_kernel(
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
     NUM_XCDS: tl.constexpr = 8
-    start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
+    # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
+    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
+    # The new pid logic has better affinity with the xcd remapping
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     # num_tiles = num_pid_m * num_pid_n
