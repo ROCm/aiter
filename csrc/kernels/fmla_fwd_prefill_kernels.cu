@@ -16,12 +16,9 @@ template <int32_t kSizeD_,
           int32_t kBlockM_,
           int32_t kBlockN0_,
           int32_t kBlockN1_,
-          int32_t kNumWarps_,
-          typename Mask_>
+          int32_t kNumWarps_>
 struct FlashMlaPrefillKernelTrait
 {
-    using Mask = Mask_;
-
     static constexpr int32_t kSizeD                     = kSizeD_;    // hidden dimension size of query and key
     static constexpr int32_t kSizeDV                    = kSizeDV_;   // hidden dimension size of value
     static constexpr int32_t kNumWarps                  = kNumWarps_;
@@ -32,7 +29,7 @@ struct FlashMlaPrefillKernelTrait
     static constexpr int32_t kBlockN0                   = kBlockN0_;
     static constexpr int32_t kBlockN1                   = kBlockN1_;
     static constexpr int32_t kBlockK0                   = 32;
-    static constexpr int32_t kBlockK1                   = 32;
+    static constexpr int32_t kBlockK1                   = kBlockN0;
     static constexpr int32_t kFixedOverheadNumBlocks    = 5;
     static constexpr int32_t kMaxBatchSize              = 4096;
     static constexpr int32_t kCuReuse                   = 2;
@@ -87,38 +84,6 @@ private:
 
         constexpr index_t MaxNPerThread = 16 / sizeof(DataType);
         return min(MaxNPerThread, ElemPerThread);
-    }
-
-    CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeQ()
-    {
-        constexpr int32_t lds_alignment = 16; // optional
-        constexpr int32_t q_smem_size =
-            ck_tile::integer_divide_ceil(
-                sizeof(scalar_t) * MakeQLdsBlockDescriptor().get_element_space_size(),
-                lds_alignment) *
-            lds_alignment;
-        return q_smem_size;
-    }
-
-    CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeSingleKV()
-    {
-        constexpr int32_t SingleKSize = MakeKLdsBlockDescriptor().get_element_space_size();
-        constexpr int32_t SingleVSize =[&]() {
-            // TODO: Check correctness
-            constexpr index_t Banks        = 32; // TODO: need change based on arch
-            constexpr index_t PixelsPerRow = Banks * 4 / sizeof(scalar_t);
-            constexpr index_t kKPack       = 16 / sizeof(scalar_t);
-            static_assert(PixelsPerRow % kKPack == 0);
-            constexpr index_t NPerRow    = PixelsPerRow / kKPack;
-            constexpr index_t kNPerBlock = Traits::kBlockN1;
-            constexpr index_t kKPerBlock = Traits::kBlockK1;
-            static_assert(kNPerBlock % NPerRow == 0);
-            static_assert(kKPerBlock % kKPack == 0);
-
-            return (kKPerBlock / kKPack) * (kNPerBlock / NPerRow) * (PixelsPerRow + kKPack);
-        }();
-
-        return ck_tile::max(SingleKSize, SingleVSize) * sizeof(scalar_t):
     }
 
 public:
@@ -248,21 +213,91 @@ public:
         constexpr int32_t kKPerBlock = Traits::kBlockK0;
         constexpr int32_t kKPack     = 16 / sizeof(scalar_t);
 
-        constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor(
-            make_tuple(number<kKPerBlock / kKPack>{}, number<kNPerBlock>{}, number<kKPack>{}),
-            make_tuple(number<(kNPerBlock + 1) * kKPack>{}, number<kKPack>{}, number<1>{}),
-            number<8>{},
-            number<1>{});
+        constexpr auto k_lds_block_desc_0 = ck_tile::make_naive_tensor_descriptor(
+            ck_tile::make_tuple(ck_tile::number<kKPerBlock / kKPack>{}, ck_tile::number<kNPerBlock>{}, ck_tile::number<kKPack>{}),
+            ck_tile::make_tuple(ck_tile::number<(kNPerBlock + 1) * kKPack>{}, ck_tile::number<kKPack>{}, ck_tile::number<1>{}),
+            ck_tile::number<8>{},
+            ck_tile::number<1>{});
 
-        constexpr auto k_lds_block_desc = transform_tensor_descriptor(
+        constexpr auto k_lds_block_desc = ck_tile::transform_tensor_descriptor(
             k_lds_block_desc_0,
-            make_tuple(
-                make_pass_through_transform(number<kNPerBlock>{}),
-                make_merge_transform(make_tuple(number<kKPerBlock / kKPack>{}, number<kKPack>{}))),
-            make_tuple(sequence<1>{}, sequence<0, 2>{}),
-            make_tuple(sequence<0>{}, sequence<1>{}));
+            ck_tile::make_tuple(
+                ck_tile::make_pass_through_transform(ck_tile::number<kNPerBlock>{}),
+                ck_tile::make_merge_transform(make_tuple(ck_tile::number<kKPerBlock / kKPack>{}, ck_tile::number<kKPack>{}))),
+            ck_tile::make_tuple(ck_tile::sequence<1>{}, ck_tile::sequence<0, 2>{}),
+            ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
 
         return k_lds_block_desc;
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr auto MakeVLdsBlockDescriptor()
+    {
+        constexpr int32_t Banks        = 32; // TODO: need change based on arch
+        constexpr int32_t PixelsPerRow = Banks * 4 / sizeof(scalar_t);
+        constexpr int32_t kKPack       = 16 / sizeof(scalar_t);
+        static_assert(PixelsPerRow % kKPack == 0);
+        constexpr int32_t NPerRow    = PixelsPerRow / kKPack;
+        constexpr int32_t kNPerBlock = Traits::kBlockN1;
+        constexpr int32_t kKPerBlock = Traits::kBlockK1;
+        static_assert(kNPerBlock % NPerRow == 0);
+        static_assert(kKPerBlock % kKPack == 0);
+
+        constexpr auto v_lds_block_desc_0 = ck_tile::make_naive_tensor_descriptor(
+            ck_tile::make_tuple(ck_tile::number<Traits::kNumPrefetchKV>{},
+                       ck_tile::number<kKPerBlock / kKPack>{},
+                       ck_tile::number<kNPerBlock / NPerRow>{},
+                       ck_tile::number<NPerRow>{},
+                       ck_tile::number<kKPack>{}),
+            ck_tile::make_tuple(ck_tile::number<GetSingleSmemElementSpaceSize<Problem>()>{},
+                       ck_tile::number<(kNPerBlock / NPerRow) * (PixelsPerRow + kKPack)>{},
+                       ck_tile::number<PixelsPerRow + kKPack>{},
+                       ck_tile::number<kKPack>{},
+                       ck_tile::number<1>{}),
+            ck_tile::number<kKPack>{},
+            ck_tile::number<1>{});
+
+        constexpr auto v_lds_block_desc = ck_tile::transform_tensor_descriptor(
+            v_lds_block_desc_0,
+            ck_tile::make_tuple(
+                ck_tile::make_merge_transform(ck_tile::make_tuple(
+                    ck_tile::number<Traits::kNumPrefetchKV>{}, ck_tile::number<kNPerBlock / NPerRow>{}, ck_tile::number<NPerRow>{})),
+                ck_tile::make_merge_transform(ck_tile::make_tuple(ck_tile::number<kKPerBlock / kKPack>{}, ck_tile::number<kKPack>{}))),
+            ck_tile::make_tuple(ck_tile::sequence<0, 2, 3>{}, ck_tile::sequence<1, 4>{}),
+            ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
+
+        return v_lds_block_desc;
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeQ()
+    {
+        constexpr int32_t lds_alignment = 16; // optional
+        constexpr int32_t q_smem_size =
+            ck_tile::integer_divide_ceil(
+                sizeof(scalar_t) * MakeQLdsBlockDescriptor().get_element_space_size(),
+                lds_alignment) *
+            lds_alignment;
+        return q_smem_size;
+    }
+
+    CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeSingleKV()
+    {
+        constexpr int32_t SingleKSize = MakeKLdsBlockDescriptor().get_element_space_size();
+        constexpr int32_t SingleVSize =[&]() {
+            // TODO: Check correctness
+            constexpr index_t Banks        = 32; // TODO: need change based on arch
+            constexpr index_t PixelsPerRow = Banks * 4 / sizeof(scalar_t);
+            constexpr index_t kKPack       = 16 / sizeof(scalar_t);
+            static_assert(PixelsPerRow % kKPack == 0);
+            constexpr index_t NPerRow    = PixelsPerRow / kKPack;
+            constexpr index_t kNPerBlock = Traits::kBlockN1;
+            constexpr index_t kKPerBlock = Traits::kBlockK1;
+            static_assert(kNPerBlock % NPerRow == 0);
+            static_assert(kKPerBlock % kKPack == 0);
+
+            return (kKPerBlock / kKPack) * (kNPerBlock / NPerRow) * (PixelsPerRow + kKPack);
+        }();
+
+        return ck_tile::max(SingleKSize, SingleVSize) * sizeof(scalar_t):
     }
 
     CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSize()
@@ -540,6 +575,8 @@ CK_TILE_DEVICE static auto MakePageBlockNavigator(
 }
 
 template<typename Traits,
+         typename scalar_t,
+         typename acc_t,
          typename QDramBlockWindow,
          typename LseDramBlockWindow,
          typename KPageBlockNavigator,
@@ -564,6 +601,26 @@ CK_TILE_DEVICE static auto kn_fmla_fwd_splitkv_prefill_tile(
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{}, ck_tile::number<Traits::kBlockK0>{});
     auto v_dram_window_lengths =
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockN1>{}, ck_tile::number<Traits::kBlockK1>{});
+
+    /*
+     *  1. Allocate LDS
+     */
+    auto q_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
+        reinterpret_cast<scalar_t*>(p_smem),
+        Policy::MakeQLdsBlockDescriptor());
+    auto k_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
+        reinterpret_cast<scalar_t*>(p_smem + Policy::GetSmemSizeQ()),
+        Policy::MakeKLdsBlockDescriptor());
+    auto v_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
+        reinterpret_cast<scalar_t*>(p_smem + Policy::GetSmemSizeQ()),
+        Policy::MakeVLdsBlockDescriptor());
+
+    auto q_lds_window = ck_tile::make_tile_window(
+        q_lds, ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockN0>{}), {0, 0});
+    auto k_lds_window = ck_tile::make_tile_window(
+        k_lds, ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{}, ck_tile::number<Traits::kBlockK0>{}), {0, 0});
+    auto v_lds_window = ck_tile::make_tile_window(
+        v_lds, Policy::MakeVLdsBlockDescriptor().get_lengths(), {0, 0});
 }
 
 // =====================================================================================================================
@@ -619,7 +676,9 @@ __global__ kn_fmla_fwd_splictkv_prefill(
         params.p_value, v_dram_complete, v_dram_last, bid, hkid, seqlen_k, params.stride_b_v, params.stride_h_v,
         params.p_block_table, params.block_table_batch_stride, params.page_block_size);
     
-    using Mask = typename Traits::Mask;
+    using Mask = std::conditional_t<kIsCausal,
+                                    ck_tile::GenericAttentionMask<true, false>,
+                                    ck_tile::GenericAttentionMask<false>>;
     Mask mask = kIsCausal ?
                 ck_tile::make_generic_attention_mask_from_lr_window<Mask>(-1, -1, params.size_s, seqlen_k, true) :
                 Mask{params.size_s, seqlen_k};
@@ -648,7 +707,7 @@ __global__ kn_fmla_fwd_splictkv_prefill(
         auto out_acc_dram_window =
             ck_tile::make_tile_window(out_acc_dram, out_acc_dram_window_lengths, {mid, nid});
 
-        auto o_acc_tile = kn_fmla_fwd_splitkv_prefill_tile<Traits>(
+        auto o_acc_tile = kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t>(
             q_dram_req_window,
             q_dram_smem_window,
             k_page_block_navigator,
@@ -685,7 +744,7 @@ __global__ kn_fmla_fwd_splictkv_prefill(
         auto out_dram_window =
             ck_tile::make_tile_window(out_dram, out_dram_window_lengths, {mid, nid});
 
-        auto o_acc_tile = kn_fmla_fwd_splitkv_prefill_tile<Traits>(
+        auto o_acc_tile = kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t>(
             q_dram_req_window,
             q_dram_smem_window,
             k_page_block_navigator,
