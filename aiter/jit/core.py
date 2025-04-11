@@ -149,8 +149,9 @@ def get_module(md_name):
     return importlib.import_module(f'{__package__}.{md_name}')
 
 
-def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, extra_include, extra_ldflags, verbose):
+def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, extra_include, extra_ldflags, verbose, is_python_module, is_standalone):
     startTS = time.perf_counter()
+    target_name = f'{md_name}.so' if not is_standalone else md_name
     try:
         op_dir = f'{bd_dir}/{md_name}'
         logger.info(f'start build [{md_name}] under {op_dir}')
@@ -158,8 +159,8 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
         opbd_dir = f'{op_dir}/build'
         src_dir = f'{op_dir}/build/srcs'
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f'{get_user_jit_dir()}/{md_name}.so'):
-            os.remove(f'{get_user_jit_dir()}/{md_name}.so')
+        if os.path.exists(f'{get_user_jit_dir()}/{target_name}'):
+            os.remove(f'{get_user_jit_dir()}/{target_name}')
 
         sources = rename_cpp_to_cu(srcs, src_dir)
 
@@ -241,35 +242,24 @@ def build_module(md_name, srcs, flags_extra_cc, flags_extra_hip, blob_gen_cmd, e
             f"{old_bd_include_dir}",
         ]
 
-        if md_name in ["bench_mha_fwd", "bench_mha_bwd"]:
-            module = cpp_extension.load(
-                md_name,
-                sources,
-                extra_cflags=flags_cc,
-                extra_cuda_cflags=flags_hip,
-                extra_ldflags=extra_ldflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=opbd_dir,
-                verbose=verbose or AITER_LOG_MORE > 0,
-                with_cuda=True,
-                is_python_module=False,
-                is_standalone=True,
-            )
-            shutil.copy(f'{opbd_dir}/{md_name}', f'{AITER_CORE_DIR}/op_tests/cpp/mha')
+        module = cpp_extension.load(
+            md_name,
+            sources,
+            extra_cflags=flags_cc,
+            extra_cuda_cflags=flags_hip,
+            extra_ldflags=extra_ldflags,
+            extra_include_paths=extra_include_paths,
+            build_directory=opbd_dir,
+            verbose=verbose or AITER_LOG_MORE > 0,
+            with_cuda=True,
+            is_python_module=is_python_module,
+            is_standalone=is_standalone,
+        )
+        if is_python_module and not is_standalone:
+            shutil.copy(f'{opbd_dir}/{target_name}', f'{get_user_jit_dir()}')
         else:
-            module = cpp_extension.load(
-                md_name,
-                sources,
-                extra_cflags=flags_cc,
-                extra_cuda_cflags=flags_hip,
-                extra_ldflags=extra_ldflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=opbd_dir,
-                verbose=verbose or AITER_LOG_MORE > 0,
-                with_cuda=True,
-                is_python_module=True,
-            )
-            shutil.copy(f'{opbd_dir}/{md_name}.so', f'{get_user_jit_dir()}')
+            shutil.copy(f'{opbd_dir}/{target_name}', f'{AITER_CORE_DIR}/op_tests/cpp/mha')
+
 
     except Exception as e:
         logger.error('failed build jit [{}]\n-->[History]: {}'.format(
@@ -290,6 +280,8 @@ def get_args_of_build(ops_name: str, exclue=[]):
                         "extra_ldflags": None,
                         "extra_include": [],
                         "verbose": False,
+                        "is_python_module": True,
+                        "is_standalone": False,
                         "blob_gen_cmd": ""
                         }
 
@@ -380,8 +372,11 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 extra_include = d_args["extra_include"]
                 extra_ldflags = d_args["extra_ldflags"]
                 verbose = d_args["verbose"]
+                is_python_module = d_args["is_python_module"]
+                is_standalone = d_args["is_standalone"]
                 module = build_module(md_name, srcs, flags_extra_cc, flags_extra_hip,
-                                      blob_gen_cmd, extra_include, extra_ldflags, verbose)
+                                      blob_gen_cmd, extra_include, extra_ldflags, verbose,
+                                      is_python_module, is_standalone)
                 
             if isinstance(module, types.ModuleType):
                 op = getattr(module, loadName)
