@@ -67,6 +67,8 @@ if IS_ROCM:
                     extra_include = all_opts_args_build["extra_include"],
                     extra_ldflags = None,
                     verbose = False,
+                    is_python_module = True,
+                    is_standalone = False,
         )
 else:
     raise NotImplementedError("Only ROCM is supported")
