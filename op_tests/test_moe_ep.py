@@ -9,7 +9,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe_bf16_asm import asm_moe, torch_moe, moe_sorting_ck, fused_topk
+from aiter.fused_moe import asm_moe, torch_moe, moe_sorting, fused_topk
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
 

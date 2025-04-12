@@ -3,8 +3,15 @@
 
 from torch import Tensor
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
+from ..jit.core import (
+    compile_ops,
+    CK_DIR,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    AITER_CORE_DIR,
+)
 import torch.nn.functional as F
+from .enum import ActivationType, Enum, QuantType
 
 
 @compile_ops("module_moe_asm")
@@ -47,14 +54,6 @@ def fmoe(
 ): ...
 
 
-@compile_ops("module_moe_asm", fc_name='ActivationType')
-class _ActivationType():
-    ...
-
-
-ActivationType = _ActivationType(0)
-
-
 @compile_ops("module_moe_asm")
 def fmoe_int8_g1u0(
     out: Tensor,
@@ -70,7 +69,7 @@ def fmoe_int8_g1u0(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[_ActivationType] = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu,
 ): ...
 
 
@@ -89,8 +88,9 @@ def fmoe_g1u1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[_ActivationType] = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu,
 ): ...
+
 
 @compile_ops("module_moe_asm")
 def fmoe_g1u1_tkw1(
@@ -107,8 +107,9 @@ def fmoe_g1u1_tkw1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[_ActivationType] = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu,
 ): ...
+
 
 @compile_ops("module_moe_asm")
 def fmoe_int8_g1u0_a16(
@@ -166,6 +167,26 @@ def fmoe_fp8_blockscale_g1u1(
 ): ...
 
 
+@compile_ops("module_moe_asm")
+def moe_stage1_g1u1(
+    input: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    inter_dim: int,
+    kernelName: str,
+    block_m: int,
+    ksplit: int = 0,
+    activation: Enum = ActivationType.Silu,
+    quant_type: Enum = QuantType.No,
+    a1_scale: Optional[Tensor] = None,
+    w1_scale: Optional[Tensor] = None,
+): ...
+
+
 @compile_ops("module_moe")
 def ck_moe(
     hidden_states: Tensor,
@@ -178,7 +199,7 @@ def ck_moe(
     fc1_smooth_scale: Optional[Tensor] = None,
     fc2_smooth_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
-    expert_mask: Optional[Tensor] = None
+    expert_mask: Optional[Tensor] = None,
 ): ...
 
 
@@ -194,7 +215,7 @@ def ck_moe_stage1(
     topk: int,
     w1_scale: Optional[Tensor] = None,
     a1_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32
+    block_m: Optional[int] = 32,
 ): ...
 
 
@@ -211,5 +232,5 @@ def ck_moe_stage2(
     topk: int,
     w2_scale: Optional[Tensor] = None,
     a2_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32
+    block_m: Optional[int] = 32,
 ): ...

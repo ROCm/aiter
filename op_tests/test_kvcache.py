@@ -26,7 +26,6 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
         k_scale = quantCfg['k_scale']
         v_scale = quantCfg['v_scale']
         key, k_scale_ = aiter.pertoken_quant(key,
-                                             y_scale_dtype=quantCfg['y_scale_dtype'],
                                              quant_dtype=quantCfg['quant_dtype'])
         k_scale_ = k_scale_.permute(0, 1, 3, 2).view(
             num_batch*num_tokens, num_heads).contiguous()
@@ -49,7 +48,6 @@ def run_torch(key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_lay
 
     if quantCfg:
         value, v_scale_ = aiter.pertoken_quant(value,
-                                               y_scale_dtype=quantCfg['y_scale_dtype'],
                                                quant_dtype=quantCfg['quant_dtype'])
         v_scale_ = v_scale_.permute(0, 1, 3, 2).view(
             num_batch*num_tokens, num_heads).contiguous()
@@ -131,8 +129,7 @@ def test_reshape_and_cache(ctx_lens: int,
     k_cache = torch.empty(k_cache_shape, dtype=DTyoe_KVCache, device=device)
     v_cache = torch.empty(v_cache_shape, dtype=DTyoe_KVCache, device=device)
     if quantCfg:
-        k_scale = torch.empty(kv_scale_shape,
-                              dtype=quantCfg['y_scale_dtype'], device=key.device)
+        k_scale = torch.empty(kv_scale_shape, device=key.device)
         v_scale = torch.empty_like(k_scale)
         quantCfg['k_scale'] = k_scale.clone()
         quantCfg['v_scale'] = v_scale.clone()
@@ -203,13 +200,10 @@ test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
                        torch.bfloat16, torch.bfloat16)
 print('\nstart quant fp16->fp8')
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
-                       torch.float16, torch.float8_e4m3fnuz, quantCfg={'y_scale_dtype': torch.float,
-                                                                       'quant_dtype': torch.float8_e4m3fnuz})
+                       torch.float16, torch.float8_e4m3fnuz, quantCfg={'quant_dtype': torch.float8_e4m3fnuz})
 print('\nstart quant fp16->i8')
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
-                       torch.float16, torch.int8, quantCfg={'y_scale_dtype': torch.float,
-                                                            'quant_dtype': torch.int8})
+                       torch.float16, torch.int8, quantCfg={'quant_dtype': torch.int8})
 print('\nstart quant bf16->i8')
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16,
-                       torch.bfloat16, torch.int8, quantCfg={'y_scale_dtype': torch.float,
-                                                             'quant_dtype': torch.int8})
+                       torch.bfloat16, torch.int8, quantCfg={'quant_dtype': torch.int8})
