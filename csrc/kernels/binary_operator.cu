@@ -1365,7 +1365,7 @@ struct BinaryOperationPattern<3, Operation, _T0, _T1>
 
       const dim3 grid_dim(grid_x, 1, 1);
       const dim3 block_dim(256, 1, 1);
-      if (order_flag)
+      if (!order_flag)
       {
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcastM1K_unroll_kernel", [&]
