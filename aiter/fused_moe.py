@@ -74,6 +74,7 @@ def fused_moe(
     expert_mask=None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
+    doweight_stage1=False,
     # following for quant
     w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
@@ -112,6 +113,7 @@ def fused_moe(
             quant_type,
             isG1U1,
             activation,
+            doweight_stage1,
         )
     run_1stage = M < 256
     run_1stage = False

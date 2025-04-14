@@ -1,11 +1,12 @@
 token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_m,ksplit,us,tag,err
 256,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_128x128,1,0,32,0,270.8542,fmoe_stage1_bf16_pertokenFp8_blockscale_g1u1_32x512_pf2,1.6%
 512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Tensor,1,0,64,0,346.93691000000007,fmoe_stage1_bf16_pertokenInt8_g1u1_64x256_pf3,0.0%
-512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0,64,0,340.65006999999997,fmoe_stage1_bf16_pertokenInt8_g1u1_64x256_pf3,0.0%
-512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0,64,0,336.42204999999996,fmoe_stage1_bf16_pertokenFp8_g1u1_64x256_pf3,0.0%
+512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0,64,0,340.65007,fmoe_stage1_bf16_pertokenInt8_g1u1_64x256_pf3,0.0%
+512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0,64,0,336.42205,fmoe_stage1_bf16_pertokenFp8_g1u1_64x256_pf3,0.0%
 512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.int4,QuantType.per_Tensor,1,0,128,0,699.5049699999998,ck_128,0.1%
 512,6144,4096,8,2,ActivationType.Gelu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Tensor,1,0,64,0,347.0561,fmoe_stage1_bf16_pertokenInt8_g1u1_64x256_pf3,0.0%
 512,6144,4096,8,2,ActivationType.Gelu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Token,1,0,64,0,334.47364,fmoe_stage1_bf16_pertokenInt8_g1u1_64x256_pf3,0.0%
 512,6144,4096,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0,64,0,357.0689999999998,fmoe_stage1_bf16_pertokenFp8_g1u1_64x128_2tg_pf3,0.0%
 512,6144,4096,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.int4,QuantType.per_Tensor,1,0,128,0,837.6014699999998,ck_128,0.0%
-4,2304,1536,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,1,32,0,19.579269999999998,fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_32x128_3tg_pf3,0.0%
+4,2304,1536,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0,32,0,18.364460000000005,fmoe_stage1_bf16_pertokenFp8_g1u1_32x64_4tg_pf3,0.0%
+4,2304,1536,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,1,32,0,19.47728,fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_32x64_4tg_pf3,0.0%
