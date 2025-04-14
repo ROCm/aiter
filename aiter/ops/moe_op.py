@@ -184,6 +184,8 @@ def moe_stage1_g1u1(
     quant_type: Enum = QuantType.No,
     a1_scale: Optional[Tensor] = None,
     w1_scale: Optional[Tensor] = None,
+    doweight_stage1: bool = False,
+    sorted_weight_buf: Optional[Tensor] = None # do sorted weight multiply in stage1
 ): ...
 
 

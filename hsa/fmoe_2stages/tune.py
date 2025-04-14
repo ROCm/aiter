@@ -92,6 +92,7 @@ def go(
         "q_dtype_w",
         "q_type",
         "use_g1u1",
+        "doweight_stage1"
     ]
     print(untunedf[args])
     prorfiles = []
@@ -109,6 +110,7 @@ def go(
             q_dtype_w,
             q_type,
             use_g1u1,
+            doweight_stage1
         ) = line
         dtype = eval(dtype)
         q_dtype_a = eval(q_dtype_a)
@@ -152,6 +154,7 @@ def go(
             dtype=dtype,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
+            doweight=doweight_stage1
         )
         if q_type == QuantType.per_128x128:
             ref, ref_scale = aiter.pertoken_quant(
@@ -173,7 +176,12 @@ def go(
             kernel_dict = df.groupby("tile_m")["knl_name"].apply(list).to_dict()
             return kernel_dict
 
-        extraInfo = "_blockscale" if q_type == QuantType.per_128x128 else ""
+        extraInfo = ""
+        if q_type == QuantType.per_128x128:
+            extraInfo += "_blockscale"
+        if doweight_stage1:
+            extraInfo += "_doweight"
+
         if q_dtype_a == torch.int8:
             quantDtype = "Int8"
         elif q_dtype_a == torch.float8_e4m3fnuz:
@@ -226,11 +234,12 @@ def go(
                                     else a1_scale
                                 ),
                                 w1_scale,
+                                sorted_weights if doweight_stage1 else None,
                             ),
                         )
                     )
 
-            if blockM in [32, 64, 128] and q_type != QuantType.per_128x128:
+            if blockM in [32, 64, 128] and q_type != QuantType.per_128x128 and doweight_stage1 == 0:
                 if q_dtype_w == torch.int4:
                     w1_qt_shffle = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(
@@ -256,6 +265,7 @@ def go(
                             act_type,
                             a1_scale,
                             w1_scale,
+                            # sorted_weights if doweight_stage1 else None,
                         ),
                     )
                 )
@@ -290,6 +300,7 @@ def go(
                     q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
                     q_type,
                     use_g1u1,
+                    doweight_stage1,
                     block_m,
                     0,
                     us,

@@ -271,6 +271,7 @@ def get_2stage_cfgs(
     q_type,
     use_g1u1,
     activation,
+    doweight_stage1
 ):
     def get_cfg_2stages(tune_file):
         import pandas as pd
@@ -289,6 +290,7 @@ def get_2stage_cfgs(
                 "q_dtype_w",
                 "q_type",
                 "use_g1u1",
+                "doweight_stage1"
             ]
         ).to_dict("index")
         return cfg_2stages
@@ -311,13 +313,14 @@ def get_2stage_cfgs(
         str(q_dtype_w),
         str(q_type),
         use_g1u1,
+        doweight_stage1
     )
 
     def MainFunc():
         with open(untune_file, "a") as f:
             q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
             f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)}"
+                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(
@@ -371,6 +374,7 @@ def get_2stage_cfgs(
             kernelName=tag,
             activation=activation,
             quant_type=q_type,
+            doweight_stage1=doweight_stage1,
         ),
         aiter.ck_moe_stage2,
         block_m,
@@ -392,6 +396,7 @@ def fused_moe_2stages(
     block_size_M,
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
+    doweight_stage1=False,
     # following for quant
     q_dtype_a=None,
     q_dtype_w=None,
@@ -421,6 +426,7 @@ def fused_moe_2stages(
         quant_type,
         isG1U1,
         activation,
+        doweight_stage1
     )
 
     a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
@@ -448,6 +454,7 @@ def fused_moe_2stages(
         block_m=block_m,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
+        sorted_weights_buf=sorted_weights if doweight_stage1 else None,
     )
 
     if quant_type != QuantType.per_128x128:
@@ -513,6 +520,7 @@ def asm_stage1(
     quant_type=QuantType.No,
     a1_scale=None,
     w1_scale=None,
+    sorted_weights=None
 ):
     dtype = out.dtype
     device = out.device
@@ -547,7 +555,8 @@ def asm_stage1(
         activation=activation,
         quant_type=quant_type,
         a1_scale=a1_scale,
-        w1_scale=w1_scale,
+        w1_scale=w1_scale, 
+        sorted_weight_buf=sorted_weights,
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
@@ -673,6 +682,7 @@ def torch_moe_stage1(
     # following for quant
     a1_scale=None,  # [token, 1]
     w1_scale=None,  # [expert, inter_dim, 1]
+    doweight=False
 ):
     ctype = torch.float  # compute type
     hidden_states = hidden_states.to(ctype)
@@ -718,6 +728,8 @@ def torch_moe_stage1(
         if mask.sum():
             sub_tokens = hidden_states[mask]
             act_input = sub_tokens @ (w1[E_id].transpose(0, 1))
+            if doweight:
+                act_input = act_input * topk_weight[mask].view(-1, 1)
             out[mask] = act_input
 
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
@@ -739,7 +751,8 @@ def torch_moe_stage2(
     dtype=torch.float16,
     quant_type=QuantType.No,
     w2_scale=None,  # [1]
-    a2_scale=None,  # [expert]]
+    a2_scale=None,  # [expert]]'
+    doweight=False
 ):
     ctype = torch.float  # compute type
     hidden_states = hidden_states.to(ctype)
@@ -779,7 +792,9 @@ def torch_moe_stage2(
             sub_tokens = hidden_states[mask]
             act_input = sub_tokens @ (w2[E_id].transpose(0, 1))
             out[mask] = act_input
-    return (out * topk_weights.view(token_num, -1, 1)).sum(1).to(dtype)
+    if doweight:
+        out = out * topk_weights.view(token_num, -1, 1)
+    return out.sum(1).to(dtype)
 
 
 def fused_topk(

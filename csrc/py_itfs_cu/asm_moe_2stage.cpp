@@ -55,16 +55,27 @@ struct __attribute__((packed)) KernelArgs
     p3 _p20;
     unsigned int activation;
     p3 _p21;
+    void *ptr_SW;
+    p2 _p22;
 };
 
-static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, QuantType &quant_type)
+static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, QuantType &quant_type, bool do_weight)
 {
     int E = w1.size(0);
     int dim1 = w1.size(1);
+
     if (inp.scalar_type() == at::ScalarType::Float8_e4m3fnuz &&
         w1.scalar_type() == at::ScalarType::Float8_e4m3fnuz &&
         out.scalar_type() == at::ScalarType::BFloat16 &&
-        quant_type == QuantType::per_Token)
+        quant_type == QuantType::per_Token &&
+        do_weight)
+    {
+        return &cfg_fmoe_stage1_bf16_pertokenFp8_doweight_g1u1;
+    }
+    else if (inp.scalar_type() == at::ScalarType::Float8_e4m3fnuz &&
+             w1.scalar_type() == at::ScalarType::Float8_e4m3fnuz &&
+             out.scalar_type() == at::ScalarType::BFloat16 &&
+             quant_type == QuantType::per_Token)
     {
         return &cfg_fmoe_stage1_bf16_pertokenFp8_g1u1;
     }
@@ -84,7 +95,8 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported input_type:", inp.scalar_type(), " weight_type:", w1.scalar_type(), ", out_type:", out.scalar_type(), ", quant_type:", static_cast<int>(quant_type));
+        TORCH_CHECK(false, "Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
+                    ", out_type:", out.scalar_type(), ", quant_type:", static_cast<int>(quant_type), ", do_weight:", do_weight);
     }
 };
 
@@ -142,14 +154,15 @@ void moe_stage1_g1u1(
     int ksplit = 0,
     ActivationType activation = ActivationType::Silu,
     QuantType quant_type = QuantType::No,
-    std::optional<torch::Tensor> a1_scale = std::nullopt, // [token_cnt, 1], token scale
-    std::optional<torch::Tensor> w1_scale = std::nullopt  // [expert, 1, inter_dim], gate(up) scale
+    std::optional<torch::Tensor> a1_scale = std::nullopt,         // [token_cnt, 1], token scale
+    std::optional<torch::Tensor> w1_scale = std::nullopt,         // [expert, 1, inter_dim], gate(up) scale
+    std::optional<torch::Tensor> sorted_weight_buf = std::nullopt // [max_num_tokens_padded], do_weight==true need
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    CFG *config_map = get_cfg(input, out, w1, quant_type);
+    CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weight_buf.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     int model_dim = input.size(1);
     int hidden_dim = inter_dim;
@@ -226,6 +239,7 @@ void moe_stage1_g1u1(
     args.topk = topk;
     args.splitk = ksplit;
     args.activation = static_cast<int>(activation);
+    args.ptr_SW = sorted_weight_buf.has_value() ? sorted_weight_buf.value().data_ptr() : nullptr;
 
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0, __func__, " Unsupported ksplit for model_dim:", model_dim, " k_num:", k_num);
