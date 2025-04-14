@@ -401,13 +401,14 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
         float t = aiter::mha_bwd(args,
                                  stream_config,
-                                 mask,
                                  q_dtype_str,
-                                 true,  // is_group_mode
+                                 true,   // is_group_mode
+                                 mask,
                                  bias_type,
+                                 false,  // has_dbias
+                                 false,  // is_store_randval
                                  deterministic,
-                                 false, // has_dbias
-                                 true,  // use_ext_asm
+                                 true,   // use_ext_asm
                                  is_v3_atomic_fp32,
                                  how_v3_bf16_cvt);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_bwd");

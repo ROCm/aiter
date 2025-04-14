@@ -27,6 +27,7 @@
 #include "rope.h"
 #include "rocsolgemm.cuh"
 #include "hipbsolgemm.cuh"
+#include "aiter_enum.h"
 
 #include "torch/mha_varlen_fwd.h"
 #include "torch/mha_varlen_bwd.h"
@@ -42,6 +43,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
       // remove *TUNE* , MHA*
       // GEMM_A8W8_TUNE_PYBIND;
+      AITER_ENUM_PYBIND;
       RMSNORM_PYBIND;
       MHA_VARLEN_FWD_PYBIND;
       MHA_VARLEN_BWD_PYBIND;
