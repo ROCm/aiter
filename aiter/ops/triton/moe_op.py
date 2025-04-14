@@ -345,29 +345,18 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
     # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
     # The new pid logic has better affinity with the xcd remapping
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    # Load tile-invariant runtime constant
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     tile_id = start_pid
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # Load tile-invariant runtime constant
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-
+    num_tiles = num_pid_m * num_pid_n
     # Compute how many tiles are outside the padding region
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    pid_m = 0
-    tile_id2 = start_pid - NUM_SMS
-    num_valid_tiles = -1
-    while pid_m * BLOCK_SIZE_M < num_tokens_post_padded:
-        num_valid_tiles += 1
-        tile_id2 += NUM_SMS
-        group_id = tile_id2 // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id2 % num_pid_in_group) % group_size_m)
-
-
+    num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
     for _ in range(0, num_valid_tiles):
         pid_m, pid_n = pid_grid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
@@ -763,30 +752,20 @@ def _fused_moe_persistent_kernel(
     # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
     # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
     # The new pid logic has better affinity with the xcd remapping
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    # num_tiles = num_pid_m * num_pid_n
-    tile_id = start_pid
-
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # offs_token = tl.zeros((BLOCK_SIZE_M,), dtype=tl.int32)
-    # token_mask = tl.zeros((BLOCK_SIZE_M,), dtype=tl.int1)
 
     # Load tile-invariant runtime constant
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tile_id = start_pid
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    num_tiles = num_pid_m * num_pid_n
+
     # Compute how many tiles are outside the padding region
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    pid_m = 0
-    tile_id2 = start_pid - NUM_SMS
-    num_valid_tiles = -1
-    while pid_m * BLOCK_SIZE_M < num_tokens_post_padded:
-        num_valid_tiles += 1
-        tile_id2 += NUM_SMS
-        group_id = tile_id2 // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id2 % num_pid_in_group) % group_size_m)
+    num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
 
     for _ in range(0, num_valid_tiles):
         pid_m, pid_n = pid_grid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)

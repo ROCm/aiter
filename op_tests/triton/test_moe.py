@@ -149,7 +149,7 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int,
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 def get_default_config() -> Dict[str, int]:
-    config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1} #TODO using GROUP_SIZE_M > 1 results in accuracy issues
+    config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
     return config
 
 def quantize_fp8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
