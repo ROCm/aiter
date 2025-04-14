@@ -308,8 +308,7 @@ def _fused_moe_persistent_kernel_gptq_awq(
         compute_type: tl.constexpr,
         has_zp: tl.constexpr,
         use_int4_w4a16: tl.constexpr,
-        use_int8_w8a16: tl.constexpr,
-        GRID_MN: tl.constexpr
+        use_int8_w8a16: tl.constexpr
     ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -342,7 +341,6 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # This is done in a grouped ordering to promote L2 data reuse.
     start_pid = tl.program_id(axis=0)
     NUM_XCDS: tl.constexpr = 8
-    # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
     # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
     # The new pid logic has better affinity with the xcd remapping
     # Load tile-invariant runtime constant
@@ -358,7 +356,8 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # Compute how many tiles are outside the padding region
     num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
     for _ in range(0, num_valid_tiles):
-        pid_m, pid_n = pid_grid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)
+        tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
+        pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
@@ -716,7 +715,6 @@ def _fused_moe_persistent_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
-    GRID_MN: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -749,7 +747,6 @@ def _fused_moe_persistent_kernel(
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
     NUM_XCDS: tl.constexpr = 8
-    # start_pid = remap_xcd(start_pid, GRID_MN, NUM_XCDS)
     # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
     # The new pid logic has better affinity with the xcd remapping
 
@@ -768,7 +765,9 @@ def _fused_moe_persistent_kernel(
     num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
 
     for _ in range(0, num_valid_tiles):
-        pid_m, pid_n = pid_grid(tile_id, num_pid_m, num_pid_n, GROUP_SIZE_M)
+        tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
+        pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
@@ -928,7 +927,6 @@ def fused_moe(A: torch.Tensor,
                 NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
                                     triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])), )
 
-            GRID_MN = grid(config)[0]
             _fused_moe_persistent_kernel_gptq_awq[grid](
                     A,
                     B,
@@ -965,7 +963,6 @@ def fused_moe(A: torch.Tensor,
                     has_zp=B_zp is not None,
                     use_int4_w4a16=use_int4_w4a16,
                     use_int8_w8a16=use_int8_w8a16,
-                    GRID_MN=GRID_MN,
                     **config,
                 )
         else:
@@ -1016,7 +1013,6 @@ def fused_moe(A: torch.Tensor,
             grid = lambda META: (min(
                 NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
                                     triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])), )
-            GRID_MN = grid(config)[0]
 
             _fused_moe_persistent_kernel[grid](
                 A,
@@ -1057,7 +1053,6 @@ def fused_moe(A: torch.Tensor,
                 compute_type=compute_type,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
-                GRID_MN=GRID_MN,
                 **config,
             )
         else:
