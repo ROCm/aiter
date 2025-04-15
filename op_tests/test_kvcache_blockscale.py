@@ -61,7 +61,7 @@ def run_torch(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, bloc
     return k_cache, v_cache, k_scale, v_scale
 
 
-@perftest(num_iters=10)
+@perftest()
 def run_aiter(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, block_size, x, asm_layout, quantCfg={}):
     aiter.reshape_and_cache_with_block_quant(
         key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout)
@@ -77,7 +77,7 @@ def test_reshape_and_cache(ctx_lens: int,
                            DTyoe_KVCache: torch.dtype,
                            quantCfg: dict = {}
                            ):
-    asm_layout = False
+    asm_layout = True
     qhead, kvhead = num_heads
     num_blocks = (MAX_TOKEN_SUPPORTED+block_size-1)//block_size
     # num_blocks = (ctx_lens+1+block_size-1)//block_size
@@ -118,16 +118,13 @@ def test_reshape_and_cache(ctx_lens: int,
     v_cache_a = v_cache.clone()
     k_scale_a = k_scale.clone()
     v_scale_a = v_scale.clone()
-    (k_cache_a, v_cache_a, k_scale_a, v_scale_a), us_a = run_aiter(key, value, 
+    (k_cache_a, v_cache_a, k_scale_a, v_scale_a), us_a = run_aiter(key.view(bs, ctx_lens, kvhead, head_size), 
+                                                                    value.view(bs, ctx_lens, kvhead, head_size), 
                                                                     k_cache_a, v_cache_a, k_scale_a, v_scale_a,
                                                                     slot_mapping, block_size, x, asm_layout, quantCfg)
 
     print(f'prefill part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     slots_edit = torch.unique(slot_mapping // block_size)
-    # print(k_cache_ref[slots_edit])
-    # print(k_cache_a[slots_edit])
-    # print(v_cache_ref[slots_edit])
-    # print(v_cache_a[slots_edit])
     checkAllclose(k_cache_ref[slots_edit].to(torch.float32), k_cache_a[slots_edit].to(torch.float32), msg=f'k_cache {k_cache_ref.shape}')
     checkAllclose(v_cache_ref[slots_edit].to(torch.float32), v_cache_a[slots_edit].to(torch.float32), msg=f'v_cache {v_cache_ref.shape}')
     if not asm_layout:
@@ -136,38 +133,54 @@ def test_reshape_and_cache(ctx_lens: int,
         k_scale_a = k_scale_a.t()
         v_scale_a = v_scale_a.t()
 
-    # print(k_scale_ref[slots_edit].view(-1,8))
-    # print(k_scale_a[slots_edit].view(-1,8))
-    # print(v_scale_ref[slots_edit].view(-1,8))
-    # print(v_scale_a[slots_edit].view(-1,8))
     checkAllclose(k_scale_ref[slots_edit], k_scale_a[slots_edit], atol=0.001, msg=f'k_scale {k_scale_ref.shape}')
     checkAllclose(v_scale_ref[slots_edit], v_scale_a[slots_edit], atol=0.001, msg=f'v_scale {v_scale_ref.shape}')
 
-    # print(torch.isnan(out_ref[0]).any(), torch.isnan(out_a[0]).any())
-    # print(torch.isnan(out_ref[1]).any(), torch.isnan(out_a[1]).any())
-    # print("torch", out_ref[2][:33])
-    # print("aiter", out_a[2][:33])
+    ##################################################### chunk-prefill part
+    chunk_left_ctx_lens = 10
+    
+    qkv = torch.randn(
+        bs*chunk_left_ctx_lens, qhead+2*kvhead, head_size, dtype=DTyoe_KV, device='cuda')*2
+    _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
 
-    # k_pad = torch.zeros((bs, ceil(ctx_lens/block_size)*block_size, kvhead, head_size), dtype=key.dtype, device=device)
-    # k_pad[:,:ctx_lens, ...] = key.view(bs, ctx_lens, kvhead, head_size)
-    # k_pad = k_pad.view(bs, ceil(ctx_lens/block_size), block_size, kvhead, head_size).permute(0, 1, 3, 2, 4).contiguous()
-    # k_pad = k_pad.view(bs, ceil(ctx_lens/block_size), kvhead, -1)
-    # max, _ = torch.max(
-    #     input=torch.abs(k_pad),
-    #     dim=-1,
-    #     keepdim=True
-    # )
-    # print(max.view(-1)[:10])
-    # print(max.view(-1)[:10]/240)
+    slot_mapping = torch.tensor(
+        [bsID*max_token_num_support+ctx_lens+i for bsID in range(bs) for i in range(chunk_left_ctx_lens)]).cuda()
+
+    if not asm_layout:
+        k_scale_ref = k_scale_ref.t()
+        v_scale_ref = v_scale_ref.t()
+        k_scale_a = k_scale_a.t()
+        v_scale_a = v_scale_a.t()
+    
+    (k_cache_ref, v_cache_ref, k_scale_ref, v_scale_ref), us_ref = run_torch(key.view(bs, chunk_left_ctx_lens, kvhead, head_size),
+                                                                            value.view(bs, chunk_left_ctx_lens, kvhead, head_size),
+                                                                            k_cache_ref, v_cache_ref, k_scale_ref, v_scale_ref,
+                                                                            slot_mapping, block_size, x, asm_layout, quantCfg)
+
+    (k_cache_a, v_cache_a, k_scale_a, v_scale_a), us_a = run_aiter(key.view(bs, chunk_left_ctx_lens, kvhead, head_size), 
+                                                                    value.view(bs, chunk_left_ctx_lens, kvhead, head_size), 
+                                                                    k_cache_a, v_cache_a, k_scale_a, v_scale_a,
+                                                                    slot_mapping, block_size, x, asm_layout, quantCfg)
+
+    print(f'chunk-prefill part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
+    slots_edit = torch.unique(slot_mapping // block_size)    
+    checkAllclose(k_cache_ref[slots_edit].to(torch.float32), k_cache_a[slots_edit].to(torch.float32), msg=f'k_cache {k_cache_ref.shape}')
+    checkAllclose(v_cache_ref[slots_edit].to(torch.float32), v_cache_a[slots_edit].to(torch.float32), msg=f'v_cache {v_cache_ref.shape}')
+    if not asm_layout:
+        k_scale_ref = k_scale_ref.t()
+        v_scale_ref = v_scale_ref.t()
+        k_scale_a = k_scale_a.t()
+        v_scale_a = v_scale_a.t()
+    checkAllclose(k_scale_ref[slots_edit], k_scale_a[slots_edit], atol=0.001, msg=f'k_scale {k_scale_ref.shape}')
+    checkAllclose(v_scale_ref[slots_edit], v_scale_a[slots_edit], atol=0.001, msg=f'v_scale {v_scale_ref.shape}')
 
     ##################################################### decode part
-    
     qkv = torch.randn(
         bs, qhead+2*kvhead, head_size, dtype=DTyoe_KV, device='cuda')*2
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
 
     slot_mapping = torch.tensor(
-        [bsID*max_token_num_support+ctx_lens for bsID in range(bs)]).cuda()
+        [bsID*max_token_num_support+ctx_lens+chunk_left_ctx_lens for bsID in range(bs)]).cuda()
 
     if not asm_layout:
         k_scale_ref = k_scale_ref.t()
@@ -180,19 +193,13 @@ def test_reshape_and_cache(ctx_lens: int,
                                                                             k_cache_ref, v_cache_ref, k_scale_ref, v_scale_ref,
                                                                             slot_mapping, block_size, x, asm_layout, quantCfg)
 
-    k_scale_a2 = k_scale_a.clone()
-    (k_cache_a, v_cache_a, k_scale_a, v_scale_a), us_a = run_aiter(key, value, 
+    (k_cache_a, v_cache_a, k_scale_a, v_scale_a), us_a = run_aiter(key.view(bs, 1, kvhead, head_size), 
+                                                                    value.view(bs, 1, kvhead, head_size), 
                                                                     k_cache_a, v_cache_a, k_scale_a, v_scale_a,
                                                                     slot_mapping, block_size, x, asm_layout, quantCfg)
 
     print(f'decode part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     slots_edit = torch.unique(slot_mapping // block_size)    
-    # print(v_cache_ref[slots_edit].view(-1, 4))
-    # print(v_cache_a[slots_edit].view(-1, 4))
-    # print(k_cache_ref[slots_edit])
-    # print(k_cache_a[slots_edit])
-    # print(v_cache_ref[slots_edit])
-    # print(v_cache_a[slots_edit])
     checkAllclose(k_cache_ref[slots_edit].to(torch.float32), k_cache_a[slots_edit].to(torch.float32), msg=f'k_cache {k_cache_ref.shape}')
     checkAllclose(v_cache_ref[slots_edit].to(torch.float32), v_cache_a[slots_edit].to(torch.float32), msg=f'v_cache {v_cache_ref.shape}')
     if not asm_layout:
@@ -200,10 +207,6 @@ def test_reshape_and_cache(ctx_lens: int,
         v_scale_ref = v_scale_ref.t()
         k_scale_a = k_scale_a.t()
         v_scale_a = v_scale_a.t()
-    # print(k_scale_ref[slots_edit].view(-1,8))
-    # print(k_scale_a[slots_edit].view(-1,8))
-    # print(v_scale_ref[slots_edit].view(-1,8))
-    # print(v_scale_a[slots_edit].view(-1,8))
     checkAllclose(k_scale_ref[slots_edit], k_scale_a[slots_edit], atol=0.001, msg=f'k_scale {k_scale_ref.shape}')
     checkAllclose(v_scale_ref[slots_edit], v_scale_a[slots_edit], atol=0.001, msg=f'v_scale {v_scale_ref.shape}')
 
