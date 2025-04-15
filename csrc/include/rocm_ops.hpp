@@ -333,7 +333,8 @@
             py::arg("topk"),                    \
             py::arg("w1_scale") = std::nullopt, \
             py::arg("a1_scale") = std::nullopt, \
-            py::arg("block_m") = 32);           \
+            py::arg("block_m") = 32,            \
+            py::arg("sorted_weights") = std::nullopt);           \
                                                 \
       m.def("ck_moe_stage2", &ck_moe_stage2,    \
             py::arg("inter_states"),            \

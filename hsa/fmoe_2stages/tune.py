@@ -239,7 +239,7 @@ def go(
                         )
                     )
 
-            if blockM in [32, 64, 128] and q_type != QuantType.per_128x128 and doweight_stage1 == 0:
+            if blockM in [32, 64, 128] and q_type != QuantType.per_128x128:
                 if q_dtype_w == torch.int4:
                     w1_qt_shffle = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(
@@ -265,7 +265,7 @@ def go(
                             act_type,
                             a1_scale,
                             w1_scale,
-                            # sorted_weights if doweight_stage1 else None,
+                            sorted_weights if doweight_stage1 else None,
                         ),
                     )
                 )

@@ -218,6 +218,7 @@ def ck_moe_stage1(
     w1_scale: Optional[Tensor] = None,
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
+    sorted_weights:  Optional[Tensor] = None,
 ): ...
 
 

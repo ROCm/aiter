@@ -315,7 +315,7 @@ def ck_moe_2stages(a1,
     aiter.ck_moe_stage1(a1, w1, w2,
                         sorted_ids, sorted_expert_ids, num_valid_ids,
                         a2, topk,
-                        fc1_scale, a1_scale, block_size)
+                        fc1_scale, a1_scale, block_size, sorted_weights)
 
     # g1u0
     if (w2.shape[2] != w1.shape[1]) and (w2.dtype == torch.float8_e4m3fnuz):

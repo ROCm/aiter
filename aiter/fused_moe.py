@@ -445,6 +445,7 @@ def fused_moe_2stages(
             dtype=q_dtype_a,
             device=device,
         )
+
     stage1(
         a1,
         w1,
@@ -580,6 +581,7 @@ def ck_stage1(
     activation=ActivationType.Silu,
     a1_scale=None,
     w1_scale=None,
+    sorted_weights_buf=None
 ):
     topk = out.shape[1]
     expert, topk, _ = out.shape
@@ -600,6 +602,7 @@ def ck_stage1(
         w1_scale,
         a1_scale,
         block_m,
+        sorted_weights_buf,
     )
     if activation == ActivationType.Silu:
         aiter.silu_and_mul(out, tmp)

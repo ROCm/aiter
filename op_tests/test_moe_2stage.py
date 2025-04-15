@@ -138,6 +138,7 @@ def test_fmoe(
         a1_scale=a1_scale,
         w1_scale=w1_scale,
         num_iters=3,
+        doweight=False,
     )
 
     if WQDType == torch.int4:  # int4 w quant
@@ -217,6 +218,7 @@ def test_fmoe(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         num_iters=3,
+        doweight=False,
     )
     # # out_ref = torch_moe(
     # #     input,
@@ -257,6 +259,7 @@ def test_fmoe(
     # ######################## stage 2 end ###########
 
     # ######################## fused 2 stage #########
+
     out2_aiter, us_fuse = run_perftest(
         fused_moe,
         input,
@@ -268,6 +271,7 @@ def test_fmoe(
         w2_scale=w2_scale,
         quant_type=qType,
         activation=actType,
+        doweight_stage1=False,
     )
 
     err = checkAllclose(
