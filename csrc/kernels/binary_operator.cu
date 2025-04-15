@@ -1211,12 +1211,12 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
     hipGetDeviceProperties(&dev_prop, dev);
     uint32_t num_cu = dev_prop.multiProcessorCount;
 
-    bool bcast_k_dim = (input.dim() == 1 && input.size(0) == K) || (other.dim() == 1 && other.size(0) == K);
+    bool bcast_k_dim = (input.dim() == 1 && input.size(0) == shape[2]) || (other.dim() == 1 && other.size(0) == shape[2]);
     bool bcast_scalar = (input.dim() == 1 && input.size(0) == 1) || (other.dim() == 1 && other.size(0) == 1);
-    bool vec_unroll_able = num_elements % (rows * vec * 256) == 0 && K % vec == 0;
+    bool vec_unroll_able = num_elements % (rows * vec * 256) == 0 && shape[2] % vec == 0;
 
     //  (m,n,k), (k,)
-    if (bcast_k_dim && vec_unroll_able)
+    if (bcast_k_dim && vec_unroll_able && output.dim() == 3)
     {
       int grid_x = (num_elements / (rows * vec) + 256 - 1) / 256;
       int occupancy;
@@ -1237,7 +1237,7 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
         VLLM_DISPATCH_FLOATING_TYPES(
             output.scalar_type(), "operator_bcastK_unroll_vectorize_naive", [&]
             { aiter::operator_bcastK_unroll_vectorize_naive<scalar_t, rows, Operation, true, _T1, _T0>
-                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, M, N, K, types_match); });
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, shape[0], shape[1], shape[2], types_match); });
       }
     }
     // (m, n, k), (1)
@@ -1818,20 +1818,26 @@ torch::Tensor binary_operation(torch::Tensor &input, torch::Tensor &other)
       {
         if (other.dim() == 1)
         {
-          if (other.size(0) == 1 || other.size(0) == input.size(2))
+          if (other.size(0) == 1 || (other.size(0) == input.size(2) && input.size(2) % (128 / input.element_size()) == 0))
           {
-            is_support = true;
-            pattern = PATTERN_BROADCAST_0;
-            order_flag = true;
+            if (input.numel() % (256 * 8 * 16 / input.element_size()) == 0)
+            {
+              is_support = true;
+              pattern = PATTERN_BROADCAST_0;
+              order_flag = true;
+            }
           }
         }
         else
         {
-          if (input.size(0) == 1 || input.size(0) == other.size(2))
+          if (input.size(0) == 1 || (input.size(0) == other.size(2) && other.size(2) % (128 / other.element_size()) == 0))
           {
-            is_support = true;
-            pattern = PATTERN_BROADCAST_0;
-            order_flag = false;
+            if (other.numel() % (256 * 8 * 16 / other.element_size()) == 0)
+            {
+              is_support = true;
+              pattern = PATTERN_BROADCAST_0;
+              order_flag = false;
+            }
           }
         }
       }

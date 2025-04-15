@@ -7,36 +7,50 @@ import aiter
 from aiter.test_common import checkAllclose, perftest
 from torch.profiler import profile, record_function, ProfilerActivity
 
-# input shape: torch.Size([4096, 64, 160]) (20480, 1, 128) 
-# other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)
+input_shapes = [
+        (512,), (1280, 232, 256), (256, 256), (256, 8192), (256,), (1280, 32, 256), 
+        (384, 256), (384,), (65536,), (65536, 256), (1, 8, 256), (512, 256), 
+        (1280, 532, 256),
+        (6144, 100, 96), (1, 100, 96),
+        (6144, 16, 96), (6144, 1, 96),
+        (6144, 289, 96), (289, 1),
+        (6144, 16, 192), (192,),
+        (6144, 8, 1), (1,),
+        ]  
+input_strides = [
+        (1,), (59392, 256, 1), (256, 1), (8192, 1), (1, ), (8192, 256, 1), 
+        (256, 1), (1,), (1,), (256, 1), (2048, 256, 1), (256, 1), 
+        (136192, 256, 1),
+        (9600, 96, 1), (9600, 96, 1),
+        (16*96, 96, 1), (96, 96, 1),
+        (289*96, 96, 1), (1, 1),
+        (16*192, 192, 1), (1,),
+        (8, 1, 1), (1,),
+        ]
 
-# input shape: torch.Size([4096, 64, 160]) (47360, 1, 296)
-# other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)
+other_shapes = [
+        (512,), (1280, 232, 256), (256, 256), (256, 8192), (256,), (1280, 32, 256), 
+        (384, 256), (384,), (65536,), (65536, 256), (1, 8, 256), (512, 256), 
+        (1280, 532, 256),
+        (1, 100, 96), (6144, 100, 96),
+        (6144, 1, 96), (6144, 16, 96),
+        (289, 1), (6144, 289, 96),
+        (192,), (6144, 16, 192),
+        (1,), (6144, 8, 1),
+        ]  
+other_strides = [
+        (1,), (59392, 256, 1), (256, 1), (8192, 1), (1, ), (8192, 256, 1), 
+        (256, 1), (1,), (1,), (256, 1), (2048, 256, 1), (256, 1), 
+        (136192, 256, 1),
+        (9600, 96, 1), (9600, 96, 1),
+        (96, 96, 1), (16*96, 96, 1),
+        (1, 1), (289*96, 96, 1),
+        (1,), (16*192, 192, 1),
+        (1,), (8, 1, 1),
+        ]
 
-# shape0 = (4096, 64, 160)
-# shape1 = (4096, 64, 160)
-# stride0 = (47360, 1, 296)
-# # stride1 = (20480, 1, 128)
-# stride1 = (10240, 160, 1)
-
-# shape1 = (4096, 200, 64)
-# shape0 = (1, 200, 64)
-# stride0 = (12800, 64, 1)
-# stride1 = (12800, 64, 1)
-
-# shape1 = (144, 1, 160)
-# shape0 = (144, 4096, 160)
-# stride1 = (160, 160, 1)
-# stride0 = (655360, 160, 1)
-
-shapes = [(512,), (1280, 232, 256), (256, 256), (256, 8192), (256,), (1280, 32, 256), (384, 256), (384,), (65536,), (65536, 256), (1, 8, 256), (512, 256), (1280, 532, 256)]  
-strides = [(1,), (59392, 256, 1), (256, 1), (8192, 1), (1, ), (8192, 256, 1), (256, 1), (1,), (1,), (256, 1), (2048, 256, 1), (256, 1), (136192, 256, 1)]
-
-# shapes = [(512,)]
-# strides = [(1,)]
-
-tensors0 = [torch.empty_strided(shape, stride, dtype=torch.bfloat16, device='cuda') for shape, stride in zip(shapes, strides)]  
-tensors1 = [torch.empty_strided(shape, stride, dtype=torch.bfloat16, device='cuda') for shape, stride in zip(shapes, strides)]
+tensors0 = [torch.empty_strided(shape, stride, dtype=torch.bfloat16, device='cuda') for shape, stride in zip(input_shapes, input_strides)]  
+tensors1 = [torch.empty_strided(shape, stride, dtype=torch.bfloat16, device='cuda') for shape, stride in zip(other_shapes, other_strides)]
 for tensor in tensors0:
     tensor.copy_(torch.rand_like(tensor))  
     # tensor.fill_(1)
