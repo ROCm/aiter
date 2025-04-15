@@ -4,6 +4,7 @@ import triton.language as tl
 from typing import Any, Dict, Optional, List
 
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 #Source:
 #MoE Kernel adapted from VLLM 
@@ -125,8 +126,6 @@ def _fused_moe_silu_kernel_gptq_awq(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
-    NUM_XCDS: tl.constexpr = 8
-
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
@@ -134,37 +133,9 @@ def _fused_moe_silu_kernel_gptq_awq(
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+    NUM_XCDS: tl.constexpr = 8
+    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -383,39 +354,24 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    NUM_XCDS: tl.constexpr = 8
+    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
+    # The new pid logic has better affinity with the xcd remapping
+    # Load tile-invariant runtime constant
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     tile_id = start_pid
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
-    # Load tile-invariant runtime constant
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-
+    num_tiles = num_pid_m * num_pid_n
     # Compute how many tiles are outside the padding region
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    pid_m = 0
-    tile_id2 = start_pid - NUM_SMS
-    num_valid_tiles = -1
-    while pid_m * BLOCK_SIZE_M < num_tokens_post_padded:
-        num_valid_tiles += 1
-        tile_id2 += NUM_SMS
-        group_id = tile_id2 // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id2 % num_pid_in_group) % group_size_m)
-
-
+    num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
     for _ in range(0, num_valid_tiles):
-        if GROUP_SIZE_M == 1:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
-        else:
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+        tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
+        pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
@@ -625,37 +581,8 @@ def _fused_moe_silu_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     NUM_XCDS: tl.constexpr = 8
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
@@ -862,41 +789,28 @@ def _fused_moe_persistent_silu_kernel(
     # -----------------------------------------------------------
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    # num_tiles = num_pid_m * num_pid_n
-    tile_id = start_pid
-
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # offs_token = tl.zeros((BLOCK_SIZE_M,), dtype=tl.int32)
-    # token_mask = tl.zeros((BLOCK_SIZE_M,), dtype=tl.int1)
+    NUM_XCDS: tl.constexpr = 8
+    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
+    # The new pid logic has better affinity with the xcd remapping
 
     # Load tile-invariant runtime constant
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    tile_id = start_pid
+
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    num_tiles = num_pid_m * num_pid_n
+
     # Compute how many tiles are outside the padding region
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    pid_m = 0
-    tile_id2 = start_pid - NUM_SMS
-    num_valid_tiles = -1
-    while pid_m * BLOCK_SIZE_M < num_tokens_post_padded:
-        num_valid_tiles += 1
-        tile_id2 += NUM_SMS
-        group_id = tile_id2 // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + ((tile_id2 % num_pid_in_group) % group_size_m)
+    num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
 
     for _ in range(0, num_valid_tiles):
-        if GROUP_SIZE_M == 1:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
-        else:
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+        tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
+        pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
