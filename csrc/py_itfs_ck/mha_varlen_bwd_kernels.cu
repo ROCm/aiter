@@ -367,6 +367,7 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
+        stream_config.log_level_ = 1;
 
         auto args =
             get_ck_fmha_varlen_bwd_args(
@@ -398,12 +399,13 @@ mha_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
 
         float t = aiter::mha_bwd(args,
                                  stream_config,
-                                 mask,
                                  q_dtype_str,
                                  true,  //is_group_mode
+                                 mask,
                                  bias_type,
-                                 deterministic,
                                  false,  // has_dbias
+                                 false,  // is_store_randval
+                                 deterministic,
                                  false,  // use_ext_asm
                                  false,  // is_v3_atomic_fp32
                                  0);     // how_v3_bf16_cvt

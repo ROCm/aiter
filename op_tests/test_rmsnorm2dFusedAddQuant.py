@@ -31,7 +31,7 @@ def run_torch(input, weight, eps, residual=None, x_scale = None, y_scale_dtype =
         y_scale = None
         output_q = output
     else:
-        output_q, y_scale = aiter.pertoken_quant(output, y_scale_dtype, x_scale=x_scale)
+        output_q, y_scale = aiter.pertoken_quant(output, x_scale=x_scale)
     return output_q, residual_out, y_scale, output
 
 @perftest()

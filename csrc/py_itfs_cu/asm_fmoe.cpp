@@ -76,7 +76,7 @@ public:
     FMoeKernel(const char *name, const char *hsaco, uint32_t sub_GU = 512)
     {
         const char *AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
-        std::cout << "hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << name;
+        std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str() << " GetFunction: " << name;
         HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
@@ -813,12 +813,13 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
                               torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                               torch::Tensor &num_valid_ids,     // [1]
                               uint32_t topk,                    //
+                              torch::Tensor &input_scale,       // [expert, 1, dim]
                               torch::Tensor &fc1_scale,         // [expert, 1, inter_dim]
                               torch::Tensor &fc2_scale,         // [expert, 1, dim]
-                              torch::Tensor input_scale,        // [expert, 1, dim]
-                              int fc_scale_blkn = 128,
-                              int fc_scale_blkk = 128,
-                              std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt) // [expert, 1, inter_dim])
+                              int fc_scale_blkn,
+                              int fc_scale_blkk,
+                              std::optional<torch::Tensor> fc2_smooth_scale,
+                              ActivationType activation)
 {
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
