@@ -549,7 +549,7 @@ def _attn_fwd(q_ptr: torch.Tensor,
                                         block_min, block_max, 0, 0, 0, alibi_slope, 
                                         descale_q, descale_k, descale_v,
                                         offs_m, offs_n, BLOCK_M, BLOCK_N, BLOCK_DMODEL,BLOCK_DMODEL_POW2,
-                                        sm_scale, IS_CAUSAL, MASK_STEPS=False, ENABLE_DROPOUT=ENABLE_DROPOUT, 
+                                        sm_scale, False, MASK_STEPS=False, ENABLE_DROPOUT=ENABLE_DROPOUT, 
                                         RETURN_SCORES=RETURN_SCORES, PADDED_HEAD=BLOCK_DMODEL!=BLOCK_DMODEL_POW2,
                                         IS_FP8=IS_FP8, FP8_MAX=FP8_MAX
                                         )
