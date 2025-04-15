@@ -360,8 +360,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     int MPerBlock = block_m.value();
     // int M = agvtokens_per_expert < 32 ? 32 : (agvtokens_per_expert < 64 ? 64 : 128);
     bool isPerTensorQuant = (!w2_scale.has_value()) || (w2_scale.value().numel() == E);
-    // bool MulRoutedWeight = sorted_weights.defined() || sorted_weights.numel() != 0;
-    bool MulRoutedWeight = true;
+    bool MulRoutedWeight = sorted_weights.defined() || sorted_weights.numel() != 0;
     
 
     void *inter_states_ptr = inter_states.data_ptr();
