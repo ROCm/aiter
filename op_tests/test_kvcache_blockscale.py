@@ -125,8 +125,8 @@ def test_reshape_and_cache(ctx_lens: int,
 
     print(f'prefill part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     slots_edit = torch.unique(slot_mapping // block_size)
-    checkAllclose(k_cache_ref[slots_edit].to(torch.float32), k_cache_a[slots_edit].to(torch.float32), msg=f'k_cache {k_cache_ref.shape}')
-    checkAllclose(v_cache_ref[slots_edit].to(torch.float32), v_cache_a[slots_edit].to(torch.float32), msg=f'v_cache {v_cache_ref.shape}')
+    checkAllclose(k_cache_ref.to(torch.float32)[slots_edit], k_cache_a.to(torch.float32)[slots_edit], msg=f'k_cache {k_cache_ref.shape}')
+    checkAllclose(v_cache_ref.to(torch.float32)[slots_edit], v_cache_a.to(torch.float32)[slots_edit], msg=f'v_cache {v_cache_ref.shape}')
     if not asm_layout:
         k_scale_ref = k_scale_ref.t()
         v_scale_ref = v_scale_ref.t()
@@ -164,8 +164,8 @@ def test_reshape_and_cache(ctx_lens: int,
 
     print(f'chunk-prefill part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     slots_edit = torch.unique(slot_mapping // block_size)    
-    checkAllclose(k_cache_ref[slots_edit].to(torch.float32), k_cache_a[slots_edit].to(torch.float32), msg=f'k_cache {k_cache_ref.shape}')
-    checkAllclose(v_cache_ref[slots_edit].to(torch.float32), v_cache_a[slots_edit].to(torch.float32), msg=f'v_cache {v_cache_ref.shape}')
+    checkAllclose(k_cache_ref.to(torch.float32)[slots_edit], k_cache_a.to(torch.float32)[slots_edit], msg=f'k_cache {k_cache_ref.shape}')
+    checkAllclose(v_cache_ref.to(torch.float32)[slots_edit], v_cache_a.to(torch.float32)[slots_edit], msg=f'v_cache {v_cache_ref.shape}')
     if not asm_layout:
         k_scale_ref = k_scale_ref.t()
         v_scale_ref = v_scale_ref.t()
@@ -200,8 +200,8 @@ def test_reshape_and_cache(ctx_lens: int,
 
     print(f'decode part: ref vs aiter {us_ref:.2f}us vs {us_a:.2f}us')
     slots_edit = torch.unique(slot_mapping // block_size)    
-    checkAllclose(k_cache_ref[slots_edit].to(torch.float32), k_cache_a[slots_edit].to(torch.float32), msg=f'k_cache {k_cache_ref.shape}')
-    checkAllclose(v_cache_ref[slots_edit].to(torch.float32), v_cache_a[slots_edit].to(torch.float32), msg=f'v_cache {v_cache_ref.shape}')
+    checkAllclose(k_cache_ref.to(torch.float32)[slots_edit], k_cache_a.to(torch.float32)[slots_edit], msg=f'k_cache {k_cache_ref.shape}')
+    checkAllclose(v_cache_ref.to(torch.float32)[slots_edit], v_cache_a.to(torch.float32)[slots_edit], msg=f'v_cache {v_cache_ref.shape}')
     if not asm_layout:
         k_scale_ref = k_scale_ref.t()
         v_scale_ref = v_scale_ref.t()
