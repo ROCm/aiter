@@ -42,13 +42,13 @@ def run_torch(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, bloc
 
     k_cache[slot_mapping] = key.view(-1, num_heads, head_size)
     k_cache = k_cache.view(num_blocks, block_size, num_heads, head_size).permute(0, 2, 1, 3).view(num_blocks, num_heads, -1)
-    k_cache, k_scale = aiter.pertoken_quant(k_cache, y_scale_dtype=quantCfg['y_scale_dtype'], quant_dtype=quantCfg['quant_dtype'])
+    k_cache, k_scale = aiter.pertoken_quant(k_cache, scale_dtype=quantCfg['y_scale_dtype'], quant_dtype=quantCfg['quant_dtype'])
     k_cache = k_cache.view(num_blocks, num_heads, block_size, head_size//x, x).permute(0, 1, 3, 2, 4).contiguous()
     k_scale = k_scale.view(num_blocks, num_heads)
 
     v_cache[slot_mapping] = value.view(-1, num_heads, head_size)
     v_cache = v_cache.view(num_blocks, block_size, num_heads, head_size).permute(0, 2, 1, 3).view(num_blocks, num_heads, -1)
-    v_cache, v_scale = aiter.pertoken_quant(v_cache, y_scale_dtype=quantCfg['y_scale_dtype'], quant_dtype=quantCfg['quant_dtype'])
+    v_cache, v_scale = aiter.pertoken_quant(v_cache, scale_dtype=quantCfg['y_scale_dtype'], quant_dtype=quantCfg['quant_dtype'])
     v_scale = v_scale.view(num_blocks, num_heads)
 
     if asm_layout:
