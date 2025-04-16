@@ -210,7 +210,7 @@ def go(
                     dtype=q_dtype_a,
                 )
 
-            if use_g1u1 and dtype == torch.bfloat16 and q_dtype_w != torch.int4:
+            if use_g1u1 and q_dtype_w != torch.int4:
                 for el in asm_kernels.get(blockM, []):
                     tasks.append(
                         (
@@ -223,7 +223,7 @@ def go(
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                out,
+                                out.view(torch.bfloat16),
                                 blockM,
                                 el,
                                 0,
@@ -277,6 +277,8 @@ def go(
 
         profileDF = []
         for (tag, block_m), us, _ in rets:
+            if us == float("inf"):
+                continue
             if q_type == QuantType.per_128x128:
                 scale = (
                     _[token:, ...]
@@ -286,7 +288,7 @@ def go(
                 )
                 _ = _[:token, :, :].to(torch.float32)
             err = checkAllclose(
-                ref.to("cpu"), _, msg=f"[{tag:<50}]: {us:.2f}us ......      "
+                ref.to("cpu"), _.to(ref.dtype), msg=f"[{tag:<50}]: {us:.2f}us ......      "
             )
             profileDF.append(
                 [

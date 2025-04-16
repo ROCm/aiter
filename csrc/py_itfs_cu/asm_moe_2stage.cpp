@@ -110,12 +110,12 @@ std::string get_heuristic_kernel(int m_num, int N, int blockk_size, CFG *cfgs)
     uint32_t empty_cu = num_cu;
     uint32_t tg_num = 0;
     uint32_t round = 0xffffffff;
-    std::string selected;
+    std::string selected = "inter_dim = " + std::to_string(N);
 
     for (const auto &el : *cfgs)
     {
         const auto &cfg = el.second;
-        if (cfg.tile_M != blockk_size)
+        if (cfg.tile_M != blockk_size || N % cfg.tile_N != 0)
         {
             continue;
         }
@@ -179,6 +179,8 @@ void moe_stage1_g1u1(
         const auto &cfg = it->second;
         const char *name = cfg.name.c_str();
         const char *co_name = cfg.co_name.c_str();
+
+        TORCH_CHECK(inter_dim % cfg.tile_N == 0, "ASM kernel " + std::string(name) + " is not supported for inter_dim = " + std::to_string(inter_dim));
 
         auto result = impl_ptr_map.emplace(name, nullptr);
         if (result.second)

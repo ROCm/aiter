@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn.functional as F
-import triton.language as tl
+import math
 import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -96,7 +96,7 @@ def test_fmoe(
 ):
     torch_quant = aiter.get_torch_quant(qType)
     torch_act = aiter.get_torch_act(actType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.randn((token, model_dim), dtype=dtype) / math.sqrt(inter_dim)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
     else:
@@ -283,7 +283,7 @@ def test_fmoe(
     return {"us": us_fuse, "err": err}
 
 
-list_dtype = [torch.bfloat16]
+list_dtype = [torch.bfloat16, torch.float16][:1]
 list_dim = [(6144, 4096)]
 list_tokenNum = [
     1,

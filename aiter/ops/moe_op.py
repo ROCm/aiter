@@ -218,7 +218,7 @@ def ck_moe_stage1(
     w1_scale: Optional[Tensor] = None,
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
-    sorted_weights:  Optional[Tensor] = None,
+    sorted_weights: Optional[Tensor] = None,
 ): ...
 
 
@@ -229,11 +229,11 @@ def ck_moe_stage2(
     w2: Tensor,
     sorted_token_ids: Tensor,
     sorted_expert_ids: Tensor,
-    sorted_weights: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
     topk: int,
     w2_scale: Optional[Tensor] = None,
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
+    sorted_weights: Optional[Tensor] = None,
 ): ...

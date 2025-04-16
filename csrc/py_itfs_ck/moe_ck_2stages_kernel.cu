@@ -136,7 +136,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     void *sorted_weights_ptr = MulRoutedWeight ? sorted_weights.value().data_ptr() : nullptr;
     void *num_valid_ids_ptr = num_valid_ids.data_ptr();
     void *out_ptr = out.data_ptr();
-    void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().transpose(0, 1).data_ptr() : nullptr;
+    void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
     void *a1_scale_ptr = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
 
     // BF16

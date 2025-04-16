@@ -26,10 +26,10 @@ def perftest(
                 used_memory = torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
                 cache_size = min(
                     properties.L2_cache_size * 64 * 128,
-                    (properties.total_memory - used_memory) * 0.9 - inputSize,
+                    (properties.total_memory - used_memory) * 0.85 - inputSize,
                 )
                 cache_size = max(cache_size, 0)
-                num = (cache_size + inputSize - 1) // inputSize
+                num = int((cache_size + inputSize - 1) // inputSize)
             num = min(num, num_iters)
 
             rotate_args = [

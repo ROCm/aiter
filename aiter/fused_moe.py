@@ -303,6 +303,7 @@ def get_2stage_cfgs(
     config_path = f"{AITER_ROOT_DIR}/aiter/configs/"
     tune_file = os.path.join(config_path, "tuned_fmoe.csv")
     untune_file = os.path.join(config_path, "untuned_fmoe.csv")
+    profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     keys = (
@@ -328,7 +329,7 @@ def get_2stage_cfgs(
             )
         logger.info("\033[34m Start tuning fmoe")
         os.system(
-            f"{PY} {AITER_ASM_DIR}/fmoe_2stages/tune.py -i {untune_file} -o {tune_file}"
+            f"{PY} {AITER_ASM_DIR}/fmoe_2stages/tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
         )
 
     def FinalFunc():
@@ -360,7 +361,10 @@ def get_2stage_cfgs(
 
     if "ck" in tag:
         return (
-            ck_stage1,
+            functools.partial(
+                ck_stage1,
+                activation=activation,
+            ),
             aiter.ck_moe_stage2,
             block_m,
             ksplit,
@@ -447,7 +451,7 @@ def fused_moe_2stages(
             device=device,
         )
 
-    stage1(
+    a2 = stage1(
         a1,
         w1,
         w2,
@@ -483,8 +487,7 @@ def fused_moe_2stages(
             return torch.tensor(1.0, dtype=torch.float, device=device)
 
         a2_scale = get1tensor(device)
-    # if doweight_stage1:
-    #     sorted_weights = torch.ones_like(sorted_weights)
+
     stage2(
         a2,
         w1,
@@ -528,7 +531,8 @@ def asm_stage1(
     w1_scale=None,
     sorted_weights=None
 ):
-    dtype = out.dtype
+    dtype = torch.bfloat16 # out.dtype, asm only support bf16
+    out = out.view(dtype)
     device = out.device
     token_num, topk, _ = out.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
