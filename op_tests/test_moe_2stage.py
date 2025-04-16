@@ -92,6 +92,7 @@ def test_fmoe(
     AQDType,
     WQDType,
     use_g1u1=False,
+    doweight_stage1=False,
 ):
     torch_quant = aiter.get_torch_quant(qType)
     torch_act = aiter.get_torch_act(actType)
@@ -138,7 +139,7 @@ def test_fmoe(
         a1_scale=a1_scale,
         w1_scale=w1_scale,
         num_iters=3,
-        doweight=False,
+        doweight=doweight_stage1,
     )
 
     if WQDType == torch.int4:  # int4 w quant
@@ -218,7 +219,7 @@ def test_fmoe(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         num_iters=3,
-        doweight=False,
+        doweight=not doweight_stage1,
     )
     # # out_ref = torch_moe(
     # #     input,
@@ -271,7 +272,7 @@ def test_fmoe(
         w2_scale=w2_scale,
         quant_type=qType,
         activation=actType,
-        doweight_stage1=False,
+        doweight_stage1=doweight_stage1,
     )
 
     err = checkAllclose(
@@ -304,6 +305,7 @@ list_quant = [
     # (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
+list_doweight_stage1 = [False, True]
 expert, topk = 8, 2
 
 import pandas as pd
@@ -313,7 +315,8 @@ for (
     act_type,
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
-) in itertools.product(list_dtype, list_act, list_quant, list_dim):
+    doweight_stage1
+) in itertools.product(list_dtype, list_act, list_quant, list_dim, list_doweight_stage1):
     df = []
     for m in list_tokenNum:
         ret = test_fmoe(
@@ -328,6 +331,7 @@ for (
             aq_dtype,
             wq_dtype,
             use_g1u1=True,
+            doweight_stage1=doweight_stage1,
         )
         df.append(ret)
     df = pd.DataFrame(df)

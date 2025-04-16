@@ -154,15 +154,15 @@ void moe_stage1_g1u1(
     int ksplit = 0,
     ActivationType activation = ActivationType::Silu,
     QuantType quant_type = QuantType::No,
-    std::optional<torch::Tensor> a1_scale = std::nullopt,         // [token_cnt, 1], token scale
-    std::optional<torch::Tensor> w1_scale = std::nullopt,         // [expert, 1, inter_dim], gate(up) scale
-    std::optional<torch::Tensor> sorted_weight_buf = std::nullopt // [max_num_tokens_padded], do_weight==true need
+    std::optional<torch::Tensor> a1_scale = std::nullopt,      // [token_cnt, 1], token scale
+    std::optional<torch::Tensor> w1_scale = std::nullopt,      // [expert, 1, inter_dim], gate(up) scale
+    std::optional<torch::Tensor> sorted_weights = std::nullopt // [max_num_tokens_padded], do_weight==true need
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weight_buf.has_value());
+    CFG *config_map = get_cfg(input, out, w1, quant_type, sorted_weights.has_value());
     static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
     int model_dim = input.size(1);
     int hidden_dim = inter_dim;
@@ -239,7 +239,7 @@ void moe_stage1_g1u1(
     args.topk = topk;
     args.splitk = ksplit;
     args.activation = static_cast<int>(activation);
-    args.ptr_SW = sorted_weight_buf.has_value() ? sorted_weight_buf.value().data_ptr() : nullptr;
+    args.ptr_SW = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
 
     uint32_t k_num = 1 << ksplit;
     TORCH_CHECK(model_dim % k_num == 0, __func__, " Unsupported ksplit for model_dim:", model_dim, " k_num:", k_num);

@@ -142,6 +142,7 @@ def go(
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
+        del input, w1, w2, score
 
         ref = torch_moe_stage1(
             a1_qt,
@@ -361,27 +362,42 @@ if __name__ == "__main__":
         help="All the kernels are tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
     )
 
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        required=False,
+        help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
+    )
+
     args = parser.parse_args()
     untunedf = pd.read_csv(args.untune_file)
     untunedf = untunedf.drop_duplicates()
-    if not args.all:
+    
+    if not args.all or args.last:
         if os.path.exists(args.tune_file):
             old_tunedf = pd.read_csv(args.tune_file)
-            untunedf_cols = untunedf.columns
-            mask = untunedf.apply(tuple, axis=1).isin(
-                old_tunedf[untunedf_cols].apply(tuple, axis=1)
-            )
-            untunedf = untunedf[~mask]
         else:
             old_tunedf = None
     else:
         old_tunedf = None
+
+    if args.last:
+        untunedf = untunedf.iloc[-1:]
+    elif old_tunedf is not None and not args.all:
+        untunedf_cols = untunedf.columns
+        mask = untunedf.apply(tuple, axis=1).isin(
+            old_tunedf[untunedf_cols].apply(tuple, axis=1)
+        )
+        untunedf = untunedf[~mask]
+    
     tunedf = None
     # tunedf = pd.read_csv(args.tune_file)
     profiles, tunedf = go(untunedf, tunedf)
     if old_tunedf is not None and tunedf is not None:
         tunedf = pd.concat([old_tunedf, tunedf], axis=0)
     if tunedf is not None:
+        tunedf = tunedf.astype(str).drop_duplicates(subset=["token","model_dim","inter_dim","expert","topk","act_type","dtype",
+                                                "q_dtype_a","q_dtype_w","q_type","use_g1u1","doweight_stage1"], keep="last")
         tunedf.to_csv(args.tune_file, index=False)
     if profiles is not None:
         profiles.to_csv(args.profile_file, index=False)

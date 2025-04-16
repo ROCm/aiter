@@ -40,7 +40,7 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
           torch::Tensor &gate,              // [expert, hidden_dim, dim] N,K
           torch::Tensor &down,              // [expert, hidden_dim, dim]
           torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-          torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+          torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
           torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
           torch::Tensor &num_valid_ids,     // [1]
           uint32_t topk                     //
@@ -51,7 +51,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &gate,              // [expert, hidden_dim, dim] N,K
                     torch::Tensor &down,              // [expert, hidden_dim, dim]
                     torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                    torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                     torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                     torch::Tensor &num_valid_ids,     // [1]
                     uint32_t topk,                    //
@@ -66,7 +66,7 @@ void fmoe_g1u1(torch::Tensor &out,                                           // 
                torch::Tensor &gate,                                          // [expert, hidden_dim*2, dim] N,K
                torch::Tensor &down,                                          // [expert, hidden_dim, dim]
                torch::Tensor &sorted_token_ids,                              // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,                             // [max_num_tokens_padded]
+               torch::Tensor &sorted_weights,                                // [max_num_tokens_padded]
                torch::Tensor &sorted_expert_ids,                             // [max_num_m_blocks]
                torch::Tensor &num_valid_ids,                                 // [1]
                uint32_t topk,                                                //
@@ -81,7 +81,7 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                                         
                     torch::Tensor &gate,                                          // [expert, hidden_dim*2, dim] N,K
                     torch::Tensor &down,                                          // [expert, hidden_dim, dim]
                     torch::Tensor &sorted_token_ids,                              // [max_num_tokens_padded]
-                    torch::Tensor &sorted_weight_buf,                             // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weights,                                // [max_num_tokens_padded]
                     torch::Tensor &sorted_expert_ids,                             // [max_num_m_blocks]
                     torch::Tensor &num_valid_ids,                                 // [1]
                     uint32_t topk,                                                //
@@ -96,7 +96,7 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                         torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
                         torch::Tensor &down,              // [expert, dim, inter_dim]
                         torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                        torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                        torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                         torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                         torch::Tensor &num_valid_ids,     // [1]
                         uint32_t topk,                    //
@@ -110,7 +110,7 @@ void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
                    torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
                    torch::Tensor &down,              // [expert, dim, inter_dim]
                    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                   torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                   torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                    torch::Tensor &num_valid_ids,     // [1]
                    uint32_t topk,                    //
@@ -125,7 +125,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,                               
                               torch::Tensor &gate,                                          // [expert, inter_dim*2, dim] N,K
                               torch::Tensor &down,                                          // [expert, dim, inter_dim]
                               torch::Tensor &sorted_token_ids,                              // [max_num_tokens_padded]
-                              torch::Tensor &sorted_weight_buf,                             // [max_num_tokens_padded]
+                              torch::Tensor &sorted_weights,                                // [max_num_tokens_padded]
                               torch::Tensor &sorted_expert_ids,                             // [max_num_m_blocks]
                               torch::Tensor &num_valid_ids,                                 // [1]
                               uint32_t topk,                                                //
@@ -152,7 +152,6 @@ void moe_stage1_g1u1(torch::Tensor &input,             // [token_cnt, model_dim]
                      QuantType quant_type,
                      std::optional<torch::Tensor> a1_scale, // [token_cnt, 1], token scale
                      std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
-                     std::optional<torch::Tensor> sorted_weight_buf
-);
+                     std::optional<torch::Tensor> sorted_weights);
 
 void moe_sum(torch::Tensor &input, torch::Tensor &output);

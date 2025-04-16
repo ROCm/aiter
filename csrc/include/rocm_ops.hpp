@@ -321,33 +321,33 @@
             py::arg("alibi_slopes") = std::nullopt,               \
             py::arg("gen") = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                   \
-      m.def("ck_moe_stage1", &ck_moe_stage1,    \
-            py::arg("hidden_states"),           \
-            py::arg("w1"),                      \
-            py::arg("w2"),                      \
-            py::arg("sorted_token_ids"),        \
-            py::arg("sorted_expert_ids"),       \
-            py::arg("num_valid_ids"),           \
-            py::arg("out"),                     \
-            py::arg("topk"),                    \
-            py::arg("w1_scale") = std::nullopt, \
-            py::arg("a1_scale") = std::nullopt, \
-            py::arg("block_m") = 32,            \
-            py::arg("sorted_weights") = std::nullopt);           \
-                                                \
-      m.def("ck_moe_stage2", &ck_moe_stage2,    \
-            py::arg("inter_states"),            \
-            py::arg("w1"),                      \
-            py::arg("w2"),                      \
-            py::arg("sorted_token_ids"),        \
-            py::arg("sorted_expert_ids"),       \
-            py::arg("sorted_weights"),          \
-            py::arg("num_valid_ids"),           \
-            py::arg("out"),                     \
-            py::arg("topk"),                    \
-            py::arg("w2_scale") = std::nullopt, \
-            py::arg("a2_scale") = std::nullopt, \
+#define MOE_CK_2STAGES_PYBIND                          \
+      m.def("ck_moe_stage1", &ck_moe_stage1,           \
+            py::arg("hidden_states"),                  \
+            py::arg("w1"),                             \
+            py::arg("w2"),                             \
+            py::arg("sorted_token_ids"),               \
+            py::arg("sorted_expert_ids"),              \
+            py::arg("num_valid_ids"),                  \
+            py::arg("out"),                            \
+            py::arg("topk"),                           \
+            py::arg("w1_scale") = std::nullopt,        \
+            py::arg("a1_scale") = std::nullopt,        \
+            py::arg("block_m") = 32,                   \
+            py::arg("sorted_weights") = std::nullopt); \
+                                                       \
+      m.def("ck_moe_stage2", &ck_moe_stage2,           \
+            py::arg("inter_states"),                   \
+            py::arg("w1"),                             \
+            py::arg("w2"),                             \
+            py::arg("sorted_token_ids"),               \
+            py::arg("sorted_expert_ids"),              \
+            py::arg("sorted_weights"),                 \
+            py::arg("num_valid_ids"),                  \
+            py::arg("out"),                            \
+            py::arg("topk"),                           \
+            py::arg("w2_scale") = std::nullopt,        \
+            py::arg("a2_scale") = std::nullopt,        \
             py::arg("block_m") = 32);
 
 #define MOE_CK_PYBIND                                                               \
@@ -383,7 +383,7 @@
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0,                                   \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
@@ -392,7 +392,7 @@
       m.def("fmoe_g1u1", &fmoe_g1u1,                                             \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
@@ -401,7 +401,7 @@
       m.def("fmoe_g1u1_tkw1", &fmoe_g1u1_tkw1,                                   \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
@@ -412,7 +412,7 @@
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,               \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"),                                                     \
             py::arg("input_scale"),                                              \
@@ -434,7 +434,7 @@
             py::arg("quant_type") = QuantType::No,                               \
             py::arg("a1_scale") = std::nullopt,                                  \
             py::arg("w1_scale") = std::nullopt,                                  \
-            py::arg("sorted_weight_buf") = std::nullopt);                        \
+            py::arg("sorted_weights") = std::nullopt);                           \
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_SORTING_PYBIND                                          \

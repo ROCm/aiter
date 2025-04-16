@@ -124,6 +124,7 @@ def fused_moe(
     )
 
     if run_1stage:
+        assert doweight_stage1 == False, "doweight_stage1 not support in fused_moe_1stage"
         return fused_moe_1stage(
             hidden_states,
             w1,
@@ -160,6 +161,7 @@ def fused_moe(
             block_size_M,
             activation=activation,
             quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
             q_dtype_a=q_dtype_a,
             q_dtype_w=q_dtype_w,
             w1_scale=w1_scale,
@@ -376,7 +378,6 @@ def get_2stage_cfgs(
             kernelName=tag,
             activation=activation,
             quant_type=q_type,
-            doweight_stage1=doweight_stage1,
         ),
         aiter.ck_moe_stage2,
         block_m,
@@ -457,7 +458,7 @@ def fused_moe_2stages(
         block_m=block_m,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
-        sorted_weights_buf=sorted_weights if doweight_stage1 else None,
+        sorted_weights=sorted_weights if doweight_stage1 else None,
     )
 
     if quant_type != QuantType.per_128x128:
@@ -482,6 +483,8 @@ def fused_moe_2stages(
             return torch.tensor(1.0, dtype=torch.float, device=device)
 
         a2_scale = get1tensor(device)
+    if doweight_stage1:
+        sorted_weights = torch.ones_like(sorted_weights)
     stage2(
         a2,
         w1,
@@ -559,7 +562,7 @@ def asm_stage1(
         quant_type=quant_type,
         a1_scale=a1_scale,
         w1_scale=w1_scale, 
-        sorted_weight_buf=sorted_weights,
+        sorted_weights=sorted_weights,
     )
     if ksplit > 0:
         if activation == ActivationType.Silu:
@@ -581,7 +584,7 @@ def ck_stage1(
     activation=ActivationType.Silu,
     a1_scale=None,
     w1_scale=None,
-    sorted_weights_buf=None
+    sorted_weights=None
 ):
     topk = out.shape[1]
     expert, topk, _ = out.shape
@@ -602,7 +605,7 @@ def ck_stage1(
         w1_scale,
         a1_scale,
         block_m,
-        sorted_weights_buf,
+        sorted_weights,
     )
     if activation == ActivationType.Silu:
         aiter.silu_and_mul(out, tmp)
@@ -757,7 +760,7 @@ def torch_moe_stage2(
     quant_type=QuantType.No,
     w2_scale=None,  # [1]
     a2_scale=None,  # [expert]]'
-    doweight=False
+    doweight=True
 ):
     ctype = torch.float  # compute type
     hidden_states = hidden_states.to(ctype)

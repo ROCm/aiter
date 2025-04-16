@@ -94,7 +94,7 @@ public:
                        torch::Tensor &w1,                // [expert, inter_dim, dim] N,K
                        torch::Tensor &w2,                // [expert, dim, inter_dim]
                        torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                       torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                       torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                        torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                        torch::Tensor &num_valid_ids,     // [1]
                        uint32_t topk,                    //
@@ -155,7 +155,7 @@ public:
             args.ptr_SMQ = nullptr;
         }
         args.ptr_STP = sorted_token_ids.data_ptr();
-        args.ptr_SW = sorted_weight_buf.data_ptr();
+        args.ptr_SW = sorted_weights.data_ptr();
         args.ptr_SEP = sorted_expert_ids.data_ptr();
         args.dim = dim;
         args.inter_dim = inter_dim;
@@ -258,7 +258,7 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
           torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
           torch::Tensor &down,              // [expert, dim, inter_dim]
           torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-          torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+          torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
           torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
           torch::Tensor &num_valid_ids,     // [1]
           uint32_t topk                     //
@@ -283,7 +283,7 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
                                                 gate,
                                                 down,
                                                 sorted_token_ids,
-                                                sorted_weight_buf,
+                                                sorted_weights,
                                                 sorted_expert_ids,
                                                 num_valid_ids,
                                                 topk);
@@ -294,7 +294,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
                     torch::Tensor &down,              // [expert, dim, inter_dim]
                     torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                    torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                     torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                     torch::Tensor &num_valid_ids,     // [1]
                     uint32_t topk,                    //
@@ -385,7 +385,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                                                gate,
                                                down,
                                                sorted_token_ids,
-                                               sorted_weight_buf,
+                                               sorted_weights,
                                                sorted_expert_ids,
                                                num_valid_ids,
                                                topk,
@@ -400,7 +400,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
                torch::Tensor &down,                           // [expert, dim, inter_dim]
                torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,              // [max_num_tokens_padded]
+               torch::Tensor &sorted_weights,                 // [max_num_tokens_padded]
                torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
                torch::Tensor &num_valid_ids,                  // [1]
                uint32_t topk,                                 //
@@ -593,7 +593,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                                                gate,
                                                down,
                                                sorted_token_ids,
-                                               sorted_weight_buf,
+                                               sorted_weights,
                                                sorted_expert_ids,
                                                num_valid_ids,
                                                topk,
@@ -605,19 +605,19 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
 }
 
 void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt, dim]
-               torch::Tensor &input,                          // [token_cnt, dim] M,K
-               torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
-               torch::Tensor &down,                           // [expert, dim, inter_dim]
-               torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,              // [max_num_tokens_padded]
-               torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
-               torch::Tensor &num_valid_ids,                  // [1]
-               uint32_t topk,                                 //
-               torch::Tensor &input_scale,                    // [token_cnt, 1]
-               torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
-               torch::Tensor &fc2_scale,                      // [expert, 1, dim]
-               std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
-               ActivationType activation)
+                    torch::Tensor &input,                          // [token_cnt, dim] M,K
+                    torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
+                    torch::Tensor &down,                           // [expert, dim, inter_dim]
+                    torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weights,                 // [max_num_tokens_padded]
+                    torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
+                    torch::Tensor &num_valid_ids,                  // [1]
+                    uint32_t topk,                                 //
+                    torch::Tensor &input_scale,                    // [token_cnt, 1]
+                    torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
+                    torch::Tensor &fc2_scale,                      // [expert, 1, dim]
+                    std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
+                    ActivationType activation)
 {
     struct FMoeKernelConfig
     {
@@ -699,7 +699,7 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
                                                gate,
                                                down,
                                                sorted_token_ids,
-                                               sorted_weight_buf,
+                                               sorted_weights,
                                                sorted_expert_ids,
                                                num_valid_ids,
                                                topk,
@@ -715,7 +715,7 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                         torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
                         torch::Tensor &down,              // [expert, dim, inter_dim]
                         torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                        torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                        torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                         torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                         torch::Tensor &num_valid_ids,     // [1]
                         uint32_t topk,                    //
@@ -731,7 +731,7 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                                                 gate,
                                                 down,
                                                 sorted_token_ids,
-                                                sorted_weight_buf,
+                                                sorted_weights,
                                                 sorted_expert_ids,
                                                 num_valid_ids,
                                                 topk,
@@ -747,7 +747,7 @@ void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
                    torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
                    torch::Tensor &down,              // [expert, dim, inter_dim]
                    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                   torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                   torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                    torch::Tensor &num_valid_ids,     // [1]
                    uint32_t topk,                    //
@@ -793,7 +793,7 @@ void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
                                                      gate,
                                                      down,
                                                      sorted_token_ids,
-                                                     sorted_weight_buf,
+                                                     sorted_weights,
                                                      sorted_expert_ids,
                                                      num_valid_ids,
                                                      topk,
@@ -809,7 +809,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
                               torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
                               torch::Tensor &down,              // [expert, dim, inter_dim]
                               torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                              torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                              torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                               torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                               torch::Tensor &num_valid_ids,     // [1]
                               uint32_t topk,                    //
@@ -848,7 +848,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
                                                       gate,
                                                       down,
                                                       sorted_token_ids,
-                                                      sorted_weight_buf,
+                                                      sorted_weights,
                                                       sorted_expert_ids,
                                                       num_valid_ids,
                                                       topk,
