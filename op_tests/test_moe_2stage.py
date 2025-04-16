@@ -68,13 +68,13 @@ def ck_moe_stage2(
         w2,
         sorted_token_ids,
         sorted_expert_ids,
-        sorted_weights,
         num_valid_ids,
         out,
         topk,
         w2_scale,
         a2_scale,
         block_size,
+        sorted_weights,
     )
     return out
 

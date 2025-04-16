@@ -342,8 +342,8 @@ def ck_moe_2stages(a1,
         a2_scale = ck_moe_2stages.one_float_tensor
 
     aiter.ck_moe_stage2(a2, w1, w2, sorted_ids,
-                        sorted_expert_ids, sorted_weights,
-                        num_valid_ids, moe_buf, topk, fc2_scale, a2_scale, block_size)
+                        sorted_expert_ids,
+                        num_valid_ids, moe_buf, topk, fc2_scale, a2_scale, block_size, sorted_weights)
 
     return moe_buf
 

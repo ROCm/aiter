@@ -8,7 +8,7 @@ using AccDataType = F32;
 using EDataType = B16;
 using CDEElementOp = TypeCastExpertWeight;
 const bool Nswizzle = false;
-const bool PerTensorQuant = false;
-CK_MOE_STAGE1_GEMM_DEFINE(32, 256/sizeof(A0DataType), 1, 4, true)
-CK_MOE_STAGE1_GEMM_DEFINE(64, 256/sizeof(A0DataType), 1, 4, true)
-CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 2, 2, true)
+const bool PerTensorQuant = true;
+CK_MOE_STAGE2_GEMM_DEFINE(32, 256/sizeof(A0DataType), 1, 4, true)
+CK_MOE_STAGE2_GEMM_DEFINE(64, 256/sizeof(A0DataType), 1, 4, true)
+CK_MOE_STAGE2_GEMM_DEFINE(128, 128/sizeof(A0DataType), 2, 2, true)

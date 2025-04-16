@@ -483,21 +483,21 @@ def fused_moe_2stages(
             return torch.tensor(1.0, dtype=torch.float, device=device)
 
         a2_scale = get1tensor(device)
-    if doweight_stage1:
-        sorted_weights = torch.ones_like(sorted_weights)
+    # if doweight_stage1:
+    #     sorted_weights = torch.ones_like(sorted_weights)
     stage2(
         a2,
         w1,
         w2,
         sorted_ids,
         sorted_expert_ids,
-        sorted_weights,
         num_valid_ids,
         moe_out,
         topk,
         w2_scale,
         a2_scale,
         block_size_M,
+        sorted_weights=sorted_weights if not doweight_stage1 else None,
     )
 
     return moe_out

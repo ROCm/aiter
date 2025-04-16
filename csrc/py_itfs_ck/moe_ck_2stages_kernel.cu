@@ -335,13 +335,13 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
                    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
                    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-                   torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                    torch::Tensor &num_valid_ids,     // [1]
                    torch::Tensor &out,               // [max_num_tokens_padded, inter_dim]
                    int topk,
                    std::optional<torch::Tensor> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
-                   std::optional<int> block_m = 32)
+                   std::optional<int> block_m = 32,
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt)    // [max_num_tokens_padded])
 {
     // TORCH_CHECK(inter_states.dtype() == w2.dtype(),
     //             "Weights and activations should both be same dtype!");
@@ -359,7 +359,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     int MPerBlock = block_m.value();
     // int M = agvtokens_per_expert < 32 ? 32 : (agvtokens_per_expert < 64 ? 64 : 128);
     bool isPerTensorQuant = (!w2_scale.has_value()) || (w2_scale.value().numel() == E);
-    bool MulRoutedWeight = sorted_weights.defined() || sorted_weights.numel() != 0;
+    bool MulRoutedWeight = sorted_weights.has_value();
     
 
     void *inter_states_ptr = inter_states.data_ptr();
@@ -367,7 +367,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
     void *w2_ptr = w2.data_ptr();
     void *sorted_token_ids_ptr = sorted_token_ids.data_ptr();
     void *sorted_expert_ids_ptr = sorted_expert_ids.data_ptr();
-    void *sorted_weights_ptr = MulRoutedWeight ? sorted_weights.data_ptr() : nullptr;
+    void *sorted_weights_ptr = MulRoutedWeight ? sorted_weights.value().data_ptr() : nullptr;
     void *num_valid_ids_ptr = num_valid_ids.data_ptr();
     void *out_ptr = out.data_ptr();
     void *w2_scale_ptr = w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr;
@@ -380,9 +380,17 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         using B0DataType = B16;
         using AccDataType = F32;
         using EDataType = B16;
-        using CDEElementOp = TypeCastExpertWeight;
         const bool Nswizzle = false;
-        CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, Nswizzle, isPerTensorQuant, MPerBlock);
+        if (MulRoutedWeight) 
+        {
+            using CDEElementOp = TypeCastExpertWeight;
+            CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, Nswizzle, isPerTensorQuant, MPerBlock);
+        }
+        else 
+        {
+            using CDEElementOp = TypeCast;
+            CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, Nswizzle, isPerTensorQuant, MPerBlock);
+        }
     }
     // FP16
     else if (inter_states.dtype() == at::ScalarType::Half)
@@ -391,9 +399,17 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         using B0DataType = F16;
         using AccDataType = F32;
         using EDataType = F16;
-        using CDEElementOp = TypeCastExpertWeight;
         const bool Nswizzle = false;
-        CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, Nswizzle, isPerTensorQuant, MPerBlock);
+        if (MulRoutedWeight) 
+        {
+            using CDEElementOp = TypeCastExpertWeight;
+            CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, Nswizzle, isPerTensorQuant, MPerBlock);
+        }
+        else 
+        {
+            using CDEElementOp = TypeCast;
+            CK_MOE_STAGE2_GEMM_IMPL(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, Nswizzle, isPerTensorQuant, MPerBlock);
+        }
     }
     // FP8 wint4
     else if (inter_states.dtype() == at::ScalarType::Float8_e4m3fnuz && w1.dtype() == at::ScalarType::UInt32)

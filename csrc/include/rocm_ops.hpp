@@ -342,13 +342,13 @@
             py::arg("w2"),                             \
             py::arg("sorted_token_ids"),               \
             py::arg("sorted_expert_ids"),              \
-            py::arg("sorted_weights"),                 \
             py::arg("num_valid_ids"),                  \
             py::arg("out"),                            \
             py::arg("topk"),                           \
             py::arg("w2_scale") = std::nullopt,        \
             py::arg("a2_scale") = std::nullopt,        \
-            py::arg("block_m") = 32);
+            py::arg("block_m") = 32,                   \
+            py::arg("sorted_weights") = std::nullopt); \
 
 #define MOE_CK_PYBIND                                                               \
       m.def("ck_moe", &ck_moe,                                                      \
