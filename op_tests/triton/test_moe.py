@@ -15,6 +15,7 @@ from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
 from aiter import silu_and_mul
 from aiter.ops.triton.moe_op_gelu import fused_moe_gelu as triton_moe_gelu
 from aiter.ops.triton.moe_op_gelu import moe_set_use_persistent_kernel as moe_set_use_persistent_kernel_gelu
+from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 
 DEBUG_MODE = False
 
@@ -264,7 +265,10 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    config = get_default_config()
+    moe_config_func = get_optimal_moe_config_func(dtype, use_int8_w8a16=int8_w8a16, use_fp8_w8a8=fp8_w8a8)
+
+    config = moe_config_func(M)
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
 
 
@@ -303,7 +307,9 @@ def input_helper_int4_w4a16(M: int, N: int, K: int , top_k: int, E: int, routed_
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    config = get_default_config()
+    moe_config_func = get_optimal_moe_config_func(dtype, use_int4_w4a16=True)
+
+    config = moe_config_func(M)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
 
     return a, b, c, c_silu, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config

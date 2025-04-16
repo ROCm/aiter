@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, List
-
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
 
 #Source:
