@@ -165,7 +165,6 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         using B0DataType = F16;
         using AccDataType = F32;
         using EDataType = F16;
-        using CDEElementOp = TypeCast;
         const bool Nswizzle = false;
         if (MulRoutedWeight) 
         {
