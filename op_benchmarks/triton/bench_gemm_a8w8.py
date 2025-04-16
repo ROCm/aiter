@@ -28,11 +28,9 @@ def get_x_vals():
 
 
 def run_benchmark(args):
-    M = args.M
-    N = args.N
-    K = args.K
+    user_shape = args.shape
 
-    x_vals_list = get_x_vals()
+    x_vals_list = get_x_vals() if user_shape is None else [user_shape]
     x_names = ['M', 'N', 'K']
 
     if args.metric == 'time':
@@ -89,9 +87,7 @@ def parse_args():
         prog="Benchmark A8W8 GEMM",
         allow_abbrev=False,
     )
-    parser.add_argument("-M", type=int, default=0, help="M dimension")
-    parser.add_argument("-N", type=int, default=0, help="N dimension")
-    parser.add_argument("-K", type=int, default=0, help="K dimension")
+    parser.add_argument("--shape", type=int, nargs=3, metavar=("M", "N", "K"), help="user-defined shape to benchmark")
     parser.add_argument("--metric", type=str, choices=["time", "throughput", "bandwidth"], default="throughput", help="metric to plot")
     args = parser.parse_args()
     return args
