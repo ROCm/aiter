@@ -10,9 +10,9 @@ from utils.benchmark_utils import get_model_configs, get_available_models
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
+    M_list = [args.M] if args.model == "all" else [2 ** i for i in range(0, 15)]
     shapes = []
-    for i in range(1, 15):
-        M = 2 ** i
+    for M in M_list:
         for _, config in configs.items():
             N = config["intermediate_size"]
             K = config["hidden_size"]
@@ -42,8 +42,8 @@ def get_x_vals():
 
 
 def run_benchmark(args):
-    assert not(args.shape and args.model), \
-        "User cannot specify --shape or --model at the same time"
+    assert not(args.shape and args.model) or not(args.shape and args.M), \
+        "User can specify --shape or --model MODEL -M VAL exclusively"
 
     x_names = ['M', 'N', 'K']
     if args.model:
@@ -113,6 +113,7 @@ def parse_args():
                   "]. Use 'all' to benchmark all models or leave blank for the default benchmark script.")
     parser.add_argument('--model-configs', type=str, default="utils/model_configs.json", help="Model config json file.")
     parser.add_argument('--model', type=str, help=model_help)
+    parser.add_argument('-M', type=int, default=4096, help="M dim of model benchmark if only one model is under test")
     parser.add_argument("--shape", type=int, nargs=3, metavar=("M", "N", "K"), help="user-defined shape to benchmark")
     parser.add_argument("--metric", type=str, choices=["time", "throughput", "bandwidth"], default="throughput", help="metric to plot")
     args = parser.parse_args()
