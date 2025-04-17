@@ -69,6 +69,8 @@ def e2e_moe_kernel(
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_tokens,
     EM: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -128,7 +130,6 @@ def e2e_moe_kernel(
         tl.assume(stride_w1sn > 0)
         tl.assume(stride_w2se > 0)
         tl.assume(stride_w2sk > 0)
-
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -166,13 +167,19 @@ def e2e_moe_kernel(
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
-
-
-    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    # ----------------------------------------------------------
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
+        tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
-
-    # Here we assume that valid tokens are in the range [0, M).
-    token_mask = (offs_token >= 0) & (offs_token < EM)
+    token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m)
     offs_k1 = tl.arange(0, BLOCK_SIZE_K1)
@@ -318,6 +325,8 @@ def e2e_moe_persistent_kernel(
     topk_weights_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    num_valid_tokens,
     EM: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -334,7 +343,9 @@ def e2e_moe_persistent_kernel(
     NUM_SMS: tl.constexpr,
     ):
     start_m = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n: tl.constexpr = tl.cdiv(N, BLOCK_SIZE_N1)
     num_pid_k: tl.constexpr = tl.cdiv(K, BLOCK_SIZE_K2)
     m_tile_per_sm = num_pid_m // NUM_SMS
@@ -365,7 +376,7 @@ def e2e_moe_persistent_kernel(
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
         # Here we assume that valid tokens are in the range [0, M).
-        token_mask = (offs_token >= 0) & (offs_token < EM)
+        token_mask = offs_token < num_valid_tokens
 
         off_experts = tl.load(expert_ids_ptr + pid_m)
         # tl.device_print("pid_m", pid_m)
@@ -492,7 +503,9 @@ def e2e_moe(A: torch.Tensor,
                             W2_scale: Optional[torch.Tensor],
                             topk_weights: torch.Tensor,
                             sorted_token_ids: torch.Tensor,
+                            topk_ids,
                             expert_ids: torch.Tensor,
+                            num_tokens_post_padded: torch.Tensor,
                             mul_routed_weight: bool,
                             top_k: int,
                             config: Dict[str, Any],
@@ -587,6 +600,8 @@ def e2e_moe(A: torch.Tensor,
             topk_weights,
             sorted_token_ids,
             expert_ids,
+            num_tokens_post_padded,
+            topk_ids.numel(),
             EM,
             N,
             K,
@@ -636,6 +651,8 @@ def e2e_moe(A: torch.Tensor,
             topk_weights,
             sorted_token_ids,
             expert_ids,
+            num_tokens_post_padded,
+            topk_ids.numel(),
             EM,
             N,
             K,
