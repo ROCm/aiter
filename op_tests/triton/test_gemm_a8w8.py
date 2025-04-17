@@ -85,9 +85,9 @@ def generate_gemm_a8w8_inputs(M, N, K, dtype):
 @pytest.mark.parametrize(
     "dtype, m, n, k", [(dtype, *shape) for dtype in ["bf16"] for shape in get_x_vals()]
 )
-def test_gemm(dtype, M, N, K):
+def test_gemm(dtype, m, n, k):
     dtype = name_to_torch_types[dtype]
-    x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(M, N, K)
+    x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(m, n, k, dtype)
 
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype)
