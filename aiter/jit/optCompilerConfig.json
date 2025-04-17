@@ -1,4 +1,17 @@
 {
+    "module_aiter_enum": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/aiter_enum_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_activation": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/activation_pybind.cu'",
@@ -9,6 +22,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_attention": {
@@ -21,6 +36,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_pa_ragged": {
@@ -35,6 +52,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_attention_asm": {
@@ -47,6 +66,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_pa": {
@@ -61,6 +82,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_mla_asm": {
@@ -73,6 +96,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_cache": {
@@ -87,6 +112,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_custom_all_reduce": {
@@ -100,6 +127,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_custom": {
@@ -113,6 +142,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_batched_gemm_bf16": {
@@ -126,6 +157,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv'"
     },
     "module_batched_gemm_a8w8": {
@@ -139,6 +172,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv'"
     },
     "module_gemm_a8w8": {
@@ -152,6 +187,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_blockscale": {
@@ -165,6 +202,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_asm": {
@@ -177,6 +216,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_gemm_a8w8_blockscale_asm": {
@@ -189,6 +230,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_moe_asm": {
@@ -197,14 +240,17 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "f'{AITER_ASM_DIR}/fmoe_2stages/codegen.py --output_dir {{}}'"
     },
     "module_moe": {
         "srcs": [
@@ -219,6 +265,8 @@
             "f'{CK_DIR}/example/ck_tile/15_fused_moe'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_moe_ck2stages": {
@@ -233,6 +281,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_moe_sorting": {
@@ -242,12 +292,16 @@
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": ["'-DCK_TILE_WA_ISSUE_2028=0'"],
+        "flags_extra_hip": [
+            "'-DCK_TILE_WA_ISSUE_2028=0'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_norm": {
@@ -263,6 +317,8 @@
             "f'{CK_DIR}/example/ck_tile/02_layernorm2d'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/02_layernorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
     "module_pos_encoding": {
@@ -275,6 +331,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_rmsnorm": {
@@ -290,6 +348,8 @@
             "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d/generate.py --api fwd --gen_blobs --working_path {{}}'"
     },
     "module_smoothquant": {
@@ -307,6 +367,8 @@
             "f'{CK_DIR}/example/ck_tile/14_moe_smoothquant'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_batched_gemm_bf16_tune": {
@@ -320,6 +382,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune'"
     },
     "module_batched_gemm_a8w8_tune": {
@@ -333,6 +397,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune'"
     },
     "module_gemm_a8w8_tune": {
@@ -346,6 +412,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune'"
     },
     "module_gemm_a8w8_blockscale_tune": {
@@ -359,6 +427,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune'"
     },
     "module_aiter_operator": {
@@ -373,6 +443,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_quant": {
@@ -387,6 +459,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_rope_general_fwd": {
@@ -399,6 +473,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_rope_general_bwd": {
@@ -411,6 +487,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_rope_pos_fwd": {
@@ -423,6 +501,8 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_mha_fwd": {
@@ -434,15 +514,17 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 500 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
@@ -455,16 +537,18 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 500 --output_dir {{}}'",
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
@@ -476,14 +560,15 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
@@ -497,14 +582,15 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
@@ -519,13 +605,15 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
@@ -540,45 +628,28 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
-            ]
-    },
-    "module_bench_mha_fwd": {
-        "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/benchmark_mha_fwd.cpp'"
-        ],
-        "flags_extra_cc": [],
-        "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
-        ],
-        "extra_ldflags": "None",
-        "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
-        ],
-        "verbose": "False",
-        "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 500 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'"
         ]
     },
-    "module_bench_mha_fwd_splitkv": {
+    "bench_mha_fwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/benchmark_mha_fwd.cpp'"
+            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_fwd.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
             "'-DCK_TILE_FMHA_FWD_SPLITKV_API=1'"
         ],
         "extra_ldflags": "None",
@@ -586,25 +657,30 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "False",
+        "is_standalone": "True",
         "blob_gen_cmd": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 200 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
-    "module_bench_mha_bwd": {
+    "bench_mha_bwd": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/benchmark_mha_bwd.cpp'"
+            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_bwd.cpp'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT=3'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/01_fmha'"
         ],
         "verbose": "False",
+        "is_python_module": "False",
+        "is_standalone": "True",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 1 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
@@ -629,6 +705,8 @@
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     },
     "module_hipbsolgemm": {
@@ -650,6 +728,8 @@
             "f'{AITER_GRADLIB_DIR}/include/'"
         ],
         "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
         "blob_gen_cmd": "''"
     }
 }

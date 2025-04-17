@@ -372,12 +372,13 @@ fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
 
         float t = aiter::mha_bwd(args,
                                  stream_config,
-                                 mask,
                                  q_dtype_str,
                                  false, // is_group_mode
+                                 mask,
                                  bias_type,
-                                 deterministic,
                                  false, // has_dbias
+                                 false,  // is_store_randval
+                                 deterministic,
                                  true,  // use_ext_asm
                                  is_v3_atomic_fp32,
                                  how_v3_bf16_cvt);

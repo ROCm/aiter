@@ -12,7 +12,7 @@ import argparse
 @perftest()
 def run_torch(input, x_scale, y_scale_dtype=torch.float32):
     output, y_scale = aiter.pertoken_quant(
-        input, x_scale=x_scale, y_scale_dtype=y_scale_dtype)
+        input, x_scale=x_scale, scale_dtype=y_scale_dtype)
     return output, y_scale
 
 

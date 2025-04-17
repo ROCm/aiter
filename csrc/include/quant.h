@@ -2,7 +2,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/torch.h>
 
 void static_scaled_fp8_quant(torch::Tensor &out,          // [..., d]
                              torch::Tensor const &input,  // [..., d]

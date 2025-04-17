@@ -11,7 +11,7 @@ import aiter
 from aiter.ops.shuffle import shuffle_weight
 
 
-@perftest()
+@perftest(num_iters=5)
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     x = x.to(torch.float32) * x_scale
     weight = weight.to(torch.float32) * w_scale

@@ -131,6 +131,14 @@
             "                        Tensor! k_dequant_scales,"                              \
             "                        Tensor! v_dequant_scales,"                              \
             "                        Tensor slot_mapping) -> ()");                           \
+      m.def("reshape_and_cache_with_block_quant", &reshape_and_cache_with_block_quant,       \
+            "reshape_and_cache_with_block_quant(Tensor key, Tensor value,"                   \
+            "                        Tensor! key_cache,"                                     \
+            "                        Tensor! value_cache,"                                   \
+            "                        Tensor! k_dequant_scales,"                              \
+            "                        Tensor! v_dequant_scales,"                              \
+            "                        Tensor slot_mapping,"                                   \
+            "                        const bool asm_layout) -> ()");                         \
       m.def("convert_fp8", &convert_fp8,                                                     \
             "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "                 \
             "str kv_cache_dtype) -> ()");
@@ -379,10 +387,6 @@
             "Aligning the number of tokens to be processed by each expert such " \
             "that it is divisible by the block size.");                          \
       m.def("fmoe", &fmoe);                                                      \
-      py::enum_<ActivationType>(m, "ActivationType")                             \
-          .value("Silu", ActivationType::Silu)                                   \
-          .value("Gelu", ActivationType::Gelu)                                   \
-          .export_values();                                                      \
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0,                                   \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
@@ -418,10 +422,25 @@
             py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"),                                                     \
-            py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
             py::arg("input_scale"),                                              \
+            py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
             py::arg("fc_scale_blkn") = 128, py::arg("fc_scale_blkk") = 128,      \
-            py::arg("fc2_smooth_scale") = std::nullopt);                         \
+            py::arg("fc2_smooth_scale") = std::nullopt,                          \
+            py::arg("activation") = ActivationType::Silu);                       \
+      m.def("moe_stage1_g1u1", &moe_stage1_g1u1,                                 \
+            py::arg("input"),                                                    \
+            py::arg("w1"), py::arg("w2"),                                        \
+            py::arg("sorted_token_ids"),                                         \
+            py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
+            py::arg("out"),                                                      \
+            py::arg("inter_dim"),                                                \
+            py::arg("kernelName"),                                               \
+            py::arg("block_m"),                                                  \
+            py::arg("ksplit") = 0,                                               \
+            py::arg("activation") = ActivationType::Silu,                        \
+            py::arg("quant_type") = QuantType::No,                               \
+            py::arg("a1_scale") = std::nullopt,                                  \
+            py::arg("w1_scale") = std::nullopt);                                 \
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_SORTING_PYBIND                                          \
@@ -532,3 +551,17 @@
       m.def("rocb_destroy_extension", &rocb_destroy_extension, "destroy_extension"); \
       m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
       m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
+
+#define AITER_ENUM_PYBIND                               \
+      py::enum_<QuantType>(m, "QuantType")              \
+          .value("No", QuantType::No)                   \
+          .value("per_Tensor", QuantType::per_Tensor)   \
+          .value("per_Token", QuantType::per_Token)     \
+          .value("per_1x128", QuantType::per_1x128)     \
+          .value("per_128x128", QuantType::per_128x128) \
+          .export_values();                             \
+      py::enum_<ActivationType>(m, "ActivationType")    \
+          .value("No", ActivationType::No)              \
+          .value("Silu", ActivationType::Silu)          \
+          .value("Gelu", ActivationType::Gelu)          \
+          .export_values();

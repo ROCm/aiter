@@ -4,11 +4,11 @@
 import torch
 
 
-def shuffle_weight(x: torch.Tensor, layout=(16, 16)) -> torch.Tensor:
+def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     IN, IK = layout
     BK = IK*2
-    K = 16//x.element_size()
+    K = 16//x.element_size() if not use_int4 else 32
     BN = IN
     assert (x.shape[-2] %
             BN == 0), f'{x.shape[-2]} % {BN} == {x.shape[-2] % BN }'

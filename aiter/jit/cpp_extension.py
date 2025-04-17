@@ -1735,13 +1735,21 @@ def _jit_compile(name,
                         hipify_result = hipify_python.hipify(
                             project_directory=build_directory,
                             output_directory=build_directory,
-                            header_include_dirs=(extra_include_paths if extra_include_paths is not None else []),
+                            header_include_dirs=(
+                                extra_include_paths
+                                if extra_include_paths is not None
+                                else []
+                            ),
                             extra_files=[os.path.abspath(s) for s in sources],
-                            ignores=[_join_rocm_home('*'), os.path.join(_TORCH_PATH, '*')],  # no need to hipify ROCm or PyTorch headers
+                            ignores=[
+                                _join_rocm_home("*"),
+                                os.path.join(_TORCH_PATH, "*"),
+                            ],  # no need to hipify ROCm or PyTorch headers
                             show_detailed=verbose,
                             show_progress=verbose,
                             is_pytorch_extension=True,
-                            clean_ctx=clean_ctx
+                            hipify_extra_files_only=True,  # don't hipify everything in includes path
+                            clean_ctx=clean_ctx,
                         )
 
                         hipified_sources = set()
@@ -2091,6 +2099,13 @@ def _get_num_workers(verbose: bool) -> Optional[int]:
             print(f'Using envvar MAX_JOBS ({max_jobs}) as the number of workers...',
                   file=sys.stderr)
         return int(max_jobs)
+    else:
+        max_jobs = int(max(1, os.cpu_count() * 0.8))
+        print(
+            f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
+            file=sys.stderr,
+        )
+        return max_jobs
     if verbose:
         print('Allowing ninja to set a default number of workers... '
               '(overridable by setting the environment variable MAX_JOBS=N)',

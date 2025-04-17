@@ -10,7 +10,7 @@ import os
 import aiter
 
 
-@perftest()
+@perftest(num_iters=5)
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     B = x.size(0)
     M = x.size(1)

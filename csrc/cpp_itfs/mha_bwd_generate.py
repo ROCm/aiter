@@ -10,55 +10,69 @@ GEN_DIR = ""    # in Cmake, have to generate files in same folder
 
 AITER_API_FILENAME = "mha_bwd.cpp"
 
-AITER_CPP_API = """#include <iostream>
-#include "mha_bwd.h"
+AITER_CPP_API = """#include "mha_bwd.h"
 
 namespace aiter {{
-mha_bwd_traits get_mha_bwd_traits(const mask_info &mask,
-    std::string dtype,
-    int head_size_q,
-    int head_size_v,
-    bool has_dropout,
-    bool is_group_mode,
-    bias_enum bias_type,
-    bool deterministic,
-    bool has_dbias,
-    bool use_ext_asm,
-    bool is_v3_atomic_fp32,
-    int how_v3_bf16_cvt)
+mha_bwd_traits get_mha_bwd_traits(int head_size_q,
+                                  int head_size_v,
+                                  std::string dtype,
+                                  bool is_group_mode,
+                                  const mask_info &mask,
+                                  bias_enum bias_type,
+                                  bool has_dbias,
+                                  bool has_dropout,
+                                  bool is_store_randval,
+                                  bool deterministic,
+                                  bool use_ext_asm,
+                                  bool is_v3_atomic_fp32,
+                                  int how_v3_bf16_cvt)
 {{
-    return mha_bwd_traits(mask,
-            dtype,
-            head_size_q,
-            head_size_v,
-            has_dropout,
-            is_group_mode,
-            bias_type,
-            deterministic,
-            has_dbias,
-            use_ext_asm,
-            is_v3_atomic_fp32,
-            how_v3_bf16_cvt);
+    return mha_bwd_traits(head_size_q,
+                          head_size_v,
+                          dtype,
+                          is_group_mode,
+                          mask,
+                          bias_type,
+                          has_dbias,
+                          has_dropout,
+                          is_store_randval,
+                          deterministic,
+                          use_ext_asm,
+                          is_v3_atomic_fp32,
+                          how_v3_bf16_cvt);
 }}
 
 // share with varlen(group mode) api
 float mha_bwd(mha_bwd_args args,
-        const ck_tile::stream_config& stream_config,
-        mask_info mask,
-        std::string q_dtype_str,
-        bool is_group_mode,
-        bias_enum bias_type,
-        bool deterministic,
-        bool has_dbias,
-        bool use_ext_asm,
-        bool is_v3_atomic_fp32,
-        int how_v3_bf16_cvt)
+              const ck_tile::stream_config& stream_config,
+              std::string q_dtype_str,
+              bool is_group_mode,
+              mask_info mask,
+              bias_enum bias_type,
+              bool has_dbias,
+              bool is_store_randval,
+              bool deterministic,
+              bool use_ext_asm,
+              bool is_v3_atomic_fp32,
+              int how_v3_bf16_cvt)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0;
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
-    auto traits = get_mha_bwd_traits(mask, q_dtype_str, head_size_q, head_size_v, has_dropout, is_group_mode, bias_type, deterministic, has_dbias, use_ext_asm, is_v3_atomic_fp32, how_v3_bf16_cvt);
+    auto traits = get_mha_bwd_traits(head_size_q, 
+                                     head_size_v,
+                                     q_dtype_str,
+                                     is_group_mode,
+                                     mask,
+                                     bias_type,
+                                     has_dbias,
+                                     has_dropout,
+                                     is_store_randval,
+                                     deterministic,
+                                     use_ext_asm,
+                                     is_v3_atomic_fp32,
+                                     how_v3_bf16_cvt);
     float t = -1;
     {F_dispatch}
     return t;
@@ -109,8 +123,8 @@ if __name__ == "__main__":
         default=0,
         required=False,
         help="codegen receipt. 1: generate fmha v2 c++ api\n"  + \
-             "  2: generate fmha v3 c++ api\n"                 + \
-             "  3: generate v2 v3 combined api for PREBUILD mode"
+                            "  2: generate fmha v3 c++ api\n"                 + \
+                            "  3: generate v2 v3 combined api for PREBUILD mode"
     )
 
     args = parser.parse_args()

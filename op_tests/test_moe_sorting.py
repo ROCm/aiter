@@ -5,7 +5,7 @@ import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.fused_moe_bf16_asm import moe_sorting_ck, fused_topk
+from aiter.fused_moe import moe_sorting, fused_topk
 
 BLOCK_SIZE_M = 32
 
@@ -69,7 +69,7 @@ def test_moe_sorting_naive(
 def test_moe_sorting_ck(
     topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask=None
 ):
-    return moe_sorting_ck(
+    return moe_sorting(
         topk_ids,
         topk_weights,
         num_experts,

@@ -10,18 +10,17 @@ GEN_DIR = ""    # in Cmake, have to generate files in same folder
 
 AITER_API_FILENAME = "mha_fwd.cpp"
 
-AITER_CPP_API = """#include <iostream>
-#include "mha_fwd.h"
+AITER_CPP_API = """#include "mha_fwd.h"
 
 namespace aiter {{
-mha_fwd_traits get_mha_fwd_traits(const mask_info &mask,
-    std::string dtype,
-    bool is_group_mode,
-    int head_size_q,
-    int head_size_v,
-    bool has_dropout,
-    bool has_lse,
-    bias_enum bias_type)
+mha_fwd_traits get_mha_fwd_traits(int head_size_q,
+                                  int head_size_v,
+                                  std::string dtype,
+                                  bool is_group_mode,
+                                  const mask_info &mask,
+                                  bias_enum bias_type,
+                                  bool has_lse,
+                                  bool has_dropout)
 {{
     return mha_fwd_traits(head_size_q,
                           head_size_v,
@@ -33,13 +32,13 @@ mha_fwd_traits get_mha_fwd_traits(const mask_info &mask,
                           has_dropout);
 }}
 
-mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(const mask_info &mask,
+mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
+                                                  int head_size_v,
                                                   std::string dtype,
                                                   bool is_group_mode,
-                                                  int head_size_q,
-                                                  int head_size_v,
-                                                  bool has_lse,
-                                                  bias_enum bias_type)
+                                                  const mask_info &mask,
+                                                  bias_enum bias_type,
+                                                  bool has_lse)
 {{
     return mha_fwd_splitkv_traits(head_size_q,
                                   head_size_v,
@@ -58,33 +57,46 @@ mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(const mask_info &mask,
 FMHA_FWD_API = """
 float mha_fwd(mha_fwd_args args,
               const ck_tile::stream_config& stream_config,
-              mask_info mask,
               std::string q_dtype_str,
               bool is_group_mode,
+              mask_info mask,
               bias_enum bias_type,
               bool has_lse)
 {
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
-    auto traits = get_mha_fwd_traits(mask, q_dtype_str, is_group_mode, head_size_q, head_size_v, has_dropout, has_lse, bias_type);
+    auto traits = get_mha_fwd_traits(head_size_q,
+                                     head_size_v,
+                                     q_dtype_str,
+                                     is_group_mode,
+                                     mask,
+                                     bias_type,
+                                     has_lse,
+                                     has_dropout);
     return fmha_fwd(traits, args, stream_config);
 }"""
 
 FMHA_FWD_SPLITKV_API = """
 float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       const ck_tile::stream_config& stream_config,
-                      mask_info mask,
                       std::string q_dtype_str,
                       bool is_group_mode,
+                      mask_info mask,
                       bias_enum bias_type,
                       bool has_lse)
-{{
+{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
-    auto traits = get_mha_fwd_splitkv_traits(mask, q_dtype_str, is_group_mode, head_size_q, head_size_v, has_lse, bias_type);
+    auto traits = get_mha_fwd_splitkv_traits(head_size_q,
+                                             head_size_v,
+                                             q_dtype_str,
+                                             is_group_mode,
+                                             mask,
+                                             bias_type,
+                                             has_lse);
     return fmha_fwd_splitkv(traits, args, stream_config);
-}}"""
+}"""
 
 API_MAP = {
     1: FMHA_FWD_API,
@@ -120,8 +132,8 @@ if __name__ == "__main__":
         default=0,
         required=False,
         help="codegen receipt. 1: generate mha_fwd c++ api\n"  + \
-             "  2. generate mha_fwd_splitkv c++ api\n"  + \
-             "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD"
+                            "  2: generate mha_fwd_splitkv c++ api\n"  + \
+                            "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD"
     )
 
     args = parser.parse_args()

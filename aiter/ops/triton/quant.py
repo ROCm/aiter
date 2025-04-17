@@ -3,7 +3,6 @@ import triton.language as tl
 import torch
 
 
-
 @triton.jit
 def _per_tensor_fp8_quant(x_in: torch.Tensor, 
                                 scale_in: torch.Tensor
@@ -85,7 +84,6 @@ def static_per_tensor_fp8_quant(qx: torch.Tensor,
     return qx
 
 
-
 @triton.jit
 def _dynamic_per_tensor_fp8_quant_kernel(qx_ptr: torch.Tensor, 
                                         scale_out_ptr: torch.Tensor,
@@ -121,7 +119,6 @@ def _dynamic_per_tensor_fp8_quant_kernel(qx_ptr: torch.Tensor,
 
     tl.store(qx_ptr + offs, qx, mask=mask)
     tl.store(scale_out_ptr, scale_out)
-
 
 
 def dynamic_per_tensor_fp8_quant(qx: torch.Tensor, 
@@ -167,7 +164,8 @@ def _dynamic_per_token_fp8_quant_kernel(qx_ptr: torch.Tensor,
                                         x_in_stride_c: int,
                                         BLOCK_SIZE: tl.constexpr,
                                         NUM_COL_POW2: tl.constexpr,
-                                        FP8_MAX: tl.constexpr
+                                        FP8_MAX: tl.constexpr,
+                                        QDTYPE: tl.constexpr
 ):
     """
     #TODO: Add Doc
@@ -183,7 +181,7 @@ def _dynamic_per_token_fp8_quant_kernel(qx_ptr: torch.Tensor,
     scale_out = m / FP8_MAX
 
     qx = x / scale_out[:, None]
-    qx = qx.to(tl.float8e4b8)
+    qx = qx.to(QDTYPE)
 
     tl.store(qx_ptr + offs, qx, mask=mask)
 
@@ -194,7 +192,9 @@ def _dynamic_per_token_fp8_quant_kernel(qx_ptr: torch.Tensor,
 
 def dynamic_per_token_fp8_quant(qx: torch.Tensor,
                                 x_in: torch.Tensor,
-                                scale_out: torch.Tensor
+                                scale_out: torch.Tensor,
+                                quant_dtype=torch.float8_e4m3fnuz,
+                                dtypeMax:torch.Tensor=torch.finfo(torch.float8_e4m3fnuz).max
 ):
 
     """
@@ -205,6 +205,7 @@ def dynamic_per_token_fp8_quant(qx: torch.Tensor,
     BLOCK_SIZE = 32
     NUM_COL_POW2 = triton.next_power_of_2(cols)
     grid = lambda meta: (triton.cdiv(rows,meta['BLOCK_SIZE']),)  
+    qdtype = torchDtype2Triton(quant_dtype)
     _dynamic_per_token_fp8_quant_kernel[grid](qx, 
                                             scale_out,
                                             x_in, 
@@ -216,12 +217,16 @@ def dynamic_per_token_fp8_quant(qx: torch.Tensor,
                                             x_in.stride(1),
                                             BLOCK_SIZE=BLOCK_SIZE,
                                             NUM_COL_POW2=NUM_COL_POW2,
-                                            FP8_MAX=torch.finfo(torch.float8_e4m3fnuz).max
+                                            FP8_MAX=dtypeMax,
+                                            QDTYPE=qdtype
                                             )
 
     return qx, scale_out
 
-   
 
-
-
+def torchDtype2Triton(dtype):
+    tmp = {
+        torch.int8: tl.int8,
+        torch.float8_e4m3fnuz: tl.float8e4b8,
+    }
+    return tmp[dtype]

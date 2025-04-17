@@ -134,7 +134,7 @@ def asm_moe(hidden_states,
             else:
                 logger.warning(f'FMOE fall into pure torch quant...')
                 a8, a8_scale = aiter.pertoken_quant(
-                    hidden_states, torch.float, quant_dtype=w1.dtype)
+                    hidden_states, quant_dtype=w1.dtype)
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_int8_g1u0
         elif w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
@@ -246,7 +246,7 @@ def asm_moe_tkw1(hidden_states,
             else:
                 logger.warning(f'FMOE fall into pure torch quant...')
                 a8, a8_scale = aiter.pertoken_quant(
-                    hidden_states, torch.float, quant_dtype=w1.dtype)
+                    hidden_states, quant_dtype=w1.dtype)
         if w2.shape[2] * 2 * lastdim_mul == w1.shape[1]:
             fmoe_func = aiter.fmoe_g1u1_tkw1
 
@@ -301,7 +301,7 @@ def ck_moe_2stages(a1,
 
     # print("block_size:", block_size, sorted_expert_ids)
     if w1.dtype == torch.float8_e4m3fnuz:
-        a1, a1_scale = aiter.per_tensor_quant_fp8_hip(a1, a1_scale)
+        a1, a1_scale = aiter.per_tensor_quant_hip(a1, a1_scale, quant_dtype=w1.dtype)
         # a1, a1_scale = aiter.per_tensor_quant(a1, quant_dtype=w1.dtype)
     else:
         a1_scale = None
@@ -333,7 +333,7 @@ def ck_moe_2stages(a1,
         aiter.silu_and_mul(tmp, a2)
         a2 = tmp
       if w2.dtype == torch.float8_e4m3fnuz:
-        a2, a2_scale = aiter.per_tensor_quant_fp8_hip(a2, a2_scale)
+        a2, a2_scale = aiter.per_tensor_quant_hip(a2, a2_scale, quant_dtype=w2.dtype)
         # a2, a2_scale = aiter.per_tensor_quant(a2, quant_dtype=w2.dtype)
       else:
         if not hasattr(ck_moe_2stages, "one_float_tensor"):
@@ -495,7 +495,7 @@ def torch_moe_tkw1(hidden_states, w1, w2, topk_weight, topk_ids,
             if fc2_smooth_scale is not None:
                 act_out = act_out * (fc2_smooth_scale[E_id])
             act_out, act_out_scale =  pertoken_quant(
-                 act_out, torch.float, quant_dtype = torch.float8_e4m3fnuz, dtypeMax=None)
+                 act_out, quant_dtype = torch.float8_e4m3fnuz, dtypeMax=None)
             out[mask] = act_out.to(computeType) @ (w2[E_id].transpose(0, 1))*act_out_scale.view(-1, 1)
 
     return out.sum(dim=1).to(dtype) 

@@ -10,10 +10,10 @@ import os
 from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
 from aiter.fused_moe_bf16_asm import asm_moe_tkw1, torch_moe_tkw1, moe_sorting_ck,torch_moe
-from aiter.fused_moe_gelu import fused_topk, moe_align_block_size, fused_experts
+from aiter.fused_moe import fused_topk
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
-from int4_utils import *
+from aiter.int4_utils import *
 from aiter import ActivationType
 
 BLOCK_SIZE_M = 32
@@ -178,9 +178,9 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
     else:
         dtypeMax = 7 if use_int4 else None
         w1, fc1_scale = pertoken_quant(
-            w1, torch.float, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
+            w1, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
         w2, fc2_scale = pertoken_quant(
-            w2, torch.float, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
+            w2, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
 
         sp1 = (E+shared_E, inter_dim)
         sp2 = (E+shared_E, model_dim)

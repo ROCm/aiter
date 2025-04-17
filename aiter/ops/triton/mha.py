@@ -549,7 +549,7 @@ def _attn_fwd(q_ptr: torch.Tensor,
                                         block_min, block_max, 0, 0, 0, alibi_slope, 
                                         descale_q, descale_k, descale_v,
                                         offs_m, offs_n, BLOCK_M, BLOCK_N, BLOCK_DMODEL,BLOCK_DMODEL_POW2,
-                                        sm_scale, IS_CAUSAL, MASK_STEPS=False, ENABLE_DROPOUT=ENABLE_DROPOUT, 
+                                        sm_scale, False, MASK_STEPS=False, ENABLE_DROPOUT=ENABLE_DROPOUT, 
                                         RETURN_SCORES=RETURN_SCORES, PADDED_HEAD=BLOCK_DMODEL!=BLOCK_DMODEL_POW2,
                                         IS_FP8=IS_FP8, FP8_MAX=FP8_MAX
                                         )
@@ -726,8 +726,17 @@ def _flash_attn_forward(
         dropout_mask = None
 
 
-    BLOCK_M = 32 #TODO. Add config/tuning support
-    BLOCK_N = 32 #TODO Add config/tuning support
+    # Best config from ROCm/triton/python/perf-kernels/flash_attention.py::attn_fwd autotuning is BLOCK_M: 128, BLOCK_N: 64, waves_per_eu: 2, num_warps: 4, num_ctas: 1, num_stages: 1
+    # Tuned for MI300x
+    config = {
+        'BLOCK_M': 128,
+        'BLOCK_N': 32, # BLOCK_N: 64 spills for _attn_fwd
+        'waves_per_eu': 2,
+        'num_warps': 4,
+        'num_ctas': 1,
+        'num_stages': 1,
+    }
+
     grid = lambda META:(triton.cdiv(seqlen_q, META['BLOCK_M']), num_q_heads, batch)
     _attn_fwd[grid](q,
                     k,
@@ -767,8 +776,6 @@ def _flash_attn_forward(
                     IS_CAUSAL=causal,
                     NUM_Q_HEADS=num_q_heads,
                     NUM_K_HEADS=num_k_heads,
-                    BLOCK_M=BLOCK_M,
-                    BLOCK_N=BLOCK_N,
                     BLOCK_DMODEL=head_sz,
                     BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
                     RETURN_SCORES=return_softmax,
@@ -776,6 +783,7 @@ def _flash_attn_forward(
                     IS_FP8=IS_FP8,
                     FP8_MAX=FP8_MAX,
                     VARLEN=is_varlen,
+                    **config
     )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset 
