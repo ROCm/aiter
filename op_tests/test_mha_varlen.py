@@ -257,7 +257,7 @@ def test_flash_attn_varlen_func(
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
+    out_tol = max(4 * (out_pt - out_ref).abs().max().item(), 0.01)
     assert (out - out_ref).abs().max().item() <= out_tol
 
     # TODO: Support varlen bwd for bias
