@@ -13,7 +13,7 @@ from packaging.version import parse, Version
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f'{this_dir}/aiter/')
 from jit import core
-from jit.cpp_extension import (
+from jit.utils.cpp_extension import (
     BuildExtension,
     CppExtension,
     CUDAExtension,

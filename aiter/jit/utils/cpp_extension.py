@@ -20,12 +20,12 @@ import warnings
 import collections
 from pathlib import Path
 import errno
-
 import torch
-from torch.utils.file_baton import FileBaton
-from torch.utils._cpp_extension_versioner import ExtensionVersioner
-from torch.utils.hipify import hipify_python
-from torch.utils.hipify.hipify_python import GeneratedFileCleaner
+
+from file_baton import FileBaton
+from _cpp_extension_versioner import ExtensionVersioner
+from hipify import hipify_python
+from hipify.hipify_python import GeneratedFileCleaner
 from typing import Dict, List, Optional, Union, Tuple
 from torch.torch_version import TorchVersion, Version
 

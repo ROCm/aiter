@@ -11,9 +11,12 @@ import importlib
 import functools
 import traceback
 from typing import List, Optional
-from . import cpp_extension
 import torch
-from torch.utils.file_baton import FileBaton
+this_dir = os.path.dirname(os.path.abspath(__file__))
+print(f'{this_dir}/utils/')
+sys.path.insert(0, f'{this_dir}/utils/')
+import cpp_extension
+from file_baton import FileBaton
 import logging
 import json
 import multiprocessing
@@ -280,11 +283,12 @@ def build_module(
             [f"{AITER_CSRC_DIR}/include"] + extra_include, old_bd_include_dir
         )
 
-        bd_include_dir = f"{op_dir}/build/include/torch"
-        os.makedirs(bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu(
-            [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
-        )
+        if not is_standalone:
+            bd_include_dir = f"{op_dir}/build/include/torch"
+            os.makedirs(bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
+            )
 
         extra_include_paths = [
             f"{CK_DIR}/include",
