@@ -302,7 +302,7 @@ list_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
     (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
-    # (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
+    (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 list_doweight_stage1 = [False, True]

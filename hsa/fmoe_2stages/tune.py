@@ -373,7 +373,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     untunedf = pd.read_csv(args.untune_file)
-    untunedf = untunedf.drop_duplicates()
+    untunedf = untunedf.drop_duplicates(keep="last")
     
     if not args.all or args.last:
         if os.path.exists(args.tune_file):

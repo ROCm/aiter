@@ -20,7 +20,7 @@ def worker(gpuIDMap, tag, func, args, **kwargs):
     torch.cuda.synchronize()
 
     try:
-        _, us = run_perftest(func, *args, **kwargs, num_rotate_args=1)
+        _, us = run_perftest(func, *args, **kwargs)
         torch.cuda.synchronize()
         _ = _.to("cpu")
     except Exception as e:
