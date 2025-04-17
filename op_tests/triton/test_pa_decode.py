@@ -59,50 +59,9 @@ def paged_attention_decode_ref(
 
 tl_to_torch_dtype = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
 
-@pytest.mark.parametrize("B", [1, 4, 27])
-@pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (24,4)])
-@pytest.mark.parametrize("D", [1, 64, 128])
-@pytest.mark.parametrize("KV_BLK_SZ", [1, 4, 16])
-@pytest.mark.parametrize("SEQ_LEN", [1, 57, 10000])
-@pytest.mark.parametrize("NUM_BLK", [4, 16])
-# q_dtype, kv_dtype, compute_type, output_type
-# INT8xINT8 -> BF16-> BF16
-# FP8xFP8 -> BF16-> FP8
-# BF16xINT8 -> BF16-> BF16
-# BF16xFP8 -> BF16-> BF16
-# BF16xBF16->BF16->BF16
-# FP16xFP16->FP16->FP16
-@pytest.mark.parametrize(
-    "dtype, kv_cache_dtype, compute_type, output_type",
-    [
-        (torch.float16, torch.float16, tl.float16, torch.float16),
-        (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.int8, tl.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fnuz, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
-        (torch.int8, torch.int8, tl.bfloat16, torch.bfloat16),
-    ],
-)
-
-def test_paged_attn(
-    B,
-    H_Q,
-    H_KV,
-    D,
-    KV_BLK_SZ,
-    SEQ_LEN,
-    NUM_BLK,
-    dtype,
-    kv_cache_dtype,
-    compute_type,
-    output_type,
-):
-
-    if SEQ_LEN >= 8192 and B >=16:
-        pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
-    torch.set_printoptions(threshold=100000)
-    num_blocks = NUM_BLK
-
+def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks=4):
+    """Helper function to generate input tensors for paged attention testing."""
+    # Query tensor generation
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
         query = torch.randn(
             B, H_Q, D, dtype=torch.float16, device="cuda"
@@ -150,9 +109,60 @@ def test_paged_attn(
         ]
         block_tables.append(block_table)
     block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
+
+    output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
+
+    return query, output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len
+
+@pytest.mark.parametrize("B", [1, 4, 27])
+@pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (24,4)])
+@pytest.mark.parametrize("D", [1, 64, 128])
+@pytest.mark.parametrize("KV_BLK_SZ", [1, 4, 16])
+@pytest.mark.parametrize("SEQ_LEN", [1, 57, 10000])
+@pytest.mark.parametrize("NUM_BLK", [4, 16])
+# q_dtype, kv_dtype, compute_type, output_type
+# INT8xINT8 -> BF16-> BF16
+# FP8xFP8 -> BF16-> FP8
+# BF16xINT8 -> BF16-> BF16
+# BF16xFP8 -> BF16-> BF16
+# BF16xBF16->BF16->BF16
+# FP16xFP16->FP16->FP16
+@pytest.mark.parametrize(
+    "dtype, kv_cache_dtype, compute_type, output_type",
+    [
+        (torch.float16, torch.float16, tl.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.int8, tl.bfloat16, torch.bfloat16),
+        (torch.float8_e4m3fnuz, torch.float8_e4m3fnuz, tl.bfloat16, torch.bfloat16),
+        (torch.int8, torch.int8, tl.bfloat16, torch.bfloat16),
+    ],
+)
+
+def test_paged_attn(
+    B,
+    H_Q,
+    H_KV,
+    D,
+    KV_BLK_SZ,
+    SEQ_LEN,
+    NUM_BLK,
+    dtype,
+    kv_cache_dtype,
+    compute_type,
+    output_type,
+):
+
+    if SEQ_LEN >= 8192 and B >=16:
+        pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
+    torch.set_printoptions(threshold=100000)
+    num_blocks = NUM_BLK
+
+    query, triton_output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len \
+        = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
+
     attn_scale = 1.0 / (D**0.5)
 
-    triton_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
     paged_attention_decode(
         triton_output,
         query,
@@ -219,59 +229,15 @@ def test_paged_attn_per_token_quant(
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
 
     num_blocks =  NUM_BLK
-    
 
-    if dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        query = torch.randn(
-            B, H_Q, D, dtype=torch.float16, device="cuda"
-        )  # assumption dtype is 8bits or lower
-        query = query.to(dtype=dtype, device="cuda")
-    else:
-        query = torch.randn(B, H_Q, D, dtype=dtype, device="cuda")
+    query, triton_output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len \
+        = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
 
-    if kv_cache_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        x = min(D, 16 // torch.tensor([], dtype=torch.float16).element_size())
-        key_cache = torch.randn(
-            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=torch.float16, device="cuda"
-        )
-        value_cache = torch.randn(
-            num_blocks, H_KV, D, KV_BLK_SZ, dtype=torch.float16, device="cuda"
-        )
-        # torch doesn't have randn for fp8 data type, so we convert here
-        key_cache = key_cache.to(dtype=kv_cache_dtype)
-        value_cache = value_cache.to(dtype=kv_cache_dtype)
-    else:
-        x = min(D, 16 // torch.tensor([], dtype=kv_cache_dtype).element_size())
-        key_cache = torch.randn(
-            num_blocks, H_KV, D // x, KV_BLK_SZ, x, dtype=kv_cache_dtype, device="cuda"
-        )
-        value_cache = torch.randn(
-            num_blocks, H_KV, D, KV_BLK_SZ, dtype=kv_cache_dtype, device="cuda"
-        )
-
-    key_cache = torch.clamp(key_cache, min=1e-3)
-    value_cache = torch.clamp(value_cache, min=1e-3)
-    key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
-    value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
-
-    context_lens = torch.full((B,), SEQ_LEN, device="cuda")
-    max_context_len = max(context_lens)
-    max_num_blks_per_seq = (max_context_len + KV_BLK_SZ - 1) // KV_BLK_SZ
-
-    block_tables = []
-    for i in range(B):
-        block_table = [
-            random.randint(0, num_blocks - 1) for _ in range(max_num_blks_per_seq)
-        ]
-        block_tables.append(block_table)
-    block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
     attn_scale = 1.0 / (D**0.5)
 
     key_cache_tri_quant, k_scale, = pertoken_quant(key_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz)
     value_cache_tri_quant, v_scale, = pertoken_quant(value_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz)
 
-
-    triton_output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
     paged_attention_decode(
         triton_output,
         query,

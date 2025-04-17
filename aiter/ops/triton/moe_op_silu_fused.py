@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, List
+
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
 
 #Source:
@@ -50,7 +51,7 @@ def _write_zeros_to_output(c_ptr, stride_cm, stride_cn, pid_n, N, offs_token,
     lambda args: triton.cdiv(args['EM'], args['BLOCK_SIZE_M']) * triton.cdiv(args['N'], args['BLOCK_SIZE_N'])
 })
 @triton.jit
-def _fused_moe_kernel_gptq_awq(
+def _fused_moe_silu_kernel_gptq_awq(
         # Pointers to matrices
         a_ptr,
         b_ptr,
@@ -124,14 +125,14 @@ def _fused_moe_kernel_gptq_awq(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    NUM_XCDS: tl.constexpr = 8
+
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    NUM_XCDS: tl.constexpr = 8
 
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
@@ -189,8 +190,17 @@ def _fused_moe_kernel_gptq_awq(
                               BLOCK_SIZE_N, compute_type)
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    # silu ptrs
+    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
+    i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
+    i_floor = i // 2
+    offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
+    # (i % 2): [0, 1, 0, 1,...] (alternating)
+    # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
+    # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+    offs_bn = (offs_half + (i % 2) * (N // 2)) % N
+
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
                       offs_k[None, :] * stride_ak)
@@ -280,16 +290,22 @@ def _fused_moe_kernel_gptq_awq(
         accumulator = accumulator * moe_weight[:, None]
 
     accumulator = accumulator.to(compute_type)
+
+    silu_acc, mul_acc = accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
+    silu_acc = (silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089))))
+    accumulator = (silu_acc * mul_acc).to(compute_type)
+
     # -----------------------------------------------------------
     # Write back the block of the output
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
         None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N // 2)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
+
 @triton.jit
-def _fused_moe_persistent_kernel_gptq_awq(
+def _fused_moe_persistent_silu_kernel_gptq_awq(
         # Pointers to matrices
         a_ptr,
         b_ptr,
@@ -407,12 +423,21 @@ def _fused_moe_persistent_kernel_gptq_awq(
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
         token_mask = offs_token < num_valid_tokens
         off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-    
+
+        # silu ptrs
+        BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
+        i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
+        i_floor = i // 2
+        offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
+        # (i % 2): [0, 1, 0, 1,...] (alternating)
+        # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
+        # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+        offs_bn = (offs_half + (i % 2) * (N // 2)) % N
+
         # Compute the A pointer
         a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
                       offs_k[None, :] * stride_ak)
-        offs_bn = (pid_n * BLOCK_SIZE_N +
-                   tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
 
         if use_int4_w4a16:
             b_ptrs = (b_ptr + off_experts * stride_be + 
@@ -499,23 +524,27 @@ def _fused_moe_persistent_kernel_gptq_awq(
             accumulator = accumulator * moe_weight[:, None]
 
         accumulator = accumulator.to(compute_type)
+
+        silu_acc, mul_acc = accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
+        silu_acc = (silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089))))
+        accumulator = (silu_acc * mul_acc).to(compute_type)
+
         # -----------------------------------------------------------
         # Write back the block of the output
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
             None, :]
-        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N // 2)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
         tile_id += NUM_SMS
-
 
 @triton.heuristics({
 'GRID_MN':
     lambda args: triton.cdiv(args['EM'], args['BLOCK_SIZE_M']) * triton.cdiv(args['N'], args['BLOCK_SIZE_N'])
 })
 @triton.jit
-def _fused_moe_kernel(
+def _fused_moe_silu_kernel(
         # Pointers to matrices
         a_ptr,
         b_ptr,
@@ -596,7 +625,6 @@ def _fused_moe_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     NUM_XCDS: tl.constexpr = 8
-
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
@@ -628,6 +656,7 @@ def _fused_moe_kernel(
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
+
     # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
@@ -652,8 +681,17 @@ def _fused_moe_kernel(
                               BLOCK_SIZE_N, compute_type)
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N +
-               tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    # silu ptrs
+    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
+    i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
+    i_floor = i // 2
+    offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
+    # (i % 2): [0, 1, 0, 1,...] (alternating)
+    # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
+    # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+    offs_bn = (offs_half + (i % 2) * (N // 2)) % N
+
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
                       offs_k[None, :] * stride_ak)
@@ -727,12 +765,18 @@ def _fused_moe_kernel(
             accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     else:
         accumulator = accumulator.to(compute_type)
+
+    # silu_and_mul
+    silu_acc, mul_acc = accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
+    silu_acc = (silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089))))
+    accumulator = (silu_acc * mul_acc).to(compute_type)
+
     # -----------------------------------------------------------
     # Write back the block of the output
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[
         None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N // 2)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -740,7 +784,7 @@ def _fused_moe_kernel(
     'EVEN_K': lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0,
 })
 @triton.jit
-def _fused_moe_persistent_kernel(
+def _fused_moe_persistent_silu_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -859,11 +903,21 @@ def _fused_moe_persistent_kernel(
         token_mask = offs_token < num_valid_tokens
         off_experts = tl.load(expert_ids_ptr + pid_m)
 
+        # silu ptrs
+        BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
+        i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
+        i_floor = i // 2
+        offs_half = (pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)
+        # (i % 2): [0, 1, 0, 1,...] (alternating)
+        # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
+        # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+        offs_bn = (offs_half + (i % 2) * (N // 2)) % N
+
         # Compute the A pointer
         a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am +
             offs_k[None, :] * stride_ak)
         # Compute the B pointer
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         b_ptrs = (b_ptr + off_experts * stride_be +
             (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn))
 
@@ -935,19 +989,25 @@ def _fused_moe_persistent_kernel(
                 accumulator = (accumulator * a_scale * b_scale).to(compute_type)
         else:
             accumulator = accumulator.to(compute_type)
+
+        # silu_and_mul
+        silu_acc, mul_acc = accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
+        silu_acc = (silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089))))
+        accumulator = (silu_acc * mul_acc).to(compute_type)
+
         # -----------------------------------------------------------
         # Write back the block of the output
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
         c_ptrs = (c_ptr + stride_cm * offs_token[:, None] +
                 stride_cn * offs_cn[None, :])
-        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        c_mask = token_mask[:, None] & (offs_cn[None, :] <  N // 2)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
         # advance tile_id
         tile_id += NUM_SMS
 
 
-def fused_moe(A: torch.Tensor,
+def fused_moe_silu(A: torch.Tensor,
                             B: torch.Tensor,
                             C: torch.Tensor,
                             A_scale: Optional[torch.Tensor],
@@ -1012,7 +1072,7 @@ def fused_moe(A: torch.Tensor,
                 NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
                                     triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])), )
 
-            _fused_moe_persistent_kernel_gptq_awq[grid](
+            _fused_moe_persistent_silu_kernel_gptq_awq[grid](
                     A,
                     B,
                     C,
@@ -1031,8 +1091,8 @@ def fused_moe(A: torch.Tensor,
                     B.stride(0),
                     B.stride(2),
                     B.stride(1),
+                    C.stride(0),
                     C.stride(1),
-                    C.stride(2),
                     B_scale.stride(0),
                     B_scale.stride(2),
                     B_scale.stride(1),
@@ -1053,7 +1113,7 @@ def fused_moe(A: torch.Tensor,
         else:
             grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
                 B.shape[1], META['BLOCK_SIZE_N']), )
-            _fused_moe_kernel_gptq_awq[grid](
+            _fused_moe_silu_kernel_gptq_awq[grid](
                 A,
                 B,
                 C,
@@ -1072,8 +1132,8 @@ def fused_moe(A: torch.Tensor,
                 B.stride(0),
                 B.stride(2),
                 B.stride(1),
+                C.stride(0),
                 C.stride(1),
-                C.stride(2),
                 B_scale.stride(0),
                 B_scale.stride(2),
                 B_scale.stride(1),
@@ -1098,7 +1158,7 @@ def fused_moe(A: torch.Tensor,
                 NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"]) *
                                     triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"])), )
 
-            _fused_moe_persistent_kernel[grid](
+            _fused_moe_persistent_silu_kernel[grid](
                 A,
                 B,
                 C,
@@ -1117,8 +1177,8 @@ def fused_moe(A: torch.Tensor,
                 B.stride(0),
                 B.stride(2),
                 B.stride(1),
+                C.stride(0),
                 C.stride(1),
-                C.stride(2),
                 A_scale.stride(0)
                 if A_scale is not None and A_scale.ndim == 2 else 0,
                 A_scale.stride(1)
@@ -1142,7 +1202,7 @@ def fused_moe(A: torch.Tensor,
         else:
             grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
                 B.shape[1], META['BLOCK_SIZE_N']), )
-            _fused_moe_kernel[grid](
+            _fused_moe_silu_kernel[grid](
                 A,
                 B,
                 C,
@@ -1161,8 +1221,8 @@ def fused_moe(A: torch.Tensor,
                 B.stride(0),
                 B.stride(2),
                 B.stride(1),
+                C.stride(0),
                 C.stride(1),
-                C.stride(2),
                 A_scale.stride(0)
                 if A_scale is not None and A_scale.ndim == 2 else 0,
                 A_scale.stride(1)
