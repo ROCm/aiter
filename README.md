@@ -43,3 +43,4 @@ There are number of op test, you can run them with: `python3 op_tests/test_layer
 |LAYERNORM                      | x = (x - u) / (σ2 + ϵ) e*0.5                                                                                                                                      |
 |ROPE                           | Rotary Position Embedding                                                                                                                                         |
 |GEMM                           | D=αAβB+C                                                                                                                                                          |
+
