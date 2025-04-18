@@ -564,172 +564,173 @@ class BuildExtension(build_ext):
             # Return *all* object filenames, not just the ones we just built.
             return objects
 
-        def win_cuda_flags(cflags):
-            return (COMMON_NVCC_FLAGS +
-                    cflags + _get_cuda_arch_flags(cflags))
+        # def win_cuda_flags(cflags):
+        #     return (COMMON_NVCC_FLAGS +
+        #             cflags + _get_cuda_arch_flags(cflags))
 
-        def win_wrap_single_compile(sources,
-                                    output_dir=None,
-                                    macros=None,
-                                    include_dirs=None,
-                                    debug=0,
-                                    extra_preargs=None,
-                                    extra_postargs=None,
-                                    depends=None):
+        # def win_wrap_single_compile(sources,
+        #                             output_dir=None,
+        #                             macros=None,
+        #                             include_dirs=None,
+        #                             debug=0,
+        #                             extra_preargs=None,
+        #                             extra_postargs=None,
+        #                             depends=None):
 
-            self.cflags = copy.deepcopy(extra_postargs)
-            extra_postargs = None
+        #     self.cflags = copy.deepcopy(extra_postargs)
+        #     extra_postargs = None
 
-            def spawn(cmd):
-                # Using regex to match src, obj and include files
-                src_regex = re.compile('/T(p|c)(.*)')
-                src_list = [
-                    m.group(2) for m in (src_regex.match(elem) for elem in cmd)
-                    if m
-                ]
+        #     def spawn(cmd):
+        #         # Using regex to match src, obj and include files
+        #         src_regex = re.compile('/T(p|c)(.*)')
+        #         src_list = [
+        #             m.group(2) for m in (src_regex.match(elem) for elem in cmd)
+        #             if m
+        #         ]
 
-                obj_regex = re.compile('/Fo(.*)')
-                obj_list = [
-                    m.group(1) for m in (obj_regex.match(elem) for elem in cmd)
-                    if m
-                ]
+        #         obj_regex = re.compile('/Fo(.*)')
+        #         obj_list = [
+        #             m.group(1) for m in (obj_regex.match(elem) for elem in cmd)
+        #             if m
+        #         ]
 
-                include_regex = re.compile(r'((\-|\/)I.*)')
-                include_list = [
-                    m.group(1)
-                    for m in (include_regex.match(elem) for elem in cmd) if m
-                ]
+        #         include_regex = re.compile(r'((\-|\/)I.*)')
+        #         include_list = [
+        #             m.group(1)
+        #             for m in (include_regex.match(elem) for elem in cmd) if m
+        #         ]
 
-                if len(src_list) >= 1 and len(obj_list) >= 1:
-                    src = src_list[0]
-                    obj = obj_list[0]
-                    if _is_cuda_file(src):
-                        nvcc = _join_cuda_home('bin', 'nvcc')
-                        if isinstance(self.cflags, dict):
-                            cflags = self.cflags['nvcc']
-                        elif isinstance(self.cflags, list):
-                            cflags = self.cflags
-                        else:
-                            cflags = []
+        #         if len(src_list) >= 1 and len(obj_list) >= 1:
+        #             src = src_list[0]
+        #             obj = obj_list[0]
+        #             if _is_cuda_file(src):
+        #                 nvcc = _join_cuda_home('bin', 'nvcc')
+        #                 if isinstance(self.cflags, dict):
+        #                     cflags = self.cflags['nvcc']
+        #                 elif isinstance(self.cflags, list):
+        #                     cflags = self.cflags
+        #                 else:
+        #                     cflags = []
 
-                        cflags = win_cuda_flags(cflags) + ['-std=c++17', '--use-local-env']
-                        for flag in COMMON_MSVC_FLAGS:
-                            cflags = ['-Xcompiler', flag] + cflags
-                        for ignore_warning in MSVC_IGNORE_CUDAFE_WARNINGS:
-                            cflags = ['-Xcudafe', '--diag_suppress=' + ignore_warning] + cflags
-                        cmd = [nvcc, '-c', src, '-o', obj] + include_list + cflags
-                    elif isinstance(self.cflags, dict):
-                        cflags = COMMON_MSVC_FLAGS + self.cflags['cxx']
-                        append_std17_if_no_std_present(cflags)
-                        cmd += cflags
-                    elif isinstance(self.cflags, list):
-                        cflags = COMMON_MSVC_FLAGS + self.cflags
-                        append_std17_if_no_std_present(cflags)
-                        cmd += cflags
+        #                 cflags = win_cuda_flags(cflags) + ['-std=c++17', '--use-local-env']
+        #                 for flag in COMMON_MSVC_FLAGS:
+        #                     cflags = ['-Xcompiler', flag] + cflags
+        #                 for ignore_warning in MSVC_IGNORE_CUDAFE_WARNINGS:
+        #                     cflags = ['-Xcudafe', '--diag_suppress=' + ignore_warning] + cflags
+        #                 cmd = [nvcc, '-c', src, '-o', obj] + include_list + cflags
+        #             elif isinstance(self.cflags, dict):
+        #                 cflags = COMMON_MSVC_FLAGS + self.cflags['cxx']
+        #                 append_std17_if_no_std_present(cflags)
+        #                 cmd += cflags
+        #             elif isinstance(self.cflags, list):
+        #                 cflags = COMMON_MSVC_FLAGS + self.cflags
+        #                 append_std17_if_no_std_present(cflags)
+        #                 cmd += cflags
 
-                return original_spawn(cmd)
+        #         return original_spawn(cmd)
 
-            try:
-                self.compiler.spawn = spawn
-                return original_compile(sources, output_dir, macros,
-                                        include_dirs, debug, extra_preargs,
-                                        extra_postargs, depends)
-            finally:
-                self.compiler.spawn = original_spawn
+        #     try:
+        #         self.compiler.spawn = spawn
+        #         return original_compile(sources, output_dir, macros,
+        #                                 include_dirs, debug, extra_preargs,
+        #                                 extra_postargs, depends)
+        #     finally:
+        #         self.compiler.spawn = original_spawn
 
-        def win_wrap_ninja_compile(sources,
-                                   output_dir=None,
-                                   macros=None,
-                                   include_dirs=None,
-                                   debug=0,
-                                   extra_preargs=None,
-                                   extra_postargs=None,
-                                   depends=None):
+        # def win_wrap_ninja_compile(sources,
+        #                            output_dir=None,
+        #                            macros=None,
+        #                            include_dirs=None,
+        #                            debug=0,
+        #                            extra_preargs=None,
+        #                            extra_postargs=None,
+        #                            depends=None):
 
-            if not self.compiler.initialized:
-                self.compiler.initialize()
-            output_dir = os.path.abspath(output_dir)
+        #     if not self.compiler.initialized:
+        #         self.compiler.initialize()
+        #     output_dir = os.path.abspath(output_dir)
 
-            # Note [Absolute include_dirs]
-            # Convert relative path in self.compiler.include_dirs to absolute path if any,
-            # For ninja build, the build location is not local, the build happens
-            # in a in script created build folder, relative path lost their correctness.
-            # To be consistent with jit extension, we allow user to enter relative include_dirs
-            # in setuptools.setup, and we convert the relative path to absolute path here
-            convert_to_absolute_paths_inplace(self.compiler.include_dirs)
+        #     # Note [Absolute include_dirs]
+        #     # Convert relative path in self.compiler.include_dirs to absolute path if any,
+        #     # For ninja build, the build location is not local, the build happens
+        #     # in a in script created build folder, relative path lost their correctness.
+        #     # To be consistent with jit extension, we allow user to enter relative include_dirs
+        #     # in setuptools.setup, and we convert the relative path to absolute path here
+        #     convert_to_absolute_paths_inplace(self.compiler.include_dirs)
 
-            _, objects, extra_postargs, pp_opts, _ = \
-                self.compiler._setup_compile(output_dir, macros,
-                                             include_dirs, sources,
-                                             depends, extra_postargs)
-            common_cflags = extra_preargs or []
-            cflags = []
-            if debug:
-                cflags.extend(self.compiler.compile_options_debug)
-            else:
-                cflags.extend(self.compiler.compile_options)
-            common_cflags.extend(COMMON_MSVC_FLAGS)
-            cflags = cflags + common_cflags + pp_opts
-            with_cuda = any(map(_is_cuda_file, sources))
+        #     _, objects, extra_postargs, pp_opts, _ = \
+        #         self.compiler._setup_compile(output_dir, macros,
+        #                                      include_dirs, sources,
+        #                                      depends, extra_postargs)
+        #     common_cflags = extra_preargs or []
+        #     cflags = []
+        #     if debug:
+        #         cflags.extend(self.compiler.compile_options_debug)
+        #     else:
+        #         cflags.extend(self.compiler.compile_options)
+        #     common_cflags.extend(COMMON_MSVC_FLAGS)
+        #     cflags = cflags + common_cflags + pp_opts
+        #     with_cuda = any(map(_is_cuda_file, sources))
 
-            # extra_postargs can be either:
-            # - a dict mapping cxx/nvcc to extra flags
-            # - a list of extra flags.
-            if isinstance(extra_postargs, dict):
-                post_cflags = extra_postargs['cxx']
-            else:
-                post_cflags = list(extra_postargs)
-            append_std17_if_no_std_present(post_cflags)
+        #     # extra_postargs can be either:
+        #     # - a dict mapping cxx/nvcc to extra flags
+        #     # - a list of extra flags.
+        #     if isinstance(extra_postargs, dict):
+        #         post_cflags = extra_postargs['cxx']
+        #     else:
+        #         post_cflags = list(extra_postargs)
+        #     append_std17_if_no_std_present(post_cflags)
 
-            cuda_post_cflags = None
-            cuda_cflags = None
-            if with_cuda:
-                cuda_cflags = ['-std=c++17', '--use-local-env']
-                for common_cflag in common_cflags:
-                    cuda_cflags.append('-Xcompiler')
-                    cuda_cflags.append(common_cflag)
-                for ignore_warning in MSVC_IGNORE_CUDAFE_WARNINGS:
-                    cuda_cflags.append('-Xcudafe')
-                    cuda_cflags.append('--diag_suppress=' + ignore_warning)
-                cuda_cflags.extend(pp_opts)
-                if isinstance(extra_postargs, dict):
-                    cuda_post_cflags = extra_postargs['nvcc']
-                else:
-                    cuda_post_cflags = list(extra_postargs)
-                cuda_post_cflags = win_cuda_flags(cuda_post_cflags)
+        #     cuda_post_cflags = None
+        #     cuda_cflags = None
+        #     if with_cuda:
+        #         cuda_cflags = ['-std=c++17', '--use-local-env']
+        #         for common_cflag in common_cflags:
+        #             cuda_cflags.append('-Xcompiler')
+        #             cuda_cflags.append(common_cflag)
+        #         for ignore_warning in MSVC_IGNORE_CUDAFE_WARNINGS:
+        #             cuda_cflags.append('-Xcudafe')
+        #             cuda_cflags.append('--diag_suppress=' + ignore_warning)
+        #         cuda_cflags.extend(pp_opts)
+        #         if isinstance(extra_postargs, dict):
+        #             cuda_post_cflags = extra_postargs['nvcc']
+        #         else:
+        #             cuda_post_cflags = list(extra_postargs)
+        #         cuda_post_cflags = win_cuda_flags(cuda_post_cflags)
 
-            cflags = _nt_quote_args(cflags)
-            post_cflags = _nt_quote_args(post_cflags)
-            if with_cuda:
-                cuda_cflags = _nt_quote_args(cuda_cflags)
-                cuda_post_cflags = _nt_quote_args(cuda_post_cflags)
-            if isinstance(extra_postargs, dict) and 'nvcc_dlink' in extra_postargs:
-                cuda_dlink_post_cflags = win_cuda_flags(extra_postargs['nvcc_dlink'])
-            else:
-                cuda_dlink_post_cflags = None
+        #     cflags = _nt_quote_args(cflags)
+        #     post_cflags = _nt_quote_args(post_cflags)
+        #     if with_cuda:
+        #         cuda_cflags = _nt_quote_args(cuda_cflags)
+        #         cuda_post_cflags = _nt_quote_args(cuda_post_cflags)
+        #     if isinstance(extra_postargs, dict) and 'nvcc_dlink' in extra_postargs:
+        #         cuda_dlink_post_cflags = win_cuda_flags(extra_postargs['nvcc_dlink'])
+        #     else:
+        #         cuda_dlink_post_cflags = None
 
-            _write_ninja_file_and_compile_objects(
-                sources=sources,
-                objects=objects,
-                cflags=cflags,
-                post_cflags=post_cflags,
-                cuda_cflags=cuda_cflags,
-                cuda_post_cflags=cuda_post_cflags,
-                cuda_dlink_post_cflags=cuda_dlink_post_cflags,
-                build_directory=output_dir,
-                verbose=True,
-                with_cuda=with_cuda)
+        #     _write_ninja_file_and_compile_objects(
+        #         sources=sources,
+        #         objects=objects,
+        #         cflags=cflags,
+        #         post_cflags=post_cflags,
+        #         cuda_cflags=cuda_cflags,
+        #         cuda_post_cflags=cuda_post_cflags,
+        #         cuda_dlink_post_cflags=cuda_dlink_post_cflags,
+        #         build_directory=output_dir,
+        #         verbose=True,
+        #         with_cuda=with_cuda)
 
-            # Return *all* object filenames, not just the ones we just built.
-            return objects
+        #     # Return *all* object filenames, not just the ones we just built.
+        #     return objects
 
         # Monkey-patch the _compile or compile method.
         # https://github.com/python/cpython/blob/dc0284ee8f7a270b6005467f26d8e5773d76e959/Lib/distutils/ccompiler.py#L511
         if self.compiler.compiler_type == 'msvc':
-            if self.use_ninja:
-                self.compiler.compile = win_wrap_ninja_compile
-            else:
-                self.compiler.compile = win_wrap_single_compile
+            print("currently only support unix")
+            # if self.use_ninja:
+            #     self.compiler.compile = win_wrap_ninja_compile
+            # else:
+            #     self.compiler.compile = win_wrap_single_compile
         else:
             if self.use_ninja:
                 self.compiler.compile = unix_wrap_ninja_compile
@@ -1213,19 +1214,6 @@ def remove_extension_h_precompiler_headers():
     _remove_if_file_exists(head_file_signature)
 
 
-def get_args(func):
-    import inspect
-
-    sig = inspect.signature(func)
-    params = sig.parameters
-    args = {}
-
-    for param in params.values():
-        args[param.name] = None
-
-    return args
-
-
 def _jit_compile(name,
                  sources,
                  extra_cflags,
@@ -1244,27 +1232,16 @@ def _jit_compile(name,
 
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
-    with_cudnn = any('cudnn' in f for f in extra_ldflags or [])
     old_version = JIT_EXTENSION_VERSIONER.get_version(name)
-
-    args = get_args(JIT_EXTENSION_VERSIONER.bump_version_if_changed)
-    args.update(
-        {
-            "name": name,
-            "source_files": sources,
-            "build_arguments": [
-                extra_cflags,
-                extra_cuda_cflags,
-                extra_ldflags,
-                extra_include_paths,
-            ],
-            "build_directory": build_directory,
-            "with_cuda": with_cuda,
-            "is_python_module": is_python_module,
-            "is_standalone": is_standalone,
-        }
+    version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(
+        name,
+        sources,
+        build_arguments=[extra_cflags, extra_cuda_cflags, extra_ldflags, extra_include_paths],
+        build_directory=build_directory,
+        with_cuda=with_cuda,
+        is_python_module=is_python_module,
+        is_standalone=is_standalone,
     )
-    version = JIT_EXTENSION_VERSIONER.bump_version_if_changed(**args)
     if version > 0:
         if version != old_version and verbose:
             print(f'The input conditions for extension module {name} have changed. ' +
@@ -1277,7 +1254,7 @@ def _jit_compile(name,
         try:
             if version != old_version:
                 with GeneratedFileCleaner(keep_intermediates=keep_intermediates) as clean_ctx:
-                    if IS_HIP_EXTENSION and (with_cuda or with_cudnn):
+                    if IS_HIP_EXTENSION and with_cuda:
                         hipify_result = hipify_python.hipify(
                             project_directory=build_directory,
                             output_directory=build_directory,
@@ -1315,6 +1292,7 @@ def _jit_compile(name,
                         build_directory=build_directory,
                         verbose=verbose,
                         with_cuda=with_cuda,
+                        is_python_module=is_python_module,
                         is_standalone=is_standalone,
                         torch_exclude=torch_exclude)
             elif verbose:
@@ -1390,12 +1368,12 @@ def _write_ninja_file_and_build_library(
         build_directory: str,
         verbose: bool,
         with_cuda: Optional[bool],
+        is_python_module: bool,
         is_standalone: bool = False,
         torch_exclude: bool = False) -> None:
     verify_ninja_availability()
 
     compiler = get_cxx_compiler()
-    # FIXME: How to remove this?
     get_compiler_abi_compatibility_and_version(compiler, torch_exclude)
     if with_cuda is None:
         with_cuda = any(map(_is_cuda_file, sources))
@@ -1419,6 +1397,7 @@ def _write_ninja_file_and_build_library(
         extra_ldflags=extra_ldflags or [],
         extra_include_paths=extra_include_paths or [],
         with_cuda=with_cuda,
+        is_python_module=is_python_module,
         is_standalone=is_standalone,
         torch_exclude=torch_exclude)
 
@@ -1715,30 +1694,33 @@ def _write_ninja_file_to_build_library(path,
                                        extra_ldflags,
                                        extra_include_paths,
                                        with_cuda,
+                                       is_python_module,
                                        is_standalone,
                                        torch_exclude) -> None:
     extra_cflags = [flag.strip() for flag in extra_cflags]
     extra_cuda_cflags = [flag.strip() for flag in extra_cuda_cflags]
     extra_ldflags = [flag.strip() for flag in extra_ldflags]
     extra_include_paths = [flag.strip() for flag in extra_include_paths]
+    # include_paths() gives us the location of torch/extension.h
+    system_includes = [] if torch_exclude else include_paths(with_cuda)
 
-    if not is_standalone and torch_exclude:
-        print("for module_aiter_enum, we currently use pybind11 to keep torch independency.")
+    # build python module excluded with torch, use `pybind11`
+    if torch_exclude and is_python_module:
+        print("for module_aiter_enum, we currently use pybind11 to keep torch independent.")
         import pybind11
         extra_include_paths.append(pybind11.get_include())
+
+    # sysconfig.get_path('include') gives us the location of Python.h
+    # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
+    # installations where default `get_path` points to non-existing `/Library/Python/M.m/include` folder
+    if is_python_module:
+        python_include_path = sysconfig.get_path('include', scheme='nt' if IS_WINDOWS else 'posix_prefix')
+        if python_include_path is not None:
+            system_includes.append(python_include_path)
 
     # Turn into absolute paths so we can emit them into the ninja build
     # file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
-
-    # include_paths() gives us the location of torch/extension.h
-    system_includes = [] if torch_exclude else include_paths(with_cuda)
-    # sysconfig.get_path('include') gives us the location of Python.h
-    # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
-    # installations where default `get_path` points to non-existing `/Library/Python/M.m/include` folder
-    python_include_path = sysconfig.get_path('include', scheme='nt' if IS_WINDOWS else 'posix_prefix')
-    if python_include_path is not None:
-        system_includes.append(python_include_path)
 
     common_cflags = []
     if not is_standalone or not torch_exclude:
@@ -1933,17 +1915,17 @@ def _write_ninja_file(path,
     content += "\n"
     _maybe_write(path, content)
 
-def _join_cuda_home(*paths) -> str:
-    """
-    Join paths with CUDA_HOME, or raises an error if it CUDA_HOME is not set.
+# def _join_cuda_home(*paths) -> str:
+#     """
+#     Join paths with CUDA_HOME, or raises an error if it CUDA_HOME is not set.
 
-    This is basically a lazy way of raising an error for missing $CUDA_HOME
-    only once we need to get any CUDA-specific path.
-    """
-    if CUDA_HOME is None:
-        raise OSError('CUDA_HOME environment variable is not set. '
-                      'Please set it to your CUDA install root.')
-    return os.path.join(CUDA_HOME, *paths)
+#     This is basically a lazy way of raising an error for missing $CUDA_HOME
+#     only once we need to get any CUDA-specific path.
+#     """
+#     if CUDA_HOME is None:
+#         raise OSError('CUDA_HOME environment variable is not set. '
+#                       'Please set it to your CUDA install root.')
+#     return os.path.join(CUDA_HOME, *paths)
 
 
 def _is_cuda_file(path: str) -> bool:

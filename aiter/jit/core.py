@@ -370,6 +370,8 @@ def get_args_of_build(ops_name: str, exclue=[]):
             if isinstance(val, list):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
+                        if "torch" in el:
+                            import torch
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
