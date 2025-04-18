@@ -7,7 +7,6 @@ import time
 import os
 import tempfile
 import re
-from prettytable import PrettyTable
 
 
 # Base directory where configs are located
@@ -43,8 +42,8 @@ def get_model_configs(config_path='./utils/model_configs.json', models="llama3,m
     for model in models:
         delimiter = "_" if "_" in model else "-"
         model_specs = model.split(delimiter)
-        model_family = model_specs[0] 
-        
+        model_family = model_specs[0]
+
         if model_family in configs:
             model_size = model_specs[1] if len(model_specs) > 1 else None
             # Check if model filtering is required
@@ -84,9 +83,11 @@ def get_available_models(config_file='utils/model_configs.json', filter=None):
 
 
 def parse_vgpr_usage(file_path, table_start="result-table-name"):
+    from prettytable import PrettyTable
+
     with open(file_path, "r") as f:
         lines = f.readlines()
-    
+
     # Extract VGPR-related information
     vgpr_info = []
     table_lines = []
@@ -116,7 +117,7 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
     table = PrettyTable()
     table.field_names = table_lines[0].split()
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
-    
+
     print(table)
 
 def print_vgpr(fun, table_start="result-table-name"):
@@ -127,12 +128,12 @@ def print_vgpr(fun, table_start="result-table-name"):
         # Redirect stdout and stderr to the temporary file
         sys.stdout = temp_file
         sys.stderr = temp_file
-        
+
         os.environ["AMDGCN_ENABLE_DUMP"] = "1"
         os.environ["TRITON_ALWAYS_COMPILE"] = "1"
         os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
         fun() # run the function
-        
+
         sys.stdout.flush()
         sys.stderr.flush()
 

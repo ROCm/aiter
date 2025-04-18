@@ -246,9 +246,10 @@ def test_fmoe(dtype, token, model_dim, inter_dim, E, topk, quant='No', use_g1u1=
 
 print('\ng1u1 fp8quant')
 for dtype in [torch.bfloat16]:
-    for m in [128,256]:
-        for dim in [4096,8192]:
-            for hdim in [1024,2048]:
-                test_fmoe(dtype, m, dim, hdim, 32, 5,
-                          quant='fp8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
+    for m in [1, 128, 256]:
+        for dim in [5120]:
+            for hdim in [1024]:
+                for num_of_experts in [16, 128]:
+                    test_fmoe(dtype, m, dim, hdim, num_of_experts, 1,
+                            quant='fp8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Silu)
                         #   quant='fp8quant', use_g1u1=True)
