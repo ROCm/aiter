@@ -17,7 +17,6 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     CppExtension,
     CUDAExtension,
-    ROCM_VERSION,
     ROCM_HOME,
     IS_HIP_EXTENSION,
 )

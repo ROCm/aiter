@@ -1722,6 +1722,11 @@ def _write_ninja_file_to_build_library(path,
     extra_ldflags = [flag.strip() for flag in extra_ldflags]
     extra_include_paths = [flag.strip() for flag in extra_include_paths]
 
+    if not is_standalone and torch_exclude:
+        print("for module_aiter_enum, we currently use pybind11 to keep torch independency.")
+        import pybind11
+        extra_include_paths.append(pybind11.get_include())
+
     # Turn into absolute paths so we can emit them into the ninja build
     # file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
