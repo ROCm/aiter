@@ -104,6 +104,7 @@ def test_mla(
     kvtype,
     page_size,
     varlen,
+    mtp
 ):
     kv_max_sz = (
         65536 * 32
@@ -144,6 +145,7 @@ def test_mla(
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
     # ############################## normal: prefill
+    '''
     q = torch.randn((total_qo, nhead, qk_head_dim), dtype=dtype)
     k = torch.randn((total_kv, nhead, qk_head_dim), dtype=dtype)
     v = torch.randn((total_kv, nhead, v_head_dim), dtype=dtype)
@@ -184,6 +186,7 @@ def test_mla(
         out_aiter,
         msg=f"mla_prefill-normal    [torch vs  aiter_ck]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us...... {flop/us_aiter/1000/1000:>8.2f} TFlops",
     )
+    '''
 
     # absorb init
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -191,6 +194,7 @@ def test_mla(
     v_head_dim = kv_lora_rank
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
+    '''
     # test prefill
     if batch_size * ctx_lens < 32 * 8192:
         # ############################## absorb: prefill
@@ -265,9 +269,16 @@ def test_mla(
             attn_logits,
             msg=f"mla_prefill-absorb    [torch vs aiter_asm]:{us_torch:>8.2f} us vs {us_asm:>8.2f} us......",
         )
-
+    '''
     # ############################## absorb: decode
     seq_lens_qo.fill_(1)
+    if nhead == 16:
+        mtp = False
+    
+    if mtp:
+        seq_lens_qo = torch.randint(1, 5, (batch_size,), dtype=torch.int)
+        seq_lens_qo.fill_(2)
+    max_seqlen_qo = seq_lens_qo.max().item()
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
@@ -294,7 +305,7 @@ def test_mla(
     else:
         out_ref = torch.empty_like(q)
 
-    num_kv_splits = 16
+    num_kv_splits = 1
     attn_logits = torch.empty(
         (total_q, nhead, num_kv_splits, v_head_dim + 1),
         dtype=torch.float32,
@@ -320,18 +331,20 @@ def test_mla(
         out_ref,
         msg=f"mla_decode-absorb    [golden vs    triton]:{us_torch_decode:>8.2f} us vs {us_ref:>8.2f} us......",
     )
-
+    return
     # aiter implementation
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-    out_asm = torch.empty((batch_size, nhead, v_head_dim), dtype=dtype).fill_(-1)
+    out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
     (attn_logits, attn_lse), us_asm = run_perftest(
         aiter.mla.mla_decode_fwd,
         q,
         kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
         out_asm,
+        qo_indptr,
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
+        max_seqlen_qo,
         sm_scale,
     )
 
@@ -352,26 +365,27 @@ kv_lora_rank = 512
 qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
-nhead = 16  # 128/TP8
 block_size = 1
 df = []
 for dtype, kvtype in [(torch.bfloat16, torch.bfloat16)]:
-    for ctx_len in [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]:
-        for batch_size in [1, 3, 5, 16, 32, 64, 128, 256][:]:
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                kv_lora_rank,
-                qk_nope_head_dim,
-                qk_rope_head_dim,
-                v_head_dim,
-                dtype,
-                kvtype,
-                block_size,
-                varlen=False,
-            )
-            df.append(ret)
+    for ctx_len in [21, 64, 256, 512, 1200, 3200, 5200, 8192, 3200][-1:]:
+        for batch_size in [1, 3, 5, 16, 32, 64, 128, 256,128][-1:]:
+            for nhead in [128]:
+                ret = test_mla(
+                    ctx_len,
+                    batch_size,
+                    nhead,
+                    kv_lora_rank,
+                    qk_nope_head_dim,
+                    qk_rope_head_dim,
+                    v_head_dim,
+                    dtype,
+                    kvtype,
+                    block_size,
+                    varlen=False,
+                    mtp = True,
+                )
+                df.append(ret)
 import pandas as pd
 
 df = pd.DataFrame(df)

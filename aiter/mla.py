@@ -75,9 +75,11 @@ def mla_decode_fwd(
     q,
     kv_buffer,
     o,
+    qo_indptr,
     kv_indptr,
     kv_indices,
     kv_last_page_lens,
+    max_seqlen_q,
     sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
     logit_cap=0.0,
     num_kv_splits=None,  # for experts only!!!
@@ -88,34 +90,47 @@ def mla_decode_fwd(
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
     num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
-    bs, nhead, v_head_dim = o.shape
+    total_s, nhead, v_head_dim = o.shape
+    bs = qo_indptr.shape[0] - 1
 
     if num_kv_splits is None:
         device_properties = torch.cuda.get_device_properties(device)
         cu_num = device_properties.multi_processor_count
         num_kv_splits = min(16, max(1, cu_num // bs))
+        num_kv_splits = 1
 
-    logits = torch.empty(
-        (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
-    )
+    if nhead == 16:
+        logits = torch.empty(
+            (total_s, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+        )
+        assert max_seqlen_q == 1, f"Assertion: max_seqlen_q should be 1 when n_head=16, but got {max_seqlen_q}"
+    else:
+        logits = o.view((total_s, num_kv_splits, nhead, v_head_dim)) if num_kv_splits == 1 else torch.empty(
+            (total_s, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+        )
+
     attn_lse = torch.empty(
-        (bs, num_kv_splits, nhead, 1), dtype=torch.float, device=device
+        (total_s, num_kv_splits, nhead, 1), dtype=torch.float, device=device
     )
 
-    aiter.mla_stage1_asm_fwd(
+    aiter.mla_decode_stage1_asm_fwd(
         q,
         kv_buffer,
+        qo_indptr,
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
+        max_seqlen_q,
         sm_scale,
         logits,
         attn_lse,
     )
 
+    if num_kv_splits == 1 and nhead == 128:
+        return logits.view(total_s, nhead, v_head_dim), attn_lse
     Lv = v_head_dim
     BLOCK_DV = triton.next_power_of_2(Lv)
-    grid = (bs, nhead)
+    grid = (total_s, nhead)
     extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
     _fwd_kernel_stage2_asm[grid](
         logits,
