@@ -92,6 +92,7 @@ def go(
         "q_dtype_w",
         "q_type",
         "use_g1u1",
+        "doweight_stage1"
     ]
     print(untunedf[args])
     prorfiles = []
@@ -109,6 +110,7 @@ def go(
             q_dtype_w,
             q_type,
             use_g1u1,
+            doweight_stage1
         ) = line
         dtype = eval(dtype)
         q_dtype_a = eval(q_dtype_a)
@@ -140,6 +142,7 @@ def go(
         else:
             torch_quant = aiter.get_torch_quant(q_type)
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
+        del input, w1, w2, score
 
         ref = torch_moe_stage1(
             a1_qt,
@@ -152,6 +155,7 @@ def go(
             dtype=dtype,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
+            doweight=doweight_stage1
         )
         if q_type == QuantType.per_128x128:
             ref, ref_scale = aiter.pertoken_quant(
@@ -173,7 +177,12 @@ def go(
             kernel_dict = df.groupby("tile_m")["knl_name"].apply(list).to_dict()
             return kernel_dict
 
-        extraInfo = "_blockscale" if q_type == QuantType.per_128x128 else ""
+        extraInfo = ""
+        if q_type == QuantType.per_128x128:
+            extraInfo += "_blockscale"
+        if doweight_stage1:
+            extraInfo += "_doweight"
+
         if q_dtype_a == torch.int8:
             quantDtype = "Int8"
         elif q_dtype_a == torch.float8_e4m3fnuz:
@@ -201,7 +210,7 @@ def go(
                     dtype=q_dtype_a,
                 )
 
-            if use_g1u1 and dtype == torch.bfloat16 and q_dtype_w != torch.int4:
+            if use_g1u1 and q_dtype_w != torch.int4:
                 for el in asm_kernels.get(blockM, []):
                     tasks.append(
                         (
@@ -214,7 +223,7 @@ def go(
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                out,
+                                out.view(torch.bfloat16),
                                 blockM,
                                 el,
                                 0,
@@ -226,6 +235,7 @@ def go(
                                     else a1_scale
                                 ),
                                 w1_scale,
+                                sorted_weights if doweight_stage1 else None,
                             ),
                         )
                     )
@@ -256,6 +266,7 @@ def go(
                             act_type,
                             a1_scale,
                             w1_scale,
+                            sorted_weights if doweight_stage1 else None,
                         ),
                     )
                 )
@@ -266,6 +277,8 @@ def go(
 
         profileDF = []
         for (tag, block_m), us, _ in rets:
+            if us == float("inf"):
+                continue
             if q_type == QuantType.per_128x128:
                 scale = (
                     _[token:, ...]
@@ -275,7 +288,7 @@ def go(
                 )
                 _ = _[:token, :, :].to(torch.float32)
             err = checkAllclose(
-                ref.to("cpu"), _, msg=f"[{tag:<50}]: {us:.2f}us ......      "
+                ref.to("cpu"), _.to(ref.dtype), msg=f"[{tag:<50}]: {us:.2f}us ......      "
             )
             profileDF.append(
                 [
@@ -290,6 +303,7 @@ def go(
                     q_dtype_w if q_dtype_w != torch.int4 else "torch.int4",
                     q_type,
                     use_g1u1,
+                    doweight_stage1,
                     block_m,
                     0,
                     us,
@@ -350,27 +364,42 @@ if __name__ == "__main__":
         help="All the kernels are tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
     )
 
+    parser.add_argument(
+        "--last",
+        action="store_true",
+        required=False,
+        help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
+    )
+
     args = parser.parse_args()
     untunedf = pd.read_csv(args.untune_file)
-    untunedf = untunedf.drop_duplicates()
-    if not args.all:
+    untunedf = untunedf.drop_duplicates(keep="last")
+    
+    if not args.all or args.last:
         if os.path.exists(args.tune_file):
             old_tunedf = pd.read_csv(args.tune_file)
-            untunedf_cols = untunedf.columns
-            mask = untunedf.apply(tuple, axis=1).isin(
-                old_tunedf[untunedf_cols].apply(tuple, axis=1)
-            )
-            untunedf = untunedf[~mask]
         else:
             old_tunedf = None
     else:
         old_tunedf = None
+
+    if args.last:
+        untunedf = untunedf.iloc[-1:]
+    elif old_tunedf is not None and not args.all:
+        untunedf_cols = untunedf.columns
+        mask = untunedf.apply(tuple, axis=1).isin(
+            old_tunedf[untunedf_cols].apply(tuple, axis=1)
+        )
+        untunedf = untunedf[~mask]
+    
     tunedf = None
     # tunedf = pd.read_csv(args.tune_file)
     profiles, tunedf = go(untunedf, tunedf)
     if old_tunedf is not None and tunedf is not None:
         tunedf = pd.concat([old_tunedf, tunedf], axis=0)
     if tunedf is not None:
+        tunedf = tunedf.astype(str).drop_duplicates(subset=["token","model_dim","inter_dim","expert","topk","act_type","dtype",
+                                                "q_dtype_a","q_dtype_w","q_type","use_g1u1","doweight_stage1"], keep="last")
         tunedf.to_csv(args.tune_file, index=False)
     if profiles is not None:
         profiles.to_csv(args.profile_file, index=False)

@@ -143,7 +143,7 @@ def per_tensor_quant_hip(x, scale=None, quant_dtype=torch.float8_e4m3fnuz):
             static_scaled_fp8_quant(y, x, scale)
     else:
         raise ValueError(f"unsupported: {quant_dtype=}")
-    return y, scale
+    return y, scale.view(1)
 
 
 def per_token_quant_triton(x, scale=None, quant_dtype=torch.int8):

@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn.functional as F
-import triton.language as tl
+import math
 import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -68,13 +68,13 @@ def ck_moe_stage2(
         w2,
         sorted_token_ids,
         sorted_expert_ids,
-        sorted_weights,
         num_valid_ids,
         out,
         topk,
         w2_scale,
         a2_scale,
         block_size,
+        sorted_weights,
     )
     return out
 
@@ -92,10 +92,11 @@ def test_fmoe(
     AQDType,
     WQDType,
     use_g1u1=False,
+    doweight_stage1=False,
 ):
     torch_quant = aiter.get_torch_quant(qType)
     torch_act = aiter.get_torch_act(actType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.randn((token, model_dim), dtype=dtype) / math.sqrt(inter_dim)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
     else:
@@ -138,6 +139,7 @@ def test_fmoe(
         a1_scale=a1_scale,
         w1_scale=w1_scale,
         num_iters=3,
+        doweight=doweight_stage1,
     )
 
     if WQDType == torch.int4:  # int4 w quant
@@ -217,6 +219,7 @@ def test_fmoe(
         w2_scale=w2_scale,
         a2_scale=a2_scale,
         num_iters=3,
+        doweight=not doweight_stage1,
     )
     # # out_ref = torch_moe(
     # #     input,
@@ -257,6 +260,7 @@ def test_fmoe(
     # ######################## stage 2 end ###########
 
     # ######################## fused 2 stage #########
+
     out2_aiter, us_fuse = run_perftest(
         fused_moe,
         input,
@@ -268,6 +272,7 @@ def test_fmoe(
         w2_scale=w2_scale,
         quant_type=qType,
         activation=actType,
+        doweight_stage1=doweight_stage1,
     )
 
     err = checkAllclose(
@@ -278,7 +283,7 @@ def test_fmoe(
     return {"us": us_fuse, "err": err}
 
 
-list_dtype = [torch.bfloat16]
+list_dtype = [torch.bfloat16, torch.float16][:1]
 list_dim = [(6144, 4096)]
 list_tokenNum = [
     1,
@@ -297,9 +302,10 @@ list_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
     (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
-    # (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
+    (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
+list_doweight_stage1 = [False, True]
 expert, topk = 8, 2
 
 import pandas as pd
@@ -309,7 +315,8 @@ for (
     act_type,
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
-) in itertools.product(list_dtype, list_act, list_quant, list_dim):
+    doweight_stage1
+) in itertools.product(list_dtype, list_act, list_quant, list_dim, list_doweight_stage1):
     df = []
     for m in list_tokenNum:
         ret = test_fmoe(
@@ -324,6 +331,7 @@ for (
             aq_dtype,
             wq_dtype,
             use_g1u1=True,
+            doweight_stage1=doweight_stage1,
         )
         df.append(ret)
     df = pd.DataFrame(df)
