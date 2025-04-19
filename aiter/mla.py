@@ -7,6 +7,7 @@ import torch
 import aiter
 import triton
 import triton.language as tl
+import functools
 
 
 @triton.jit
@@ -76,6 +77,19 @@ def _fwd_kernel_stage2_asm(
     )
 
 
+@functools.lru_cache()
+def get_meta_param(num_kv_splits, device, bs, nhead):
+    if num_kv_splits is None:
+        device_properties = torch.cuda.get_device_properties(device)
+        cu_num = device_properties.multi_processor_count
+        num_kv_splits = min(16, max(1, cu_num // bs))
+
+    get_mgc = {16: 64, 128: 16}
+    assert nhead in get_mgc, f"{nhead=} not supported"
+    mgc = get_mgc[nhead]
+    return num_kv_splits, mgc
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -98,10 +112,7 @@ def mla_decode_fwd(
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
 
-    if num_kv_splits is None:
-        device_properties = torch.cuda.get_device_properties(device)
-        cu_num = device_properties.multi_processor_count
-        num_kv_splits = min(16, max(1, cu_num // bs))
+    num_kv_splits, mgc = get_meta_param(num_kv_splits, device, bs, nhead)
 
     if nhead == 16:
         logits = torch.empty(
@@ -112,7 +123,7 @@ def mla_decode_fwd(
         assert (
             max_seqlen_q == 1
         ), f"Assertion: max_seqlen_q should be 1 when n_head=16, but got {max_seqlen_q}"
-    else:
+    elif nhead == 128:
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if num_kv_splits == 1
@@ -122,6 +133,8 @@ def mla_decode_fwd(
                 device=device,
             )
         )
+    else:
+        assert False, f"{nhead=} not supported"
 
     attn_lse = torch.empty(
         (total_s, num_kv_splits, nhead, 1), dtype=torch.float, device=device
@@ -160,7 +173,7 @@ def mla_decode_fwd(
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
-        mgc=64,
+        mgc=mgc,
         num_warps=4,
         num_stages=2,
         **extra_kargs,
