@@ -39,6 +39,8 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int GQA;
     p3 _p18;
+    void *ptr_QTP;
+    p2 _p19;
 };
 
 const float f_log2E = log2f(expf(1));
@@ -52,6 +54,7 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      std::optional<torch::Tensor> &K_QScale,
                      std::optional<torch::Tensor> &V_QScale,
                      std::optional<torch::Tensor> &out_,
+                     std::optional<torch::Tensor> &qo_indptr,
                      std::optional<int> high_precision = 1)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
@@ -98,13 +101,35 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     args.Bs = stride_KV_blk;
     args.KVs = stride_KV_head;
     args.GQA = gqa_ratio;
+    args.ptr_QTP = qo_indptr ? qo_indptr.value().data_ptr() : nullptr;
     // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs << std::endl;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AiterAsmKernel *impl_ptr = nullptr;
-    if (K_QScale)
+    if (qo_indptr)
+    {
+        TORCH_CHECK(Q.dtype() == at::ScalarType::BFloat16 && K_QScale && K.dtype() == at::ScalarType::Float8_e4m3fnuz,
+                    __func__, ": qo_indptr only support bf16 asm pa with fp8 kv cache");
+
+        if (gqa_ratio <= 8)
+        {
+            static AiterAsmKernel impl_a16w8_1tg_g8_f8_gqa8_qlen("pa_a16w8_1tg_g8_f8_gqa8_qlen", "pa_a16w8_1tg_g8_f8_gqa8_qlen.co");
+            impl_ptr = &impl_a16w8_1tg_g8_f8_gqa8_qlen;
+        }
+        else if (gqa_ratio <= 16)
+        {
+            static AiterAsmKernel impl_a16w16_1tg_g8_f8_gqa16_qlen("pa_a16w8_1tg_g8_f8_gqa16_qlen", "pa_a16w8_1tg_g8_f8_gqa16_qlen.co");
+            impl_ptr = &impl_a16w16_1tg_g8_f8_gqa16_qlen;
+        }
+        else
+        {
+            TORCH_CHECK(false,
+                        __func__, ": gqa_ratio only support less 16 on bf16 asm pa with qo_indptr !!!");
+        }
+    }
+    else if (K_QScale)
     {
         if (Q.dtype() == at::ScalarType::Half)
         {

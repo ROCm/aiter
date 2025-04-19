@@ -41,17 +41,18 @@
             py::arg("splitData"),                                               \
             py::arg("splitLse"));
 
-#define ATTENTION_ASM_PYBIND                    \
-      m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",    \
-            py::arg("Q"),                       \
-            py::arg("K"),                       \
-            py::arg("V"),                       \
-            py::arg("block_tables"),            \
-            py::arg("context_lens"),            \
-            py::arg("max_num_blocks"),          \
-            py::arg("K_QScale") = std::nullopt, \
-            py::arg("V_QScale") = std::nullopt, \
-            py::arg("out_") = std::nullopt,     \
+#define ATTENTION_ASM_PYBIND                     \
+      m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",     \
+            py::arg("Q"),                        \
+            py::arg("K"),                        \
+            py::arg("V"),                        \
+            py::arg("block_tables"),             \
+            py::arg("context_lens"),             \
+            py::arg("max_num_blocks"),           \
+            py::arg("K_QScale") = std::nullopt,  \
+            py::arg("V_QScale") = std::nullopt,  \
+            py::arg("out_") = std::nullopt,      \
+            py::arg("qo_indptr") = std::nullopt, \
             py::arg("high_precision") = 1);
 
 #define ATTENTION_CK_PYBIND                                \

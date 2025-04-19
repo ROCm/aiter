@@ -399,7 +399,7 @@ def run_aiter_asm(
         k_scale,
         v_scale,
         None,
-        high_precision,
+        high_precision=high_precision,
     )
 
 
