@@ -92,27 +92,35 @@ def get_x_vals():
     return x_vals
 
 
+def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
+    scale_n = (N + block_shape_n - 1) // block_shape_n
+    scale_k = (K + block_shape_k - 1) // block_shape_k
+
+    x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(
+        torch.float8_e4m3fnuz
+    )
+    weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
+        torch.float8_e4m3fnuz
+    )
+
+    x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+
+    return x, weight, x_scale, w_scale
+
+
 @pytest.mark.parametrize(
-    "dtype, m, n, k", [(dtype, *shape) for dtype in ["bf16"] for shape in get_x_vals()]
+    "dtype, M, N, K", [(dtype, *shape) for dtype in ["bf16"] for shape in get_x_vals()]
 )
-def test_gemm(dtype, m, n, k):
+def test_gemm(dtype, M, N, K):
     block_shape_n, block_shape_k = block_shape
     # TODO: Remove this skip condition
-    if (n % block_shape_n != 0) or (k % block_shape_k != 0):
+    if (N % block_shape_n != 0) or (K % block_shape_k != 0):
         pytest.skip("Skip N/K sizes not aligned to SCALE_BLOCK_SIZE")
 
     dtype = name_to_torch_types[dtype]
-    dim = (m, n, k)
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=torch.float16, device="cuda") / 10).to(
-        torch.float8_e4m3fnuz
-    )
-    weight = (torch.rand((n, k), dtype=torch.float16, device="cuda") / 10).to(
-        torch.float8_e4m3fnuz
-    )
-    x_scale = torch.rand([m, scale_k], dtype=torch.float32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+    x, weight, x_scale, w_scale = generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n,
+            block_shape_k)
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     b = run_triton(x, weight, x_scale, w_scale, dtype)
