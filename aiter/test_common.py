@@ -225,7 +225,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = (~isClose).to("cpu")
     if isClose.all():
-        logger.info(f"{msg}[checkAllclose {atol=} {rtol=} passed~]")
+        logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
         return 0
     else:
         num = mask.sum()
@@ -236,7 +236,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
         delta = (a_msked - b_msked).abs()
         if percent > 0.01:
             logger.info(
-                f"""{msg}[checkAllclose {atol=} {rtol=} failed!]
+                f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
@@ -246,7 +246,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
             )
         else:
             logger.info(
-                f"""{msg}[checkAllclose {atol=} {rtol=} warning!] a and b results are not all close"""
+                f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
             )
         logger.info(
             f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"
