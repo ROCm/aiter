@@ -425,6 +425,9 @@ def get_args_of_build(ops_name: str, exclue=[]):
 
 def compile_ops(_md_name: str, fc_name: Optional[str] = None):
     def decorator(func):
+        func.arg_checked = False
+
+        @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
             loadName = fc_name
             md_name = _md_name
@@ -471,6 +474,27 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 op = getattr(module, loadName)
             else:
                 return None
+
+            def check_args():
+                import inspect
+                import typing
+
+                if not op.__doc__.startswith("Members:"):
+                    doc_str = op.__doc__.split("\n")[0]
+                    namespace = {"List": List, "Optional": Optional, "torch": torch}
+                    exec(f"def {doc_str}: pass", namespace)
+                    foo = namespace[doc_str.split("(")[0]]
+                    sig = inspect.signature(foo)
+                    func.__signature__ = sig
+                    ann = dict(sig.parameters)
+
+                    func_hints = typing.get_type_hints(func)
+                    if ann != func_hints:
+                        logger.warning(f"type hints mismatch, it should be\n{doc_str}")
+                return True
+
+            if not func.arg_checked:
+                func.arg_checked = check_args()
 
             if AITER_LOG_MORE == 2:
                 from ..test_common import log_args
