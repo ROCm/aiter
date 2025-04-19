@@ -53,7 +53,6 @@ void mla_decode_stage1_asm_fwd(torch::Tensor &Q,                 //   [num_seqs,
 )
 {
     int batch = qo_indptr.size(0) - 1;
-    std::cout << "batch: " << batch << std::endl;
     int num_heads = Q.size(1);
     int head_size = Q.size(2);
     int page_size = KV.size(1);
@@ -102,23 +101,24 @@ void mla_decode_stage1_asm_fwd(torch::Tensor &Q,                 //   [num_seqs,
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AiterAsmKernel *impl_ptr = nullptr;
-    int sub_Q = 16;
     TORCH_CHECK(Q.is_contiguous(),
                 __func__, ":only support Q.is_contiguous() for now");
     TORCH_CHECK(num_kv_heads == 1,
                 __func__, ":only support num_kv_heads==1 for now");
     TORCH_CHECK(head_size == KV.size(3),
                 __func__, ":only support head_size == KV.size(3) for now");
+    int sub_Q;
     if (Q.dtype() == at::ScalarType::BFloat16)
     {
         if (gqa_ratio == 128)
         {
-            static AiterAsmKernel impl_a16w16_bf16_subQ128("mla_a16w16_dec_subQ128_mqa128", "/mla/mla_a16w16_dec_subQ128_mqa128.co");
             sub_Q = 128;
+            static AiterAsmKernel impl_a16w16_bf16_subQ128("mla_a16w16_dec_subQ128_mqa128", "/mla/mla_a16w16_dec_subQ128_mqa128.co");
             impl_ptr = &impl_a16w16_bf16_subQ128;
         }
         else
         {
+            sub_Q = 16;
             static AiterAsmKernel impl_a16w16_bf16("mla_stage1_a16w16_bf16", "/mla/mla_stage1_a16w16_bf16.co");
             impl_ptr = &impl_a16w16_bf16;
         }
@@ -126,10 +126,7 @@ void mla_decode_stage1_asm_fwd(torch::Tensor &Q,                 //   [num_seqs,
 
     TORCH_CHECK(impl_ptr != nullptr,
                 __func__, ": unsupport current input type");
-    // std::cout << "max_seqlen_q" << max_seqlen_q << std::endl;
-    // std::cout << (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q << std::endl;
-    // std::cout << batch << std::endl;
-    // std::cout << kv_split << std::endl;
+
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q, // gdx

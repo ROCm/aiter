@@ -14,6 +14,7 @@ def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
     O,
+    qo_indptr,
     kv_indptr,
     stride_mid_ob,
     stride_mid_oh,
@@ -27,10 +28,14 @@ def _fwd_kernel_stage2_asm(
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
+    cur_qo_offs = tl.program_id(2)
 
-    cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
-        kv_indptr + cur_batch
-    )
+    cur_qo_start = tl.load(qo_indptr + cur_batch)
+    cur_qo_end = tl.load(qo_indptr + cur_batch + 1)
+    cur_qo = cur_qo_start + cur_qo_offs
+    if cur_qo > cur_qo_end:
+        return
+    cur_kv_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
 
     offs_d = tl.arange(0, BLOCK_DV)
     mask_d = offs_d < Lv
@@ -39,13 +44,13 @@ def _fwd_kernel_stage2_asm(
     e_max = -float("inf")
     acc = tl.zeros([BLOCK_DV], dtype=tl.float32)
 
-    offs_v = (cur_batch * stride_mid_ob + cur_head * stride_mid_oh) * Lv + offs_d
-    offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh
+    offs_v = (cur_qo * stride_mid_ob + cur_head * stride_mid_oh) * Lv + offs_d
+    offs_logic = cur_qo * stride_mid_ob + cur_head * stride_mid_oh
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
-        kv_len_per_split = tl.maximum(mgc, tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS))
+        kv_len_per_split = tl.maximum(mgc, tl.cdiv(cur_kv_seq_len, NUM_KV_SPLITS))
         split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_kv_seq_len)
 
         if split_kv_end > split_kv_start:
             tv = tl.load(
@@ -65,7 +70,7 @@ def _fwd_kernel_stage2_asm(
             e_max = n_e_max
 
     tl.store(
-        O + cur_batch * stride_obs + cur_head * stride_oh + offs_d,
+        O + cur_qo * stride_obs + cur_head * stride_oh + offs_d,
         acc / e_sum,
         mask=mask_d,
     )
@@ -101,12 +106,22 @@ def mla_decode_fwd(
 
     if nhead == 16:
         logits = torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+            (total_s, num_kv_splits, nhead, v_head_dim),
+            dtype=torch.float,
+            device=device,
         )
-        assert max_seqlen_q == 1, f"Assertion: max_seqlen_q should be 1 when n_head=16, but got {max_seqlen_q}"
+        assert (
+            max_seqlen_q == 1
+        ), f"Assertion: max_seqlen_q should be 1 when n_head=16, but got {max_seqlen_q}"
     else:
-        logits = o.view((total_s, num_kv_splits, nhead, v_head_dim)) if num_kv_splits == 1 else torch.empty(
-            (total_s, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+        logits = (
+            o.view((total_s, num_kv_splits, nhead, v_head_dim))
+            if num_kv_splits == 1
+            else torch.empty(
+                (total_s, num_kv_splits, nhead, v_head_dim),
+                dtype=torch.float,
+                device=device,
+            )
         )
 
     attn_lse = torch.empty(
@@ -130,12 +145,13 @@ def mla_decode_fwd(
         return logits.view(total_s, nhead, v_head_dim), attn_lse
     Lv = v_head_dim
     BLOCK_DV = triton.next_power_of_2(Lv)
-    grid = (total_s, nhead)
+    grid = (bs, nhead, max_seqlen_q)
     extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
     _fwd_kernel_stage2_asm[grid](
         logits,
         attn_lse,
         o,
+        qo_indptr,
         kv_indptr,
         attn_lse.stride(0),
         attn_lse.stride(2),
