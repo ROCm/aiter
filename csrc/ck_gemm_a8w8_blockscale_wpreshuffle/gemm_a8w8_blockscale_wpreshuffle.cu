@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#include "gemm_a8w8_blockscale_common.cuh"
-#include "gemm_a8w8_blockscale_manifest.h"
-#include "gemm_a8w8_blockscale_lookup.h"
+#include "gemm_a8w8_blockscale_wpreshuffle_common.cuh"
+#include "gemm_a8w8_blockscale_wpreshuffle_manifest.h"
+#include "gemm_a8w8_blockscale_wpreshuffle_lookup.h"
 #include <cmath>
 
-   
 using BlockwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &, 
-                  torch::Tensor &)>; 
+                  torch::Tensor &, torch::Tensor &,
+                  torch::Tensor &)>;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -26,7 +25,7 @@ struct IntTupleHash
 
 using BlockwiseKernelMap = std::unordered_map<
     std::tuple<int, int, int>,
-    BlockwiseKernel, 
+    BlockwiseKernel,
     IntTupleHash>;
 
 template <typename DDataType, typename EDataType = DDataType>
@@ -34,15 +33,15 @@ BlockwiseKernel blockwise_heuristic_dispatch(int M, int N, int K)
 {
   if (M <= 16)
   {
-    return a8w8_blockscale_1x128x128_256x16x64x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_4_1x1_intrawave_v1<DDataType, EDataType>;
+    return a8w8_blockscale_wpreshuffle_1x128x128_256x16x64x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_4_1x1_intrawave_v1<DDataType, EDataType>;
   }
   else if (M <= 32)
   {
-    return a8w8_blockscale_1x128x128_256x32x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8_2x1_intrawave_v1<DDataType, EDataType>;
+    return a8w8_blockscale_wpreshuffle_1x128x128_256x32x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8_2x1_intrawave_v1<DDataType, EDataType>;
   }
   else
   {
-    return a8w8_blockscale_1x128x128_256x64x64x128_16x16_32x32_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v1<DDataType, EDataType>;
+    return a8w8_blockscale_wpreshuffle_1x128x128_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x2_intrawave_v3<DDataType, EDataType>;
   }
 }
 
@@ -57,12 +56,12 @@ static constexpr int nextPow2(unsigned int num)
 template <typename DDataType, typename EDataType = DDataType>
 BlockwiseKernel blockscale_dispatch(int M, int N, int K)
 {
-    // For a given shape, either find the best kernel via lookup or heuristic.
-    // For many small M shapes, we bucket them to the next largest kernel.
-    // This is fine since kernels are padded anyway.
-    
-    static const auto lookup = []
-    {
+  // For a given shape, either find the best kernel via lookup or heuristic.
+  // For many small M shapes, we bucket them to the next largest kernel.
+  // This is fine since kernels are padded anyway.
+
+  static const auto lookup = []
+  {
       if constexpr (std::is_same_v<EDataType, F16>) {
           return BlockwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType,F16)};
       } else if constexpr (std::is_same_v<EDataType, B16>) {
@@ -70,49 +69,49 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
       } else {
           static_assert(false, "blockscale_dispatch used with unsupported dtype!");
       } }();
-    
-    // First check if this shape(M,N,K) is available in the direct lookup.
-    auto it = lookup.find({M, N, K});
-    // If we found an optimal kernel, use it.
-    if (it != lookup.end())
-    {
-      return it->second;
-    }
 
-    int padded_m = M;
-    if (M > 1 && M <= 16)
-    {
-      padded_m = 16;
-    }
-    else if (M <= 16384)
-    {
-      padded_m = nextPow2(M);
-    }
-    else if (M <= 20480)
-    {
-      padded_m = 20480;
-    }
-    // Second check if this shape(padded_m,N,K) is available in the direct lookup.
-    it = lookup.find({padded_m, N, K});
-    // If we found an optimal kernel, use it.
-    if (it != lookup.end())
-    {
-      return it->second;
-    }
-    // Otherwise, use heuristics.
-    return blockwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
+  // First check if this shape(M,N,K) is available in the direct lookup.
+  auto it = lookup.find({M, N, K});
+  // If we found an optimal kernel, use it.
+  if (it != lookup.end())
+  {
+    return it->second;
+  }
+
+  int padded_m = M;
+  if (M > 1 && M <= 16)
+  {
+    padded_m = 16;
+  }
+  else if (M <= 16384)
+  {
+    padded_m = nextPow2(M);
+  }
+  else if (M <= 20480)
+  {
+    padded_m = 20480;
+  }
+  // Second check if this shape(padded_m,N,K) is available in the direct lookup.
+  it = lookup.find({padded_m, N, K});
+  // If we found an optimal kernel, use it.
+  if (it != lookup.end())
+  {
+    return it->second;
+  }
+  // Otherwise, use heuristics.
+  return blockwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
 
-torch::Tensor gemm_a8w8_blockscale(
-    torch::Tensor& XQ,
-    torch::Tensor& WQ,
-    torch::Tensor& x_scale,
-    torch::Tensor& w_scale,
-    torch::Tensor& Y)
+torch::Tensor gemm_a8w8_blockscale_wpreshuffle(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y)
 {
-    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
-                "Scales should have the same dtype!");
+  TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
+  TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
+              "Scales should have the same dtype!");
 
   int M = XQ.size(0);
   int N = WQ.size(0);
