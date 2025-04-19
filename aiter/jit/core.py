@@ -11,14 +11,15 @@ import importlib
 import functools
 import traceback
 from typing import List, Optional
-from . import cpp_extension
-import torch
-from torch.utils.file_baton import FileBaton
 import logging
 import json
 import multiprocessing
 from packaging.version import parse, Version
 
+this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, f'{this_dir}/utils/')
+from cpp_extension import load, get_hip_version
+from file_baton import FileBaton
 
 def mp_lock(
     lockPath: str,
@@ -162,10 +163,6 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
-def get_hip_version():
-    return parse(torch.version.hip.split()[-1].rstrip("-").replace("-", "+"))
-
-
 @functools.lru_cache()
 def check_numa():
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
@@ -199,6 +196,7 @@ def build_module(
     verbose,
     is_python_module,
     is_standalone,
+    torch_exclude,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -236,7 +234,7 @@ def build_module(
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-        hip_version = get_hip_version()
+        hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
         if hip_version > Version("5.7.23302"):
             flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
@@ -280,11 +278,12 @@ def build_module(
             [f"{AITER_CSRC_DIR}/include"] + extra_include, old_bd_include_dir
         )
 
-        bd_include_dir = f"{op_dir}/build/include/torch"
-        os.makedirs(bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu(
-            [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
-        )
+        if not is_standalone:
+            bd_include_dir = f"{op_dir}/build/include/torch"
+            os.makedirs(bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
+            )
 
         extra_include_paths = [
             f"{CK_DIR}/include",
@@ -293,7 +292,7 @@ def build_module(
         ]
 
         try:
-            module = cpp_extension.load(
+            module = load(
                 md_name,
                 sources,
                 extra_cflags=flags_cc,
@@ -305,6 +304,7 @@ def build_module(
                 with_cuda=True,
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
+                torch_exclude=torch_exclude,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -356,6 +356,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
         "verbose": False,
         "is_python_module": True,
         "is_standalone": False,
+        "torch_exclude": False,
         "blob_gen_cmd": "",
     }
 
@@ -369,12 +370,19 @@ def get_args_of_build(ops_name: str, exclue=[]):
             if isinstance(val, list):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
+                        if "torch" in el:
+                            import torch
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
                 d_ops[k] = eval(val)
             else:
                 pass
+            
+        # undefined compile features will be replaced with default value
+        for k, val in d_opt_build_args.items():
+            if k not in d_ops.keys():
+                d_ops[k] = val
         return d_ops
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
@@ -454,6 +462,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 verbose = d_args["verbose"]
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
+                torch_exclude = d_args["torch_exclude"]
                 module = build_module(
                     md_name,
                     srcs,
@@ -465,6 +474,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     verbose,
                     is_python_module,
                     is_standalone,
+                    torch_exclude,
                 )
 
             if isinstance(module, types.ModuleType):

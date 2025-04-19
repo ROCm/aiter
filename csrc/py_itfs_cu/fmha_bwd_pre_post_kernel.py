@@ -38,7 +38,6 @@ FMHA_BWD_API="""
 #include "aiter_hip_common.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include "py_itfs_common.h"
 #include "mha_bwd.h"
 
 namespace aiter {
