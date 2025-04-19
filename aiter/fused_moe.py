@@ -570,30 +570,38 @@ def ck_stage1(
     a1_scale=None,
     w1_scale=None,
 ):
-    topk = out.shape[1]
-    expert, topk, _ = out.shape
+    token_num = input.shape[0]
+    D = w1.shape[1] // 2
+    _, topk, _ = out.shape
+    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
-    # tmp = torch.empty_like(out)
-    dtype = out.dtype
-    device = out.device
-    tmp = torch.empty((expert, topk, w1.shape[1]), dtype=dtype, device=device)
-    aiter.ck_moe_stage1(
-        input,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        tmp,
-        topk,
-        w1_scale,
-        a1_scale,
-        block_m,
-    )
     if activation == ActivationType.Silu:
-        aiter.silu_and_mul(out, tmp)
+        act_op = 1
     else:
-        aiter.gelu_and_mul(out, tmp)
+        act_op = 0
+
+    aiter.ck_moe_stage1(input, w1, w2, sorted_ids,
+                        sorted_expert_ids, num_valid_ids, out, topk, w1_scale, a1_scale, block_m, act_op)
+    # topk = out.shape[1]
+    # expert, topk, _ = out.shape
+
+
+    # # tmp = torch.empty_like(out)
+    # aiter.ck_moe_stage1(
+    #     input,
+    #     w1,
+    #     w2,
+    #     sorted_ids,
+    #     sorted_expert_ids,
+    #     num_valid_ids,
+    #     out,
+    #     topk,
+    #     w1_scale,
+    #     a1_scale,
+    #     block_m,
+    #     act_op
+    # )
+
     return out
 
 
