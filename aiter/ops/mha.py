@@ -40,6 +40,7 @@ def mha_varlen_fwd(
     v: Tensor,
     cu_seqlens_q: Tensor,
     cu_seqlens_k: Tensor,
+    seqlens_k: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -55,7 +56,7 @@ def mha_varlen_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-): ...
+) -> list[Tensor]: ...
 
 
 @compile_ops("module_mha_bwd", fc_name="mha_bwd")
@@ -739,6 +740,7 @@ def _flash_attn_varlen_forward(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -848,6 +850,7 @@ def _flash_attn_varlen_forward(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
@@ -941,7 +944,9 @@ def _flash_attn_varlen_backward(
         f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}']
 
     (_, nhead_q, hdim_q) = q.shape
-    (_, nhead_k, hdim_v) = v.shape
+
+    nhead_k = v.shape[-2]
+    hdim_v = v.shape[-1]
 
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
@@ -1061,6 +1066,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
@@ -1074,6 +1080,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+
         is_v3_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1
     ):
@@ -1082,8 +1089,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_q_og = q.size(2)
-        head_size_v_og = v.size(2)
+        head_size_q_og = q.size(-1)
+        head_size_v_og = v.size(-1)
         if head_size_q_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
@@ -1095,6 +1102,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             v,
             cu_seqlens_q,
             cu_seqlens_k,
+            seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
             dropout_p,
@@ -1175,7 +1183,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., : head_size_q_og]
         dv = dv[..., : head_size_v_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, dbias, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, dbias, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -1184,6 +1192,7 @@ def flash_attn_varlen_func(
     v,
     cu_seqlens_q,
     cu_seqlens_k,
+    seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
     dropout_p=0.0,
@@ -1258,6 +1267,7 @@ def flash_attn_varlen_func(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,

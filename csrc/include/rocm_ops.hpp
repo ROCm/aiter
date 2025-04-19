@@ -313,6 +313,7 @@
             py::arg("q"), py::arg("k"), py::arg("v"),             \
             py::arg("cu_seqlens_q"),                              \
             py::arg("cu_seqlens_k"),                              \
+            py::arg("seqlens_k"),                                 \
             py::arg("max_seqlen_q"),                              \
             py::arg("max_seqlen_k"),                              \
             py::arg("dropout_p"),                                 \

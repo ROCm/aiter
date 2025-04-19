@@ -108,12 +108,15 @@ def run_ck(
     else:
         bias_unpad = None
 
+    seqlens_k = None
+    
     out_unpad, _, S_dmask = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
         v_unpad,
         cu_seqlens_q,
         cu_seqlens_k,
+        seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
