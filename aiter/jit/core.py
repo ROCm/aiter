@@ -514,7 +514,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                                 raise TypeError(
                                     f"{el} needs to be List[{sub_t}] but got {arg}"
                                 )
-                        elif origin is Optional:
+                        elif origin is typing.Union:
                             if arg is not None and not isinstance(arg, sub_t):
                                 raise TypeError(
                                     f"{el} needs to be Optional[{sub_t}] but got {arg}"
