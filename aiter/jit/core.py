@@ -497,10 +497,30 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
 
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
-                        if not isinstance(arg, ann[el]):
-                            raise TypeError(
-                                f"{el} need be {ann[el]} but got {type(arg)}"
-                            )
+                        expected_type = ann[el]
+                        origin = typing.get_origin(expected_type)
+                        sub_t = typing.get_args(expected_type)
+
+                        if origin is None:
+                            if not isinstance(arg, expected_type):
+                                raise TypeError(
+                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                )
+                        elif origin is list:
+                            if (
+                                not isinstance(arg, list)
+                                # or not all(isinstance(i, sub_t) for i in arg)
+                            ):
+                                raise TypeError(
+                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                )
+                        elif origin is Optional:
+                            if arg is not None and not isinstance(arg, sub_t):
+                                raise TypeError(
+                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                )
+                        else:
+                            raise TypeError(f"Unsupported type: {expected_type}")
 
                     func_hints = typing.get_type_hints(func)
                     if ann["return"] is None:
