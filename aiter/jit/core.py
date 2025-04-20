@@ -478,19 +478,37 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
             def check_args():
                 import inspect
                 import typing
+                import re
 
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
-                    namespace = {"List": List, "Optional": Optional, "torch": torch}
-                    exec(f"def {doc_str}: pass", namespace)
+                    doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    namespace = {
+                        "List": List,
+                        "Optional": Optional,
+                        "torch": torch,
+                    }
+                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
                     foo = namespace[doc_str.split("(")[0]]
                     sig = inspect.signature(foo)
                     func.__signature__ = sig
-                    ann = dict(sig.parameters)
+                    ann = {k: v.annotation for k, v in sig.parameters.items()}
+                    ann["return"] = sig.return_annotation
+
+                    callargs = inspect.getcallargs(func, *args, **kwargs)
+                    for el, arg in callargs.items():
+                        if not isinstance(arg, ann[el]):
+                            raise TypeError(
+                                f"{el} need be {ann[el]} but got {type(arg)}"
+                            )
 
                     func_hints = typing.get_type_hints(func)
+                    if ann["return"] is None:
+                        func_hints["return"] = None
                     if ann != func_hints:
-                        logger.warning(f"type hints mismatch, it should be\n{doc_str}")
+                        logger.warning(
+                            f"type hints mismatch, override to --> {doc_str}"
+                        )
                 return True
 
             if not func.arg_checked:
