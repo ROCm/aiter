@@ -487,6 +487,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 import inspect
                 import typing
                 import re
+                import torch
 
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
