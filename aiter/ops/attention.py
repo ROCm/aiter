@@ -109,17 +109,20 @@ MD_NAME = "module_mla_asm"
 
 
 @compile_ops(MD_NAME)
-def mla_stage1_asm_fwd(
+def mla_decode_stage1_asm_fwd(
     # [num_seqs, num_heads, head_size]
     Q: torch.Tensor,
     # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
     KV: torch.Tensor,
+    # [batch_size+1]
+    qo_indptr: torch.Tensor,
     # [batch_size+1]
     kv_indptr: torch.Tensor,
     # [num_page_used]
     kv_page_indices: torch.Tensor,
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
+    max_seqlen_q: int,
     softmax_scale: float,
     # [batch_size, num_kv_splits, num_heads, v_head_dim]
     splitData: torch.Tensor,

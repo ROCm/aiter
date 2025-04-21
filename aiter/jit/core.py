@@ -433,6 +433,9 @@ def get_args_of_build(ops_name: str, exclue=[]):
 
 def compile_ops(_md_name: str, fc_name: Optional[str] = None):
     def decorator(func):
+        func.arg_checked = False
+
+        @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
             loadName = fc_name
             md_name = _md_name
@@ -481,6 +484,65 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 op = getattr(module, loadName)
             else:
                 return None
+
+            def check_args():
+                import inspect
+                import typing
+                import re
+
+                if not op.__doc__.startswith("Members:"):
+                    doc_str = op.__doc__.split("\n")[0]
+                    doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    namespace = {
+                        "List": List,
+                        "Optional": Optional,
+                        "torch": torch,
+                    }
+                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
+                    foo = namespace[doc_str.split("(")[0]]
+                    sig = inspect.signature(foo)
+                    func.__signature__ = sig
+                    ann = {k: v.annotation for k, v in sig.parameters.items()}
+                    ann["return"] = sig.return_annotation
+
+                    callargs = inspect.getcallargs(func, *args, **kwargs)
+                    for el, arg in callargs.items():
+                        expected_type = ann[el]
+                        origin = typing.get_origin(expected_type)
+                        sub_t = typing.get_args(expected_type)
+
+                        if origin is None:
+                            if not isinstance(arg, expected_type):
+                                raise TypeError(
+                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                )
+                        elif origin is list:
+                            if (
+                                not isinstance(arg, list)
+                                # or not all(isinstance(i, sub_t) for i in arg)
+                            ):
+                                raise TypeError(
+                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                )
+                        elif origin is typing.Union:
+                            if arg is not None and not isinstance(arg, sub_t):
+                                raise TypeError(
+                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                )
+                        else:
+                            raise TypeError(f"Unsupported type: {expected_type}")
+
+                    func_hints = typing.get_type_hints(func)
+                    if ann["return"] is None:
+                        func_hints["return"] = None
+                    if ann != func_hints:
+                        logger.warning(
+                            f"type hints mismatch, override to --> {doc_str}"
+                        )
+                return True
+
+            if not func.arg_checked:
+                func.arg_checked = check_args()
 
             if AITER_LOG_MORE == 2:
                 from ..test_common import log_args
