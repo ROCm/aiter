@@ -76,4 +76,59 @@ def pos_bias_fn(
 
     return pos_weight
 
-def 
+
+def get_mask(N: int, mask_type: str):
+    assert mask_type in [
+        "lower_triangular",
+        "upper_triangular",
+    ]
+
+    seq= torch.arange(N)
+    seq_m = torch.unsqueeze(seq, 1)
+    seq_n = torch.unsqueeze(seq, 0)
+    mask = seq_m - seq_n
+
+    if mask_type == "lower_triangular":
+        mask = 1 if mask >= 0 else 0
+    else:
+        mask = 1 if mask <= 0 else 0
+
+    return mask
+
+
+def torch_hstu_attention_fwd(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    invalid_attn_mask_type: str,
+    num_targets: Optional[torch.Tensor],
+    attn_bias: Optional[torch.Tensor],
+    seq2_offsets: Optional[torch.Tensor],
+    max_attn_len: Optional[int],
+    contextual_seq_len: int,
+    sort_by_length_indices: Optional[torch.Tensor],
+) -> torch.Tensor:
+    seq_start = seq_offsets[0:-1]
+    seq_end = seq_offsets[1:]
+
+    out = torch.empty_like(v)
+    mask = get_mask(N, invalid_attn_mask_type)
+    for i in range(len(seq_start)):
+        in_q = q[seq_start:seq_end].permute(1, 0, 2)
+        in_k = k[seq_start:seq_end].permute(1, 0, 2)
+        in_v = v[seq_start:seq_end].permute(1, 0, 2)
+
+        qk = torch.bmm(in_q, in_k)
+        silu = qk / (torch.exp(-qk) + 1.0) / N
+        silu = silu * mask
+        qkv = torch.bmm(silu, in_v)
+        out[seq_start:seq_end] = qkv.permute(1, 0, 2)
+    
+    return out
+
+
+
+
