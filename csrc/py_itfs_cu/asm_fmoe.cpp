@@ -627,8 +627,13 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
     };
     FMoeKernel *impl_ptr = nullptr;
     int inter_dim = down.size(2);
-    int sub_X_cnt = sorted_expert_ids.size(0);
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+
+    const int token_cnt = input.size(0);
+    const int block_m = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
+    const int estimated_sub_X_cnt = (token_cnt * topk + block_m - 1) / block_m;
+
+
     if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
     {
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
@@ -649,7 +654,7 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
             {192, {"fmoe_fp8_g1u1_subGU_192_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_192_gelu_tkw1.co", 192}},
             {128, {"fmoe_fp8_g1u1_subGU_128_gelu_tkw1", "fmoe/gelu/fmoe_fp8_g1u1_subGU_128_gelu_tkw1.co", 128}}};
 
-        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
+        int selectedTile = get_heuristic_tile(inter_dim, estimated_sub_X_cnt, {512, 448, 384, 320, 256, 192, 128});
 
         std::unordered_map<int, FMoeKernelConfig> *config_map = nullptr;
         if (fc2_smooth_scale.has_value())

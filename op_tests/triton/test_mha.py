@@ -76,7 +76,7 @@ def fp8_assert_close(tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_
 
 
 @pytest.mark.parametrize('BATCH', [1,4,57,128])
-@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
+@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16), (64, 128)])
 @pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
 @pytest.mark.parametrize('HEAD_SZ', [8, 32, 128])
 @pytest.mark.parametrize('DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ',[(0.2, True, True), (0.0, False, False)])
@@ -122,10 +122,10 @@ def test_mha(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, NUM_K_H
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
         print(f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}")
 
-    torch.testing.assert_close(triton_out, torch_out,atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 @pytest.mark.parametrize('BATCH', [1,4,57,128])
-@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
+@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16), (64, 128)])
 @pytest.mark.parametrize('DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ',[(0.0, False, False), (0.2, True, True)])
 @pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
 @pytest.mark.parametrize('HEAD_SZ', [8, 32, 128])
@@ -213,7 +213,7 @@ def test_mha_varlen(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int, 
 
 
 @pytest.mark.parametrize('BATCH', [1,4,57,128])
-@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
+@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16), (64, 128)])
 @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False)])
 #@pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. fails for seq >= 64
 @pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
@@ -272,6 +272,8 @@ def test_mha_backward(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int
         torch_out = attention_ref(q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL)
     torch_out, attention_scores = torch_out
 
+    torch.testing.assert_close(triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2)
+
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
     if DEBUG_MODE:
@@ -293,7 +295,7 @@ def test_mha_backward(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEADS: int
 
 
 @pytest.mark.parametrize('BATCH', [1,4,57,128])
-@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16)])
+@pytest.mark.parametrize('SEQLEN_Q, SEQLEN_K', [(1,1), (4,4), (128,128), (2,1), (1,2), (32,16), (64, 128)])
 @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False), (0.0, True)])
 #@pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. Fails for seq >=64
 @pytest.mark.parametrize('NUM_Q_HEADS, NUM_K_HEADS', [(1,1), (16,16), (2,1), (48,8)])
@@ -383,6 +385,8 @@ def test_mha_backward_varlen(BATCH: int, SEQLEN_Q: int, SEQLEN_K: int, NUM_Q_HEA
     with torch.enable_grad():
         torch_out = attention_ref(q, k, v, query_padding_mask=query_padding_mask, key_padding_mask=key_padding_mask, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL)
     torch_out, attention_scores = torch_out
+
+    torch.testing.assert_close(triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2)
 
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 

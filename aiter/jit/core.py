@@ -11,14 +11,15 @@ import importlib
 import functools
 import traceback
 from typing import List, Optional
-from . import cpp_extension
-import torch
-from torch.utils.file_baton import FileBaton
 import logging
 import json
 import multiprocessing
 from packaging.version import parse, Version
 
+this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, f'{this_dir}/utils/')
+from cpp_extension import load, get_hip_version
+from file_baton import FileBaton
 
 def mp_lock(
     lockPath: str,
@@ -102,8 +103,8 @@ bd_dir = f"{get_user_jit_dir()}/build"
 # copy ck to build, thus hippify under bd_dir
 if multiprocessing.current_process().name == "MainProcess":
     shutil.copytree(CK_DIR, f"{bd_dir}/ck", dirs_exist_ok=True)
-    if os.path.exists(f"{bd_dir}/ck/library"):
-        shutil.rmtree(f"{bd_dir}/ck/library")
+    # if os.path.exists(f"{bd_dir}/ck/library"):
+    #     shutil.rmtree(f"{bd_dir}/ck/library")
 CK_DIR = f"{bd_dir}/ck"
 
 
@@ -162,10 +163,6 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
-def get_hip_version():
-    return parse(torch.version.hip.split()[-1].rstrip("-").replace("-", "+"))
-
-
 @functools.lru_cache()
 def check_numa():
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
@@ -199,6 +196,7 @@ def build_module(
     verbose,
     is_python_module,
     is_standalone,
+    torch_exclude,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -236,7 +234,7 @@ def build_module(
         ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
-        hip_version = get_hip_version()
+        hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
         if hip_version > Version("5.7.23302"):
             flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
@@ -280,11 +278,12 @@ def build_module(
             [f"{AITER_CSRC_DIR}/include"] + extra_include, old_bd_include_dir
         )
 
-        bd_include_dir = f"{op_dir}/build/include/torch"
-        os.makedirs(bd_include_dir, exist_ok=True)
-        rename_cpp_to_cu(
-            [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
-        )
+        if not is_standalone:
+            bd_include_dir = f"{op_dir}/build/include/torch"
+            os.makedirs(bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include/torch"] + extra_include, bd_include_dir
+            )
 
         extra_include_paths = [
             f"{CK_DIR}/include",
@@ -293,7 +292,7 @@ def build_module(
         ]
 
         try:
-            module = cpp_extension.load(
+            module = load(
                 md_name,
                 sources,
                 extra_cflags=flags_cc,
@@ -305,6 +304,7 @@ def build_module(
                 with_cuda=True,
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
+                torch_exclude=torch_exclude,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -356,6 +356,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
         "verbose": False,
         "is_python_module": True,
         "is_standalone": False,
+        "torch_exclude": False,
         "blob_gen_cmd": "",
     }
 
@@ -369,13 +370,18 @@ def get_args_of_build(ops_name: str, exclue=[]):
             if isinstance(val, list):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
+                        if "torch" in el:
+                            import torch
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
                 d_ops[k] = eval(val)
             else:
                 pass
-        return d_ops
+            
+        # undefined compile features will be replaced with default value
+        d_opt_build_args.update(d_ops)
+        return d_opt_build_args
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
@@ -425,6 +431,9 @@ def get_args_of_build(ops_name: str, exclue=[]):
 
 def compile_ops(_md_name: str, fc_name: Optional[str] = None):
     def decorator(func):
+        func.arg_checked = False
+
+        @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
             loadName = fc_name
             md_name = _md_name
@@ -454,6 +463,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 verbose = d_args["verbose"]
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
+                torch_exclude = d_args["torch_exclude"]
                 module = build_module(
                     md_name,
                     srcs,
@@ -465,12 +475,73 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     verbose,
                     is_python_module,
                     is_standalone,
+                    torch_exclude,
                 )
 
             if isinstance(module, types.ModuleType):
                 op = getattr(module, loadName)
             else:
                 return None
+
+            def check_args():
+                import inspect
+                import typing
+                import re
+                import torch
+
+                if not op.__doc__.startswith("Members:"):
+                    doc_str = op.__doc__.split("\n")[0]
+                    doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                    namespace = {
+                        "List": List,
+                        "Optional": Optional,
+                        "torch": torch,
+                    }
+                    exec(f"from aiter import*\ndef {doc_str}: pass", namespace)
+                    foo = namespace[doc_str.split("(")[0]]
+                    sig = inspect.signature(foo)
+                    func.__signature__ = sig
+                    ann = {k: v.annotation for k, v in sig.parameters.items()}
+                    ann["return"] = sig.return_annotation
+
+                    callargs = inspect.getcallargs(func, *args, **kwargs)
+                    for el, arg in callargs.items():
+                        expected_type = ann[el]
+                        origin = typing.get_origin(expected_type)
+                        sub_t = typing.get_args(expected_type)
+
+                        if origin is None:
+                            if not isinstance(arg, expected_type):
+                                raise TypeError(
+                                    f"{el} needs to be {expected_type} but got {type(arg)}"
+                                )
+                        elif origin is list:
+                            if (
+                                not isinstance(arg, list)
+                                # or not all(isinstance(i, sub_t) for i in arg)
+                            ):
+                                raise TypeError(
+                                    f"{el} needs to be List[{sub_t}] but got {arg}"
+                                )
+                        elif origin is typing.Union:
+                            if arg is not None and not isinstance(arg, sub_t):
+                                raise TypeError(
+                                    f"{el} needs to be Optional[{sub_t}] but got {arg}"
+                                )
+                        else:
+                            raise TypeError(f"Unsupported type: {expected_type}")
+
+                    func_hints = typing.get_type_hints(func)
+                    if ann["return"] is None:
+                        func_hints["return"] = None
+                    if ann != func_hints:
+                        logger.warning(
+                            f"type hints mismatch, override to --> {doc_str}"
+                        )
+                return True
+
+            if not func.arg_checked:
+                func.arg_checked = check_args()
 
             if AITER_LOG_MORE == 2:
                 from ..test_common import log_args

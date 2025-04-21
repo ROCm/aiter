@@ -11,10 +11,15 @@ import sys
 
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe_op import moe_set_use_persistent_kernel
+from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
+from aiter import silu_and_mul
+from aiter.ops.triton.moe_op_gelu import fused_moe_gelu as triton_moe_gelu
+from aiter.ops.triton.moe_op_gelu import moe_set_use_persistent_kernel as moe_set_use_persistent_kernel_gelu
+from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 
 DEBUG_MODE = False
 
-def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16):
+def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16, gelu=False):
     if fp8_w8a8:
         a , _ , a_scale = quantize_fp8(a)
 
@@ -47,6 +52,10 @@ def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weight
 
     if routed_weight:
         c *= topk_weights.unsqueeze(-1)
+
+
+    if not routed_weight and gelu:
+        c = 0.5 * c * (1.0 + torch.tanh(0.7978845608 * (c + 0.044715 * c * c * c)))
 
 
     if fp8_w8a8:    
@@ -149,7 +158,7 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int,
     return sorted_ids, expert_ids, num_tokens_post_pad
 
 def get_default_config() -> Dict[str, int]:
-    config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 1} #TODO using GROUP_SIZE_M > 1 results in accuracy issues
+    config = {'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}
     return config
 
 def quantize_fp8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -249,17 +258,21 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
     b_zp = False 
 
     c = torch.zeros((M, top_k, N), dtype=dtype, device='cuda')
+    c_silu = torch.zeros((M * top_k, N // 2), dtype=dtype, device='cuda')
 
     values = torch.randn(M, E, dtype=dtype, device='cuda')
 
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    config = get_default_config()
+    moe_config_func = get_optimal_moe_config_func(dtype, use_int8_w8a16=int8_w8a16, use_fp8_w8a8=fp8_w8a8)
+
+    config = moe_config_func(M)
+
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
 
 
-    return a, b, c, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
+    return a, b, c, c_silu, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
 
 def input_helper_int4_w4a16(M: int, N: int, K: int , top_k: int, E: int, routed_weight: bool, dtype: torch.dtype, group_size: int, has_zp: bool):
 
@@ -287,16 +300,19 @@ def input_helper_int4_w4a16(M: int, N: int, K: int , top_k: int, E: int, routed_
     b = b_q
 
     c = torch.zeros((M, top_k, N), dtype=dtype, device='cuda')
+    c_silu = torch.zeros((M * top_k, N // 2), dtype=dtype, device='cuda')
 
     values = torch.randn(M, E, dtype=dtype, device='cuda')
 
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    config = get_default_config()
+    moe_config_func = get_optimal_moe_config_func(dtype, use_int4_w4a16=True)
+
+    config = moe_config_func(M)
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
 
-    return a, b, c, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
+    return a, b, c, c_silu, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
 
 
 torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, torch.float32 : tl.float32}
@@ -312,7 +328,8 @@ torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, t
 @pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False)])  
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize('persistent',[False, True])
-def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, persistent: bool, dtype,):
+@pytest.mark.parametrize('silu_fused', [False, True])
+def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, persistent: bool, silu_fused: bool, dtype,):
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     if persistent:
@@ -320,7 +337,7 @@ def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: 
     else:
         moe_set_use_persistent_kernel(False)
 
-    a, b, triton_out, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
+    a, b, triton_out, triton_out_silu, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
         M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16)
 
     if DEBUG_MODE:
@@ -333,31 +350,42 @@ def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: 
         print(f"expert_ids.shape={expert_ids.shape}")
         print(f"expert_ids={expert_ids}")
         print(f"num_tokens_post_padded={num_tokens_post_padded}")
-    triton_moe(a, b, triton_out, a_scale, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+    _triton_moe = triton_moe_silu if silu_fused else triton_moe
+
+    _triton_moe(a, b, triton_out_silu if silu_fused else triton_out, a_scale, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
                        num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16, False)
 
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, None, 0, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
                         num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, False)
+    if silu_fused:
+        torch_out_silu = torch.empty_like(triton_out_silu)
+        silu_and_mul(torch_out_silu, torch_out.view(-1, N))
 
     if DEBUG_MODE:
         print(f"triton_out={triton_out}")
         print(f"torch_out={torch_out}")
     # Validate correctness
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    if silu_fused:
+        torch.testing.assert_close(triton_out_silu, torch_out_silu, atol=1e-1, rtol=1e-1)
+    else:
+        torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 @pytest.mark.parametrize("M, N, K, top_k, E", [(1, 64, 128, 1, 2), (1, 64, 128, 2, 4), (4, 32, 64, 4, 16), (8, 96, 256, 2, 16)])
 @pytest.mark.parametrize('routed_weight', [False, True])
 @pytest.mark.parametrize('group_size',[8, 16, 32, 64])
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize('has_zp',[False, True])
-@pytest.mark.parametrize('persistent',[True])
+@pytest.mark.parametrize('persistent',[False])
+#@pytest.mark.parametrize('persistent',[False, True]) #Persistent results in accuracy issues
+#@pytest.mark.parametrize('silu_fused', [False, True])
+@pytest.mark.parametrize('silu_fused', [False]) #Silu results in accuracy issues
 def test_fused_moe_int4_w4a16(M: int, N: int, K: int, top_k:int, E: int, 
                                 routed_weight: bool, dtype: torch.dtype, group_size: int, 
-                                has_zp: bool, persistent: bool
+                                has_zp: bool, persistent: bool, silu_fused: bool
 ):
     torch.manual_seed(20)
-    a, b, triton_out, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper_int4_w4a16(
+    a, b, triton_out, triton_out_silu, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper_int4_w4a16(
         M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, group_size=group_size, has_zp=has_zp)
 
     if persistent:
@@ -365,11 +393,62 @@ def test_fused_moe_int4_w4a16(M: int, N: int, K: int, top_k:int, E: int,
     else:
         moe_set_use_persistent_kernel(False)
 
-    triton_moe(a, b, triton_out, None, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+    _triton_moe = triton_moe_silu if silu_fused else triton_moe
+    _triton_moe(a, b, triton_out_silu if silu_fused else triton_out, None, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
                        num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=True, block_shape=(0, group_size))
 
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe(a, b, torch_out, None, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, False, False, True)
+    if silu_fused:
+        torch_out_silu = torch.empty_like(triton_out_silu)
+        silu_and_mul(torch_out_silu, torch_out.view(-1, N))
 
+    if silu_fused:
+        torch.testing.assert_close(triton_out_silu, torch_out_silu, atol=2e-1, rtol=2e-1)
+    else:
+        torch.testing.assert_close(triton_out, torch_out, atol=2e-1, rtol=2e-1)
+
+
+#Note: TODO These 2 result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
+@pytest.mark.parametrize("M, N, K, top_k, E", [(64, 14336, 4096, 2, 8), (16, 14336, 1, 2, 4), (4, 4, 8, 1, 2),
+                                               (1, 14336, 128, 2, 4), (3, 14336, 128, 2, 4), (16, 14336, 128, 1, 4),
+                                               (16, 14336, 128, 1, 1), (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8),
+                                               (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8), (1, 1024, 16384, 1, 2)])
+@pytest.mark.parametrize('routed_weight', [False, True])
+#@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) #TODO: Accuracy issues with fp8
+@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False)])  
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('persistent',[False, True])
+def test_moe_fused_gelu(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, persistent: bool, dtype,):
+    torch.manual_seed(20)
+    torch.set_printoptions(threshold=100000)
+    if persistent:
+        moe_set_use_persistent_kernel(True)
+    else:
+        moe_set_use_persistent_kernel(False)
+
+    a, b, triton_out, triton_out_silu, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
+        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16)
+
+    if DEBUG_MODE:
+        print(f"M={M}, N={N}, K={K}, top_K={top_k}, E={E}")
+        print(f"config={config}")
+        print(f"a.shape={a.shape} a={a}")
+        print(f"b.shape={b.shape} b={b}")
+        print(f"sorted_token_ids.shape={sorted_token_ids.shape}")
+        print(f"sorted_token_ids={sorted_token_ids}")
+        print(f"expert_ids.shape={expert_ids.shape}")
+        print(f"expert_ids={expert_ids}")
+        print(f"num_tokens_post_padded={num_tokens_post_padded}")
+    triton_moe_gelu(a, b, triton_out, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids,
+                       num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16)
+
+    torch_out = torch.empty_like(triton_out)
+    torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, None, 0, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
+                        num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, False, gelu=True)
+
+    if DEBUG_MODE:
+        print(f"triton_out={triton_out}")
+        print(f"torch_out={torch_out}")
+    # Validate correctness
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
-

@@ -72,17 +72,22 @@ def get_x_vals():
     return x_vals
 
 
+def generate_gemm_a8w8_inputs(M, N, K, dtype):
+    x = torch.randint(-20, 20, (M, K), dtype=torch.int8).cuda()
+    weight = torch.randint(-20, 20, (N, K), dtype=torch.int8).cuda()
+    x_scale = torch.rand([M, 1], dtype=torch.float32).cuda() + 1e-6
+    w_scale = torch.rand([1, N], dtype=torch.float32).cuda() + 1e-6
+    bias = torch.rand([1, N], dtype=dtype).cuda() * 10
+
+    return x, weight, x_scale, w_scale, bias
+
+
 @pytest.mark.parametrize(
     "dtype, m, n, k", [(dtype, *shape) for dtype in ["bf16"] for shape in get_x_vals()]
 )
 def test_gemm(dtype, m, n, k):
-    dim = (m, n, k)
     dtype = name_to_torch_types[dtype]
-    x = torch.randint(-20, 20, (m, k), dtype=torch.int8).cuda()
-    weight = torch.randint(-20, 20, (n, k), dtype=torch.int8).cuda()
-    x_scale = torch.rand([m, 1], dtype=torch.float32).cuda() + 1e-6
-    w_scale = torch.rand([1, n], dtype=torch.float32).cuda() + 1e-6
-    bias = torch.rand([1, n], dtype=dtype).cuda() * 10
+    x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(m, n, k, dtype)
 
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype)

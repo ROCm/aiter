@@ -80,7 +80,7 @@ def input_helper(M: int, E: int, top_k: int):
     values = torch.randn(M, E, dtype=torch.float16, device='cuda')
 
     softmax_vals = torch.softmax(values, dim=1)
-    _, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1) 
+    _, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
     return topk_ids
 
