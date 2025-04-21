@@ -380,10 +380,8 @@ def get_args_of_build(ops_name: str, exclue=[]):
                 pass
             
         # undefined compile features will be replaced with default value
-        for k, val in d_opt_build_args.items():
-            if k not in d_ops.keys():
-                d_ops[k] = val
-        return d_ops
+        d_opt_build_args.update(d_ops)
+        return d_opt_build_args
 
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)

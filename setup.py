@@ -22,9 +22,6 @@ from jit.utils.cpp_extension import (
     IS_HIP_EXTENSION,
 )
 
-# import torch
-
-
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
@@ -43,15 +40,9 @@ else:
 FORCE_CXX11_ABI = False
 
 if IS_ROCM:
-    # print(f"\n\ntorch.__version__  = {torch.__version__}\n\n")
-    # TORCH_MAJOR = int(torch.__version__.split(".")[0])
-    # TORCH_MINOR = int(torch.__version__.split(".")[1])
     assert os.path.exists(
         ck_dir
     ), f'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
-
-    # if FORCE_CXX11_ABI:
-    #     torch._C._GLIBCXX_USE_CXX11_ABI = True
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
         exclude_ops = ["bench_mha_fwd", "bench_mha_bwd"]
@@ -139,13 +130,3 @@ setup(
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):
     shutil.rmtree("aiter_meta")
-# if os.path.exists(bd_dir):
-#     shutil.rmtree(bd_dir)
-# if os.path.exists(blob_dir):
-#     shutil.rmtree(blob_dir)
-# if os.path.exists(f"./.eggs"):
-#     shutil.rmtree(f"./.eggs")
-# if os.path.exists(f"./{PACKAGE_NAME}.egg-info"):
-#     shutil.rmtree(f"./{PACKAGE_NAME}.egg-info")
-# if os.path.exists('./build'):
-#     shutil.rmtree(f"./build")

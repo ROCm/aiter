@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 """Constants for annotations in the mapping.
 
 The constants defined here are used to annotate the mapping tuples in cuda_to_hip_mappings.py.
