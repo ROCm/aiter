@@ -77,23 +77,16 @@ def pos_bias_fn(
     return pos_weight
 
 
-def get_mask(N: int, mask_type: str):
-    assert mask_type in [
-        "lower_triangular",
-        "upper_triangular",
-    ]
-
+def get_invalid_mask(N: int, max_attn_len: int, causal: bool):
     seq= torch.arange(N)
     seq_m = torch.unsqueeze(seq, 1)
     seq_n = torch.unsqueeze(seq, 0)
-    mask = seq_m - seq_n
+    offs_m_minus_n = seq_m - seq_n
+    invalid_mask = seq_m >= seq_n
+    if max_attn_len is not None:
+        invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
 
-    if mask_type == "lower_triangular":
-        mask = 1 if mask >= 0 else 0
-    else:
-        mask = 1 if mask <= 0 else 0
-
-    return mask
+    return invalid_mask
 
 
 def torch_hstu_attention_fwd(
@@ -103,23 +96,27 @@ def torch_hstu_attention_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
-    invalid_attn_mask_type: str,
+    causal: bool,
     num_targets: Optional[torch.Tensor],
-    attn_bias: Optional[torch.Tensor],
-    seq2_offsets: Optional[torch.Tensor],
-    max_attn_len: Optional[int],
-    contextual_seq_len: int,
+    max_attn_len: int, # None
+    contextual_seq_len: int, # false
     sort_by_length_indices: Optional[torch.Tensor],
 ) -> torch.Tensor:
     seq_start = seq_offsets[0:-1]
     seq_end = seq_offsets[1:]
+    seq_len = seq_end - seq_start
 
     out = torch.empty_like(v)
-    mask = get_mask(N, invalid_attn_mask_type)
+    mask = get_invalid_mask(N, max_attn_len, causal)
     for i in range(len(seq_start)):
         in_q = q[seq_start:seq_end].permute(1, 0, 2)
         in_k = k[seq_start:seq_end].permute(1, 0, 2)
         in_v = v[seq_start:seq_end].permute(1, 0, 2)
+        n_targets = num_targets[i] if num_targets is not None else 0
+        end = seq_len - n_targets if causal else seq_len
+        in_q[end:] = 0
+        in_k[end:] = 0
+        in_v[end:] = 0
 
         qk = torch.bmm(in_q, in_k)
         silu = qk / (torch.exp(-qk) + 1.0) / N
@@ -128,7 +125,4 @@ def torch_hstu_attention_fwd(
         out[seq_start:seq_end] = qkv.permute(1, 0, 2)
     
     return out
-
-
-
 
