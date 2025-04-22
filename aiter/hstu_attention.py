@@ -32,14 +32,14 @@ import triton.language as tl
 # )
 
 try:
-    from triton.language.extra.libdevice import fast_dividef, fast_exp  # @manual=//triton:triton
+    from triton.language.extra.libdevice import fast_dividef, fast_expf  # @manual=//triton:triton
 except ImportError:
     try:
         # @manual=//triton:triton
-        from triton.language.extra.hip.libdevice import fast_dividef, fast_exp
+        from triton.language.extra.hip.libdevice import fast_dividef, fast_expf
     except ImportError:
         # pyre-ignore[21]
-        from triton.language.math import fast_dividef, fast_exp  # @manual=//triton:triton
+        from triton.language.math import fast_dividef, fast_expf  # @manual=//triton:triton
 
 STATIC_MAX_SEQ_LENS: List[int] = []
 USE_RUNTIME_MAX_SEQ_LEN: bool = False
@@ -158,7 +158,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
             offs_m[:, None] == 0 and offs_n[None, :] < max_ids
         )
     # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
-    silu = fast_dividef(qk, 1.0 + fast_exp(-qk)) * (1.0 / MAX_SEQ_LEN)
+    silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * (1.0 / MAX_SEQ_LEN)
     silu = tl.where(invalid_mask, silu, 0)
     v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
     silu = silu.to(v.dtype)
@@ -788,7 +788,7 @@ def _get_bw_configs() -> List[triton.Config]:
     return configs
 
 
-@triton_autotune(
+@triton.autotune(
     configs=_get_bw_configs(),
     key=[
         "AUTOTUNE_Z",
@@ -1218,5 +1218,3 @@ class _AttentionFunction(torch.autograd.Function):
                 None,
                 None,
             )
-
-hstu_attention = _AttentionFunction()
