@@ -7,11 +7,11 @@ from aiter.ops.triton.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
 )
-from utils.mla_decode_ref import (
+from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,
     decode_attention_fwd_grouped,
 )
-from utils.rotary_embedding import DeepseekScalingRotaryEmbedding
+from op_tests.triton_tests.utils.rotary_embedding import DeepseekScalingRotaryEmbedding
 
 
 def input_helper(
