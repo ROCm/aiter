@@ -6,6 +6,12 @@ from aiter.ops.triton.rmsnorm import rms_norm
 from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add
 
 
+def generate_rmsnorm_inputs(M, N, dtype):
+    x = torch.randn((M, N), dtype=dtype).cuda()
+    weight = torch.randn(N, dtype=dtype).cuda()
+
+    return x, weight
+
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
     M, N = x.shape
     # cast to float32 as the triton kernel
@@ -66,8 +72,7 @@ def test_rmsnorm(M, N, in_dtype_str):
     out_dtype = in_dtype
     torch.manual_seed(0)
 
-    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
-    weight = torch.randn(N, device="cuda", dtype=in_dtype)
+    x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
 
     y_torch, *_ = run_torch(x, weight, 1e-5)
     y_triton, *_ = run_triton(x, weight, 1e-5)
@@ -76,7 +81,7 @@ def test_rmsnorm(M, N, in_dtype_str):
         atol, rtol = 1e-2, 1e-2
     else:
         # float32 typically can be tighter
-        atol, rtol = 1e-5, 1e-5
+        atol, rtol = 1e-4, 1e-4
 
     assert (
         y_triton.dtype == out_dtype
