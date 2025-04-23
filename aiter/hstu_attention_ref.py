@@ -78,13 +78,13 @@ def pos_bias_fn(
 
 
 def get_invalid_mask(N: int, max_attn_len: int, causal: bool):
-    seq= torch.arange(N)
+    seq= torch.arange(N).cuda()
     seq_m = torch.unsqueeze(seq, 1)
     seq_n = torch.unsqueeze(seq, 0)
     offs_m_minus_n = seq_m - seq_n
     invalid_mask = seq_m >= seq_n
-    if max_attn_len is not None:
-        invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+    # if max_attn_len is not None:
+    #     invalid_mask = invalid_mask and (offs_m_minus_n <= max_attn_len)
 
     return invalid_mask
 
@@ -107,22 +107,33 @@ def torch_hstu_attention_fwd(
     seq_len = seq_end - seq_start
 
     out = torch.empty_like(v)
-    mask = get_invalid_mask(N, max_attn_len, causal)
     for i in range(len(seq_start)):
-        in_q = q[seq_start:seq_end].permute(1, 0, 2)
-        in_k = k[seq_start:seq_end].permute(1, 0, 2)
-        in_v = v[seq_start:seq_end].permute(1, 0, 2)
+        ss = seq_offsets[i]
+        se = seq_offsets[i + 1]
+        ss_len = se - ss
+        mask = get_invalid_mask(ss_len, max_attn_len, causal)
+        in_q = q[ss : se].permute(1, 0, 2)
+        in_k = k[ss : se].permute(1, 0, 2)
+        in_v = v[ss : se].permute(1, 0, 2)
         n_targets = num_targets[i] if num_targets is not None else 0
-        end = seq_len - n_targets if causal else seq_len
-        in_q[end:] = 0
-        in_k[end:] = 0
-        in_v[end:] = 0
+        end = ss_len - n_targets if causal else ss_len
 
-        qk = torch.bmm(in_q, in_k)
+        if end < ss_len:
+            pad_shape = in_q.shape
+            pad_shape1 = (pad_shape[0], ss_len - end, pad_shape[2])
+            padding_0 = torch.zeros(pad_shape1, dtype=in_q.dtype, device=in_q.device)
+            tmp_q = in_q[end : ss_len]
+            in_q[:, end : ss_len, :] = padding_0
+            in_k[:, end : ss_len, :] = padding_0
+            in_v[:, end : ss_len, :] = padding_0
+
+        qk = torch.bmm(in_q, in_k.permute(0, 2, 1))
         silu = qk / (torch.exp(-qk) + 1.0) / N
+        print(f"silu.shape = {silu.shape}")
+        print(f"mask.shape = {mask.shape}")
         silu = silu * mask
         qkv = torch.bmm(silu, in_v)
-        out[seq_start:seq_end] = qkv.permute(1, 0, 2)
+        out[ss : se] = qkv.permute(1, 0, 2)
     
     return out
 
