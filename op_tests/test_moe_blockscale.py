@@ -136,7 +136,7 @@ def asm_moe_test(
     model_dim = hidden_states.shape[-1]
     topk = topk_ids.shape[-1]
     E = w1.shape[0]
-    sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out_asm = (
+    sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out_asm = (
         moe_sorting(topk_ids, topk_weights, E, model_dim, dtype)
     )
     scale_blk_n, scale_blk_k = scale_blk
@@ -146,7 +146,7 @@ def asm_moe_test(
         w1,
         w2,
         sorted_token_ids,
-        sorted_weight_buf,
+        sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
         topk,
