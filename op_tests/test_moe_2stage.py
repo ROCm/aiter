@@ -18,6 +18,7 @@ from aiter.test_common import (
 )
 from aiter.int4_utils import *
 
+from aiter.fused_moe_bf16_asm import get_block_size
 from aiter.fused_moe import (
     fused_topk,
     get_inter_dim,
@@ -106,10 +107,11 @@ def test_fmoe(
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
-    # BLOCK_SIZE_M = 128
-    # sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-    #     topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
-    # )
+    BLOCK_SIZE_M = 128
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
+    )
+
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
         w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=WQDType)
@@ -165,6 +167,7 @@ def test_fmoe(
     #     a1_scale=a1_scale,
     #     activation=actType,
     #     block_m=BLOCK_SIZE_M,
+    #     sorted_weights=sorted_weights if doweight_stage1 else None
     # )
 
     # checkAllclose(
@@ -173,34 +176,35 @@ def test_fmoe(
     #     msg=f"[perf]  ck_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     # )
 
-    # if WQDType != torch.int4:
-    #     # asm int4 2 stage not support yet
-    #     if qType == aiter.QuantType.per_Tensor:
-    #         a1_scale = a1_scale.view(1).repeat(token)
-    #         w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[-2])
+    if WQDType != torch.int4:
+        # asm int4 2 stage not support yet
+        # if qType == aiter.QuantType.per_Tensor:
+        #     # a1_scale = a1_scale.view(1).repeat(token)
+        #     w1_scale = w1_scale.view(E, 1).repeat(1, w1.shape[-2])
 
-    #     out1_asm = torch.empty((token, topk, inter_dim), dtype=dtype)
-    #     _, us = run_perftest(
-    #         asm_stage1,
-    #         a1_qt,
-    #         shuffle_weight(w1_qt, (16, 16)),
-    #         shuffle_weight(w2_qt, (16, 16)),
-    #         sorted_ids,
-    #         sorted_expert_ids,
-    #         num_valid_ids,
-    #         out1_asm,
-    #         kernelName="fmoe_stage1_bf16_pertokenFp8_g1u1_128x128_pf2",
-    #         w1_scale=w1_scale,
-    #         a1_scale=a1_scale,
-    #         activation=actType,
-    #         quant_type=qType,
-    #         block_m=BLOCK_SIZE_M,
-    #     )
-    #     checkAllclose(
-    #         out1_ref,
-    #         out1_asm,
-    #         msg=f"[perf] asm_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    #     )
+        out1_asm = torch.empty((token, topk, inter_dim), dtype=dtype)
+        _, us = run_perftest(
+            asm_stage1,
+            a1_qt,
+            shuffle_weight(w1_qt, (16, 16)),
+            shuffle_weight(w2_qt, (16, 16)),
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            out1_asm,
+            kernelName="fmoe_stage1_bf16_pertokenFp8_doweight_g1u1_128x128_pf2",
+            w1_scale=w1_scale,
+            a1_scale=a1_scale,
+            activation=actType,
+            quant_type=qType,
+            block_m=BLOCK_SIZE_M,
+            sorted_weights=sorted_weights if doweight_stage1 else None
+        )
+        checkAllclose(
+            out1_ref,
+            out1_asm,
+            msg=f"[perf] asm_moe_stage1:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        )
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_Token:
@@ -299,13 +303,13 @@ list_tokenNum = [
     163840,
 ]
 list_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
+    # (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
-    (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
-    (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
+    # (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.float8_e4m3fnuz),  # a8w8
+    # (aiter.QuantType.per_Token, torch.float8_e4m3fnuz, torch.int4),  # a8w4
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
-list_doweight_stage1 = [False, True]
+list_doweight_stage1 = [True]
 expert, topk = 8, 2
 
 import pandas as pd
