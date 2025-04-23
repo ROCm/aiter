@@ -267,20 +267,7 @@ def test_hstu_attention(
         max_attn_len=None,
         contextual_seq_len=0,
     )
-    fn = lambda: _AttentionFunction.apply(
-        max_seq_len,
-        alpha,
-        q,
-        k,
-        v,
-        seq_offsets,
-        causal,
-        num_targets,
-        0,  # max_attn_len,
-        0,  # contextual_seq_len
-        True,  # sort_by_length,
-    )
-    # fn_ref = lambda: torch_hstu_attention_fwd(
+    # fn = lambda: _AttentionFunction.apply(
     #     max_seq_len,
     #     alpha,
     #     q,
@@ -289,13 +276,25 @@ def test_hstu_attention(
     #     seq_offsets,
     #     causal,
     #     num_targets,
-    #     None,
-    #     0,
-    #     True,
+    #     0,  # max_attn_len,
+    #     0,  # contextual_seq_len
+    #     True,  # sort_by_length,
     # )
+    fn_ref = lambda: torch_hstu_attention_fwd(
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        causal,
+        num_targets,
+        None,
+        0,
+        True,
+    )
 
     # out = fn() * max_seq_len
-    out = fn()
-    print(f"out = {out}")
-    # out_ref = fn_ref() * max_seq_len
+    out_ref = fn_ref() * max_seq_len
+    print(f"out_ref = {out_ref}")
     # torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=0)
