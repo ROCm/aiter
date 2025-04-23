@@ -272,13 +272,13 @@ def _attn_fwd_inner(
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
             qk += tl.dot(q, k)
-        qk_scaled = qk * SM_SCALE
+
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask and causal_mask
 
-        qk_scaled = tl.where(mask, qk_scaled, float("-inf"))
+        qk = tl.where(mask, qk, float("-inf"))
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -287,15 +287,16 @@ def _attn_fwd_inner(
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, global_m_positions, global_n_positions
             )
-            qk_scaled += alibi_block
+            qk += alibi_block / SM_SCALE
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
 
         # scale and subtract max
-        q_shifted = qk_scaled - m_ij[:, None]
+        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
 
         # Compute scaled QK and softmax probabilities
-        p = tl.math.exp2(q_shifted * RCP_LN2)
+        p = tl.math.exp2(q_shifted)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -319,8 +320,8 @@ def _attn_fwd_inner(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = m_i - m_ij
-        alpha = tl.math.exp2(m_diff * RCP_LN2)
+        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
+        alpha = tl.math.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
         v = load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         # -- update m_i and l_i
@@ -803,7 +804,8 @@ def _attn_fwd(
         RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
-        mi_base2 = m_i * RCP_LN2
+        # mi_base2 = m_i * RCP_LN2
+        mi_base2 = m_i * RCP_LN2 * sm_scale
         softmax_lse = mi_base2 + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
@@ -974,9 +976,9 @@ def _flash_attn_forward(
             "num_stages": 1,
         }
 
-    grid = lambda META: ( # noqa: E731
+    grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
-    )  
+    )
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     _attn_fwd[grid](
