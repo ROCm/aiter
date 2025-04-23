@@ -1,23 +1,22 @@
 # mha benchmark
 
-This folder contains benchmark scripts for mha_fwd and mha_bwd. The implementation are ported from ck.
+This folder contains benchmark scripts for mha_fwd and mha_bwd.
 
 Current unsupported features:
-* `bench_mha_fwd` vlayout col_major
-* `bench_mha_fwd` appendkv
+* `benchmark_mha_fwd` vlayout col_major
+* `benchmark_mha_fwd` appendkv
 
-## build
-Make sure `aiter` has been installed, then run this command under this folder:
+## build and run
+This build method is independent from aiter and torch. By running
 ```
 bash build_mha.sh
 ```
-This will result in executables `bench_mha_fwd` and `bench_mha_bwd` in this folder, or you can just run
-```
-python3 -c "import aiter; aiter.compile_bench_mha_fwd()"
-python3 -c "import aiter; aiter.compile_bench_mha_bwd()"
-```
-to build the executable separately.
+This will result in executables `benchmark_mha_fwd` and `benchmark_mha_bwd` in this folder. You can type `./benchmark_mha_fwd -?` to list all the arguments.
 
-## run
-You can type `./bench_mha_fwd -?` to list all the arguments.
-Or you can just run the smoke test to check the integrity of your executable by `bash smoke_test_fwd.sh`
+To validate the integrity of the executable, we also provide `smoke_test` scripts.
+
+One possible way to integrate aiter::mha into your project is to 
+```
+python3 compile.py
+```
+to build `libmha_fwd.so` and `libmha_bwd.so` and link them into your project.

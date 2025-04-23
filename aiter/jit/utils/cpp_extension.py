@@ -38,10 +38,6 @@ CLIB_PREFIX = '' if IS_WINDOWS else 'lib'
 CLIB_EXT = '.dll' if IS_WINDOWS else '.so'
 SHARED_FLAG = '/DLL' if IS_WINDOWS else '-shared'
 
-import torch
-_TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
-TORCH_LIB_PATH = os.path.join(_TORCH_PATH, 'lib')
-
 SUBPROCESS_DECODE_ARGS = ('oem',) if IS_WINDOWS else ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
@@ -1009,7 +1005,8 @@ def include_paths(cuda: bool = False) -> List[str]:
     Returns:
         A list of include path strings.
     """
-    lib_include = os.path.join(_TORCH_PATH, 'include')
+    import torch
+    lib_include = os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'include')
     paths = [
         lib_include,
         # Remove this once torch/torch.h is officially no longer supported for C++ extensions.
@@ -1036,7 +1033,8 @@ def library_paths(cuda: bool = False) -> List[str]:
         A list of library path strings.
     """
     # We need to link against libtorch.so
-    paths = [TORCH_LIB_PATH]
+    import torch
+    paths = [os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib')]
 
     if cuda and IS_HIP_EXTENSION:
         lib_dir = 'lib'
@@ -1207,9 +1205,9 @@ def remove_extension_h_precompiler_headers():
     def _remove_if_file_exists(path_file):
         if os.path.exists(path_file):
             os.remove(path_file)
-
-    head_file_pch = os.path.join(_TORCH_PATH, 'include', 'torch', 'extension.h.gch')
-    head_file_signature = os.path.join(_TORCH_PATH, 'include', 'torch', 'extension.h.sign')
+    import torch
+    head_file_pch = os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'include', 'torch', 'extension.h.gch')
+    head_file_signature = os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'include', 'torch', 'extension.h.sign')
 
     _remove_if_file_exists(head_file_pch)
     _remove_if_file_exists(head_file_signature)
@@ -1256,6 +1254,10 @@ def _jit_compile(name,
             if version != old_version:
                 with GeneratedFileCleaner(keep_intermediates=keep_intermediates) as clean_ctx:
                     if IS_HIP_EXTENSION and with_cuda:
+                        torch_path = ""
+                        if not torch_exclude:
+                            import torch
+                            torch_path = os.path.join(os.path.join(os.path.dirname(torch.__file__)), "*")
                         hipify_result = hipify_python.hipify(
                             project_directory=build_directory,
                             output_directory=build_directory,
@@ -1267,7 +1269,7 @@ def _jit_compile(name,
                             extra_files=[os.path.abspath(s) for s in sources],
                             ignores=[
                                 _join_rocm_home("*"),
-                                os.path.join("") if torch_exclude else os.path.join(_TORCH_PATH, "*"),
+                                torch_path,
                             ],  # no need to hipify ROCm or PyTorch headers
                             show_detailed=verbose,
                             show_progress=verbose,
@@ -1307,13 +1309,21 @@ def _jit_compile(name,
     if verbose:
         print(f'Loading extension module {name}...', file=sys.stderr)
 
-    if is_standalone:
-        if torch_exclude:
-            return os.path.join(build_directory, f'{name}{EXEC_EXT}')
-        else:
+    # if is_standalone:
+    #     if torch_exclude:
+    #         return os.path.join(build_directory, f'{name}{EXEC_EXT}')
+    #     else:
+    #         return _get_exec_path(name, build_directory)
+    # if is_python_module:
+    #     return _import_module_from_library(name, build_directory, is_python_module)
+    
+    if torch_exclude:
+        return os.path.join(build_directory, f'{name}{EXEC_EXT}')
+    else:
+        if is_standalone:
             return _get_exec_path(name, build_directory)
-
-    return _import_module_from_library(name, build_directory, is_python_module)
+        else:
+            return _import_module_from_library(name, build_directory, is_python_module)
 
 
 def _write_ninja_file_and_compile_objects(
@@ -1428,6 +1438,7 @@ def verify_ninja_availability():
 
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
     if not torch_exclude:
+        import torch
         if IS_WINDOWS:
             python_lib_path = os.path.join(sys.base_exec_prefix, 'libs')
 
@@ -1441,13 +1452,13 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
                 # Related issue: https://github.com/pytorch/pytorch/issues/31611
                 extra_ldflags.append('-INCLUDE:?warp_size@cuda@at@@YAHXZ')
             extra_ldflags.append('torch.lib')
-            extra_ldflags.append(f'/LIBPATH:{TORCH_LIB_PATH}')
+            extra_ldflags.append(f'/LIBPATH:{os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib')}')
             if not is_standalone:
                 extra_ldflags.append('torch_python.lib')
                 extra_ldflags.append(f'/LIBPATH:{python_lib_path}')
 
         else:
-            extra_ldflags.append(f'-L{TORCH_LIB_PATH}')
+            extra_ldflags.append(f'-L{os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib')}')
             extra_ldflags.append('-lc10')
             if with_cuda:
                 extra_ldflags.append('-lc10_hip' if IS_HIP_EXTENSION else '-lc10_cuda')
@@ -1459,7 +1470,7 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
                 extra_ldflags.append('-ltorch_python')
 
             if is_standalone:
-                extra_ldflags.append(f"-Wl,-rpath,{TORCH_LIB_PATH}")
+                extra_ldflags.append(f"-Wl,-rpath,{os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib')}")
 
     if with_cuda and IS_HIP_EXTENSION:
         if verbose:
@@ -1663,13 +1674,14 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
 
 
 def _get_exec_path(module_name, path):
-    if IS_WINDOWS and TORCH_LIB_PATH not in os.getenv('PATH', '').split(';'):
+    import torch
+    if IS_WINDOWS and os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib') not in os.getenv('PATH', '').split(';'):
         torch_lib_in_path = any(
-            os.path.exists(p) and os.path.samefile(p, TORCH_LIB_PATH)
+            os.path.exists(p) and os.path.samefile(p, os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib'))
             for p in os.getenv('PATH', '').split(';')
         )
         if not torch_lib_in_path:
-            os.environ['PATH'] = f"{TORCH_LIB_PATH};{os.getenv('PATH', '')}"
+            os.environ['PATH'] = f"{os.path.join(os.path.join(os.path.dirname(torch.__file__)), 'lib')};{os.getenv('PATH', '')}"
     return os.path.join(path, f'{module_name}{EXEC_EXT}')
 
 
@@ -1724,7 +1736,7 @@ def _write_ninja_file_to_build_library(path,
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
     common_cflags = []
-    if not is_standalone or not torch_exclude:
+    if not torch_exclude:
         common_cflags.append(f'-DTORCH_EXTENSION_NAME={name}')
         common_cflags.append('-DTORCH_API_INCLUDE_EXTENSION_H')
         common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]

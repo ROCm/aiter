@@ -565,10 +565,8 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
-    "bench_mha_fwd": {
-        "srcs": [
-            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_fwd.cpp'"
-        ],
+    "libmha_fwd": {
+        "srcs": [],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -581,7 +579,7 @@
         ],
         "verbose": "False",
         "is_python_module": "False",
-        "is_standalone": "True",
+        "is_standalone": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
@@ -589,13 +587,10 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
-    "bench_mha_bwd": {
-        "srcs": [
-            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_bwd.cpp'"
-        ],
+    "libmha_bwd": {
+        "srcs": [],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
             "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
         ],
         "extra_ldflags": "None",
@@ -604,7 +599,7 @@
         ],
         "verbose": "False",
         "is_python_module": "False",
-        "is_standalone": "True",
+        "is_standalone": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
