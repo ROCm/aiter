@@ -30,7 +30,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.api == "fwd":
-        print(";;;")
         compile_mha_fwd()
     elif args.api == "bwd":
         compile_mha_bwd()
