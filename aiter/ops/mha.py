@@ -995,7 +995,7 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_fp16_a32_psskddv_group
         # bwd_hd128_fp16_causal_a32_psskddv_group
         ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q > 64 or hdim_q < 128
+        ret &= hdim_q > 64 and hdim_q < 128
         ret &= nmask # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
