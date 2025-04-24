@@ -471,7 +471,7 @@ def _flash_attn_backward(
         # bwd_hd192_bf16_causal_a32_rtna_psskddv
         # bwd_hd192_bf16_causal_a32_rtz_psskddv
         ret = is_v3_atomic_fp32 == True
-        ret &= (hdim_q > 64 and hdim_q < 128) or (hdim_q > 128 and hdim_q <= 192)
+        ret &= hdim_q > 64 and hdim_q <= 192
         ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
