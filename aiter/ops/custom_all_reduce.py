@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor
+import torch
 from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR, AITER_CORE_DIR
+from ..jit.core import (
+    compile_ops,
+    CK_DIR,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    AITER_CORE_DIR,
+)
 import torch.nn.functional as F
 
 MD_NAME = "module_custom_all_reduce"
@@ -11,47 +17,66 @@ MD_NAME = "module_custom_all_reduce"
 
 @compile_ops("module_custom_all_reduce")
 def init_custom_ar(
-    out: Tensor, exp_sums: Tensor, handles, offsets, rank: int, full_nvlink: bool
+    meta: torch.Tensor,
+    rank_data: torch.Tensor,
+    handles: list[str],
+    offsets: list[int],
+    rank: int,
+    full_nvlink: bool,
 ) -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_reg(_fa: int, inp: Tensor, out: Tensor): ...
+def all_reduce_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor): ...
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_unreg(_fa: int, inp: Tensor,
-                     reg_buffer: Tensor, out: Tensor): ...
+def all_reduce_unreg(
+    _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
+): ...
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_asm_(inp: Tensor,
-                    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> Tensor: ...
+def all_reduce_asm_(
+    inp: torch.Tensor,
+    ca: int,
+    reg_sig: torch.Tensor,
+    reg_buffer: torch.Tensor,
+    isGraph: bool,
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_reduce_rmsnorm_(
-    input: Tensor,
-    residual_in: Tensor,
-    weight: Tensor,
-    bias: Tensor,
+    input: torch.Tensor,
+    residual_in: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
     epsilon: float,
-    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> List[Tensor]: ...
+    ca: int,
+    reg_sig: torch.Tensor,
+    reg_buffer: torch.Tensor,
+    isGraph: bool,
+) -> List[torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_reduce_rmsnorm_quant_(
-    input: Tensor,
-    residual_in: Tensor,
-    weight: Tensor,
-    xscale: Tensor,
-    bias: Tensor,
+    input: torch.Tensor,
+    residual_in: torch.Tensor,
+    weight: torch.Tensor,
+    xscale: torch.Tensor,
+    bias: torch.Tensor,
     epsilon: float,
-    ca: int, reg_sig: Tensor, reg_buffer: Tensor, isGraph: bool) -> List[Tensor]: ...
+    ca: int,
+    reg_sig: torch.Tensor,
+    reg_buffer: torch.Tensor,
+    isGraph: bool,
+) -> List[torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def dispose(_fa: int, inp: Tensor, out: Tensor): ...
+def dispose(_fa: int): ...
 
 
 @compile_ops("module_custom_all_reduce")
@@ -59,20 +84,22 @@ def meta_size() -> int: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def register_buffer(_fa: int, t: Tensor, handles, offsets): ...
+def register_buffer(
+    _fa: int, t: torch.Tensor, handles: list[str], offsets: list[int]
+): ...
 
 
 @compile_ops("module_custom_all_reduce")
-def get_graph_buffer_ipc_meta(_fa: int): ...
+def get_graph_buffer_ipc_meta(_fa: int) -> tuple[torch.Tensor, list[int]]: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def register_graph_buffers(_fa: int, handles, offsets): ...
+def register_graph_buffers(_fa: int, handles: list[str], offsets: list[list[int]]): ...
 
 
 @compile_ops("module_custom_all_reduce")
-def allocate_meta_buffer(size: int) -> Tensor: ...
+def allocate_meta_buffer(size: int) -> torch.Tensor: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def get_meta_buffer_ipc_handle(inp: Tensor) -> Tensor: ...
+def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor: ...

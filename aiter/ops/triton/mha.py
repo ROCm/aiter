@@ -221,17 +221,24 @@ def _attn_fwd_inner(
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
         # TODO: This can be optimized to only be true for the padded block.
+        mask = tl.full([BLOCK_M, BLOCK_N], True, dtype=tl.int1)
         if MASK_STEPS:
             # If this is the last block / iteration, we want to
             # mask if the sequence length is not a multiple of block size
             # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
             # last step might get wasted but that is okay. check if this masking works For
             # that case.
-            if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
-                boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
-                size_n = start_n + OFFS_N[None, :]
-                mask = size_n < boundary_m[:, None]
-                qk = tl.where(mask, qk, float("-inf"))
+
+            # remove the old if condition
+            # if (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0):
+            # Though this will unconditionally compute mask_partial at runtime,
+            # the causal for loop does not have the if-else block any more, which
+            # helps instruction scheduling and register pressure.
+            bound_cond = (start_n + BLOCK_N == block_max) and (n_extra_tokens != 0)
+            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
+            size_n = start_n + OFFS_N[None, :]
+            mask_partial = size_n < boundary_m[:, None]
+            mask = tl.where(bound_cond, mask_partial, mask)
 
         # compute masks
         q_mask = (OFFS_M[:, None] < seqlen_q)
@@ -243,11 +250,13 @@ def _attn_fwd_inner(
             qk += (tl.dot(q, k) * descale_q * descale_k)
         else:
             qk += tl.dot(q, k)
-        qk_scaled =  qk * SM_SCALE
+
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
-            qk_scaled = tl.where(causal_mask, qk_scaled, float("-inf"))
+            mask = mask and causal_mask
+
+        qk = tl.where(mask, qk, float("-inf"))
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -255,15 +264,16 @@ def _attn_fwd_inner(
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
             alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, global_m_positions,
                                               global_n_positions)
-            qk_scaled += alibi_block
+            qk += alibi_block / SM_SCALE
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
 
         # scale and subtract max
-        q_shifted = qk_scaled - m_ij[:, None]
-        
+        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
+
         # Compute scaled QK and softmax probabilities
-        p = tl.math.exp2(q_shifted * RCP_LN2)
+        p = tl.math.exp2(q_shifted)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -281,12 +291,12 @@ def _attn_fwd_inner(
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             tl.store(sd_mask_ptrs, p, mask=p_mask)
-        
+
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = m_i - m_ij
-        alpha = tl.math.exp2(m_diff * RCP_LN2)
+        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
+        alpha = tl.math.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
         v = load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         # -- update m_i and l_i

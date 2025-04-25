@@ -20,11 +20,11 @@ import torch
 from setuptools import setup
 aiter_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, f'{aiter_dir}/aiter/')
-from jit.cpp_extension import (
+from jit.utils.cpp_extension import (
     BuildExtension,
     CUDAExtension,
 )
-from torch.utils.hipify import hipify_python
+from jit.utils.hipify import hipify_python
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 #gpus = subprocess.check_output("/opt/rocm/bin/rocminfo").decode(
@@ -38,7 +38,7 @@ extra_args = ["--offload-arch=" + g for g in gpus]
 #sets_rocm_pytorch = False
 maj_ver, min_ver, *_ = torch.__version__.split('.')
 if int(maj_ver) > 1 or (int(maj_ver) == 1 and int(min_ver) >= 5):
-    from jit.cpp_extension import ROCM_HOME
+    from jit.utils.cpp_extension import ROCM_HOME
     is_rocm_pytorch = bool(torch.version.hip is not None
                            and ROCM_HOME is not None)
 

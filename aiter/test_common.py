@@ -18,20 +18,23 @@ def perftest(
             num = num_rotate_args
             if num < 1:
                 gpu_id = torch.cuda.current_device()
-                inputSize = (
-                    sum([el.nbytes for el in args if isinstance(el, torch.Tensor)]) + 1
-                )
+
+                iter_used_memory, inputSize, _, _ = device_memory_profiling(func, *args, **kwargs)
+
                 properties = torch.cuda.get_device_properties(gpu_id)
+                free_memory = torch.cuda.mem_get_info(gpu_id)[0]
                 cache_size = min(
                     properties.L2_cache_size * 64 * 128,
-                    properties.total_memory - inputSize,
+                    (free_memory - iter_used_memory + inputSize) * 0.9,
                 )
-                num = (cache_size + inputSize - 1) // inputSize
+                cache_size = max(cache_size, 0)
+                num = int((cache_size + inputSize - 1) // inputSize)
+                # print(f"{iter_used_memory=}, {inputSize=}, {cache_size=}, {free_memory=}, {num=}")
             num = min(num, num_iters)
 
-            rotate_args = [
-                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num)
-            ]
+            rotate_args =[
+                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num-1)
+            ] +  [(args, kwargs)]
 
             run_iters(num_warmup, func, *args, **kwargs)
             if int(os.environ.get("AITER_LOG_MORE", 0)):
@@ -95,6 +98,40 @@ def benchmark():
         return wrapper
 
     return decorator
+
+
+def device_memory_profiling(func, *args, **kwargs):
+    gpu_id = torch.cuda.current_device()
+    inputSize = (
+        sum([el.nbytes for el in args if isinstance(el, torch.Tensor) and el.device.index == gpu_id]) + 1
+    )
+    torch.cuda.reset_peak_memory_stats(gpu_id)
+    cuda_memory_before = (
+        torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
+    )
+    torch_memory_before = torch.cuda.memory_reserved(gpu_id)
+    torch_peak_before = torch.cuda.memory_stats(gpu_id).get(
+        "allocated_bytes.all.peak", 0
+    )
+    non_torch_memory_before = cuda_memory_before - torch_memory_before
+
+    data = func(*args, **kwargs)
+
+    torch.cuda.reset_peak_memory_stats(gpu_id)
+    cuda_memory_after = (
+        torch.cuda.mem_get_info(gpu_id)[1] - torch.cuda.mem_get_info(gpu_id)[0]
+    )
+    torch_memory_after = torch.cuda.memory_reserved(gpu_id)
+    torch_peak_after = torch.cuda.memory_stats(gpu_id).get(
+        "allocated_bytes.all.peak", 0
+    )
+    non_torch_memory_after = cuda_memory_after - torch_memory_after
+
+    torch_peak_increase = torch_peak_after - torch_peak_before
+    non_torch_increase = non_torch_memory_after - non_torch_memory_before
+    iter_used_memory = torch_peak_increase + non_torch_increase + inputSize
+
+    return iter_used_memory, inputSize, torch_peak_increase, non_torch_increase
 
 
 def run_iters(num_iters, func, *args, **kwargs):
@@ -225,7 +262,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = (~isClose).to("cpu")
     if isClose.all():
-        logger.info(f"{msg}[checkAllclose {atol=} {rtol=} passed~]")
+        logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
         return 0
     else:
         num = mask.sum()
@@ -236,7 +273,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
         delta = (a_msked - b_msked).abs()
         if percent > 0.01:
             logger.info(
-                f"""{msg}[checkAllclose {atol=} {rtol=} failed!]
+                f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
@@ -246,7 +283,7 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
             )
         else:
             logger.info(
-                f"""{msg}[checkAllclose {atol=} {rtol=} waring!] a and b results are not all close"""
+                f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
             )
         logger.info(
             f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"

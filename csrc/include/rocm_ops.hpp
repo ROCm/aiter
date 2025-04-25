@@ -19,26 +19,28 @@
       m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid.");                     \
       m.def("tanh", &aiter_tanh, "apply for tanh.");
 
-#define ATTENTION_ASM_MLA_PYBIND                                                \
-      m.def("mla_stage1_asm_fwd", &mla_stage1_asm_fwd, "mla_stage1_asm_fwd",    \
-            py::arg("Q"),                                                       \
-            py::arg("KV"),                                                      \
-            py::arg("kv_indptr"),                                               \
-            py::arg("kv_page_indices"),                                         \
-            py::arg("kv_last_page_lens"),                                       \
-            py::arg("softmax_scale"),                                           \
-            py::arg("splitData"),                                               \
-            py::arg("splitLse"));                                               \
-      m.def("mla_prefill_asm_fwd", &mla_prefill_asm_fwd, "mla_prefill_asm_fwd", \
-            py::arg("Q"),                                                       \
-            py::arg("KV"),                                                      \
-            py::arg("qo_indptr"),                                               \
-            py::arg("kv_indptr"),                                               \
-            py::arg("kv_page_indices"),                                         \
-            py::arg("kv_last_page_lens"),                                       \
-            py::arg("max_seqlen_q"),                                            \
-            py::arg("softmax_scale"),                                           \
-            py::arg("splitData"),                                               \
+#define ATTENTION_ASM_MLA_PYBIND                                                                  \
+      m.def("mla_decode_stage1_asm_fwd", &mla_decode_stage1_asm_fwd, "mla_decode_stage1_asm_fwd", \
+            py::arg("Q"),                                                                         \
+            py::arg("KV"),                                                                        \
+            py::arg("qo_indptr"),                                                                 \
+            py::arg("kv_indptr"),                                                                 \
+            py::arg("kv_page_indices"),                                                           \
+            py::arg("kv_last_page_lens"),                                                         \
+            py::arg("max_seqlen_q"),                                                              \
+            py::arg("softmax_scale"),                                                             \
+            py::arg("splitData"),                                                                 \
+            py::arg("splitLse"));                                                                 \
+      m.def("mla_prefill_asm_fwd", &mla_prefill_asm_fwd, "mla_prefill_asm_fwd",                   \
+            py::arg("Q"),                                                                         \
+            py::arg("KV"),                                                                        \
+            py::arg("qo_indptr"),                                                                 \
+            py::arg("kv_indptr"),                                                                 \
+            py::arg("kv_page_indices"),                                                           \
+            py::arg("kv_last_page_lens"),                                                         \
+            py::arg("max_seqlen_q"),                                                              \
+            py::arg("softmax_scale"),                                                             \
+            py::arg("splitData"),                                                                 \
             py::arg("splitLse"));
 
 #define ATTENTION_ASM_PYBIND                    \
@@ -143,28 +145,32 @@
             "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "                 \
             "str kv_cache_dtype) -> ()");
 
-#define CUSTOM_ALL_REDUCE_PYBIND                                                                         \
-      m.def("init_custom_ar", &init_custom_ar,                                                           \
-            "init_custom_ar(Tensor meta, Tensor rank_data, "                                             \
-            "str[] handles, int[] offsets, int rank, "                                                   \
-            "bool full_nvlink) -> int");                                                                 \
-                                                                                                         \
-      m.def("all_reduce_reg", &all_reduce_reg, "all_reduce_reg(int fa, Tensor inp, Tensor! out) -> ()"); \
-      m.def("all_reduce_unreg", &all_reduce_unreg,                                                       \
-            "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> "                   \
-            "()");                                                                                       \
-      m.def("all_reduce_asm_", &all_reduce_asm, "");                                                     \
-      m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                           \
-      m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant");         \
-      m.def("dispose", &dispose);                                                                        \
-      m.def("meta_size", &meta_size);                                                                    \
-      m.def("register_buffer", &register_buffer,                                                         \
-            "register_buffer(int fa, Tensor t, str[] handles, "                                          \
-            "int[] offsets) -> ()");                                                                     \
-      m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);                                    \
-      m.def("register_graph_buffers", &register_graph_buffers);                                          \
-      m.def("allocate_meta_buffer", &allocate_meta_buffer);                                              \
-      m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
+#define CUSTOM_ALL_REDUCE_PYBIND                                                                        \
+      m.def("init_custom_ar", &init_custom_ar,                                                          \
+            "init_custom_ar(Tensor meta, Tensor rank_data, "                                            \
+            "str[] handles, int[] offsets, int rank, "                                                  \
+            "bool full_nvlink) -> int",                                                                 \
+            py::arg("meta"), py::arg("rank_data"),                                                      \
+            py::arg("handles"), py::arg("offsets"),                                                     \
+            py::arg("rank"), py::arg("full_nvlink"));                                                   \
+      m.def("all_reduce_reg", &all_reduce_reg, "all_reduce_reg(int fa, Tensor inp, Tensor! out) -> ()", \
+            py::arg("_fa"), py::arg("inp"), py::arg("out"));                                            \
+      m.def("all_reduce_unreg", &all_reduce_unreg,                                                      \
+            "all_reduce_unreg(int fa, Tensor inp, Tensor reg_buffer, Tensor! out) -> ()",               \
+            py::arg("_fa"), py::arg("inp"), py::arg("reg_buffer"), py::arg("out"));                     \
+      m.def("all_reduce_asm_", &all_reduce_asm, "");                                                    \
+      m.def("all_reduce_rmsnorm_", &all_reduce_rmsnorm, "all_reduce_rmsnorm");                          \
+      m.def("all_reduce_rmsnorm_quant_", &all_reduce_rmsnorm_quant, "all_reduce_rmsnorm_quant");        \
+      m.def("dispose", &dispose, py::arg("_fa"));                                                       \
+      m.def("meta_size", &meta_size);                                                                   \
+      m.def("register_buffer", &register_buffer,                                                        \
+            "register_buffer(int fa, Tensor t, str[] handles, int[] offsets) -> ()",                    \
+            py::arg("_fa"), py::arg("t"), py::arg("handles"), py::arg("offsets"));                      \
+      m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta, py::arg("_fa"));                   \
+      m.def("register_graph_buffers", &register_graph_buffers,                                          \
+            py::arg("_fa"), py::arg("handles"), py::arg("offsets"));                                    \
+      m.def("allocate_meta_buffer", &allocate_meta_buffer, py::arg("size"));                            \
+      m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle, py::arg("inp"));
 
 #define CUSTOM_PYBIND                                                                                 \
       m.def("wvSpltK", &wvSpltK, "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"         \
@@ -329,33 +335,34 @@
             py::arg("alibi_slopes") = std::nullopt,               \
             py::arg("gen") = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                   \
-      m.def("ck_moe_stage1", &ck_moe_stage1,    \
-            py::arg("hidden_states"),           \
-            py::arg("w1"),                      \
-            py::arg("w2"),                      \
-            py::arg("sorted_token_ids"),        \
-            py::arg("sorted_expert_ids"),       \
-            py::arg("num_valid_ids"),           \
-            py::arg("out"),                     \
-            py::arg("topk"),                    \
-            py::arg("w1_scale") = std::nullopt, \
-            py::arg("a1_scale") = std::nullopt, \
-            py::arg("block_m") = 32);           \
-                                                \
-      m.def("ck_moe_stage2", &ck_moe_stage2,    \
-            py::arg("inter_states"),            \
-            py::arg("w1"),                      \
-            py::arg("w2"),                      \
-            py::arg("sorted_token_ids"),        \
-            py::arg("sorted_expert_ids"),       \
-            py::arg("sorted_weights"),          \
-            py::arg("num_valid_ids"),           \
-            py::arg("out"),                     \
-            py::arg("topk"),                    \
-            py::arg("w2_scale") = std::nullopt, \
-            py::arg("a2_scale") = std::nullopt, \
-            py::arg("block_m") = 32);
+#define MOE_CK_2STAGES_PYBIND                          \
+      m.def("ck_moe_stage1", &ck_moe_stage1,           \
+            py::arg("hidden_states"),                  \
+            py::arg("w1"),                             \
+            py::arg("w2"),                             \
+            py::arg("sorted_token_ids"),               \
+            py::arg("sorted_expert_ids"),              \
+            py::arg("num_valid_ids"),                  \
+            py::arg("out"),                            \
+            py::arg("topk"),                           \
+            py::arg("w1_scale") = std::nullopt,        \
+            py::arg("a1_scale") = std::nullopt,        \
+            py::arg("block_m") = 32,                   \
+            py::arg("sorted_weights") = std::nullopt); \
+                                                       \
+      m.def("ck_moe_stage2", &ck_moe_stage2,           \
+            py::arg("inter_states"),                   \
+            py::arg("w1"),                             \
+            py::arg("w2"),                             \
+            py::arg("sorted_token_ids"),               \
+            py::arg("sorted_expert_ids"),              \
+            py::arg("num_valid_ids"),                  \
+            py::arg("out"),                            \
+            py::arg("topk"),                           \
+            py::arg("w2_scale") = std::nullopt,        \
+            py::arg("a2_scale") = std::nullopt,        \
+            py::arg("block_m") = 32,                   \
+            py::arg("sorted_weights") = std::nullopt); \
 
 #define MOE_CK_PYBIND                                                               \
       m.def("ck_moe", &ck_moe,                                                      \
@@ -390,7 +397,7 @@
       m.def("fmoe_int8_g1u0", &fmoe_int8_g1u0,                                   \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
@@ -399,7 +406,7 @@
       m.def("fmoe_g1u1", &fmoe_g1u1,                                             \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
@@ -408,7 +415,7 @@
       m.def("fmoe_g1u1_tkw1", &fmoe_g1u1_tkw1,                                   \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"), py::arg("input_scale"),                             \
             py::arg("fc1_scale"), py::arg("fc2_scale"),                          \
@@ -419,7 +426,7 @@
       m.def("fmoe_fp8_blockscale_g1u1", &fmoe_fp8_blockscale_g1u1,               \
             py::arg("out"), py::arg("input"),                                    \
             py::arg("gate"), py::arg("down"),                                    \
-            py::arg("sorted_token_ids"), py::arg("sorted_weight_buf"),           \
+            py::arg("sorted_token_ids"), py::arg("sorted_weights"),              \
             py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),              \
             py::arg("topk"),                                                     \
             py::arg("input_scale"),                                              \
@@ -440,7 +447,8 @@
             py::arg("activation") = ActivationType::Silu,                        \
             py::arg("quant_type") = QuantType::No,                               \
             py::arg("a1_scale") = std::nullopt,                                  \
-            py::arg("w1_scale") = std::nullopt);                                 \
+            py::arg("w1_scale") = std::nullopt,                                  \
+            py::arg("sorted_weights") = std::nullopt);                           \
       m.def("moe_sum", &moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
 #define MOE_SORTING_PYBIND                                          \
@@ -553,14 +561,14 @@
       m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
 #define AITER_ENUM_PYBIND                               \
-      py::enum_<QuantType>(m, "QuantType")              \
+      pybind11::enum_<QuantType>(m, "QuantType")              \
           .value("No", QuantType::No)                   \
           .value("per_Tensor", QuantType::per_Tensor)   \
           .value("per_Token", QuantType::per_Token)     \
           .value("per_1x128", QuantType::per_1x128)     \
           .value("per_128x128", QuantType::per_128x128) \
           .export_values();                             \
-      py::enum_<ActivationType>(m, "ActivationType")    \
+      pybind11::enum_<ActivationType>(m, "ActivationType")    \
           .value("No", ActivationType::No)              \
           .value("Silu", ActivationType::Silu)          \
           .value("Gelu", ActivationType::Gelu)          \
