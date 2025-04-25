@@ -4,7 +4,7 @@
 import torch
 import torch.nn.functional as F
 import aiter
-from op_tests.triton.utils import mla_decode_ref, mla_extend_ref
+from op_tests.triton_tests.utils import mla_decode_ref, mla_extend_ref
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.test_mha_common import attention_ref
 from einops import rearrange
