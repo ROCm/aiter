@@ -45,8 +45,3 @@ print(torch.equal(result, output))
 print("result:", result)
 print("output:", output)
 
-# 逐元素比较
-# elementwise_close = torch.isclose(result, output, atol=1e-2)
-
-# 判断是否所有元素都满足条件
-# print(torch.all(elementwise_close))  # True
