@@ -432,10 +432,13 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
 
     const int max_num_partitions = gridDim.y;
     int context_len;
-    if constexpr(BLOCK_SIZE > 1){
-        context_len =
-            (kv_indptr[seq_idx + 1] - kv_indptr[seq_idx] - 1) * BLOCK_SIZE + kv_last_page_lens[seq_idx];
-    }else{
+    if constexpr(BLOCK_SIZE > 1)
+    {
+        context_len = (kv_indptr[seq_idx + 1] - kv_indptr[seq_idx] - 1) * BLOCK_SIZE +
+                      kv_last_page_lens[seq_idx];
+    }
+    else
+    {
         context_len = kv_indptr[seq_idx + 1] - kv_indptr[seq_idx];
     }
 
@@ -1575,7 +1578,8 @@ template <typename scalar_t,
           int HEAD_SIZE,
           int NUM_THREADS,
           int PARTITION_SIZE,
-          int NPAR_LOOPS, bool ENABLE_LAST_PAGE_LENS>
+          int NPAR_LOOPS,
+          bool ENABLE_LAST_PAGE_LENS>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                    // [num_seqs, num_heads, head_size]
     const float* __restrict__ exp_sums,        // [num_seqs, num_heads,
@@ -1594,10 +1598,13 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int head_idx  = blockIdx.x;
     const int seq_idx   = blockIdx.y;
     int context_len;
-    if constexpr(ENABLE_LAST_PAGE_LENS){
-        context_len =
-            (kv_indptr[seq_idx + 1] - kv_indptr[seq_idx] - 1) * block_size + kv_last_page_lens[seq_idx];
-    }else{
+    if constexpr(ENABLE_LAST_PAGE_LENS)
+    {
+        context_len = (kv_indptr[seq_idx + 1] - kv_indptr[seq_idx] - 1) * block_size +
+                      kv_last_page_lens[seq_idx];
+    }
+    else
+    {
         context_len = kv_indptr[seq_idx + 1] - kv_indptr[seq_idx];
     }
     const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
@@ -1878,7 +1885,8 @@ template <typename scalar_t,
           int HEAD_SIZE,
           int NUM_THREADS,
           int PARTITION_SIZE,
-          int NPAR_LOOPS, bool ENABLE_LAST_PAGE_LENS>
+          int NPAR_LOOPS,
+          bool ENABLE_LAST_PAGE_LENS>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     OUTT* __restrict__ out,                    // [num_seqs, num_heads, head_size]
     const float* __restrict__ exp_sums,        // [num_seqs, num_heads,
@@ -1930,16 +1938,22 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
                                      v_scale_ptr,                    \
                                      fp8_out_scale_ptr);
 
-#define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS)                                                        \
-    paged_attention_ll4mi_reduce_kernel<T, OUTT, HEAD_SIZE, HEAD_SIZE, PARTITION_SIZE, NPAR_LOOPS, (BLOCK_SIZE > 1)> \
-        <<<reduce_grid, reduce_block, 0, stream>>>(out_ptr,                                        \
-                                                   exp_sums_ptr,                                   \
-                                                   max_logits_ptr,                                 \
-                                                   tmp_out_ptr,                                    \
-                                                   kv_indptr_ptr,                                  \
-                                                   kv_last_page_lens_ptr,                          \
-                                                   BLOCK_SIZE,                                     \
-                                                   max_num_partitions,                             \
+#define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS)                               \
+    paged_attention_ll4mi_reduce_kernel<T,                                \
+                                        OUTT,                             \
+                                        HEAD_SIZE,                        \
+                                        HEAD_SIZE,                        \
+                                        PARTITION_SIZE,                   \
+                                        NPAR_LOOPS,                       \
+                                        (BLOCK_SIZE > 1)>                 \
+        <<<reduce_grid, reduce_block, 0, stream>>>(out_ptr,               \
+                                                   exp_sums_ptr,          \
+                                                   max_logits_ptr,        \
+                                                   tmp_out_ptr,           \
+                                                   kv_indptr_ptr,         \
+                                                   kv_last_page_lens_ptr, \
+                                                   BLOCK_SIZE,            \
+                                                   max_num_partitions,    \
                                                    fp8_out_scale_ptr);
 
 template <typename T,
@@ -1968,25 +1982,26 @@ void paged_attention_custom_launcher(torch::Tensor& out,
                                      torch::Tensor& v_scale,
                                      const c10::optional<torch::Tensor>& fp8_out_scale)
 {
-    const int num_kv_heads = kv_cache_layout=="HND" ? key_cache.size(1) : key_cache.size(2);
-    int num_seqs        = query.size(0);
-    int num_heads       = query.size(1);
-    int head_size       = query.size(2);
-    int q_stride        = query.stride(0);
-    int kv_block_stride = key_cache.stride(0);
-    int kv_head_stride  = kv_cache_layout == "HND" ? key_cache.stride(1) : key_cache.stride(2);
-    int kv_seq_stride   = kv_cache_layout == "HND" ? key_cache.stride(2) : key_cache.stride(1);
+    const int num_kv_heads = kv_cache_layout == "HND" ? key_cache.size(1) : key_cache.size(2);
+    int num_seqs           = query.size(0);
+    int num_heads          = query.size(1);
+    int head_size          = query.size(2);
+    int q_stride           = query.stride(0);
+    int kv_block_stride    = key_cache.stride(0);
+    int kv_head_stride     = kv_cache_layout == "HND" ? key_cache.stride(1) : key_cache.stride(2);
+    int kv_seq_stride      = kv_cache_layout == "HND" ? key_cache.stride(2) : key_cache.stride(1);
 
     // NOTE: alibi_slopes is optional.
     const float* alibi_slopes_ptr =
         alibi_slopes ? reinterpret_cast<const float*>(alibi_slopes.value().data_ptr()) : nullptr;
 
-    T* query_ptr               = reinterpret_cast<T*>(query.data_ptr());
-    KVT* key_cache_ptr         = reinterpret_cast<KVT*>(key_cache.data_ptr());
-    KVT* value_cache_ptr       = reinterpret_cast<KVT*>(value_cache.data_ptr());
-    int* kv_indptr_ptr         = kv_indptr.data_ptr<int>();
-    int* kv_page_indices_ptr   = kv_page_indices.data_ptr<int>();
-    int* kv_last_page_lens_ptr = BLOCK_SIZE > 1 ? kv_last_page_lens.value().data_ptr<int>() : nullptr;
+    T* query_ptr             = reinterpret_cast<T*>(query.data_ptr());
+    KVT* key_cache_ptr       = reinterpret_cast<KVT*>(key_cache.data_ptr());
+    KVT* value_cache_ptr     = reinterpret_cast<KVT*>(value_cache.data_ptr());
+    int* kv_indptr_ptr       = kv_indptr.data_ptr<int>();
+    int* kv_page_indices_ptr = kv_page_indices.data_ptr<int>();
+    int* kv_last_page_lens_ptr =
+        BLOCK_SIZE > 1 ? kv_last_page_lens.value().data_ptr<int>() : nullptr;
 
     const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
     const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
@@ -2074,7 +2089,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
                                                              kv_indptr,                         \
                                                              kv_page_indices,                   \
                                                              kv_last_page_lens,                 \
-                                                             max_num_partitions,                   \
+                                                             max_num_partitions,                \
                                                              alibi_slopes,                      \
                                                              kv_cache_layout,                   \
                                                              logits_soft_cap,                   \
@@ -2100,9 +2115,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     }
 
 #define CALL_CUSTOM_LAUNCHER_ALIBI(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE)            \
-    if(alibi_slopes)                                                                              \
-    {                                                                                             \
-    }                                                                                             \
+    if(alibi_slopes) {}                                                                           \
     else                                                                                          \
     {                                                                                             \
         CALL_CUSTOM_LAUNCHER_SOFT_CAP(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, false); \
@@ -2126,13 +2139,11 @@ void paged_attention_custom_launcher(torch::Tensor& out,
         CALL_CUSTOM_LAUNCHER_PSIZE(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T); \
     }
 #else
-#define CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)             \
-    if(fp8_out_scale)                                                               \
-    {                                                                               \
-    }                                                                               \
-    else                                                                            \
-    {                                                                               \
-        CALL_CUSTOM_LAUNCHER_PSIZE(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T);       \
+#define CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)       \
+    if(fp8_out_scale) {}                                                      \
+    else                                                                      \
+    {                                                                         \
+        CALL_CUSTOM_LAUNCHER_PSIZE(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, T); \
     }
 #endif
 #define CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, HEAD_SIZE)                   \
@@ -2157,8 +2168,8 @@ void paged_attention_ragged(
     torch::Tensor& value_cache, // [num_blocks, num_heads, block_size, head_size] or
                                 // [num_blocks, block_size, num_heads, head_size]
     double scale,
-    torch::Tensor& kv_indptr,         // [num_seqs + 1]
-    torch::Tensor& kv_page_indices,   // [max_num_blocks]
+    torch::Tensor& kv_indptr,                        // [num_seqs + 1]
+    torch::Tensor& kv_page_indices,                  // [max_num_blocks]
     std::optional<torch::Tensor>& kv_last_page_lens, // [num_seqs]
     int64_t block_size,
     int64_t max_num_partitions,
