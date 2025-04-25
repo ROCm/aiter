@@ -5,6 +5,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_bf16.h>
+
+#include <ck_tile/ops/fmha/block/variants.hpp>
+
 #include "hip_compat.h"
 #include "attention_ragged.h"
 
@@ -390,8 +393,8 @@ template <typename scalar_t,
           int HEAD_SIZE,
           int NUM_THREADS,
           bool ALIBI_ENABLED,
-          bool LOGITS_SOFT_CAP_ENABLED,
-          int GQA_RATIO>
+          int GQA_RATIO,
+          typename AttentionVariant>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache, // [num_blocks, num_kv_heads,
@@ -414,9 +417,11 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                                     // head_size]
     OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
     float logits_soft_cap,
+    float logits_soft_cap_rcp,
     const float* k_scale_ptr,
     const float* v_scale_ptr,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const AttentionVariant& variant)
 {
     constexpr int NWARPS = NUM_THREADS / WARP_SIZE;
     const int warpid     = threadIdx.x / WARP_SIZE;
@@ -483,6 +488,18 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const int wg_start_head_idx    = blockIdx.z * GQA_RATIO;
     const int wg_start_kv_head_idx = blockIdx.z;
     const int total_num_heads      = gridDim.z * GQA_RATIO;
+
+    const auto variant_params = [&] {
+        if constexpr(AttentionVariant::use_logits_soft_cap)
+        {
+            return ck_tile::LogitsSoftCapParams<AttentionVariant::use_exp2>{
+                scale, logits_soft_cap, logits_soft_cap_rcp};
+        }
+        else
+        {
+            return ck_tile::StandardAttentionParams{scale};
+        }
+    }();
 
     // for QK mfma, tokens in multiples of TOKENS_PER_WARP are spread across warps
     // each mfma takes QH16xT16x16HE across warp
@@ -727,7 +744,10 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                 }
             }
         }
-        dout[token_depth] *= scale2;
+        for(int i = 0; i < 4; i++)
+        {
+            dout[token_depth][i] = variant.QueryTransform(variant_params, dout[token_depth][i]);
+        }
     }
 
     const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
@@ -745,20 +765,12 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
             }
         }
     }
-    // apply soft-capping to logits
-    if constexpr(LOGITS_SOFT_CAP_ENABLED)
-    {
-        const float logits_soft_cap_reciprocal = __frcp_rn(logits_soft_cap);
-        const auto apply_soft_cap              = [&](float value) {
-            return logits_soft_cap * tanhf(value * logits_soft_cap_reciprocal);
-        };
 
-        for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+    for(int token_depth = 0; token_depth < TLOOP; token_depth++)
+    {
+        for(int i = 0; i < 4; i++)
         {
-            for(int i = 0; i < 4; i++)
-            {
-                dout[token_depth][i] = apply_soft_cap(dout[token_depth][i]);
-            }
+            dout[token_depth][i] = variant.LogitsTransform(variant_params, dout[token_depth][i]);
         }
     }
 
@@ -1811,8 +1823,8 @@ template <typename scalar_t,
           int HEAD_SIZE,
           int NUM_THREADS,
           bool ALIBI_ENABLED,
-          bool LOGITS_SOFT_CAP_ENABLED,
-          int GQA_RATIO>
+          int GQA_RATIO,
+          typename AttentionVariant>
 __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,      // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache, // [num_blocks, num_kv_heads,
@@ -1835,9 +1847,11 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                                     // head_size]
     OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
     float logits_soft_cap,
+    float logits_soft_cap_rcp,
     const float* k_scale_ptr,
     const float* v_scale_ptr,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const AttentionVariant& variant)
 {
     UNREACHABLE_CODE
 }
@@ -1906,37 +1920,38 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 
 #endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
 
-#define LAUNCH_CUSTOM_ATTENTION_MFMA16(GQA_RATIO)                    \
-    paged_attention_ll4mi_QKV_mfma16_kernel<T,                       \
-                                            KVT,                     \
-                                            KV_DTYPE,                \
-                                            OUTT,                    \
-                                            BLOCK_SIZE,              \
-                                            HEAD_SIZE,               \
-                                            NTHR,                    \
-                                            ALIBI_ENABLED,           \
-                                            LOGITS_SOFT_CAP_ENABLED, \
-                                            GQA_RATIO>               \
-        <<<grid, block, 0, stream>>>(query_ptr,                      \
-                                     key_cache_ptr,                  \
-                                     value_cache_ptr,                \
-                                     scale,                          \
-                                     kv_indptr_ptr,                  \
-                                     kv_page_indices_ptr,            \
-                                     kv_last_page_lens_ptr,          \
-                                     alibi_slopes_ptr,               \
-                                     q_stride,                       \
-                                     kv_block_stride,                \
-                                     kv_head_stride,                 \
-                                     kv_seq_stride,                  \
-                                     exp_sums_ptr,                   \
-                                     max_logits_ptr,                 \
-                                     tmp_out_ptr,                    \
-                                     out_ptr,                        \
-                                     logits_soft_cap,                \
-                                     k_scale_ptr,                    \
-                                     v_scale_ptr,                    \
-                                     fp8_out_scale_ptr);
+#define LAUNCH_CUSTOM_ATTENTION_MFMA16(GQA_RATIO)           \
+    paged_attention_ll4mi_QKV_mfma16_kernel<T,              \
+                                            KVT,            \
+                                            KV_DTYPE,       \
+                                            OUTT,           \
+                                            BLOCK_SIZE,     \
+                                            HEAD_SIZE,      \
+                                            NTHR,           \
+                                            ALIBI_ENABLED,  \
+                                            GQA_RATIO>      \
+        <<<grid, block, 0, stream>>>(query_ptr,             \
+                                     key_cache_ptr,         \
+                                     value_cache_ptr,       \
+                                     scale,                 \
+                                     kv_indptr_ptr,         \
+                                     kv_page_indices_ptr,   \
+                                     kv_last_page_lens_ptr, \
+                                     alibi_slopes_ptr,      \
+                                     q_stride,              \
+                                     kv_block_stride,       \
+                                     kv_head_stride,        \
+                                     kv_seq_stride,         \
+                                     exp_sums_ptr,          \
+                                     max_logits_ptr,        \
+                                     tmp_out_ptr,           \
+                                     out_ptr,               \
+                                     logits_soft_cap,       \
+                                     logits_soft_cap_rcp,   \
+                                     k_scale_ptr,           \
+                                     v_scale_ptr,           \
+                                     fp8_out_scale_ptr,     \
+                                     variant);
 
 #define LAUNCH_CUSTOM_REDUCTION(NPAR_LOOPS)                               \
     paged_attention_ll4mi_reduce_kernel<T,                                \
@@ -2010,6 +2025,8 @@ void paged_attention_custom_launcher(torch::Tensor& out,
         fp8_out_scale ? reinterpret_cast<const float*>(fp8_out_scale.value().data_ptr()) : nullptr;
     OUTT* out_ptr = reinterpret_cast<OUTT*>(out.data_ptr());
 
+    const float logits_soft_cap_rcp = (LOGITS_SOFT_CAP_ENABLED ? 1.f / logits_soft_cap : 0.f);
+
     // partition size is fixed at 256 since both mfma4 and mfma16 kernels support it
     // mfma4 kernel also supports partition size 512
     constexpr int PARTITION_SIZE = 256;
@@ -2022,6 +2039,8 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     float* max_logits_ptr = exp_sums_ptr + (num_seqs * num_heads * max_num_partitions);
     T* tmp_out_ptr =
         reinterpret_cast<T*>(max_logits_ptr + (num_seqs * num_heads * max_num_partitions));
+
+    ck_tile::ComposedAttention<LOGITS_SOFT_CAP_ENABLED * ck_tile::LOGITS_SOFT_CAP> variant;
 
     constexpr int NTHR = 256;
     dim3 grid(num_seqs, max_num_partitions, num_kv_heads);
