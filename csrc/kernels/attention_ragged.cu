@@ -2102,7 +2102,6 @@ void paged_attention_custom_launcher(torch::Tensor& out,
 #define CALL_CUSTOM_LAUNCHER_ALIBI(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE)            \
     if(alibi_slopes)                                                                              \
     {                                                                                             \
-        CALL_CUSTOM_LAUNCHER_SOFT_CAP(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, OUTT, PSIZE, true);  \
     }                                                                                             \
     else                                                                                          \
     {                                                                                             \
@@ -2130,7 +2129,6 @@ void paged_attention_custom_launcher(torch::Tensor& out,
 #define CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE)             \
     if(fp8_out_scale)                                                               \
     {                                                                               \
-        CALL_CUSTOM_LAUNCHER_PSIZE(T, KVT, KV_DTYPE, BLK_SIZE, HEAD_SIZE, uint8_t); \
     }                                                                               \
     else                                                                            \
     {                                                                               \
@@ -2141,15 +2139,12 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     switch(block_size)                                                          \
     {                                                                           \
     case 1: CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 1, HEAD_SIZE); break;    \
-    case 16: CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 16, HEAD_SIZE); break;  \
-    case 32: CALL_CUSTOM_LAUNCHER_OUT(T, KVT, KV_DTYPE, 32, HEAD_SIZE); break;  \
     default: TORCH_CHECK(false, "Unsupported block size: ", block_size); break; \
     }
 
 #define CALL_CUSTOM_LAUNCHER_BLK_HEAD(T, KVT, KV_DTYPE)                       \
     switch(head_size)                                                         \
     {                                                                         \
-    case 64: CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 64); break;           \
     case 128: CALL_CUSTOM_LAUNCHER_BLK(T, KVT, KV_DTYPE, 128); break;         \
     default: TORCH_CHECK(false, "Unsupported head size: ", head_size); break; \
     }
