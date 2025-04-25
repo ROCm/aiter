@@ -353,30 +353,30 @@ def _flash_attn_backward(
     nmask = (causal == False and window_size_left == -1 and window_size_right == -1) # no mask
 
     def np():
-        # bwd_v3_bf16_a16_rtne
-        # bwd_v3_bf16_a16_rtna
-        # bwd_v3_bf16_a16_rtz
-        # bwd_v3_bf16_a32_rtne
-        # bwd_v3_bf16_a32_rtna
-        # bwd_v3_bf16_a32_rtz
-        # bwd_v3_bf16_causal_a16_rtne
-        # bwd_v3_bf16_causal_a16_rtna
-        # bwd_v3_bf16_causal_a16_rtz
-        # bwd_v3_bf16_causal_a32_rtne
-        # bwd_v3_bf16_causal_a32_rtna
-        # bwd_v3_bf16_causal_a32_rtz
-        # bwd_v3_hd64_bf16_a16_rtne
-        # bwd_v3_hd64_bf16_a16_rtna
-        # bwd_v3_hd64_bf16_a16_rtz
-        # bwd_v3_hd64_bf16_causal_a16_rtne
-        # bwd_v3_hd64_bf16_causal_a16_rtna
-        # bwd_v3_hd64_bf16_causal_a16_rtz
-        # bwd_v3_hd64_fp16_a16
-        # bwd_v3_fp16_a16
-        # bwd_v3_fp16_a32
-        # bwd_v3_hd64_fp16_causal_a16
-        # bwd_v3_fp16_causal_a16
-        # bwd_v3_fp16_causal_a32
+        # bwd_hd128_bf16_a16_rtne
+        # bwd_hd128_bf16_a16_rtna
+        # bwd_hd128_bf16_a16_rtz
+        # bwd_hd128_bf16_a32_rtne
+        # bwd_hd128_bf16_a32_rtna
+        # bwd_hd128_bf16_a32_rtz
+        # bwd_hd128_bf16_causal_a16_rtne
+        # bwd_hd128_bf16_causal_a16_rtna
+        # bwd_hd128_bf16_causal_a16_rtz
+        # bwd_hd128_bf16_causal_a32_rtne
+        # bwd_hd128_bf16_causal_a32_rtna
+        # bwd_hd128_bf16_causal_a32_rtz
+        # bwd_hd128_fp16_a16
+        # bwd_hd128_fp16_a32
+        # bwd_hd128_fp16_causal_a16
+        # bwd_hd128_fp16_causal_a32
+        # bwd_hd64_bf16_a16_rtne
+        # bwd_hd64_bf16_a16_rtna
+        # bwd_hd64_bf16_a16_rtz
+        # bwd_hd64_bf16_causal_a16_rtne
+        # bwd_hd64_bf16_causal_a16_rtna
+        # bwd_hd64_bf16_causal_a16_rtz
+        # bwd_hd64_fp16_a16
+        # bwd_hd64_fp16_causal_a16
         npssk = seqlen_q == seqlen_k
         npssk &= seqlen_k % 64 == 0
         npssk &= stride_q == stride_do
@@ -403,14 +403,14 @@ def _flash_attn_backward(
         # FIXME: Currently we only support mask_type == mask_enum::no_mask or causal mask with seqlen_q == seqlen_k
         # Because python side only support mask_enum::bottom_right
         # However v3 kernel only support mask_enum::top_left
-        # bwd_v3_hd64_bf16_a32_rtne_pssk
-        # bwd_v3_hd64_bf16_a32_rtna_pssk
-        # bwd_v3_hd64_bf16_a32_rtz_pssk
-        # bwd_v3_hd64_bf16_causal_a32_rtne_pssk
-        # bwd_v3_hd64_bf16_causal_a32_rtna_pssk
-        # bwd_v3_hd64_bf16_causal_a32_rtz_pssk
-        # bwd_v3_hd64_fp16_a32_pssk
-        # bwd_v3_hd64_fp16_causal_a32_pssk
+        # bwd_hd64_bf16_a32_rtne_pssk
+        # bwd_hd64_bf16_a32_rtna_pssk
+        # bwd_hd64_bf16_a32_rtz_pssk
+        # bwd_hd64_bf16_causal_a32_rtne_pssk
+        # bwd_hd64_bf16_causal_a32_rtna_pssk
+        # bwd_hd64_bf16_causal_a32_rtz_pssk
+        # bwd_hd64_fp16_a32_pssk
+        # bwd_hd64_fp16_causal_a32_pssk
         ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64
         ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
@@ -419,14 +419,14 @@ def _flash_attn_backward(
 
     def pddv():
         # only for a16 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
-        # bwd_v3_bf16_a16_rtne_pddv
-        # bwd_v3_bf16_a16_rtna_pddv
-        # bwd_v3_bf16_a16_rtz_pddv
-        # bwd_v3_bf16_causal_a16_rtne_pddv
-        # bwd_v3_bf16_causal_a16_rtna_pddv
-        # bwd_v3_bf16_causal_a16_rtz_pddv
-        # bwd_v3_fp16_a16_pddv
-        # bwd_v3_fp16_causal_a16_pddv
+        # bwd_hd128_bf16_a16_rtne_pddv
+        # bwd_hd128_bf16_a16_rtna_pddv
+        # bwd_hd128_bf16_a16_rtz_pddv
+        # bwd_hd128_bf16_causal_a16_rtne_pddv
+        # bwd_hd128_bf16_causal_a16_rtna_pddv
+        # bwd_hd128_bf16_causal_a16_rtz_pddv
+        # bwd_hd128_fp16_a16_pddv
+        # bwd_hd128_fp16_causal_a16_pddv
         ret = is_v3_atomic_fp32 == False
         ret &= hdim_q > 64 and hdim_q < 128
         ret &= seqlen_q == seqlen_k
@@ -446,16 +446,24 @@ def _flash_attn_backward(
 
     def psskddv():
         # only for a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
-        # bwd_v3_bf16_a32_rtne_psskddv
-        # bwd_v3_bf16_a32_rtna_psskddv
-        # bwd_v3_bf16_a32_rtz_psskddv
-        # bwd_v3_bf16_causal_a32_rtne_psskddv
-        # bwd_v3_bf16_causal_a32_rtna_psskddv
-        # bwd_v3_bf16_causal_a32_rtz_psskddv
-        # bwd_v3_fp16_a32_psskddv
-        # bwd_v3_fp16_causal_a32_psskddv
+        # bwd_hd128_bf16_a32_rtne_psskddv
+        # bwd_hd128_bf16_a32_rtna_psskddv
+        # bwd_hd128_bf16_a32_rtz_psskddv
+        # bwd_hd128_bf16_causal_a32_rtne_psskddv
+        # bwd_hd128_bf16_causal_a32_rtna_psskddv
+        # bwd_hd128_bf16_causal_a32_rtz_psskddv
+        # bwd_hd128_fp16_a32_psskddv
+        # bwd_hd128_fp16_causal_a32_psskddv
+        # bwd_hd192_fp16_a32_psskddv
+        # bwd_hd192_fp16_causal_a32_psskddv
+        # bwd_hd192_bf16_a32_rtne_psskddv
+        # bwd_hd192_bf16_a32_rtna_psskddv
+        # bwd_hd192_bf16_a32_rtz_psskddv
+        # bwd_hd192_bf16_causal_a32_rtne_psskddv
+        # bwd_hd192_bf16_causal_a32_rtna_psskddv
+        # bwd_hd192_bf16_causal_a32_rtz_psskddv
         ret = is_v3_atomic_fp32 == True
-        ret &= hdim_q > 64 and hdim_q < 128
+        ret &= hdim_q > 64 and hdim_q <= 192
         ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
@@ -464,11 +472,12 @@ def _flash_attn_backward(
         # basic
         ret = alibi_slopes is None
         ret &= bias is None
+        ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= mask or nmask
         ret &= np() or pssk() or pddv() or psskddv()
         ret &= 'gfx942' in torch.cuda.get_device_properties("cuda").gcnArchName
@@ -946,16 +955,39 @@ def _flash_attn_varlen_backward(
         # FIXME: Currently we only support mask_type == mask_enum::no_mask
         # Because python side only support mask_enum::bottom_right
         # However v3 kernel only support mask_enum::top_left
-        # bwd_v3_hd64_bf16_a32_rtne_pssk_group
-        # bwd_v3_hd64_bf16_a32_rtna_pssk_group
-        # bwd_v3_hd64_bf16_a32_rtz_pssk_group
-        # bwd_v3_hd64_bf16_causal_a32_rtne_pssk_group
-        # bwd_v3_hd64_bf16_causal_a32_rtna_pssk_group
-        # bwd_v3_hd64_bf16_causal_a32_rtz_pssk_group
-        # bwd_v3_hd64_fp16_a32_pssk_group
-        # bwd_v3_hd64_fp16_causal_a32_pssk_group
+        # bwd_hd64_bf16_a32_rtne_pssk_group
+        # bwd_hd64_bf16_a32_rtna_pssk_group
+        # bwd_hd64_bf16_a32_rtz_pssk_group
+        # bwd_hd64_bf16_causal_a32_rtne_pssk_group
+        # bwd_hd64_bf16_causal_a32_rtna_pssk_group
+        # bwd_hd64_bf16_causal_a32_rtz_pssk_group
+        # bwd_hd64_fp16_a32_pssk_group
+        # bwd_hd64_fp16_causal_a32_pssk_group
+        # bwd_hd128_bf16_a32_rtne_pssk_group
+        # bwd_hd128_bf16_a32_rtna_pssk_group
+        # bwd_hd128_bf16_a32_rtz_pssk_group
+        # bwd_hd128_bf16_causal_a32_rtne_pssk_group
+        # bwd_hd128_bf16_causal_a32_rtna_pssk_group
+        # bwd_hd128_bf16_causal_a32_rtz_pssk_group
+        # bwd_hd128_fp16_a32_pssk_group
+        # bwd_hd128_fp16_causal_a32_pssk_group
         ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q == 64
+        ret &= hdim_q == 64 or hdim_q == 128
+        ret &= nmask # TODO: or (mask and mask_type == mask_enum::mask_top_left)
+
+        return ret
+    
+    def psskddv():
+        # bwd_hd128_bf16_a32_rtne_psskddv_group
+        # bwd_hd128_bf16_a32_rtna_psskddv_group
+        # bwd_hd128_bf16_a32_rtz_psskddv_group
+        # bwd_hd128_bf16_causal_a32_rtne_psskddv_group
+        # bwd_hd128_bf16_causal_a32_rtna_psskddv_group
+        # bwd_hd128_bf16_causal_a32_rtz_psskddv_group
+        # bwd_hd128_fp16_a32_psskddv_group
+        # bwd_hd128_fp16_causal_a32_psskddv_group
+        ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret &= hdim_q > 64 and hdim_q < 128
         ret &= nmask # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
@@ -963,13 +995,15 @@ def _flash_attn_varlen_backward(
     def can_impl_fmha_v3_bwd():
         # basic
         ret = alibi_slopes is None
+        # ret &= bias is None
+        # ret &= dbias is None
         ret &= dropout_p == 0.0
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= mask or nmask
-        ret &= pssk()
+        ret &= pssk() or psskddv()
         ret &= 'gfx942' in torch.cuda.get_device_properties("cuda").gcnArchName
 
         return ret

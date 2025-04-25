@@ -242,7 +242,9 @@
         ],
         "md_name": "'module_moe_ck2stages'",
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
