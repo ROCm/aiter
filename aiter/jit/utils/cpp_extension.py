@@ -1113,13 +1113,10 @@ def _jit_compile(name,
     if verbose:
         print(f'Loading extension module {name}...', file=sys.stderr)
 
-    if torch_exclude:
-        return os.path.join(build_directory, f'{name}{EXEC_EXT}')
-    else:
-        if is_standalone:
-            return _get_exec_path(name, build_directory)
-        else:
-            return _import_module_from_library(name, build_directory, is_python_module)
+    if is_standalone:
+        return _get_exec_path(name, build_directory)
+
+    return _import_module_from_library(name, build_directory, is_python_module)
 
 
 def _write_ninja_file_and_compile_objects(
