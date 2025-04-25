@@ -1383,8 +1383,9 @@ def _write_ninja_file_to_build_library(path,
     system_includes = [] if torch_exclude else include_paths(with_cuda)
 
     # build python module excluded with torch, use `pybind11`
+    # But we can't use this now because all aiter op based on torch
+    # which means pybind11_abi must from torch now
     if torch_exclude and is_python_module:
-        print("for module_aiter_enum, we currently use pybind11 to keep torch independent.")
         import pybind11
         extra_include_paths.append(pybind11.get_include())
 
