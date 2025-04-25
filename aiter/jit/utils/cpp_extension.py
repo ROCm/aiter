@@ -1116,7 +1116,7 @@ def _jit_compile(name,
     if is_standalone:
         return _get_exec_path(name, build_directory)
 
-    return _import_module_from_library(name, build_directory, is_python_module)
+    return _import_module_from_library(name, build_directory, is_python_module, torch_exclude)
 
 
 def _write_ninja_file_and_compile_objects(
@@ -1348,7 +1348,7 @@ def _get_exec_path(module_name, path):
     return os.path.join(path, f'{module_name}{EXEC_EXT}')
 
 
-def _import_module_from_library(module_name, path, is_python_module):
+def _import_module_from_library(module_name, path, is_python_module, torch_exclude):
     filepath = os.path.join(path, f"{module_name}{LIB_EXT}")
     if is_python_module:
         # https://stackoverflow.com/questions/67631/how-to-import-a-module-given-the-full-path
@@ -1359,8 +1359,9 @@ def _import_module_from_library(module_name, path, is_python_module):
         spec.loader.exec_module(module)
         return module
     else:
-        import torch
-        torch.ops.load_library(filepath)
+        if not torch_exclude:
+            import torch
+            torch.ops.load_library(filepath)
 
 
 def _write_ninja_file_to_build_library(path,
