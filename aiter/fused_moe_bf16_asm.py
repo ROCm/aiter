@@ -52,6 +52,7 @@ def asm_moe(hidden_states,
             fc2_smooth_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
             a16=False,
             per_tensor_quant_scale=None,
+            block_shape=None,
             expert_mask=None,
             activation = ActivationType.Silu
             ):
@@ -91,7 +92,29 @@ def asm_moe(hidden_states,
         else:
             raise ValueError(
                 f"Invalid args: {w1.dtype} {w1.shape=} {w2.shape=}")
-
+    elif block_shape is not None:
+        assert dtype == torch.bfloat16, "asm_moe for block_scale only support bfloat16 hidden_states"
+        assert block_shape == (
+            128, 128), "asm_moe for block_scale only support (128, 128)"
+        assert w1.dtype == torch.float8_e4m3fnuz, "asm_moe for block_scale only support float8_e4m3fnuz weight"
+        assert w2.shape[2] * 2 == w1.shape[1], "aiter moe for block_scale only support g1u1"
+        scale_blk_n, scale_blk_k = block_shape
+        hidden_states = hidden_states.view(M *
+                                           model_dim//scale_blk_k, scale_blk_k)
+        a8 = torch.empty(
+            (M, model_dim), dtype=w1.dtype, device=device)
+        a8_scale = torch.empty((M, model_dim//scale_blk_k), dtype=torch.float, device=device)
+        aiter.dynamic_per_token_scaled_fp8_quant(a8, hidden_states, a8_scale)
+        
+        aiter.fmoe_fp8_blockscale_g1u1(moe_buf, a8, w1, w2, sorted_ids,
+                                       sorted_weights, sorted_expert_ids, num_valid_ids,
+                                       topk,
+                                       fc1_scale.view(E, -1),
+                                       fc2_scale.view(E, -1),
+                                       a8_scale.t().contiguous(),
+                                       scale_blk_n,
+                                       scale_blk_k,
+                                       fc2_smooth_scale)
     else:
         # a8w8 fmoe, opt: smooth quant
         a8_type = w1.dtype if w1.dtype != torch.int32 and w1.dtype != torch.uint32 else torch.float8_e4m3fnuz
