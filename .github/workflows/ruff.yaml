@@ -9,7 +9,7 @@ jobs:
         uses: actions/setup-python@v2
         with:
           python-version: "3.8"
-      - name: install dependancies
+      - name: install dependencies
         run: pip3 install ruff black
       - name: install reviewdog
         uses: reviewdog/action-setup@e04ffabe3898a0af8d0fb1af00c188831c4b5893
