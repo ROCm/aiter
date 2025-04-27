@@ -331,6 +331,8 @@ def build_module(
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_CORE_DIR}/op_tests/cpp/mha"
                 )
+            if is_python_module:
+                module = get_module(md_name)
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
             logger.error(
