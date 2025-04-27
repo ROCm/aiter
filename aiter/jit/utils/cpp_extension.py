@@ -1385,6 +1385,7 @@ def _write_ninja_file_to_build_library(path,
     # FIXME: build python module excluded with torch, use `pybind11`
     # But we can't use this now because all aiter op based on torch
     # which means pybind11 related build flags must from torch now
+    common_cflags = []
     if torch_exclude and is_python_module:
         import pybind11
         extra_include_paths.append(pybind11.get_include())
@@ -1403,7 +1404,6 @@ def _write_ninja_file_to_build_library(path,
     # file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
-    common_cflags = []
     if not torch_exclude:
         common_cflags.append(f'-DTORCH_EXTENSION_NAME={name}')
         common_cflags.append('-DTORCH_API_INCLUDE_EXTENSION_H')
