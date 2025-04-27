@@ -18,7 +18,7 @@ from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f'{this_dir}/utils/')
-from cpp_extension import load, get_hip_version
+from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -311,7 +311,7 @@ def build_module(
         ]
 
         try:
-            module = load(
+            _jit_compile(
                 md_name,
                 sources,
                 extra_cflags=flags_cc,
@@ -331,8 +331,6 @@ def build_module(
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_CORE_DIR}/op_tests/cpp/mha"
                 )
-            if is_python_module:
-                module = get_module(md_name)
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
             logger.error(
@@ -346,24 +344,15 @@ def build_module(
                 )
             )
             raise
-        return module
 
     def FinalFunc():
         logger.info(
             f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
         )
 
-    def WaitFunc():
-        module = get_module(md_name)
-        return module
-
-    module = mp_lock(
-        lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc, WaitFunc=WaitFunc
+    mp_lock(
+        lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc
     )
-
-    if md_name not in __mds:
-        __mds[md_name] = module
-    return module
 
 
 def get_args_of_build(ops_name: str, exclue=[]):
@@ -488,7 +477,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                module = build_module(
+                build_module(
                     md_name,
                     srcs,
                     flags_extra_cc,
@@ -501,6 +490,9 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_standalone,
                     torch_exclude,
                 )
+                module = get_module(md_name)
+                if md_name not in __mds:
+                    __mds[md_name] = module
 
             if isinstance(module, types.ModuleType):
                 op = getattr(module, loadName)
