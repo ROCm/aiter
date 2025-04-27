@@ -20,6 +20,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f'{this_dir}/utils/')
 from cpp_extension import load, get_hip_version
 from file_baton import FileBaton
+AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 def mp_lock(
     lockPath: str,
@@ -184,6 +185,19 @@ def get_module(md_name):
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
 
+# @functools.lru_cache(maxsize=None)
+# def rebuild_module(md_name):
+#     if md_name != "module_aiter_enum":
+#         raise ModuleNotFoundError("")
+
+rebuilded_list = ["module_aiter_enum"]
+
+def rm_module(md_name):
+    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+
+def clear_build(md_name):
+    os.system(f"rm -rf {bd_dir}/ck")
+    os.system(f"rm -rf {bd_dir}/{md_name}")
 
 def build_module(
     md_name,
@@ -203,6 +217,11 @@ def build_module(
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
+        if AITER_REBUILD == 1:
+            rm_module(md_name)
+            clear_build(md_name)
+        elif AITER_REBUILD >= 2:
+            rm_module(md_name)
         op_dir = f"{bd_dir}/{md_name}"
         logger.info(f"start build [{md_name}] under {op_dir}")
 
@@ -444,6 +463,9 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
+                elif AITER_REBUILD and md_name not in rebuilded_list:
+                    rebuilded_list.append(md_name)
+                    raise ModuleNotFoundError("")
                 if module is None:
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
