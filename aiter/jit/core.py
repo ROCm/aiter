@@ -82,7 +82,7 @@ AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
 AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
-CK_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
+CK_3RDPARTY_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 
 
 @functools.lru_cache(maxsize=None)
@@ -103,7 +103,7 @@ def get_user_jit_dir():
 bd_dir = f"{get_user_jit_dir()}/build"
 # copy ck to build, thus hippify under bd_dir
 if multiprocessing.current_process().name == "MainProcess":
-    shutil.copytree(CK_DIR, f"{bd_dir}/ck", dirs_exist_ok=True)
+    os.makedirs(bd_dir, exist_ok=True)
     # if os.path.exists(f"{bd_dir}/ck/library"):
     #     shutil.rmtree(f"{bd_dir}/ck/library")
 CK_DIR = f"{bd_dir}/ck"
@@ -185,18 +185,18 @@ def get_module(md_name):
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
 
-# @functools.lru_cache(maxsize=None)
-# def rebuild_module(md_name):
-#     if md_name != "module_aiter_enum":
-#         raise ModuleNotFoundError("")
-
 rebuilded_list = ["module_aiter_enum"]
 
 def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
 
+@functools.lru_cache()
+def recopy_ck():
+    if os.path.exists(f"CK_DIR"):
+        os.system(f"rm -rf {CK_DIR}")
+    shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
+
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/ck")
     os.system(f"rm -rf {bd_dir}/{md_name}")
 
 def build_module(
@@ -217,6 +217,7 @@ def build_module(
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
+        recopy_ck()
         if AITER_REBUILD == 1:
             rm_module(md_name)
             clear_build(md_name)
