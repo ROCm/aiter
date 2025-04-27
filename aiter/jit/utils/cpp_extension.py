@@ -1382,12 +1382,14 @@ def _write_ninja_file_to_build_library(path,
     # include_paths() gives us the location of torch/extension.h
     system_includes = [] if torch_exclude else include_paths(with_cuda)
 
-    # build python module excluded with torch, use `pybind11`
+    # FIXME: build python module excluded with torch, use `pybind11`
     # But we can't use this now because all aiter op based on torch
-    # which means pybind11_abi must from torch now
+    # which means pybind11 related build flags must from torch now
     if torch_exclude and is_python_module:
         import pybind11
         extra_include_paths.append(pybind11.get_include())
+        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
 
     # sysconfig.get_path('include') gives us the location of Python.h
     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS

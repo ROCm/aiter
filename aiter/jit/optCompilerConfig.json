@@ -8,6 +8,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
     "module_activation": {
