@@ -3,7 +3,7 @@ import sys
 import torch
 import triton
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
-from op_tests.triton.test_gemm_a8w8 import generate_gemm_a8w8_inputs
+from op_tests.triton_tests.test_gemm_a8w8 import generate_gemm_a8w8_inputs
 from utils.benchmark_utils import get_model_configs, get_available_models
 
 
