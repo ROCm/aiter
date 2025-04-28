@@ -18,8 +18,9 @@ from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f'{this_dir}/utils/')
-from cpp_extension import load, get_hip_version
+from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
+AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 def mp_lock(
     lockPath: str,
@@ -81,7 +82,7 @@ AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
 AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
-CK_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
+CK_3RDPARTY_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 
 
 @functools.lru_cache(maxsize=None)
@@ -102,7 +103,7 @@ def get_user_jit_dir():
 bd_dir = f"{get_user_jit_dir()}/build"
 # copy ck to build, thus hippify under bd_dir
 if multiprocessing.current_process().name == "MainProcess":
-    shutil.copytree(CK_DIR, f"{bd_dir}/ck", dirs_exist_ok=True)
+    os.makedirs(bd_dir, exist_ok=True)
     # if os.path.exists(f"{bd_dir}/ck/library"):
     #     shutil.rmtree(f"{bd_dir}/ck/library")
 CK_DIR = f"{bd_dir}/ck"
@@ -184,6 +185,19 @@ def get_module(md_name):
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
 
+rebuilded_list = ["module_aiter_enum"]
+
+def rm_module(md_name):
+    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+
+@functools.lru_cache()
+def recopy_ck():
+    if os.path.exists(f"CK_DIR"):
+        os.system(f"rm -rf {CK_DIR}")
+    shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
+
+def clear_build(md_name):
+    os.system(f"rm -rf {bd_dir}/{md_name}")
 
 def build_module(
     md_name,
@@ -203,6 +217,12 @@ def build_module(
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
+        recopy_ck()
+        if AITER_REBUILD == 1:
+            rm_module(md_name)
+            clear_build(md_name)
+        elif AITER_REBUILD >= 2:
+            rm_module(md_name)
         op_dir = f"{bd_dir}/{md_name}"
         logger.info(f"start build [{md_name}] under {op_dir}")
 
@@ -292,7 +312,7 @@ def build_module(
         ]
 
         try:
-            module = load(
+            _jit_compile(
                 md_name,
                 sources,
                 extra_cflags=flags_cc,
@@ -325,24 +345,15 @@ def build_module(
                 )
             )
             raise
-        return module
 
     def FinalFunc():
         logger.info(
             f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
         )
 
-    def WaitFunc():
-        module = get_module(md_name)
-        return module
-
-    module = mp_lock(
-        lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc, WaitFunc=WaitFunc
+    mp_lock(
+        lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc
     )
-
-    if md_name not in __mds:
-        __mds[md_name] = module
-    return module
 
 
 def get_args_of_build(ops_name: str, exclue=[]):
@@ -444,6 +455,9 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
+                elif AITER_REBUILD and md_name not in rebuilded_list:
+                    rebuilded_list.append(md_name)
+                    raise ModuleNotFoundError("")
                 if module is None:
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
@@ -464,7 +478,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                module = build_module(
+                build_module(
                     md_name,
                     srcs,
                     flags_extra_cc,
@@ -477,6 +491,9 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_standalone,
                     torch_exclude,
                 )
+                module = get_module(md_name)
+                if md_name not in __mds:
+                    __mds[md_name] = module
 
             if isinstance(module, types.ModuleType):
                 op = getattr(module, loadName)
