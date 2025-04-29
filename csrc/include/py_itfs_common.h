@@ -2,15 +2,8 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
-#include "quant_common.cuh"
 #include <torch/all.h>
-
-#include <hip/hip_fp8.h>
-#if CK_TILE_USE_OCP_FP8
-const auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
-#else
-const auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
-#endif
+#include "aiter_hip_common.h"
 
 // common utility functions
 #define FOREACH_BUFFER_TORCH_TYPE_MAP(F) \

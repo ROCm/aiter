@@ -19,17 +19,7 @@
 
 #include <cmath>
 #include "hip_float8.h"
-#include "ck_tile/core.hpp"
-
-// Using the default max value from pytorch (240.0) will cause accuracy
-// issue when running dynamic quantization. Here use 224.0f for rocm.
-using FP8_TYPE = ck_tile::fp8_t;
-// constexpr auto FP8_MAX = ck_tile::numeric<FP8_TYPE>::float32_max();
-#if CK_TILE_USE_OCP_FP8
-constexpr auto FP8_MAX = 448.f;
-#else
-constexpr auto FP8_MAX = 240.f;
-#endif
+#include "aiter_hip_common.h"
 
 namespace vllm
 {
