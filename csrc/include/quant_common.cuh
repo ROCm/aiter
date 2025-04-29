@@ -24,7 +24,7 @@
 // Using the default max value from pytorch (240.0) will cause accuracy
 // issue when running dynamic quantization. Here use 224.0f for rocm.
 using FP8_TYPE = ck_tile::fp8_t;
-constexpr auto FP8_E4M3_MAX = ck_tile::numeric<FP8_TYPE>::float32_max();
+constexpr auto FP8_MAX = ck_tile::numeric<FP8_TYPE>::float32_max();
 
 namespace vllm {
 
@@ -95,7 +95,7 @@ __global__ void segmented_max_reduction(float* __restrict__ scale,
   // Finally, since cache[0] contains the maximum for this thread block,
   // atomically write the max to the target location
   if (threadIdx.x == 0) {
-    atomicMaxFloat(scale, cache[0] / FP8_E4M3_MAX);
+    atomicMaxFloat(scale, cache[0] / FP8_MAX);
   }
 }
 

@@ -23,21 +23,14 @@
 #include "dispatch_utils.h"
 #include "py_itfs_common.h"
 
-#ifdef USE_ROCM
 #include "quant_utils.cuh"
-#else
-#include "quantization/fp8/nvidia/quant_utils.cuh"
-#endif
 
 #include <algorithm>
 #include <cassert>
 #include <map>
 #include <vector>
 
-#ifdef USE_ROCM
 #include <hip/hip_bf16.h>
-typedef __hip_bfloat16 __nv_bfloat16;
-#endif
 
 template <typename T, typename F>
 __device__ constexpr T block_reduce(T val, F reduce_f)
@@ -592,7 +585,7 @@ namespace vllm
       block_idx = slot_idx / block_size;
       block_offset = slot_idx % block_size;
     }
-    
+
     if (slot_idx < 0)
     {
       // Padding token that should be ignored.
@@ -1000,10 +993,9 @@ void reshape_and_cache_with_pertoken_quant(
   using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
 
   float dtypeMax;
-  std::cout << "torch_fp8: " << torch_fp8 << std::endl;
   if (key_cache.dtype() == torch_fp8)
   {
-    dtypeMax = std::numeric_limits<c10_fp8>::max();
+    dtypeMax = FP8_MAX;
     if (key.dtype() == at::ScalarType::Float)
     {
       CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, hip_fp8, dequant_scale_t);
@@ -1014,7 +1006,7 @@ void reshape_and_cache_with_pertoken_quant(
     }
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__nv_bfloat16, hip_fp8, dequant_scale_t);
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__hip_bfloat16, hip_fp8, dequant_scale_t);
     }
     else
     {
@@ -1035,7 +1027,7 @@ void reshape_and_cache_with_pertoken_quant(
     }
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__nv_bfloat16, int8_t, dequant_scale_t);
+      CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__hip_bfloat16, int8_t, dequant_scale_t);
     }
     else
     {
@@ -1084,7 +1076,7 @@ void reshape_and_cache_with_block_quant(
   float dtypeMax;
   if (key_cache.dtype() == torch_fp8)
   {
-    dtypeMax = std::numeric_limits<c10_fp8>::max();
+    dtypeMax = FP8_MAX;
     if (key.dtype() == at::ScalarType::Float)
     {
       CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, hip_fp8, dequant_scale_t);
@@ -1095,7 +1087,7 @@ void reshape_and_cache_with_block_quant(
     }
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__nv_bfloat16, hip_fp8, dequant_scale_t);
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__hip_bfloat16, hip_fp8, dequant_scale_t);
     }
     else
     {
@@ -1116,7 +1108,7 @@ void reshape_and_cache_with_block_quant(
     }
     else if (key.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__nv_bfloat16, int8_t, dequant_scale_t);
+      CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__hip_bfloat16, int8_t, dequant_scale_t);
     }
     else
     {
@@ -1186,7 +1178,7 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
     }
     else if (src_cache.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_CONVERT_FP8(uint8_t, __nv_bfloat16, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(uint8_t, __hip_bfloat16, vllm::Fp8KVCacheDataType::kAuto);
     }
     else if (dst_cache.dtype() == at::ScalarType::Float)
     {
@@ -1198,7 +1190,7 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
     }
     else if (dst_cache.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_CONVERT_FP8(__nv_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(__hip_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kAuto);
     }
   }
   else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3")
@@ -1213,7 +1205,7 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
     }
     else if (src_cache.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_CONVERT_FP8(uint8_t, __nv_bfloat16,
+      CALL_CONVERT_FP8(uint8_t, __hip_bfloat16,
                        vllm::Fp8KVCacheDataType::kFp8E4M3);
     }
     else if (dst_cache.dtype() == at::ScalarType::Float)
@@ -1226,7 +1218,7 @@ void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
     }
     else if (dst_cache.dtype() == at::ScalarType::BFloat16)
     {
-      CALL_CONVERT_FP8(__nv_bfloat16, uint8_t,
+      CALL_CONVERT_FP8(__hip_bfloat16, uint8_t,
                        vllm::Fp8KVCacheDataType::kFp8E4M3);
     }
   }
