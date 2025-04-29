@@ -1,8 +1,13 @@
+import functools
+import json
+from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
-from typing import Optional, Tuple
+from aiter.ops.triton.utils.core import (
+    AITER_TRITON_OPS_PATH,
+    AITER_TRITON_CONFIGS_PATH
+)
 
 
 @triton.jit
@@ -843,6 +848,20 @@ def _attn_fwd(
     op = acc.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
+<<<<<<< HEAD
+=======
+@functools.lru_cache(maxsize=1024)
+def _get_config_attn_fwd():
+    if not hasattr(_get_config_attn_fwd, "_attn_fwd_config_dict"):
+        print("Open config")
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/MI300X-MHA-FWD.json" 
+        with open(fpath, 'r') as file:
+            config = json.load(file)
+        _get_config_attn_fwd._attn_fwd_config_dict = config
+
+    #TODO: Add logic to pick the right config
+    return _get_config_attn_fwd._attn_fwd_config_dict["fwd"]
+>>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
 
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -863,6 +882,7 @@ def _flash_attn_forward(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     # FP8
@@ -946,19 +966,7 @@ def _flash_attn_forward(
     else:
         s_dmask = None
         dropout_mask = None
-
-    # Best config from ROCm/triton/python/perf-kernels/flash_attention.py::attn_fwd autotuning is BLOCK_M: 128, BLOCK_N: 64, waves_per_eu: 2, num_warps: 4, num_ctas: 1, num_stages: 1
-    # BLOCK_N=64 spills but has higher performance
-    # Tuned for MI300x
-    config = {
-        "BLOCK_M": 128,
-        "BLOCK_N": 64,
-        "waves_per_eu": 2,
-        "num_warps": 4,
-        "num_ctas": 1,
-        "num_stages": 1,
-    }
-    # Dropout significantly increases VGPR usage so use small tiles
+     # Dropout significantly increases VGPR usage so use small tiles
     if enable_dropout:
         config = {
             "BLOCK_M": 32,
@@ -968,6 +976,9 @@ def _flash_attn_forward(
             "num_ctas": 1,
             "num_stages": 1,
         }
+    
+    if config is None:
+        config = _get_config_attn_fwd()
 
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
@@ -2727,7 +2738,12 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
+<<<<<<< HEAD
         is_grad_enabled,
+=======
+        is_grad_enabled, 
+        config,
+>>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -2737,6 +2753,7 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+<<<<<<< HEAD
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
                 q,
@@ -2753,6 +2770,23 @@ class FlashAttnFunc(torch.autograd.Function):
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
             )
+=======
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = _flash_attn_forward(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            alibi_slopes=alibi_slopes,
+            return_lse=return_lse,
+            return_softmax=return_softmax and dropout_p > 0,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            config=config
+>>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
         )
 
         if is_grad:
@@ -2840,6 +2874,7 @@ def flash_attn_func(
     deterministic=True,
     return_lse=False,
     return_attn_probs=False,
+    config: Optional[dict] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -2902,6 +2937,10 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+<<<<<<< HEAD
+=======
+        config
+>>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
     )
 
 
