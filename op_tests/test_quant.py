@@ -69,7 +69,7 @@ list_quant = [
     (aiter.QuantType.per_Token, dtypes.fp8),
     (aiter.QuantType.per_Token, dtypes.i8),
 ]
-list_dtype = [dtypes.fp16, dtypes.bf16][]
+list_dtype = [dtypes.fp16, dtypes.bf16][:]
 import pandas as pd
 
 for (
