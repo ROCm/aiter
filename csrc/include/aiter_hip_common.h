@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
 #include <hip/hip_runtime.h>
 #include <iostream>
 #include "ck_tile/core.hpp"
