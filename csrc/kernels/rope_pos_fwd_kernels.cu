@@ -7,13 +7,20 @@
 // Interfaces
 //
 
-// Parameters:
-//   output:       [s, b, h, d]
-//   input:        [s, b, h, d]
-//   cos:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   sin:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   positions:    [s, b]
-//   rotate_style: 0: NEOX style, 1: GPT-J style
+/**
+ * @brief Compute Rotational Positional Encoding on @param input. Results are written in @param output.
+ *        Cosine and sine of frequency should have been calculated and specified in @param cos and @param sin.
+ *        @param positions is an indirect buffer storing the index of value in @param cos and @param sin used to
+ *        calculate with current input element.
+ *
+ * @param output       [s, b, h, d]
+ * @param input        [s, b, h, d]
+ * @param cos          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param sin          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param positions    [s, b]
+ * @param rotate_style 0: NEOX style, 1: GPT-J style
+ * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
+ */
 void rope_cached_positions_fwd_impl(
     torch::Tensor&       output,
     const torch::Tensor& input,
@@ -67,13 +74,23 @@ void rope_cached_positions_fwd_impl(
             stride_o_s, stride_o_b, stride_o_h, stride_o_d););
 }
 
-// Parameters:
-//   output_x/y:   [s, b, h, d]
-//   input_x/y:    [s, b, h, d]
-//   cos:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   sin:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   positions:    [s, b]
-//   rotate_style: 0: NEOX style, 1: GPT-J style
+/**
+ * @brief Compute Rotational Positional Encoding on 2 channels: @param input_x and @param input_y. Results are written
+ *        in @param output_x and @param output_y respectively.
+ *        Cosine and sine of frequency should have been calculated and specified in @param cos and @param sin.
+ *        @param positions is an indirect buffer storing the index of value in @param cos and @param sin used to
+ *        calculate with current input element.
+ *
+ * @param output_x     [s, b, h, d]
+ * @param output_y     [s, b, h, d]
+ * @param input_x      [s, b, h, d]
+ * @param input_y      [s, b, h, d]
+ * @param cos          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param sin          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param positions    [s, b]
+ * @param rotate_style 0: NEOX style, 1: GPT-J style
+ * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
+ */
 void rope_cached_positions_2c_fwd_impl(
     torch::Tensor&       output_x,
     torch::Tensor&       output_y,
@@ -142,14 +159,22 @@ void rope_cached_positions_2c_fwd_impl(
             stride_oy_s, stride_oy_b, stride_oy_h, stride_oy_d););
 }
 
-// Parameters:
-//   output:       [s, b, h, d]
-//   input:        [s, b, h, d]
-//   cos:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   sin:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   positions:    [s, b]
-//   offsets:      [s, b]
-//   rotate_style: 0: NEOX style, 1: GPT-J style
+/**
+ * @brief Compute Rotational Positional Encoding on @param input. Results are written in @param output.
+ *        Cosine and sine of frequency should have been calculated and specified in @param cos and @param sin.
+ *        @param positions and @param offsets are indirect buffers storing the index of value in @param cos and
+ *        @param sin used to calculate with current input element. The corresponding values in @param positions and
+ *        @param offsets are added together to get the final index.
+ *
+ * @param output       [s, b, h, d]
+ * @param input        [s, b, h, d]
+ * @param cos          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param sin          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param positions    [s, b]
+ * @param offsets      [s, b]
+ * @param rotate_style 0: NEOX style, 1: GPT-J style
+ * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
+ */
 void rope_cached_positions_offsets_fwd_impl(
     torch::Tensor&       output,
     const torch::Tensor& input,
@@ -206,14 +231,25 @@ void rope_cached_positions_offsets_fwd_impl(
             stride_o_s, stride_o_b, stride_o_h, stride_o_d););
 }
 
-// Parameters:
-//   output_x/y:   [s, b, h, d]
-//   input_x/y:    [s, b, h, d]
-//   cos:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   sin:          [max_pos, 1, 1, d // 2] if reuse_freqs_front_part else [max_pos, 1, 1, d]
-//   positions:    [s, b]
-//   offsets:      [s, b]
-//   rotate_style: 0: NEOX style, 1: GPT-J style
+/**
+ * @brief Compute Rotational Positional Encoding on 2 channels: @param input_x and @param input_y. Results are written
+ *        in @param output_x and @param output_y respectively.
+ *        Cosine and sine of frequency should have been calculated and specified in @param cos and @param sin.
+ *        @param positions and @param offsets are indirect buffers storing the index of value in @param cos and
+ *        @param sin used to calculate with current input element. The corresponding values in @param positions and
+ *        @param offsets are added together to get the final index.
+ *
+ * @param output_x     [s, b, h, d]
+ * @param output_y     [s, b, h, d]
+ * @param input_x      [s, b, h, d]
+ * @param input_y      [s, b, h, d]
+ * @param cos          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param sin          [max_pos, 1, 1, d // 2] if @param reuse_freqs_front_part else [max_pos, 1, 1, d]
+ * @param positions    [s, b]
+ * @param offsets      [s, b]
+ * @param rotate_style 0: NEOX style, 1: GPT-J style
+ * @param nope_first   If true, back part in last dimension of input is rotated. Otherwise, the front part is rotated.
+ */
 void rope_cached_positions_offsets_2c_fwd_impl(
     torch::Tensor&       output_x,
     torch::Tensor&       output_y,
