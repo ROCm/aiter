@@ -1,3 +1,8 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
 
