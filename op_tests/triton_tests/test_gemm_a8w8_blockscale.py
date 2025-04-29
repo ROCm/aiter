@@ -97,10 +97,10 @@ def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
     x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(
-        torch.float8_e4m3fnuz
+        e4m3_type
     )
     weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
-        torch.float8_e4m3fnuz
+        e4m3_type
     )
 
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
