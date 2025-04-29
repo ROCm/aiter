@@ -132,7 +132,7 @@ def test_fmoe_ep(
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
     # expert_mask = torch.randint(0, 2, (E+shared_E+1,), dtype=dtypes.i32, device="cuda")
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
-    expert_mask[: E // ep] = 1
+    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
     # The last expert
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
@@ -155,19 +155,19 @@ def test_fmoe_ep(
     if use_g1u1:
         w1 = (
             torch.randn(
-                (E + shared_E, inter_dim * 2, model_dim), dtype=dtype, device="cuda"
+                (E // ep + shared_E, inter_dim * 2, model_dim), dtype=dtype, device="cuda"
             )
             / 10
         )
     else:
         w1 = (
             torch.randn(
-                (E + shared_E, inter_dim, model_dim), dtype=dtype, device="cuda"
+                (E // ep + shared_E, inter_dim, model_dim), dtype=dtype, device="cuda"
             )
             / 10
         )
     w2 = (
-        torch.randn((E + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda")
+        torch.randn((E // ep + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda")
         / 10
     )
     score = torch.randn((token, E), device="cuda", dtype=dtype)

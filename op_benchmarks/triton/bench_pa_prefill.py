@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 from utils.benchmark_utils import get_model_configs, get_available_models, get_dtype_bytes, torch_to_tl_dtype
-from op_tests.triton.test_pa_prefill import seed_everything, STR_DTYPE_TO_TORCH_DTYPE
+from op_tests.triton_tests.test_pa_prefill import seed_everything, STR_DTYPE_TO_TORCH_DTYPE
 import torch
 import argparse
 from aiter.ops.triton.pa_prefill import context_attention_fwd

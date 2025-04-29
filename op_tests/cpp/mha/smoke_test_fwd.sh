@@ -1,6 +1,6 @@
 #!/bin/bash
 # TODO: run this script from CK root or build directory
-EXE="$(find . -name bench_mha_fwd -type f | head -n 1)"
+EXE="$(find . -name benchmark_mha_fwd -type f | head -n 1)"
 KNAME=1
 
 export CK_WARMUP=0

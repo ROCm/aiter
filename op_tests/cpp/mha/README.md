@@ -1,23 +1,30 @@
-# mha benchmark
+# aiter mha kernel
 
-This folder contains benchmark scripts for mha_fwd and mha_bwd. The implementation are ported from ck.
+this is an example how to benchmark aiter mha fwd/bwd kernel through c++ API: `aiter::mha_fwd`, `aiter::mha_fwd_splitkv`, `aiter::mha_bwd`.
 
-Current unsupported features:
-* `bench_mha_fwd` vlayout col_major
-* `bench_mha_fwd` appendkv
-
-## build
-Make sure `aiter` has been installed, then run this command under this folder:
+## build and run
+We provide a simple script `build_mha.sh` to build the device library as well as a simple executable:
 ```
+# this will build fwd+bwd
 bash build_mha.sh
-```
-This will result in executables `bench_mha_fwd` and `bench_mha_bwd` in this folder, or you can just run
-```
-python3 -c "import aiter; aiter.compile_bench_mha_fwd()"
-python3 -c "import aiter; aiter.compile_bench_mha_bwd()"
-```
-to build the executable separately.
 
-## run
-You can type `./bench_mha_fwd -?` to list all the arguments.
-Or you can just run the smoke test to check the integrity of your executable by `bash smoke_test_fwd.sh`
+# this will build fwd only
+bash build_mha.sh fwd
+
+# this will build bwd only
+bash build_mha.sh bwd
+```
+Device library `libmha_fwd.so` and `libmha_bwd.so` will be built under current folder, and corresponding executables `benchmark_mha_fwd` and/or `benchmark_mha_bwd` will also be built. You can type `./benchmark_mha_fwd -?` to list all the supported arguments. You can also refer to the `smoke_test_*` script under this folder for a list of quick test.
+
+## how to build/link aiter mha in your c++ project
+We recommend you download the source code of `aiter` and put it under the `3rdparty` submodule folder of your project (you don't need to install `aiter`). We use a way simliar to [cpp_extension](https://github.com/pytorch/pytorch/blob/main/torch/utils/cpp_extension.py) to build the device kernel library without `torch` dependency (you don't need to install `torch`), so it's easy to embed `aiter` into other project.
+
+Basically the build process will be similiar to that inside `build_mha.sh` script. 
+
+First, you need to build the device kernel into a `so`, which is done by a python `compile.py` inside this folder.
+```
+python3 compile.py
+```
+you can also call this python script from different directory, the generated `.so` will always under current directory.
+
+Second, link the `.so` into your executable and compile. You need specify the correct path through `-L` inorder to link to the device lib. You also need to specify the include directory through `-I`, for this example you need set `$TOP_DIR/csrc/include` for the `aiter` API header, and the dependent ck header `$TOP_DIR/3rdparty/composable_kernel/include` and `$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/`. Please refer to `build_mha.sh` for detailed command
