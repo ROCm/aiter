@@ -1,8 +1,14 @@
 from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.core import (
+    AITER_TRITON_OPS_PATH,
+    AITER_TRITON_CONFIGS_PATH
+)
 
 
 @triton.heuristics(
@@ -94,13 +100,40 @@ def _gemm_a16_w16_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_gemm_config_dict"):
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/MI300X-GEMM-A16W16.json" 
+        with open(fpath, 'r') as file:
+            config = json.load(file)
+        _get_config._gemm_config_dict = config
+
+    #TODO: Update this logic
+    if M < 512:
+        return _get_config._gemm_config_dict["small"]
+    elif M >= 512 and M < 1024:
+        return _get_config._gemm_config_dict["medium"]
+    else:
+        return _get_config._gemm_config_dict["large"]
 
 # Wrapper for gemm kernel.
+<<<<<<< HEAD
 def gemm_a16w16(
     x,
     w,
     dtype: Optional[float] = torch.bfloat16,
 ):
+=======
+def gemm_a16w16(x, 
+                w, 
+                dtype: Optional[float] = torch.bfloat16,
+                config: Optional[dict] = None,
+                ):
+>>>>>>> a3f05356 ([TRITON]: Add Config Support for GEMM_A16W16)
     """
     Computes the 16 bit matmul Y = X x W
 
@@ -117,15 +150,9 @@ def gemm_a16w16(
 
     y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    BLOCK_SIZE_M = 256
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
-    GROUP_SIZE_M = 4
-    waves_per_eu = 2
-    kpack = 1
-    matrix_instr_nonkdim = 16
-    num_warps = 8
-    num_stages = 2
+    if config is None:
+        config = _get_config(M, N, K)
+
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -142,15 +169,7 @@ def gemm_a16w16(
         w.stride(1),
         y.stride(0),
         y.stride(1),
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        kpack=kpack,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **config
     )
 
     return y
