@@ -219,6 +219,8 @@ def fused_moe_1stage(
         quant_func = get_quant(quant_type)
         a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
         if quant_type == QuantType.per_1x128:
+            a1 = a1.view_as(hidden_states)
+            a1_scale = a1_scale.view(hidden_states.shape[0], -1).t().contiguous()
             fmoe_func = functools.partial(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,
