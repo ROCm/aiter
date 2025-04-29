@@ -4,6 +4,11 @@
 #pragma once
 #include <torch/all.h>
 #include "aiter_hip_common.h"
+#if CK_TILE_USE_OCP_FP8
+const auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
+#else
+const auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
+#endif
 
 // common utility functions
 #define FOREACH_BUFFER_TORCH_TYPE_MAP(F) \

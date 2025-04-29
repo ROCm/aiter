@@ -19,7 +19,8 @@
 
 #include <cmath>
 #include "hip_float8.h"
-#include "aiter_hip_common.h"
+#include "py_itfs_common.h"
+using FP8_TYPE = ck_tile::fp8_t;
 
 namespace vllm
 {

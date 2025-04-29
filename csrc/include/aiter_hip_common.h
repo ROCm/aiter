@@ -6,10 +6,8 @@
 #include "ck_tile/core.hpp"
 
 #if CK_TILE_USE_OCP_FP8
-const auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
 constexpr auto FP8_MAX = 448.f;
 #else
-const auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 constexpr auto FP8_MAX = 240.f;
 #endif
 
