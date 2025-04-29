@@ -19,11 +19,12 @@
 
 #include <cmath>
 #include "hip_float8.h"
+#include "ck_tile/core.hpp"
 
 // Using the default max value from pytorch (240.0) will cause accuracy
 // issue when running dynamic quantization. Here use 224.0f for rocm.
-using FP8_TYPE = __hip_fp8_e4m3_fnuz;
-constexpr auto FP8_E4M3_MAX = 240.0f;
+using FP8_TYPE = ck_tile::fp8_t;
+constexpr auto FP8_E4M3_MAX = ck_tile::numeric<FP8_TYPE>::float32_max();
 
 namespace vllm {
 
@@ -47,8 +48,7 @@ __device__ __forceinline__ FP8_TYPE scaled_fp8_conversion(float const val,
     x = val / scale;
   }
 
-  // Use hardware cvt instruction for fp8 on rocm
-  return __hip_fp8_e4m3_fnuz(x);
+  return ck_tile::type_convert<FP8_TYPE, float>(x);
 }
 
 __global__ void initializeScale(float* d_data, int size, float value) {  

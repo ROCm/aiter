@@ -37,7 +37,8 @@ struct __align__(8) vec4_t {
 template <typename quant_type_t>
 struct __align__(4) q8x4_t {
   static_assert(std::is_same_v<quant_type_t, int8_t> ||
-                std::is_same_v<quant_type_t, __hip_fp8_e4m3_fnuz>);
+                std::is_same_v<quant_type_t, __hip_fp8_e4m3_fnuz> ||
+                std::is_same_v<quant_type_t, _BitInt(8)>);
   quant_type_t x;
   quant_type_t y;
   quant_type_t z;

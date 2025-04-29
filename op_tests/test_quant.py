@@ -32,7 +32,7 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
 
     q_funcs = {
         "triton": get_triton_quant,
-        # "hip": get_hip_quant,
+        "hip": get_hip_quant,
     }
     ret = {}
     for name, q_func in q_funcs.items():
