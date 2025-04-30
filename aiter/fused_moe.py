@@ -387,9 +387,6 @@ def get_2stage_cfgs(
         block_m,
         ksplit,
     )
-@functools.lru_cache()
-def get1tensor(device):
-    return torch.tensor(1.0, dtype=torch.float, device=device)
 
 def fused_moe_2stages(
     hidden_states,
@@ -481,9 +478,6 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
-
-    if quant_type == aiter.QuantType.No:
-        a2_scale = get1tensor(device)
 
     stage2(
         a2,
