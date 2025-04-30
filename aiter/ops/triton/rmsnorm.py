@@ -275,7 +275,7 @@ def get_num_sms():
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float = 1e-6):
 
     n_rows, n_cols = x.shape
-    y = torch.zeros_like(x, device="cuda", dtype=x.dtype)
+    y = torch.empty_like(x, device="cuda", dtype=x.dtype)
 
     MAX_FUSED_SIZE = 65536 // x.element_size()
     blk_size = min(MAX_FUSED_SIZE, triton.next_power_of_2(n_cols))
