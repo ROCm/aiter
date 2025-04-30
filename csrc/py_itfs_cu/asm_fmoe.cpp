@@ -498,6 +498,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                 const auto &config = it->second;
                 const char *name = config.name.c_str();
                 const char *co_name = config.co_name.c_str();
+                printf("name:%s co_name:%s\n", name, co_name);
 
                 auto result = impl_ptr_map.emplace(name, nullptr);
                 if (result.second)
@@ -526,11 +527,13 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             {128, {"fmoe_fp8_g1u1_multix_subGU_128", "fmoe_fp8_g1u1_multix_subGU_128.co", 128}}};
 
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
-            {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe/silu/fmoe_fp8_g1u1_subGU_512.co", 512}},
+            // {512, {"fmoe_fp8_g1u1_subGU_512", "fmoe/silu/fmoe_fp8_g1u1_subGU_512.co", 512}},
+            {512, {"fmoe_fp8_g1u1_subGU_512_f16", "fmoe/silu/fmoe_fp8_g1u1_subGU_512_f16.co", 512}},
             {448, {"fmoe_fp8_g1u1_subGU_448", "fmoe/silu/fmoe_fp8_g1u1_subGU_448.co", 448}},
             {384, {"fmoe_fp8_g1u1_subGU_384", "fmoe/silu/fmoe_fp8_g1u1_subGU_384.co", 384}},
             {320, {"fmoe_fp8_g1u1_subGU_320", "fmoe/silu/fmoe_fp8_g1u1_subGU_320.co", 320}},
-            {256, {"fmoe_fp8_g1u1_subGU_256", "fmoe/silu/fmoe_fp8_g1u1_subGU_256.co", 256}},
+            // {256, {"fmoe_fp8_g1u1_subGU_256", "fmoe/silu/fmoe_fp8_g1u1_subGU_256.co", 256}},
+            {256, {"fmoe_fp8_g1u1_subGU_256_f16", "fmoe/silu/fmoe_fp8_g1u1_subGU_256_f16.co", 256}},
             {192, {"fmoe_fp8_g1u1_subGU_192", "fmoe/silu/fmoe_fp8_g1u1_subGU_192.co", 192}},
             {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe/silu/fmoe_fp8_g1u1_subGU_128.co", 128}}};
 
@@ -567,6 +570,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                 const auto &config = it->second;
                 const char *name = config.name.c_str();
                 const char *co_name = config.co_name.c_str();
+                printf("name:%s co_name:%s\n", name, co_name);
 
                 auto result = impl_ptr_map.emplace(name, nullptr);
                 if (result.second)

@@ -69,6 +69,7 @@ def asm_moe(hidden_states,
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting_ck(topk_ids, topk_weight, global_E,
                                                                                            model_dim, dtype, BLOCK_SIZE_M, expert_mask)
 
+    print("cvt moe_buf to f16==================.")
     if fc1_scale is None:
         # pure bf16
         aiter.fmoe(moe_buf, hidden_states, w1, w2, sorted_ids,
@@ -179,6 +180,8 @@ def asm_moe(hidden_states,
         else:
             raise ValueError(
                 f"Invalid MoE weight: {w1.shape=} {w2.shape=} {lastdim_mul}")
+
+        moe_buf = moe_buf.to(torch.float16)
 
         fmoe_func(moe_buf, a8, w1, w2, sorted_ids,
                   sorted_weights, sorted_expert_ids, num_valid_ids,
