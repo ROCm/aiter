@@ -148,12 +148,20 @@ def tune_gemm(m, n, k, useSplitK=False):
 
 
 def tune_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False):
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
     for i in range(len(untunedf)):
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
         K = untunedf.loc[i, "K"]
 
-        if tunedf[(tunedf["M"] == M) & (tunedf["N"] == N) & (tunedf["K"] == K)].empty:
+        if tunedf[
+            (tunedf["M"] == M)
+            & (tunedf["N"] == N)
+            & (tunedf["K"] == K)
+            & (tunedf["cu_num"] == cu_num)
+        ].empty:
             kernelId, splitK, time = tune_gemm(M, N, K, useSplitK)
             kernelName = "None" if kernelId == -1 else kernels_list[kernelId].name
             temp = pd.DataFrame(
@@ -161,6 +169,7 @@ def tune_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False):
                     "M": [M],
                     "N": [N],
                     "K": [K],
+                    "cu_num": [cu_num],
                     "kernelId": [kernelId],
                     "splitK": [splitK],
                     "us": [time],
@@ -174,7 +183,7 @@ def tune_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False):
         print()
         print()
     if issorted:
-        tunedf = tunedf.sort_values(by=["M", "N", "K"])
+        tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
     print("Totall tuning result:")
     print(tunedf)
     return tunedf
