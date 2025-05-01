@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from aiter import logger
 
+pd.set_option("display.max_rows", 200)
+
 
 def perftest(
     num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -11,6 +11,7 @@ from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest, tensor_dump, benchmark
 from einops import rearrange
 from einops import repeat as eirp
+import pandas as pd
 
 block_shape = (128, 128)
 
@@ -61,6 +62,8 @@ def test_gemm(dtype, m, n, k):
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
+
+    return {"us": avg_b}
 
 
 @perftest(num_iters=5)
@@ -116,6 +119,7 @@ def test_gemm_asm(dtype, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 
+df = []
 for dtype in [dtypes.bf16]:
     # deepseek-r1
     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
@@ -130,8 +134,10 @@ for dtype in [dtypes.bf16]:
             (512, 7168),
             (4096, 512),
         ]:
-            test_gemm(dtype, m, n, k)
-
+            ret = test_gemm(dtype, m, n, k)
+            df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
 # for dtype in [dtypes.fp16]:
 #     # deepseek-r1
 #     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
