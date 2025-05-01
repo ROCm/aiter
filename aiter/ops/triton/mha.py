@@ -250,13 +250,13 @@ def _attn_fwd_inner(
             qk += (tl.dot(q, k) * descale_q * descale_k)
         else:
             qk += tl.dot(q, k)
-
+        qk_scaled =  qk * SM_SCALE
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask and causal_mask
 
-        qk = tl.where(mask, qk, float("-inf"))
+        qk_scaled = tl.where(mask, qk_scaled, float("-inf"))
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -264,16 +264,15 @@ def _attn_fwd_inner(
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
             alibi_block = compute_alibi_block(alibi_slope, seqlen_q, seqlen_k, global_m_positions,
                                               global_n_positions)
-            qk += alibi_block / SM_SCALE
+            qk_scaled += alibi_block
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
+        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
 
         # scale and subtract max
-        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
-
+        q_shifted = qk_scaled - m_ij[:, None]
+        
         # Compute scaled QK and softmax probabilities
-        p = tl.math.exp2(q_shifted)
+        p = tl.math.exp2(q_shifted * RCP_LN2)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -291,12 +290,12 @@ def _attn_fwd_inner(
         elif RETURN_SCORES:
             # NOTE: the returned score is not the same as the reference because we need to adjust as we find new maxes per block. We are not doing that
             tl.store(sd_mask_ptrs, p, mask=p_mask)
-
+        
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
-        alpha = tl.math.exp2(m_diff_scaled)
+        m_diff = m_i - m_ij
+        alpha = tl.math.exp2(m_diff * RCP_LN2)
         acc = acc * alpha[:, None]
         v = load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         # -- update m_i and l_i
