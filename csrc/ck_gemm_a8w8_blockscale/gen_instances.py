@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 from dataclasses import dataclass
@@ -16,9 +16,9 @@ from gemm_a8w8_blockscale_common import (
 )
 
 
-""" 
+"""
 
-a8w8_blockscale_gemm instance gen 
+a8w8_blockscale_gemm instance gen
 
 """
 
@@ -69,15 +69,15 @@ torch::Tensor
 
 """
 
-        INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelperF8BlockScale<        
+        INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelperF8BlockScale<
             DDataType, EDataType,
             {k.BLOCK_SIZE},
             {k.ScaleBlockM}, {k.ScaleBlockN}, {k.ScaleBlockK},
             {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
             {k.AK1}, {k.BK1},
-            {k.MPerXDL}, {k.NPerXDL}, 
-            {k.WAVE_MAP_M}, {k.WAVE_MAP_N}, 
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>, 
+            {k.MPerXDL}, {k.NPerXDL},
+            {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
+            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
             S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
@@ -237,7 +237,7 @@ def get_tune_dict(tune_dict_csv):
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
         tune_df = pd.read_csv(tune_dict_csv)
-        tune_df = tune_df[tune_df["cu_num"] == cu_num]
+        tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
