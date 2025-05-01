@@ -4,6 +4,7 @@ import numpy as np
 import sys
 import os
 from typing import Any, Callable, Dict, Optional, Tuple
+import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk
 from aiter import dtypes
@@ -137,19 +138,32 @@ def test_moe_sorting(
         sorted_expert_ids_b[expert_mask],
         msg="sorted_expert_ids",
     )
-    print(f"[passed~]")
+    return {"us": avg_b}
 
 
+import pandas as pd
+
+df = []
 print("test test_moe_sorting, no expert mask")
+for dtype in [dtypes.bf16]:
+    for m in [1, 7, 31, 64, 128, 256, 163840][:]:
+        for E in [32, 256][:]:
+            for top in [5, 8][:]:
+                ret = test_moe_sorting(dtype, m, 7168, 4096, E, top)
+                df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
+
+
+df = []
+print("test test_moe_sorting, with expert mask")
 for dtype in [dtypes.bf16]:
     for m in [1, 7, 31, 64, 128, 256, 163840]:
         for E in [32, 256]:
             for top in [5, 8]:
-                test_moe_sorting(dtype, m, 7168, 4096, E, top)
-
-print("test test_moe_sorting, with expert mask")
-for dtype in [dtypes.bf16]:
-    for m in [1, 7, 31, 64, 128, 256]:
-        for E in [32, 256]:
-            for top in [5, 8]:
-                test_moe_sorting(dtype, m, 4096, 4096, E, top, has_expert_mask=True)
+                ret = test_moe_sorting(
+                    dtype, m, 4096, 4096, E, top, has_expert_mask=True
+                )
+                df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
