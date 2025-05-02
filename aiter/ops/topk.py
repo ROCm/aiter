@@ -40,6 +40,16 @@ def grouped_topk(
     scale_factor: float = 1.0,
 ): ...
 
+@compile_ops("module_moe_asm")
+def moe_fused_gate(
+    input: Tensor,
+    bias: Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    scale_factor: float=1.0,
+): ...
 
 # this one copied from sglang
 def biased_grouped_topk_torch(

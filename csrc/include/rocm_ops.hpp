@@ -335,35 +335,35 @@
             py::arg("alibi_slopes") = std::nullopt,               \
             py::arg("gen") = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                          \
-      m.def("ck_moe_stage1", &ck_moe_stage1,           \
-            py::arg("hidden_states"),                  \
-            py::arg("w1"),                             \
-            py::arg("w2"),                             \
-            py::arg("sorted_token_ids"),               \
-            py::arg("sorted_expert_ids"),              \
-            py::arg("num_valid_ids"),                  \
-            py::arg("out"),                            \
-            py::arg("topk"),                           \
-            py::arg("w1_scale") = std::nullopt,        \
-            py::arg("a1_scale") = std::nullopt,        \
-            py::arg("block_m") = 32,                   \
-            py::arg("sorted_weights") = std::nullopt,  \
-            py::arg("act_op") = 0);                    \
-                                                       \
-      m.def("ck_moe_stage2", &ck_moe_stage2,           \
-            py::arg("inter_states"),                   \
-            py::arg("w1"),                             \
-            py::arg("w2"),                             \
-            py::arg("sorted_token_ids"),               \
-            py::arg("sorted_expert_ids"),              \
-            py::arg("num_valid_ids"),                  \
-            py::arg("out"),                            \
-            py::arg("topk"),                           \
-            py::arg("w2_scale") = std::nullopt,        \
-            py::arg("a2_scale") = std::nullopt,        \
-            py::arg("block_m") = 32,                   \
-            py::arg("sorted_weights") = std::nullopt); \
+#define MOE_CK_2STAGES_PYBIND                         \
+      m.def("ck_moe_stage1", &ck_moe_stage1,          \
+            py::arg("hidden_states"),                 \
+            py::arg("w1"),                            \
+            py::arg("w2"),                            \
+            py::arg("sorted_token_ids"),              \
+            py::arg("sorted_expert_ids"),             \
+            py::arg("num_valid_ids"),                 \
+            py::arg("out"),                           \
+            py::arg("topk"),                          \
+            py::arg("w1_scale") = std::nullopt,       \
+            py::arg("a1_scale") = std::nullopt,       \
+            py::arg("block_m") = 32,                  \
+            py::arg("sorted_weights") = std::nullopt, \
+            py::arg("act_op") = 0);                   \
+                                                      \
+      m.def("ck_moe_stage2", &ck_moe_stage2,          \
+            py::arg("inter_states"),                  \
+            py::arg("w1"),                            \
+            py::arg("w2"),                            \
+            py::arg("sorted_token_ids"),              \
+            py::arg("sorted_expert_ids"),             \
+            py::arg("num_valid_ids"),                 \
+            py::arg("out"),                           \
+            py::arg("topk"),                          \
+            py::arg("w2_scale") = std::nullopt,       \
+            py::arg("a2_scale") = std::nullopt,       \
+            py::arg("block_m") = 32,                  \
+            py::arg("sorted_weights") = std::nullopt);
 
 #define MOE_CK_PYBIND                                                               \
       m.def("ck_moe", &ck_moe,                                                      \
@@ -390,6 +390,12 @@
             py::arg("num_expert_group"), py::arg("topk_grp"),                    \
             py::arg("need_renorm"),                                              \
             py::arg("routed_scaling_factor") = 1.0f,                             \
+            "Apply biased grouped topk softmax to the gating outputs.");         \
+      m.def("moe_fused_gate", &moe_fused_gate,                                   \
+            py::arg("input"), py::arg("bias"),                                   \
+            py::arg("num_expert_group"), py::arg("topk_group"),                  \
+            py::arg("topk"), py::arg("n_share_experts_fusion"),                  \
+            py::arg("routed_scaling_factor") = 1.0,                              \
             "Apply biased grouped topk softmax to the gating outputs.");         \
       m.def("moe_align_block_size", &moe_align_block_size,                       \
             "Aligning the number of tokens to be processed by each expert such " \
@@ -561,16 +567,16 @@
       m.def("rocb_mm", &RocSolIdxBlas, "mm");                                        \
       m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
-#define AITER_ENUM_PYBIND                               \
-      pybind11::enum_<QuantType>(m, "QuantType")        \
-          .value("No", QuantType::No)                   \
-          .value("per_Tensor", QuantType::per_Tensor)   \
-          .value("per_Token", QuantType::per_Token)     \
-          .value("per_1x128", QuantType::per_1x128)     \
-          .value("per_128x128", QuantType::per_128x128) \
-          .export_values();                             \
-      pybind11::enum_<ActivationType>(m, "ActivationType")  \
-          .value("No", ActivationType::No)                  \
-          .value("Silu", ActivationType::Silu)              \
-          .value("Gelu", ActivationType::Gelu)              \
+#define AITER_ENUM_PYBIND                                  \
+      pybind11::enum_<QuantType>(m, "QuantType")           \
+          .value("No", QuantType::No)                      \
+          .value("per_Tensor", QuantType::per_Tensor)      \
+          .value("per_Token", QuantType::per_Token)        \
+          .value("per_1x128", QuantType::per_1x128)        \
+          .value("per_128x128", QuantType::per_128x128)    \
+          .export_values();                                \
+      pybind11::enum_<ActivationType>(m, "ActivationType") \
+          .value("No", ActivationType::No)                 \
+          .value("Silu", ActivationType::Silu)             \
+          .value("Gelu", ActivationType::Gelu)             \
           .export_values();

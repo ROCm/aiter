@@ -29,6 +29,15 @@ void grouped_topk(
     std::string scoring_func = "softmax",
     const float routed_scaling_factor = 1.);
 
+std::vector<at::Tensor> moe_fused_gate(
+    at::Tensor &input,
+    at::Tensor &bias,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t n_share_experts_fusion,
+    double routed_scaling_factor);
+
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           int64_t block_size, torch::Tensor sorted_token_ids,
                           torch::Tensor experts_ids,
