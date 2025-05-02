@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 #include <torch/all.h>
@@ -9,6 +9,15 @@ const auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
 #else
 const auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 #endif
+
+// clang-format off
+template <typename T> struct t2ck;
+template <> struct t2ck<float> { using type = ck_tile::fp32_t; };
+template <> struct t2ck<c10::Half> { using type = ck_tile::fp16_t; };
+template <> struct t2ck<c10::BFloat16> { using type = ck_tile::bf16_t; };
+template <> struct t2ck<int32_t> { using type = ck_tile::index_t; };
+template <> struct t2ck<int8_t> { using type = ck_tile::int8_t; };
+// clang-format on
 
 // common utility functions
 #define FOREACH_BUFFER_TORCH_TYPE_MAP(F) \
