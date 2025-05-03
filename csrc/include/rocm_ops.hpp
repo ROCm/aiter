@@ -336,6 +336,28 @@
             py::arg("alibi_slopes") = std::nullopt,               \
             py::arg("gen") = std::nullopt);
 
+#define MHA_BATCH_PREFILL_PYBIND                      \
+      m.def("mha_batch_prefill", &aiter::torch_itfs::mha_batch_prefill,  \
+            py::arg("q"), py::arg("k"), py::arg("v"),                    \
+            py::arg("cu_seqlens_q"),                                     \
+            py::arg("kv_indptr"),                                        \
+            py::arg("kv_page_indices"),                                  \
+            py::arg("max_seqlen_q"),                                     \
+            py::arg("max_seqlen_k"),                                     \
+            py::arg("dropout_p"),                                        \
+            py::arg("softmax_scale"),                                    \
+            py::arg("logits_soft_cap"),                                  \
+            py::arg("zero_tensors"),                                     \
+            py::arg("is_causal"),                                        \
+            py::arg("window_size_left"),                                 \
+            py::arg("window_size_right"),                                \
+            py::arg("return_softmax_lse"),                               \
+            py::arg("return_dropout_randval"),                           \
+            py::arg("out") = std::nullopt,                               \
+            py::arg("bias") = std::nullopt,                              \
+            py::arg("alibi_slopes") = std::nullopt,                      \
+            py::arg("gen") = std::nullopt);
+
 #define MOE_CK_2STAGES_PYBIND                          \
       m.def("ck_moe_stage1", &ck_moe_stage1,           \
             py::arg("hidden_states"),                  \
