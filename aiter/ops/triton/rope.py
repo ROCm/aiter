@@ -2123,13 +2123,13 @@ def _rope_cached_thd_positions_2c_fwd(
     else:
         have_nope = False
 
-    #TODO: create heuristics for SPLIT_SEQ_SIZE based on H and h and d
+    #TODO: create heuristics for SPLIT_SEQ_SIZE based h and d
     SPLIT_SEQ_SIZE = 32
     grid = (h, triton.cdiv(t, SPLIT_SEQ_SIZE), 1)
     num_warps = 4
     waves_per_eu = 0
-    #TODO: add a new kernel for NOEX
-    _rope_fwd_kernel_gptj_cached_thd_position_2c[grid](x, y,  cos, sin, positions, out_x, out_y,
+    if rotate_style == RotateStyle.GPTJ:
+        _rope_fwd_kernel_gptj_cached_thd_position_2c[grid](x, y,  cos, sin, positions, out_x, out_y,
                                     *x.stride(), *cos.stride(),*positions.stride(), *out_x.stride(), 
                                     reuse_freqs_front_part = reuse_freqs_front_part, 
                                     SEQ_LEN = t,
@@ -2138,6 +2138,10 @@ def _rope_cached_thd_positions_2c_fwd(
                                     SPLIT_SEQ_SIZE = SPLIT_SEQ_SIZE,
                                     num_warps = num_warps,
                                     waves_per_eu = waves_per_eu)
+    elif rotate_style == RotateStyle.NEOX:
+        #TODO: add a new kernel for NOEX    
+        raise NotImplementedError("NEOX ratate style has not been implemented.")
+    
     return out_x, out_y
 
 def rope_cached_thd_positions_2c_fwd(
