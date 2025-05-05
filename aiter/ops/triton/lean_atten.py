@@ -15,9 +15,7 @@ TO be added features:
     -
 """
 
-import pytest
 import torch
-import sys
 
 import triton
 import triton.language as tl
@@ -60,7 +58,7 @@ def persistent_lean_attention(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
-    la_fwd = la_persistent[grid](
+    la_persistent[grid](
         q,
         k,
         v,

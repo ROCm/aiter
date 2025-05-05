@@ -1,8 +1,6 @@
 import sys
-import numpy as np
 import pytest
 import torch
-import triton
 
 from aiter.ops.triton.lean_atten import persistent_lean_attention
 
