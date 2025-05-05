@@ -173,7 +173,7 @@ def parse_args():
     # parser.add_argument('--model-configs', type=str, default="utils/model_configs.json",
     #         help="Model config json file.")
     # parser.add_argument('--model', type=str, help=model_help)
-    parser.add_argument("--shape", type=int, nargs=3, metavar=("B", "S", "H", "D"),
+    parser.add_argument("--shape", type=int, nargs=4, metavar=("B", "S", "H", "D"),
             help="user-defined shape to benchmark")
     parser.add_argument("--metric", type=str, choices=["time", "throughput", "ban-dwidth"],
             default="bandwidth", help="metric to plot")
