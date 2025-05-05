@@ -4,7 +4,7 @@ import triton
 import torch.nn.functional as F
 from aiter.ops.triton.rmsnorm import rms_norm
 from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add
-from aiter.ops.triton.rmsnorm import rms_norm_dynamic_fp8_per_token_quant
+from aiter.ops.triton.rmsnorm import rms_norm_dynamic_per_token_fp8_quant
 
 #TODO: Move to a share utils file to avoid duplication for other tests
 def torch_dynamic_per_token_fp8_quant(x):
@@ -159,7 +159,7 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
 @pytest.mark.parametrize("T", [128, 512, 2048])
 @pytest.mark.parametrize("D", [64, 4096])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_rms_norm_fp8_rowwise_quant(
+def test_rms_norm_dynamic_per_token_fp8_quant(
     B: int, T: int, D: int, dtype: torch.dtype
 ) -> None:
     B_T = B * T
@@ -175,7 +175,7 @@ def test_rms_norm_fp8_rowwise_quant(
     EPS = 1e-5
 
     xq_fused_triton, x_scale_fused, x_normed = (
-        rms_norm_dynamic_fp8_per_token_quant(x, w, dump_rms_norm=True)
+        rms_norm_dynamic_per_token_fp8_quant(x, w, dump_rms_norm=True)
     )
     ref_x_normed, _ = run_torch(x, w, EPS)
     ref_xq, ref_x_scale = torch_dynamic_per_token_fp8_quant(x)

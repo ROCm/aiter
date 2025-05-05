@@ -337,7 +337,7 @@ def rmsnorm2d_fwd_with_add(
 
 
 @triton.jit
-def _rms_norm_dynamic_fp8_per_token_quant_kernel(
+def _rms_norm_dynamic_per_token_fp8_quant_kernel(
     x_ptr,
     o_ptr,
     w_ptr,
@@ -395,7 +395,7 @@ def _rms_norm_dynamic_fp8_per_token_quant_kernel(
             mask=mask,
         )
 
-def rms_norm_dynamic_fp8_per_token_quant(
+def rms_norm_dynamic_per_token_fp8_quant(
     x: torch.Tensor,
     w: torch.Tensor,
     eps: float = 1.0e-5,
@@ -422,7 +422,7 @@ def rms_norm_dynamic_fp8_per_token_quant(
     if dump_rms_norm:
         out_rms_norm = torch.empty_like(x)
 
-    _rms_norm_dynamic_fp8_per_token_quant_kernel[(B_T,)](
+    _rms_norm_dynamic_per_token_fp8_quant_kernel[(B_T,)](
         x,
         out,
         w,
