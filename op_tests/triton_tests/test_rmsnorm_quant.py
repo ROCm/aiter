@@ -6,6 +6,8 @@ from aiter.ops.triton.rmsnorm import rms_norm
 from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add
 from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_smoothquant
 from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_dynamicquant
+from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add_smoothquant
+from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add_dynamicquant
 
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
@@ -55,7 +57,7 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
             rmsnorm2d_fwd_with_dynamicquant(output, input, y_scale, weight, eps)
         elif residual is not None:
             residual_out = torch.empty_like(input)
-            aiter.rmsnorm2d_fwd_with_add_dynamicquant(
+            rmsnorm2d_fwd_with_add_dynamicquant(
                 output, input, residual, residual_out, y_scale, weight, eps
             )
     else:
@@ -66,7 +68,7 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
             rmsnorm2d_fwd_with_smoothquant(output, input, x_scale, y_scale, weight, eps)
         else:
             residual_out = torch.empty_like(input)
-            out_before_quant = torch.empty_like(input)
+            # out_before_quant = torch.empty_like(input)
             rmsnorm2d_fwd_with_add_smoothquant(
                 output,
                 input,
@@ -76,16 +78,14 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
                 y_scale,
                 weight,
                 eps,
-                out_before_quant=out_before_quant,
+                # out_before_quant=out_before_quant,
             )
-    return output, residual_out, y_scale, out_before_quant
+    return output, residual_out, y_scale  # , out_before_quant
 
 
-@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
-@pytest.mark.parametrize("scale_dtype_str", ["fp32"])
-@pytest.mark.parametrize(
-    "M, N",
-    [
+def get_vals():
+
+    vals = [
         (1, 4),
         (2, 10),
         (8192, 4096),
@@ -97,7 +97,16 @@ def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=No
         (873, 1245),
         (23153, 45),
         (89999, 234),
-    ],
+    ]
+
+    return vals
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("scale_dtype_str", ["fp32"])
+@pytest.mark.parametrize(
+    "M, N",
+    [(shape) for shape in get_vals()],
 )
 def test_rmsnorm_smoothquant(M, N, in_dtype_str, scale_dtype_str):
     arg_to_torch_dtype = {
@@ -129,19 +138,7 @@ def test_rmsnorm_smoothquant(M, N, in_dtype_str, scale_dtype_str):
 @pytest.mark.parametrize("scale_dtype_str", ["fp32"])
 @pytest.mark.parametrize(
     "M, N",
-    [
-        (1, 4),
-        (2, 10),
-        (8192, 4096),
-        (4096, 8192),
-        (8000, 8000),
-        (1, 31744),
-        (3, 65536),
-        (1, 131072),
-        (873, 1245),
-        (23153, 45),
-        (89999, 234),
-    ],
+    [(shape) for shape in get_vals()],
 )
 def test_rmsnorm_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     arg_to_torch_dtype = {
@@ -165,4 +162,71 @@ def test_rmsnorm_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     )
 
     triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("scale_dtype_str", ["fp32"])
+@pytest.mark.parametrize(
+    "M, N",
+    [(shape) for shape in get_vals()],
+)
+def test_rmsnorm_fused_add_smoothquant(M, N, in_dtype_str, scale_dtype_str):
+    arg_to_torch_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    in_dtype = arg_to_torch_dtype[in_dtype_str]
+    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+
+    torch.manual_seed(0)
+
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    weight = torch.randn(N, device="cuda", dtype=in_dtype)
+    res = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    x_scale = torch.randn(N, device="cuda", dtype=scale_dtype)
+
+    (y_torch, res_torch, yscale_torch, *_) = run_torch(
+        x, weight, 1e-5, residual=res, x_scale=x_scale, y_scale_dtype=scale_dtype
+    )
+    (y_triton, res_triton, yscale_triton, *_) = run_triton(
+        x, weight, 1e-5, residual=res, x_scale=x_scale, y_scale_dtype=scale_dtype
+    )
+
+    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
+    triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("scale_dtype_str", ["fp32"])
+@pytest.mark.parametrize(
+    "M, N",
+    [(shape) for shape in get_vals()],
+)
+def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
+    arg_to_torch_dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    in_dtype = arg_to_torch_dtype[in_dtype_str]
+    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+
+    torch.manual_seed(0)
+
+    x = torch.randn(M, N, device="cuda", dtype=in_dtype)
+    weight = torch.randn(N, device="cuda", dtype=in_dtype)
+    res = torch.randn(M, N, device="cuda", dtype=in_dtype)
+
+    (y_torch, res_torch, yscale_torch, *_) = run_torch(
+        x, weight, 1e-5, residual=res, y_scale_dtype=scale_dtype
+    )
+    (y_triton, res_triton, yscale_triton, *_) = run_triton(
+        x, weight, 1e-5, residual=res, y_scale_dtype=scale_dtype
+    )
+
+    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    triton.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
     triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
