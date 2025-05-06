@@ -269,7 +269,6 @@ def build_module(
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
             "-Wno-macro-redefined",
-            "-Wpass-failed=no-transform-warning",
             "-fgpu-flush-denormals-to-zero",
         ]
 
