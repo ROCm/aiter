@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import re
 import os
@@ -17,9 +17,11 @@ import multiprocessing
 from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, f'{this_dir}/utils/')
+sys.path.insert(0, f"{this_dir}/utils/")
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
+from chip_info import get_gfx
+
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 
@@ -83,15 +85,14 @@ AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
 AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
-CK_3RDPARTY_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
+CK_3RDPARTY_DIR = os.environ.get(
+    "CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel"
+)
 
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    import torch
-
-    device = torch.cuda.current_device()
-    gfx = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    gfx = get_gfx()
     global AITER_ASM_DIR
     AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/{gfx}/"
     os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
@@ -198,10 +199,13 @@ def get_module(md_name):
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
 
+
 rebuilded_list = ["module_aiter_enum"]
+
 
 def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+
 
 @functools.lru_cache()
 def recopy_ck():
@@ -209,8 +213,10 @@ def recopy_ck():
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
 
+
 def clear_build(md_name):
     os.system(f"rm -rf {bd_dir}/{md_name}")
+
 
 def build_module(
     md_name,
@@ -348,7 +354,7 @@ def build_module(
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
             logger.error(
-                f"{tag}↓↓↓↓↓↓↓↓↓↓\n-->[History]: {{}}{tag}↑↑↑↑↑↑↑↑↑↑".format(
+                f"{tag}??????????\n-->[History]: {{}}{tag}??????????".format(
                     re.sub(
                         "error:",
                         "\033[31merror:\033[0m",
@@ -364,9 +370,7 @@ def build_module(
             f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
         )
 
-    mp_lock(
-        lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc
-    )
+    mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
 def get_args_of_build(ops_name: str, exclue=[]):

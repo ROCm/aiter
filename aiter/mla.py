@@ -9,6 +9,7 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
+from .jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -81,8 +82,7 @@ def _fwd_kernel_stage2_asm(
 @functools.lru_cache()
 def get_meta_param(num_kv_splits, device, bs, nhead):
     if num_kv_splits is None:
-        device_properties = torch.cuda.get_device_properties(device)
-        cu_num = device_properties.multi_processor_count
+        cu_num = get_cu_num()
         num_kv_splits = min(16, max(1, cu_num // bs))
 
     get_mgc = {16: 64, 128: 16}
