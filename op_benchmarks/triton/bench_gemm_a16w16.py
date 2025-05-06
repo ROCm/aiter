@@ -119,8 +119,8 @@ def parse_args():
             help="user-defined shape to benchmark")
     parser.add_argument("--metric", type=str, choices=["time", "throughput", "bandwidth"],
             default="throughput", help="metric to plot")
-    parser.add_argument("--layout", type=str, choices=["tt", "tn", "nt", "nn"],
-            default="tn", help="Layout of input and weight matrix")
+    parser.add_argument("--layout", type=str, choices=["TT", "TN", "NT", "NN"],
+            default="TN", help="Layout of input and weight matrix")
     args = parser.parse_args()
     return args
 
