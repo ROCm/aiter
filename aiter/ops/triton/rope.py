@@ -1946,7 +1946,6 @@ def _rope_cached_positions_fwd(
     transpose_output: bool = False
 ) -> torch.Tensor :
     s, b, h, d = x.shape
-    print("cached_positions_fwd")
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
             have_nope = False
@@ -2028,7 +2027,6 @@ def _rope_cached_positions_offsets_fwd(
     transpose_output: bool = False
 ) -> torch.Tensor :
     s, b, h, d = x.shape
-    print("cached_positions_fwd")
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
             have_nope = False
@@ -2158,6 +2156,24 @@ def rope_cached_thd_positions_2c_fwd(
     t, h, d = x.shape
     out_x = torch.empty((t,h,d), dtype=x.dtype, device=x.device, requires_grad=False)
     out_y = torch.empty((t,h,d), dtype=x.dtype, device=x.device, requires_grad=False)
+
+    _rope_cached_thd_positions_2c_fwd(x, y, out_x, out_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+    return out_x, out_y
+
+def rope_cached_thd_positions_2c_fwd_inplace(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+    transpose_output: bool = False 
+):
+    out_x = x
+    out_y = y
 
     _rope_cached_thd_positions_2c_fwd(x, y, out_x, out_y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
 
