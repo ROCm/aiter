@@ -16,26 +16,33 @@ from aiter.ops.triton.rope import (
     rope_cached_positions_fwd, rope_cached_positions_fwd_inplace, 
     rope_cached_positions_offsets_fwd, rope_cached_positions_offsets_fwd_inplace,
     rope_cached_thd_positions_2c_fwd, rope_cached_thd_positions_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_fwd, rope_cached_thd_positions_offsets_2c_fwd_inplace,
     rope_fwd_2d, rope_fwd_2d_inplace,
     )
 
 DEBUG_MODE = True
 
-def ref_rope_cached_thd_positions_2c_fwd(x: torch.Tensor,
+def ref_rope_cached_thd_positions_offsets_2c_fwd(x: torch.Tensor,
                                         y: torch.Tensor,
                                         cos: torch.Tensor,
                                         sin: torch.Tensor,
-                                        positions: torch.Tensor
+                                        positions: torch.Tensor,
+                                        offsets: torch.Tensor = None
                                 ) -> torch.Tensor:
     """
     Args:
         x: [num_tokens, num_heads, head_size]
         cos: [num_tokens, head_size // 2]
         sin: [num_tokens, head_size // 2]
-        positions: [num_tokens,]
+        positions: [num_tokens, ]
+        offsets: [num_tokens, ]
     """
-    cos = cos[positions]
-    sin = sin[positions]
+    if offsets is None:
+        cos = cos[positions]
+        sin = sin[positions]
+    else:
+        cos = cos[positions + offsets]
+        sin = sin[positions + offsets]
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
 
@@ -235,20 +242,65 @@ def test_rope_fwd_cached_thd_position_2c(T: int, H: int, D: int, rotate_style: R
         freqs_D = D // 2
     freqs = torch.randn((T, freqs_D), dtype=dtype, device="cuda")
 
-    positions = torch.randint(0,  T, (T,), device="cuda") 
-    #positions = torch.arange(0,  T, device="cuda") 
+    positions = torch.randint(0, T, (T, ), device="cuda")
+    offsets = torch.randint(int(T * -0.25), int(T * 0.25), (T, ), device="cuda")
+
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
 
-    torch_out_x, torch_out_y = ref_rope_cached_thd_positions_2c_fwd(x, y, cos, sin, positions)
+    torch_out_x, torch_out_y = ref_rope_cached_thd_positions_offsets_2c_fwd(x, y, cos, sin, positions)
     if DEBUG_MODE:
         print(f"torch_out_x={torch_out_x}")
         print(f"torch_out_y={torch_out_y}")
 
     if inplace:
-        triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd_inplace(x, y, cos, sin, positions,  rotate_style=rotate_style, reuse_freqs_front_part=reuse_freqs_front_part, nope_first=False, transpose_output=False)        
+        triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd_inplace(x, y, cos, sin, positions, rotate_style=rotate_style, reuse_freqs_front_part=reuse_freqs_front_part, nope_first=False, transpose_output=False)        
     else:
-        triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd(x, y, cos, sin, positions,  rotate_style=rotate_style, reuse_freqs_front_part=reuse_freqs_front_part, nope_first=False, transpose_output=False)
+        triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd(x, y, cos, sin, positions, rotate_style=rotate_style, reuse_freqs_front_part=reuse_freqs_front_part, nope_first=False, transpose_output=False)
+    if DEBUG_MODE:
+        print(f"triton_out_x={triton_out_x}")
+        print(f"triton_out_y={triton_out_y}")
+
+    torch.testing.assert_close(triton_out_x, torch_out_x,atol=1e-3, rtol=1e-1)
+    torch.testing.assert_close(triton_out_y, torch_out_y,atol=1e-3, rtol=1e-1)
+
+@pytest.mark.parametrize('T', [(4), (6), (100), (320), (500)])
+@pytest.mark.parametrize('H', [1, 8, 32])
+@pytest.mark.parametrize('D', [4, 64, 128])  #For now, D is power of 2.
+#@pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
+@pytest.mark.parametrize('rotate_style', [RotateStyle.GPTJ])
+#@pytest.mark.parametrize('nope, nope_first', [(False, False)])
+#@pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
+# @pytest.mark.parametrize('reuse_freqs_front_part', [True])
+@pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize('inplace',[True, False])
+#@pytest.mark.parametrize('positions, offsets',[(False, False), (True,False), (True,True)])
+def test_rope_fwd_cached_thd_position_offsets_2c(T: int, H: int, D: int, rotate_style: RotateStyle, dtype: torch.dtype, inplace: bool):
+    torch.manual_seed(20)
+    x = torch.randn((T, H, D), dtype=dtype, device="cuda")
+    y = torch.randn((T, H, D), dtype=dtype, device="cuda")
+
+    reuse_freqs_front_part = True
+
+    if reuse_freqs_front_part:
+        freqs_D = D // 2
+    freqs = torch.randn((T, freqs_D), dtype=dtype, device="cuda")
+
+    positions = torch.randint(int(T * 0.25), int(T * 0.75), (T, ), device="cuda")
+    offsets  = torch.randint(int(T * -0.25), int(T * 0.25), (T, ), device="cuda")
+    
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+
+    torch_out_x, torch_out_y = ref_rope_cached_thd_positions_offsets_2c_fwd(x, y, cos, sin, positions, offsets)
+    if DEBUG_MODE:
+        print(f"torch_out_x={torch_out_x}")
+        print(f"torch_out_y={torch_out_y}")
+
+    if inplace:
+        triton_out_x, triton_out_y = rope_cached_thd_positions_offsets_2c_fwd_inplace(x, y, cos, sin, positions, offsets, rotate_style=rotate_style, reuse_freqs_front_part=reuse_freqs_front_part, nope_first=False, transpose_output=False)        
+    else:
+        triton_out_x, triton_out_y = rope_cached_thd_positions_offsets_2c_fwd(x, y, cos, sin, positions, offsets, rotate_style=rotate_style, reuse_freqs_front_part=reuse_freqs_front_part, nope_first=False, transpose_output=False)
     if DEBUG_MODE:
         print(f"triton_out_x={triton_out_x}")
         print(f"triton_out_y={triton_out_y}")

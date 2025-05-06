@@ -263,10 +263,10 @@ class RotaryEmbedding(nn.Module):
         num_tokens = positions.numel()
 
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size) # fixed to thd layout
+        query = query.view(num_tokens, -1, self.head_size)
         if key is not None:
             key_shape = key.shape
-            key = key.view(num_tokens, -1, self.head_size) # fixed to thd layout
+            key = key.view(num_tokens, -1, self.head_size)
 
         positions = positions.view(*query.shape[:2])
         if offsets is not None:
@@ -293,8 +293,7 @@ class RotaryEmbedding(nn.Module):
                     nope_first=is_nope_first,
                 )
             else:
-                raise NotImplementedError("RoPE style not implemented yet")
-                ops.rope_cached_positions_offsets_2c_fwd_inplace(
+                ops.rope_cached_thd_positions_offsets_2c_fwd_inplace(
                     query_,
                     key_,
                     cos,

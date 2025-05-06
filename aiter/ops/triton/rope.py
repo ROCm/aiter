@@ -1617,7 +1617,95 @@ def _rope_fwd_kernel_gptj_cached_thd_position_2c(x_ptr: torch.Tensor,
     #store output for this batch and head (s, 1, 1, d)
     tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
     tl.store(out_y_ptr + x_offs, out_y, mask=x_mask)
-   
+
+
+@triton.jit
+def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(x_ptr: torch.Tensor,
+                y_ptr: torch.Tensor,
+                cos_ptr: torch.Tensor,
+                sin_ptr: torch.Tensor,
+                pos_ptr: torch.Tensor,
+                off_ptr: torch.Tensor,
+                out_x_ptr: torch.Tensor,
+                out_y_ptr: torch.Tensor,
+                stride_x_t, stride_x_h, stride_x_d,
+                stride_cos_t, stride_cos_d,
+                stride_pos_t, 
+                stride_out_t, stride_out_h, stride_out_d,
+                reuse_freqs_front_part: tl.constexpr,
+                SEQ_LEN, #: tl.constexpr,  # assume SEQ_LEN is a variable
+                D_MODEL: tl.constexpr,
+                D_MODEL_HALF: tl.constexpr,
+                SPLIT_SEQ_SIZE: tl.constexpr,
+):
+    #Parallelize over head. Handle 1 sequence per program
+    h = tl.program_id(0)
+    s = tl.program_id(1)
+
+    #Load cos for this head
+    pos_offs = s * SPLIT_SEQ_SIZE + tl.arange(0, SPLIT_SEQ_SIZE)
+    pos_mask = pos_offs < SEQ_LEN
+    pos = tl.load(pos_ptr + pos_offs, mask=pos_mask)
+    offset = tl.load(off_ptr + pos_offs, mask=pos_mask)
+    cos_offs_t = pos + offset
+
+    if reuse_freqs_front_part:
+        cos_offs_d = tl.arange(0, D_MODEL) // 2
+        cos_mask_d = cos_offs_d < D_MODEL_HALF
+    else:
+        cos_offs_d = tl.arange(0, D_MODEL)
+        cos_mask_d = cos_offs_d < D_MODEL
+
+    cos_mask = (cos_offs_t < SEQ_LEN)[:, None] & (cos_mask_d)[None, :]
+    cos_offs = (stride_cos_t * cos_offs_t[:, None] +
+                stride_cos_d * cos_offs_d[None, :])
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+
+    #Load X [SEQ_LEN, D_MODEL]
+    x_offs_t = s * SPLIT_SEQ_SIZE + tl.arange(0, SPLIT_SEQ_SIZE)
+    x_offs_d = tl.arange(0, D_MODEL)
+    x_offs = (x_offs_t[:, None] * stride_x_t + 
+            stride_x_h*h +
+            x_offs_d[None, :] * stride_x_d)
+    x_mask = (x_offs_t < SEQ_LEN)[:, None] &  (x_offs_d < D_MODEL)[None, :]
+
+    # x = tl.load(x_ptr + x_offs, mask=x_mask)
+    # y = tl.load(y_ptr + x_offs, mask=x_mask)
+    
+    #Load rotated.
+    #X1 = even idx of x, [D_MODEL/2]
+    #X2 = odd idx of x, [D_MODEL/2]
+    x1_offs_d_rotated = tl.arange(0, D_MODEL_HALF) * 2
+    x1_offs_rotated = (x_offs_t[:, None] * stride_x_t + 
+            stride_x_h*h +
+            x1_offs_d_rotated[None, :] * stride_x_d)
+    x1_mask_rotated = (x_offs_t < SEQ_LEN)[:, None] &  (x1_offs_d_rotated < D_MODEL)[None, :]
+    x1 = tl.load(x_ptr + x1_offs_rotated, mask=x1_mask_rotated)
+    y1 = tl.load(y_ptr + x1_offs_rotated, mask=x1_mask_rotated)
+
+    x2_offs_rotated = (x_offs_t[:, None] * stride_x_t + 
+            stride_x_h*h +
+            (x1_offs_d_rotated + 1)[None, :] * stride_x_d)
+    x2_mask_rotated = (x_offs_t < SEQ_LEN)[:, None] &  ((x1_offs_d_rotated + 1) < D_MODEL)[None, :]
+    x2 = tl.load(x_ptr + (x2_offs_rotated), mask=x2_mask_rotated)
+    y2 = tl.load(y_ptr + (x2_offs_rotated), mask=x2_mask_rotated)
+    x = tl.interleave(x1, x2)
+    y = tl.interleave(y1, y2)
+    x2 = -x2
+    x_rotated = tl.interleave(x2, x1)
+    y2 = -y2
+    y_rotated = tl.interleave(y2, y1)
+
+    #compute output
+    out_x = x * cos + x_rotated * sin
+    out_x = out_x.to(x_ptr.dtype.element_ty)
+    out_y = y * cos + y_rotated * sin
+    out_y = out_y.to(y_ptr.dtype.element_ty)
+
+    #store output for this batch and head (s, 1, 1, d)
+    tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
+    tl.store(out_y_ptr + x_offs, out_y, mask=x_mask)
 
 
 @triton.jit
@@ -2109,7 +2197,7 @@ def _rope_cached_thd_positions_2c_fwd(
     reuse_freqs_front_part : bool,
     nope_first : bool,
     transpose_output: bool = False
-) -> torch.Tensor :
+):
     t, h, d = x.shape
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
@@ -2179,6 +2267,92 @@ def rope_cached_thd_positions_2c_fwd_inplace(
 
     return out_x, out_y
 
+def _rope_cached_thd_positions_offsets_2c_fwd(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    out_x: torch.Tensor,
+    out_y: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    offsets: torch.Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+    transpose_output: bool = False
+):
+    t, h, d = x.shape
+    if cos.shape[-1] == d // 2:
+        if reuse_freqs_front_part:
+            have_nope = False
+        else:
+            have_nope = True
+    elif cos.shape[-1] == d // 4:
+        have_nope = True
+    else:
+        have_nope = False
+
+    #TODO: create heuristics for SPLIT_SEQ_SIZE based h and d
+    SPLIT_SEQ_SIZE = 32
+    grid = (h, triton.cdiv(t, SPLIT_SEQ_SIZE), 1)
+    num_warps = 4
+    waves_per_eu = 0
+    if rotate_style == RotateStyle.GPTJ:
+        _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c[grid](x, y,  cos, sin, positions, offsets, out_x, out_y,
+                                    *x.stride(), *cos.stride(), *positions.stride(), *out_x.stride(), 
+                                    reuse_freqs_front_part = reuse_freqs_front_part, 
+                                    SEQ_LEN = t,
+                                    D_MODEL = d,
+                                    D_MODEL_HALF = d // 2,
+                                    SPLIT_SEQ_SIZE = SPLIT_SEQ_SIZE,
+                                    num_warps = num_warps,
+                                    waves_per_eu = waves_per_eu)
+    elif rotate_style == RotateStyle.NEOX:
+        #TODO: add a new kernel for NOEX    
+        raise NotImplementedError("NEOX ratate style has not been implemented.")
+    
+    return out_x, out_y
+
+
+def rope_cached_thd_positions_offsets_2c_fwd(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    offsets: torch.Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+    transpose_output: bool = False 
+):
+    t, h, d = x.shape
+    out_x = torch.empty((t,h,d), dtype=x.dtype, device=x.device, requires_grad=False)
+    out_y = torch.empty((t,h,d), dtype=x.dtype, device=x.device, requires_grad=False)
+
+    _rope_cached_thd_positions_offsets_2c_fwd(x, y, out_x, out_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+    return out_x, out_y
+
+def rope_cached_thd_positions_offsets_2c_fwd_inplace(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    offsets: torch.Tensor,
+    rotate_style: int,
+    reuse_freqs_front_part : bool,
+    nope_first : bool,
+    transpose_output: bool = False 
+):
+    out_x = x
+    out_y = y
+    
+    _rope_cached_thd_positions_offsets_2c_fwd(x, y, out_x, out_y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+    return out_x, out_y
+        
 def _rope_fwd_2d(
     x: torch.Tensor,
     out: torch.Tensor,

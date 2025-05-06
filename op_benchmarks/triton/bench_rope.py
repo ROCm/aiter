@@ -12,6 +12,7 @@ from aiter.ops.triton.rope import (
     rope_cached_positions_fwd, rope_cached_positions_fwd_inplace, 
     rope_cached_positions_offsets_fwd, rope_cached_positions_offsets_fwd_inplace,
     rope_cached_thd_positions_2c_fwd, rope_cached_thd_positions_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_fwd, rope_cached_thd_positions_offsets_2c_fwd_inplace,
     rope_fwd_2d, rope_fwd_2d_inplace,
     )
 
@@ -139,11 +140,17 @@ def run_benchmark(args):
         
         transpose_output = False
         fn = None 
-        if two_inputs and cached and pos and not offs and layout == "thd":
-            if inplace:
-                fn = lambda: rope_cached_thd_positions_2c_fwd_inplace(x, y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+        if two_inputs and cached and pos and layout == "thd":
+            if offs:
+                if inplace:
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace(x, y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                else:
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd(x, y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
             else:
-                fn = lambda: rope_cached_thd_positions_2c_fwd(x, y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                if inplace:
+                    fn = lambda: rope_cached_thd_positions_2c_fwd_inplace(x, y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                else:
+                    fn = lambda: rope_cached_thd_positions_2c_fwd(x, y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
         
         # TODO enable these versions after passing tests in test_rope_trition.py
         # if not two_inputs and cached and pos and offs and layout == "sbhd":
