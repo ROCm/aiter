@@ -113,11 +113,11 @@ def gemm_a16w16(x,
 
     y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
+    BLOCK_SIZE_M = 256
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 64
     GROUP_SIZE_M = 4
-    waves_per_eu = 1
+    waves_per_eu = 2
     kpack = 1
     matrix_instr_nonkdim = 16
     num_warps = 8
