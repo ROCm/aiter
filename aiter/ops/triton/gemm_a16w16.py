@@ -63,8 +63,7 @@ def _gemm_a16_w16_kernel(
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
-    acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -76,7 +75,7 @@ def _gemm_a16_w16_kernel(
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        accumulator += tl.dot(a, b, input_precision="ieee")
+        accumulator += tl.dot(a, b)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -95,23 +94,23 @@ def _gemm_a16_w16_kernel(
 # Wrapper for gemm kernel.
 def gemm_a16w16(x, 
                 w, 
-                dtype: Optional[float] = torch.bfloat16,
+                y,
                 ):
     """
     Computes the 16 bit matmul Y = X x W
 
     Key parameters:
-    - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (N, K).
+    - X: Matrix with shape (M, K).
+    - W: Matrix with shape (N, K).
+    - Y: Matrix with shape (M, N).
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+    - Nothing. Output produced in Y.
     """
     
     M, K = x.shape
-    K, N = w.shape
-
-    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    _, N = w.shape
+    assert x.shape[1] == w.shape[0], "Incompatible GEMM Dimensions!!!"
 
     BLOCK_SIZE_M = 256
     BLOCK_SIZE_N = 256
@@ -148,4 +147,3 @@ def gemm_a16w16(x,
         num_stages=num_stages,
     )
 
-    return y
