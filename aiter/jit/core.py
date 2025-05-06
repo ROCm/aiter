@@ -269,6 +269,7 @@ def build_module(
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
             "-Wno-macro-redefined",
+            "-Wno-pass-failed=transform-warning",
             "-fgpu-flush-denormals-to-zero",
         ]
 
@@ -354,7 +355,7 @@ def build_module(
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
             logger.error(
-                f"{tag}??????????\n-->[History]: {{}}{tag}??????????".format(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
                     re.sub(
                         "error:",
                         "\033[31merror:\033[0m",
