@@ -8,6 +8,7 @@ import os
 import aiter
 from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from aiter.dist.parallel_state import graph_capture
+from aiter import dtypes
 import sys
 import traceback
 import logging
@@ -223,7 +224,7 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype, withGraph=False, perTKQuant=F
 
     res_in = torch.randn(shape, dtype=dtype)
     weight = torch.randn(shape[-1], dtype=dtype)
-    xscale = torch.randn(shape[-1], dtype=torch.float)
+    xscale = torch.randn(shape[-1], dtype=dtypes.fp32)
     xscale.fill_(1.0)
     bias = torch.randn(shape[-1], dtype=dtype)
     epsilon = 1e-5
@@ -304,13 +305,13 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype, withGraph=False, perTKQuant=F
 
 if __name__ == "__main__":
     mp.freeze_support()
-    # for dtype in [torch.bfloat16]:
+    # for dtype in [dtypes.bf16]:
     #     for shape in [(128, 8192)]:
     #         # test_communication(8, shape, dtype, withGraph=False)
     #         test_communication(8, shape, dtype, withGraph=True)
 
     print("start test test_communication\n")
-    for dtype in [torch.bfloat16]:
+    for dtype in [dtypes.bf16]:
         for shape in [(128, 8192)]:
             # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False)
             test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False, perTKQuant=True)

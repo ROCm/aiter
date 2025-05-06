@@ -22,6 +22,7 @@ from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
+
 def mp_lock(
     lockPath: str,
     MainFunc: callable,
@@ -85,7 +86,19 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=1)
+def get_asm_dir():
+    import torch
+
+    device = torch.cuda.current_device()
+    gfx = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    global AITER_ASM_DIR
+    AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/{gfx}/"
+    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+    return AITER_ASM_DIR
+
+
+@functools.lru_cache(maxsize=1)
 def get_user_jit_dir():
     if "JIT_WORKSPACE_DIR" in os.environ:
         path = os.getenv("JIT_WORKSPACE_DIR")
@@ -372,11 +385,6 @@ def get_args_of_build(ops_name: str, exclue=[]):
     }
 
     def convert(d_ops: dict):
-        # judge isASM
-        # if d_ops["isASM"].lower() == "true":
-        #     d_ops["flags_extra_hip"].append(
-        #         "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
-        # del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):
                 for idx, el in enumerate(val):
@@ -389,7 +397,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                 d_ops[k] = eval(val)
             else:
                 pass
-            
+
         # undefined compile features will be replaced with default value
         d_opt_build_args.update(d_ops)
         return d_opt_build_args
@@ -501,6 +509,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 return None
 
             def check_args():
+                get_asm_dir()
                 import inspect
                 import typing
                 import re

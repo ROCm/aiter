@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
+from aiter import dtypes
 
 
 @perftest()
@@ -102,13 +103,13 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     # checkAllclose(res_a, res_c, atol=0.01, msg='cu res check')
 
 
-# for dtype in [torch.float16, torch.bfloat16]:
+# for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_rmsnorm2d(dtype, m, n)
 
 print('\nstart fuse add test')
-for dtype in [torch.float16, torch.bfloat16]:
+for dtype in [dtypes.fp16, dtypes.bf16]:
     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
         for n in [4096, 8192, 16384, 32768, 65536]:
             test_rmsnorm2d_fuseAdd(dtype, m, n)

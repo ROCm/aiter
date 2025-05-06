@@ -1,35 +1,43 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from aiter.test_common import checkAllclose, perftest
 import torch
 import torch.nn.functional as F
 import numpy as np
 import sys
 import os
+from aiter import dtypes
+from aiter.test_common import checkAllclose, perftest
+
 if 1:
     _path = os.path.abspath(os.path.dirname(__file__))
-    sys.path.insert(0, f'{_path}/../../')
+    sys.path.insert(0, f"{_path}/../../")
     from aiter.tuned_gemm import tgemm
 
 
 @perftest(num_iters=10)
 def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
-    if x.dtype == torch.float8_e4m3fnuz:
+    if x.dtype == dtypes.fp8:
         if scaleA is None:
-            scaleA = torch.ones(1, dtype=torch.float, device = x.device)
+            scaleA = torch.ones(1, dtype=dtypes.fp32, device=x.device)
         if scaleB is None:
-            scaleB = torch.ones(1, dtype=torch.float, device = x.device)
-        
+            scaleB = torch.ones(1, dtype=dtypes.fp32, device=x.device)
+
         try:
-            out = torch._scaled_mm(x,
-                                    weight.t(),
-                                    out_dtype=otype,
-                                    scale_a=scaleA,
-                                    scale_b=scaleB,
-                                    bias=bias)
+            out = torch._scaled_mm(
+                x,
+                weight.t(),
+                out_dtype=otype,
+                scale_a=scaleA,
+                scale_b=scaleB,
+                bias=bias,
+            )
         except RuntimeError:
-            out = F.linear(x.to(torch.float32), weight.to(torch.float32)) * scaleA * scaleB
+            out = (
+                F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
+                * scaleA
+                * scaleB
+            )
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
     if scaleA is not None:
@@ -46,16 +54,16 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
 
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
-    x = torch.randn(m, k, dtype=otype, device='cuda').to(dtype)
-    weight = torch.rand(n, k, dtype=otype, device='cuda').to(dtype)
+    x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
+    weight = torch.rand(n, k, dtype=otype, device="cuda").to(dtype)
     if bias:
-        bias = torch.rand(n, dtype=otype, device='cuda')
+        bias = torch.rand(n, dtype=otype, device="cuda")
     else:
-        bias=None
+        bias = None
     if scaleA is not None:
-        scaleA = torch.tensor(scaleA, dtype=torch.float, device='cuda')
+        scaleA = torch.tensor(scaleA, dtype=dtypes.fp32, device="cuda")
     if scaleB is not None:
-        scaleB = torch.tensor(scaleB, dtype=torch.float, device='cuda')
+        scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
 
@@ -63,9 +71,11 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     checkAllclose(a, b, msg=msg)
 
 
-test_gemm(torch.float8_e4m3fnuz, 128, 768, 4096, bias=False, otype=torch.bfloat16, scaleA=0.5, scaleB=0.5)
-test_gemm(torch.bfloat16, 128, 32, 8192)
-# for dtype in [torch.float16, torch.bfloat16]:
+test_gemm(
+    dtypes.fp8, 128, 768, 4096, bias=False, otype=dtypes.bf16, scaleA=0.5, scaleB=0.5
+)
+test_gemm(dtypes.bf16, 128, 32, 8192)
+# for dtype in [dtypes.fp16, dtypes.bf16]:
 #     # # qkv_proj
 #     # for (m, n, k) in [(4096, 1280, 8192),
 #     #                   (128, 1280, 8192),

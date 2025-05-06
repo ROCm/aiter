@@ -22,6 +22,7 @@
 
 #include "hip_compat.h"
 #include "dispatch_utils.h"
+#include "py_itfs_common.h"
 
 #ifdef USE_ROCM
 #include "quant_utils.cuh"
@@ -51,7 +52,7 @@ namespace vllm
   using fp8_type = __hip_fp8_e4m3;
   template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&)>
   __global__ void scaled_act_and_mul_kernel(
-      c10::Float8_e4m3fnuz* __restrict__ out,  // [..., d]
+      c10_fp8* __restrict__ out,  // [..., d]
       const scalar_t* __restrict__ input,      // [..., 2, d]
       const int d, const float scale) {
     const int64_t token_idx = blockIdx.x;
@@ -59,9 +60,9 @@ namespace vllm
       const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
       const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
       float r = ACT_FN(x) * y * scale;
-      out[token_idx * d + idx] = c10::Float8_e4m3fnuz(
+      out[token_idx * d + idx] = c10_fp8(
         __hip_cvt_float_to_fp8(r, __HIP_SATFINITE, __HIP_E4M3_FNUZ),
-        c10::Float8_e4m3fnuz::from_bits());
+        c10_fp8::from_bits());
     }
   }
   #endif
@@ -125,7 +126,7 @@ namespace vllm
         input.scalar_type(), "scaled_act_and_mul_kernel", [&] {       \
           vllm::scaled_act_and_mul_kernel<scalar_t, KERNEL<scalar_t>> \
               <<<grid, block, 0, stream>>>(                           \
-                  out.data_ptr<c10::Float8_e4m3fnuz>(),               \
+                  out.data_ptr<c10_fp8>(),               \
                   input.data_ptr<scalar_t>(), d,                      \
                   1.0 / (*scale.data_ptr<float>()));                  \
         });

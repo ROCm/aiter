@@ -16,17 +16,11 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     n = weight.shape[0]
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = x.to(x_scale.dtype).view(
-        m, k // block_shape[1], block_shape[1]
-    ) * x_scale.unsqueeze(-1)
+    x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
+    x = x.to(x_scale.dtype) * x_scale[:m, :k]
     x = x.view(m, k)
-
-    w_scale = rearrange(
-        w_scale.view(-1, 1)
-        .repeat(1, block_shape_n * block_shape_k)
-        .view(scale_n, scale_k, block_shape_n, block_shape_k),
-        "num_blk_n num_blk_k blk_n blk_k -> (num_blk_n blk_n) (num_blk_k blk_k)",
-    )
+    w_scale = w_scale.repeat_interleave(block_shape_k, dim=0)
+    w_scale = w_scale.repeat_interleave(block_shape_n, dim=1)
     w_scale = w_scale[:n, :k]
     weight = weight.to(w_scale.dtype) * w_scale
 
@@ -88,6 +82,9 @@ def get_x_vals():
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
+        (2048, 2048, 2049),
+        (159, 17389, 597),
+        (16, 576, 7168),
     ]
     return x_vals
 
@@ -97,10 +94,10 @@ def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
     x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(
-        torch.float8_e4m3fnuz
+        e4m3_type
     )
     weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
-        torch.float8_e4m3fnuz
+        e4m3_type
     )
 
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
@@ -114,9 +111,6 @@ def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
 )
 def test_gemm(dtype, M, N, K):
     block_shape_n, block_shape_k = block_shape
-    # TODO: Remove this skip condition
-    if (N % block_shape_n != 0) or (K % block_shape_k != 0):
-        pytest.skip("Skip N/K sizes not aligned to SCALE_BLOCK_SIZE")
 
     dtype = name_to_torch_types[dtype]
     x, weight, x_scale, w_scale = generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n,

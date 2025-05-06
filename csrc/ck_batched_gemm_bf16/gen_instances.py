@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import sys
 from dataclasses import dataclass
@@ -253,7 +253,7 @@ if __name__ == "__main__":
         "--tune",
         action='store_true',
         required=False,
-        help="generated tune instanses"
+        help="generated tune instances"
     )
 
     args = parser.parse_args()

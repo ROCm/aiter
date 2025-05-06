@@ -27,7 +27,8 @@
 #include "quant_utils.cuh"
 
 #if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx940__) || \
-                           defined(__gfx941__) || defined(__gfx942__))
+                           defined(__gfx941__) || defined(__gfx942__) || \
+                           defined(__gfx950__))
   #define __HIP__MI300_MI250__
 #endif
 

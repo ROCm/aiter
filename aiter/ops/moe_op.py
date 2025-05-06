@@ -182,13 +182,12 @@ def moe_stage1_g1u1(
     kernelName: str,
     block_m: int,
     ksplit: int = 0,
-    activation: Enum = ActivationType.Silu,
-    quant_type: Enum = QuantType.No,
-    a1_scale: Optional[Tensor] = None,
-    w1_scale: Optional[Tensor] = None,
-    doweight_stage1: bool = False,
-    sorted_weights: Optional[Tensor] = None # do sorted weight multiply in stage1
-): ...
+    activation: ActivationType = ActivationType.Silu,
+    quant_type: QuantType = QuantType.No,
+    a1_scale: Optional[torch.Tensor] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    sorted_weights: Optional[torch.Tensor] = None,
+) -> None: ...
 
 
 @compile_ops("module_moe")

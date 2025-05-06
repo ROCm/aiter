@@ -217,15 +217,12 @@ def gemm_a8w8_blockscale(
     K, N = w.shape
 
     # Scale block sizes
-    GROUP_K = triton.cdiv(K, w_scale.shape[0])
-    GROUP_N = triton.cdiv(N, w_scale.shape[1])
+    # TODO: need a better way to pass scale block sizes around
+    GROUP_K = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
+    GROUP_N = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
 
     # Check constraints.
-    # TODO: Remove the scale block size constraint
     assert x.shape[1] == w.shape[0], "Incompatible dimensions!!!"
-    assert (N % GROUP_N == 0) and (
-        K % GROUP_K == 0
-    ), "N/K sizes not aligned to SCALE BLOCK SIZE!"
 
     y = torch.empty((M, N), dtype=dtype, device=x.device)
 

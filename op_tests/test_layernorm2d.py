@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
+from aiter import dtypes
 
 
 @perftest()
@@ -18,7 +19,7 @@ def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
             normalized_shape=(input.shape[-1],),
             weight=weight,
             bias=bias,
-            eps=eps
+            eps=eps,
         )
     else:
         residual_out = input + residual
@@ -27,7 +28,7 @@ def run_torch(input, weight, bias, eps, residual=None, x_bias=None):
             normalized_shape=(input.shape[-1],),
             weight=weight,
             bias=bias,
-            eps=eps
+            eps=eps,
         )
     return output, residual_out
 
@@ -49,14 +50,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_bias=None):
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
         aiter.layernorm2d_fwd_with_add(
-            output,
-            input,
-            residual,
-            residual_out,
-            weight,
-            bias,
-            eps,
-            x_bias
+            output, input, residual, residual_out, weight, bias, eps, x_bias
         )
     return output, residual_out
 
@@ -70,13 +64,7 @@ def run_asm(input, weight, bias, eps, residual=None):
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
         aiter.layernorm2d_with_add_asm(
-            output,
-            input,
-            residual,
-            residual_out,
-            weight,
-            bias,
-            eps
+            output, input, residual, residual_out, weight, bias, eps
         )
     return output, residual_out
 
@@ -86,8 +74,8 @@ def test_layernorm2d(dtype, m, n):
     input = torch.randn(dim, dtype=dtype, device="cuda")
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
-    hidden_stats = torch.randn(m, n*8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6*n, n, n], dim=1)
+    hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
+    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     input = k
     (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
@@ -103,8 +91,8 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
-    hidden_stats = torch.randn(m, n*8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6*n, n, n], dim=1)
+    hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
+    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)
@@ -112,20 +100,20 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
 
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
-    checkAllclose(res_a, res_b, msg='res check')
-    checkAllclose(a, c, atol=0.03, msg='asm')
-    checkAllclose(res_a, res_c, atol=0.01, msg='asm res')
+    checkAllclose(res_a, res_b, msg="res check")
+    checkAllclose(a, c, atol=0.03, msg="asm")
+    checkAllclose(res_a, res_c, atol=0.01, msg="asm res")
 
 
-# for dtype in [torch.float16, torch.bfloat16]:
+# for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d(dtype, m, n)
-test_layernorm2d_fuseAdd(torch.bfloat16, 128, 8192)
+test_layernorm2d_fuseAdd(dtypes.bf16, 128, 8192)
 
 
 # print('\nstart fuse add test')
-# for dtype in [torch.float16, torch.bfloat16]:
+# for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d_fuseAdd(dtype, m, n)

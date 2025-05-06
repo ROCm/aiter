@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from aiter.test_common import checkAllclose, perftest, tensor_dump
 import torch
 import torch.nn.functional as F
 import numpy as np
 import sys
 import os
 import aiter
+from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import checkAllclose, perftest, tensor_dump
 
 
 @perftest(num_iters=5)
-def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    x = x.to(torch.float32) * x_scale
-    weight = weight.to(torch.float32) * w_scale
+def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    x = x.to(dtypes.fp32) * x_scale
+    weight = weight.to(dtypes.fp32) * w_scale
     out = F.linear(x, weight)
     if bias is not None:
         out = out.to(bias) + bias
@@ -22,15 +23,16 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
 
 
 @perftest()
-def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
+def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_CK(x, weight, x_scale, w_scale, bias, dtype)
 
+
 @perftest()
-def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
+def run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_ASM(x, weightshuffle, x_scale, w_scale, bias)
 
 
-def test_gemm(dtype, m, n, k, quantDtype=torch.int8):
+def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
@@ -44,9 +46,9 @@ def test_gemm(dtype, m, n, k, quantDtype=torch.int8):
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-    if dtype == torch.bfloat16 and quantDtype == torch.int8 and bias is not None:
-        weightshuffle = shuffle_weight(weight,layout=(32,16))
-        bias_f32 = bias.to(torch.float)
+    if dtype == dtypes.bf16 and quantDtype == dtypes.i8 and bias is not None:
+        weightshuffle = shuffle_weight(weight, layout=(32, 16))
+        bias_f32 = bias.to(dtypes.fp32)
         c, avg_c = run_gemm_asm(x, weightshuffle, x_scale, w_scale, bias_f32, dtype)
     else:
         c = None
@@ -54,14 +56,15 @@ def test_gemm(dtype, m, n, k, quantDtype=torch.int8):
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, {quantDtype=} torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm : not support, uplift: {avg_a/avg_b-1:<5.1%}"
     else:
         msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, {quantDtype=} torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/min(avg_b,avg_c)-1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: "+msg, rtol=1e-2, atol=0.01)
+    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
     if c != None:
-        checkAllclose(a, c, msg="\033[1A\033[2K" + "a,c: "+ msg, rtol=1e-2, atol=0.01)
+        checkAllclose(a, c, msg="\033[1A\033[2K" + "a,c: " + msg, rtol=1e-2, atol=0.01)
 
-for dtype in [torch.bfloat16, torch.float16]:
-    for quantDtype in [torch.int8, torch.float8_e4m3fnuz]:
+
+for dtype in [dtypes.bf16, dtypes.fp16]:
+    for quantDtype in [dtypes.i8, dtypes.fp8]:
         # qkv_proj
-        for (m, n, k) in [
+        for m, n, k in [
             (1, 1280, 8192),
             (32, 1280, 8192),
             (64, 1280, 8192),
@@ -78,7 +81,7 @@ for dtype in [torch.bfloat16, torch.float16]:
         ]:
             test_gemm(dtype, m, n, k, quantDtype)
         # attn_out
-        for (m, n, k) in [
+        for m, n, k in [
             (1, 8192, 1024),
             (32, 8192, 1024),
             (64, 8192, 1024),
