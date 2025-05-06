@@ -7,7 +7,7 @@ import pandas as pd
 import time
 
 
-def worker(gpuIDMap, tag, func, args, **kwargs):
+def worker(gpuIDMap, tag, func, args, kwargs):
     from aiter.test_common import run_perftest
     pid = mp.current_process().pid
     gpuID = gpuIDMap[pid]
@@ -36,10 +36,10 @@ def get_pid():
     return mp.current_process().pid
 
 
-def mp_tuner(tasks):
+def mp_tuner(tasks, mp_num=0):
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
-    pool = mp.Pool(processes=gpu_num)
+    pool = mp.Pool(processes=gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num)
     pids = [pool.apply_async(get_pid) for i in range(gpu_num)]
     # time.sleep(2)
 
