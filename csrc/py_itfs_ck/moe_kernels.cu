@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -71,14 +71,14 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
     std::string prec_sw = !w1_scale ? "fp32" : torchDTypeToStr(w1_scale->dtype());
     std::string prec_sq = !a2_scale ? "fp32" : torchDTypeToStr(a2_scale->dtype());
 
-    int workspace_size = ck_tile::moe_sorting_get_workspace_size(tokens, experts);
+    int workspace_size = ck_tile::moe_sorting_get_workspace_size(tokens, experts, topk);
     void *ws_ptr = nullptr;
     if (workspace_size > 0)
     {
         auto ws = torch::zeros({workspace_size}, torch::TensorOptions().dtype(topk_ids.dtype()).device(device_of(topk_ids)));
         ws_ptr = ws.data_ptr();
     }
-    
+
     fused_moe_traits traits{
         prec_i,
         prec_w,
