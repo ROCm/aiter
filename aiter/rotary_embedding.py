@@ -127,11 +127,17 @@ class RotaryEmbedding(nn.Module):
         sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
         return cos, sin
 
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        else:
+            return self.forward_hip(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
         is_nope_first=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -163,6 +169,9 @@ class RotaryEmbedding(nn.Module):
             if not is_nope_first
             else torch.cat((query_pass, query_rot), dim=-1).reshape(query_shape)
         )
+        
+        if key is None:
+            return query
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
@@ -230,7 +239,7 @@ class RotaryEmbedding(nn.Module):
             )
         return query, key
 
-    def forward(
+    def forward_hip(
         self,
         positions: torch.Tensor,
         # if     is_nope_first
