@@ -315,6 +315,18 @@
         "is_standalone": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/fmoe_2stage_blockscale_tuned_gemm.csv'"
     },
+    "module_moe_stage2_blockscale_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_stage2_blockscale.cpp'",
+            "f'{AITER_CSRC_DIR}/pybind/moe_stage2_blockscale_asm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_sorting": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/moe_sorting_kernels.cu'",

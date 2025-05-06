@@ -108,7 +108,23 @@ def moe_stage2_tune(
     )
     
     if quant_type == aiter.QuantType.per_1x128:
-        aiter.moe_stage2_blockscale(
+        # aiter.moe_stage2_blockscale(
+        #     hidden_states,
+        #     w1,
+        #     w2,
+        #     sorted_token_ids,
+        #     sorted_expert_ids,
+        #     sorted_weights,
+        #     num_valid_ids,
+        #     out,
+        #     topk,
+        #     "",#"ck_moe_stage2_B16_F8_F8_PerTensor_256x128x128x128_2x2_16_MulABScaleExpertWeight_Nswizzle0_interwave_v1",
+        #     quant_type,
+        #     w2_scale,
+        #     a2_scale,
+        #     block_size,
+        # )        
+        aiter.moe_stage2_blockscale_asm(
             hidden_states,
             w1,
             w2,
@@ -117,13 +133,9 @@ def moe_stage2_tune(
             sorted_weights,
             num_valid_ids,
             out,
-            topk,
-            "",#"ck_moe_stage2_B16_F8_F8_PerTensor_256x128x128x128_2x2_16_MulABScaleExpertWeight_Nswizzle0_interwave_v1",
-            quant_type,
             w2_scale,
             a2_scale,
-            block_size,
-        )        
+        )       
     else:
         aiter.moe_stage2(
             hidden_states,

@@ -286,3 +286,22 @@ def moe_stage2_blockscale(
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
 ): ...
+
+
+@compile_ops("module_moe_2stages_blockscale_asm", fc_name="moe_stage2_blockscale_asm")
+def moe_stage2_blockscale_asm(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    sorted_weights: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str = "moe_2stages_bs_asm",
+    quant_type: Enum = QuantType.No,
+    w2_scale: Optional[Tensor] = None,
+    a2_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+): ...
