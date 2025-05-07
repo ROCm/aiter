@@ -220,8 +220,8 @@ def test_rope_fwd_thd(B: int, T: int, H: int, D: int, rotate_style: int, reuse_f
 #         print(f"triton_out={triton_out}")
 #     torch.testing.assert_close(triton_out, torch_out,atol=1e-1, rtol=1e-1)
 
-@pytest.mark.parametrize('T', [(4), (6), (100), (320), (500)])
-@pytest.mark.parametrize('H', [1, 8, 32])
+@pytest.mark.parametrize('T', [(4), (6), (100), (320), (500), (8192)])
+@pytest.mark.parametrize('H', [1, 8, 32, 128])
 @pytest.mark.parametrize('D', [4, 64, 128])  #For now, D is power of 2.
 #@pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
 @pytest.mark.parametrize('rotate_style', [RotateStyle.GPTJ])
