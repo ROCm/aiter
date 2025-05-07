@@ -1946,7 +1946,6 @@ def _rope_cached_positions_fwd(
     transpose_output: bool = False
 ) -> torch.Tensor :
     s, b, h, d = x.shape
-    print("cached_positions_fwd")
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
             have_nope = False
@@ -2028,7 +2027,6 @@ def _rope_cached_positions_offsets_fwd(
     transpose_output: bool = False
 ) -> torch.Tensor :
     s, b, h, d = x.shape
-    print("cached_positions_fwd")
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
             have_nope = False
