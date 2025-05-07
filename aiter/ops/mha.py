@@ -359,6 +359,7 @@ def _flash_attn_backward(
     nmask = (
         causal == False and window_size_left == -1 and window_size_right == -1
     )  # no mask
+    swa = causal == False and (window_size_left > 0 or window_size_right > 0)
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -474,7 +475,7 @@ def _flash_attn_backward(
         # bwd_hd192_bf16_causal_a32_rtz_psskddv
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= nmask or (mask and seqlen_q == seqlen_k) or (swa and hdim_q > 64 and hdim_q <= 128)# TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
 
@@ -488,7 +489,7 @@ def _flash_attn_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= mask or nmask
+        ret &= mask or nmask or swa
         ret &= np() or pssk() or pddv() or psskddv()
         ret &= "gfx942" in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
@@ -592,8 +593,8 @@ class FlashAttnFunc(torch.autograd.Function):
             dropout_p,
             softmax_scale,
             causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
+            window_size_left=window_size[0].item(),
+            window_size_right=window_size[1].item(),
             bias=bias,
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
@@ -646,8 +647,8 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.dropout_p,
             ctx.softmax_scale,
             ctx.causal,
-            ctx.window_size[0],
-            ctx.window_size[1],
+            ctx.window_size[0].item(),
+            ctx.window_size[1].item(),
             ctx.bias,
             ctx.alibi_slopes,
             ctx.deterministic,
