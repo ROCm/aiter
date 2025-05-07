@@ -8,8 +8,9 @@ from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 def generate_gemm_a16w16_inputs(M, N, K, dtype):
     x = torch.randn((M, K), dtype=dtype).cuda()
     weight = torch.randn((K, N), dtype=dtype).cuda()
+    out = torch.randn((M, N), dtype=dtype).cuda()
 
-    return x, weight
+    return x, weight, out
 
 def get_x_vals():
 
@@ -48,11 +49,11 @@ def get_x_vals():
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
 def test_gemm_a16_w16(M: int, N: int, K: int, dtype):
-    x, w = generate_gemm_a16w16_inputs(M, N, K, dtype)
+    x, w, y = generate_gemm_a16w16_inputs(M, N, K, dtype)
 
     torch_out = torch.matmul(x,w)
 
-    triton_out = gemm_a16w16(x, w, dtype)
+    triton_out = gemm_a16w16(x, w, y)
 
-    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    triton.testing.assert_close(y, torch_out, atol=1e-1, rtol=1e-1)
 
