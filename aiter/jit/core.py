@@ -136,13 +136,8 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip : str):
-    with open(f"{bd_dir}/tmp.hip", 'w') as f:
-        f.write("int main() { return 0; }")
-
-    ret = os.system(f"hipcc {flag_hip} {bd_dir}/tmp.hip -o {bd_dir}/tmp.out")
-    os.remove(f"{bd_dir}/tmp.hip")
+    ret = os.system(f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -")
     if ret == 0:
-        os.remove(f"{bd_dir}/tmp.out")
         return [flag_hip]
     else:
         logger.warning(f"{flag_hip} is not supported by hipcc.")
