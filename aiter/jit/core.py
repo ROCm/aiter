@@ -285,7 +285,7 @@ def build_module(
                 "-mllvm",
                 "-amdgpu-function-calls=false",
             ]
-        if hip_version > Version("6.2.41133"):
+        if Version("6.4") >= hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         flags_cc += flags_extra_cc
