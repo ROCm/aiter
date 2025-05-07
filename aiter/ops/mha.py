@@ -355,11 +355,11 @@ def _flash_attn_backward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = causal == True and window_size_left == -1  # causal mask
+    mask = causal and window_size_left == -1  # causal mask
     nmask = (
-        causal == False and window_size_left == -1 and window_size_right == -1
+        not causal and window_size_left == -1 and window_size_right == -1
     )  # no mask
-    swa = causal == False and (window_size_left > 0 or window_size_right > 0)
+    swa = not causal and (window_size_left > 0 or window_size_right > 0)
 
     def np():
         # bwd_hd128_bf16_a16_rtne
