@@ -130,8 +130,8 @@ def run_benchmark(args):
         flops = B * S * H * (D/2.0) * 3.0 * 2.0 * (2.0 if two_inputs else 1.0)
         
         # memory transfer (B = 1, T = S for thd layout, positions and offsets are always int)
-        mem_read = B * S * H * D * ((2.0 * x        .element_size()) if two_inputs else 1.0) + \
-                       S *     D * ((2.0 * freqs    .element_size()) if cached     else 1.0) + \
+        mem_read = B * S * H * D * ((2.0 * x        .element_size()) if two_inputs else (1.0 * x    .element_size())) + \
+                       S *     D * ((2.0 * freqs    .element_size()) if cached     else (1.0 * freqs.element_size())) + \
                    B * S *         ((1.0 * positions.element_size()) if pos        else 0.0) + \
                    B * S *         ((1.0 * offsets  .element_size()) if offs       else 0.0)
                    
