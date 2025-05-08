@@ -127,11 +127,17 @@ class RotaryEmbedding(nn.Module):
         sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
         return cos, sin
 
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            return self.forward_native(*args, **kwargs)
+        else:
+            return self.forward_hip(*args, **kwargs)
+
     def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
         is_nope_first=False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -163,6 +169,9 @@ class RotaryEmbedding(nn.Module):
             if not is_nope_first
             else torch.cat((query_pass, query_rot), dim=-1).reshape(query_shape)
         )
+        
+        if key is None:
+            return query
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
@@ -230,7 +239,7 @@ class RotaryEmbedding(nn.Module):
             )
         return query, key
 
-    def forward(
+    def forward_hip(
         self,
         positions: torch.Tensor,
         # if     is_nope_first
@@ -249,29 +258,14 @@ class RotaryEmbedding(nn.Module):
         cos, sin = self.cos_cache, self.sin_cache
 
         rotate_style = 0 if self.is_neox_style else 1
-        assert (
-            len(query.shape) == 4
-        ), "Query tensor must be 4D: [batch_size, seq_len, num_heads, head_size]"
-        query_shape = query.shape
-        if key is not None:
-            assert (
-                len(key.shape) == 4
-            ), "Key tensor must be 4D: [batch_size, seq_len, num_heads, head_size]"
-            key_shape = key.shape
-        # if query.dim() == 3 and query.shape[-1] == self.head_size: # [num_tokens, num_heads, head_size]
-        #     query = query.unsqueeze(0)
-        # elif query.dim() == 3: # [batch_size, seq_len, num_heads*head_size]
-        #     query = query.view(query.size(0), query.size(1), query.size(2)// self.head_size, self.head_size)
-        # elif query.dim() == 2: # [num_tokens, num_heads*head_size]
-        #     query = query.view(1, query.size(0), query.size(1)// self.head_size, self.head_size)
 
-        # if key is not None:
-        #     if key.dim() == 3 and key.shape[-1] == self.head_size: # [num_tokens, num_heads, head_size]
-        #         key = key.unsqueeze(0)
-        #     elif key.dim() == 3: # [batch_size, seq_len, num_heads*head_size]
-        #         key = key.view(key.size(0), key.size(1), key.size(2)// self.head_size, self.head_size)
-        #     elif key.dim() == 2: # [num_tokens, num_heads*head_size]
-        #         key = key.view(1, key.size(0), key.size(1)// self.head_size, self.head_size)
+        num_tokens = positions.numel()
+
+        query_shape = query.shape
+        query = query.view(1, num_tokens, -1, self.head_size)
+        if key is not None:
+            key_shape = key.shape
+            key = key.view(1, num_tokens, -1, self.head_size)
 
         positions = positions.view(*query.shape[:2])
         if offsets is not None:
@@ -799,9 +793,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = freqs.cos() * self.mscale
         sin = freqs.sin() * self.mscale
-        cache = torch.cat((cos, sin), dim=-1)
-        print("Cache shape", cache.shape)
-        return cache
+        cos = freqs.cos().unsqueeze(-2).unsqueeze(-2)
+        sin = freqs.sin().unsqueeze(-2).unsqueeze(-2)
+        return cos, sin
 
     def forward(
         self,
@@ -810,39 +804,10 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward()."""
-        query_rot = query[..., : self.rotary_dim]
-        key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
-
-        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(positions.device)
-        cos_sin = self.cos_sin_cache[
-            torch.add(positions, offsets) if offsets is not None else positions
-        ]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if self.is_neox_style:
-            # NOTE(woosuk): Here we assume that the positions tensor has the
-            # shape [batch_size, seq_len].
-            cos = cos.repeat(1, 1, 2).unsqueeze(-2)
-            sin = sin.repeat(1, 1, 2).unsqueeze(-2)
-        else:
-            cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
-            sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
-
-        rotate_fn = _rotate_neox if self.is_neox_style else _rotate_gptj
-        query_rot = query_rot * cos + rotate_fn(query_rot) * sin
-        key_rot = key_rot * cos + rotate_fn(key_rot) * sin
-
-        if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
-        else:
-            query = query_rot
-            key = key_rot
+        query, key = super().forward(positions, query, key, offsets)
+        if positions.numel() == 1:
+            key = key.clone()
         return query, key
-
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
@@ -1125,9 +1090,9 @@ def get_rope(
         )
     else:
         scaling_type = (
-            rope_scaling["type"]
-            if "type" in rope_scaling
-            else rope_scaling["rope_type"]
+            rope_scaling["rope_type"]
+            if "rope_type" in rope_scaling
+            else rope_scaling["type"]
         )
         # The correct one should be "longrope" but keep "su" here
         # for backward compatible
@@ -1250,3 +1215,28 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
+def get_rope_wrapper(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+    device: Optional[str] = None,
+):
+    if device != "cpu":
+        return get_rope(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            rope_scaling,
+            dtype,
+            partial_rotary_factor,
+        )
+
+    assert False, "get_rope_wrapper in AITER is not implemented for cpu device"
