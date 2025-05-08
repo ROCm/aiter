@@ -2210,7 +2210,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     D_MODEL = d
     D_MODEL_HALF = d // 2
 
-    BLOCK_T = 128
+    BLOCK_T = 32
     SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
     
     if t >= 8192:
