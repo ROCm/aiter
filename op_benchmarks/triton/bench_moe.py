@@ -1,15 +1,22 @@
 import triton
 import triton.language as tl
-from utils.benchmark_utils import get_model_configs, get_available_models, torch_to_tl_dtype
+from utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+    torch_to_tl_dtype,
+)
 from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
 import torch
 import argparse
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
 import sys
 
+
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="mistral" if args.model == None else args.model)
+    configs = get_model_configs(
+        config_path=config_file, models="mistral" if args.model is None else args.model
+    )
     moe_configs = []
     M = args.M if args.M else 4096  # check size
     # M, K, N, E, top_k
@@ -30,20 +37,114 @@ def model_benchmark_configs(args):
     return moe_configs
 
 
-def fused_moe(M, N, K, top_k, E, routed_weight=False, dtype=torch.float16, int4_w4a16=False,
-                fp8_w8a8=False, int8_w8a16=False, group_size=128, has_zp=True):
+def fused_moe(
+    M,
+    N,
+    K,
+    top_k,
+    E,
+    routed_weight=False,
+    dtype=torch.float16,
+    int4_w4a16=False,
+    fp8_w8a8=False,
+    int8_w8a16=False,
+    group_size=128,
+    has_zp=True,
+):
     if int4_w4a16:
-        a, b, triton_out, _, b_zp, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper_int4_w4a16(
-        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, group_size=group_size, has_zp=has_zp)
+        (
+            a,
+            b,
+            triton_out,
+            _,
+            b_zp,
+            b_scale,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            config,
+        ) = input_helper_int4_w4a16(
+            M,
+            N,
+            K,
+            top_k,
+            E,
+            routed_weight=routed_weight,
+            dtype=dtype,
+            group_size=group_size,
+            has_zp=has_zp,
+        )
 
-        return lambda: triton_moe(a, b, triton_out, None, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
-                        num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], use_fp8_w8a8=False, use_int8_w8a16=False, use_int4_w4a16=True, block_shape=(0, group_size))
+        return lambda: triton_moe(  # noqa: E731
+            a,
+            b,
+            triton_out,
+            None,
+            b_scale,
+            b_zp,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            routed_weight,
+            top_k,
+            config,
+            torch_to_tl_dtype[dtype],
+            use_fp8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=True,
+            block_shape=(0, group_size),
+        )
     else:
-        a, b, triton_out, _, b_zp, a_scale, b_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
-            M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16)
+        (
+            a,
+            b,
+            triton_out,
+            _,
+            b_zp,
+            a_scale,
+            b_scale,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            config,
+        ) = input_helper(
+            M,
+            N,
+            K,
+            top_k,
+            E,
+            routed_weight=routed_weight,
+            dtype=dtype,
+            fp8_w8a8=fp8_w8a8,
+            int8_w8a16=int8_w8a16,
+        )
 
-        return lambda: triton_moe(a, b, triton_out, a_scale, b_scale, b_zp, topk_weights, topk_ids, sorted_token_ids, expert_ids,
-                        num_tokens_post_padded, routed_weight, top_k, config, torch_to_tl_dtype[dtype], fp8_w8a8, int8_w8a16, use_int4_w4a16=False)
+        return lambda: triton_moe(
+            a,
+            b,
+            triton_out,
+            a_scale,
+            b_scale,
+            b_zp,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            routed_weight,
+            top_k,
+            config,
+            torch_to_tl_dtype[dtype],
+            fp8_w8a8,
+            int8_w8a16,
+            use_int4_w4a16=False,
+        )
 
 
 def run_benchmark(args):
@@ -60,20 +161,26 @@ def run_benchmark(args):
         assert group_size != None, "set group_size with -group_size"
 
     kernel_name = "_fused_moe_kernel"
-    if (int8_w8a16 or int4_w4a16) and \
-            (group_size is not None) and group_size > 0:
+    if (int8_w8a16 or int4_w4a16) and (group_size is not None) and group_size > 0:
         kernel_name = "_fused_moe_kernel_gptq_awq"
 
     x_vals_list = model_benchmark_configs(args)
-    x_names = ['model', 'M', 'N', 'K', 'E', 'top_k']
+    x_names = ["model", "M", "N", "K", "E", "top_k"]
 
-    line_names = ['Time (ms)', 'TFLOPS', 'Bandwidth (GB/s)']
-    line_vals = ['time', 'tflops', 'bandwidth']
+    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+    line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
-        x_names=x_names, x_vals=x_vals_list, line_arg='metric', line_vals=line_vals, line_names=line_names,
-        styles=[('red', '-'), ('blue', '-'),
-                ('yellow', '-')], ylabel='ms / TFLOPS / GB/s', plot_name=f'{kernel_name}-benchmark', args={})
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="metric",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
+        ylabel="ms / TFLOPS / GB/s",
+        plot_name=f"{kernel_name}-benchmark",
+        args={},
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_moe_gemm(M, N, K, E, top_k, metric, model=None):
@@ -100,8 +207,20 @@ def run_benchmark(args):
         mem_write = (M * top_k * N) * c_bytes
         mem = mem_read + mem_write
 
-        fn = fused_moe(M, N, K, top_k, E, routed_weight=routed_weight, dtype=torch.float16, int4_w4a16=int4_w4a16,
-                fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16, group_size=group_size, has_zp=has_zp)
+        fn = fused_moe(
+            M,
+            N,
+            K,
+            top_k,
+            E,
+            routed_weight=routed_weight,
+            dtype=torch.float16,
+            int4_w4a16=int4_w4a16,
+            fp8_w8a8=fp8_w8a8,
+            int8_w8a16=int8_w8a16,
+            group_size=group_size,
+            has_zp=has_zp,
+        )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
 
@@ -109,11 +228,11 @@ def run_benchmark(args):
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active
-        if metric == 'time':
+        if metric == "time":
             return ms
-        elif metric == 'tflops':
+        elif metric == "tflops":
             return tflops
-        elif metric == 'bandwidth':
+        elif metric == "bandwidth":
             return bandwidth
         else:
             raise ValueError("Unknown metric: " + metric)
@@ -126,27 +245,40 @@ def parse_args():
         prog="Benchmark MoE GEMM",
         allow_abbrev=False,
     )
-    parser.add_argument('-model_configs', type=str, default="utils/model_configs.json", help="Model config json file.")
+    parser.add_argument(
+        "-model_configs",
+        type=str,
+        default="utils/model_configs.json",
+        help="Model config json file.",
+    )
     available_models = get_available_models()  # Dynamically load model names
-    model_help = ("Model name to benchmark. Select from: [" + ", ".join(available_models) +
-                  "]. Use 'all' to benchmark all models or leave blank for the default benchmark script.")
-    parser.add_argument('-model', type=str, default=None, help=model_help)
+    model_help = (
+        "Model name to benchmark. Select from: ["
+        + ", ".join(available_models)
+        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
+    )
+    parser.add_argument("-model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="M dimension")
-    parser.add_argument("-group_size", type=int, default=None, help="group_size for in4")
-    parser.add_argument("-routed_weight", action='store_true', default=False)
-    parser.add_argument("-int8_w8a16", action='store_true', default=False)
-    parser.add_argument("-fp8_w8a8", action='store_true', default=False)
-    parser.add_argument("-int4_w4a16", action='store_true', default=False)
-    parser.add_argument("-has_zp", action='store_true', default=False)
-    parser.add_argument("-dtype", default='fp16')
-    parser.add_argument("-fp8_type", default='e5m2fnuz')
+    parser.add_argument(
+        "-group_size", type=int, default=None, help="group_size for in4"
+    )
+    parser.add_argument("-routed_weight", action="store_true", default=False)
+    parser.add_argument("-int8_w8a16", action="store_true", default=False)
+    parser.add_argument("-fp8_w8a8", action="store_true", default=False)
+    parser.add_argument("-int4_w4a16", action="store_true", default=False)
+    parser.add_argument("-has_zp", action="store_true", default=False)
+    parser.add_argument("-dtype", default="fp16")
+    parser.add_argument("-fp8_type", default="e5m2fnuz")
     args = parser.parse_args()
     return args
 
 
 arg_to_torch_dtype = {
-    'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32, "e5m2fnuz": torch.float8_e5m2fnuz, "e4m3fnuz":
-    torch.float8_e4m3fnuz
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "e5m2fnuz": torch.float8_e5m2fnuz,
+    "e4m3fnuz": torch.float8_e4m3fnuz,
 }
 
 
@@ -155,5 +287,5 @@ def main():
     run_benchmark(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

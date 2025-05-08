@@ -1,6 +1,5 @@
 import torch
 import triton
-import triton.language as tl
 import pytest
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
 import torch.nn.functional as F
@@ -103,16 +102,19 @@ def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype):
 
 @pytest.mark.parametrize(
     "in_dtype, out_dtype, m, n, k",
-    [(in_dtype, out_dtype, *shape)
-    for in_dtype in ["fp8e4", "fp8e5", "int8"]
-    for out_dtype in ["bf16"]
-    for shape in get_x_vals()]
+    [
+        (in_dtype, out_dtype, *shape)
+        for in_dtype in ["fp8e4", "fp8e5", "int8"]
+        for out_dtype in ["bf16"]
+        for shape in get_x_vals()
+    ],
 )
 def test_gemm(in_dtype, out_dtype, m, n, k):
     in_dtype = name_to_torch_types[in_dtype]
     out_dtype = name_to_torch_types[out_dtype]
-    x, weight, x_scale, w_scale, bias = \
-        generate_gemm_a8w8_inputs(m, n, k, in_dtype, out_dtype)
+    x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(
+        m, n, k, in_dtype, out_dtype
+    )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype)
