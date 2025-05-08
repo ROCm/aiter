@@ -264,8 +264,8 @@ def test_rope_fwd_cached_thd_position_2c(T: int, H: int, D: int, rotate_style: R
     torch.testing.assert_close(triton_out_x, torch_out_x,atol=1e-3, rtol=1e-1)
     torch.testing.assert_close(triton_out_y, torch_out_y,atol=1e-3, rtol=1e-1)
 
-@pytest.mark.parametrize('T', [(4), (6), (100), (320), (500)])
-@pytest.mark.parametrize('H', [1, 8, 32])
+@pytest.mark.parametrize('T', [(4), (6), (100), (320), (500), (8192)])
+@pytest.mark.parametrize('H', [1, 8, 32, 128])
 @pytest.mark.parametrize('D', [4, 64, 128])  #For now, D is power of 2.
 #@pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
 @pytest.mark.parametrize('rotate_style', [RotateStyle.GPTJ])
