@@ -181,8 +181,8 @@ class Gemm:
         if top_sols:
             solutions = self.hipb_top_sols
         task = []
-        scaleA = HALF.cpu() if self.scaleAB else None
-        scaleB = HALF.cpu() if self.scaleAB else None
+        scaleA = HALF if self.scaleAB else None
+        scaleB = HALF if self.scaleAB else None
 
         gtimes = {}
         for solidx in solutions:
@@ -190,10 +190,10 @@ class Gemm:
                 (solidx,
                 call_hipb_mm,
                 (
-                    self.inp.cpu(),
-                    self.weights.t().cpu(),
+                    self.inp,
+                    self.weights.t(),
                     solidx,
-                    self.bias.cpu() if self.bias is not None else None,
+                    self.bias if self.bias is not None else None,
                     self.outdtype,
                     scaleA,
                     scaleB,
@@ -250,8 +250,8 @@ class Gemm:
                 (solidx,
                 call_rocb_mm,
                 (
-                    self.inp.cpu(),
-                    self.weights.t().cpu(),
+                    self.inp,
+                    self.weights.t(),
                     solidx,
                 ),
                 {
