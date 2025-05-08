@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import sys
-from dataclasses import dataclass
-import copy
 from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
 from batched_gemm_bf16_common import kernelInstance, kernels_list, default_kernels_dict
-
 
 
 class batched_gemm_bf16_fwd_codegen:
@@ -107,14 +103,25 @@ torch::Tensor
         return batched_gemm_bf16_impl<DeviceGemmInstance>(XQ, WQ, Y, bias, KBatch);
 """
         if self.istune:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
-                                                     INSTANCE_CONTENT_nopad=(INSTANCE_CONTENT_nobias.format(GemmSpec="Default")))
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
+                INSTANCE_CONTENT_pad=(
+                    INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")
+                ),
+                INSTANCE_CONTENT_nopad=(
+                    INSTANCE_CONTENT_nobias.format(GemmSpec="Default")
+                ),
+            )
         else:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=INSTANCE_CONTENT_bias.format(GemmSpec="MNKPadding"),
-                                                     INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_bias.format(GemmSpec="Default"))
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
+                INSTANCE_CONTENT_pad=INSTANCE_CONTENT_bias.format(
+                    GemmSpec="MNKPadding"
+                ),
+                INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_bias.format(GemmSpec="Default"),
+            )
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-                INSTANCE_IMPL_str)
+            INSTANCE_IMPL_str
+        )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -133,9 +140,13 @@ torch::Tensor
         INSTANCE = INSTANCE_template.format(name=k.name)
 
         if self.istune:
-            Path(os.path.join(self.instances_path, f"{k.name}.cpp")).write_text(INSTANCE)
+            Path(os.path.join(self.instances_path, f"{k.name}.cpp")).write_text(
+                INSTANCE
+            )
         else:
-            Path(os.path.join(self.instances_path, f"{k.name}.cpp")).write_text(INSTANCE)
+            Path(os.path.join(self.instances_path, f"{k.name}.cpp")).write_text(
+                INSTANCE
+            )
 
     def gen_lookup_dict(self, kernels_dict):
         LOOKUP_head = """#pragma once
@@ -156,13 +167,21 @@ torch::Tensor
 
 #endif // USE_ROCM
 """
-        with open(os.path.join(self.working_path, "batched_gemm_bf16_lookup.h"), "w") as f:
+        with open(
+            os.path.join(self.working_path, "batched_gemm_bf16_lookup.h"), "w"
+        ) as f:
             f.write(LOOKUP_head)
             for mnk, k in kernels_dict.items():
-                #print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
+                # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(LOOKUP_template.format(mnk="{"+(", ").join(
-                        map(lambda x: str(x), list(mnk))) + "}", kernel_name=k.name))
+                    f.write(
+                        LOOKUP_template.format(
+                            mnk="{"
+                            + (", ").join(map(lambda x: str(x), list(mnk)))
+                            + "}",
+                            kernel_name=k.name,
+                        )
+                    )
                 elif self.istune and isinstance(mnk, int):
                     f.write(LOOKUP_template.format(mnk=mnk, kernel_name=k.name))
             f.write(LOOKUP_end)
@@ -192,7 +211,9 @@ torch::Tensor
 #endif // USE_ROCM
 """
 
-        with open(os.path.join(self.working_path, "batched_gemm_bf16_manifest.h"), "w") as f:
+        with open(
+            os.path.join(self.working_path, "batched_gemm_bf16_manifest.h"), "w"
+        ) as f:
             f.write(MAINFEST_head)
             for mnk, k in kernels_dict.items():
                 f.write(MAINFEST_template.format(kernel_name=k.name))
@@ -226,6 +247,7 @@ def get_tune_dict(tune_dict_csv):
             tune_dict[(B, M, N, K)] = kernels_list[kid]
     return tune_dict
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
@@ -238,7 +260,7 @@ if __name__ == "__main__":
         "--working_path",
         default="./",
         required=False,
-        help="the path where all the blobs are going to be generated"
+        help="the path where all the blobs are going to be generated",
     )
 
     parser.add_argument(
@@ -246,14 +268,11 @@ if __name__ == "__main__":
         "--tune_file",
         default="aiter/configs/bf16_tuned_batched_gemm.csv",
         required=False,
-        help="tune_file include the result after run batched_gemm_bf16_tune.py"
+        help="tune_file include the result after run batched_gemm_bf16_tune.py",
     )
 
     parser.add_argument(
-        "--tune",
-        action='store_true',
-        required=False,
-        help="generated tune instances"
+        "--tune", action="store_true", required=False, help="generated tune instances"
     )
 
     args = parser.parse_args()

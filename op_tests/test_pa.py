@@ -3,7 +3,6 @@
 
 import random
 from typing import List, Optional, Tuple, Union
-import itertools
 import torch
 import aiter
 from aiter import dtypes

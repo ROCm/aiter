@@ -3,7 +3,6 @@
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 import sys
 import os
 from aiter import dtypes
@@ -33,11 +32,7 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
                 bias=bias,
             )
         except RuntimeError:
-            out = (
-                F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32))
-                * scaleA
-                * scaleB
-            )
+            out = F.linear(x.to(dtypes.fp32), weight.to(dtypes.fp32)) * scaleA * scaleB
             out = (out.to(otype) + bias) if bias is not None else out.to(otype)
         return out
     if scaleA is not None:
