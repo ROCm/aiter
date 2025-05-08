@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -14,6 +14,7 @@ from ..jit.core import (
     AITER_CORE_DIR,
 )
 from ..utility import dtypes
+from ..jit.utils.chip_info import get_cu_num
 
 
 @compile_ops("module_batched_gemm_bf16", fc_name="batched_gemm_bf16")
@@ -27,8 +28,7 @@ def compute_batched_gemm_SplitK(
     M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int
 ):
 
-    device_properties = torch.cuda.get_device_properties(0)
-    cu_num = device_properties.multi_processor_count
+    cu_num = get_cu_num()
     tile_num = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
     cusPerTile = cu_num / tile_num
     splitK = 0

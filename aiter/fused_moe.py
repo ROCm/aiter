@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +16,7 @@ from aiter import ActivationType, QuantType, dtypes
 # from aiter import get_torch_quant as get_quant
 from aiter import get_triton_quant as get_quant
 from aiter.jit.core import AITER_ROOT_DIR, PY, get_asm_dir, bd_dir, mp_lock
+from aiter.jit.utils.chip_info import get_cu_num
 
 BLOCK_SIZE_M = 32
 
@@ -252,9 +253,7 @@ def fused_moe_1stage(
 
 @functools.lru_cache(maxsize=1024)
 def get_block_size_M(token, topk, expert, inter_dim):
-    gpu = torch.cuda.current_device()
-    device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_count
+    cu_num = get_cu_num()
     tileN = 128
     tgN = (inter_dim + tileN - 1) // tileN
     support_list = [32, 64, 128]
