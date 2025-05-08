@@ -12,12 +12,32 @@ import sys
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from aiter.ops.triton.moe_op import moe_set_use_persistent_kernel
 from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
-from aiter import silu_and_mul
 from aiter.ops.triton.moe_op_gelu import fused_moe_gelu as triton_moe_gelu
 from aiter.ops.triton.moe_op_gelu import moe_set_use_persistent_kernel as moe_set_use_persistent_kernel_gelu
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 
 DEBUG_MODE = False
+
+def silu_and_mul(input):
+    """
+    Performs the SiLU activation on the first half of the input tensor and
+    multiplies it element-wise with the second half.
+    Args:
+        input (torch.Tensor): Input tensor of shape [..., 2 * d].
+        param (float): Parameter for the SiLU activation function.
+    Returns:
+        torch.Tensor: Output tensor of shape [..., d].
+    """
+    dtype = input.dtype
+    d = input.size(-1) // 2
+    A, B = input[:, :d], input[:, d:]
+
+    silu_A = A / (1.0 + torch.exp(-A.float()))
+
+    output = silu_A * B
+
+    return output.to(dtype)
+
 
 def torch_moe(a, b, c, a_scale, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, int4_w4a16, gelu=False):
     if fp8_w8a8:
@@ -359,8 +379,7 @@ def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: 
     torch_out = torch_moe(a, b, torch_out, a_scale, b_scale, None, 0, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids,
                         num_tokens_post_padded, dtype, fp8_w8a8, int8_w8a16, False)
     if silu_fused:
-        torch_out_silu = torch.empty_like(triton_out_silu)
-        silu_and_mul(torch_out_silu, torch_out.view(-1, N))
+        torch_out_silu = silu_and_mul(torch_out.view(-1, N))
 
     if DEBUG_MODE:
         print(f"triton_out={triton_out}")
@@ -400,8 +419,7 @@ def test_fused_moe_int4_w4a16(M: int, N: int, K: int, top_k:int, E: int,
     torch_out = torch.empty_like(triton_out)
     torch_out = torch_moe(a, b, torch_out, None, b_scale, b_zp, group_size, topk_ids, topk_weights, routed_weight, sorted_token_ids, expert_ids, num_tokens_post_padded, dtype, False, False, True)
     if silu_fused:
-        torch_out_silu = torch.empty_like(triton_out_silu)
-        silu_and_mul(torch_out_silu, torch_out.view(-1, N))
+        torch_out_silu = silu_and_mul(torch_out.view(-1, N))
 
     if silu_fused:
         torch.testing.assert_close(triton_out_silu, torch_out_silu, atol=2e-1, rtol=2e-1)
