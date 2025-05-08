@@ -2193,6 +2193,9 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     nope_first : bool,
     transpose_output: bool = False
 ):
+    if nope_first:
+        raise NotImplementedError("nope style has not been implemented in RoPE Triton backend.")
+
     t, h, d = x.shape
     if cos.shape[-1] == d // 2:
         if reuse_freqs_front_part:
@@ -2207,7 +2210,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     D_MODEL = d
     D_MODEL_HALF = d // 2
 
-    BLOCK_T = 32
+    BLOCK_T = 128
     SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
     
     if t >= 8192:
@@ -2235,8 +2238,12 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
     if offsets is None:
-        if rotate_style == RotateStyle.GPTJ:
-            _rope_fwd_kernel_gptj_cached_thd_position_2c[grid](x, y,  cos, sin, positions, out_x, out_y,
+        if rotate_style == RotateStyle.GPTJ:        
+            if have_nope:
+                #TODO: add a new kernel for nope
+                raise NotImplementedError("nope style has not been implemented in RoPE Triton backend.")
+            else:
+                _rope_fwd_kernel_gptj_cached_thd_position_2c[grid](x, y,  cos, sin, positions, out_x, out_y,
                                         *x.stride(), *cos.stride(),*positions.stride(), *out_x.stride(), 
                                         T = t,
                                         H = h, 
@@ -2250,10 +2257,14 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
                                         num_stages = num_stages)
         elif rotate_style == RotateStyle.NEOX:
             #TODO: add a new kernel for NOEX    
-            raise NotImplementedError("NEOX ratate style has not been implemented.")
+            raise NotImplementedError("NEOX ratate style has not been implemented in RoPE Triton backend.")
     else:
         if rotate_style == RotateStyle.GPTJ:
-            _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c[grid](x, y,  cos, sin, positions, offsets, out_x, out_y,
+            if have_nope:
+                #TODO: add a new kernel for nope    
+                raise NotImplementedError("nope style has not been implemented in RoPE Triton backend.")
+            else:
+                _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c[grid](x, y,  cos, sin, positions, offsets, out_x, out_y,
                                         *x.stride(), *cos.stride(),*positions.stride(), *out_x.stride(), 
                                         T = t,
                                         H = h, 
@@ -2267,7 +2278,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
                                         num_stages = num_stages)
         elif rotate_style == RotateStyle.NEOX:
             #TODO: add a new kernel for NOEX    
-            raise NotImplementedError("NEOX ratate style has not been implemented.")
+            raise NotImplementedError("NEOX ratate style has not been implemented in RoPE Triton backend.")
     
     return out_x, out_y
 
