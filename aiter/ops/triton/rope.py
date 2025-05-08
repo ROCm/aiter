@@ -2208,7 +2208,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     D_MODEL_HALF = d // 2
 
     BLOCK_T = 32
-    SPLIT_SEQ = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
+    SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
     
     if t >= 8192:
         MIN_NUM_WG = 2048
@@ -2217,10 +2217,10 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     else:
         MIN_NUM_WG = 512
     
-    if SPLIT_SEQ < MIN_NUM_WG:
+    if SPLIT_T < MIN_NUM_WG:
         SPLIT_H_SIZE = h
         SPLIT_H = (triton.next_power_of_2(h) + SPLIT_H_SIZE - 1) // SPLIT_H_SIZE
-        while SPLIT_H * SPLIT_SEQ < MIN_NUM_WG and SPLIT_H_SIZE > 1:
+        while SPLIT_H * SPLIT_T < MIN_NUM_WG and SPLIT_H_SIZE > 1:
             SPLIT_H_SIZE = SPLIT_H_SIZE // 2
             SPLIT_H = (triton.next_power_of_2(h) + SPLIT_H_SIZE - 1) // SPLIT_H_SIZE
     else:
@@ -2228,7 +2228,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     
     SPLIT_H = (triton.next_power_of_2(h) + SPLIT_H_SIZE - 1) // SPLIT_H_SIZE
 
-    grid = (SPLIT_H, SPLIT_SEQ, 1)
+    grid = (SPLIT_H, SPLIT_T, 1)
 
     num_warps = 4
     waves_per_eu = 0
