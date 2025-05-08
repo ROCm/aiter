@@ -85,6 +85,8 @@ class Gemm:
         self.rocb_sols = []
         self.rtol = 1e-2
         self.atol = 1e-2
+        self.ref = self.get_gemm_ref()
+        self.check_err_ratio = 0.01
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
@@ -118,7 +120,7 @@ class Gemm:
         # print(sols)
         self.hipb_sols = sols
 
-    def check_gemm_ref(self, libtype, solidx):
+    def get_gemm_ref(self):
         scaleA = HALF if self.scaleAB else ONE
         scaleB = HALF if self.scaleAB else ONE
         if self.indtype == dtypes.fp8:
@@ -145,31 +147,9 @@ class Gemm:
             if type(ref) is tuple and len(ref) == 2:
                 ref = ref[0]
         else:
-            ref = F.linear(self.inp, self.weights, self.bias)
-        if libtype == "hipblaslt":
-            c = aiter.hipb_mm(
-                self.inp,
-                self.weights.t(),
-                solidx,
-                bias=self.bias,
-                out_dtype=self.outdtype,
-                scaleA=scaleA,
-                scaleB=scaleB,
-            )
-        elif libtype == "rocblas":
-            c = aiter.rocb_mm(self.inp, self.weights.t(), solidx)
-            if self.bias is not None:
-                c += self.bias
-        if torch.allclose(
-            c.to(self.outdtype), ref.to(self.outdtype), atol=self.atol, rtol=self.rtol
-        ):
-            return True
-
-        print(">>>", libtype, "Solidx", solidx, "FAILED reference test", flush=True)
-        # print(ref, flush=True)
-        # print(c, flush=True)
-        return False
-
+            ref = F.linear(self.inp, self.weights, self.bias).to(self.outdtype)
+        return ref
+    
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 20
@@ -202,10 +182,17 @@ class Gemm:
                 {
                     "num_warmup": warmi,
                     "num_iters": coldi,
-                })
+                },
+                self.ref if fast_mode == 0 else None,
+                self.rtol,
+                self.atol,
+                )
             )
         ret = mp_tuner(task, self.mp)
-        for solidx, us, _ in ret:
+        for solidx, us, err_ratio in ret:
+            if fast_mode == 0:
+                if err_ratio > self.check_err_ratio:
+                    continue
             gtimes[solidx] = us/ 1000.0
         self.hipb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
@@ -260,7 +247,10 @@ class Gemm:
                 })
             )
         ret = mp_tuner(task, self.mp)
-        for solidx, us, _ in ret:
+        for solidx, us, err_ratio in ret:
+            if fast_mode == 0:
+                if err_ratio > self.check_err_ratio:
+                    continue
             gtimes[solidx] = us/ 1000.0
         self.rocb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
@@ -273,16 +263,14 @@ class Gemm:
         for i in range(warmi):
             self.blob = self.blob + 0.00001
 
-    def functional_check_topn_fastest(self):
+    def functional_get_topn_fastest(self):
         rocb_topn = []
         for solidx in self.rocb_gtimedf.index[: self.topn]:
-            if self.check_gemm_ref(libtype="rocblas", solidx=solidx):
-                rocb_topn.append(solidx)
+            rocb_topn.append(solidx)
         self.rocb_top_sols = rocb_topn
         hipb_topn = []
         for solidx in self.hipb_gtimedf.index[: self.topn]:
-            if self.check_gemm_ref(libtype="hipblaslt", solidx=solidx):
-                hipb_topn.append(solidx)
+            hipb_topn.append(solidx)
         self.hipb_top_sols = hipb_topn
 
     def find_fastest_solution(self):
@@ -294,7 +282,7 @@ class Gemm:
         self.rocb_time_all_sols(fast_mode=1)
         self.warmup()
         self.hipb_time_all_sols(fast_mode=1)
-        self.functional_check_topn_fastest()
+        self.functional_get_topn_fastest()
         self.warmup()
         self.rocb_time_all_sols(fast_mode=0, top_sols=1)
         self.warmup()

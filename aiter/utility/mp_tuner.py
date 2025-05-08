@@ -5,9 +5,9 @@ import multiprocessing as mp
 import os
 import pandas as pd
 import time
+from aiter.test_common import checkAllclose
 
-
-def worker(gpuIDMap, tag, func, args, kwargs):
+def worker(gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2):
     from aiter.test_common import run_perftest
     pid = mp.current_process().pid
     gpuID = gpuIDMap[pid]
@@ -19,16 +19,28 @@ def worker(gpuIDMap, tag, func, args, kwargs):
     args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
     torch.cuda.synchronize()
 
+    max_err_ratio = 0.0
     try:
-        _, us = run_perftest(func, *args, **kwargs)
+        res, us = run_perftest(func, *args, **kwargs)
         torch.cuda.synchronize()
-        _ = _.to("cpu")
+        
+        if ref is not None:
+            if isinstance(ref, torch.Tensor):
+                ref = [ref]
+            if isinstance(res, torch.Tensor):
+                res = [res]
+            ref = [el.to("cpu").to(device) if isinstance(el, torch.Tensor) and el.device != device else el for el in ref]
+            for i in range(len(ref)):
+                if isinstance(ref[i], torch.Tensor):
+                    err_ratio = checkAllclose(ref[i], res[i], atol=atol, rtol=rtol, printLog=False)
+                    max_err_ratio = max(max_err_ratio, err_ratio)
+
     except Exception as e:
         print(f"Error in process {pid}: {e}")
         us = float("inf")
-        _ = None
+        max_err_ratio = 1.0
 
-    return tag, us, _
+    return tag, us, max_err_ratio
 
 
 def get_pid():
