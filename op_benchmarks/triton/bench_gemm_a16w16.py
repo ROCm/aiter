@@ -17,26 +17,32 @@ def model_benchmark_shapes(args):
             N = config["intermediate_size"]
             K = config["hidden_size"]
 
-            shapes.append((M, N, K))
+            shapes.append((M, N, K, 'TN'))
 
     return shapes
 
 
 def get_x_vals():
     x_vals = [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
+        (1, 1280, 8192, 'TN'),
+        (32, 1280, 8192, 'TN'),
+        (64, 1280, 8192, 'TN'),
+        (128, 1280, 8192, 'TN'),
+        (192, 1280, 8192, 'TN'),
+        (256, 1280, 8192, 'TN'),
+        (320, 1280, 8192, 'TN'),
+        (512, 1280, 8192, 'TN'),
+        (1024, 1280, 8192, 'TN'),
+        (2048, 1280, 8192, 'TN'),
+        (4096, 1280, 8192, 'TN'),
+        (8192, 1280, 8192, 'TN'),
+        (16384, 1280, 8192, 'TN'),
+        (8192, 7168, 20480, 'NT'),
+        (1024, 20480, 8192, 'NT'),
+        (1024, 8192, 20480, 'NT'),
+        (8192, 7168, 20480, 'TN'),
+        (1024, 20480, 8192, 'TN'),
+        (1024, 8192, 20480, 'TN'),
     ]
     return x_vals
 
@@ -45,11 +51,11 @@ def run_benchmark(args):
     assert not(args.shape and args.model) or not(args.shape and args.M), \
         "User can specify --shape or --model MODEL -M VAL exclusively"
 
-    x_names = ['M', 'N', 'K']
+    x_names = ['M', 'N', 'K', 'layout']
     if args.model:
         x_vals_list = model_benchmark_shapes(args)
     elif args.shape:
-        x_vals_list = [args.shape]
+        x_vals_list = [args.shape + [args.layout]]
     else:
         x_vals_list = get_x_vals()
 
@@ -71,10 +77,10 @@ def run_benchmark(args):
         ylabel=ylabel, plot_name=f'GEMM A16W16 Benchmark', args={"metric": args.metric})
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, N, K, metric, provider):
+    def bench_gemm_a16w16(M, N, K, layout, metric, provider):
         # NOTE: Assume bias and output has the same dtype
         c_dtype = torch.bfloat16
-        x, w = generate_gemm_a16w16_inputs(M, N, K, c_dtype)
+        x, w = generate_gemm_a16w16_inputs(M, N, K, c_dtype, layout)
         # flops
         flops = 2.0 * M * N * K
         # memory transfer
@@ -119,6 +125,8 @@ def parse_args():
             help="user-defined shape to benchmark")
     parser.add_argument("--metric", type=str, choices=["time", "throughput", "bandwidth"],
             default="throughput", help="metric to plot")
+    parser.add_argument("--layout", type=str, choices=["TT", "TN", "NT", "NN"],
+            default="TN", help="Layout of input and weight matrix")
     args = parser.parse_args()
     return args
 

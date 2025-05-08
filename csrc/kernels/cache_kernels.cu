@@ -274,7 +274,7 @@ namespace vllm
       const int64_t *__restrict__ slot_mapping, // [num_tokens]
       const int block_stride, const int key_stride, const int value_stride,
       const int num_heads, const int head_size, const int block_size,
-      const float k_scale, const float v_scale)
+      const float* k_scale, const float* v_scale)
   {
     const int64_t token_idx = blockIdx.x;
     const int64_t slot_idx = slot_mapping[token_idx];
@@ -305,9 +305,9 @@ namespace vllm
       else
       {
         key_cache[tgt_key_value_idx] =
-            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, k_scale);
+            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_key, *k_scale);
         value_cache[tgt_key_value_idx] =
-            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, v_scale);
+            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(tgt_value, *v_scale);
       }
     }
   }
@@ -873,7 +873,7 @@ void reshape_and_cache(
           reinterpret_cast<CACHE_T *>(key_cache.data_ptr()),          \
           reinterpret_cast<CACHE_T *>(value_cache.data_ptr()),        \
           slot_mapping.data_ptr<int64_t>(), block_stride, key_stride, \
-          value_stride, num_heads, head_size, block_size, k_scale, v_scale);
+          value_stride, num_heads, head_size, block_size, k_scale.data_ptr<float>(), v_scale.data_ptr<float>());
 
 void reshape_and_cache_flash(
     torch::Tensor &key,       // [num_tokens, num_heads, head_size]
@@ -882,8 +882,9 @@ void reshape_and_cache_flash(
     torch::Tensor &
         value_cache,             // [num_blocks, block_size, num_heads, head_size]
     torch::Tensor &slot_mapping, // [num_tokens]
-    const std::string &kv_cache_dtype, const double k_scale,
-    const double v_scale)
+    const std::string &kv_cache_dtype,
+    torch::Tensor& k_scale,
+    torch::Tensor& v_scale)
 {
   int num_tokens = key.size(0);
   int num_heads = key.size(1);
