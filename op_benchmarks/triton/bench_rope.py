@@ -237,9 +237,9 @@ def parse_args():
     parser.add_argument("--reuse_freqs_front_part", type=str,
                         help="turn on reuse_freqs_front_part", default='true')
     parser.add_argument("--nope", type=str,
-                        help="turn on nope", default='true')
+                        help="turn on nope", default='false')
     parser.add_argument("--nope_first", type=str,
-                        help="turn on nope_fist", default='true')
+                        help="turn on nope_fist", default='false')
     parser.add_argument("--pos", type=str,
                         help="input positions", default='true')
     parser.add_argument("--offs", type=str,
