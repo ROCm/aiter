@@ -66,7 +66,7 @@ dtypes = {
 }
 
 
-def get_dtype(dtype_str):
+def get_dtype(dtype_str: str):
     if dtype_str is None:
         return None
     if dtype_str.startswith("torch"):
