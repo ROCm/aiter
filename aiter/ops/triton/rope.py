@@ -2210,9 +2210,12 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     BLOCK_T = 32
     SPLIT_SEQ = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
     
-    import os
-    MIN_NUM_WG = 2048
-    MIN_NUM_WG = int(os.environ.get("MIN_NUM_WG", MIN_NUM_WG))
+    if t >= 8192:
+        MIN_NUM_WG = 2048
+    elif t >= 1024:
+        MIN_NUM_WG = 1024
+    else:
+        MIN_NUM_WG = 512
     
     if SPLIT_SEQ < MIN_NUM_WG:
         SPLIT_H_SIZE = h
