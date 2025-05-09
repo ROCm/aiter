@@ -1,18 +1,15 @@
-import os
 import json
+import os
+import re
+import sys
+import tempfile
+import time
+
 import torch
 import triton.language as tl
-import sys
-import time
-import os
-import tempfile
-import re
-
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
-
-torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, torch.float32 : tl.float32}
 
 def get_model_configs(config_path='./utils/model_configs.json', models="llama3,mistral_7B"):
     """
