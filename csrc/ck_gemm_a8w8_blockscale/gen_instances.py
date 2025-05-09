@@ -233,11 +233,12 @@ torch::Tensor
 def get_tune_dict(tune_dict_csv):
     tune_dict = default_kernels_dict
     if os.path.exists(tune_dict_csv):
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
         tune_df = pd.read_csv(tune_dict_csv)
-        tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+        if torch.cuda.is_available():
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
         for i in range(len(tune_df)):
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]

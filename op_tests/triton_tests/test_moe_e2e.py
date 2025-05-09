@@ -11,7 +11,8 @@ import sys
 
 from aiter.ops.triton.moe_op_e2e import e2e_moe as triton_e2e_moe
 from aiter.ops.triton.moe_op_e2e import moe_set_use_persistent_kernel
-from aiter import silu_and_mul
+from op_tests.triton_tests.test_moe import silu_and_mul
+
 
 DEBUG_MODE = False
 
@@ -49,7 +50,7 @@ def torch_e2e_moe(a, w1, w2, c, a_scale, w1_scale, w2_scale, topk_ids, topk_weig
     print(intermidiate.shape)
 
     silu_out = torch.zeros([M * top_k, N // 2], dtype=a.dtype, device=a.device)
-    silu_and_mul(silu_out, intermidiate.view(-1, N))
+    silu_out = silu_and_mul(intermidiate.view(-1, N))
 
     silu_out = silu_out.view(M, top_k, N // 2)
 
