@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from einops import rearrange, repeat
 import torch
@@ -282,9 +282,7 @@ def test_flash_attn_varlen_func(
             requires_grad=True,
         )
     elif bias_type == "alibi":
-        alibi_slopes = torch.rand(
-            batch_size, nheads, device="cuda", dtype=dtypes.fp32
-        )
+        alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
 
     dout = torch.randn(
         batch_size,

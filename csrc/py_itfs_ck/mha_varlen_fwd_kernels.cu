@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -24,8 +24,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                                           const at::Tensor q,
                                           const at::Tensor k,
                                           const at::Tensor v,
-                                          const at::Tensor seqlens_q,
-                                          const at::Tensor seqlens_k,
+                                          const at::Tensor cu_seqlens_q,
+                                          std::optional<const at::Tensor> &cu_seqlens_k,
+                                          std::optional<const at::Tensor> &seqlens_k,
                                           std::optional<const at::Tensor> &bias_,
                                           std::optional<const at::Tensor> &alibi_slopes_,
                                           at::Tensor out,
@@ -99,9 +100,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         seqlens_q.data_ptr(), // seqstart_q
-                         seqlens_k.data_ptr(), // seqstart_k
-                         nullptr,              // seqlen_kpads
+                         cu_seqlens_q.data_ptr(), // seqstart_q
+                         cu_seqlens_k.has_value() ? cu_seqlens_k.value().data_ptr() : nullptr, // seqstart_k
+                         seqlens_k.has_value() ? seqlens_k.value().data_ptr() : nullptr, // seqlen_kpads
                          total_q,
                          total_k,
                          b,
@@ -158,8 +159,9 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
                                                           const at::Tensor q,
                                                           const at::Tensor k,
                                                           const at::Tensor v,
-                                                          const at::Tensor seqlens_q,
-                                                          const at::Tensor seqlens_k,
+                                                          const at::Tensor cu_seqlens_q,
+                                                          std::optional<const at::Tensor> &cu_seqlens_k,
+                                                          std::optional<const at::Tensor> &seqlens_k,
                                                           std::optional<const at::Tensor> &block_table_,
                                                           std::optional<const at::Tensor> &bias_,
                                                           std::optional<const at::Tensor> &alibi_slopes_,
@@ -207,9 +209,19 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.is_gappy = false;
     args.cache_batch_idx = nullptr;
 
-    args.seqstart_q_ptr = seqlens_q.data_ptr();
-    args.seqstart_k_ptr = seqlens_k.data_ptr();
-    args.seqlen_k_ptr = nullptr;
+    args.seqstart_q_ptr = cu_seqlens_q.data_ptr();
+    if (cu_seqlens_k.has_value()) {
+        args.seqstart_k_ptr = cu_seqlens_k.value().data_ptr();
+    }
+    else {
+        args.seqstart_k_ptr = nullptr;
+    }
+    if (seqlens_k.has_value()) {
+        args.seqlen_k_ptr = seqlens_k.value().data_ptr();
+    }
+    else {
+        args.seqlen_k_ptr = nullptr;
+    }
 
     args.batch = b;
     args.max_seqlen_q = max_seqlen_q;
@@ -286,7 +298,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
-               const at::Tensor &cu_seqlens_k, // [b+1]
+               std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
                int max_seqlen_q,
                int max_seqlen_k,
                float p_dropout,
@@ -311,13 +323,17 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
-    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+    if (cu_seqlens_k.has_value()) {
+        TORCH_CHECK(cu_seqlens_k.value().dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+    }
 
     std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(cu_seqlens_q);
-    CHECK_DEVICE(cu_seqlens_k);
+    if (cu_seqlens_k.has_value()) {
+        CHECK_DEVICE(cu_seqlens_k.value());
+    }
 
     at::Tensor block_table;
     const bool paged_KV = block_table_.has_value();
@@ -332,15 +348,17 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     CHECK_CONTIGUOUS(cu_seqlens_q);
-    CHECK_CONTIGUOUS(cu_seqlens_k);
+    if (cu_seqlens_k.has_value()) {
+        CHECK_CONTIGUOUS(cu_seqlens_k.value());
+    }
 
     const auto sizes = q.sizes();
 
     const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
-    const int head_size_q = sizes[2];
-    const int head_size_v = v.size(2);
-    const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
+    const int head_size_q = q.size(-1);
+    const int head_size_v = v.size(-1);
+    const int num_heads_k = k.size(-2);
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
@@ -359,7 +377,6 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
 
 
     const int total_q = q.size(0);
-
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(head_size_q <= 256, "CK only supports head dimension at most 256");
     TORCH_CHECK(head_size_v <= 256, "CK only supports head dimension at most 256");
@@ -399,7 +416,9 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
     }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
-    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+    if (cu_seqlens_k.has_value()) {
+        CHECK_SHAPE(cu_seqlens_k.value(), batch_size + 1);
+    }
     auto opts = q.options();
 
     at::Tensor out;
@@ -467,7 +486,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         hipLaunchKernelGGL(
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
-
+    std::optional<const at::Tensor> seqlens_k = std::nullopt;
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
@@ -493,6 +512,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     v,
                     cu_seqlens_q,
                     cu_seqlens_k,
+                    seqlens_k,
                     block_table_,
                     bias_,
                     alibi_slopes_,
@@ -512,8 +532,8 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         }
         else
         {
+            TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");
             auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-
             auto args =
                 get_ck_fmha_varlen_fwd_args(
                     has_lse,
@@ -530,6 +550,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                     v,
                     cu_seqlens_q,
                     cu_seqlens_k,
+                    seqlens_k,
                     bias_,
                     alibi_slopes_,
                     out,

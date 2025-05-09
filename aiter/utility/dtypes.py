@@ -1,19 +1,13 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import functools
+from ..jit.utils.chip_info import get_gfx
 
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},
     "gfx950": {"fp8": torch.float8_e4m3fn},
 }
-
-
-@functools.lru_cache(maxsize=1)
-def get_gfx():
-    device = torch.cuda.current_device()
-    gfx = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    return gfx
 
 
 def get_dtype_fp8():

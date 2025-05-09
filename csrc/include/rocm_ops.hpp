@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #define ACTIVATION_PYBIND                                                                               \
       m.def("silu_and_mul", &silu_and_mul, "Activation function used in SwiGLU.");                      \
