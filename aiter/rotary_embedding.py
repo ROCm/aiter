@@ -396,7 +396,6 @@ class RotaryEmbedding(nn.Module):
                 )
             return query.view(query_shape), key.view(key_shape)
         else:
-            raise NotImplementedError("only-query RoPE operations has not been implemented in Triton backend.")
             if offsets is None:
                 ops.rope_cached_positions_fwd_inplace(
                     query_,
