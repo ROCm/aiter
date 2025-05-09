@@ -66,7 +66,7 @@ dtypes = {
 }
 
 
-def get_dtype(dtype_str):
+def get_dtype(dtype_str: str):
     if dtype_str is None:
         return None
     if dtype_str.startswith("torch"):
@@ -106,6 +106,12 @@ if __name__ == "__main__":
         type=str,
         default=os.getenv("GTUNE_INPUT", None),
         help="list of gemms to tune for, mutually exclusive with model_dir",
+    )
+    parser.add_argument(
+        "--mp",
+        type=int,
+        default=torch.cuda.device_count(),
+        help="Tuning on multiple GPUs using multiple processes",
     )
     parser.add_argument(
         "--tp",
@@ -160,7 +166,7 @@ if __name__ == "__main__":
     indtype = get_dtype(args.indtype)
     outdtype = get_dtype(args.outdtype)
 
-    gtuner = GemmTuner(indtype, outdtype, args.tuned_file, args.rocblas_decode)
+    gtuner = GemmTuner(indtype, outdtype, args.tuned_file, args.rocblas_decode, args.mp)
     nsets = [i * args.batch_size for i in args.nsets]
     if args.input_file:
         print(f">>> Loading {args.input_file}")
