@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
-from typing import Tuple, Optional
+
 
 @triton.jit
 def _rms_norm_kernel(
@@ -394,6 +396,7 @@ def _rms_norm_dynamic_per_token_fp8_quant_kernel(
             o_rms_norm,
             mask=mask,
         )
+
 
 def rms_norm_dynamic_per_token_fp8_quant(
     x: torch.Tensor,

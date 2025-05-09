@@ -1,26 +1,31 @@
-import torch
 import pytest
-import triton
+import torch
 import torch.nn.functional as F
-from aiter.ops.triton.rmsnorm import rms_norm
-from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add
-from aiter.ops.triton.rmsnorm import rms_norm_dynamic_per_token_fp8_quant
+import triton
+from aiter.ops.triton.rmsnorm import (
+    rms_norm,
+    rms_norm_dynamic_per_token_fp8_quant,
+    rmsnorm2d_fwd_with_add,
+)
 
-#TODO: Move to a share utils file to avoid duplication for other tests
+
+# TODO: Move to a share utils file to avoid duplication for other tests
 def torch_dynamic_per_token_fp8_quant(x):
-    x_max, _ = torch.max(torch.abs(x),axis=-1)
+    x_max, _ = torch.max(torch.abs(x), axis=-1)
     scale_out = x_max / torch.finfo(torch.float8_e4m3fnuz).max
-    
-    out = (x / scale_out[:, None])
+
+    out = x / scale_out[:, None]
     out = out.to(torch.float8_e4m3fnuz)
 
     return out, scale_out
+
 
 def generate_rmsnorm_inputs(M, N, dtype):
     x = torch.randn((M, N), dtype=dtype).cuda()
     weight = torch.randn(N, dtype=dtype).cuda()
 
     return x, weight
+
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
     M, N = x.shape
@@ -174,8 +179,8 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
 
     EPS = 1e-5
 
-    xq_fused_triton, x_scale_fused, x_normed = (
-        rms_norm_dynamic_per_token_fp8_quant(x, w, dump_rms_norm=True)
+    xq_fused_triton, x_scale_fused, x_normed = rms_norm_dynamic_per_token_fp8_quant(
+        x, w, dump_rms_norm=True
     )
     ref_x_normed, _ = run_torch(x, w, EPS)
     ref_xq, ref_x_scale = torch_dynamic_per_token_fp8_quant(x)

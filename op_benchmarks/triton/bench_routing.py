@@ -2,7 +2,6 @@ from functools import partial
 
 import torch
 import triton
-import triton.language as tl
 
 from aiter.ops.triton.routing import (
     _routing_sigmoid_top1_kernel,
@@ -36,9 +35,14 @@ def benchmark(M, N, K):
     )
     _compiled = _get_compiled(_eager)
 
-    eager_fn = lambda: _eager(x, w, TOPK)
-    triton_fn = lambda: routing_sigmoid_top1(x, w, TOPK)
-    compile_fn = lambda: _compiled(x, w, TOPK)
+    def eager_fn():
+        return _eager(x, w, TOPK)
+
+    def triton_fn():
+        return routing_sigmoid_top1(x, w, TOPK)
+
+    def compile_fn():
+        return _compiled(x, w, TOPK)
 
     # warmup
     for _ in range(5):

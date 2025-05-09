@@ -1,8 +1,7 @@
-from functools import partial
-
 import torch
 import triton
 import triton.language as tl
+
 
 def get_config_heuristic(M, K, N):
     """
@@ -21,11 +20,7 @@ def get_config_heuristic(M, K, N):
     m_bucket = (
         "very_large"
         if M >= 8192
-        else "large"
-        if M >= 4096
-        else "medium"
-        if M >= 2048
-        else "small"
+        else "large" if M >= 4096 else "medium" if M >= 2048 else "small"
     )
 
     # Create parameter configuration using nested dictionaries
@@ -136,7 +131,8 @@ def _routing_sigmoid_top1_kernel(
 
         X_ptrs = X_ptr + (
             # pyre-ignore
-            offs_m[:, None] * stride_xm + offs_k_iter[None, :] * stride_xk
+            offs_m[:, None] * stride_xm
+            + offs_k_iter[None, :] * stride_xk
         )
         W_ptrs = W_ptr + (
             offs_k_iter[:, None] * stride_wk + offs_n[None, :] * stride_wn

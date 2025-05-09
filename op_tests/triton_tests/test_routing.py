@@ -1,7 +1,9 @@
-import torch
-import pytest
-from aiter.ops.triton.routing import routing_sigmoid_top1, torch_routing_sigmoid_top1
 from functools import partial
+
+import pytest
+import torch
+from aiter.ops.triton.routing import routing_sigmoid_top1, torch_routing_sigmoid_top1
+
 
 @pytest.mark.parametrize("M", [128, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("N", [16, 128])
@@ -19,7 +21,9 @@ def test_routing_sigmoid_top1(M, N, K, dtype):
 
     dummy_ids = torch.ones((M, 1), dtype=torch.int32, device="cuda") * N
     dummy_weights = torch.ones((M, 1), dtype=torch.float32, device="cuda")
-    _eager = partial(torch_routing_sigmoid_top1, dummy_ids=dummy_ids, dummy_weights=dummy_weights)
+    _eager = partial(
+        torch_routing_sigmoid_top1, dummy_ids=dummy_ids, dummy_weights=dummy_weights
+    )
 
     topk_ids, topk_weights = routing_sigmoid_top1(x, w, TOPK, fused_shared_experts=True)
     _eager_topk_ids, _eager_topk_weights = _eager(x, w, TOPK, fused_shared_experts=True)
