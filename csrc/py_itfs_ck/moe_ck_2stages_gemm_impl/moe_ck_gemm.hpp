@@ -30,6 +30,8 @@ using F32 = float;
 using Row = ck::tensor_layout::gemm::RowMajor;
 using Col = ck::tensor_layout::gemm::ColumnMajor;
 
+using PipelineVersion = ck::BlockGemmPipelineVersion;
+
 struct TypeCast
 {
     template <typename E, typename C, typename D0, typename D1, typename D2>
@@ -339,7 +341,7 @@ struct MulABScaleExpertWeightWin4
     }
 };
 
-template <typename A0DataType, typename B0DataType, typename AccDataType, typename EDataType, typename CDEElementOp, int MPerBlock, int KPerBlock, int MWaves, int NWaves, bool Nswizzle, bool PerTensorQuant, bool MulRoutedWeight, int ActOP>
+template <typename A0DataType, typename B0DataType, typename AccDataType, typename EDataType, typename CDEElementOp, PipelineVersion PipelineVer, int MPerBlock, int KPerBlock, int MWaves, int NWaves, bool Nswizzle, bool PerTensorQuant, bool MulRoutedWeight, int ActOP>
 void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&hidden_states,                          // [m, k], input token
@@ -354,7 +356,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<void *> a1_scale = std::nullopt  // [m, 1], token scale
 );
 
-template <typename A0DataType, typename B0DataType, typename AccDataType, typename EDataType, typename CDEElementOp, int MPerBlock, int KPerBlock, int MWaves, int NWaves, bool Nswizzle, bool PerTensorQuant, bool MulRoutedWeight>
+template <typename A0DataType, typename B0DataType, typename AccDataType, typename EDataType, typename CDEElementOp, PipelineVersion PipelineVer, int MPerBlock, int KPerBlock, int MWaves, int NWaves, bool Nswizzle, bool PerTensorQuant, bool MulRoutedWeight>
 void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&inter_states,                           // [max_num_tokens_padded, k], input token
