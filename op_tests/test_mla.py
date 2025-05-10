@@ -2,13 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
-from op_tests.triton_tests.utils import mla_decode_ref, mla_extend_ref
 from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.test_mha_common import attention_ref
 from aiter import dtypes
-from einops import rearrange
 import random
 import itertools
 

@@ -4,9 +4,9 @@
 
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-GEN_DIR = ""    # in Cmake, have to generate files in same folder
+GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
 AITER_API_FILENAME = "mha_bwd.cpp"
 
@@ -89,11 +89,8 @@ COMBINED_API = """t = fmha_bwd_v3(traits, args, stream_config);
     if (t == -1) { t = fmha_bwd(traits, args, stream_config); }
 """
 
-API_MAP = {
-    1: V2_API,
-    2: V3_API,
-    3: COMBINED_API
-}
+API_MAP = {1: V2_API, 2: V3_API, 3: COMBINED_API}
+
 
 def write_blobs(output_dir: Optional[str], receipt) -> None:
     if output_dir is None:
@@ -103,8 +100,9 @@ def write_blobs(output_dir: Optional[str], receipt) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    api = AITER_CPP_API.format(F_dispatch = API_MAP[receipt])
+    api = AITER_CPP_API.format(F_dispatch=API_MAP[receipt])
     (output_dir / AITER_API_FILENAME).write_text(api)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -115,16 +113,16 @@ if __name__ == "__main__":
         "-o",
         "--output_dir",
         required=False,
-        help="write all the blobs into a directory"
+        help="write all the blobs into a directory",
     )
     parser.add_argument(
         "-r",
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt. 1: generate fmha v2 c++ api\n"  + \
-                            "  2: generate fmha v3 c++ api\n"                 + \
-                            "  3: generate v2 v3 combined api for PREBUILD mode"
+        help="codegen receipt. 1: generate fmha v2 c++ api\n"
+        + "  2: generate fmha v3 c++ api\n"
+        + "  3: generate v2 v3 combined api for PREBUILD mode",
     )
 
     args = parser.parse_args()

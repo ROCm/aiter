@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -334,3 +336,114 @@ def rmsnorm2d_fwd_with_add(
     )
 
     return out, residual_out
+
+
+@triton.jit
+def _rms_norm_dynamic_per_token_fp8_quant_kernel(
+    x_ptr,
+    o_ptr,
+    w_ptr,
+    o_scale_ptr,
+    scale_ub,
+    o_rms_norm_ptr,
+    EPS: tl.constexpr,
+    EPS_FP8: tl.constexpr,
+    D: tl.constexpr,
+    MAX_FP8: tl.constexpr,
+    CLAMP_MAX: tl.constexpr,
+    TL_FP8_DTYPE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    DUMP_INTERMEDIATE: tl.constexpr,
+):
+    row_idx = tl.program_id(axis=0).to(tl.int64)
+    variance = tl.zeros([1], dtype=tl.float32)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < D
+
+    row_start_ptr = x_ptr + row_idx * D
+    out_start_ptr = o_ptr + row_idx * D
+    input_ptrs = row_start_ptr + col_offsets
+    output_ptrs = out_start_ptr + col_offsets
+
+    row = tl.load(input_ptrs, mask=mask, other=0.0, eviction_policy="evict_last").to(
+        tl.float32
+    )
+    variance = tl.sum(row * row, axis=0) / D
+    rstd = tl.rsqrt(variance + EPS)
+
+    w = tl.load(w_ptr + col_offsets, mask=mask, eviction_policy="evict_first").to(
+        tl.float32
+    )
+    o_rms_norm = row * rstd * w
+
+    # FP8 rowwise quantize
+    cur_max = tl.max(tl.abs(o_rms_norm))
+
+    if CLAMP_MAX:
+        ub = tl.load(scale_ub)
+        cur_max = tl.clamp(cur_max, EPS_FP8, ub)
+    else:
+        cur_max = tl.maximum(cur_max, EPS_FP8)
+    o_scale = MAX_FP8 / cur_max
+    tl.store(o_scale_ptr + row_idx, 1.0 / o_scale)
+    o_fp8 = tl.clamp(o_rms_norm * o_scale, -MAX_FP8, MAX_FP8)
+    o_fp8.to(TL_FP8_DTYPE)
+    tl.store(output_ptrs, o_fp8, mask=mask)
+
+    if DUMP_INTERMEDIATE:
+        tl.store(
+            o_rms_norm_ptr + row_idx * D + col_offsets,
+            o_rms_norm,
+            mask=mask,
+        )
+
+
+def rms_norm_dynamic_per_token_fp8_quant(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    eps: float = 1.0e-5,
+    scale_ub: Optional[torch.Tensor] = None,
+    dump_rms_norm: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    assert x.is_contiguous()
+    assert w.is_contiguous()
+    x_shape = x.shape
+    x = x.view(-1, x.size(-1))
+    (B_T, D) = x.shape
+
+    pt_dtype = torch.float8_e4m3fnuz
+    tl_dtype = tl.float8e4b8
+    max_fp8 = torch.finfo(pt_dtype).max
+    eps_fp8 = 1e-12
+
+    out = torch.empty((B_T, D), device=x.device, dtype=pt_dtype)
+    out_scale = torch.empty((B_T), device=x.device, dtype=torch.float32)
+    assert w.shape == (D,)
+    assert out.shape == x.shape
+
+    out_rms_norm = None
+    if dump_rms_norm:
+        out_rms_norm = torch.empty_like(x)
+
+    _rms_norm_dynamic_per_token_fp8_quant_kernel[(B_T,)](
+        x,
+        out,
+        w,
+        out_scale,
+        scale_ub,
+        out_rms_norm,
+        eps,
+        eps_fp8,
+        D,
+        MAX_FP8=max_fp8,
+        CLAMP_MAX=scale_ub is not None,
+        TL_FP8_DTYPE=tl_dtype,
+        BLOCK_SIZE=triton.next_power_of_2(D),
+        DUMP_INTERMEDIATE=dump_rms_norm,
+    )
+
+    if dump_rms_norm:
+        assert out_rms_norm is not None
+        out_rms_norm = out_rms_norm.view(x_shape)
+
+    return out.view(x_shape), out_scale, out_rms_norm

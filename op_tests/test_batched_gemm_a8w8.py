@@ -3,12 +3,9 @@
 
 import torch
 import torch.nn.functional as F
-import numpy as np
-import sys
-import os
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest, tensor_dump
+from aiter.test_common import checkAllclose, perftest
 
 
 @perftest(num_iters=5)

@@ -134,14 +134,18 @@ def validate_and_update_archs():
     ), f"One of GPU archs of {archs} is invalid or not supported"
     return archs
 
+
 @functools.lru_cache()
-def hip_flag_checker(flag_hip : str):
-    ret = os.system(f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -")
+def hip_flag_checker(flag_hip: str):
+    ret = os.system(
+        f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -"
+    )
     if ret == 0:
         return [flag_hip]
     else:
         logger.warning(f"{flag_hip} is not supported by hipcc.")
         return []
+
 
 def check_and_set_ninja_worker():
     max_num_jobs_cores = int(max(1, os.cpu_count() * 0.8))
@@ -217,7 +221,7 @@ def rm_module(md_name):
 
 @functools.lru_cache()
 def recopy_ck():
-    if os.path.exists(f"CK_DIR"):
+    if os.path.exists(CK_DIR):
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
 
@@ -287,7 +291,9 @@ def build_module(
         if hip_version > Version("6.1.40090"):
             flags_hip += hip_flag_checker("-mllvm -enable-post-misched=0")
         if hip_version > Version("6.2.41132"):
-            flags_hip += hip_flag_checker("-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false")
+            flags_hip += hip_flag_checker(
+                "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"
+            )
         if hip_version > Version("6.2.41133"):
             flags_hip += hip_flag_checker("-mllvm -amdgpu-coerce-illegal-types=1")
 
@@ -397,7 +403,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
                         if "torch" in el:
-                            import torch
+                            import torch as torch
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
@@ -476,7 +482,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 if module is None:
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
-            except ModuleNotFoundError as e:
+            except ModuleNotFoundError:
                 d_args = get_args_of_build(md_name)
                 d_args.update(custom_build_args)
 

@@ -57,9 +57,22 @@ def paged_attention_decode_ref(
         out = out.view(num_q_heads, head_sz)
         output[s].copy_(out, non_blocking=True)
 
+
 tl_to_torch_dtype = {tl.bfloat16: torch.bfloat16, tl.float16: torch.float16}
 
-def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks=4):
+
+def input_helper(
+    B,
+    H_Q,
+    H_KV,
+    D,
+    KV_BLK_SZ,
+    SEQ_LEN,
+    dtype,
+    kv_cache_dtype,
+    output_type,
+    num_blocks=4,
+):
     """Helper function to generate input tensors for paged attention testing."""
     # Query tensor generation
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -78,8 +91,12 @@ def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, out
         value_cache = torch.randn(
             num_blocks, H_KV, D, KV_BLK_SZ, dtype=torch.float16, device="cuda"
         )
-        key_cache = torch.clamp(key_cache, min=1e-3) #For FP8 case, this is needed to prevent NANs
-        value_cache = torch.clamp(value_cache, min=1e-3) #For FP8 case, this is needed to prevent NANs
+        key_cache = torch.clamp(
+            key_cache, min=1e-3
+        )  # For FP8 case, this is needed to prevent NANs
+        value_cache = torch.clamp(
+            value_cache, min=1e-3
+        )  # For FP8 case, this is needed to prevent NANs
 
         # torch doesn't have randn for fp8 data type, so we convert here
         key_cache = key_cache.to(dtype=kv_cache_dtype)
@@ -92,8 +109,12 @@ def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, out
         value_cache = torch.randn(
             num_blocks, H_KV, D, KV_BLK_SZ, dtype=kv_cache_dtype, device="cuda"
         )
-        key_cache = torch.clamp(key_cache, min=1e-3) #For FP8 case, this is needed to prevent NANs
-        value_cache = torch.clamp(value_cache, min=1e-3) #For FP8 case, this is needed to prevent NANs
+        key_cache = torch.clamp(
+            key_cache, min=1e-3
+        )  # For FP8 case, this is needed to prevent NANs
+        value_cache = torch.clamp(
+            value_cache, min=1e-3
+        )  # For FP8 case, this is needed to prevent NANs
 
     key_cache_tri = key_cache.permute(0, 1, 3, 2, 4).flatten(3, 4).contiguous().cuda()
     value_cache_tri = value_cache.permute(0, 1, 3, 2).contiguous().cuda()
@@ -112,10 +133,21 @@ def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, out
 
     output = torch.zeros(B, H_Q, D, dtype=output_type, device="cuda")
 
-    return query, output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len
+    return (
+        query,
+        output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    )
+
 
 @pytest.mark.parametrize("B", [1, 4, 27])
-@pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (24,4)])
+@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16), (24, 4)])
 @pytest.mark.parametrize("D", [1, 64, 128])
 @pytest.mark.parametrize("KV_BLK_SZ", [1, 4, 16])
 @pytest.mark.parametrize("SEQ_LEN", [1, 57, 10000])
@@ -138,7 +170,6 @@ def input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, out
         (torch.int8, torch.int8, tl.bfloat16, torch.bfloat16),
     ],
 )
-
 def test_paged_attn(
     B,
     H_Q,
@@ -153,13 +184,33 @@ def test_paged_attn(
     output_type,
 ):
 
-    if SEQ_LEN >= 8192 and B >=16:
+    if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
     torch.set_printoptions(threshold=100000)
     num_blocks = NUM_BLK
 
-    query, triton_output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len \
-        = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
+    (
+        query,
+        triton_output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    ) = input_helper(
+        B,
+        H_Q,
+        H_KV,
+        D,
+        KV_BLK_SZ,
+        SEQ_LEN,
+        dtype,
+        kv_cache_dtype,
+        output_type,
+        num_blocks,
+    )
 
     attn_scale = 1.0 / (D**0.5)
 
@@ -176,7 +227,7 @@ def test_paged_attn(
         k_scale=torch.tensor([1.0]),
         v_scale=torch.tensor([1.0]),
         num_seq_partitions=0,
-        alibi_slopes=None
+        alibi_slopes=None,
     )
 
     # torch doesn't have support for fp8 data type, so we convert here
@@ -195,8 +246,8 @@ def test_paged_attn(
 
 
 @pytest.mark.parametrize("B", [1, 4, 57, 64])
-#@pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (2,1), (24,4)]) #TODO: GQA failing
-@pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16)])
+# @pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (2,1), (24,4)]) #TODO: GQA failing
+@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16)])
 @pytest.mark.parametrize("D", [1, 64, 128])
 @pytest.mark.parametrize("KV_BLK_SZ", [1, 4, 512])
 @pytest.mark.parametrize("SEQ_LEN", [1, 32, 57, 512, 10000])
@@ -205,7 +256,7 @@ def test_paged_attn(
     "dtype, kv_cache_dtype, compute_type, output_type",
     [
         (torch.float16, torch.float16, tl.float16, torch.float16),
-        #(torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
+        # (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
     ],
 )
 def test_paged_attn_per_token_quant(
@@ -222,21 +273,51 @@ def test_paged_attn_per_token_quant(
     output_type,
 ):
     torch.set_printoptions(precision=5, threshold=10000)
-    if D == 128 and KV_BLK_SZ == 512: #Causes Shared Memory out of resources on Mi300
+    if D == 128 and KV_BLK_SZ == 512:  # Causes Shared Memory out of resources on Mi300
         pytest.skip("D={128} and KV_BLK_SZ={512} causes shared memory out of resources")
 
-    if SEQ_LEN >= 8192 and B >=16:
+    if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
 
-    num_blocks =  NUM_BLK
+    num_blocks = NUM_BLK
 
-    query, triton_output, key_cache, value_cache, key_cache_tri, value_cache_tri, context_lens, block_tables, max_context_len \
-        = input_helper(B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, dtype, kv_cache_dtype, output_type, num_blocks)
+    (
+        query,
+        triton_output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    ) = input_helper(
+        B,
+        H_Q,
+        H_KV,
+        D,
+        KV_BLK_SZ,
+        SEQ_LEN,
+        dtype,
+        kv_cache_dtype,
+        output_type,
+        num_blocks,
+    )
 
     attn_scale = 1.0 / (D**0.5)
 
-    key_cache_tri_quant, k_scale, = pertoken_quant(key_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz)
-    value_cache_tri_quant, v_scale, = pertoken_quant(value_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz)
+    (
+        key_cache_tri_quant,
+        k_scale,
+    ) = pertoken_quant(
+        key_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz
+    )
+    (
+        value_cache_tri_quant,
+        v_scale,
+    ) = pertoken_quant(
+        value_cache_tri, scale_dtype=torch.float32, quant_dtype=torch.float8_e4m3fnuz
+    )
 
     paged_attention_decode(
         triton_output,
@@ -251,18 +332,28 @@ def test_paged_attn_per_token_quant(
         k_scale=k_scale,
         v_scale=v_scale,
         num_seq_partitions=0,
-        alibi_slopes=None
+        alibi_slopes=None,
     )
 
     if DEBUG_MODE:
-        print(f"B={B} H_Q={H_Q}, H_KV={H_KV} D={D}, KV_BLK_SZ={KV_BLK_SZ}, SEQ_LEN={SEQ_LEN}, NUM_BLK={NUM_BLK}")
+        print(
+            f"B={B} H_Q={H_Q}, H_KV={H_KV} D={D}, KV_BLK_SZ={KV_BLK_SZ}, SEQ_LEN={SEQ_LEN}, NUM_BLK={NUM_BLK}"
+        )
         print(f"query={query}")
-        print(f"key_cache_tri.shape={key_cache_tri.shape} key_cache_tri={key_cache_tri}")
+        print(
+            f"key_cache_tri.shape={key_cache_tri.shape} key_cache_tri={key_cache_tri}"
+        )
         print(f"k_scale.shape={k_scale.shape} k_scale={k_scale}")
-        print(f"key_cache_tri_quant.shape={key_cache_tri_quant.shape} key_cache_tri_quant={key_cache_tri_quant}")
+        print(
+            f"key_cache_tri_quant.shape={key_cache_tri_quant.shape} key_cache_tri_quant={key_cache_tri_quant}"
+        )
         print(f"v_scale.shape={v_scale.shape} v_scale={v_scale}")
-        print(f"value_cache_tri.shape={value_cache_tri.shape} value_cache_tri={value_cache_tri}")
-        print(f"value_cache_tri_quant.shape={value_cache_tri_quant.shape} value_cache_tri_quant={value_cache_tri_quant}")
+        print(
+            f"value_cache_tri.shape={value_cache_tri.shape} value_cache_tri={value_cache_tri}"
+        )
+        print(
+            f"value_cache_tri_quant.shape={value_cache_tri_quant.shape} value_cache_tri_quant={value_cache_tri_quant}"
+        )
         print(f"triton_output={triton_output}")
     # torch doesn't have support for fp8 data type, so we convert here
     if dtype not in (torch.bfloat16, torch.float16, torch.float32):

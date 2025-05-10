@@ -9,22 +9,13 @@ import itertools
 from pathlib import Path
 from typing import List, Optional
 
-GEN_DIR = ""    # in Cmake, have to generate files in same folder
+GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
-BWD_DTYPE_MAP = {
-    "fp16": "FmhaBwdFp16",
-    "bf16": "FmhaBwdBf16"
-}
+BWD_DTYPE_MAP = {"fp16": "FmhaBwdFp16", "bf16": "FmhaBwdBf16"}
 
-MODE_MAP = {
-    "batch" : "false",
-    "group" : "true"
-}
+MODE_MAP = {"batch": "false", "group": "true"}
 
-BOOL_MAP = {
-    "t" : "true",
-    "f" : "false"
-}
+BOOL_MAP = {"t": "true", "f": "false"}
 
 FMHA_BWD_KERNEL_HEADER = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.\n
@@ -32,8 +23,8 @@ FMHA_BWD_KERNEL_HEADER = """// SPDX-License-Identifier: MIT
 #include "fmha_bwd.hpp"
 """
 
-FMHA_BWD_API_FILENAME="asm_fmha_bwd_v3.cpp"
-FMHA_BWD_API="""
+FMHA_BWD_API_FILENAME = "asm_fmha_bwd_v3.cpp"
+FMHA_BWD_API = """
 #include <iostream>
 #include "aiter_hip_common.h"
 #include <hip/hip_runtime.h>
@@ -2334,6 +2325,7 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
 } // namespace aiter
 """
 
+
 # GEMM0: Q@K=S^T
 # GEMM1: P^T@dO^T=dV(This was chosen as G1 to match fwd, but N1 must be equal to headdim_v)
 # GEMM2: dO@V=dP^T(This was chosen as G2 because of the calculation order)
@@ -2342,66 +2334,189 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
 # Is it necessary to distinguish between K0~K4?
 @dataclass
 class FmhaBwdDQDKDVTileSize:
-    F_bm0       : int  # tile size along q seqlen (block size)
-    F_bn0       : int  # tile size along k seqlen
-    F_bk0       : int  # tile size along gemm0 unroll(F_bhdq)
-    F_bk1       : int  # tile size along gemm1 unroll(F_bm0)
-    F_bk2       : int  # tile size along gemm2 unroll(F_bhdv)
-    F_bk3       : int  # tile size along gemm3 unroll(F_bm0)
-    F_bk4       : int  # tile size along gemm4 unroll(F_bn0)
-    F_bhdq      : int  # q head_dim
-    F_bhdv      : int  # v head_dim
-    F_rm0       : int  # number of warps along q seqlen (block warps) in gemm0/gemm2
-    F_rn0       : int  # number of warps along k seqlen (block warps) in gemm0/gemm2
-    F_rk0       : int  # number of warps along headdim_qk/v (not used) in gemm0/gemm2
-    F_rm1       : int  # number of warps along k seqlen (block warps) in gemm1/gemm3
-    F_rn1       : int  # number of warps along headdim_qk/v (block warps) in gemm1/gemm3
-    F_rk1       : int  # number of warps along q seqlen (not used) in gemm1/gemm3
-    F_rm2       : int  # number of warps along q seqlen (block warps) in gemm4
-    F_rn2       : int  # number of warps along headdim_qk (block warps) in gemm4
-    F_rk2       : int  # number of warps along k seqlen (not used) in gemm4
-    F_wm0       : int  # warp size along m in gemm0/gemm2/gemm4
-    F_wn0       : int  # warp size along n in gemm0/gemm2/gemm4
-    F_wk0       : int  # warp size along k in gemm0/gemm2/gemm4
-    F_wm1       : int  # warp size along m in gemm1/gemm3
-    F_wn1       : int  # warp size along n in gemm1/gemm3
-    F_wk1       : int  # warp size along k in gemm1/gemm3
-    F_occupancy : int  # occupancy
+    F_bm0: int  # tile size along q seqlen (block size)
+    F_bn0: int  # tile size along k seqlen
+    F_bk0: int  # tile size along gemm0 unroll(F_bhdq)
+    F_bk1: int  # tile size along gemm1 unroll(F_bm0)
+    F_bk2: int  # tile size along gemm2 unroll(F_bhdv)
+    F_bk3: int  # tile size along gemm3 unroll(F_bm0)
+    F_bk4: int  # tile size along gemm4 unroll(F_bn0)
+    F_bhdq: int  # q head_dim
+    F_bhdv: int  # v head_dim
+    F_rm0: int  # number of warps along q seqlen (block warps) in gemm0/gemm2
+    F_rn0: int  # number of warps along k seqlen (block warps) in gemm0/gemm2
+    F_rk0: int  # number of warps along headdim_qk/v (not used) in gemm0/gemm2
+    F_rm1: int  # number of warps along k seqlen (block warps) in gemm1/gemm3
+    F_rn1: int  # number of warps along headdim_qk/v (block warps) in gemm1/gemm3
+    F_rk1: int  # number of warps along q seqlen (not used) in gemm1/gemm3
+    F_rm2: int  # number of warps along q seqlen (block warps) in gemm4
+    F_rn2: int  # number of warps along headdim_qk (block warps) in gemm4
+    F_rk2: int  # number of warps along k seqlen (not used) in gemm4
+    F_wm0: int  # warp size along m in gemm0/gemm2/gemm4
+    F_wn0: int  # warp size along n in gemm0/gemm2/gemm4
+    F_wk0: int  # warp size along k in gemm0/gemm2/gemm4
+    F_wm1: int  # warp size along m in gemm1/gemm3
+    F_wn1: int  # warp size along n in gemm1/gemm3
+    F_wk1: int  # warp size along k in gemm1/gemm3
+    F_occupancy: int  # occupancy
+
     @property
     def name(self) -> str:
-        return f"b{self.F_bm0}x{self.F_bn0}x{self.F_bk0}x{self.F_bk1}x{self.F_bk2}x{self.F_bk3}x{self.F_bk4}x{self.F_bhdq}x{self.F_bhdv}" +\
-        f"_r{self.F_rm0}x{self.F_rn0}x{self.F_rk0}_r{self.F_rm1}x{self.F_rn1}x{self.F_rk1}_r{self.F_rm2}x{self.F_rn2}x{self.F_rk2}" +\
-        f"_w{self.F_wm0}x{self.F_wn0}x{self.F_wk0}_w{self.F_wm1}x{self.F_wn1}x{self.F_wk1}_o{self.F_occupancy}"
+        return (
+            f"b{self.F_bm0}x{self.F_bn0}x{self.F_bk0}x{self.F_bk1}x{self.F_bk2}x{self.F_bk3}x{self.F_bk4}x{self.F_bhdq}x{self.F_bhdv}"
+            + f"_r{self.F_rm0}x{self.F_rn0}x{self.F_rk0}_r{self.F_rm1}x{self.F_rn1}x{self.F_rk1}_r{self.F_rm2}x{self.F_rn2}x{self.F_rk2}"
+            + f"_w{self.F_wm0}x{self.F_wn0}x{self.F_wk0}_w{self.F_wm1}x{self.F_wn1}x{self.F_wk1}_o{self.F_occupancy}"
+        )
+
 
 # TODO: design a more practical way to do it
 # this is current supported tile size & pipeline.
-def get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype : str) -> Optional[dict]:
-    if dtype == 'fp16' or dtype == 'bf16':
+def get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype: str) -> Optional[dict]:
+    if dtype == "fp16" or dtype == "bf16":
         return {
-            '32'  : [FmhaBwdDQDKDVTileSize( 32, 128,  32, 32,  32, 32, 64,  32,  32, 1, 4, 1, 4, 1, 1, 2, 2, 1, 16, 16, 32, 16, 16, 16, 1),
-                        "kr_ktr_vr_iglp", "kr_ktr_vr"],
-            '64'  : [FmhaBwdDQDKDVTileSize( 32, 128,  64, 32,  64, 32, 32,  64,  64, 1, 4, 1, 4, 1, 1, 1, 4, 1, 16, 16, 32, 16, 16, 16, 1),
-                        "kr_ktr_vr_iglp", "kr_ktr_vr"],
-            '128' : [FmhaBwdDQDKDVTileSize( 16, 128, 128, 16, 128, 16, 32, 128, 128, 1, 4, 1, 4, 1, 1, 1, 4, 1, 16, 16, 32, 16, 16, 16, 1),
-                        "kr_ktr_vr_iglp", "kr_ktr_vr"],
-            '256' : [FmhaBwdDQDKDVTileSize( 16,  64, 256, 16, 256, 16, 32, 256, 256, 1, 4, 1, 4, 1, 1, 1, 4, 1, 16, 16, 32, 16, 16, 16, 1),
-                        "kr_ktr_vr_iglp", "kr_ktr_vr"]
+            "32": [
+                FmhaBwdDQDKDVTileSize(
+                    32,
+                    128,
+                    32,
+                    32,
+                    32,
+                    32,
+                    64,
+                    32,
+                    32,
+                    1,
+                    4,
+                    1,
+                    4,
+                    1,
+                    1,
+                    2,
+                    2,
+                    1,
+                    16,
+                    16,
+                    32,
+                    16,
+                    16,
+                    16,
+                    1,
+                ),
+                "kr_ktr_vr_iglp",
+                "kr_ktr_vr",
+            ],
+            "64": [
+                FmhaBwdDQDKDVTileSize(
+                    32,
+                    128,
+                    64,
+                    32,
+                    64,
+                    32,
+                    32,
+                    64,
+                    64,
+                    1,
+                    4,
+                    1,
+                    4,
+                    1,
+                    1,
+                    1,
+                    4,
+                    1,
+                    16,
+                    16,
+                    32,
+                    16,
+                    16,
+                    16,
+                    1,
+                ),
+                "kr_ktr_vr_iglp",
+                "kr_ktr_vr",
+            ],
+            "128": [
+                FmhaBwdDQDKDVTileSize(
+                    16,
+                    128,
+                    128,
+                    16,
+                    128,
+                    16,
+                    32,
+                    128,
+                    128,
+                    1,
+                    4,
+                    1,
+                    4,
+                    1,
+                    1,
+                    1,
+                    4,
+                    1,
+                    16,
+                    16,
+                    32,
+                    16,
+                    16,
+                    16,
+                    1,
+                ),
+                "kr_ktr_vr_iglp",
+                "kr_ktr_vr",
+            ],
+            "256": [
+                FmhaBwdDQDKDVTileSize(
+                    16,
+                    64,
+                    256,
+                    16,
+                    256,
+                    16,
+                    32,
+                    256,
+                    256,
+                    1,
+                    4,
+                    1,
+                    4,
+                    1,
+                    1,
+                    1,
+                    4,
+                    1,
+                    16,
+                    16,
+                    32,
+                    16,
+                    16,
+                    16,
+                    1,
+                ),
+                "kr_ktr_vr_iglp",
+                "kr_ktr_vr",
+            ],
         }
     else:
         return None
+
 
 class FmhaBwdApiPool:
     @property
     def api(self) -> str:
         return FMHA_BWD_KERNEL_HEADER + FMHA_BWD_API
 
+
 def get_bwd_dq_dk_dv_blobs() -> FmhaBwdApiPool:
     # TODO: we don't support tuning yet, so pick up one value for pad
     #       support this in future
     api_pool = FmhaBwdApiPool()
-    return (api_pool)
+    return api_pool
 
-FMHA_BWD_DOT_DO_O_KERNEL_BODY="""
+
+FMHA_BWD_DOT_DO_O_KERNEL_BODY = """
 using fmha_dtype_{F_idx} = {F_dtype};
 
 using fmha_bwd_dot_do_o_trait_{F_idx} =
@@ -2459,47 +2574,57 @@ std::string fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_{F_idx}>()
 }}
 """
 
+
 @dataclass
 class FmhaBwdOGradDotOKernel:
-    F_idx       : int  # this is not a tunable, but a counter to differentiate symbol
-    F_hdim      : int  # hdim
-    F_dtype     : str  # data type
-    F_spad      : str  # true/false
-    F_dvpad     : str  #
-    F_mode      : str  # value from MODE_MAP
-    F_occupancy : int
+    F_idx: int  # this is not a tunable, but a counter to differentiate symbol
+    F_hdim: int  # hdim
+    F_dtype: str  # data type
+    F_spad: str  # true/false
+    F_dvpad: str  #
+    F_mode: str  # value from MODE_MAP
+    F_occupancy: int
 
     @property
     def template(self) -> str:
-        return FMHA_BWD_KERNEL_HEADER + \
-            FMHA_BWD_DOT_DO_O_KERNEL_BODY.format(
-                F_idx       = self.F_idx,
-                F_hdim      = self.F_hdim,
-                F_dtype     = BWD_DTYPE_MAP[self.F_dtype],
-                F_spad      = BOOL_MAP[self.F_spad],
-                F_dvpad     = BOOL_MAP[self.F_dvpad],
-                F_mode      = MODE_MAP[self.F_mode],
-                F_occupancy = self.F_occupancy)
+        return FMHA_BWD_KERNEL_HEADER + FMHA_BWD_DOT_DO_O_KERNEL_BODY.format(
+            F_idx=self.F_idx,
+            F_hdim=self.F_hdim,
+            F_dtype=BWD_DTYPE_MAP[self.F_dtype],
+            F_spad=BOOL_MAP[self.F_spad],
+            F_dvpad=BOOL_MAP[self.F_dvpad],
+            F_mode=MODE_MAP[self.F_mode],
+            F_occupancy=self.F_occupancy,
+        )
 
     @property
     def name(self) -> str:
         def pad_name() -> str:
-            n = ''
-            if self.F_spad == 't': n += 's'
-            if self.F_dvpad == 't' : n += 'dv'
-            if n != '' : n = 'p' + n
+            n = ""
+            if self.F_spad == "t":
+                n += "s"
+            if self.F_dvpad == "t":
+                n += "dv"
+            if n != "":
+                n = "p" + n
             return n
+
         pn = pad_name()
         n = f"fmha_bwd_dot_do_o_d{self.F_hdim}_{self.F_dtype}_{self.F_mode}_o{self.F_occupancy}"
-        if pn != '' : n += f'_{pn}'
-        else: n += '_npad'
+        if pn != "":
+            n += f"_{pn}"
+        else:
+            n += "_npad"
         return n
 
     @property
     def filename(self) -> str:
         return self.name + ".cpp"
 
-def get_bwd_dot_do_o_blobs(kernel_filter : Optional[str]) -> List[FmhaBwdOGradDotOKernel]:
+
+def get_bwd_dot_do_o_blobs(
+    kernel_filter: Optional[str],
+) -> List[FmhaBwdOGradDotOKernel]:
     # TODO: we don't support tuning yet, so pick up one value for pad/occupancy
     #       support this in future
     def get_occupancy(dtype, hdim):
@@ -2511,21 +2636,30 @@ def get_bwd_dot_do_o_blobs(kernel_filter : Optional[str]) -> List[FmhaBwdOGradDo
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
         if d == None:
             continue
-        for hdim_str, mode, spad, dvpad in itertools.product(d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"]):
+        for hdim_str, mode, spad, dvpad in itertools.product(
+            d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"]
+        ):
             hdim = int(hdim_str)
-            if (mode == "group" and spad == "f"):
+            if mode == "group" and spad == "f":
                 continue
-            k = FmhaBwdOGradDotOKernel(F_idx=0, F_hdim=hdim, F_dtype=dtype,
-                                F_spad=spad, F_dvpad=dvpad, F_mode=mode,
-                                F_occupancy=get_occupancy(dtype, hdim))
-            if kernel_filter != '':
+            k = FmhaBwdOGradDotOKernel(
+                F_idx=0,
+                F_hdim=hdim,
+                F_dtype=dtype,
+                F_spad=spad,
+                F_dvpad=dvpad,
+                F_mode=mode,
+                F_occupancy=get_occupancy(dtype, hdim),
+            )
+            if kernel_filter != "":
                 if not fnmatch.fnmatch(k.name, kernel_filter):
                     continue
             gen.append(k)
 
     return gen
 
-FMHA_BWD_CONVERT_DQ_KERNEL_BODY="""
+
+FMHA_BWD_CONVERT_DQ_KERNEL_BODY = """
 using fmha_dtype_{F_idx} = {F_dtype};
 
 using fmha_bwd_convert_dq_trait_{F_idx} =
@@ -2591,55 +2725,67 @@ std::string fmha_bwd_convert_dq_get_name_<convert_dq_trait_{F_idx}>()
 }}
 """
 
+
 @dataclass
 class FmhaBwdConvertQGradKernel:
-    F_idx           : int  # this is not a tunable, but a counter to differentiate symbol
-    F_hdim          : int  # hdim
-    F_dtype         : str  # data type
-    F_bm0           : int  # tile size along q seqlen (block size)
-    F_bn0           : int  # tile size along k seqlen
-    F_spad          : str  # true/false
-    F_dpad          : str  #
-    F_mode          : str  # value from MODE_MAP
-    F_occupancy     : int  #
-    F_deterministic : str  #
+    F_idx: int  # this is not a tunable, but a counter to differentiate symbol
+    F_hdim: int  # hdim
+    F_dtype: str  # data type
+    F_bm0: int  # tile size along q seqlen (block size)
+    F_bn0: int  # tile size along k seqlen
+    F_spad: str  # true/false
+    F_dpad: str  #
+    F_mode: str  # value from MODE_MAP
+    F_occupancy: int  #
+    F_deterministic: str  #
 
     @property
     def template(self) -> str:
-        return FMHA_BWD_KERNEL_HEADER + \
-            FMHA_BWD_CONVERT_DQ_KERNEL_BODY.format(
-                F_idx           = self.F_idx,
-                F_hdim          = self.F_hdim,
-                F_dtype         = BWD_DTYPE_MAP[self.F_dtype],
-                F_bm0           = self.F_bm0,
-                F_bn0           = self.F_bn0,
-                F_spad          = BOOL_MAP[self.F_spad],
-                F_dpad          = BOOL_MAP[self.F_dpad],
-                F_mode          = MODE_MAP[self.F_mode],
-                F_occupancy     = self.F_occupancy,
-                F_deterministic = BOOL_MAP[self.F_deterministic])
+        return FMHA_BWD_KERNEL_HEADER + FMHA_BWD_CONVERT_DQ_KERNEL_BODY.format(
+            F_idx=self.F_idx,
+            F_hdim=self.F_hdim,
+            F_dtype=BWD_DTYPE_MAP[self.F_dtype],
+            F_bm0=self.F_bm0,
+            F_bn0=self.F_bn0,
+            F_spad=BOOL_MAP[self.F_spad],
+            F_dpad=BOOL_MAP[self.F_dpad],
+            F_mode=MODE_MAP[self.F_mode],
+            F_occupancy=self.F_occupancy,
+            F_deterministic=BOOL_MAP[self.F_deterministic],
+        )
 
     @property
     def name(self) -> str:
         def pad_name() -> str:
-            n = ''
-            if self.F_spad == 't': n += 's'
-            if self.F_dpad == 't' : n += 'd'
-            if n != '' : n = 'p' + n
+            n = ""
+            if self.F_spad == "t":
+                n += "s"
+            if self.F_dpad == "t":
+                n += "d"
+            if n != "":
+                n = "p" + n
             return n
+
         pn = pad_name()
         n = f"fmha_bwd_convert_dq_d{self.F_hdim}_{self.F_dtype}_b{self.F_bm0}x{self.F_bn0}_{self.F_mode}_o{self.F_occupancy}"
-        if pn != '' : n += f'_{pn}'
-        else: n += '_npad'
-        if self.F_deterministic == 't' : n += '_deterministic'
-        else: n += '_ndeterministic'
+        if pn != "":
+            n += f"_{pn}"
+        else:
+            n += "_npad"
+        if self.F_deterministic == "t":
+            n += "_deterministic"
+        else:
+            n += "_ndeterministic"
         return n
 
     @property
     def filename(self) -> str:
         return self.name + ".cpp"
 
-def get_bwd_convert_dq_blobs(kernel_filter : Optional[str]) -> List[FmhaBwdConvertQGradKernel]:
+
+def get_bwd_convert_dq_blobs(
+    kernel_filter: Optional[str],
+) -> List[FmhaBwdConvertQGradKernel]:
     # TODO: we don't support tuning yet, so pick up one value for pad/occupancy
     #       support this in future
     def get_occupancy(dtype, hdim):
@@ -2651,36 +2797,56 @@ def get_bwd_convert_dq_blobs(kernel_filter : Optional[str]) -> List[FmhaBwdConve
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
         if d == None:
             continue
-        for hdim_str, mode, spad, dpad, deterministic in itertools.product(d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"], ["t", "f"]):
+        for hdim_str, mode, spad, dpad, deterministic in itertools.product(
+            d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"], ["t", "f"]
+        ):
             hdim = int(hdim_str)
             tile = d[hdim_str][0]
-            if (mode == "group" and spad == "f"):
+            if mode == "group" and spad == "f":
                 continue
-            k = FmhaBwdConvertQGradKernel(F_idx=0, F_hdim=hdim, F_dtype=dtype, F_bm0=64, F_bn0=tile.F_bn0,
-                                F_spad=spad, F_dpad=dpad, F_mode=mode, F_occupancy=get_occupancy(dtype, hdim), F_deterministic=deterministic)
-            if kernel_filter != '':
+            k = FmhaBwdConvertQGradKernel(
+                F_idx=0,
+                F_hdim=hdim,
+                F_dtype=dtype,
+                F_bm0=64,
+                F_bn0=tile.F_bn0,
+                F_spad=spad,
+                F_dpad=dpad,
+                F_mode=mode,
+                F_occupancy=get_occupancy(dtype, hdim),
+                F_deterministic=deterministic,
+            )
+            if kernel_filter != "":
                 if not fnmatch.fnmatch(k.name, kernel_filter):
                     continue
             gen.append(k)
 
     return gen
 
-def write_single_bwd_dot_do_o_kernel(kernel: FmhaBwdOGradDotOKernel, autogen_dir: Path) -> None:
+
+def write_single_bwd_dot_do_o_kernel(
+    kernel: FmhaBwdOGradDotOKernel, autogen_dir: Path
+) -> None:
     (autogen_dir / kernel.filename).write_text(kernel.template)
 
-def write_single_bwd_convert_dq_kernel(kernel: FmhaBwdConvertQGradKernel, autogen_dir: Path) -> None:
+
+def write_single_bwd_convert_dq_kernel(
+    kernel: FmhaBwdConvertQGradKernel, autogen_dir: Path
+) -> None:
     (autogen_dir / kernel.filename).write_text(kernel.template)
 
-def write_bwd_api(api_pool : FmhaBwdApiPool, autogen_dir: Path) -> None:
+
+def write_bwd_api(api_pool: FmhaBwdApiPool, autogen_dir: Path) -> None:
     (autogen_dir / FMHA_BWD_API_FILENAME).write_text(api_pool.api)
 
-def write_bwd_blobs(output_dir : Path, filter_list : str, receipt: int) -> None:
+
+def write_bwd_blobs(output_dir: Path, filter_list: str, receipt: int) -> None:
     api_pool = FmhaBwdApiPool()
     write_bwd_api(api_pool, output_dir)
 
     if receipt == 0:
-        filter_list = filter_list.split('@')
-        filter_list.extend([''] * (3 - len(filter_list)))
+        filter_list = filter_list.split("@")
+        filter_list.extend([""] * (3 - len(filter_list)))
 
         kernels = get_bwd_dot_do_o_blobs(filter_list[0])
         for kernel in kernels:
@@ -2690,7 +2856,9 @@ def write_bwd_blobs(output_dir : Path, filter_list : str, receipt: int) -> None:
             write_single_bwd_convert_dq_kernel(kernel, output_dir)
 
 
-def write_blobs(output_dir: Optional[str], filters_list : List[str], receipt: int) -> None:
+def write_blobs(
+    output_dir: Optional[str], filters_list: List[str], receipt: int
+) -> None:
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:
@@ -2701,6 +2869,7 @@ def write_blobs(output_dir: Optional[str], filters_list : List[str], receipt: in
     for kernel_filter in filters_list:
         write_bwd_blobs(output_dir, kernel_filter, receipt)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
@@ -2710,29 +2879,28 @@ if __name__ == "__main__":
         "-o",
         "--output_dir",
         required=False,
-        help="write all the blobs into a directory"
+        help="write all the blobs into a directory",
     )
     parser.add_argument(
         "-r",
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt.  0: generate dot_do_o, dqdkdv and convert_dq kernels \n"  + \
-                              " 1: only generate mha_bwd dqdkdv kernels"
+        help="codegen receipt.  0: generate dot_do_o, dqdkdv and convert_dq kernels \n"
+        + " 1: only generate mha_bwd dqdkdv kernels",
     )
     # TODO: if using filter, must apply same value to output_dir and list_blobs
     parser.add_argument(
         "-f",
         "--filter",
-        default='',
+        default="",
         required=False,
-        help="filter out kernels that need to generate, using fnmatch module"
+        help="filter out kernels that need to generate, using fnmatch module",
     )
 
     args = parser.parse_args()
     api_list = ["bwd"]
-    filter_list = args.filter.split(',')
-    filter_list.extend([''] * (len(api_list) - len(filter_list)))
-
+    filter_list = args.filter.split(",")
+    filter_list.extend([""] * (len(api_list) - len(filter_list)))
 
     write_blobs(args.output_dir, filter_list, int(args.receipt))
