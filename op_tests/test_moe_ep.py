@@ -2,14 +2,8 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
-import triton.language as tl
-import numpy as np
-import sys
-import os
-from typing import Any, Callable, Dict, Optional, Tuple
 from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe import torch_moe, moe_sorting, fused_topk
+from aiter.fused_moe import torch_moe, fused_topk
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter import pertoken_quant, ck_moe
@@ -155,7 +149,9 @@ def test_fmoe_ep(
     if use_g1u1:
         w1 = (
             torch.randn(
-                (E // ep + shared_E, inter_dim * 2, model_dim), dtype=dtype, device="cuda"
+                (E // ep + shared_E, inter_dim * 2, model_dim),
+                dtype=dtype,
+                device="cuda",
             )
             / 10
         )
@@ -167,7 +163,9 @@ def test_fmoe_ep(
             / 10
         )
     w2 = (
-        torch.randn((E // ep + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda")
+        torch.randn(
+            (E // ep + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
+        )
         / 10
     )
     score = torch.randn((token, E), device="cuda", dtype=dtype)
@@ -183,9 +181,7 @@ def test_fmoe_ep(
     s_topk_ids_list = [[fake_expertid] * (shared_E + 1)] * MAX_TOKENS
     for i in range(ep_id, MAX_TOKENS, ep):
         s_topk_ids_list[i] = shared_expert_ids
-    s_topk_ids[:] = torch.tensor(
-        s_topk_ids_list, dtype=dtypes.i32, device=input.device
-    )
+    s_topk_ids[:] = torch.tensor(s_topk_ids_list, dtype=dtypes.i32, device=input.device)
 
     # init total_topk_weights, inference time you just need to fill ns_topk_weights in total_topk_weights
     total_topk_weights = torch.empty(

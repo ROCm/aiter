@@ -2,12 +2,11 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 
 # from ater.test_common import checkAllclose, perftest
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity
 
 # input shape: torch.Size([4096, 64, 160]) (20480, 1, 128)
 # other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)

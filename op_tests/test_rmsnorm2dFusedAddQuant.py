@@ -3,7 +3,6 @@
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 import aiter
 import argparse
 from aiter.test_common import checkAllclose, perftest
@@ -94,7 +93,7 @@ def test_rmsnorm2d_instance(dtype, m, n):
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     )
     checkAllclose(a, b)
-    print(f"[passed~]")
+    print("[passed~]")
 
 
 def test_rmsnorm2d_fuseAdd_instance(dtype, m, n):
@@ -110,7 +109,7 @@ def test_rmsnorm2d_fuseAdd_instance(dtype, m, n):
     )
     checkAllclose(a, b, rtol=1e-2, atol=1e-1)
     checkAllclose(res_a, res_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_rmsnorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleType):
@@ -130,7 +129,7 @@ def test_rmsnorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleType)
     )
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscaleType):
@@ -153,7 +152,7 @@ def test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscaleT
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
     checkAllclose(ynorm_a, ynorm_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_rmsnorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
@@ -170,7 +169,7 @@ def test_rmsnorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
     )
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
@@ -191,7 +190,7 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_rmsnorm2d():

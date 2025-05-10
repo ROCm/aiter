@@ -3,7 +3,7 @@
 
 from torch import Tensor, Generator
 from typing import Optional, Tuple
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
 from ..utility import dtypes
 import torch
 
@@ -357,9 +357,7 @@ def _flash_attn_backward(
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
-    nmask = (
-        not causal and window_size_left == -1 and window_size_right == -1
-    )  # no mask
+    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = not causal and (window_size_left > 0 or window_size_right > 0)
 
     def np():
@@ -478,7 +476,11 @@ def _flash_attn_backward(
         # bwd_hd192_bf16_causal_a32_rtz_psskddv
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= nmask or (mask and seqlen_q == seqlen_k) or (swa and hdim_q > 64 and hdim_q <= 128)# TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= (
+            nmask
+            or (mask and seqlen_q == seqlen_k)
+            or (swa and hdim_q > 64 and hdim_q <= 128)
+        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
 

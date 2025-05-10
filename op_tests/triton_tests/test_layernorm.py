@@ -1,7 +1,6 @@
 import triton
 import torch
 import torch.nn.functional as F
-import triton.language as tl
 import pytest
 from aiter.ops.triton.norm import layer_norm
 from aiter.ops.triton.norm import layernorm2d_fwd_with_add

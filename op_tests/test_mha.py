@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from einops import repeat
 import torch
-import torch.nn.functional as F
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
@@ -14,7 +11,6 @@ from aiter.test_mha_common import (
     convert_flash_attn_S_to_softmax,
 )
 import pytest
-import sys
 
 
 def run_torch(
@@ -222,9 +218,7 @@ def test_flash_attn_output(
             seqlen_q, seqlen_k, device="cuda", dtype=dtype, requires_grad=True
         )
     elif bias_type == "alibi":
-        alibi_slopes = torch.rand(
-            batch_size, nheads, device="cuda", dtype=dtypes.fp32
-        )
+        alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
 
     dout = torch.randn(
         batch_size,

@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-import warnings
 import os
 import sys
 import shutil
 
-from setuptools import setup, find_packages
-from packaging.version import parse, Version
+from setuptools import setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -16,9 +14,6 @@ sys.path.insert(0, f"{this_dir}/aiter/")
 from jit import core
 from jit.utils.cpp_extension import (
     BuildExtension,
-    CppExtension,
-    CUDAExtension,
-    ROCM_HOME,
     IS_HIP_EXTENSION,
 )
 
@@ -42,7 +37,7 @@ FORCE_CXX11_ABI = False
 if IS_ROCM:
     assert os.path.exists(
         ck_dir
-    ), f'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
+    ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
         exclude_ops = ["libmha_fwd", "libmha_bwd"]

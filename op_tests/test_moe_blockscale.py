@@ -7,7 +7,7 @@ import aiter
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.fused_moe import torch_moe, moe_sorting, fused_topk
 from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant, ck_moe
+from aiter import pertoken_quant
 from aiter import dtypes
 from einops import rearrange
 

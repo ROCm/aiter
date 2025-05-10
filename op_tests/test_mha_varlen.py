@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from einops import rearrange, repeat
 import torch
-import torch.nn.functional as F
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
