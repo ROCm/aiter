@@ -1,9 +1,5 @@
 import torch
-import torch.nn.functional as F
-import numpy as np
-import sys
-import os
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Tuple
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk

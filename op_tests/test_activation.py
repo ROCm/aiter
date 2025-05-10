@@ -1,17 +1,17 @@
 import torch
 import torch.nn.functional as F
 import aiter
-from aiter import silu_and_mul
 from aiter.test_common import run_perftest, checkAllclose, benchmark
 from aiter import dtypes
 import pandas as pd
 
-def torch_scaled_silu_and_mul(input: torch.Tensor, 
-                             scale: torch.Tensor) -> torch.Tensor:
+
+def torch_scaled_silu_and_mul(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     d = input.shape[-1] // 2
     x, y = input.split([d, d], dim=-1)
     out = F.silu(x) * y / scale
     return out.to(dtypes.fp8)
+
 
 def torch_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
     d = input.shape[-1] // 2
@@ -19,11 +19,12 @@ def torch_silu_and_mul(input: torch.Tensor) -> torch.Tensor:
     out = F.silu(x) * y
     return out
 
+
 @benchmark()
 def test_scaled_silu_and_mul(m, n, dtype):
-    input = torch.randn(m, n, dtype=dtype, device='cuda')
+    input = torch.randn(m, n, dtype=dtype, device="cuda")
     scale = torch.max(input).to(torch.float32)
-    out = torch.empty((m,n//2), dtype=dtypes.fp8, device='cuda')
+    out = torch.empty((m, n // 2), dtype=dtypes.fp8, device="cuda")
 
     ref, us = run_perftest(
         torch_scaled_silu_and_mul,
@@ -46,10 +47,11 @@ def test_scaled_silu_and_mul(m, n, dtype):
     checkAllclose(ref.to(torch.float), out.to(torch.float))
     return {"us_aiter": us_aiter}
 
+
 @benchmark()
 def test_silu_and_mul(m, n, dtype):
-    input = torch.randn(m, n, dtype=dtype, device='cuda')
-    out = torch.empty((m,n//2), dtype=dtype, device='cuda')
+    input = torch.randn(m, n, dtype=dtype, device="cuda")
+    out = torch.empty((m, n // 2), dtype=dtype, device="cuda")
 
     ref, us = run_perftest(
         torch_silu_and_mul,
@@ -69,6 +71,7 @@ def test_silu_and_mul(m, n, dtype):
     # Check if the results are close
     checkAllclose(ref, out)
     return {"us_aiter": us_aiter}
+
 
 df = []
 for dtype in [torch.float16, torch.bfloat16]:

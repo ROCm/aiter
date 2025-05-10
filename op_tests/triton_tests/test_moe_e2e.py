@@ -1,23 +1,33 @@
-import triton
 import torch
 import triton.language as tl
 import pytest
-from typing import Any, Dict, Optional
-import os
-import json
-import functools
-import argparse
-import sys
+from typing import Dict
 
 from aiter.ops.triton.moe_op_e2e import e2e_moe as triton_e2e_moe
 from aiter.ops.triton.moe_op_e2e import moe_set_use_persistent_kernel
-from aiter import silu_and_mul
+from op_tests.triton_tests.test_moe import silu_and_mul
+
 
 DEBUG_MODE = False
 
-def torch_e2e_moe(a, w1, w2, c, a_scale, w1_scale, w2_scale, topk_ids, topk_weights, routed_weight, dtype, fp8_w8a8, int8_w8a16):
+
+def torch_e2e_moe(
+    a,
+    w1,
+    w2,
+    c,
+    a_scale,
+    w1_scale,
+    w2_scale,
+    topk_ids,
+    topk_weights,
+    routed_weight,
+    dtype,
+    fp8_w8a8,
+    int8_w8a16,
+):
     if fp8_w8a8:
-        a , _ , a_scale = quantize_fp8(a)
+        a, _, a_scale = quantize_fp8(a)
 
     M, top_k, _ = c.shape
     E, N, _ = w1.shape
@@ -30,7 +40,9 @@ def torch_e2e_moe(a, w1, w2, c, a_scale, w1_scale, w2_scale, topk_ids, topk_weig
     else:
         w1_indexed = w1[topk_ids]
 
-    intermidiate = torch.einsum("mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype))
+    intermidiate = torch.einsum(
+        "mek,menk->men", a_expanded.to(dtype), w1_indexed.to(dtype)
+    )
 
     if fp8_w8a8:
         intermidiate = intermidiate * w1_scale[topk_ids].unsqueeze(-1)
@@ -49,12 +61,12 @@ def torch_e2e_moe(a, w1, w2, c, a_scale, w1_scale, w2_scale, topk_ids, topk_weig
     print(intermidiate.shape)
 
     silu_out = torch.zeros([M * top_k, N // 2], dtype=a.dtype, device=a.device)
-    silu_and_mul(silu_out, intermidiate.view(-1, N))
+    silu_out = silu_and_mul(intermidiate.view(-1, N))
 
     silu_out = silu_out.view(M, top_k, N // 2)
 
     if fp8_w8a8:
-        silu_out , _ , silu_out_scale = quantize_fp8(silu_out)
+        silu_out, _, silu_out_scale = quantize_fp8(silu_out)
 
     c = torch.einsum("mek,menk->men", silu_out.to(dtype), w2_indexed.to(dtype))
 
@@ -71,9 +83,16 @@ def torch_e2e_moe(a, w1, w2, c, a_scale, w1_scale, w2_scale, topk_ids, topk_weig
         c *= topk_weights.unsqueeze(-1)
     return c
 
-def _moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, top_k: int, block_size: int,
-                          sorted_token_ids: torch.Tensor, expert_ids: torch.Tensor,
-                          num_tokens_post_pad: torch.Tensor) -> None:
+
+def _moe_align_block_size(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    block_size: int,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
     M, top_k = topk_ids.shape
 
     expert_to_tokens = [[] for _ in range(num_experts)]
@@ -91,7 +110,7 @@ def _moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, top_k: int, 
         tokens_for_expert = expert_to_tokens[e_id]
         num_tokens = len(tokens_for_expert)
 
-        n_blocks = ((num_tokens + block_size - 1) // block_size)
+        n_blocks = (num_tokens + block_size - 1) // block_size
         # If not a multiple of block_size, pad up to the next multiple
         padded_size = n_blocks * block_size
 
@@ -108,9 +127,14 @@ def _moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, top_k: int, 
     token_length = len(reordered_token_ids)
     expert_length = len(reordered_expert_ids)
 
-    sorted_token_ids[:token_length] = torch.tensor(reordered_token_ids, dtype=sorted_token_ids.dtype,
-                                                   device=sorted_token_ids.device)
-    expert_ids[:expert_length] = torch.tensor(reordered_expert_ids, dtype=expert_ids.dtype, device=expert_ids.device)
+    sorted_token_ids[:token_length] = torch.tensor(
+        reordered_token_ids,
+        dtype=sorted_token_ids.dtype,
+        device=sorted_token_ids.device,
+    )
+    expert_ids[:expert_length] = torch.tensor(
+        reordered_expert_ids, dtype=expert_ids.dtype, device=expert_ids.device
+    )
 
     # Fill remainder with topk_ids.numel() if these arrays are bigger than total_length
     if token_length < sorted_token_ids.numel():
@@ -121,8 +145,9 @@ def _moe_align_block_size(topk_ids: torch.Tensor, num_experts: int, top_k: int, 
     num_tokens_post_pad.fill_(token_length)
 
 
-def moe_align_block_size(topk_ids: torch.Tensor, block_size: int,
-                         num_experts: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def moe_align_block_size(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block size for matrix multiplication.
 
@@ -150,37 +175,54 @@ def moe_align_block_size(topk_ids: torch.Tensor, block_size: int,
     - The padding ensures that the total number of tokens is now divisible by block_size for proper block matrix operations.
     """
     top_k = topk_ids.shape[1]
-    sorted_ids = torch.empty((topk_ids.numel() + num_experts * (block_size - 1), ), dtype=torch.int32,
-                             device=topk_ids.device)
-    expert_ids = torch.empty((topk_ids.numel() + num_experts, ), dtype=torch.int32, device=topk_ids.device)
+    sorted_ids = torch.empty(
+        (topk_ids.numel() + num_experts * (block_size - 1),),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    expert_ids = torch.empty(
+        (topk_ids.numel() + num_experts,), dtype=torch.int32, device=topk_ids.device
+    )
     sorted_ids.fill_(topk_ids.numel())
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    _moe_align_block_size(topk_ids, num_experts, top_k, block_size, sorted_ids, expert_ids, num_tokens_post_pad)
+    _moe_align_block_size(
+        topk_ids,
+        num_experts,
+        top_k,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+    )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
+
 
 def get_default_config(persistent: bool) -> Dict[str, int]:
     if persistent:
         return {
-            'BLOCK_SIZE_M': 64,
-            'BLOCK_SIZE_N1': 128,
-            'BLOCK_SIZE_N2': 64,
-            'BLOCK_SIZE_K1': 64,
-            'BLOCK_SIZE_K2': 64,
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N1": 128,
+            "BLOCK_SIZE_N2": 64,
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 64,
         }
     return {
-            'BLOCK_SIZE_M': 64,
-            'BLOCK_SIZE_N': 128,
-            'BLOCK_SIZE_K1': 64,
-            'BLOCK_SIZE_K2': 64,
-            'GROUP_SIZE_M': 2,
-        } # TODO setting GROUP_SIZE_M = 1 gives set fault, why?
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K1": 64,
+        "BLOCK_SIZE_K2": 64,
+        "GROUP_SIZE_M": 2,
+    }  # TODO setting GROUP_SIZE_M = 1 gives set fault, why?
 
-def quantize_fp8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+def quantize_fp8(
+    tensor: torch.Tensor, dim=()
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
     max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
     max_repr_val = torch.finfo(torch.float8_e4m3fnuz).max
-    max_vals[max_vals == 0] = 1e-8 # Avoid division by zero
+    max_vals[max_vals == 0] = 1e-8  # Avoid division by zero
 
     # Compute scale factors for each channel
     scale: torch.Tensor = max_repr_val / max_vals.to(torch.float32)
@@ -194,11 +236,14 @@ def quantize_fp8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Ten
 
     return tensor_quantized, scale, 1 / scale
 
-def quantize_int8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+def quantize_int8(
+    tensor: torch.Tensor, dim=()
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
     max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
     max_repr_val = torch.iinfo(torch.int8).max
-    max_vals[max_vals == 0] = 1e-8 # Avoid division by zero
+    max_vals[max_vals == 0] = 1e-8  # Avoid division by zero
 
     # Compute scale factors for each channel
     scale: torch.Tensor = max_repr_val / max_vals.to(torch.float32)
@@ -213,12 +258,24 @@ def quantize_int8(tensor: torch.Tensor, dim=() ) -> tuple[torch.Tensor, torch.Te
 
     return tensor_quantized, scale, 1 / scale
 
-def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, dtype, fp8_w8a8: bool, int8_w8a16: bool, persistent: bool):
+
+def input_helper(
+    M: int,
+    N: int,
+    K: int,
+    top_k: int,
+    E: int,
+    routed_weight: bool,
+    dtype,
+    fp8_w8a8: bool,
+    int8_w8a16: bool,
+    persistent: bool,
+):
     assert not (fp8_w8a8 and int8_w8a16)
 
-    a = torch.randn((M, K), dtype=dtype, device='cuda')
-    w1 = torch.rand((E, N, K), dtype=dtype, device='cuda')
-    w2 = torch.rand((E, K, N // 2), dtype=dtype, device='cuda')
+    a = torch.randn((M, K), dtype=dtype, device="cuda")
+    w1 = torch.rand((E, N, K), dtype=dtype, device="cuda")
+    w2 = torch.rand((E, K, N // 2), dtype=dtype, device="cuda")
     a_scale = None
     w1_scale = None
     w2_scale = None
@@ -231,31 +288,73 @@ def input_helper(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool
         w1, _, w1_scale = quantize_int8(w1, dim=(0,))
         w2, _, w2_scale = quantize_int8(w2, dim=(0,))
 
-    c = torch.zeros((M, top_k, K), dtype=dtype, device='cuda')
+    c = torch.zeros((M, top_k, K), dtype=dtype, device="cuda")
 
-    values = torch.randn(M, E, dtype=dtype, device='cuda')
+    values = torch.randn(M, E, dtype=dtype, device="cuda")
 
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
     config = get_default_config(persistent)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'], E)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, config["BLOCK_SIZE_M"], E
+    )
 
-    return a, w1, w2, c, a_scale, w1_scale, w2_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config
+    return (
+        a,
+        w1,
+        w2,
+        c,
+        a_scale,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        config,
+    )
 
-torch_to_tl_dtype = {torch.float16 : tl.float16, torch.bfloat16 : tl.bfloat16, torch.float32 : tl.float32}
+
+torch_to_tl_dtype = {
+    torch.float16: tl.float16,
+    torch.bfloat16: tl.bfloat16,
+    torch.float32: tl.float32,
+}
+
 
 # TODO (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8), (4, 4, 8, 1, 2), (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8) don't work because of the percision issue with atomics
-@pytest.mark.parametrize("M, N, K, top_k, E", [(16, 14336, 4096, 2, 8), (16, 14336, 1, 2, 4), 
-                                               (1, 14336, 128, 2, 4), (3, 14336, 128, 2, 4), (16, 14336, 128, 1, 4),
-                                               (16, 14336, 128, 1, 1), (1, 1024, 16384, 1, 2)])
-@pytest.mark.parametrize('routed_weight', [False, True])
-#@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) #TODO: Accuracy issues with fp8
-@pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False)])
-@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "M, N, K, top_k, E",
+    [
+        (16, 14336, 4096, 2, 8),
+        (16, 14336, 1, 2, 4),
+        (1, 14336, 128, 2, 4),
+        (3, 14336, 128, 2, 4),
+        (16, 14336, 128, 1, 4),
+        (16, 14336, 128, 1, 1),
+        (1, 1024, 16384, 1, 2),
+    ],
+)
+@pytest.mark.parametrize("routed_weight", [False, True])
+# @pytest.mark.parametrize('fp8_w8a8, int8_w8a16', [(False, False), (True, False), (False, True)]) #TODO: Accuracy issues with fp8
+@pytest.mark.parametrize("fp8_w8a8, int8_w8a16", [(False, False)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 # @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize('persistent',[True])
-def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: bool, fp8_w8a8: bool, int8_w8a16: bool, persistent: bool, dtype,):
+@pytest.mark.parametrize("persistent", [True])
+def test_correctness(
+    M: int,
+    N: int,
+    K: int,
+    top_k: int,
+    E: int,
+    routed_weight: bool,
+    fp8_w8a8: bool,
+    int8_w8a16: bool,
+    persistent: bool,
+    dtype,
+):
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     if persistent:
@@ -265,10 +364,36 @@ def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: 
 
     intermediate = None
     if persistent:
-        intermediate = torch.zeros((M * top_k, N // 2), dtype=torch.float32, device='cuda')
+        intermediate = torch.zeros(
+            (M * top_k, N // 2), dtype=torch.float32, device="cuda"
+        )
 
-    a, w1, w2, triton_out, a_scale, w1_scale, w2_scale, topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded, config = input_helper(
-        M, N, K, top_k, E, routed_weight=routed_weight, dtype=dtype, fp8_w8a8=fp8_w8a8, int8_w8a16=int8_w8a16, persistent=persistent)
+    (
+        a,
+        w1,
+        w2,
+        triton_out,
+        a_scale,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        config,
+    ) = input_helper(
+        M,
+        N,
+        K,
+        top_k,
+        E,
+        routed_weight=routed_weight,
+        dtype=dtype,
+        fp8_w8a8=fp8_w8a8,
+        int8_w8a16=int8_w8a16,
+        persistent=persistent,
+    )
 
     if DEBUG_MODE:
         print(f"M={M}, N={N}, K={K}, top_K={top_k}, E={E}")
@@ -281,11 +406,43 @@ def test_correctness(M: int, N: int, K: int, top_k: int, E: int, routed_weight: 
         print(f"expert_ids.shape={expert_ids.shape}")
         print(f"expert_ids={expert_ids}")
         print(f"num_tokens_post_padded={num_tokens_post_padded}")
-    triton_out = triton_e2e_moe(a, w1, w2, intermediate, triton_out, a_scale, w1_scale, w2_scale, topk_weights, sorted_token_ids, topk_ids, expert_ids, num_tokens_post_padded,
-                       routed_weight, top_k, config, fp8_w8a8, int8_w8a16)
+    triton_out = triton_e2e_moe(
+        a,
+        w1,
+        w2,
+        intermediate,
+        triton_out,
+        a_scale,
+        w1_scale,
+        w2_scale,
+        topk_weights,
+        sorted_token_ids,
+        topk_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        routed_weight,
+        top_k,
+        config,
+        fp8_w8a8,
+        int8_w8a16,
+    )
 
     torch_out = torch.empty_like(triton_out)
-    torch_out = torch_e2e_moe(a, w1, w2, torch_out, a_scale, w1_scale, w2_scale, topk_ids, topk_weights, routed_weight, dtype, fp8_w8a8, int8_w8a16)
+    torch_out = torch_e2e_moe(
+        a,
+        w1,
+        w2,
+        torch_out,
+        a_scale,
+        w1_scale,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        routed_weight,
+        dtype,
+        fp8_w8a8,
+        int8_w8a16,
+    )
 
     if DEBUG_MODE:
         print(f"triton_out={triton_out}")

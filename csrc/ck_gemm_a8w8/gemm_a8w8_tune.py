@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import sys
 import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest
-from gemm_a8w8_common import kernelInstance, kernels_list
+from aiter.test_common import perftest
+from gemm_a8w8_common import kernels_list
 import argparse
 
 
@@ -100,7 +98,7 @@ def tune_gemm(m, n, k, useSplitK=False):
                     print(
                         f"{str(dim):<20} kernelid:{i:<3d}\t No pass         , {kernel.name}, {splitK=}"
                     )
-            except RuntimeError as e:
+            except RuntimeError:
                 print(
                     f"{str(dim):<20} kernelid:{i:<3d}\t No support      , {kernel.name}, {splitK=}"
                 )

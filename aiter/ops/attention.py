@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
 import torch
-from typing import List, Optional
+from typing import Optional
 from ..jit.core import (
     compile_ops,
-    CK_DIR,
-    AITER_CSRC_DIR,
-    AITER_ROOT_DIR,
-    AITER_CORE_DIR,
 )
 
 MD_NAME = "module_attention"

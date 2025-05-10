@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import sys
 import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import aiter
-from aiter.test_common import checkAllclose, perftest
+from aiter.test_common import perftest
 from aiter import dtypes
-from batched_gemm_bf16_common import kernelInstance, kernels_list
+from batched_gemm_bf16_common import kernels_list
 import argparse
 
 

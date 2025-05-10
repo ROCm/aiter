@@ -3,9 +3,8 @@
 
 import torch
 from torch import Tensor
-from typing import List, Optional
-from enum import Enum
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from typing import Optional
+from ..jit.core import compile_ops
 import torch.nn.functional as F
 import functools
 from .enum import *
@@ -117,7 +116,7 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     if scale is None:
         scale = torch.empty(shape[:-1], dtype=dtypes.fp32, device=device)
     else:
-        raise ValueError(f"unsupported: static per token quant")
+        raise ValueError("unsupported: static per token quant")
 
     if quant_dtype == dtypes.fp8:
         y = torch.empty(shape, dtype=quant_dtype, device=device)
@@ -158,7 +157,7 @@ def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
             y, x, scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax
         )
     else:
-        raise ValueError(f"unsupported: static per token quant")
+        raise ValueError("unsupported: static per token quant")
 
     return y, scale
 

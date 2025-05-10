@@ -20,8 +20,6 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.test_common import (
     checkAllclose,
     perftest,
-    tensor_dump,
-    tensor_load,
     benchmark,
 )
 from aiter import dtypes

@@ -5,10 +5,13 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 
-@triton.heuristics({
-    'EVEN_K':lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0, 
-    'GRID_MN':lambda args: triton.cdiv(args['M'], args['BLOCK_SIZE_M']) * triton.cdiv(args['N'], args['BLOCK_SIZE_N'])
-})
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+    }
+)
 @triton.jit
 def _gemm_a16_w16_kernel(
     a_ptr,
@@ -93,10 +96,11 @@ def _gemm_a16_w16_kernel(
 
 
 # Wrapper for gemm kernel.
-def gemm_a16w16(x, 
-                w, 
-                dtype: Optional[float] = torch.bfloat16,
-                ):
+def gemm_a16w16(
+    x,
+    w,
+    dtype: Optional[float] = torch.bfloat16,
+):
     """
     Computes the 16 bit matmul Y = X x W
 
@@ -107,7 +111,7 @@ def gemm_a16w16(x,
     Returns:
     - Y: The output matrix with shape (M, N).
     """
-    
+
     M, K = x.shape
     K, N = w.shape
 
@@ -122,8 +126,9 @@ def gemm_a16w16(x,
     matrix_instr_nonkdim = 16
     num_warps = 8
     num_stages = 2
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
     _gemm_a16_w16_kernel[grid](
         x,
         w,
