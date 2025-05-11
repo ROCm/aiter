@@ -213,13 +213,10 @@ def gemm_afp4wfp4_splitk(x,
 
     NUM_KSPLIT = 4
     SPLITK_BLOCK_SIZE = triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
-    print(f"SPLITK_BLOCK_SIZE: {SPLITK_BLOCK_SIZE}")
 
     y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
 
-    #grid = lambda META: (NUM_KSPLIT, triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
-    grid = (NUM_KSPLIT, triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N), )
-    print(grid)
+    grid = lambda META: (NUM_KSPLIT, triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
     _gemm_afp4_wfp4_split_kernel[grid](
         x,
         w,
