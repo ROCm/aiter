@@ -107,7 +107,7 @@ def _gemm_afp4_wfp4_split_kernel(
             # If it is out of bounds, set it to 0.
             if EVEN_K:
                 a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs)
+                b = tl.load(b_ptrs, cache_modifier=".cg")
             else:
                 a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0)
                 b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0)
@@ -201,15 +201,15 @@ def gemm_afp4wfp4_splitk(x,
     M, K = x.shape
     K, N = w.shape
 
-    BLOCK_SIZE_M = 256
-    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_M = 16
+    BLOCK_SIZE_N = 64
     BLOCK_SIZE_K = 256
-    GROUP_SIZE_M = 4
-    waves_per_eu = 1
+    GROUP_SIZE_M = 1
+    waves_per_eu = 6
     kpack = 1
-    num_warps = 8
+    num_warps = 4
     num_stages = 2
-    matrix_instr_nonkdim = 32
+    matrix_instr_nonkdim = 16
 
     NUM_KSPLIT = 4
     SPLITK_BLOCK_SIZE = triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
@@ -271,4 +271,3 @@ def gemm_afp4wfp4_splitk(x,
         NUM_KSPLIT,
     )
 
-    return y, y_pp
