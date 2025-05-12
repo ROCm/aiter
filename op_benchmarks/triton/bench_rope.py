@@ -261,10 +261,10 @@ def run_benchmark(args):
 
         # memory transfer (B = 1, T = S for thd layout, positions and offsets are always int)
 
-        mem_read = B * S * H * D * ((2.0 * x        .element_size()) if two_inputs else (1.0 * x    .element_size())) + \
-                       S *     D * ((2.0 * freqs    .element_size()) if cached     else (1.0 * freqs.element_size())) + \
-                   B * S *         ((1.0 * positions.element_size()) if pos        else 0.0) + \
-                   B * S *         ((1.0 * offsets  .element_size()) if offs       else 0.0)
+        mem_read = B * S * H * D * ((2.0 * x.element_size()) if two_inputs else (1.0 * x.element_size())) + \
+        S * D * ((2.0 * freqs.element_size()) if cached else (1.0 * freqs.element_size())) + \
+        B * S * ((1.0 * positions.element_size()) if pos else 0.0) + \
+        B * S * ((1.0 * offsets.element_size()) if offs else 0.0)
                    
         mem_write = B * S * H * D * (2.0 if two_inputs else 1.0) * x.element_size()
         mem = mem_read + mem_write
@@ -356,39 +356,51 @@ def parse_args():
     parser.add_argument(
         "-l", type=str, help="'thd' or 'sbhd' the layout of the input.", default="thd"
     )
-    parser.add_argument("-l", type=str, 
-                        help="'thd' or 'sbhd' the layout of the input.", default='thd')
-    parser.add_argument("-B", type=int,
-                        help="the batch size, B (this argument will be ignored if you set -l to 'thd').", default=1)
-    parser.add_argument("-S", "-T", type=int,
-                        help="the sequence length, S, or the number of tokens, T", default=4096)
-    parser.add_argument("-H", type=int,
-                        help="the number of heads, H", default=128)
-    parser.add_argument("-D", type=int,
-                        help="the head dimension, D", default=64)
-    parser.add_argument("--cached", type=str,
-                        help="cached sin/cos", default='true')
-    parser.add_argument("--rotate_style", type=str,
-                        help="gptj or neox", default='gptj')
-    parser.add_argument("--reuse_freqs_front_part", type=str,
-                        help="turn on reuse_freqs_front_part", default='true')
-    parser.add_argument("--nope", type=str,
-                        help="turn on nope", default='false')
-    parser.add_argument("--nope_first", type=str,
-                        help="turn on nope_fist", default='false')
-    parser.add_argument("--pos", type=str,
-                        help="input positions", default='true')
-    parser.add_argument("--offs", type=str,
-                        help="input offsets", default='false')
-    parser.add_argument("--two_inputs", type=str,
-                        help="input both K and Q", default='true')
-    parser.add_argument("--inplace", type=str,
-                        help="inplace operation", default='false')
-    parser.add_argument("--dtype", type=str,
-                        help="data type", default='bf16')
-    parser.add_argument("--repeat", type=int,
-                        help="number of repetition for benchmark", default=1000)
-    
+    parser.add_argument(
+        "-B", type=int, help="the batch size, B (this argument will be ignored if you set -l to 'thd').", default=1
+    )
+    parser.add_argument(
+        "-S", "-T", type=int, help="the sequence length, S, or the number of tokens, T", default=4096
+    )
+    parser.add_argument(
+        "-H", type=int, help="the number of heads, H", default=128
+    )
+    parser.add_argument(
+        "-D", type=int, help="the head dimension, D", default=64
+    )
+    parser.add_argument(
+        "--cached", type=str, help="cached sin/cos", default='true'
+    )
+    parser.add_argument(
+        "--rotate_style", type=str, help="gptj or neox", default='gptj'
+    )
+    parser.add_argument(
+        "--reuse_freqs_front_part", type=str, help="turn on reuse_freqs_front_part", default='true'
+    )
+    parser.add_argument(
+        "--nope", type=str, help="turn on nope", default='false'
+    )
+    parser.add_argument(
+        "--nope_first", type=str, help="turn on nope_fist", default='false'
+    )
+    parser.add_argument(
+        "--pos", type=str, help="input positions", default='true'
+    )
+    parser.add_argument(
+        "--offs", type=str, help="input offsets", default='false'
+    )
+    parser.add_argument(
+        "--two_inputs", type=str, help="input both K and Q", default='true'
+    )
+    parser.add_argument(
+        "--inplace", type=str, help="inplace operation", default='false'
+    )
+    parser.add_argument(
+        "--dtype", type=str, help="data type", default='bf16'
+    )
+    parser.add_argument(
+        "--repeat", type=int, help="number of repetition for benchmark", default=1000
+    )
     args = parser.parse_args()
     return args
 
