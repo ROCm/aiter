@@ -1967,13 +1967,13 @@ def _rope_fwd_kernel_gptj_cached_thd_position_2c(
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
     x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
-    x_offs = (
-        x_offs_t[:, None] * stride_x_t
-        + stride_x_h * h_start_idx
-        + x_offs_d[None, :] * stride_x_d
-    )
+    x_offs_base = (
+                x_offs_t[:, None] * stride_x_t
+                + x_offs_d[None, :] * stride_x_d
+            )
 
     for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
+        x_offs = x_offs_base + h * stride_x_h
 
         x = tl.load(x_ptr + x_offs, mask=x_mask)
         y = tl.load(y_ptr + x_offs, mask=x_mask)
@@ -2010,7 +2010,6 @@ def _rope_fwd_kernel_gptj_cached_thd_position_2c(
         tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
         tl.store(out_y_ptr + x_offs, out_y, mask=x_mask)
 
-        x_offs += stride_x_h
 
 
 @triton.jit
@@ -2077,13 +2076,13 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
     x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
-    x_offs = (
-        x_offs_t[:, None] * stride_x_t
-        + stride_x_h * h_start_idx
-        + x_offs_d[None, :] * stride_x_d
-    )
+    x_offs_base = (
+                x_offs_t[:, None] * stride_x_t
+                + x_offs_d[None, :] * stride_x_d
+            )
 
     for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
+        x_offs = x_offs_base + h * stride_x_h
 
         x = tl.load(x_ptr + x_offs, mask=x_mask)
         y = tl.load(y_ptr + x_offs, mask=x_mask)
@@ -2120,7 +2119,6 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
         tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
         tl.store(out_y_ptr + x_offs, out_y, mask=x_mask)
 
-        x_offs += stride_x_h
 
 
 @triton.jit
