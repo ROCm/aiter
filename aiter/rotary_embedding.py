@@ -32,7 +32,9 @@ from aiter import dtypes
 # from custom_op import CustomOp
 
 import os
-AITER_ROPE_TRITON_BACKEND = (int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1)
+
+AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1
+
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
@@ -136,7 +138,7 @@ class RotaryEmbedding(nn.Module):
             return self.forward_native(*args, **kwargs)
         else:
             return self.forward_hip(*args, **kwargs)
-        
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -418,7 +420,7 @@ class RotaryEmbedding(nn.Module):
                     nope_first=is_nope_first,
                 )
             return query.view(query_shape)
-        
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"
