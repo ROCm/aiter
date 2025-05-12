@@ -1,13 +1,21 @@
 import triton
 import triton.language as tl
-from utils.benchmark_utils import get_model_configs, get_available_models, get_dtype_bytes, torch_to_tl_dtype
-from op_tests.triton_tests.test_pa_prefill import seed_everything, STR_DTYPE_TO_TORCH_DTYPE
+from utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+    get_dtype_bytes,
+)
+from op_tests.triton_tests.test_pa_prefill import (
+    seed_everything,
+    STR_DTYPE_TO_TORCH_DTYPE,
+)
 import torch
 import argparse
 from aiter.ops.triton.pa_prefill import context_attention_fwd
 import sys
 import math
 import random
+
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
@@ -31,6 +39,7 @@ def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
         )
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
+
 
 def input_helper(
     BS,
@@ -135,25 +144,61 @@ def input_helper(
     k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
     if use_alibi_slope:
-        return query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, alibi_slopes
+        return (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            alibi_slopes,
+        )
     else:
-        return query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, None
+        return (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            None,
+        )
 
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="llama3,deepseek" if args.model == None else args.model)
+    configs = get_model_configs(
+        config_path=config_file,
+        models="llama3,deepseek" if args.model is None else args.model,
+    )
     fa_configs = []
     BS = args.b if args.b else 16
 
     for model_name, config in configs.items():
         HQ = config["num_attention_heads"]
-        HK = HQ if config["num_key_value_heads"] is None else config["num_key_value_heads"]
+        HK = (
+            HQ
+            if config["num_key_value_heads"] is None
+            else config["num_key_value_heads"]
+        )
         SEQ_LEN = args.sq if args.sq else 1024
         HEAD_DIM = config["hidden_size"] // HQ
         fa_configs.append((model_name, BS, HQ, HK, SEQ_LEN, HEAD_DIM))
 
     return fa_configs
+
 
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
@@ -161,17 +206,24 @@ def run_benchmark(args):
     use_alibi_slope = args.use_alibi_slope
 
     x_vals_list = model_benchmark_configs(args)
-    x_names = ['model', 'BS', 'HQ', 'HK', 'MAX_SEQ_LEN', "HEAD_DIM"]
+    x_names = ["model", "BS", "HQ", "HK", "MAX_SEQ_LEN", "HEAD_DIM"]
 
     model_name = "paged-attn-decode"
 
-    line_names = ['Time (ms)', 'TFLOPS', 'Bandwidth (GB/s)']
-    line_vals = ['time', 'tflops', 'bandwidth']
+    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+    line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
-        x_names=x_names, x_vals=x_vals_list, line_arg='metric', line_vals=line_vals, line_names=line_names,
-        styles=[('red', '-'), ('blue', '-'),
-                ('yellow', '-')], ylabel='ms / TFLOPS / GB/s', plot_name=f'{model_name}-benchmark', args={})
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="metric",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
+        ylabel="ms / TFLOPS / GB/s",
+        plot_name=f"{model_name}-benchmark",
+        args={},
+    )
 
     @triton.testing.perf_report([benchmark])
     def bench_paged_attn_decode(BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM, metric, model=None):
@@ -190,7 +242,21 @@ def run_benchmark(args):
 
         num_queries_per_kv = HQ // HK
 
-        query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, alibi_slopes = input_helper(
+        (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            alibi_slopes,
+        ) = input_helper(
             BS=BS,
             MAX_SEQ_LEN=MAX_SEQ_LEN,
             MAX_CTX_LEN=MAX_CTX_LEN,
@@ -202,12 +268,14 @@ def run_benchmark(args):
             num_queries_per_kv=num_queries_per_kv,
             dtype=dtype,
             kv_cache_dtype=kv_cache_dtype,
-            device=[f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)][0],
+            device=[
+                f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+            ][0],
             use_alibi_slope=use_alibi_slope,
         )
 
         num_tokens = query.shape[0]
-        fn = lambda: context_attention_fwd(
+        fn = lambda: context_attention_fwd(  # noqa: E731
             query,
             k,
             v,
@@ -228,9 +296,16 @@ def run_benchmark(args):
         # query and output
         mem = (num_tokens * HQ * HEAD_DIM) * get_dtype_bytes(dtype) * 2
         # kv_cache
-        mem += (cache_size * block_size * HK * HEAD_DIM * get_dtype_bytes(torch_kv_cache_dtype) * 2)
+        mem += (
+            cache_size
+            * block_size
+            * HK
+            * HEAD_DIM
+            * get_dtype_bytes(torch_kv_cache_dtype)
+            * 2
+        )
         # k, v
-        mem += (num_tokens * HK * HEAD_DIM * get_dtype_bytes(dtype) * 2)
+        mem += num_tokens * HK * HEAD_DIM * get_dtype_bytes(dtype) * 2
         # block_tables int32
         mem += BS * max_block_per_request * 4
         # b_seq_len int32
@@ -241,18 +316,22 @@ def run_benchmark(args):
         # cache
         flops = (2.0 * BS * HQ * (num_tokens // BS) * (num_tokens // BS) * HEAD_DIM) * 2
         # casual
-        flops += (2.0 * BS * HQ * max_block_per_request * (num_tokens // BS) * HEAD_DIM) * 2 // 2
+        flops += (
+            (2.0 * BS * HQ * max_block_per_request * (num_tokens // BS) * HEAD_DIM)
+            * 2
+            // 2
+        )
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active
-        if metric == 'time':
+        if metric == "time":
             return ms
-        elif metric == 'tflops':
+        elif metric == "tflops":
             return tflops
-        elif metric == 'bandwidth':
+        elif metric == "bandwidth":
             return bandwidth
         else:
             raise ValueError("Unknown metric: " + metric)
@@ -265,27 +344,38 @@ def parse_args():
         prog="Benchmark Paged Attention decode",
         allow_abbrev=False,
     )
-    parser.add_argument('-model_configs', type=str, default="utils/model_configs.json", help="Model config json file.")
+    parser.add_argument(
+        "-model_configs",
+        type=str,
+        default="utils/model_configs.json",
+        help="Model config json file.",
+    )
     available_models = get_available_models()  # Dynamically load model names
-    model_help = ("Model name to benchmark. Select from: [" + ", ".join(available_models) +
-                  "]. Use 'all' to benchmark all models or leave blank for the default benchmark script.")
-    parser.add_argument('-model', type=str, default=None, help=model_help)
+    model_help = (
+        "Model name to benchmark. Select from: ["
+        + ", ".join(available_models)
+        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
+    )
+    parser.add_argument("-model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sq", type=int, default=0)
-    parser.add_argument("-use_alibi_slope", action='store_true', default=False)
-    parser.add_argument("-dtype", default='fp16')
-    parser.add_argument("-kv_cache_dtype", default='auto')
-    parser.add_argument("-compute_type", default='fp16')
+    parser.add_argument("-use_alibi_slope", action="store_true", default=False)
+    parser.add_argument("-dtype", default="fp16")
+    parser.add_argument("-kv_cache_dtype", default="auto")
+    parser.add_argument("-compute_type", default="fp16")
 
     args = parser.parse_args()
     return args
 
 
 arg_to_torch_dtype = {
-    'fp16': torch.float16, 'bf16': torch.bfloat16, 'fp32': torch.float32, "e5m2fnuz": torch.float8_e5m2fnuz, "e4m3fnuz":
-    torch.float8_e4m3fnuz
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+    "e5m2fnuz": torch.float8_e5m2fnuz,
+    "e4m3fnuz": torch.float8_e4m3fnuz,
 }
 
 
@@ -294,5 +384,5 @@ def main():
     run_benchmark(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

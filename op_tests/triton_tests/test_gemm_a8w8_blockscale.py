@@ -1,10 +1,8 @@
 import torch
 import triton
-import triton.language as tl
 import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 import torch.nn.functional as F
-from einops import rearrange
 
 
 block_shape = (128, 128)
@@ -93,12 +91,8 @@ def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
-    x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(
-        e4m3_type
-    )
-    weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
-        e4m3_type
-    )
+    x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
+    weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
 
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
@@ -113,8 +107,9 @@ def test_gemm(dtype, M, N, K):
     block_shape_n, block_shape_k = block_shape
 
     dtype = name_to_torch_types[dtype]
-    x, weight, x_scale, w_scale = generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n,
-            block_shape_k)
+    x, weight, x_scale, w_scale = generate_gemm_a8w8_blockscale_inputs(
+        M, N, K, block_shape_n, block_shape_k
+    )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     b = run_triton(x, weight, x_scale, w_scale, dtype)

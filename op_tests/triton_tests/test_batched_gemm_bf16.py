@@ -1,6 +1,5 @@
 import torch
 import triton
-import triton.language as tl
 import pytest
 from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
 import torch.nn.functional as F

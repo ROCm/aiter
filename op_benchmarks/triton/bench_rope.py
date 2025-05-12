@@ -1,4 +1,3 @@
-
 import argparse
 import sys
 import torch
@@ -16,15 +15,29 @@ from aiter.ops.triton.rope import (
     rope_fwd_2d, rope_fwd_2d_inplace,
     )
 
-#TODO: move to aiter/op_tests/triton_tests/test_rope_triton.py
-def generate_rope_inputs(B: int, S: int, H: int, D: int, cached: bool, reuse_freqs_front_part: bool, nope: bool, pos: bool, offs: bool, two_inputs: bool, layout: str, dtype: torch.dtype):
+
+# TODO: move to aiter/op_tests/triton_tests/test_rope_triton.py
+def generate_rope_inputs(
+    B: int,
+    S: int,
+    H: int,
+    D: int,
+    cached: bool,
+    reuse_freqs_front_part: bool,
+    nope: bool,
+    pos: bool,
+    offs: bool,
+    two_inputs: bool,
+    layout: str,
+    dtype: torch.dtype,
+):
     torch.manual_seed(20)
-    
+
     device = "cuda"
-    if layout == "thd": # T == S
+    if layout == "thd":  # T == S
         assert B == 1, "B should always be 1 in THD layout"
         input_shape = (S, H, D)
-        pos_offs_shape = (S, )
+        pos_offs_shape = (S,)
     elif layout == "sbhd":
         input_shape = (S, B, H, D)
         pos_offs_shape = (S, B)
@@ -39,7 +52,7 @@ def generate_rope_inputs(B: int, S: int, H: int, D: int, cached: bool, reuse_fre
         freqs_D = freqs_D // 2
     if reuse_freqs_front_part:
         freqs_D = freqs_D // 2
-    
+
     freqs = torch.randn((S, 1, 1, freqs_D), dtype=dtype, device="cuda")
     positions = torch.randint(int(S * 0.25) if offs else 0, int(S * 0.75) if offs else S, pos_offs_shape, device=device) if pos else None
     offsets  = torch.randint(int(S * -0.25), int(S * 0.25), pos_offs_shape, device=device) if offs else None
@@ -53,13 +66,15 @@ def generate_rope_inputs(B: int, S: int, H: int, D: int, cached: bool, reuse_fre
 
     return x, y, freqs, positions, offsets, cos, sin
 
+
 def str_to_bool(v, vstr):
-    if v.lower() in ['true', 'yes']:
+    if v.lower() in ["true", "yes"]:
         return True
-    elif v.lower() in ['false', 'no']:
+    elif v.lower() in ["false", "no"]:
         return False
     else:
         raise NotImplementedError(f"invalid {vstr}: {v}")
+
 
 def get_x_vals():
     """
@@ -83,53 +98,169 @@ def get_x_vals():
     inplace = False
     dtype = torch.bfloat16
 
-    # x_vals = [(B, 2**i, H, D, cached, rotate_style, reuse_freqs_front_part, nope, nope_first, pos, offs, two_inputs, layout, inplace, dtype) 
+    # x_vals = [(B, 2**i, H, D, cached, rotate_style, reuse_freqs_front_part, nope, nope_first, pos, offs, two_inputs, layout, inplace, dtype)
     #           for i in range(0, 13)]
-    x_vals = [(B, 1, H, D, cached, rotate_style, reuse_freqs_front_part, nope, nope_first, pos, offs, two_inputs, layout, inplace, dtype)]
+    x_vals = [
+        (
+            B,
+            1,
+            H,
+            D,
+            cached,
+            rotate_style,
+            reuse_freqs_front_part,
+            nope,
+            nope_first,
+            pos,
+            offs,
+            two_inputs,
+            layout,
+            inplace,
+            dtype,
+        )
+    ]
     return x_vals
 
+
 def run_benchmark(args):
-    B, S, H, D, cached, rotate_style, reuse_freqs_front_part, nope, nope_first, pos, offs, two_inputs, layout, inplace, dtype =\
-    args.B, args.S, args.H, args.D, args.cached, args.rotate_style, args.reuse_freqs_front_part, args.nope, args.nope_first, args.pos, args.offs, args.two_inputs, args.l, args.inplace, args.dtype
-    
+    (
+        B,
+        S,
+        H,
+        D,
+        cached,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope,
+        nope_first,
+        pos,
+        offs,
+        two_inputs,
+        layout,
+        inplace,
+        dtype,
+    ) = (
+        args.B,
+        args.S,
+        args.H,
+        args.D,
+        args.cached,
+        args.rotate_style,
+        args.reuse_freqs_front_part,
+        args.nope,
+        args.nope_first,
+        args.pos,
+        args.offs,
+        args.two_inputs,
+        args.l,
+        args.inplace,
+        args.dtype,
+    )
+
     cached = str_to_bool(cached, "cached")
-    reuse_freqs_front_part = str_to_bool(reuse_freqs_front_part, "reuse_freqs_front_part")
+    reuse_freqs_front_part = str_to_bool(
+        reuse_freqs_front_part, "reuse_freqs_front_part"
+    )
     nope = str_to_bool(nope, "nope")
     nope_first = str_to_bool(nope_first, "nope_first")
     pos = str_to_bool(pos, "pos")
     offs = str_to_bool(offs, "offs")
     two_inputs = str_to_bool(two_inputs, "two_inputs")
     inplace = str_to_bool(inplace, "inplace")
-    
+
     rep = args.repeat
 
-    if dtype == 'fp16':
+    if dtype == "fp16":
         dtype = torch.float16
-    elif dtype == 'bf16':
+    elif dtype == "bf16":
         dtype = torch.bfloat16
     else:
         raise NotImplementedError(f"dtype {dtype} not supported")
-    
-    if rotate_style not in ['gptj', 'neox']:
+
+    if rotate_style not in ["gptj", "neox"]:
         raise NotImplementedError(f"rotate_style {rotate_style} not supported")
-        
-    x_names = ['B', 'S', 'H', 'D', "cached", "rotate_style", "reuse_freqs_front_part", "nope", "nope_first", "pos", "offs", "two_inputs", "layout", "inplace", "dtype"]
-    x_vals_list = [(B, S, H, D, cached, rotate_style, reuse_freqs_front_part, nope, nope_first, pos, offs, two_inputs, layout, inplace, dtype)]
-    
-    #TODO make multiple input configs compatible with rocprof
+
+    x_names = [
+        "B",
+        "S",
+        "H",
+        "D",
+        "cached",
+        "rotate_style",
+        "reuse_freqs_front_part",
+        "nope",
+        "nope_first",
+        "pos",
+        "offs",
+        "two_inputs",
+        "layout",
+        "inplace",
+        "dtype",
+    ]
+    x_vals_list = [
+        (
+            B,
+            S,
+            H,
+            D,
+            cached,
+            rotate_style,
+            reuse_freqs_front_part,
+            nope,
+            nope_first,
+            pos,
+            offs,
+            two_inputs,
+            layout,
+            inplace,
+            dtype,
+        )
+    ]
     # x_vals_list = get_x_vals()
 
     # @triton.testing.perf_report([benchmark])
-    def bench_rope(B: int, S: int, H: int, D: int, cached: bool, rotate_style: int, reuse_freqs_front_part: bool, nope: bool, nope_first: bool, pos: bool, offs: bool, two_inputs: bool, layout: str, inplace: bool, dtype: torch.dtype, metric, provider):
-        x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(B, S, H, D, cached, reuse_freqs_front_part, nope, pos, offs, two_inputs, layout, dtype)
-        if rotate_style == 'gptj':
+    def bench_rope(
+        B: int,
+        S: int,
+        H: int,
+        D: int,
+        cached: bool,
+        rotate_style: int,
+        reuse_freqs_front_part: bool,
+        nope: bool,
+        nope_first: bool,
+        pos: bool,
+        offs: bool,
+        two_inputs: bool,
+        layout: str,
+        inplace: bool,
+        dtype: torch.dtype,
+        metric,
+        provider,
+    ):
+        x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+            B,
+            S,
+            H,
+            D,
+            cached,
+            reuse_freqs_front_part,
+            nope,
+            pos,
+            offs,
+            two_inputs,
+            layout,
+            dtype,
+        )
+        if rotate_style == "gptj":
             rotate_style = RotateStyle.GPTJ
-        elif rotate_style == 'neox':
+        elif rotate_style == "neox":
             rotate_style = RotateStyle.NEOX
         # flops
-        flops = B * S * H * (D/2.0) * 3.0 * 2.0 * (2.0 if two_inputs else 1.0)
-        
+        flops = B * S * H * (D / 2.0) * 3.0 * 2.0 * (2.0 if two_inputs else 1.0)
+
         # memory transfer (B = 1, T = S for thd layout, positions and offsets are always int)
+
         mem_read = B * S * H * D * ((2.0 * x        .element_size()) if two_inputs else (1.0 * x    .element_size())) + \
                        S *     D * ((2.0 * freqs    .element_size()) if cached     else (1.0 * freqs.element_size())) + \
                    B * S *         ((1.0 * positions.element_size()) if pos        else 0.0) + \
@@ -210,7 +341,9 @@ def run_benchmark(args):
         print(f"Total memory = {mem/1e9 : .6e} (GB)")
     # bench_rope.run(save_path=".", print_data=False)
     print("")
-    print("This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime, use -h/--help for more information")
+    print(
+        "This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime, use -h/--help for more information"
+    )
 
 
 def parse_args():
@@ -218,7 +351,10 @@ def parse_args():
         prog="Benchmark RoPE",
         description="This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime (the DurationNs column) in results.csv or results.stats.csv. For instance, try \"rocprof --stats python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
         allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "-l", type=str, help="'thd' or 'sbhd' the layout of the input.", default="thd"
     )
     parser.add_argument("-l", type=str, 
                         help="'thd' or 'sbhd' the layout of the input.", default='thd')
@@ -262,5 +398,5 @@ def main():
     run_benchmark(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

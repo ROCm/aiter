@@ -3,11 +3,13 @@
 import sys
 import os
 import argparse
+
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/../../../aiter/")
 from jit.core import compile_ops
+
 
 @compile_ops("libmha_fwd", fc_name="compile_mha_fwd")
 def compile_mha_fwd(): ...
@@ -26,7 +28,7 @@ if __name__ == "__main__":
         "--api",
         default="",
         required=False,
-        help="supply API(s) to generate (default: fwd). separated by comma."
+        help="supply API(s) to generate (default: fwd). separated by comma.",
     )
 
     args = parser.parse_args()
@@ -39,6 +41,6 @@ if __name__ == "__main__":
         compile_mha_fwd()
         compile_mha_bwd()
     else:
-        raise ValueError("Invalid input value: only support 'fwd', 'bwd' or default to be ''")
-
-
+        raise ValueError(
+            "Invalid input value: only support 'fwd', 'bwd' or default to be ''"
+        )

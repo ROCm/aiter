@@ -2,11 +2,9 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
-from typing import List, Optional, Tuple, Union
-from math import ceil
+from typing import Tuple
 from aiter import dtypes
 
 MAX_TOKEN_SUPPORTED = 16384

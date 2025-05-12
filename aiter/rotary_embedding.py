@@ -173,7 +173,7 @@ class RotaryEmbedding(nn.Module):
             if not is_nope_first
             else torch.cat((query_pass, query_rot), dim=-1).reshape(query_shape)
         )
-        
+
         if key is None:
             return query
 
@@ -901,6 +901,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             key = key.clone()
         return query, key
 
+
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
     def __init__(
@@ -1307,6 +1308,7 @@ def get_rope(
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
+
 
 def get_rope_wrapper(
     head_size: int,

@@ -3,21 +3,13 @@
 
 from aiter.test_common import (
     checkAllclose,
-    perftest,
-    tensor_dump,
     benchmark,
     run_perftest,
 )
 import torch
-import torch.nn.functional as F
-import numpy as np
-import sys
-import os
 import aiter
-from aiter.ops.shuffle import shuffle_weight
 from aiter import dtypes
 from aiter import get_hip_quant, get_torch_quant, get_triton_quant
-from aiter import QuantType
 import itertools
 
 torch.set_default_device("cuda")

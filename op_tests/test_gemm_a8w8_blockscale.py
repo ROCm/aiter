@@ -3,12 +3,9 @@
 
 import torch
 import torch.nn.functional as F
-import numpy as np
-import sys
-import os
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, perftest, tensor_dump, benchmark
+from aiter.test_common import checkAllclose, perftest, benchmark
 from einops import rearrange
 from einops import repeat as eirp
 import pandas as pd
