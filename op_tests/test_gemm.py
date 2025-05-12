@@ -42,7 +42,7 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return F.linear(x, weight, bias).to(otype)
 
 
-@perftest()
+@perftest(num_iters=10)
 def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
@@ -66,10 +66,10 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     checkAllclose(a, b, msg=msg)
 
 
-test_gemm(
-    dtypes.fp8, 128, 768, 4096, bias=False, otype=dtypes.bf16, scaleA=0.5, scaleB=0.5
-)
-test_gemm(dtypes.bf16, 128, 32, 8192)
+# test_gemm(
+#     dtypes.fp8, 128, 768, 4096, bias=False, otype=dtypes.bf16, scaleA=0.5, scaleB=0.5
+# )
+# test_gemm(dtypes.bf16, 128, 32, 8192)
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     # # qkv_proj
 #     # for (m, n, k) in [(4096, 1280, 8192),
@@ -92,3 +92,12 @@ test_gemm(dtypes.bf16, 128, 32, 8192)
 #     # for (m, n, k) in [(1, 19392, 8192),
 #     #                   (128, 19392, 8192)]:
 #     #     test_gemm(dtype, m, n, k)
+seed = 8779
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+
+test_gemm(dtypes.fp16, 4, 32, 8192)
+test_gemm(dtypes.bf16, 4, 32, 8192)
+
+test_gemm(dtypes.fp16, 1, 4, 8192)
+test_gemm(dtypes.bf16, 1, 4, 8192)

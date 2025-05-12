@@ -101,7 +101,8 @@ class TunedGemm:
 
     @functools.lru_cache(maxsize=1024)
     def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
-        if dtype == dtypes.fp16 and k % 8 == 0:
+        # if dtype == dtypes.fp16 and k % 8 == 0:
+        if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
             if n > 8 and 0 < m <= 4:
                 return 3, 0
             elif n % 4 == 0 and m == 1 and k <= 8192:
