@@ -5,15 +5,23 @@ import triton
 from triton.testing import runtime
 from aiter.ops.triton.rope import RotateStyle
 from aiter.ops.triton.rope import (
-    rope_fwd, rope_fwd_inplace, 
-    rope_fwd_thd, rope_fwd_thd_inplace, 
-    rope_cached_fwd, rope_cached_fwd_inplace, 
-    rope_cached_positions_fwd, rope_cached_positions_fwd_inplace, 
-    rope_cached_positions_offsets_fwd, rope_cached_positions_offsets_fwd_inplace,
-    rope_cached_thd_positions_2c_fwd, rope_cached_thd_positions_2c_fwd_inplace,
-    rope_cached_thd_positions_offsets_2c_fwd, rope_cached_thd_positions_offsets_2c_fwd_inplace,
-    rope_fwd_2d, rope_fwd_2d_inplace,
-    )
+    rope_fwd,
+    rope_fwd_inplace,
+    rope_fwd_thd,
+    rope_fwd_thd_inplace,
+    rope_cached_fwd,
+    rope_cached_fwd_inplace,
+    rope_cached_positions_fwd,
+    rope_cached_positions_fwd_inplace,
+    rope_cached_positions_offsets_fwd,
+    rope_cached_positions_offsets_fwd_inplace,
+    rope_cached_thd_positions_2c_fwd,
+    rope_cached_thd_positions_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_fwd,
+    rope_cached_thd_positions_offsets_2c_fwd_inplace,
+    rope_fwd_2d,
+    rope_fwd_2d_inplace,
+)
 
 
 # TODO: move to aiter/op_tests/triton_tests/test_rope_triton.py
@@ -54,9 +62,22 @@ def generate_rope_inputs(
         freqs_D = freqs_D // 2
 
     freqs = torch.randn((S, 1, 1, freqs_D), dtype=dtype, device="cuda")
-    positions = torch.randint(int(S * 0.25) if offs else 0, int(S * 0.75) if offs else S, pos_offs_shape, device=device) if pos else None
-    offsets  = torch.randint(int(S * -0.25), int(S * 0.25), pos_offs_shape, device=device) if offs else None
-    
+    positions = (
+        torch.randint(
+            int(S * 0.25) if offs else 0,
+            int(S * 0.75) if offs else S,
+            pos_offs_shape,
+            device=device,
+        )
+        if pos
+        else None
+    )
+    offsets = (
+        torch.randint(int(S * -0.25), int(S * 0.25), pos_offs_shape, device=device)
+        if offs
+        else None
+    )
+
     cos = torch.cos(freqs) if cached else None
     sin = torch.sin(freqs) if cached else None
 
@@ -78,9 +99,9 @@ def str_to_bool(v, vstr):
 
 def get_x_vals():
     """
-        this get_x_vals is for DeepSeekV2 (thd)
-        H = num_attention_heads = 128
-        D = qk_rope_head_dim = 64
+    this get_x_vals is for DeepSeekV2 (thd)
+    H = num_attention_heads = 128
+    D = qk_rope_head_dim = 64
     """
     B = 1
     H = 128
@@ -261,28 +282,78 @@ def run_benchmark(args):
 
         # memory transfer (B = 1, T = S for thd layout, positions and offsets are always int)
 
-        mem_read = B * S * H * D * ((2.0 * x.element_size()) if two_inputs else (1.0 * x.element_size())) + \
-        S * D * ((2.0 * freqs.element_size()) if cached else (1.0 * freqs.element_size())) + \
-        B * S * ((1.0 * positions.element_size()) if pos else 0.0) + \
-        B * S * ((1.0 * offsets.element_size()) if offs else 0.0)
-                   
+        mem_read = (
+            B
+            * S
+            * H
+            * D
+            * ((2.0 * x.element_size()) if two_inputs else (1.0 * x.element_size()))
+            + S
+            * D
+            * ((2.0 * freqs.element_size()) if cached else (1.0 * freqs.element_size()))
+            + B * S * ((1.0 * positions.element_size()) if pos else 0.0)
+            + B * S * ((1.0 * offsets.element_size()) if offs else 0.0)
+        )
+
         mem_write = B * S * H * D * (2.0 if two_inputs else 1.0) * x.element_size()
         mem = mem_read + mem_write
-        
+
         transpose_output = False
-        fn = None 
+        fn = None
         if two_inputs and cached and pos and layout == "thd":
             if offs:
                 if inplace:
-                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace(x, y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace(
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
                 else:
-                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd(x, y, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd(
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
             else:
                 if inplace:
-                    fn = lambda: rope_cached_thd_positions_2c_fwd_inplace(x, y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_cached_thd_positions_2c_fwd_inplace(
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
                 else:
-                    fn = lambda: rope_cached_thd_positions_2c_fwd(x, y, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
-        
+                    fn = lambda: rope_cached_thd_positions_2c_fwd(
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+
         # TODO enable these versions after passing tests in test_rope_trition.py
         # if not two_inputs and cached and pos and offs and layout == "sbhd":
         #     if inplace:
@@ -307,20 +378,56 @@ def run_benchmark(args):
         if not two_inputs and not cached and not pos and not offs:
             if layout == "sbhd":
                 if inplace:
-                    fn = lambda : rope_fwd_inplace(x, freqs, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_fwd_inplace(
+                        x,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
                 else:
-                    fn = lambda : rope_fwd(x, freqs, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_fwd(
+                        x,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
             elif layout == "thd":
                 seqlens = [0, S]
                 cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
                 if inplace:
-                    fn = lambda : rope_fwd_thd_inplace(x, cu_seqlens, freqs, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_fwd_thd_inplace(
+                        x,
+                        cu_seqlens,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
                 else:
-                    fn = lambda : rope_fwd_thd(x, cu_seqlens, freqs, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+                    fn = lambda: rope_fwd_thd(
+                        x,
+                        cu_seqlens,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
 
         if fn is None:
-            raise NotImplementedError(f"No API with option: [layout='{layout}', cached={cached}, two_inputs={two_inputs}, pos={pos}, offs={offs}, inplace={inplace}].")
-        
+            raise NotImplementedError(
+                f"No API with option: [layout='{layout}', cached={cached}, two_inputs={two_inputs}, pos={pos}, offs={offs}, inplace={inplace}]."
+            )
+
         di = runtime.driver.active.get_device_interface()
         cache = runtime.driver.active.get_empty_cache_for_benchmark()
         for i in range(rep):
@@ -357,47 +464,41 @@ def parse_args():
         "-l", type=str, help="'thd' or 'sbhd' the layout of the input.", default="thd"
     )
     parser.add_argument(
-        "-B", type=int, help="the batch size, B (this argument will be ignored if you set -l to 'thd').", default=1
+        "-B",
+        type=int,
+        help="the batch size, B (this argument will be ignored if you set -l to 'thd').",
+        default=1,
     )
     parser.add_argument(
-        "-S", "-T", type=int, help="the sequence length, S, or the number of tokens, T", default=4096
+        "-S",
+        "-T",
+        type=int,
+        help="the sequence length, S, or the number of tokens, T",
+        default=4096,
+    )
+    parser.add_argument("-H", type=int, help="the number of heads, H", default=128)
+    parser.add_argument("-D", type=int, help="the head dimension, D", default=64)
+    parser.add_argument("--cached", type=str, help="cached sin/cos", default="true")
+    parser.add_argument("--rotate_style", type=str, help="gptj or neox", default="gptj")
+    parser.add_argument(
+        "--reuse_freqs_front_part",
+        type=str,
+        help="turn on reuse_freqs_front_part",
+        default="true",
+    )
+    parser.add_argument("--nope", type=str, help="turn on nope", default="false")
+    parser.add_argument(
+        "--nope_first", type=str, help="turn on nope_fist", default="false"
+    )
+    parser.add_argument("--pos", type=str, help="input positions", default="true")
+    parser.add_argument("--offs", type=str, help="input offsets", default="false")
+    parser.add_argument(
+        "--two_inputs", type=str, help="input both K and Q", default="true"
     )
     parser.add_argument(
-        "-H", type=int, help="the number of heads, H", default=128
+        "--inplace", type=str, help="inplace operation", default="false"
     )
-    parser.add_argument(
-        "-D", type=int, help="the head dimension, D", default=64
-    )
-    parser.add_argument(
-        "--cached", type=str, help="cached sin/cos", default='true'
-    )
-    parser.add_argument(
-        "--rotate_style", type=str, help="gptj or neox", default='gptj'
-    )
-    parser.add_argument(
-        "--reuse_freqs_front_part", type=str, help="turn on reuse_freqs_front_part", default='true'
-    )
-    parser.add_argument(
-        "--nope", type=str, help="turn on nope", default='false'
-    )
-    parser.add_argument(
-        "--nope_first", type=str, help="turn on nope_fist", default='false'
-    )
-    parser.add_argument(
-        "--pos", type=str, help="input positions", default='true'
-    )
-    parser.add_argument(
-        "--offs", type=str, help="input offsets", default='false'
-    )
-    parser.add_argument(
-        "--two_inputs", type=str, help="input both K and Q", default='true'
-    )
-    parser.add_argument(
-        "--inplace", type=str, help="inplace operation", default='false'
-    )
-    parser.add_argument(
-        "--dtype", type=str, help="data type", default='bf16'
-    )
+    parser.add_argument("--dtype", type=str, help="data type", default="bf16")
     parser.add_argument(
         "--repeat", type=int, help="number of repetition for benchmark", default=1000
     )
