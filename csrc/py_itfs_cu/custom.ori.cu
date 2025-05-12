@@ -15,7 +15,6 @@
  * limitations under the License.
  */
 #include <torch/all.h>
-#include <c10/core/ScalarType.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
@@ -34,11 +33,12 @@
 // }
 
 void LLGemm1(void *in_a, void *in_b, void *out_c, const int M, const int K,
-             cudaStream_t stream, const int rows_per_block = 4,
-             const c10::ScalarType scalar_type = c10::ScalarType::Half);
+             cudaStream_t stream, const int rows_per_block);
+
 // template <typename T>
 void LLMM1(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
-           const int64_t rows_per_block) {
+           const int64_t rows_per_block)
+{
         auto M = in_a.size(0);
         auto K = in_a.size(1);
         // if (N != in_b.numel())
@@ -52,12 +52,12 @@ void LLMM1(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
         // call the kernel function...
         const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
         LLGemm1(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K,
-                at::cuda::getCurrentCUDAStream(), rows_per_block, in_b.scalar_type());
+                at::cuda::getCurrentCUDAStream(), rows_per_block);
 }
 
-void wvSplitK_(void *in_a, void *in_b, void *out_c, const int M, const int K,
-              const int N, cudaStream_t stream, const int CuCount = 0,
-              const c10::ScalarType scalar_type = c10::ScalarType::Half);
+void wvSpltK_(void *in_a, void *in_b, void *out_c, const int M, const int K,
+              const int N, cudaStream_t stream, const int CuCount);
+
 void wvSpltK(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
              const int64_t N_in, const int64_t CuCount)
 {
@@ -65,8 +65,8 @@ void wvSpltK(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
         auto K = in_a.size(1);
         int N = N_in;
         const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
-        wvSplitK_(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K, N,
-                 at::cuda::getCurrentCUDAStream(), CuCount, in_b.scalar_type());
+        wvSpltK_(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K, N,
+                 at::cuda::getCurrentCUDAStream(), CuCount);
 }
 
 void LLGemmZZ(void *in_a, void *in_b, void *out_c, const int M, const int K,
@@ -99,21 +99,4 @@ void MMCustomGPU(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c)
                     out_c.data_ptr<float>(), matA_sizes[0], matA_sizes[1],
                     matB_sizes[0], matB_sizes[1], matO_sizes[0], matO_sizes[1],
                     at::cuda::getCurrentCUDAStream());
-}
-
-void MMGPUKernel(float *in_a, float *in_b, float *out_c, int numARows,
-                 int numAColumns, int numBRows, int numBColumns, int numCRows,
-                 int numCColumns, cudaStream_t stream)
-{
-//   // Initialize the grid and block dimensions
-//   dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
-//   dim3 dimGrid((numCColumns / TILE_WIDTH) + 1, (numCRows / TILE_WIDTH) + 1, 1);
-//   //@@ Launch the GPU Kernel here
-//   matrixMultiplyShared<<<dimGrid, dimBlock>>>(
-//       in_a, in_b, out_c, numARows, numAColumns, numBRows, numBColumns, numCRows,
-//       numCColumns);
-
-//   cudaError_t err = cudaGetLastError();
-//   if (cudaSuccess != err)
-//     throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
