@@ -1,0 +1,201 @@
+from typing import Optional
+import torch
+import triton
+import triton.language as tl
+from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+
+
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+    }
+)
+@triton.jit
+def _gemm_afp4_wfp4_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scales_ptr,
+    b_scales_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_asm,
+    stride_ask,
+    stride_bsn,
+    stride_bsk,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    GRID_MN: tl.constexpr,
+):
+    """Kernel for computing the matmul C = A x B.
+    A and B inputs are in the microscale fp4 (mxfp4) format.
+    A_scales and B_scales are in e8m0 format.
+    A has shape (M, K), B has shape (K, N) and C has shape (M, N)
+    """
+
+    tl.assume(stride_am > 0)
+    tl.assume(stride_ak > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_cn > 0)
+    tl.assume(stride_asm > 0)
+    tl.assume(stride_ask > 0)
+    tl.assume(stride_bsk > 0)
+    tl.assume(stride_bsn > 0)
+
+    # -----------------------------------------------------------
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    remap_xcd(pid, GRID_MN)
+
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+
+    tl.assume(pid_m > 0)
+    tl.assume(pid_n > 0)
+    # We assume 32 elements along K share the same scale.
+    SCALE_GROUP_SIZE: tl.constexpr = 32
+
+    # Create pointers for first block of A and B input matrices
+    # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
+    offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    # Create pointers for the first block of A and B scales
+    offs_ks = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+    a_scale_ptrs = (
+        a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks[None, :] * stride_ask
+    )
+    # B scales are N x K even though B operand is K x N.
+    b_scale_ptrs = (
+        b_scales_ptr + offs_bn[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
+    )
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K // 2)):
+        a_scales = tl.load(a_scale_ptrs)
+        b_scales = tl.load(b_scale_ptrs)
+        # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
+        # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
+        # Load the next block of A and B, generate a mask by checking the K dimension.
+        # If it is out of bounds, set it to 0.
+        if EVEN_K:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0
+            )
+            b = tl.load(
+                b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
+            )
+
+        accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+
+        # Advance the ptrs to the next K block.
+        a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
+        b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+        a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
+        b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
+
+    c = accumulator.to(c_ptr.type.element_ty)
+
+    # Write back the block of the output matrix C with masks.
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, c, mask=c_mask)
+
+
+# Wrapper for gemm kernel.
+def gemm_afp4wfp4(
+    x,
+    w,
+    y,
+    x_scales,
+    w_scales,
+    dtype: Optional[float] = torch.bfloat16,
+):
+    """
+    Computes the matmul Y = X x W
+    X and W are e2m1 fp4 tensors.
+    x_scales and w_scales are e8m0 tensors.
+    Every 32 elements in the K dimension share one e8m0 scale.
+
+
+    Key parameters:
+    - X: Matrix X with shape (M, K).
+    - W: Matrix W with shape (K, N).
+    - X_scales: Matrix with shape (M, K // 32)
+    - W_scales: Matrix with shape (N, K // 32)
+
+    Returns:
+    - Y: The output matrix with shape (M, N).
+    """
+
+    M, K = x.shape
+    K, N = w.shape
+
+    BLOCK_SIZE_M = 256
+    BLOCK_SIZE_N = 256
+    BLOCK_SIZE_K = 256
+    GROUP_SIZE_M = 4
+    waves_per_eu = 1
+    kpack = 1
+    num_warps = 8
+    num_stages = 2
+    matrix_instr_nonkdim = 32
+
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+    _gemm_afp4_wfp4_kernel[grid](
+        x,
+        w,
+        y,
+        x_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        y.stride(0),
+        y.stride(1),
+        x_scales.stride(0),
+        x_scales.stride(1),
+        w_scales.stride(0),
+        w_scales.stride(1),
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+        GROUP_SIZE_M,
+        waves_per_eu=waves_per_eu,
+        kpack=kpack,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        matrix_instr_nonkdim=matrix_instr_nonkdim,
+    )

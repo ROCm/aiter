@@ -4,9 +4,9 @@
 
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
-GEN_DIR = ""    # in Cmake, have to generate files in same folder
+GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
 AITER_API_FILENAME = "mha_fwd.cpp"
 
@@ -136,6 +136,7 @@ API_MAP = {
     5: FMHA_FWD_API + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
 }
 
+
 def write_blobs(output_dir: Optional[str], receipt) -> None:
     if output_dir is None:
         output_dir = Path(__file__).parent
@@ -144,8 +145,9 @@ def write_blobs(output_dir: Optional[str], receipt) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    api = AITER_CPP_API.format(F_dispatch = API_MAP[receipt])
+    api = AITER_CPP_API.format(F_dispatch=API_MAP[receipt])
     (output_dir / AITER_API_FILENAME).write_text(api)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -156,18 +158,18 @@ if __name__ == "__main__":
         "-o",
         "--output_dir",
         required=False,
-        help="write all the blobs into a directory"
+        help="write all the blobs into a directory",
     )
     parser.add_argument(
         "-r",
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt. 1: generate mha_fwd c++ api\n"  + \
-                            "  2: generate mha_fwd_splitkv c++ api\n"  + \
-                            "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD\n" + \
-                            "  4: generate mha_batch_prefill c++ api\n" + \
-                            "  5: generate all fmha fwd c++ api, also can be use for PREBUILD"
+        help="codegen receipt. 1: generate mha_fwd c++ api\n"
+        + "  2: generate mha_fwd_splitkv c++ api\n"
+        + "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD\n"
+        + "  4: generate mha_batch_prefill c++ api\n"
+        + "  5: generate all fmha fwd c++ api, also can be use for PREBUILD",
     )
 
     args = parser.parse_args()

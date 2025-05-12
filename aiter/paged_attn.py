@@ -15,7 +15,7 @@
 * limitations under the License.
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 import torch
 import aiter as ops
 from aiter import dtypes

@@ -3,14 +3,11 @@
 
 import torch
 from torch import Tensor
-from typing import List, Optional
+from typing import Optional
 import functools
 import pandas as pd
 from ..jit.core import (
     compile_ops,
-    CK_DIR,
-    AITER_CSRC_DIR,
-    AITER_ROOT_DIR,
     AITER_CORE_DIR,
 )
 from ..utility import dtypes

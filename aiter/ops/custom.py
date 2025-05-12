@@ -2,12 +2,9 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
-from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
-import torch.nn.functional as F
+from ..jit.core import compile_ops
 
 MD_NAME = "module_custom"
-
 
 
 @compile_ops("module_custom")
