@@ -347,6 +347,44 @@ def _attn_fwd_inner(
 
     return acc, l_i, m_i
 
+@triton.jit
+def _remap_XCD(k, N, NUM_XCD):
+    r = k % NUM_XCD
+    m = k // NUM_XCD
+    q = N // NUM_XCD
+    t = N - NUM_XCD * q
+    u = min(r, t + 1)
+    new_index = u * q + (r - u) * (q - 1) + r + m
+    return new_index
+
+@triton.jit
+def _balance_attn_workload(wid, NUM_CUs_PER_XCD: tl.constexpr, NUM_XCD: tl.constexpr, BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, BLOCK_M):
+    # Traversal strategy along dims: seqlen, q_head, batch
+    # 1. Fastest changing dim is the q_head dim. At every <NUM_XCD>th wid, increase the sequence block id (start_m).
+    # 2. When we are done with <CHUNK_BLOCKS_SIZE> blocks along seqlen, we move to the next set of <NUM_XCD> q_heads.
+    # 3. Batch changes last.
+
+    # so XCD 0 should get workgroups with indices (batch, head q idx, start_m)
+    # (0, 0, 0), (0, 0, 1), (0, 0, 2), ..., (0, 0, CHUNK_BLOCKS_SIZE), (0, NUM_XCD, 0)
+    # XCD 1
+    # (0, 1, 0), (0, 1, 1), (0, 1, 2), ..., (0, 1, CHUNK_BLOCKS_SIZE), (0, NUM_XCD+1, 0)
+    # ...
+    # XCD <NUM_XCD - 1>
+    # (0, NUM_XCD-1, 0), (0, NUM_XCD-1, 1), (0, NUM_XCD-1, 2), ..., (0, NUM_XCD-1, CHUNK_BLOCKS_SIZE), (0, 2 * NUM_XCD-1, 0)
+
+    # Notice that on the same round robin turn, XCDs get the same start_m, i.e. workgroups with equal workloads.
+    # But also consequent sequence blocks are sent to the same XCD, so they can benefit from L2 caching.
+
+    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    CHUNK_BLOCKS_SIZE = 1 # (NUM_CUs_PER_XCD // (NUM_Q_HEADS // NUM_K_HEADS))
+    off_q_head = (wid % NUM_XCD + wid // (CHUNK_BLOCKS_SIZE * NUM_XCD) * NUM_XCD) % NUM_Q_HEADS
+    start_m = ((wid // NUM_XCD ) % CHUNK_BLOCKS_SIZE + wid // (CHUNK_BLOCKS_SIZE * NUM_Q_HEADS) * CHUNK_BLOCKS_SIZE) % NUM_BLOCKS
+    off_z = wid // (NUM_BLOCKS * NUM_Q_HEADS) % BATCH
+    off_q_head = _remap_XCD(off_q_head, NUM_Q_HEADS-1, NUM_XCD)
+
+    return off_z, off_q_head, start_m
+
+
 
 @triton.jit
 def _attn_fwd(
@@ -409,12 +447,58 @@ def _attn_fwd(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     VARLEN: tl.constexpr,
+def _attn_fwd(q_ptr: torch.Tensor,
+            k_ptr: torch.Tensor,
+            v_ptr: torch.Tensor,
+            descale_q_ptr: torch.Tensor,
+            descale_k_ptr: torch.Tensor,
+            descale_v_ptr: torch.Tensor,
+            out_ptr: torch.Tensor,
+            alibi_slopes_ptr: torch.Tensor,
+            s_dmask_ptr: torch.Tensor,
+            dropout_mask_ptr: torch.Tensor,
+            softmax_lse_ptr: torch.Tensor,
+            stride_qz, stride_qh, stride_qm, stride_qk,
+            stride_kz, stride_kh, stride_kn, stride_kk,
+            stride_vz, stride_vh, stride_vn, stride_vk,
+            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z,
+            stride_oz, stride_oh, stride_om, stride_on,
+            stride_alibi_z, stride_alibi_h,
+            stride_sd_z, stride_sd_h, stride_sd_m, stride_sd_n,
+            stride_lse_z, stride_lse_h, stride_lse_m,
+            sm_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            SEQLEN_Q: tl.constexpr,
+            SEQLEN_K: tl.constexpr,
+            IS_CAUSAL: tl.constexpr,
+            NUM_Q_HEADS: tl.constexpr,
+            NUM_K_HEADS: tl.constexpr,
+            BLOCK_M: tl.constexpr,
+            BLOCK_N: tl.constexpr,
+            BLOCK_DMODEL: tl.constexpr,
+            BLOCK_DMODEL_POW2: tl.constexpr,
+            RETURN_SCORES: tl.constexpr,
+            ENABLE_DROPOUT: tl.constexpr,
+            IS_FP8: tl.constexpr,
+            FP8_MAX: tl.constexpr,
+            VARLEN: tl.constexpr,
+            BATCH,
+            NUM_XCD: tl.constexpr,
+            NUM_SMS: tl.constexpr,
 ):
-    # calculate offsets
-    off_z = tl.program_id(0)  # batch
-    off_q_head = tl.program_id(1)  # num_q_heads
-    start_m = tl.program_id(2)  # seqlen_q
+    #calculate offsets
+    wid = tl.program_id(0) # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
+    # num blocks along seqlen
 
+    NUM_CUs_PER_XCD: tl.constexpr = NUM_SMS // NUM_XCD
+
+    off_z, off_q_head, start_m = _balance_attn_workload(wid, NUM_CUs_PER_XCD, NUM_XCD, BATCH, NUM_Q_HEADS, NUM_K_HEADS, SEQLEN_Q, BLOCK_M)
+
+    # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
@@ -885,66 +969,76 @@ def _flash_attn_forward(
     # BLOCK_N=64 spills but has higher performance
     # Tuned for MI300x
     config = {
-        "BLOCK_M": 128,
-        "BLOCK_N": 64,
-        "waves_per_eu": 2,
-        "num_warps": 4,
-        "num_ctas": 1,
-        "num_stages": 1,
+        'BLOCK_M': 128,
+        'BLOCK_N': 64,
+        'waves_per_eu': 2,
+        'num_warps': 4,
+        'num_ctas': 1,
+        'num_stages': 1,
     }
+    # Dropout significantly increases VGPR usage so use small tiles
+    if enable_dropout:
+        config = {
+            'BLOCK_M': 32,
+            'BLOCK_N': 32,
+            'waves_per_eu': 1,
+            'num_warps': 2,
+            'num_ctas': 1,
+            'num_stages': 1,
+        }
 
-    grid = lambda META: (  # noqa: E731
-        batch,
-        num_q_heads,
-        triton.cdiv(seqlen_q, META["BLOCK_M"]),
-    )
-    _attn_fwd[grid](
-        q,
-        k,
-        v,
-        descale_q,
-        descale_k,
-        descale_v,
-        o,
-        alibi_slopes,
-        s_dmask,
-        dropout_mask,
-        softmax_lse,
-        *q_strides,
-        *k_strides,
-        *v_strides,
-        descale_q.stride(0) if descale_q is not None else 0,
-        descale_k.stride(0) if descale_k is not None else 0,
-        descale_v.stride(0) if descale_v is not None else 0,
-        *o_strides,
-        alibi_slopes.stride(0) if alibi_slopes is not None else 0,
-        alibi_slopes.stride(1) if alibi_slopes is not None else 0,
-        s_dmask.stride(0) if s_dmask is not None else 0,
-        s_dmask.stride(1) if s_dmask is not None else 0,
-        s_dmask.stride(2) if s_dmask is not None else 0,
-        s_dmask.stride(3) if s_dmask is not None else 0,
-        stride_lse_z if softmax_lse is not None else 0,
-        stride_lse_h if softmax_lse is not None else 0,
-        stride_lse_m if softmax_lse is not None else 0,
-        softmax_scale,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        dropout_p,
-        philox_seed,
-        philox_offset,
-        SEQLEN_Q=max_seqlen_q,
-        SEQLEN_K=max_seqlen_k,
-        IS_CAUSAL=causal,
-        NUM_Q_HEADS=num_q_heads,
-        NUM_K_HEADS=num_k_heads,
-        BLOCK_DMODEL=head_sz,
-        BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-        RETURN_SCORES=return_softmax,
-        ENABLE_DROPOUT=enable_dropout,
-        IS_FP8=IS_FP8,
-        FP8_MAX=FP8_MAX,
-        VARLEN=is_varlen,
-        **config,
+    grid = lambda META:(batch * num_q_heads * triton.cdiv(seqlen_q, META['BLOCK_M']),)
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    _attn_fwd[grid](q,
+                    k,
+                    v,
+                    descale_q,
+                    descale_k,
+                    descale_v,
+                    o,
+                    alibi_slopes,
+                    s_dmask,
+                    dropout_mask,
+                    softmax_lse,
+                    *q_strides,
+                    *k_strides, 
+                    *v_strides, 
+                    descale_q.stride(0) if descale_q is not None else 0,
+                    descale_k.stride(0) if descale_k is not None else 0,
+                    descale_v.stride(0) if descale_v is not None else 0,
+                    *o_strides,
+                    alibi_slopes.stride(0) if alibi_slopes is not None else 0,
+                    alibi_slopes.stride(1) if alibi_slopes is not None else 0,
+                    s_dmask.stride(0) if s_dmask is not None else 0,
+                    s_dmask.stride(1) if s_dmask is not None else 0,
+                    s_dmask.stride(2) if s_dmask is not None else 0,
+                    s_dmask.stride(3) if s_dmask is not None else 0,
+                    stride_lse_z if softmax_lse is not None else 0,
+                    stride_lse_h if softmax_lse is not None else 0,
+                    stride_lse_m if softmax_lse is not None else 0,
+                    softmax_scale, 
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    dropout_p,
+                    philox_seed,
+                    philox_offset,
+                    SEQLEN_Q=max_seqlen_q,
+                    SEQLEN_K=max_seqlen_k,
+                    IS_CAUSAL=causal,
+                    NUM_Q_HEADS=num_q_heads,
+                    NUM_K_HEADS=num_k_heads,
+                    BLOCK_DMODEL=head_sz,
+                    BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+                    RETURN_SCORES=return_softmax,
+                    ENABLE_DROPOUT=enable_dropout,
+                    IS_FP8=IS_FP8,
+                    FP8_MAX=FP8_MAX,
+                    VARLEN=is_varlen,
+                    BATCH=batch,
+                    NUM_XCD=8,
+                    NUM_SMS=NUM_SMS,
+                    **config
     )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset
