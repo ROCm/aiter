@@ -303,7 +303,7 @@ def run_benchmark(args):
         if two_inputs and cached and pos and layout == "thd":
             if offs:
                 if inplace:
-                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace( # noqa: E731
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace(  # noqa: E731
                         x,
                         y,
                         cos,
@@ -316,7 +316,7 @@ def run_benchmark(args):
                         transpose_output,
                     )
                 else:
-                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd( # noqa: E731
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd(  # noqa: E731
                         x,
                         y,
                         cos,
@@ -330,7 +330,7 @@ def run_benchmark(args):
                     )
             else:
                 if inplace:
-                    fn = lambda: rope_cached_thd_positions_2c_fwd_inplace( # noqa: E731
+                    fn = lambda: rope_cached_thd_positions_2c_fwd_inplace(  # noqa: E731
                         x,
                         y,
                         cos,
@@ -342,7 +342,7 @@ def run_benchmark(args):
                         transpose_output,
                     )
                 else:
-                    fn = lambda: rope_cached_thd_positions_2c_fwd( # noqa: E731
+                    fn = lambda: rope_cached_thd_positions_2c_fwd(  # noqa: E731
                         x,
                         y,
                         cos,
@@ -378,7 +378,7 @@ def run_benchmark(args):
         if not two_inputs and not cached and not pos and not offs:
             if layout == "sbhd":
                 if inplace:
-                    fn = lambda: rope_fwd_inplace( # noqa: E731
+                    fn = lambda: rope_fwd_inplace(  # noqa: E731
                         x,
                         freqs,
                         positions,
@@ -388,7 +388,7 @@ def run_benchmark(args):
                         transpose_output,
                     )
                 else:
-                    fn = lambda: rope_fwd( # noqa: E731
+                    fn = lambda: rope_fwd(  # noqa: E731
                         x,
                         freqs,
                         positions,
@@ -401,7 +401,7 @@ def run_benchmark(args):
                 seqlens = [0, S]
                 cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
                 if inplace:
-                    fn = lambda: rope_fwd_thd_inplace( # noqa: E731
+                    fn = lambda: rope_fwd_thd_inplace(  # noqa: E731
                         x,
                         cu_seqlens,
                         freqs,
@@ -412,7 +412,7 @@ def run_benchmark(args):
                         transpose_output,
                     )
                 else:
-                    fn = lambda: rope_fwd_thd( # noqa: E731
+                    fn = lambda: rope_fwd_thd(  # noqa: E731
                         x,
                         cu_seqlens,
                         freqs,
