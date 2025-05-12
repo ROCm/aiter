@@ -31,6 +31,10 @@ from aiter import dtypes
 
 # from custom_op import CustomOp
 
+import os
+
+AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1
+
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
@@ -128,7 +132,9 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 
     def forward(self, *args, **kwargs):
-        if torch.compiler.is_compiling():
+        if AITER_ROPE_TRITON_BACKEND:
+            return self.forward_triton(*args, **kwargs)
+        elif torch.compiler.is_compiling():
             return self.forward_native(*args, **kwargs)
         else:
             return self.forward_hip(*args, **kwargs)
@@ -292,6 +298,94 @@ class RotaryEmbedding(nn.Module):
                 )
             else:
                 ops.rope_cached_positions_offsets_2c_fwd_inplace(
+                    query_,
+                    key_,
+                    cos,
+                    sin,
+                    positions,
+                    offsets,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=is_nope_first,
+                )
+            return query.view(query_shape), key.view(key_shape)
+        else:
+            if offsets is None:
+                ops.rope_cached_positions_fwd_inplace(
+                    query_,
+                    cos,
+                    sin,
+                    positions,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=is_nope_first,
+                )
+            else:
+                ops.rope_cached_positions_offsets_fwd_inplace(
+                    query_,
+                    cos,
+                    sin,
+                    positions,
+                    offsets,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=is_nope_first,
+                )
+            return query.view(query_shape)
+
+    def forward_triton(
+        self,
+        positions: torch.Tensor,
+        # if     is_nope_first
+        # [[batch_size, seq_len, num_heads, nope_size+rope_size]
+        # if NOT is_nope_first
+        # [[batch_size, seq_len, num_heads, rope_size+nope_size],
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+        is_nope_first=False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        import aiter.ops.triton.rope as ops
+
+        self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
+        self.sin_cache = self.sin_cache.to(query.device, dtype=query.dtype)
+        cos, sin = self.cos_cache, self.sin_cache
+
+        rotate_style = 0 if self.is_neox_style else 1
+
+        num_tokens = positions.numel()
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        if key is not None:
+            key_shape = key.shape
+            key = key.view(num_tokens, -1, self.head_size)
+
+        positions = positions.view(*query.shape[:1])
+        if offsets is not None:
+            offsets = offsets.view(*query.shape[:1])
+
+        if not is_nope_first:
+            query_ = query[..., : self.rotary_dim]
+            key_ = key[..., : self.rotary_dim] if key is not None else None
+        else:
+            query_ = query[..., -self.rotary_dim :]
+            key_ = key[..., -self.rotary_dim :] if key is not None else None
+
+        if key_ is not None:
+            if offsets is None:
+                ops.rope_cached_thd_positions_2c_fwd_inplace(
+                    query_,
+                    key_,
+                    cos,
+                    sin,
+                    positions,
+                    rotate_style,
+                    reuse_freqs_front_part=True,
+                    nope_first=is_nope_first,
+                )
+            else:
+                ops.rope_cached_thd_positions_offsets_2c_fwd_inplace(
                     query_,
                     key_,
                     cos,
