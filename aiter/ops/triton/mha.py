@@ -363,11 +363,9 @@ def _remap_XCD(k, N, NUM_XCD):
 @triton.jit
 def _balance_attn_workload(
     wid,
-    NUM_CUs_PER_XCD: tl.constexpr,
     NUM_XCD: tl.constexpr,
     BATCH,
     NUM_Q_HEADS,
-    NUM_K_HEADS,
     SEQLEN_Q,
     BLOCK_M,
 ):
@@ -465,7 +463,6 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
-    NUM_SMS: tl.constexpr,
 ):
     # calculate offsets
     wid = tl.program_id(
@@ -473,15 +470,11 @@ def _attn_fwd(
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    NUM_CUs_PER_XCD: tl.constexpr = NUM_SMS // NUM_XCD
-
     off_z, off_q_head, start_m = _balance_attn_workload(
         wid,
-        NUM_CUs_PER_XCD,
         NUM_XCD,
         BATCH,
         NUM_Q_HEADS,
-        NUM_K_HEADS,
         SEQLEN_Q,
         BLOCK_M,
     )
@@ -979,7 +972,6 @@ def _flash_attn_forward(
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
     )
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     _attn_fwd[grid](
         q,
@@ -1029,7 +1021,6 @@ def _flash_attn_forward(
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=8,
-        NUM_SMS=NUM_SMS,
         **config,
     )
 
