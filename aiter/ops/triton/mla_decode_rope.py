@@ -185,7 +185,9 @@ def _fwd_grouped_kernel_stage1_rope(
         # we only apply to the last token in the K_PE
         if LAST_SPLIT:
             # debug assert
-            if (cur_batch == 0 and cur_head == 0) and split_kv_id < NUM_KV_SPLITS - 1:
+            if (
+                cur_batch == 0 and cur_head_id == 0
+            ) and split_kv_id < NUM_KV_SPLITS - 1:
                 tl.device_assert(False, "Only last split should compute k_pe")
 
             kv_loc = tl.load(
