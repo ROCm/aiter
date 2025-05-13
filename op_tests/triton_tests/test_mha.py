@@ -165,7 +165,8 @@ def test_mha(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
 
-    triton_out = triton_out[0]
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = triton_out[0]
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
@@ -179,7 +180,12 @@ def test_mha(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    if FP8:
+        fp8_assert_close(
+            triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
+    else:
+        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -315,8 +321,10 @@ def test_mha_varlen(
             print(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
-
-    triton_out = output_pad_fn(triton_out[0])
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = output_pad_fn(triton_out[0])
+    else:
+        triton_out = output_pad_fn(triton_out)
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
