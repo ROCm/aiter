@@ -13,6 +13,7 @@ enum class QuantType : int
     No,
     per_Tensor,
     per_Token,
+    per_1x32,
     per_1x128,
     per_128x128,
 };

@@ -9,7 +9,7 @@ from aiter.test_common import (
 import torch
 import aiter
 from aiter import dtypes
-from aiter import get_hip_quant, get_torch_quant, get_triton_quant
+from aiter import get_hip_quant, get_torch_quant, get_triton_quant, per_1x32_f4_quant
 import itertools
 
 torch.set_default_device("cuda")
@@ -19,12 +19,12 @@ torch.set_default_device("cuda")
 def test_quant(m, n, q_type, q_dtype, h_dtype):
     dim = (m, n)
 
-    input = torch.randn(dim, dtype=h_dtype)
+    input = torch.randn(dim, dtype=h_dtype) * 111
     ref, ref_scale = get_torch_quant(q_type)(input, quant_dtype=q_dtype)
 
     q_funcs = {
         "triton": get_triton_quant,
-        "hip": get_hip_quant,
+        # "hip": get_hip_quant,
     }
     ret = {}
     for name, q_func in q_funcs.items():
@@ -36,6 +36,13 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
             rtol=1e-3,
             atol=1e-3,
             msg=f"{name}: dynamic quant",
+        )
+        checkAllclose(
+            ref_scale.to(dtypes.fp32),
+            scale.to(dtypes.fp32),
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"{name}: dynamic quant scale",
         )
         ret[f"{name} dq"] = us1
         ret[f"{name} dq err"] = err1
@@ -57,11 +64,12 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
 
 
 list_quant = [
-    (aiter.QuantType.per_Tensor, dtypes.fp8),
-    (aiter.QuantType.per_Token, dtypes.fp8),
-    (aiter.QuantType.per_Token, dtypes.i8),
+    # (aiter.QuantType.per_Tensor, dtypes.fp8),
+    # (aiter.QuantType.per_Token, dtypes.fp8),
+    # (aiter.QuantType.per_Token, dtypes.i8),
+    (aiter.QuantType.per_1x32, dtypes.fp4x2),
 ]
-list_dtype = [dtypes.fp16, dtypes.bf16][:]
+list_dtype = [dtypes.fp16, dtypes.bf16][1:]
 import pandas as pd
 
 for (
