@@ -87,8 +87,8 @@ def run_benchmark(args):
         block_shape_n, block_shape_k = block_shape
 
         c_dtype = torch.bfloat16
-        x, weight, x_scale, w_scale = generate_gemm_a8w8_blockscale_inputs(
-            M, N, K, block_shape_n, block_shape_k
+        x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+            M, N, K, block_shape_n, block_shape_k, output=True
         )
         # flops
         flops = 2.0 * M * N * K
@@ -99,7 +99,7 @@ def run_benchmark(args):
 
         ms = triton.testing.do_bench(
             lambda: gemm_a8w8_blockscale(
-                x, weight, x_scale, w_scale, c_dtype
+                x, weight, x_scale, w_scale, c_dtype, y
             ),  # noqa: E731
             warmup=25,
             rep=100,

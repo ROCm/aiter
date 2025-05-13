@@ -163,6 +163,7 @@ def batched_gemm_bf16(
     bias: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     splitK: Optional[int] = None,
+    YQ: Optional[torch.Tensor] = None,
 ):
     """
     Computes the matmul YQ[i] = XQ[i] x WQ[i]T for every i in a given batch and optionally adds a bias to each result.
@@ -171,6 +172,7 @@ def batched_gemm_bf16(
     - XQ: Batch tensor XQ with shape (B, M, K).
     - WQ: Batch tensor WQ with shape (B, N, K).
     - Bias: Bias batch tensor with shape (B, 1, N).
+    - YQ: Output Matrix Y with shape (B, M, N). If this is none, then it's created by this API and returned as output
 
     Returns:
     - YQ: The output batch tensor with shape (B, M, N).
@@ -198,7 +200,8 @@ def batched_gemm_bf16(
     N = WQ.shape[2]
 
     has_bias = bias is not None
-    YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
+    if YQ is None:
+        YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
 
     if (M + N) >= 4096:
         BLOCK_SIZE_M = 256

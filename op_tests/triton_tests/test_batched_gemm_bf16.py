@@ -20,8 +20,8 @@ def run_torch(x, weight, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, bias=None, dtype=torch.bfloat16):
-    return batched_gemm_bf16(x, weight, bias, dtype)
+def run_triton(x, weight, bias=None, dtype=torch.bfloat16, y=None):
+    return batched_gemm_bf16(x, weight, bias, dtype, YQ=y)
 
 
 def is_cdna4():
@@ -78,10 +78,16 @@ def get_x_vals():
 
 
 @pytest.mark.parametrize(
-    "dtype, b, m, n, k",
-    [(dtype, b, *shape) for dtype in ["bf16"] for b in [16] for shape in get_x_vals()],
+    "dtype, b, m, n, k, output",
+    [
+        (dtype, b, *shape, output)
+        for output in [True, False]
+        for dtype in ["bf16"]
+        for b in [16]
+        for shape in get_x_vals()
+    ],
 )
-def test_batched_gemm_bf16(dtype, b, m, n, k):
+def test_batched_gemm_bf16(dtype, b, m, n, k, output):
 
     dtype = name_to_torch_types[dtype]
     x = torch.randint(-20, 20, (b, m, k), dtype=dtype).cuda()
@@ -89,7 +95,11 @@ def test_batched_gemm_bf16(dtype, b, m, n, k):
 
     bias = torch.rand([b, 1, n], dtype=dtype).cuda() * 10
 
+    y = None
+    if output:
+        y = torch.empty((b, m, n), dtype=dtype, device=x.device)
+
     a = run_torch(x, weight, bias, dtype)
-    b = run_triton(x, weight, bias, dtype)
+    b = run_triton(x, weight, bias, dtype, y)
 
     triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
