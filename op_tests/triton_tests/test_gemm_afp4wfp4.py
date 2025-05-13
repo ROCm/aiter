@@ -58,7 +58,7 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(2**(v-1), 4096 * v, 4096 * v) for v in range(1, 6)]
+    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     return x_vals
 
@@ -107,9 +107,9 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     x_f32 = x_f32 * x_scales_f32
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
     w_scales_f32 = e8m0_to_f32(w_scales)
-    #print(f"w shape = {w.shape}")
-    #print(f"wf32 shape = {w_f32.shape}")
-    #print(f"wscales shape = {w_scales_f32.shape}")
+    # print(f"w shape = {w.shape}")
+    # print(f"wf32 shape = {w_f32.shape}")
+    # print(f"wscales shape = {w_scales_f32.shape}")
     w_f32 = w_f32 * w_scales_f32.T
     return torch.mm(x_f32, w_f32).to(dtype)
 
@@ -127,6 +127,6 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype):
 
     gemm_afp4wfp4(x, w, out, x_scales, w_scales, dtype)
 
-    #print(f"triton_out = {out[0][0]}")
-    #print(f"torch out = {torch_out[0][0]}")
+    # print(f"triton_out = {out[0][0]}")
+    # print(f"torch out = {torch_out[0][0]}")
     torch.testing.assert_close(torch_out, out)
