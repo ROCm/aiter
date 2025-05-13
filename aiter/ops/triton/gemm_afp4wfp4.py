@@ -1,4 +1,5 @@
 from typing import Optional
+import os
 import torch
 import triton
 import triton.language as tl
@@ -245,7 +246,10 @@ def gemm_afp4wfp4(
         SPLITK_BLOCK_SIZE = (
             triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
         )
-        y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
+        if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
+            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
+        else:
+            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
     elif M <= 256:
         BLOCK_SIZE_M = 32
         BLOCK_SIZE_N = 64
@@ -317,7 +321,12 @@ def gemm_afp4wfp4(
 
     if NUM_KSPLIT > 1:
         REDUCE_BLOCK_SIZE_M = 16
-        REDUCE_BLOCK_SIZE_N = 128
+        # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
+        # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
+        # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
+        REDUCE_BLOCK_SIZE_N = (
+            128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 16
+        )
         ACTUAL_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
 
         grid_reduce = (
