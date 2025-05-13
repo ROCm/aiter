@@ -48,3 +48,9 @@ __pycache__
 # debug folder
 debug
 aiter_logs
+
+# build artifacts
+dist
+aiter_meta
+
+scripts

@@ -165,7 +165,8 @@ def test_mha(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
 
-    triton_out = triton_out[0]
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = triton_out[0]
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
@@ -315,8 +316,10 @@ def test_mha_varlen(
             print(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
-
-    triton_out = output_pad_fn(triton_out[0])
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = output_pad_fn(triton_out[0])
+    else:
+        triton_out = output_pad_fn(triton_out)
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 

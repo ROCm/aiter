@@ -853,6 +853,7 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
+    bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
     return_softmax: bool,
@@ -864,6 +865,11 @@ def _flash_attn_forward(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    if bias is not None:
+        raise ValueError("Bias is not supported yet in the Triton Backend")
+    if window_size_left != -1 or window_size_right != -1:
+        raise ValueError("Sliding Window is not supported yet in the Triton Backend")
 
     # FP8
     IS_FP8 = is_fp8(q)
@@ -2397,6 +2403,7 @@ def _flash_attn_backward(
     dq: torch.Tensor,
     dk: torch.Tensor,
     dv: torch.Tensor,
+    dbias: torch.Tensor,
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -2412,6 +2419,8 @@ def _flash_attn_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
 ):
+    if dbias is not None:
+        raise ValueError("Bias is not supported yet in the Triton Backend")
 
     IS_FP8 = is_fp8(q)
     if IS_FP8:
@@ -2723,6 +2732,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,
@@ -2745,8 +2755,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 dropout_p,
                 softmax_scale,
                 causal=causal,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
+                window_size_left=int(window_size[0]),
+                window_size_right=int(window_size[1]),
+                bias=bias,
                 alibi_slopes=alibi_slopes,
                 return_lse=return_lse,
                 return_softmax=return_softmax and dropout_p > 0,
@@ -2762,6 +2773,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
+            ctx.bias = bias
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
@@ -2773,11 +2785,13 @@ class FlashAttnFunc(torch.autograd.Function):
         if return_softmax:
             result.append(S_dmask)
 
-        return tuple(result)
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
+        bias = ctx.bias
+        dbias = torch.empty_like(bias) if bias is not None else None
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
         head_size_v_og = do.size(3)
         do_padded = do
@@ -2793,6 +2807,7 @@ class FlashAttnFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
+            dbias,
             ctx.softmax_scale,
             ctx.alibi_slopes,
             ctx.causal,
@@ -2807,25 +2822,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return (
-            dq,
-            dk,
-            dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -2835,7 +2832,8 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),
+    window_size=(-1, -1),  # -1 means infinite context window
+    bias=None,
     alibi_slopes=None,
     deterministic=True,
     return_lse=False,
@@ -2869,9 +2867,10 @@ def flash_attn_func(
         v: (batch_size, seqlen, nheads_k, headdim)
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
+            Default to 1 / sqrt(headdim_q).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        bias: (seqlen_q, seqlen_k)
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
@@ -2882,13 +2881,14 @@ def flash_attn_func(
            (they might not have the right scaling).
     Return:
         out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
+        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2897,6 +2897,7 @@ def flash_attn_func(
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,
@@ -2947,6 +2948,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
                 causal=causal,
                 window_size_left=window_size[0],
                 window_size_right=window_size[1],
+                bias=None,
                 alibi_slopes=alibi_slopes,
                 return_lse=return_lse,
                 return_softmax=return_softmax and dropout_p > 0,
@@ -2986,7 +2988,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
         if return_softmax:
             result.append(S_dmask)
 
-        return tuple(result)
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -3015,6 +3017,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
             ctx.softmax_scale,
             ctx.alibi_slopes,
             ctx.causal,
@@ -3065,131 +3068,6 @@ def flash_attn_fp8_func(
     )
 
 
-class FlashAttnVarlenFunc(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_softmax,
-        block_table,
-        is_grad_enabled,
-    ):
-        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
-            _flash_attn_forward(
-                q,
-                k,
-                v,
-                dropout_p,
-                softmax_scale,
-                causal=causal,
-                window_size_left=window_size[0],
-                window_size_right=window_size[1],
-                alibi_slopes=alibi_slopes,
-                return_lse=return_lse,
-                return_softmax=return_softmax and dropout_p > 0.0,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-            )
-        )
-        if is_grad:
-            ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k
-            )
-            ctx.max_seqlen_q = max_seqlen_q
-            ctx.max_seqlen_k = max_seqlen_k
-            ctx.philox_seed = philox_seed
-            ctx.philox_offset = philox_offset
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.alibi_slopes = alibi_slopes
-        out = out_padded[..., :head_size_og]
-
-        result = [out]
-        if return_lse:
-            result.append(softmax_lse)
-        if return_softmax:
-            result.append(S_dmask)
-
-        return tuple(result)
-
-    @staticmethod
-    def backward(ctx, do, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
-        head_size_og = do.size(2)
-        do_padded = do
-        if head_size_og % 8 != 0:
-            do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
-        _flash_attn_backward(
-            do_padded,
-            q,
-            k,
-            v,
-            out,
-            softmax_lse,
-            dq,
-            dk,
-            dv,
-            ctx.softmax_scale,
-            ctx.alibi_slopes,
-            ctx.causal,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q=ctx.max_seqlen_q,
-            max_seqlen_k=ctx.max_seqlen_k,
-            dropout_p=ctx.dropout_p,
-            philox_seed=ctx.philox_seed,
-            philox_offset=ctx.philox_offset,
-        )
-        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k.shape[-1]]
-        dv = dv[..., : v.shape[-1]]
-        return (
-            dq,
-            dk,
-            dv,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-
 def flash_attn_varlen_func(
     q,
     k,
@@ -3201,12 +3079,14 @@ def flash_attn_varlen_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),
+    window_size=(-1, -1),  # -1 means infinite context window
+    bias=None,
     alibi_slopes=None,
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
     block_table=None,
+    out=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -3245,6 +3125,7 @@ def flash_attn_varlen_func(
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        bias: (seqlen_q, seqlen_k)
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
@@ -3274,13 +3155,149 @@ def flash_attn_varlen_func(
         softmax_scale,
         causal,
         window_size,
+        bias,
         alibi_slopes,
         deterministic,
         return_lse,
         return_attn_probs,
         block_table,
+        out,
         torch.is_grad_enabled(),
     )
+
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_softmax,
+        block_table,
+        out,
+        is_grad_enabled,
+    ):
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(2)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
+            _flash_attn_forward(
+                q,
+                k,
+                v,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                bias=bias,
+                alibi_slopes=alibi_slopes,
+                return_lse=return_lse,
+                return_softmax=return_softmax and dropout_p > 0.0,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+            )
+        )
+        if is_grad:
+            ctx.save_for_backward(
+                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k
+            )
+            ctx.max_seqlen_q = max_seqlen_q
+            ctx.max_seqlen_k = max_seqlen_k
+            ctx.philox_seed = philox_seed
+            ctx.philox_offset = philox_offset
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.bias = bias
+            ctx.alibi_slopes = alibi_slopes
+        out = out_padded[..., :head_size_og]
+
+        result = [out]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(S_dmask)
+
+        return result[0] if len(result) == 1 else tuple(result)
+
+    @staticmethod
+    def backward(ctx, do, *args):
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        bias = ctx.bias
+        dbias = torch.empty_like(bias) if bias is not None else None
+        head_size_og = do.size(2)
+        do_padded = do
+        if head_size_og % 8 != 0:
+            do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_og % 8])
+        _flash_attn_backward(
+            do_padded,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            dbias,
+            ctx.softmax_scale,
+            ctx.alibi_slopes,
+            ctx.causal,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
+            dropout_p=ctx.dropout_p,
+            philox_seed=ctx.philox_seed,
+            philox_offset=ctx.philox_offset,
+        )
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            dbias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class FlashAttnVarlenFP8Func(torch.autograd.Function):
@@ -3330,6 +3347,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
                 causal=causal,
                 window_size_left=window_size[0],
                 window_size_right=window_size[1],
+                bias=None,
                 alibi_slopes=alibi_slopes,
                 return_lse=return_lse,
                 return_softmax=return_softmax and dropout_p > 0,
@@ -3371,7 +3389,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
         if return_softmax:
             result.append(S_dmask)
 
-        return tuple(result)
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do, *args):
@@ -3412,6 +3430,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
             ctx.softmax_scale,
             ctx.alibi_slopes,
             ctx.causal,
