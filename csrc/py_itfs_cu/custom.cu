@@ -41,6 +41,7 @@ void LLMM1(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
            const int64_t rows_per_block) {
         auto M = in_a.size(0);
         auto K = in_a.size(1);
+        auto N = in_b.size(0);
         // if (N != in_b.numel())
         //         throw std::invalid_argument("Size mismatch A.numel(): " +
         //         std::to_string(in_a.numel())
@@ -48,6 +49,10 @@ void LLMM1(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
         //                           std::to_string(in_b.numel()));
 
         // out_c.resize_({N});
+        TORCH_CHECK(N == 1, "Row number of activation tensor must be 1.");
+        TORCH_CHECK(in_a.dtype() == in_b.dtype());
+        TORCH_CHECK(in_b.dtype() == torch::kFloat16 ||
+                in_b.dtype() == torch::kBFloat16);
 
         // call the kernel function...
         const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
@@ -64,6 +69,10 @@ void wvSpltK(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c,
         auto M = in_a.size(0);
         auto K = in_a.size(1);
         int N = N_in;
+        TORCH_CHECK(in_a.dtype() == in_b.dtype());
+        TORCH_CHECK(K % 8 == 0, "k % 8 == 0");
+        TORCH_CHECK(in_a.dtype() == torch::kFloat16 || in_a.dtype() == torch::kBFloat16);
+
         const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
         wvSplitK_(in_a.data_ptr(), in_b.data_ptr(), out_c.data_ptr(), M, K, N,
                  at::cuda::getCurrentCUDAStream(), CuCount, in_b.scalar_type());
@@ -99,21 +108,4 @@ void MMCustomGPU(at::Tensor &in_a, at::Tensor &in_b, at::Tensor &out_c)
                     out_c.data_ptr<float>(), matA_sizes[0], matA_sizes[1],
                     matB_sizes[0], matB_sizes[1], matO_sizes[0], matO_sizes[1],
                     at::cuda::getCurrentCUDAStream());
-}
-
-void MMGPUKernel(float *in_a, float *in_b, float *out_c, int numARows,
-                 int numAColumns, int numBRows, int numBColumns, int numCRows,
-                 int numCColumns, cudaStream_t stream)
-{
-//   // Initialize the grid and block dimensions
-//   dim3 dimBlock(TILE_WIDTH, TILE_WIDTH, 1);
-//   dim3 dimGrid((numCColumns / TILE_WIDTH) + 1, (numCRows / TILE_WIDTH) + 1, 1);
-//   //@@ Launch the GPU Kernel here
-//   matrixMultiplyShared<<<dimGrid, dimBlock>>>(
-//       in_a, in_b, out_c, numARows, numAColumns, numBRows, numBColumns, numCRows,
-//       numCColumns);
-
-//   cudaError_t err = cudaGetLastError();
-//   if (cudaSuccess != err)
-//     throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }

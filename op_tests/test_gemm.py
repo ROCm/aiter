@@ -68,44 +68,70 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     checkAllclose(a, b, msg=msg)
 
 
-# test_gemm(
-#     dtypes.fp8, 128, 768, 4096, bias=False, otype=dtypes.bf16, scaleA=0.5, scaleB=0.5
-# )
-# test_gemm(dtypes.bf16, 128, 32, 8192)
-# for dtype in [dtypes.fp16, dtypes.bf16]:
-#     # # qkv_proj
-#     # for (m, n, k) in [(4096, 1280, 8192),
-#     #                   (128, 1280, 8192),
-#     #                   (128, 1024, 8192),
-#     #                   (128, 128, 8192),
-#     #                   ]:
-#     #     test_gemm(dtype, m, n, k)
-#     # # attn_out
-#     # for (m, n, k) in [(4096, 8192, 1024),
-#     #                   (128, 8192, 1024)]:
-#     #     test_gemm(dtype, m, n, k)
-#     # test_gemm(dtype, 128, 1024, 8192)
-#     test_gemm(dtype, 128, 32, 8192)
-#     # # gating
-#     # for (m, n, k) in [(4096, 32, 8192),
-#     #                   (128, 32, 8192)]:
-#     #     test_gemm(dtype, m, n, k)
-#     # # gating
-#     # for (m, n, k) in [(1, 19392, 8192),
-#     #                   (128, 19392, 8192)]:
-#     #     test_gemm(dtype, m, n, k)
-seed = 8779
-torch.manual_seed(seed)
-torch.cuda.manual_seed(seed)
+def test_normal_gemm():
 
-# test_gemm(dtypes.fp16, 4, 1, 8192)
-# test_gemm(dtypes.fp16, 4, 27, 8192)
-# test_gemm(dtypes.fp16, 4, 64, 8192)
-# test_gemm(dtypes.fp16, 4, 128, 8192)
-# test_gemm(dtypes.fp16, 4, 256, 8192)
+    test_gemm(dtypes.fp8, 128, 768, 4096, bias=False, otype=dtypes.bf16, scaleA=0.5, scaleB=0.5)
+    test_gemm(dtypes.bf16, 128, 32, 8192)
+    for dtype in [dtypes.fp16, dtypes.bf16]:
+        test_gemm(dtype, 128, 32, 8192)
+        # # qkv_proj
+        # for (m, n, k) in [(4096, 1280, 8192),
+        #                   (128, 1280, 8192),
+        #                   (128, 1024, 8192),
+        #                   (128, 128, 8192),
+        #                   ]:
+        #     test_gemm(dtype, m, n, k)
+        # # attn_out
+        # for (m, n, k) in [(4096, 8192, 1024),
+        #                   (128, 8192, 1024)]:
+        #     test_gemm(dtype, m, n, k)
+        # test_gemm(dtype, 128, 1024, 8192)
+        # # gating
+        # for (m, n, k) in [(4096, 32, 8192),
+        #                   (128, 32, 8192)]:
+        #     test_gemm(dtype, m, n, k)
+        # # gating
+        # for (m, n, k) in [(1, 19392, 8192),
+        #                   (128, 19392, 8192)]:
+        #     test_gemm(dtype, m, n, k)
 
-test_gemm(dtypes.fp16, 4, 32, 8192)
-test_gemm(dtypes.bf16, 4, 32, 8192)
 
-test_gemm(dtypes.fp16, 1, 4, 8192)
-test_gemm(dtypes.bf16, 1, 4, 8192)
+def test_skinny_gemm():
+    # seed = 8779
+    # torch.manual_seed(seed)
+    # torch.cuda.manual_seed(seed)
+
+    # test_gemm(dtypes.fp16, 4, 1, 8192)
+    # test_gemm(dtypes.fp16, 4, 27, 8192)
+    # test_gemm(dtypes.fp16, 4, 64, 8192)
+    # test_gemm(dtypes.fp16, 4, 128, 8192)
+    # test_gemm(dtypes.fp16, 4, 256, 8192)
+
+    # test_gemm(dtypes.fp16, 4, 32, 8192)
+    # test_gemm(dtypes.bf16, 4, 32, 8192)
+
+    # test_gemm(dtypes.fp16, 1, 4, 8192)
+    # test_gemm(dtypes.bf16, 1, 4, 8192)
+
+    # loop_count = 1
+    loop_count = 6
+    for i in range(loop_count):
+        for dtype in [dtypes.fp16, dtypes.bf16]:
+            mnk_list = [
+                (1, 9, 8192),
+                (2, 4, 4096),
+                (3, 8, 2048),
+                (4, 9, 1024),
+                (4, 11, 512),
+                (4, 32, 8192),
+
+                (1, 4, 8192),
+                (1, 8, 4096),
+                (1, 12, 2048),
+                ]
+            for (m, n, k) in mnk_list:
+                test_gemm(dtype, m, n, k)
+
+
+# test_normal_gemm()
+test_skinny_gemm()
