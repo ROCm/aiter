@@ -1430,7 +1430,7 @@ def _mha_batch_prefill(
         causal = False
 
     md_name = "mha_batch_prefill"
-    filter_fwd = "*"            # get_fwd_blobs()
+    filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
         md_name += "_fp16"
         filter_fwd += "fp16*"
@@ -1448,7 +1448,7 @@ def _mha_batch_prefill(
         filter_fwd += "_nbias*"
     else:
         md_name += "_alibi"
-        filter_fwd+= "_alibi*"
+        filter_fwd += "_alibi*"
     if not causal and window_size_left == -1 and window_size_right == -1:
         md_name += "_nmask"
         filter_fwd += "_nmask*"
@@ -1467,9 +1467,13 @@ def _mha_batch_prefill(
     else:
         md_name += "_dropout"
         filter_fwd += "_dropout*"
-    blob_gen_cmd = [f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill " \
-        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)]
-    blob_gen_cmd.append(f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}")
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
+        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+    ]
+    blob_gen_cmd.append(
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}"
+    )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
@@ -1493,7 +1497,7 @@ def _mha_batch_prefill(
         None,
         alibi_slopes,
         None,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd}
+        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
 

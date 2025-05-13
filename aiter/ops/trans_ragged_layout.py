@@ -2,41 +2,43 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def binary_search(value, arr_ptr, arr_length):
     left = 0
     right = arr_length - 1
-    
+
     while left <= right:
         mid = (left + right) // 2
         mid_value = tl.load(arr_ptr + mid)
-        
+
         if mid_value <= value:
             left = mid + 1
         else:
             right = mid - 1
-    
+
     return left - 1
+
 
 @triton.jit
 def _ragged_trans_kernel(
-    k_buffer_ptr, 
-    v_buffer_ptr, 
-    k_values_ptr, 
+    k_buffer_ptr,
+    v_buffer_ptr,
+    k_values_ptr,
     v_values_ptr,
-    kv_indptr_ptr, 
-    kv_indices_ptr, 
-    B, 
-    E_DIM, 
+    kv_indptr_ptr,
+    kv_indices_ptr,
+    B,
+    E_DIM,
     total_tokens,
-    BLOCK_TOKEN: tl.constexpr, 
+    BLOCK_TOKEN: tl.constexpr,
     BLOCK_E_DIM: tl.constexpr,
 ):
     token_block_idx = tl.program_id(0)
     p_token_offset = token_block_idx * BLOCK_TOKEN
 
     p_token_num = BLOCK_TOKEN * (p_token_offset < total_tokens)
-    
+
     for local_idx in range(p_token_num):
         cur_token_idx = p_token_offset + local_idx
         if cur_token_idx >= total_tokens:
@@ -55,9 +57,18 @@ def _ragged_trans_kernel(
             kv_buffer_off = kv_idx * E_DIM + tl.arange(0, BLOCK_E_DIM)
             k_vals = tl.load(k_buffer_ptr + kv_buffer_off, mask=E_DIM_mask)
             v_vals = tl.load(v_buffer_ptr + kv_buffer_off, mask=E_DIM_mask)
-            
-            tl.store(k_values_ptr + cur_token_idx * E_DIM + tl.arange(0, BLOCK_E_DIM), k_vals, mask=E_DIM_mask)
-            tl.store(v_values_ptr + cur_token_idx * E_DIM + tl.arange(0, BLOCK_E_DIM), v_vals, mask=E_DIM_mask)
+
+            tl.store(
+                k_values_ptr + cur_token_idx * E_DIM + tl.arange(0, BLOCK_E_DIM),
+                k_vals,
+                mask=E_DIM_mask,
+            )
+            tl.store(
+                v_values_ptr + cur_token_idx * E_DIM + tl.arange(0, BLOCK_E_DIM),
+                v_vals,
+                mask=E_DIM_mask,
+            )
+
 
 def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
     B = kv_indptr.shape[0] - 1
@@ -91,4 +102,3 @@ def ragged_layout_trans(kv_indptr, kv_indices, k_buffer, v_buffer):
     )
 
     return k_values, v_values
-
