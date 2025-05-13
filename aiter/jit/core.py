@@ -79,7 +79,8 @@ if find_aiter is not None:
     else:
         AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
 else:
-    print("aiter is not installed.")
+    AITER_ROOT_DIR = AITER_CORE_DIR
+    logger.warning("aiter is not installed.")
 
 AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
@@ -512,7 +513,8 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_standalone,
                     torch_exclude,
                 )
-                module = get_module(md_name)
+                if is_python_module:
+                    module = get_module(md_name)
                 if md_name not in __mds:
                     __mds[md_name] = module
 
