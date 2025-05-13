@@ -1,6 +1,5 @@
-pandas<=2.0.3
+pandas
 pytest
-numpy<2.0.0
 psutil
 einops
 pybind11
