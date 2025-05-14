@@ -52,6 +52,7 @@ def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
 
+
 def input_helper(
     BS,
     MAX_SEQ_LEN,
@@ -155,9 +156,38 @@ def input_helper(
     k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
     if use_alibi_slope:
-        return query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, alibi_slopes
+        return (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            alibi_slopes,
+        )
     else:
-        return query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, None
+        return (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            None,
+        )
+
 
 # TODO: Implement a test reference and compare it to the Triton output
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -177,7 +207,21 @@ def test_contexted_kv_attention(
     kv_cache_dtype: str,
     device: str,
 ) -> None:
-    query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, _ = input_helper(
+    (
+        query,
+        k,
+        v,
+        output,
+        k_cache,
+        v_cache,
+        block_table,
+        b_start_loc,
+        b_seq_len,
+        max_input_len,
+        k_scale,
+        v_scale,
+        _,
+    ) = input_helper(
         BS=10,
         MAX_SEQ_LEN=1024,
         MAX_CTX_LEN=1024,
@@ -250,7 +294,21 @@ def test_contexted_kv_attention_alibi(
     kv_cache_dtype: str,
     device: str,
 ) -> None:
-    query, k, v, output, k_cache, v_cache, block_table, b_start_loc, b_seq_len, max_input_len, k_scale, v_scale, alibi_slopes = input_helper(
+    (
+        query,
+        k,
+        v,
+        output,
+        k_cache,
+        v_cache,
+        block_table,
+        b_start_loc,
+        b_seq_len,
+        max_input_len,
+        k_scale,
+        v_scale,
+        alibi_slopes,
+    ) = input_helper(
         BS=10,
         MAX_SEQ_LEN=1024,
         MAX_CTX_LEN=1024,

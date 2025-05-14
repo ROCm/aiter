@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import sys
-from dataclasses import dataclass
-import copy
 from pathlib import Path
 import pandas as pd
 import argparse
 import shutil
 from gemm_a8w8_common import kernelInstance, kernels_list, default_kernels_dict
-
 
 
 class gemm_a8w8_fwd_codegen:
@@ -140,14 +136,25 @@ torch::Tensor
         return gemm_a8w8_rowwise_impl<ABDataType, DDataType, EDataType, false, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, bias, KBatch);
 """
         if self.istune:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=(INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")),
-                                                     INSTANCE_CONTENT_nopad=(INSTANCE_CONTENT_nobias.format(GemmSpec="Default")))
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
+                INSTANCE_CONTENT_pad=(
+                    INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")
+                ),
+                INSTANCE_CONTENT_nopad=(
+                    INSTANCE_CONTENT_nobias.format(GemmSpec="Default")
+                ),
+            )
         else:
-            INSTANCE_IMPL_str = INSTANCE_IMPL.format(INSTANCE_CONTENT_pad=INSTANCE_CONTENT_bias.format(GemmSpec="MNKPadding"),
-                                                     INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_bias.format(GemmSpec="Default"))
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
+                INSTANCE_CONTENT_pad=INSTANCE_CONTENT_bias.format(
+                    GemmSpec="MNKPadding"
+                ),
+                INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_bias.format(GemmSpec="Default"),
+            )
 
         Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
-                INSTANCE_IMPL_str)
+            INSTANCE_IMPL_str
+        )
 
         INSTANCE_template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -167,16 +174,24 @@ template torch::Tensor
 """
         if self.istune:
             INSTANCE_abI8_dBF16_eBF16 = INSTANCE_template.format(
-                name=k.name, dtypes="I8, B16")
-            Path(os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")).write_text(
-                INSTANCE_abI8_dBF16_eBF16)
+                name=k.name, dtypes="I8, B16"
+            )
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")
+            ).write_text(INSTANCE_abI8_dBF16_eBF16)
         else:
-            for EDtype in ['B16', 'F16']:
-                for ABDtype in ['I8', 'F8']:
-                    for DDtype in ['F32', EDtype]:
+            for EDtype in ["B16", "F16"]:
+                for ABDtype in ["I8", "F8"]:
+                    for DDtype in ["F32", EDtype]:
                         intsance = INSTANCE_template.format(
-                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}")
-                        Path(os.path.join(self.instances_path, f"{k.name}_ab{ABDtype}_d{DDtype}_e{EDtype}.cpp")).write_text(intsance)
+                            name=k.name, dtypes=f"{ABDtype}, {DDtype}, {EDtype}"
+                        )
+                        Path(
+                            os.path.join(
+                                self.instances_path,
+                                f"{k.name}_ab{ABDtype}_d{DDtype}_e{EDtype}.cpp",
+                            )
+                        ).write_text(intsance)
 
     def gen_lookup_dict(self, kernels_dict):
         LOOKUP_head = """#pragma once
@@ -202,8 +217,14 @@ template torch::Tensor
             for mnk, k in kernels_dict.items():
                 # print((", ").join(map(lambda x: str(x), list(mnk))), ":", k.name)
                 if not self.istune and (isinstance(mnk, tuple) and mnk[0] > 0):
-                    f.write(LOOKUP_template.format(MNK="{"+(", ").join(
-                        map(lambda x: str(x), list(mnk))) + "}", kernel_name=k.name))
+                    f.write(
+                        LOOKUP_template.format(
+                            MNK="{"
+                            + (", ").join(map(lambda x: str(x), list(mnk)))
+                            + "}",
+                            kernel_name=k.name,
+                        )
+                    )
                 elif self.istune and isinstance(mnk, int):
                     f.write(LOOKUP_template.format(MNK=mnk, kernel_name=k.name))
             f.write(LOOKUP_end)
@@ -269,6 +290,7 @@ def get_tune_dict(tune_dict_csv):
             tune_dict[(M, N, K)] = kernels_list[kid]
     return tune_dict
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
@@ -281,7 +303,7 @@ if __name__ == "__main__":
         "--working_path",
         default="./",
         required=False,
-        help="the path where all the blobs are going to be generated"
+        help="the path where all the blobs are going to be generated",
     )
 
     parser.add_argument(
@@ -289,14 +311,11 @@ if __name__ == "__main__":
         "--tune_file",
         default="aiter/configs/a8w8_tuned_gemm.csv",
         required=False,
-        help="tune_file include the result after run gemm_a8w8_tune.py"
+        help="tune_file include the result after run gemm_a8w8_tune.py",
     )
 
     parser.add_argument(
-        "--tune",
-        action='store_true',
-        required=False,
-        help="generated tune instances"
+        "--tune", action="store_true", required=False, help="generated tune instances"
     )
 
     # parser.add_argument(
@@ -316,7 +335,6 @@ if __name__ == "__main__":
     #         all: [fp32, same as out] \n  \
     #         same: [same as out]"
     # )
-
 
     args = parser.parse_args()
     codegen = gemm_a8w8_fwd_codegen(args.working_path, args.tune)

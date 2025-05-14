@@ -2,13 +2,12 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import multiprocessing as mp
-import os
-import pandas as pd
 import time
 
 
 def worker(gpuIDMap, tag, func, args, **kwargs):
     from aiter.test_common import run_perftest
+
     pid = mp.current_process().pid
     gpuID = gpuIDMap[pid]
     args = [el.to("cpu") if isinstance(el, torch.Tensor) else el for el in args]

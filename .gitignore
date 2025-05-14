@@ -1,3 +1,6 @@
+# aiter version
+aiter/_version.py
+
 # Prerequisites
 *.d
 

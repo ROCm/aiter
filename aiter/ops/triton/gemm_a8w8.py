@@ -7,7 +7,7 @@ import triton.language as tl
 from typing import Optional
 
 
-#TODO Move this to a common folder. Will need to add future arch list
+# TODO Move this to a common folder. Will need to add future arch list
 def get_arch():
     return triton.runtime.driver.active.get_current_target().arch
 
@@ -216,7 +216,7 @@ def gemm_a8w8(
     BLOCK_SIZE_K = 128
     GROUP_SIZE_M = 4
     waves_per_eu = 2
-    kpack = 1 if get_arch() in ('gfx950') else 2
+    kpack = 1 if get_arch() in ("gfx950") else 2
     matrix_instr_nonkdim = 16
     num_warps = 4
     num_stages = 2

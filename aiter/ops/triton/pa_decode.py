@@ -24,8 +24,8 @@ def paged_attention_decode(
     attn_scale: float,
     max_seq_len: int,
     compute_type,
-    k_scale: torch.Tensor, 
-    v_scale: torch.Tensor, 
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     num_seq_partitions: int = 0,  # TODO use this below
     alibi_slopes: torch.Tensor = None,
 ) -> None:
@@ -304,7 +304,9 @@ def _paged_attn_decode_v1_wo_dot_kernel(
         k = k.to(compute_type)
 
         # qk #[KV_BLK_SZ_POW2]
-        qk = tl.sum((q[None, :] * k).to(tl.float32), axis=1) #[1, HEAD_SZ_POW2] * [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
+        qk = tl.sum(
+            (q[None, :] * k).to(tl.float32), axis=1
+        )  # [1, HEAD_SZ_POW2] * [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
 
         if alibi_slopes_ptr is not None:
@@ -1295,8 +1297,8 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_q_heads]
     scale,
-    k_scale_ptr, #[num_blks, num_kv_heads, kv_blk_sz]
-    v_scale_ptr, #[num_blks, num_kv_heads, kv_blk_sz]
+    k_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
+    v_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
     stride_q_s,
     stride_q_h,
     stride_o_s,
@@ -1354,7 +1356,7 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
         + blk_offs[:, None] * stride_k_kb
         + head_sz_offs[None, :]
     )
-    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb 
+    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb
     blk_tbl_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
@@ -1367,8 +1369,8 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
             & (head_sz_offs[None, :] < HEAD_SZ)
         )
         kv_scale_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
-        kv_scale_offs = (kv_blk_nums * stride_k_scale_b + k_scale_offs)
-        
+        kv_scale_offs = kv_blk_nums * stride_k_scale_b + k_scale_offs
+
         # load k [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         k_scale = tl.load(k_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
         k_0 = tl.load(k_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
@@ -1425,8 +1427,8 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes,  # [num_kv_heads*query_grp_sz]
     scale,
-    k_scale_ptr, #[num_blks, num_kv_heads, kv_blk_sz]
-    v_scale_ptr, #[num_blks, num_kv_heads, kv_blk_sz]
+    k_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
+    v_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
     stride_o_s,
     stride_o_nh,
     stride_o_hs,
@@ -1498,7 +1500,7 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
         + blk_offs[:, None] * stride_k_kb
         + head_sz_offs[None, :] * stride_k_hs
     )
-    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb 
+    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb
     blk_tbl_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
@@ -1512,7 +1514,7 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
         )
 
         kv_scale_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
-        kv_scale_offs = (kv_blk_nums * stride_k_scale_b + k_scale_offs)
+        kv_scale_offs = kv_blk_nums * stride_k_scale_b + k_scale_offs
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         k_scale = tl.load(k_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
@@ -1843,7 +1845,7 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
         + head_sz_offs[None, :]
     )
     kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
-    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb 
+    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb
     blk_tables_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
@@ -1859,7 +1861,7 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
         )
 
         kv_scale_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
-        kv_scale_offs = (kv_blk_nums * stride_k_scale_b + k_scale_offs)
+        kv_scale_offs = kv_blk_nums * stride_k_scale_b + k_scale_offs
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         k_scale = tl.load(k_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
@@ -2015,8 +2017,8 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
     blk_tables_ptrs,  # [num_seqs, max_num_blks_per_seq]
     seq_lens_ptr,  # [num_seqs]
     scale,
-    k_scale_ptr, #[num_blks, num_kv_heads, kv_blk_sz]
-    v_scale_ptr, #[num_blks, num_kv_heads, kv_blk_sz]
+    k_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
+    v_scale_ptr,  # [num_blks, num_kv_heads, kv_blk_sz]
     alibi_slopes,
     stride_max_logits_s,
     stride_max_logits_nh,
@@ -2100,7 +2102,7 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
         + head_sz_offs[None, :]
     )
     kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
-    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb 
+    k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for b in range(num_kv_blks):
         kv_blk_idx = kv_blk_start + b
@@ -2115,7 +2117,7 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
         )
 
         kv_scale_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
-        kv_scale_offs = (kv_blk_nums * stride_k_scale_b + k_scale_offs)
+        kv_scale_offs = kv_blk_nums * stride_k_scale_b + k_scale_offs
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         k_scale = tl.load(k_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
