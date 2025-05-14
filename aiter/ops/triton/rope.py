@@ -1905,110 +1905,6 @@ def _rope_fwd_kernel_gptj_cached_position_off(
 
 
 @triton.jit
-def _rope_fwd_kernel_gptj_cached_thd_position_2c(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
-    stride_x_t,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_t,
-    stride_cos_d,
-    stride_pos_t,
-    stride_out_t,
-    stride_out_h,
-    stride_out_d,
-    T,
-    reuse_freqs_front_part: tl.constexpr,
-    BLOCK_T: tl.constexpr,
-    SPLIT_H_SIZE: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-    num_stages: tl.constexpr,
-):
-    # Parallelize over head. Handle 1 sequence per program
-    h_s = tl.program_id(0)
-    s = tl.program_id(1)
-
-    tl.assume(stride_x_t > 0)
-    tl.assume(stride_x_h > 0)
-    tl.assume(stride_x_d > 0)
-    tl.assume(stride_cos_t > 0)
-    tl.assume(stride_cos_d > 0)
-    tl.assume(stride_pos_t > 0)
-    tl.assume(stride_out_t > 0)
-    tl.assume(stride_out_h > 0)
-    tl.assume(stride_out_d > 0)
-
-    pos_offs = s * BLOCK_T + tl.arange(0, BLOCK_T)
-    pos_mask = pos_offs < T
-    pos = tl.load(pos_ptr + pos_offs, mask=pos_mask)
-    cos_offs_t = pos
-
-    if reuse_freqs_front_part:
-        cos_offs_d = tl.arange(0, D_MODEL) // 2
-        cos_mask_d = cos_offs_d < D_MODEL_HALF
-    else:
-        cos_offs_d = tl.arange(0, D_MODEL)
-        cos_mask_d = cos_offs_d < D_MODEL
-
-    cos_mask = (cos_offs_t < T)[:, None] & (cos_mask_d)[None, :]
-    cos_offs = stride_cos_t * cos_offs_t[:, None] + stride_cos_d * cos_offs_d[None, :]
-    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
-
-    h_start_idx = h_s * SPLIT_H_SIZE
-    h_end_idx = (h_s + 1) * SPLIT_H_SIZE
-
-    x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
-    x_offs_d = tl.arange(0, D_MODEL)
-    x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
-    x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
-
-    for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
-        x_offs = x_offs_base + h * stride_x_h
-
-        x = tl.load(x_ptr + x_offs, mask=x_mask)
-        y = tl.load(y_ptr + x_offs, mask=x_mask)
-
-        x_rotated = tl.where((x_offs_d[None, :] % 2 == 0), x, -x)
-        y_rotated = tl.where((x_offs_d[None, :] % 2 == 0), y, -y)
-
-        x_rotated = tl.reshape(x_rotated, (BLOCK_T, D_MODEL_HALF, 2))
-        y_rotated = tl.reshape(y_rotated, (BLOCK_T, D_MODEL_HALF, 2))
-
-        x_rotated = tl.flip(x_rotated, 2)
-        y_rotated = tl.flip(y_rotated, 2)
-
-        x_rotated = tl.reshape(
-            x_rotated,
-            (
-                BLOCK_T,
-                D_MODEL,
-            ),
-        )
-        y_rotated = tl.reshape(
-            y_rotated,
-            (
-                BLOCK_T,
-                D_MODEL,
-            ),
-        )
-
-        out_x = x * cos + x_rotated * sin
-        out_x = out_x.to(x_ptr.dtype.element_ty)
-        out_y = y * cos + y_rotated * sin
-        out_y = out_y.to(y_ptr.dtype.element_ty)
-
-        tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
-        tl.store(out_y_ptr + x_offs, out_y, mask=x_mask)
-
-
-@triton.jit
 def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
     x_ptr: torch.Tensor,
     y_ptr: torch.Tensor,
@@ -2033,6 +1929,7 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
     SPLIT_H_SIZE: tl.constexpr,
     D_MODEL: tl.constexpr,
     D_MODEL_HALF: tl.constexpr,
+    HAVE_OFFS: tl.constexpr,
     num_stages: tl.constexpr,
 ):
     h_s = tl.program_id(0)
@@ -2051,8 +1948,11 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
     pos_offs = s * BLOCK_T + tl.arange(0, BLOCK_T)
     pos_mask = pos_offs < T
     pos = tl.load(pos_ptr + pos_offs, mask=pos_mask)
-    offset = tl.load(off_ptr + pos_offs, mask=pos_mask)
-    cos_offs_t = pos + offset
+    if HAVE_OFFS:
+        offset = tl.load(off_ptr + pos_offs, mask=pos_mask)
+        cos_offs_t = pos + offset
+    else:
+        cos_offs_t = pos
 
     if reuse_freqs_front_part:
         cos_offs_d = tl.arange(0, D_MODEL) // 2
@@ -3009,77 +2909,42 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     waves_per_eu = 0
     num_stages = 2 if SPLIT_H_SIZE > 1 else 1
 
-    if offsets is None:
-        if rotate_style == RotateStyle.GPTJ:
-            if have_nope:
-                # TODO: add a new kernel for nope
-                raise NotImplementedError(
-                    "nope style has not been implemented in RoPE Triton backend."
-                )
-            else:
-                _rope_fwd_kernel_gptj_cached_thd_position_2c[grid](
-                    x,
-                    y,
-                    cos,
-                    sin,
-                    positions,
-                    out_x,
-                    out_y,
-                    *x.stride(),
-                    *cos.stride(),
-                    *positions.stride(),
-                    *out_x.stride(),
-                    T=t,
-                    reuse_freqs_front_part=reuse_freqs_front_part,
-                    BLOCK_T=BLOCK_T,
-                    SPLIT_H_SIZE=SPLIT_H_SIZE,
-                    D_MODEL=D_MODEL,
-                    D_MODEL_HALF=D_MODEL_HALF,
-                    num_warps=num_warps,
-                    waves_per_eu=waves_per_eu,
-                    num_stages=num_stages
-                )
-        elif rotate_style == RotateStyle.NEOX:
-            # TODO: add a new kernel for NOEX
+    if rotate_style == RotateStyle.GPTJ:
+        if have_nope:
+            # TODO: add a new kernel for nope
             raise NotImplementedError(
-                "NEOX ratate style has not been implemented in RoPE Triton backend."
+                "nope style has not been implemented in RoPE Triton backend."
             )
-    else:
-        if rotate_style == RotateStyle.GPTJ:
-            if have_nope:
-                # TODO: add a new kernel for nope
-                raise NotImplementedError(
-                    "nope style has not been implemented in RoPE Triton backend."
-                )
-            else:
-                _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c[grid](
-                    x,
-                    y,
-                    cos,
-                    sin,
-                    positions,
-                    offsets,
-                    out_x,
-                    out_y,
-                    *x.stride(),
-                    *cos.stride(),
-                    *positions.stride(),
-                    *out_x.stride(),
-                    T=t,
-                    reuse_freqs_front_part=reuse_freqs_front_part,
-                    BLOCK_T=BLOCK_T,
-                    SPLIT_H_SIZE=SPLIT_H_SIZE,
-                    D_MODEL=D_MODEL,
-                    D_MODEL_HALF=D_MODEL_HALF,
-                    num_warps=num_warps,
-                    waves_per_eu=waves_per_eu,
-                    num_stages=num_stages
-                )
-        elif rotate_style == RotateStyle.NEOX:
-            # TODO: add a new kernel for NOEX
-            raise NotImplementedError(
-                "NEOX ratate style has not been implemented in RoPE Triton backend."
+        else:
+            _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c[grid](
+                x,
+                y,
+                cos,
+                sin,
+                positions,
+                offsets,
+                out_x,
+                out_y,
+                *x.stride(),
+                *cos.stride(),
+                *positions.stride(),
+                *out_x.stride(),
+                T=t,
+                reuse_freqs_front_part=reuse_freqs_front_part,
+                BLOCK_T=BLOCK_T,
+                SPLIT_H_SIZE=SPLIT_H_SIZE,
+                D_MODEL=D_MODEL,
+                D_MODEL_HALF=D_MODEL_HALF,
+                HAVE_OFFS=(offsets is not None),
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+                num_stages=num_stages
             )
+    elif rotate_style == RotateStyle.NEOX:
+        # TODO: add a new kernel for NOEX
+        raise NotImplementedError(
+            "NEOX ratate style has not been implemented in RoPE Triton backend."
+        )
 
     return out_x, out_y
 
