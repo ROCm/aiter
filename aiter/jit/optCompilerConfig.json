@@ -461,7 +461,7 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'"
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
     "module_mha_varlen_fwd": {
