@@ -65,8 +65,9 @@ def _gemm_afp4_wfp4_kernel(
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
-    pid_k = tl.program_id(axis=0)
-    pid = tl.program_id(axis=1)
+    pid_unified = tl.program_id(axis=0)
+    pid_k = pid_unified % NUM_KSPLIT
+    pid = pid_unified // NUM_KSPLIT
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -250,6 +251,26 @@ def gemm_afp4wfp4(
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
         else:
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
+    elif M < 128:
+        BLOCK_SIZE_M = 64
+        BLOCK_SIZE_N = 64
+        BLOCK_SIZE_K = 256
+        GROUP_SIZE_M = 1
+        waves_per_eu = 6
+        kpack = 1
+        num_warps = 4
+        num_stages = 2
+        matrix_instr_nonkdim = 16
+        cache_modifier = ".cg"
+
+        NUM_KSPLIT = 4
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        )
+        if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
+            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
+        else:
+            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
     elif M <= 256:
         BLOCK_SIZE_M = 32
         BLOCK_SIZE_N = 64
@@ -269,7 +290,7 @@ def gemm_afp4wfp4(
         BLOCK_SIZE_M = 256
         BLOCK_SIZE_N = 256
         BLOCK_SIZE_K = 256
-        GROUP_SIZE_M = 4
+        GROUP_SIZE_M = 32
         waves_per_eu = 1
         kpack = 1
         num_warps = 8
@@ -282,8 +303,11 @@ def gemm_afp4wfp4(
         y_pp = None
 
     grid = lambda META: (  # noqa: E731
-        NUM_KSPLIT,
-        (triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"])),
+        (
+            NUM_KSPLIT
+            * triton.cdiv(M, META["BLOCK_SIZE_M"])
+            * triton.cdiv(N, META["BLOCK_SIZE_N"])
+        ),
     )
     _gemm_afp4_wfp4_kernel[grid](
         x,
