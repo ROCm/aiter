@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
+from aiter import dtypes
 from typing import List, Optional, Tuple, Union
 
 MAX_TOKEN_SUPPORTED = 16384
@@ -198,8 +199,8 @@ def test_reshape_and_cache(
         if el is None:
             continue
         checkAllclose(
-            el.to(torch.float32),
-            out_a[i].to(torch.float32),
+            el.to(dtypes.fp32),
+            out_a[i].to(dtypes.fp32),
             msg=f"{names[i]} {el.shape}",
         )
 
@@ -251,8 +252,8 @@ def test_reshape_and_cache(
         if el is None:
             continue
         checkAllclose(
-            el.to(torch.float32),
-            out_a[i].to(torch.float32),
+            el.to(dtypes.fp32),
+            out_a[i].to(dtypes.fp32),
             msg=f"{names[i]} {el.shape}",
         )
     print(
@@ -260,7 +261,7 @@ def test_reshape_and_cache(
     )
 
 
-test_reshape_and_cache(4097, 128, (8, 1), 128, 16, torch.bfloat16, torch.bfloat16)
+test_reshape_and_cache(4097, 128, (8, 1), 128, 16, dtypes.bf16, dtypes.bf16)
 print("\nstart quant fp16->fp8")
 test_reshape_and_cache(
     4097,
@@ -268,9 +269,9 @@ test_reshape_and_cache(
     (8, 1),
     128,
     16,
-    torch.float16,
-    torch.float8_e4m3fnuz,
-    quantCfg={"quant_dtype": torch.float8_e4m3fnuz},
+    dtypes.fp16,
+    dtypes.fp8,
+    quantCfg={"quant_dtype": dtypes.fp8},
 )
 print("\nstart quant fp16->i8")
 test_reshape_and_cache(
@@ -279,9 +280,9 @@ test_reshape_and_cache(
     (8, 1),
     128,
     16,
-    torch.float16,
-    torch.int8,
-    quantCfg={"quant_dtype": torch.int8},
+    dtypes.fp16,
+    dtypes.i8,
+    quantCfg={"quant_dtype": dtypes.i8},
 )
 print("\nstart quant bf16->i8")
 test_reshape_and_cache(
@@ -290,7 +291,7 @@ test_reshape_and_cache(
     (8, 1),
     128,
     16,
-    torch.bfloat16,
-    torch.int8,
-    quantCfg={"quant_dtype": torch.int8},
+    dtypes.bf16,
+    dtypes.i8,
+    quantCfg={"quant_dtype": dtypes.i8},
 )

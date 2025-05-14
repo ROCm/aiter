@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, perftest
 import itertools
 from enum import IntEnum
 import argparse
+from aiter import dtypes
 
 
 @perftest()
@@ -159,7 +160,6 @@ def ref_rope_2d_fwd(x, size_h, size_w, cos_h, sin_h, cos_w, sin_w, rotate_style)
     return torch.cat([x1, x2], dim=-1).view(s, b, h, d).to(dtype=x.dtype)
 
 
-
 def test_rope_sbhd(input, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first, transpose_output):
     input_msg = f"""
 dtype: {input.dtype}, \
@@ -256,7 +256,6 @@ transpose_output: {transpose_output}
     checkAllclose(ref, hip_cached_fwd, msg=f"rope_cached_position_fwd - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
 
 
-
 def test_rope_sbhd_2c_positions(input_x, input_y, freqs, grad_x, grad_y, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output):
     input_msg = f"""
 dtype: {input_x.dtype}, \
@@ -286,7 +285,6 @@ transpose_output: {transpose_output}
 
     checkAllclose(ref_x, hip_cached_fwd_x, msg=f"rope_cached_position_2d_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
     checkAllclose(ref_y, hip_cached_fwd_y, msg=f"rope_cached_position_2d_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n")
-
 
 
 def compare_rope_sbhd_2c_positions_with_legacy(input_x, input_y, freqs, positions, offsets, rotate_style, nope_first, check_correction=False):
@@ -342,7 +340,6 @@ nope_first: {nope_first}
     print(f"{color}{input_msg}hip: {hip_cached_fwd_avg:<8.2f} us. leg: {leg_cached_fwd_avg:<8.2f} us. diff: {100*hip_cached_fwd_avg/leg_cached_fwd_avg}%.\n{endc}")
 
 
-
 def test_rope_thd(input, cu_seqlens, freqs, grad, rotate_style, reuse_freqs_front_part, nope_first):
     torch.set_printoptions(profile="full")
     input_msg = f"""
@@ -390,7 +387,6 @@ dim_freqs: {str(freqs_h.shape):<20}
     checkAllclose(input.grad, hip_bwd, msg=f"rope_2d_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n")
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--no_check', action='store_true', help="Do not check correctness of ops. Default: False.")
@@ -398,8 +394,8 @@ if __name__ == "__main__":
     parser.add_argument('--compare_check', action='store_true', help="Check correctness when compare with legacy implementation. Default: False")
     args = parser.parse_args()
 
-    # dtype_ = (torch.float, torch.float16, torch.bfloat16)
-    dtype_ = (torch.float16, torch.bfloat16)
+    # dtype_ = (dtypes.fp32, dtypes.fp16, dtypes.bf16)
+    dtype_ = (dtypes.fp16, dtypes.bf16)
     transpose_output_ = (False, True)
     batch_size_ = (1, 2, 4)
     seq_size_ = (1024, 2048, 4096)
@@ -510,7 +506,7 @@ if __name__ == "__main__":
     # Test thd format for uncached
     if not args.no_check:
         cu_seqlens = torch.tensor([0, 100, 102, 128, 233, 456, 460, 711, 1024, 1536, 1739, 1888, 2000, 2001, 2048],
-                                dtype=torch.int32, device="cuda")
+                                dtype=dtypes.i32, device="cuda")
         for (dtype, fdtype,
             rotate_style,
             rotary_percent_and_reuse,

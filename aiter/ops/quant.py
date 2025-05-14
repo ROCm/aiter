@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import functools
 from .enum import *
 from . import triton
+from ..utility import dtypes
 
 
 @compile_ops("module_smoothquant")
@@ -36,11 +37,11 @@ def pertoken_quant(
     x,
     scale=None,
     x_scale=None,  # smooth_scale
-    scale_dtype=torch.float,
-    quant_dtype=torch.int8,
+    scale_dtype=dtypes.fp32,
+    quant_dtype=dtypes.i8,
     dtypeMax=None,
 ):
-    x = x.to(torch.float)
+    x = x.to(dtypes.fp32)
     if x_scale is None:
         hidden_states = x
     else:
@@ -64,9 +65,9 @@ def pertoken_quant(
 
 
 def per_tensor_quant(
-    x, scale=None, scale_dtype=torch.float, quant_dtype=torch.int8, dtypeMax=None
+    x, scale=None, scale_dtype=dtypes.fp32, quant_dtype=dtypes.i8, dtypeMax=None
 ):
-    x = x.to(torch.float)
+    x = x.to(dtypes.fp32)
     if scale is None:
         if dtypeMax is None:
             dtypeMax = get_dtype_max(quant_dtype)
@@ -101,7 +102,7 @@ def get_hip_quant(qType):
 def get_triton_quant(qType):
     tmp = {
         QuantType.No: lambda *a, **k: (a[0], None),
-        QuantType.per_Tensor: per_tensor_quant_fp8_triton,
+        QuantType.per_Tensor: per_tensor_quant_triton,
         QuantType.per_Token: per_token_quant_triton,
         QuantType.per_1x128: lambda a, **k: per_token_quant_triton(
             a.view(-1, 128), **k
@@ -110,22 +111,22 @@ def get_triton_quant(qType):
     return tmp.get(qType, NotImplementedError)
 
 
-def per_token_quant_hip(x, scale=None, quant_dtype=torch.int8):
+def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     shape = x.shape
     device = x.device
     if scale is None:
-        scale = torch.empty(shape[:-1], dtype=torch.float, device=device)
+        scale = torch.empty(shape[:-1], dtype=dtypes.fp32, device=device)
     else:
         raise ValueError(f"unsupported: static per token quant")
 
-    if quant_dtype == torch.float8_e4m3fnuz:
+    if quant_dtype == dtypes.fp8:
         y = torch.empty(shape, dtype=quant_dtype, device=device)
         dynamic_per_token_scaled_fp8_quant(y, x, scale)
-    elif quant_dtype == torch.int8:
+    elif quant_dtype == dtypes.i8:
         M, N = x.view(-1, shape[-1]).shape
-        y = torch.empty((M, N), dtype=torch.int8, device=device)
-        scale = torch.empty(M, dtype=torch.float, device=device)
-        smooth_scale = torch.ones(N, dtype=torch.float, device=device)
+        y = torch.empty((M, N), dtype=dtypes.i8, device=device)
+        scale = torch.empty(M, dtype=dtypes.fp32, device=device)
+        smooth_scale = torch.ones(N, dtype=dtypes.fp32, device=device)
         smoothquant_fwd(y, x, smooth_scale, scale)
         y = y.view(shape)
     else:
@@ -133,11 +134,11 @@ def per_token_quant_hip(x, scale=None, quant_dtype=torch.int8):
     return y, scale
 
 
-def per_tensor_quant_hip(x, scale=None, quant_dtype=torch.float8_e4m3fnuz):
+def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
-    if quant_dtype == torch.float8_e4m3fnuz:
+    if quant_dtype == dtypes.fp8:
         if scale is None:
-            scale = torch.empty(1, dtype=torch.float, device=x.device)
+            scale = torch.empty(1, dtype=dtypes.fp32, device=x.device)
             dynamic_scaled_fp8_quant(y, x, scale)
         else:
             static_scaled_fp8_quant(y, x, scale)
@@ -146,13 +147,13 @@ def per_tensor_quant_hip(x, scale=None, quant_dtype=torch.float8_e4m3fnuz):
     return y, scale.view(1)
 
 
-def per_token_quant_triton(x, scale=None, quant_dtype=torch.int8):
+def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     shape = x.shape
     device = x.device
     dtypeMax = get_dtype_max(quant_dtype)
     y = torch.empty(shape, dtype=quant_dtype, device=device)
     if scale is None:
-        scale = torch.empty(shape[:-1], dtype=torch.float, device=device)
+        scale = torch.empty(shape[:-1], dtype=dtypes.fp32, device=device)
         triton.quant.dynamic_per_token_fp8_quant(
             y, x, scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax
         )
@@ -162,13 +163,14 @@ def per_token_quant_triton(x, scale=None, quant_dtype=torch.int8):
     return y, scale
 
 
-def per_tensor_quant_fp8_triton(x, scale=None):
-    y = torch.empty(x.shape, dtype=torch.float8_e4m3fnuz, device=x.device)
+def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
+    y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    x = x.view(-1, x.shape[-1])
     if scale is None:
-        scale = torch.empty(1, dtype=torch.float, device=x.device)
-        triton.dynamic_scaled_fp8_quant(y, x, scale)
+        scale = torch.zeros(1, dtype=dtypes.fp32, device=x.device)
+        triton.quant.dynamic_per_tensor_fp8_quant(y, x, scale)
     else:
-        triton.static_scaled_fp8_quant(y, x, scale)
+        triton.quant.static_per_tensor_fp8_quant(y, x, scale)
     return y, scale
 
 

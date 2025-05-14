@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import re
 import os
@@ -17,10 +17,13 @@ import multiprocessing
 from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, f'{this_dir}/utils/')
+sys.path.insert(0, f"{this_dir}/utils/")
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
+from chip_info import get_gfx
+
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+
 
 def mp_lock(
     lockPath: str,
@@ -82,10 +85,21 @@ AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
 AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
-CK_3RDPARTY_DIR = os.environ.get("CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel")
+CK_3RDPARTY_DIR = os.environ.get(
+    "CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel"
+)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=1)
+def get_asm_dir():
+    gfx = get_gfx()
+    global AITER_ASM_DIR
+    AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/{gfx}/"
+    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+    return AITER_ASM_DIR
+
+
+@functools.lru_cache(maxsize=1)
 def get_user_jit_dir():
     if "JIT_WORKSPACE_DIR" in os.environ:
         path = os.getenv("JIT_WORKSPACE_DIR")
@@ -120,6 +134,14 @@ def validate_and_update_archs():
     ), f"One of GPU archs of {archs} is invalid or not supported"
     return archs
 
+@functools.lru_cache()
+def hip_flag_checker(flag_hip : str):
+    ret = os.system(f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -")
+    if ret == 0:
+        return [flag_hip]
+    else:
+        logger.warning(f"{flag_hip} is not supported by hipcc.")
+        return []
 
 def check_and_set_ninja_worker():
     max_num_jobs_cores = int(max(1, os.cpu_count() * 0.8))
@@ -185,10 +207,13 @@ def get_module(md_name):
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
 
+
 rebuilded_list = ["module_aiter_enum"]
+
 
 def rm_module(md_name):
     os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+
 
 @functools.lru_cache()
 def recopy_ck():
@@ -196,8 +221,10 @@ def recopy_ck():
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
 
+
 def clear_build(md_name):
     os.system(f"rm -rf {bd_dir}/{md_name}")
+
 
 def build_module(
     md_name,
@@ -256,18 +283,13 @@ def build_module(
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
         if hip_version > Version("5.7.23302"):
-            flags_hip += ["-fno-offload-uniform-block"]
+            flags_hip += hip_flag_checker("-fno-offload-uniform-block")
         if hip_version > Version("6.1.40090"):
-            flags_hip += ["-mllvm", "-enable-post-misched=0"]
+            flags_hip += hip_flag_checker("-mllvm -enable-post-misched=0")
         if hip_version > Version("6.2.41132"):
-            flags_hip += [
-                "-mllvm",
-                "-amdgpu-early-inline-all=true",
-                "-mllvm",
-                "-amdgpu-function-calls=false",
-            ]
+            flags_hip += hip_flag_checker("-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false")
         if hip_version > Version("6.2.41133"):
-            flags_hip += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
+            flags_hip += hip_flag_checker("-mllvm -amdgpu-coerce-illegal-types=1")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -335,7 +357,7 @@ def build_module(
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
             logger.error(
-                f"{tag}↓↓↓↓↓↓↓↓↓↓\n-->[History]: {{}}{tag}↑↑↑↑↑↑↑↑↑↑".format(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
                     re.sub(
                         "error:",
                         "\033[31merror:\033[0m",
@@ -351,9 +373,7 @@ def build_module(
             f"finish build [{md_name}], cost {time.perf_counter()-startTS:.8f}s"
         )
 
-    mp_lock(
-        lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc
-    )
+    mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
 def get_args_of_build(ops_name: str, exclue=[]):
@@ -372,11 +392,6 @@ def get_args_of_build(ops_name: str, exclue=[]):
     }
 
     def convert(d_ops: dict):
-        # judge isASM
-        # if d_ops["isASM"].lower() == "true":
-        #     d_ops["flags_extra_hip"].append(
-        #         "rf'-DAITER_ASM_DIR=\\\"{AITER_ROOT_DIR}/hsa/\\\"'")
-        # del d_ops["isASM"]
         for k, val in d_ops.items():
             if isinstance(val, list):
                 for idx, el in enumerate(val):
@@ -389,7 +404,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                 d_ops[k] = eval(val)
             else:
                 pass
-            
+
         # undefined compile features will be replaced with default value
         d_opt_build_args.update(d_ops)
         return d_opt_build_args
@@ -501,6 +516,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 return None
 
             def check_args():
+                get_asm_dir()
                 import inspect
                 import typing
                 import re

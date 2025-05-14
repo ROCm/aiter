@@ -47,7 +47,7 @@ void moe_smoothquant_fwd(torch::Tensor &out,      // [topk * tokens, hidden_size
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck smoothquant only support fp16 and bf16 data type");
     
-    TORCH_CHECK(odtype == torch::kChar || odtype == torch::kFloat8_e4m3fnuz,
+    TORCH_CHECK(odtype == torch::kChar || odtype == torch_fp8,
                 "ck smoothquant only support fp8 and int8 quant");
 
     std::string dtype_str = torchDTypeToStr(input.dtype());

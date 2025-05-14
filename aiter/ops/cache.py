@@ -39,8 +39,8 @@ def reshape_and_cache_flash(
     value_cache: Tensor,
     slot_mapping: Tensor,
     kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
+    k_scale: Tensor,
+    v_scale: Tensor,
 ): ...
 
 @compile_ops("module_cache")

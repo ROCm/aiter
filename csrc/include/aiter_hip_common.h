@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include "ck_tile/core.hpp"
+
+#if CK_TILE_USE_OCP_FP8
+constexpr auto FP8_MAX = 448.f;
+#else
+constexpr auto FP8_MAX = 240.f;
+#endif
 
 #define HIP_CALL(call)                                                                                                           \
     do                                                                                                                           \

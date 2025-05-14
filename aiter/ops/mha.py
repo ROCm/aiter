@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, Generator
 from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, AITER_ROOT_DIR
+from ..utility import dtypes
 import torch
+
 
 @compile_ops("module_mha_fwd", fc_name="mha_fwd")
 def mha_fwd(
@@ -47,7 +49,7 @@ def mha_varlen_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-): ...
+) -> list[Tensor]: ...
 
 
 @compile_ops("module_mha_bwd", fc_name="mha_bwd")
@@ -125,8 +127,9 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-    custom_build_args:Optional[dict]=None,
+    custom_build_args: Optional[dict] = None,
 ): ...
+
 
 @compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
 def fmha_v3_varlen_bwd(
@@ -174,52 +177,54 @@ def _flash_attn_forward(
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     return_lse: bool,
-    return_softmax: bool
+    return_softmax: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     (_, seqlen_q, _, _) = q.shape
     # causal=true is the same as causal=false in this case
     if seqlen_q == 1 and alibi_slopes is None:
         causal = False
 
-    md_name = 'mha_fwd'
-    filter = '*'
-    if q.dtype == torch.float16:
-        md_name += '_fp16'
-        filter += 'fp16*'
-    elif q.dtype == torch.bfloat16:
-        md_name += '_bf16'
-        filter += 'bf16*'
+    md_name = "mha_fwd"
+    filter = "*"
+    if q.dtype == dtypes.fp16:
+        md_name += "_fp16"
+        filter += "fp16*"
+    elif q.dtype == dtypes.bf16:
+        md_name += "_bf16"
+        filter += "bf16*"
     if bias is not None:
-        md_name += '_bias'
-        filter += '_bias*'
+        md_name += "_bias"
+        filter += "_bias*"
     elif alibi_slopes is not None:
-        md_name += '_alibi'
-        filter += '_alibi*'
+        md_name += "_alibi"
+        filter += "_alibi*"
     else:
-        md_name += '_nbias'
-        filter += '_nbias*'
+        md_name += "_nbias"
+        filter += "_nbias*"
     if not causal and window_size_left == -1 and window_size_right == -1:
-        md_name += '_nmask'
-        filter += '_nmask*'
+        md_name += "_nmask"
+        filter += "_nmask*"
     else:
-        md_name += '_mask'
-        filter += '_mask*'
+        md_name += "_mask"
+        filter += "_mask*"
     if return_lse:
-        md_name += '_lse'
-        filter += '_lse*'
+        md_name += "_lse"
+        filter += "_lse*"
     else:
-        md_name += '_nlse'
-        filter+= '_nlse*'
+        md_name += "_nlse"
+        filter += "_nlse*"
     if dropout_p == 0:
-        md_name += '_ndropout'
-        filter += '_ndropout*'
+        md_name += "_ndropout"
+        filter += "_ndropout*"
     else:
-        md_name += '_dropout'
-        filter += '_dropout*'
+        md_name += "_dropout"
+        filter += "_dropout*"
 
-    blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
-        '--receipt 100 --filter {} --output_dir {{}}'.format(filter),
-        f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}']
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}",
+    ]
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_fwd(
@@ -237,7 +242,7 @@ def _flash_attn_forward(
         bias,
         alibi_slopes,
         None,
-        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
+        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -263,63 +268,65 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1
+    how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
-    md_name = 'mha_bwd'
-    filter1 = '*'   # get_bwd_dot_do_o_blobs()
-    filter2 = '*'   # get_bwd_convert_dq_blobs()
-    filter3 = '*'   # get_bwd_dq_dk_dv_blobs()
-    if q.dtype == torch.float16:
-        md_name += '_fp16'
-        filter1+= 'fp16*'
-        filter2+= 'fp16*'
-        filter3+= 'fp16*'
-    elif q.dtype == torch.bfloat16:
-        md_name += '_bf16'
-        filter1 += 'bf16*'
-        filter2 += 'bf16*'
-        filter3 += 'bf16*'
+    md_name = "mha_bwd"
+    filter1 = "*"  # get_bwd_dot_do_o_blobs()
+    filter2 = "*"  # get_bwd_convert_dq_blobs()
+    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == dtypes.fp16:
+        md_name += "_fp16"
+        filter1 += "fp16*"
+        filter2 += "fp16*"
+        filter3 += "fp16*"
+    elif q.dtype == dtypes.bf16:
+        md_name += "_bf16"
+        filter1 += "bf16*"
+        filter2 += "bf16*"
+        filter3 += "bf16*"
     if bias is not None:
-        md_name += '_bias'
-        filter3 += '_bias*'
+        md_name += "_bias"
+        filter3 += "_bias*"
     elif alibi_slopes is not None:
-        md_name += '_alibi'
-        filter3 += '_alibi*'
+        md_name += "_alibi"
+        filter3 += "_alibi*"
     else:
-        md_name += '_nbias'
-        filter3 += '_nbias*'
+        md_name += "_nbias"
+        filter3 += "_nbias*"
     if dbias is not None:
-        md_name += '_dbias'
-        filter3 += '_dbias*'
+        md_name += "_dbias"
+        filter3 += "_dbias*"
     else:
-        md_name += '_ndbias'
-        filter3 += '_ndbias*'
+        md_name += "_ndbias"
+        filter3 += "_ndbias*"
     if not causal and window_size_left == -1 and window_size_right == -1:
-        md_name += '_nmask'
-        filter3 += '_nmask*'
+        md_name += "_nmask"
+        filter3 += "_nmask*"
     else:
-        md_name += '_mask'
-        filter3 += '_mask*'
+        md_name += "_mask"
+        filter3 += "_mask*"
     if dropout_p == 0:
-        md_name += '_ndropout'
-        filter3 += '_ndropout*'
+        md_name += "_ndropout"
+        filter3 += "_ndropout*"
     else:
-        md_name += '_dropout'
-        filter3 += '_dropout*'
+        md_name += "_dropout"
+        filter3 += "_dropout*"
     if deterministic:
-        md_name += '_deterministic'
-        filter2 += '_deterministic*'
-        filter3 += '_deterministic*'
+        md_name += "_deterministic"
+        filter2 += "_deterministic*"
+        filter3 += "_deterministic*"
     else:
-        md_name += '_ndeterministic'
-        filter2 += '_ndeterministic*'
-        filter3 += '_ndeterministic*'
+        md_name += "_ndeterministic"
+        filter2 += "_ndeterministic*"
+        filter3 += "_ndeterministic*"
 
-    filter = f'{filter1}@{filter2}@{filter3}'
+    filter = f"{filter1}@{filter2}@{filter3}"
 
-    blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd ' \
-        '--receipt 300 --filter {} --output_dir {{}}'.format(filter),
-        f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}']
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+    ]
 
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
@@ -349,8 +356,10 @@ def _flash_attn_backward(
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
-    mask = (causal == True and window_size_left == -1) # causal mask
-    nmask = (causal == False and window_size_left == -1 and window_size_right == -1) # no mask
+    mask = causal == True and window_size_left == -1  # causal mask
+    nmask = (
+        causal == False and window_size_left == -1 and window_size_right == -1
+    )  # no mask
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -411,9 +420,13 @@ def _flash_attn_backward(
         # bwd_hd64_bf16_causal_a32_rtz_pssk
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
-        ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret = (
+            is_v3_atomic_fp32 == True
+        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64
-        ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= nmask or (
+            mask and seqlen_q == seqlen_k
+        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
 
@@ -464,7 +477,9 @@ def _flash_attn_backward(
         # bwd_hd192_bf16_causal_a32_rtz_psskddv
         ret = is_v3_atomic_fp32 == True
         ret &= hdim_q > 64 and hdim_q <= 192
-        ret &= nmask or (mask and seqlen_q == seqlen_k) # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
+        ret &= nmask or (
+            mask and seqlen_q == seqlen_k
+        )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
 
         return ret
 
@@ -480,7 +495,7 @@ def _flash_attn_backward(
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= mask or nmask
         ret &= np() or pssk() or pddv() or psskddv()
-        ret &= 'gfx942' in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= "gfx942" in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
 
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -511,7 +526,7 @@ def _flash_attn_backward(
             dv,
             alibi_slopes,
             rng_state,
-            None
+            None,
         )
     else:
         (
@@ -540,7 +555,7 @@ def _flash_attn_backward(
             alibi_slopes,
             rng_state,
             None,
-            custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
+            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
 
@@ -563,11 +578,9 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
         is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1
+        how_v3_bf16_cvt: Optional[int] = 1,
     ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, k, v]
-        )
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(3)
@@ -613,7 +626,6 @@ class FlashAttnFunc(torch.autograd.Function):
 
         return result[0] if len(result) == 1 else tuple(result)
 
-
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
@@ -646,11 +658,11 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state,
             ctx.is_v3_atomic_fp32,
-            ctx.how_v3_bf16_cvt
+            ctx.how_v3_bf16_cvt,
         )
-        dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
-        dk = dk[..., : head_size_q_og]
-        dv = dv[..., : head_size_v_og]
+        dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
+        dk = dk[..., :head_size_q_og]
+        dv = dv[..., :head_size_v_og]
         return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
 
 
@@ -752,95 +764,108 @@ def _flash_attn_varlen_forward(
     return_lse: bool = False,
     return_softmax: bool = False,
     block_table: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # causal=true is the same as causal=false in this case
     if max_seqlen_q == 1 and alibi_slopes is None:
         causal = False
 
-    md_name = 'mha_varlen_fwd'
+    md_name = "mha_varlen_fwd"
     if block_table is None:
-        filter_fwd = '*'            # get_fwd_blobs()
-        if q.dtype == torch.float16:
-            md_name += '_fp16'
-            filter_fwd += 'fp16*'
-        elif q.dtype == torch.bfloat16:
-            md_name += '_bf16'
-            filter_fwd += 'bf16*'
+        filter_fwd = "*"  # get_fwd_blobs()
+        if q.dtype == dtypes.fp16:
+            md_name += "_fp16"
+            filter_fwd += "fp16*"
+        elif q.dtype == dtypes.bf16:
+            md_name += "_bf16"
+            filter_fwd += "bf16*"
         if bias is not None:
-            md_name += '_bias'
-            filter_fwd += '_bias*'
+            md_name += "_bias"
+            filter_fwd += "_bias*"
         elif alibi_slopes is not None:
-            md_name += '_alibi'
-            filter_fwd+= '_alibi*'
+            md_name += "_alibi"
+            filter_fwd += "_alibi*"
         else:
-            md_name += '_nbias'
-            filter_fwd += '_nbias*'
+            md_name += "_nbias"
+            filter_fwd += "_nbias*"
         if not causal and window_size_left == -1 and window_size_right == -1:
-            md_name += '_nmask'
-            filter_fwd += '_nmask*'
+            md_name += "_nmask"
+            filter_fwd += "_nmask*"
         else:
-            md_name += '_mask'
-            filter_fwd += '_mask*'
+            md_name += "_mask"
+            filter_fwd += "_mask*"
         if return_lse:
-            md_name += '_lse'
-            filter_fwd += '_lse*'
+            md_name += "_lse"
+            filter_fwd += "_lse*"
         else:
-            md_name += '_nlse'
-            filter_fwd += '_nlse*'
+            md_name += "_nlse"
+            filter_fwd += "_nlse*"
         if dropout_p == 0:
-            md_name += '_ndropout'
-            filter_fwd += '_ndropout*'
+            md_name += "_ndropout"
+            filter_fwd += "_ndropout*"
         else:
-            md_name += '_dropout'
-            filter_fwd += '_dropout*'
-        blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
-            '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd)]
-        blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
-            '--receipt 200 --filter {} --output_dir {{}}'.format('" @ "'))
-        blob_gen_cmd.append(f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}')
+            md_name += "_dropout"
+            filter_fwd += "_dropout*"
+        blob_gen_cmd = [
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        ]
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            "--receipt 200 --filter {} --output_dir {{}}".format('" @ "')
+        )
+        blob_gen_cmd.append(
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
+        )
     else:
-        filter_fwd_splitkv1 = '*'   # get_fwd_splitkv_combine_blobs()
-        filter_fwd_splitkv2 = '*'   # get_fwd_splitkv_blobs()
-        if q.dtype == torch.float16:
-            md_name += '_fp16'
-            filter_fwd_splitkv1+= 'fp16*'
-            filter_fwd_splitkv2+= 'fp16*'
-        elif q.dtype == torch.bfloat16:
-            md_name += '_bf16'
-            filter_fwd_splitkv1+= 'bf16*'
-            filter_fwd_splitkv2+= 'bf16*'
+        filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
+        filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
+        if q.dtype == dtypes.fp16:
+            md_name += "_fp16"
+            filter_fwd_splitkv1 += "fp16*"
+            filter_fwd_splitkv2 += "fp16*"
+        elif q.dtype == dtypes.bf16:
+            md_name += "_bf16"
+            filter_fwd_splitkv1 += "bf16*"
+            filter_fwd_splitkv2 += "bf16*"
         if bias is not None:
-            md_name += '_bias'
-            filter_fwd_splitkv2 += '_bias*'
+            md_name += "_bias"
+            filter_fwd_splitkv2 += "_bias*"
         elif alibi_slopes is not None:
-            md_name += '_alibi'
-            filter_fwd_splitkv2+= '_alibi*'
+            md_name += "_alibi"
+            filter_fwd_splitkv2 += "_alibi*"
         else:
-            md_name += '_nbias'
-            filter_fwd_splitkv2 += '_nbias*'
+            md_name += "_nbias"
+            filter_fwd_splitkv2 += "_nbias*"
         if not causal and window_size_left == -1 and window_size_right == -1:
-            md_name += '_nmask'
-            filter_fwd_splitkv2 += '_nmask*'
+            md_name += "_nmask"
+            filter_fwd_splitkv2 += "_nmask*"
         else:
-            md_name += '_mask'
-            filter_fwd_splitkv2 += '_mask*'
+            md_name += "_mask"
+            filter_fwd_splitkv2 += "_mask*"
         if return_lse:
-            md_name += '_lse'
-            filter_fwd_splitkv1+= '_lse*'
-            filter_fwd_splitkv2+= '_lse*'
+            md_name += "_lse"
+            filter_fwd_splitkv1 += "_lse*"
+            filter_fwd_splitkv2 += "_lse*"
         else:
-            md_name += '_nlse'
-            filter_fwd_splitkv1+= '_nlse*'
-            filter_fwd_splitkv2+= '_nlse*'
-        md_name += '_pagedkv'
-        filter_fwd_splitkv2 += '_pagedkv*'
-        filter_fwd_splitkv = f'{filter_fwd_splitkv1}@{filter_fwd_splitkv2}'
-        blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd ' \
-            '--receipt 200 --filter {} --output_dir {{}}'.format('" "')]
-        blob_gen_cmd.append(f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv ' \
-            '--receipt 200 --filter {} --output_dir {{}}'.format(filter_fwd_splitkv))
-        blob_gen_cmd.append(f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}')
+            md_name += "_nlse"
+            filter_fwd_splitkv1 += "_nlse*"
+            filter_fwd_splitkv2 += "_nlse*"
+        md_name += "_pagedkv"
+        filter_fwd_splitkv2 += "_pagedkv*"
+        filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
+        blob_gen_cmd = [
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+        ]
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+        )
+        blob_gen_cmd.append(
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
+        )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
@@ -859,12 +884,12 @@ def _flash_attn_varlen_forward(
         window_size_right,
         return_lse,
         return_softmax,
-        None,
+        out,
         block_table,
         bias,
         alibi_slopes,
         None,
-        custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
+        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -893,62 +918,68 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
-    zero_tensors: bool = False
+    zero_tensors: bool = False,
 ) -> torch.Tensor:
-    md_name = 'mha_varlen_bwd'
-    filter1 = '*'   # get_bwd_dot_do_o_blobs()
-    filter2 = '*'   # get_bwd_convert_dq_blobs()
-    filter3 = '*'   # get_bwd_dq_dk_dv_blobs()
-    if q.dtype == torch.float16:
-        md_name += '_fp16'
-        filter1 += 'fp16*'
-        filter2 += 'fp16*'
-        filter3 += 'fp16*'
-    elif q.dtype == torch.bfloat16:
-        md_name += '_bf16'
-        filter1 += 'bf16*'
-        filter2 += 'bf16*'
-        filter3 += 'bf16*'
+    md_name = "mha_varlen_bwd"
+    filter1 = "*"  # get_bwd_dot_do_o_blobs()
+    filter2 = "*"  # get_bwd_convert_dq_blobs()
+    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == dtypes.fp16:
+        md_name += "_fp16"
+        filter1 += "fp16*"
+        filter2 += "fp16*"
+        filter3 += "fp16*"
+    elif q.dtype == dtypes.bf16:
+        md_name += "_bf16"
+        filter1 += "bf16*"
+        filter2 += "bf16*"
+        filter3 += "bf16*"
     if alibi_slopes is None:
-        md_name += '_nbias'
-        filter3 += '_nbias*'
+        md_name += "_nbias"
+        filter3 += "_nbias*"
     else:
-        md_name += '_alibi'
-        filter3 += '_alibi*'
+        md_name += "_alibi"
+        filter3 += "_alibi*"
     if not causal and window_size_left == -1 and window_size_right == -1:
-        md_name += '_nmask'
-        filter3 += '_nmask*'
+        md_name += "_nmask"
+        filter3 += "_nmask*"
     else:
-        md_name += '_mask'
-        filter3 += '_mask*'
+        md_name += "_mask"
+        filter3 += "_mask*"
     if dropout_p == 0:
-        md_name += '_ndropout'
-        filter3 += '_ndropout*'
+        md_name += "_ndropout"
+        filter3 += "_ndropout*"
     else:
-        md_name += '_dropout'
-        filter3 += '_dropout*'
+        md_name += "_dropout"
+        filter3 += "_dropout*"
     if deterministic:
-        md_name += '_deterministic'
-        filter2 += '_deterministic*'
-        filter3 += '_deterministic*'
+        md_name += "_deterministic"
+        filter2 += "_deterministic*"
+        filter3 += "_deterministic*"
     else:
-        md_name += '_ndeterministic'
-        filter2 += '_ndeterministic*'
-        filter3 += '_ndeterministic*'
-    filter = f'{filter1}@{filter2}@{filter3}'
+        md_name += "_ndeterministic"
+        filter2 += "_ndeterministic*"
+        filter3 += "_ndeterministic*"
+    filter = f"{filter1}@{filter2}@{filter3}"
 
-    blob_gen_cmd = [f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd ' \
-        '--receipt 400 --filter {} --output_dir {{}}'.format(filter),
-        f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}']
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
+        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+    ]
 
     (_, nhead_q, hdim_q) = q.shape
-    (_, nhead_k, hdim_v) = v.shape
+
+    nhead_k = v.shape[-2]
+    hdim_v = v.shape[-1]
 
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
-    mask = (causal == True and window_size_left == -1) # causal mask
-    nmask = (causal == False and window_size_left == -1 and window_size_right == -1) # no mask
+    mask = causal == True and window_size_left == -1  # causal mask
+    nmask = (
+        causal == False and window_size_left == -1 and window_size_right == -1
+    )  # no mask
 
     def pssk():
         # only for hd64 a32 causal/no causal, fp16/bf16-rtne/rtna/rtz cases
@@ -971,12 +1002,14 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_bf16_causal_a32_rtz_pssk_group
         # bwd_hd128_fp16_a32_pssk_group
         # bwd_hd128_fp16_causal_a32_pssk_group
-        ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret = (
+            is_v3_atomic_fp32 == True
+        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64 or hdim_q == 128
-        ret &= nmask # TODO: or (mask and mask_type == mask_enum::mask_top_left)
+        ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
-    
+
     def psskddv():
         # bwd_hd128_bf16_a32_rtne_psskddv_group
         # bwd_hd128_bf16_a32_rtna_psskddv_group
@@ -986,9 +1019,11 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_bf16_causal_a32_rtz_psskddv_group
         # bwd_hd128_fp16_a32_psskddv_group
         # bwd_hd128_fp16_causal_a32_psskddv_group
-        ret = is_v3_atomic_fp32 == True # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret = (
+            is_v3_atomic_fp32 == True
+        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q > 64 and hdim_q < 128
-        ret &= nmask # TODO: or (mask and mask_type == mask_enum::mask_top_left)
+        ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
 
@@ -1004,7 +1039,7 @@ def _flash_attn_varlen_backward(
         ret &= hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= mask or nmask
         ret &= pssk() or psskddv()
-        ret &= 'gfx942' in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= "gfx942" in torch.cuda.get_device_properties("cuda").gcnArchName
 
         return ret
 
@@ -1041,7 +1076,7 @@ def _flash_attn_varlen_backward(
             dv,
             alibi_slopes,
             rng_state,
-            None
+            None,
         )
     else:
         (
@@ -1073,7 +1108,7 @@ def _flash_attn_varlen_backward(
             alibi_slopes,
             rng_state,
             None,
-            custom_build_args={'md_name': md_name, 'blob_gen_cmd': blob_gen_cmd}
+            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
 
@@ -1099,17 +1134,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         block_table,
+        out,
         is_grad_enabled,
         is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1
+        how_v3_bf16_cvt: Optional[int] = 1,
     ):
-        is_grad = is_grad_enabled and any(
-            x.requires_grad for x in [q, k, v]
-        )
+        is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_q_og = q.size(2)
-        head_size_v_og = v.size(2)
+        head_size_q_og = q.size(-1)
+        head_size_v_og = v.size(-1)
         if head_size_q_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
@@ -1133,6 +1167,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            out=out,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1163,7 +1198,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = (
+            ctx.saved_tensors
+        )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
@@ -1196,12 +1233,32 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
             is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
-            how_v3_bf16_cvt=ctx.how_v3_bf16_cvt
+            how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
         )
-        dq = dq[..., : head_size_q_og]  # We could have padded the head dimension
-        dk = dk[..., : head_size_q_og]
-        dv = dv[..., : head_size_v_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, dbias, None, None, None, None, None, None
+        dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
+        dk = dk[..., :head_size_q_og]
+        dv = dv[..., :head_size_v_og]
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            dbias,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_varlen_func(
@@ -1222,6 +1279,7 @@ def flash_attn_varlen_func(
     return_lse=False,
     return_attn_probs=False,
     block_table=None,
+    out=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -1249,9 +1307,9 @@ def flash_attn_varlen_func(
         q: (total_q, nheads, headdim_q), where total_q = total number of query tokens in the batch.
         k: (total_k, nheads_k, headdim_q), where total_k = total number of key tokens in the batch.
         v: (total_k, nheads_k, headdim_v), where total_k = total number of key tokens in the batch.
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+        cu_seqlens_q: (batch_size + 1,), dtype dtypes.i32. The cumulative sequence lengths
            of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+        cu_seqlens_k: (batch_size + 1,), dtype dtypes.i32. The cumulative sequence lengths
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
@@ -1296,5 +1354,6 @@ def flash_attn_varlen_func(
         return_lse,
         return_attn_probs,
         block_table,
+        out,
         torch.is_grad_enabled(),
     )

@@ -5,12 +5,14 @@ from einops import repeat
 import torch
 import torch.nn.functional as F
 import aiter
+from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
     ck_randval_to_dropout_mask,
-    convert_flash_attn_S_to_softmax)
+    convert_flash_attn_S_to_softmax,
+)
 import pytest
 import sys
 
@@ -27,7 +29,7 @@ def run_torch(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window,
     upcast=True,
-    reorder_ops=False
+    reorder_ops=False,
 ):
     (_, seqlen_q, _, _) = q.shape
     (_, seqlen_k, _, _) = k.shape
@@ -35,24 +37,26 @@ def run_torch(
     if bias is not None:
         attn_bias = bias
     elif alibi_slopes is not None:
-        attn_bias = attn_bias_from_alibi_slopes(alibi_slopes, seqlen_q, seqlen_k, causal=causal)
+        attn_bias = attn_bias_from_alibi_slopes(
+            alibi_slopes, seqlen_q, seqlen_k, causal=causal
+        )
     else:
         attn_bias = None
 
     out, _ = attention_ref(
-            q,
-            k,
-            v,
-            None,
-            None,
-            attn_bias,
-            dropout_p,
-            dropout_mask,
-            causal=causal,
-            window_size=window_size,
-            upcast=upcast,
-            reorder_ops=reorder_ops,
-        )
+        q,
+        k,
+        v,
+        None,
+        None,
+        attn_bias,
+        dropout_p,
+        dropout_mask,
+        causal=causal,
+        window_size=window_size,
+        upcast=upcast,
+        reorder_ops=reorder_ops,
+    )
 
     if dout == None:
         return out
@@ -79,21 +83,21 @@ def run_ck(
     window_size=(-1, -1),  # -1 means infinite context window
     deterministic=False,
     return_lse=True,
-    return_attn_probs=False
+    return_attn_probs=False,
 ):
     out, _, S_dmask = aiter.flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p,
-            causal=causal,
-            window_size=window_size,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
-        )
+        q,
+        k,
+        v,
+        dropout_p,
+        causal=causal,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_lse=return_lse,
+        return_attn_probs=return_attn_probs,
+    )
 
     if dropout_p > 0.0:
         (_, seqlen_q, _, d) = q.shape
@@ -125,7 +129,7 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv, None
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("deterministic", [True, False])
 @pytest.mark.parametrize("bias_type", ["no", "bias", "alibi"])
@@ -178,7 +182,7 @@ def test_flash_attn_output(
     bias_type,
     deterministic,
     mha_type,
-    dtype
+    dtype,
 ):
     torch.random.manual_seed(0)
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
@@ -188,29 +192,91 @@ def test_flash_attn_output(
     return_lse = True
     return_attn_probs = True
 
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True)
-    k = torch.randn(batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype, requires_grad=True)
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True
+    )
+    k = torch.randn(
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d_v,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
 
     attn_bias = None
     alibi_slopes = None
-    if bias_type == 'bias':
-        attn_bias = torch.randn(seqlen_q, seqlen_k, device="cuda", dtype=dtype, requires_grad=True)
-    elif bias_type == 'alibi':
-        alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=torch.float32)
+    if bias_type == "bias":
+        attn_bias = torch.randn(
+            seqlen_q, seqlen_k, device="cuda", dtype=dtype, requires_grad=True
+        )
+    elif bias_type == "alibi":
+        alibi_slopes = torch.rand(
+            batch_size, nheads, device="cuda", dtype=dtypes.fp32
+        )
 
-    dout = torch.randn(batch_size, seqlen_q, nheads, d_v, device="cuda", dtype=dtype, requires_grad=True)
+    dout = torch.randn(
+        batch_size,
+        seqlen_q,
+        nheads,
+        d_v,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
 
     out, dropout_mask, dq, dk, dv, dbias = run_ck(
-        q, k, v, attn_bias, alibi_slopes, dout, dropout_p, causal,
-        window_size, deterministic, return_lse, return_attn_probs)
+        q,
+        k,
+        v,
+        attn_bias,
+        alibi_slopes,
+        dout,
+        dropout_p,
+        causal,
+        window_size,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+    )
 
     out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
-        q, k, v, attn_bias, alibi_slopes, dout, dropout_p, dropout_mask, causal, window_size)
+        q,
+        k,
+        v,
+        attn_bias,
+        alibi_slopes,
+        dout,
+        dropout_p,
+        dropout_mask,
+        causal,
+        window_size,
+    )
 
     out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
-        q, k, v, attn_bias, alibi_slopes, dout, dropout_p, dropout_mask, causal, window_size,
-        upcast=False, reorder_ops=True)
+        q,
+        k,
+        v,
+        attn_bias,
+        alibi_slopes,
+        dout,
+        dropout_p,
+        dropout_mask,
+        causal,
+        window_size,
+        upcast=False,
+        reorder_ops=True,
+    )
 
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
@@ -239,7 +305,7 @@ def test_flash_attn_output(
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     batch_size = 2
     nheads = 5
     (seqlen_q, seqlen_k) = (128, 128)
@@ -248,10 +314,10 @@ if __name__ == '__main__':
     dropout_p = 0.0
     causal = False
     local = False
-    bias_type = 'no'
+    bias_type = "no"
     deterministic = False
-    mha_type = 'mha'
-    dtype = torch.bfloat16
+    mha_type = "mha"
+    dtype = dtypes.bf16
 
     test_flash_attn_output(
         batch_size,
@@ -266,5 +332,5 @@ if __name__ == '__main__':
         bias_type,
         deterministic,
         mha_type,
-        dtype
+        dtype,
     )

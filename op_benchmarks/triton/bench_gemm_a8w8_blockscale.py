@@ -76,9 +76,6 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(M, N, K, metric, provider):
         block_shape_n, block_shape_k = block_shape
-        # TODO: Remove this skip condition
-        assert (N % block_shape_n == 0) and (K % block_shape_k == 0), \
-        f"{N}N/{K}K sizes not aligned to {block_shape}"
 
         c_dtype = torch.bfloat16
         x, weight, x_scale, w_scale = \

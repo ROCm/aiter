@@ -5,10 +5,11 @@
 #include "gemm_a8w8_manifest.h"
 #include "gemm_a8w8_lookup.h"
 #include <cmath>
+#include "py_itfs_common.h"
 
 using RowwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &, 
+                  torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, std::optional<torch::Tensor>,
                   int)>;
 
@@ -101,12 +102,12 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
   // For a given shape, either find the best kernel via lookup or heuristic.
   // For many small M shapes, we bucket them to the next largest kernel.
   // This is fine since kernels are padded anyway.
-  
+
   static const auto lookup = []
   {
     return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType)};
   }();
-  
+
   // First check if this shape(M,N,K) is available in the direct lookup.
   auto it = lookup.find({M, N, K});
   // If we found an optimal kernel, use it.
@@ -148,7 +149,8 @@ torch::Tensor gemm_a8w8(
     std::optional<torch::Tensor> bias,
     int splitK)
 {
-  TORCH_CHECK((XQ.dtype() == at::ScalarType::Char || XQ.dtype() == at::ScalarType::Float8_e4m3fnuz) && XQ.dtype() == WQ.dtype(),
+  TORCH_CHECK((XQ.dtype() == at::ScalarType::Char || XQ.dtype() == torch_fp8) &&
+                  XQ.dtype() == WQ.dtype(),
               "Weights and activations should both be int8/fp8!");
   TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
               "Scales should have the same dtype!");
@@ -160,7 +162,6 @@ torch::Tensor gemm_a8w8(
   int N = WQ.size(0);
   int K = XQ.size(1);
   int KBatch = std::pow(2, splitK);
-
 
   if (XQ.dtype() == at::ScalarType::Char)
   {

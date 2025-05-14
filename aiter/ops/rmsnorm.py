@@ -92,21 +92,21 @@ def rmsnorm2d_fwd_with_add_smoothquant(
 ): ...
 
 
-# @compile_ops("module_rmsnorm")
-# def rmsnorm2d_fwd_with_dynamicquant(
-#     out: Tensor,
-#     input: Tensor,
-#     yscale: Tensor,
-#     weight: Tensor,
-#     epsilon: float):...
+@compile_ops("module_rmsnorm")
+def rmsnorm2d_fwd_with_dynamicquant(
+    out: Tensor,
+    input: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    epsilon: float):...
 
 
-# @compile_ops("module_rmsnorm")
-# def rmsnorm2d_fwd_with_add_dynamicquant(
-#     out: Tensor,
-#     input: Tensor,
-#     residual_in: Tensor,
-#     residual_out: Tensor,
-#     yscale: Tensor,
-#     weight: Tensor,
-#     epsilon: float):...
+@compile_ops("module_rmsnorm")
+def rmsnorm2d_fwd_with_add_dynamicquant(
+    out: Tensor,
+    input: Tensor,
+    residual_in: Tensor,
+    residual_out: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    epsilon: float):...

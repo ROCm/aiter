@@ -217,7 +217,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_ASM_DIR}/fmoe_2stages/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'"
     },
     "module_moe": {
         "srcs": [

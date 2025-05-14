@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
 from torch.profiler import profile, record_function, ProfilerActivity
+from aiter import dtypes
 
 input_shapes = [
         (512,), (1280, 232, 256), (256, 256), (256, 8192), (256,), (1280, 32, 256), 
@@ -49,8 +50,8 @@ other_strides = [
         (1,), (8, 1, 1),
         ]
 
-tensors0 = [torch.empty_strided(shape, stride, dtype=torch.bfloat16, device='cuda') for shape, stride in zip(input_shapes, input_strides)]  
-tensors1 = [torch.empty_strided(shape, stride, dtype=torch.bfloat16, device='cuda') for shape, stride in zip(other_shapes, other_strides)]
+tensors0 = [torch.empty_strided(shape, stride, dtype=dtypes.bf16, device='cuda') for shape, stride in zip(input_shapes, input_strides)]  
+tensors1 = [torch.empty_strided(shape, stride, dtype=dtypes.bf16, device='cuda') for shape, stride in zip(other_shapes, other_strides)]
 for tensor in tensors0:
     tensor.copy_(torch.rand_like(tensor))  
     # tensor.fill_(1)
@@ -58,10 +59,10 @@ for tensor in tensors1:
     tensor.copy_(torch.rand_like(tensor))  
     # tensor.fill_(1)
 
-# tensor0 = torch.empty_strided(shape0, stride0, dtype=torch.bfloat16, device='cuda')
-# tensor1 = torch.empty_strided(shape1, stride1, dtype=torch.bfloat16, device='cuda')
-# # tensor0 = torch.empty_strided(shape0, stride0, dtype=torch.float32, device='cuda')
-# # tensor1 = torch.empty_strided(shape1, stride1, dtype=torch.float32, device='cuda')
+# tensor0 = torch.empty_strided(shape0, stride0, dtype=dtypes.bf16, device='cuda')
+# tensor1 = torch.empty_strided(shape1, stride1, dtype=dtypes.bf16, device='cuda')
+# # tensor0 = torch.empty_strided(shape0, stride0, dtype=dtypes.fp32, device='cuda')
+# # tensor1 = torch.empty_strided(shape1, stride1, dtype=dtypes.fp32, device='cuda')
 # random_data0 = torch.rand(shape0)
 # # tensor0.copy_(random_data0)
 # tensor0.fill_(0)
@@ -74,7 +75,7 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True,
         with_stack=True, with_modules=True, record_shapes = True) as prof:
         for j in range(100):
-            #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=torch.float32).to(torch.int32)
+            #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=dtypes.fp32).to(dtypes.i32)
             result = torch.add(tensor0, tensor1)
             # result_con = result.contiguous()
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
@@ -82,7 +83,7 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True,
         with_stack=True, with_modules=True, record_shapes = True) as prof:
         for j in range(100):
-            #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=torch.float32).to(torch.int32)
+            #cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=dtypes.fp32).to(dtypes.i32)
             # output = torch.empty_like(tensor1)
             output = aiter.add(tensor0, tensor1)
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
