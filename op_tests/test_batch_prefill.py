@@ -257,8 +257,8 @@ def test_batch_prefill_with_paged_kv_cache(
             dim=0,
         ).to(dtype)
 
-        # enlarge atol for bf16 to allow passing very few numeric errors
-        rtol, atol = (1e-3, 1e-3) if dtype == torch.float16 else (4e-2, 1e-2)
+        # enlarge rtol for bf16 to allow passing very few numeric errors
+        rtol, atol = (1e-3, 1e-3) if dtype == torch.float16 else (2e-2, 1e-2)
 
         o_ref_i = ref_masked_attention(
             qi, ki, vi, causal=causal, logits_soft_cap=logits_soft_cap
