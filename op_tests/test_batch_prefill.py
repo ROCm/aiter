@@ -14,13 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import itertools
+import math
 import pytest
 import torch
-from torch.profiler import profile, record_function, ProfilerActivity
-import flashinfer
-import math
 
-import os
 import aiter
 from einops import rearrange, repeat
 
@@ -127,7 +125,7 @@ def ref_masked_attention(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("q_init_min,q_init_max", [(-10, 10)])
 @pytest.mark.parametrize("kv_init_min,kv_init_max", [(-5, 5)])
-@pytest.mark.parametrize("seed", [123])
+@pytest.mark.parametrize("seed", [19378])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -283,21 +281,27 @@ def test_batch_prefill_with_paged_kv_cache(
 
 
 if __name__ == "__main__":
-    test_batch_prefill_with_paged_kv_cache(
-        batch_size=1,
-        kv_len=8192,
-        qo_len=8192,
-        page_size=1,
-        num_qo_heads=6,
-        num_kv_heads=1,
-        head_dim=128,
-        causal=True,
-        logits_soft_cap=30.0,
-        contiguous_kv=True,
-        dtype=torch.float16,
-        q_init_min=-3,
-        q_init_max=3,
-        kv_init_min=-3,
-        kv_init_max=3,
-        seed=19378,
-    )
+    for (
+        causal,
+        logits_soft_cap,
+        dtype,
+    ) in itertools.product([False, True], [0.0, 30.0], [torch.float16, torch.bfloat16]):
+        test_batch_prefill_with_paged_kv_cache(
+            batch_size=1,
+            kv_len=8192,
+            qo_len=8192,
+            page_size=1,
+            num_qo_heads=6,
+            num_kv_heads=1,
+            head_dim=128,
+            causal=causal,
+            kv_layout="NHD",
+            logits_soft_cap=logits_soft_cap,
+            contiguous_kv=True,
+            dtype=dtype,
+            q_init_min=-10,
+            q_init_max=10,
+            kv_init_min=-5,
+            kv_init_max=5,
+            seed=19378,
+        )
