@@ -272,13 +272,13 @@ def _attn_fwd_inner(
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
             qk += tl.dot(q, k)
-        qk_scaled = qk * SM_SCALE
+
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
             mask = mask and causal_mask
 
-        qk_scaled = tl.where(mask, qk_scaled, float("-inf"))
+        qk = tl.where(mask, qk, float("-inf"))
 
         if alibi_slope is not None:
             # Compute the global position of each token within the sequence
@@ -287,15 +287,16 @@ def _attn_fwd_inner(
             alibi_block = compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, global_m_positions, global_n_positions
             )
-            qk_scaled += alibi_block
+            qk += alibi_block / SM_SCALE
         # get max scores so far
-        m_ij = tl.maximum(m_i, tl.max(qk_scaled, 1))
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        m_ij_scaled = m_ij * SM_SCALE * RCP_LN2
 
         # scale and subtract max
-        q_shifted = qk_scaled - m_ij[:, None]
+        q_shifted = qk * SM_SCALE * RCP_LN2 - m_ij_scaled[:, None]
 
         # Compute scaled QK and softmax probabilities
-        p = tl.math.exp2(q_shifted * RCP_LN2)
+        p = tl.math.exp2(q_shifted)
 
         # CAVEAT: Must update l_ij before applying dropout
         l_ij = tl.sum(p, 1)
@@ -319,8 +320,8 @@ def _attn_fwd_inner(
         # -- update output accumulator --
         # alpha is an adjustment factor for acc and li as we loop and find new maxes
         # store the diff in maxes to adjust acc and li as we discover new maxes
-        m_diff = m_i - m_ij
-        alpha = tl.math.exp2(m_diff * RCP_LN2)
+        m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
+        alpha = tl.math.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
         v = load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         # -- update m_i and l_i
@@ -346,6 +347,57 @@ def _attn_fwd_inner(
             philox_ptrs += BLOCK_N * stride_sn
 
     return acc, l_i, m_i
+
+
+@triton.jit
+def _remap_XCD(k, N, NUM_XCD):
+    r = k % NUM_XCD
+    m = k // NUM_XCD
+    q = N // NUM_XCD
+    t = N - NUM_XCD * q
+    u = min(r, t + 1)
+    new_index = u * q + (r - u) * (q - 1) + r + m
+    return new_index
+
+
+@triton.jit
+def _balance_attn_workload(
+    wid,
+    NUM_XCD: tl.constexpr,
+    BATCH,
+    NUM_Q_HEADS,
+    SEQLEN_Q,
+    BLOCK_M,
+):
+    # Traversal strategy along dims: seqlen, q_head, batch
+    # 1. Fastest changing dim is the q_head dim. At every <NUM_XCD>th wid, increase the sequence block id (start_m).
+    # 2. When we are done with <CHUNK_BLOCKS_SIZE> blocks along seqlen, we move to the next set of <NUM_XCD> q_heads.
+    # 3. Batch changes last.
+
+    # so XCD 0 should get workgroups with indices (batch, head q idx, start_m)
+    # (0, 0, 0), (0, 0, 1), (0, 0, 2), ..., (0, 0, CHUNK_BLOCKS_SIZE), (0, NUM_XCD, 0)
+    # XCD 1
+    # (0, 1, 0), (0, 1, 1), (0, 1, 2), ..., (0, 1, CHUNK_BLOCKS_SIZE), (0, NUM_XCD+1, 0)
+    # ...
+    # XCD <NUM_XCD - 1>
+    # (0, NUM_XCD-1, 0), (0, NUM_XCD-1, 1), (0, NUM_XCD-1, 2), ..., (0, NUM_XCD-1, CHUNK_BLOCKS_SIZE), (0, 2 * NUM_XCD-1, 0)
+
+    # Notice that on the same round robin turn, XCDs get the same start_m, i.e. workgroups with equal workloads.
+    # But also consequent sequence blocks are sent to the same XCD, so they can benefit from L2 caching.
+
+    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    CHUNK_BLOCKS_SIZE = 1  # (NUM_CUs_PER_XCD // (NUM_Q_HEADS // NUM_K_HEADS))
+    off_q_head = (
+        wid % NUM_XCD + wid // (CHUNK_BLOCKS_SIZE * NUM_XCD) * NUM_XCD
+    ) % NUM_Q_HEADS
+    start_m = (
+        (wid // NUM_XCD) % CHUNK_BLOCKS_SIZE
+        + wid // (CHUNK_BLOCKS_SIZE * NUM_Q_HEADS) * CHUNK_BLOCKS_SIZE
+    ) % NUM_BLOCKS
+    off_z = wid // (NUM_BLOCKS * NUM_Q_HEADS) % BATCH
+    off_q_head = _remap_XCD(off_q_head, NUM_Q_HEADS - 1, NUM_XCD)
+
+    return off_z, off_q_head, start_m
 
 
 @triton.jit
@@ -409,12 +461,25 @@ def _attn_fwd(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     VARLEN: tl.constexpr,
+    BATCH,
+    NUM_XCD: tl.constexpr,
 ):
     # calculate offsets
-    off_z = tl.program_id(0)  # batch
-    off_q_head = tl.program_id(1)  # num_q_heads
-    start_m = tl.program_id(2)  # seqlen_q
+    wid = tl.program_id(
+        0
+    )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
+    # num blocks along seqlen
 
+    off_z, off_q_head, start_m = _balance_attn_workload(
+        wid,
+        NUM_XCD,
+        BATCH,
+        NUM_Q_HEADS,
+        SEQLEN_Q,
+        BLOCK_M,
+    )
+
+    # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
@@ -732,7 +797,8 @@ def _attn_fwd(
         RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
-        mi_base2 = m_i * RCP_LN2
+        # mi_base2 = m_i * RCP_LN2
+        mi_base2 = m_i * RCP_LN2 * sm_scale
         softmax_lse = mi_base2 + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
@@ -892,12 +958,21 @@ def _flash_attn_forward(
         "num_ctas": 1,
         "num_stages": 1,
     }
+    # Dropout significantly increases VGPR usage so use small tiles
+    if enable_dropout:
+        config = {
+            "BLOCK_M": 32,
+            "BLOCK_N": 32,
+            "waves_per_eu": 1,
+            "num_warps": 2,
+            "num_ctas": 1,
+            "num_stages": 1,
+        }
 
     grid = lambda META: (  # noqa: E731
-        batch,
-        num_q_heads,
-        triton.cdiv(seqlen_q, META["BLOCK_M"]),
+        batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
     )
+
     _attn_fwd[grid](
         q,
         k,
@@ -944,6 +1019,8 @@ def _flash_attn_forward(
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
+        BATCH=batch,
+        NUM_XCD=8,
         **config,
     )
 

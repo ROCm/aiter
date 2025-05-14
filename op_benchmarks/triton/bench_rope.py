@@ -2,12 +2,26 @@ import argparse
 import sys
 import torch
 import triton
+from triton.testing import runtime
+from aiter.ops.triton.rope import RotateStyle
 from aiter.ops.triton.rope import (
-    RotateStyle,
+    rope_fwd,
+    rope_fwd_inplace,
+    rope_fwd_thd,
+    rope_fwd_thd_inplace,
+    # rope_cached_fwd,
+    # rope_cached_fwd_inplace,
+    # rope_cached_positions_fwd,
+    # rope_cached_positions_fwd_inplace,
+    # rope_cached_positions_offsets_fwd,
+    # rope_cached_positions_offsets_fwd_inplace,
     rope_cached_thd_positions_2c_fwd,
+    rope_cached_thd_positions_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_fwd,
+    rope_cached_thd_positions_offsets_2c_fwd_inplace,
+    # rope_fwd_2d,
+    # rope_fwd_2d_inplace,
 )
-
-# from utils.benchmark_utils import get_model_configs, get_available_models
 
 
 # TODO: move to aiter/op_tests/triton_tests/test_rope_triton.py
@@ -63,7 +77,6 @@ def generate_rope_inputs(
         if offs
         else None
     )
-    # ref_freqs = freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(-2) if pos else freqs
 
     cos = torch.cos(freqs) if cached else None
     sin = torch.sin(freqs) if cached else None
@@ -87,7 +100,6 @@ def str_to_bool(v, vstr):
 def get_x_vals():
     """
     this get_x_vals is for DeepSeekV2 (thd)
-    https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/config.json
     H = num_attention_heads = 128
     D = qk_rope_head_dim = 64
     """
@@ -269,9 +281,16 @@ def run_benchmark(args):
         flops = B * S * H * (D / 2.0) * 3.0 * 2.0 * (2.0 if two_inputs else 1.0)
 
         # memory transfer (B = 1, T = S for thd layout, positions and offsets are always int)
+
         mem_read = (
-            B * S * H * D * ((2.0 * x.element_size()) if two_inputs else 1.0)
-            + S * D * ((2.0 * freqs.element_size()) if cached else 1.0)
+            B
+            * S
+            * H
+            * D
+            * ((2.0 * x.element_size()) if two_inputs else (1.0 * x.element_size()))
+            + S
+            * D
+            * ((2.0 * freqs.element_size()) if cached else (1.0 * freqs.element_size()))
             + B * S * ((1.0 * positions.element_size()) if pos else 0.0)
             + B * S * ((1.0 * offsets.element_size()) if offs else 0.0)
         )
@@ -279,45 +298,135 @@ def run_benchmark(args):
         mem_write = B * S * H * D * (2.0 if two_inputs else 1.0) * x.element_size()
         mem = mem_read + mem_write
 
+        transpose_output = False
         fn = None
-        if (
-            cached
-            and two_inputs
-            and pos
-            and not offs
-            and layout == "thd"
-            and not inplace
-        ):
-            fn = lambda: rope_cached_thd_positions_2c_fwd(  # noqa: E731
-                x,
-                y,
-                cos,
-                sin,
-                positions,
-                rotate_style,
-                reuse_freqs_front_part,
-                nope_first,
-                transpose_output=False,
-            )
-        # elif not cached and not two_inputs and not pos and not offs:
-        #     if layout == "sbhd":
-        #         if inplace:
-        #             fn = lambda: rope_fwd_inplace(x, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output = False)
-        #         else:
-        #             fn = lambda: rope_fwd(x, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output = False)
-        #     elif layout == "thd":
-        #         seqlens = [0, S]
-        #         cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
-        #         if inplace:
-        #             fn = lambda: rope_fwd_thd_inplace(x, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output = False)
-        #         else:
-        #             fn = lambda: rope_fwd_thd(x, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output = False)
-        else:
+        if two_inputs and cached and pos and layout == "thd":
+            if offs:
+                if inplace:
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_fwd(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+            else:
+                if inplace:
+                    fn = lambda: rope_cached_thd_positions_2c_fwd_inplace(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_cached_thd_positions_2c_fwd(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+
+        # TODO enable these versions after passing tests in test_rope_trition.py
+        # if not two_inputs and cached and pos and offs and layout == "sbhd":
+        #     if inplace:
+        #         fn = lambda: rope_cached_positions_offsets_fwd_inplace(x, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+        #     else:
+        #         fn = lambda: rope_cached_positions_offsets_fwd(x, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+        # if not two_inputs and cached and pos and not offs and layout == "sbhd":
+        #     if inplace:
+        #         fn = lambda: rope_cached_positions_fwd_inplace(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+        #     else:
+        #         fn = lambda: rope_cached_positions_fwd(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+        # if not two_inputs and cached and not pos and not offs and layout == "sbhd":
+        #     if inplace:
+        #         fn = lambda : rope_cached_fwd_inplace(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+        #     else:
+        #         fn = lambda : rope_cached_fwd(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+
+        # TODO enable rope_fwd_2d and rope_fwd_2d_inplace,
+
+        if not two_inputs and not cached and not pos and not offs:
+            if layout == "sbhd":
+                if inplace:
+                    fn = lambda: rope_fwd_inplace(  # noqa: E731
+                        x,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_fwd(  # noqa: E731
+                        x,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+            elif layout == "thd":
+                seqlens = [0, S]
+                cu_seqlens = torch.Tensor(seqlens).to(torch.int).to(freqs.device)
+                if inplace:
+                    fn = lambda: rope_fwd_thd_inplace(  # noqa: E731
+                        x,
+                        cu_seqlens,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_fwd_thd(  # noqa: E731
+                        x,
+                        cu_seqlens,
+                        freqs,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+
+        if fn is None:
             raise NotImplementedError(
                 f"No API with option: [layout='{layout}', cached={cached}, two_inputs={two_inputs}, pos={pos}, offs={offs}, inplace={inplace}]."
             )
-
-        from triton.testing import runtime
 
         di = runtime.driver.active.get_device_interface()
         cache = runtime.driver.active.get_empty_cache_for_benchmark()
@@ -328,10 +437,6 @@ def run_benchmark(args):
             di.synchronize()
 
         return flops, mem
-
-        # ms = triton.testing.do_bench(fn, warmup=25, rep=100)
-        # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        # return bandwidth
 
     for x_vals in x_vals_list:
         print("Running input config:")
@@ -381,9 +486,9 @@ def parse_args():
         help="turn on reuse_freqs_front_part",
         default="true",
     )
-    parser.add_argument("--nope", type=str, help="turn on nope", default="true")
+    parser.add_argument("--nope", type=str, help="turn on nope", default="false")
     parser.add_argument(
-        "--nope_first", type=str, help="turn on nope_fist", default="true"
+        "--nope_first", type=str, help="turn on nope_fist", default="false"
     )
     parser.add_argument("--pos", type=str, help="input positions", default="true")
     parser.add_argument("--offs", type=str, help="input offsets", default="false")
@@ -397,7 +502,6 @@ def parse_args():
     parser.add_argument(
         "--repeat", type=int, help="number of repetition for benchmark", default=1000
     )
-
     args = parser.parse_args()
     return args
 
