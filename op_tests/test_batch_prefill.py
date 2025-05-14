@@ -16,6 +16,7 @@ limitations under the License.
 
 import itertools
 import math
+import os
 import pytest
 import torch
 
@@ -80,13 +81,13 @@ def ref_masked_attention(
 
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
     if 0 < logits_soft_cap:
-        # attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
-        attn_weights = attn_weights / (1.0 + torch.abs(attn_weights / logits_soft_cap))
-        # mode = int(os.environ.get('CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT', 0))
-        # if mode == 0:
-        #     attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
-        # else:
-        #     attn_weights = attn_weights / (1.0 + torch.abs(attn_weights / logits_soft_cap))
+        mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0))
+        if mode == 0:
+            attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
+        else:
+            attn_weights = attn_weights / (
+                1.0 + torch.abs(attn_weights / logits_soft_cap)
+            )
 
     if window_size[0] >= 0 or window_size[1] >= 0:
         local_mask = construct_local_mask(
