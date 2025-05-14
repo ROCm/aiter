@@ -21,8 +21,10 @@ It supporst page size = 1.
 import triton
 import triton.language as tl
 
+
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
+
 
 _is_cuda = False
 

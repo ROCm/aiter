@@ -23,8 +23,10 @@ import triton.language as tl
 
 from aiter.ops.triton.prefill_attention import context_attention_fwd
 
+
 def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
+
 
 _is_cuda = False
 
@@ -340,7 +342,6 @@ def extend_attention_fwd(
 
     BLOCK_M, BLOCK_N = (64, 64)
     num_warps = 4
-
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
