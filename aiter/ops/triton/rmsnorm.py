@@ -720,11 +720,10 @@ def get_num_sms():
 
 
 def get_dtype_max(dtype):
-    try:
-        dtypeMax = torch.finfo(dtype).max
-    except:
-        dtypeMax = torch.iinfo(dtype).max
-    return dtypeMax
+    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).max
+    else:
+        return torch.iinfo(dtype).max
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float = 1e-6):
@@ -737,7 +736,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float = 1e-6):
     USE_BLOCKED = n_cols > blk_size
     NUM_PRGMS = min(n_rows, get_num_sms())
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
     _rms_norm_kernel[grid](
         x,
         y,
@@ -771,7 +770,7 @@ def rmsnorm2d_fwd_with_add(
     USE_BLOCKED = n_cols > blk_size
     NUM_PRGMS = min(n_rows, get_num_sms())
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
     _fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -815,7 +814,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -861,7 +860,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -909,7 +908,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -959,7 +958,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)
+    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,

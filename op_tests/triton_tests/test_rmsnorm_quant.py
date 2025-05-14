@@ -2,12 +2,14 @@ import torch
 import pytest
 import triton
 import aiter
-from aiter.ops.triton.rmsnorm import rms_norm
-from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add
-from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_smoothquant
-from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_dynamicquant
-from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add_smoothquant
-from aiter.ops.triton.rmsnorm import rmsnorm2d_fwd_with_add_dynamicquant
+from aiter.ops.triton.rmsnorm import (
+    rms_norm,
+    rmsnorm2d_fwd_with_add,
+    rmsnorm2d_fwd_with_smoothquant,
+    rmsnorm2d_fwd_with_dynamicquant,
+    rmsnorm2d_fwd_with_add_smoothquant,
+    rmsnorm2d_fwd_with_add_dynamicquant,
+)
 
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
@@ -18,9 +20,8 @@ def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
     rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1) * 1 / N)
     rsigma = 1.0 / rms
     rms_norm_f32 = x_f32 * rsigma.unsqueeze(1) * g_f32
-    # rms_norm = rms_norm_f32.to(out_dtype)
-    # return rms_norm
-    return rms_norm_f32
+    rms_norm = rms_norm_f32.to(out_dtype)
+    return rms_norm
 
 
 def run_torch(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
@@ -39,7 +40,7 @@ def run_torch(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=Non
 
 
 def run_triton(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
-    out_before_quant = None
+    # out_before_quant = None
     if y_scale_dtype is None:
         y_scale = None
         if residual is None:
