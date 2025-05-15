@@ -2122,7 +2122,7 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c(
                 D_MODEL,
             ),
         )
-        
+
         x_rotated = tl.flip(x_rotated, 1)
         y_rotated = tl.flip(y_rotated, 1)
 
@@ -2229,7 +2229,7 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa(
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
     x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
-    
+
     x_rotated_mask = (x_offs_d < D_MODEL_HALF)[None, :]
 
     y_offs = (
@@ -3478,6 +3478,7 @@ def _rope_cat_cached_thd_positions_offsets_2c_gqa_fwd(
             )
 
     return out_x, out_y
+
 
 def rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(
     x: torch.Tensor,
