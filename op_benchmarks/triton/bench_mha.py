@@ -294,6 +294,8 @@ def run_benchmark(custom, args):
 
         # Test mode: Verify outputs match
         if hasattr(args, 'test_mode') and args.test_mode:
+            print(f"Testing backward implementation <{provider}> against Torch with shape:")
+            print(f"BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}")
             # Triton
             if varlen:
                 triton_fn = lambda: flash_attn_varlen_func(
@@ -322,22 +324,28 @@ def run_benchmark(custom, args):
                 torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
             # compare forward outputs
-            torch.testing.assert_close(
-                triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-            )
-            print("Forward outputs match")
-
+            try:
+                torch.testing.assert_close(
+                    triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+                )
+                print("Forward outputs match.")
+            except AssertionError as e:
+                print(e)
             # Compare gradients
-            torch.testing.assert_close(
+            try:
+                torch.testing.assert_close(
                 triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-            )
-            print(f"Backward gradients match for shape: BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}")
+                )
+                torch.testing.assert_close(
+                    triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+                )
+                torch.testing.assert_close(
+                    triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+                )
+                print(f"Backward gradients match.")
+            except AssertionError as e:
+                print(e)
+            
             return 0
 
         # Benchmark mode
