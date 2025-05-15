@@ -429,7 +429,7 @@ def test_rope_fwd_cached(
 # @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
 # @pytest.mark.parametrize("H", [1, 8, 32, 128])
 # @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("T", [(32)])
+@pytest.mark.parametrize("T", [32])
 @pytest.mark.parametrize("H", [32])
 @pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
 # @pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
@@ -549,6 +549,7 @@ def test_rope_fwd_cached_thd_2c(
     torch.testing.assert_close(triton_out_x, torch_out_x, atol=1e-3, rtol=1e-1)
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
+
 # @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
 # @pytest.mark.parametrize("H", [1, 8, 32, 128])
 # @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
@@ -641,7 +642,7 @@ def test_rope_fwd_cached_thd_2c_gqa(
             #     nope_first=False,
             #     transpose_output=False,
             # )
-    else:    
+    else:
         if inplace:
             triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd_inplace(
                 x,
@@ -673,6 +674,7 @@ def test_rope_fwd_cached_thd_2c_gqa(
 
     torch.testing.assert_close(triton_out_x, torch_out_x, atol=1e-3, rtol=1e-1)
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
+
 
 @pytest.mark.parametrize("B", [1, 2, 15, 32, 57])
 @pytest.mark.parametrize("H", [1, 8, 32])
