@@ -3434,12 +3434,12 @@ def _flash_attn_fused_backward(
     # Fuses dk,dv and dq computations into one kernel using atomics
     BLOCK_N = 64 if ( (BLOCK_D_MODEL_POW2 > 160) or (q.dtype==torch.float32) ) else 128 # larger head sizes lead to oom
     config = {
-        "BLOCK_M": 64,
+        "BLOCK_M": 16,
         "BLOCK_N": BLOCK_N,
-        "num_warps": 4,
+        "num_warps": 8,
         "num_stages": 1,
-        "waves_per_eu": 1,
-        "BLK_SLICE_FACTOR": 2,
+        "waves_per_eu": 2,
+        "BLK_SLICE_FACTOR": 1,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
