@@ -848,8 +848,6 @@ def _attn_fwd(
     op = acc.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
-<<<<<<< HEAD
-=======
 @functools.lru_cache(maxsize=1024)
 def _get_config_attn_fwd():
     if not hasattr(_get_config_attn_fwd, "_attn_fwd_config_dict"):
@@ -2738,12 +2736,8 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
-<<<<<<< HEAD
-        is_grad_enabled,
-=======
         is_grad_enabled, 
         config,
->>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -2753,7 +2747,6 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-<<<<<<< HEAD
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
                 q,
@@ -2769,24 +2762,8 @@ class FlashAttnFunc(torch.autograd.Function):
                 return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
+                config=config
             )
-=======
-        out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = _flash_attn_forward(
-            q,
-            k,
-            v,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
-            return_softmax=return_softmax and dropout_p > 0,
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
-            config=config
->>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
         )
 
         if is_grad:
@@ -2937,10 +2914,7 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-<<<<<<< HEAD
-=======
         config
->>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
     )
 
 
