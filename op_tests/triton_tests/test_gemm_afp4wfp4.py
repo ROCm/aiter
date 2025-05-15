@@ -10,19 +10,11 @@ SCALE_GROUP_SIZE = 32
 def generate_gemm_afp4wfp4_inputs(M, N, K):
     torch.manual_seed(5)
     # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(
-        0, 16, (M, K // 2), dtype=torch.uint8, device="cuda"
-    )
-    x_high = torch.randint(
-        0, 16, (M, K // 2), dtype=torch.uint8, device="cuda"
-    )
+    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
     x = x_low | x_high << 4
-    w_low = torch.randint(
-        0, 16, (N, K // 2), dtype=torch.uint8, device="cuda"
-    )
-    w_high = torch.randint(
-        0, 16, (N, K // 2), dtype=torch.uint8, device="cuda"
-    )
+    w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+    w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w = w_low | w_high << 4
     w = w.T
     # Scale of 1.0 in e8m0, bias 127.

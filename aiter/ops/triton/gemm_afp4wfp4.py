@@ -251,12 +251,12 @@ def gemm_afp4wfp4(
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
         else:
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
-    elif M < 128:
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
+    elif M <= 128:
+        BLOCK_SIZE_M = triton.next_power_of_2(M)
+        BLOCK_SIZE_N = 128
         BLOCK_SIZE_K = 256
         GROUP_SIZE_M = 1
-        waves_per_eu = 6
+        waves_per_eu = 4
         kpack = 1
         num_warps = 4
         num_stages = 2
@@ -272,11 +272,11 @@ def gemm_afp4wfp4(
         else:
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
     elif M <= 256:
-        BLOCK_SIZE_M = 32
-        BLOCK_SIZE_N = 64
+        BLOCK_SIZE_M = 128
+        BLOCK_SIZE_N = 128
         BLOCK_SIZE_K = 256
         GROUP_SIZE_M = 2
-        waves_per_eu = 6
+        waves_per_eu = 4
         kpack = 1
         num_warps = 4
         num_stages = 2
@@ -349,7 +349,7 @@ def gemm_afp4wfp4(
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = (
-            128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 16
+            128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 64
         )
         ACTUAL_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
 
