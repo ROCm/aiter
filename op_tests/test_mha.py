@@ -3,8 +3,6 @@
 
 import torch
 import aiter
-
-# import aiter.ops.triton.mha as aiter
 from aiter import dtypes
 from aiter.test_mha_common import (
     attention_ref,
