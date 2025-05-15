@@ -826,6 +826,6 @@ def test_mha_fused_backward_varlen(
 
 if __name__ == "__main__":
     # Run the tests
-    test_mha_fused_backward_varlen(4, 1024, 1024, 32, 8, 128, 0.0, True, False, torch.float16)
+    test_mha_fused_backward_varlen(4, 1024, 1024, 32, 8, 128, 0.0, True, False, torch.float32)
     torch.cuda.synchronize()
     print("Fused backward test passes!")
