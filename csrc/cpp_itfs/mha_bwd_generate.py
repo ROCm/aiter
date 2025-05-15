@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
 import argparse
@@ -11,6 +11,7 @@ GEN_DIR = ""  # in Cmake, have to generate files in same folder
 AITER_API_FILENAME = "mha_bwd.cpp"
 
 AITER_CPP_API = """#include "mha_bwd.h"
+#include <ostream>
 
 namespace aiter {{
 mha_bwd_traits get_mha_bwd_traits(int head_size_q,
@@ -56,11 +57,15 @@ float mha_bwd(mha_bwd_args args,
               bool is_v3_atomic_fp32,
               int how_v3_bf16_cvt)
 {{
+    if (args.hdim_q % 8 != 0) {{
+        std::cout << "not supported yet: hdim_q must be divided by 8" << std::endl;
+        return -1;
+    }}
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0;
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
-    auto traits = get_mha_bwd_traits(head_size_q, 
+    auto traits = get_mha_bwd_traits(head_size_q,
                                      head_size_v,
                                      q_dtype_str,
                                      is_group_mode,
