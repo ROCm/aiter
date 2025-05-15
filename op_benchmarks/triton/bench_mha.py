@@ -201,7 +201,7 @@ def create_benchmark_configs(custom, args):
         line_vals = [f'Triton({unit})', f'Torch({unit})']
 
     if args.test_mode:
-        line_vals = ["test_mode"]
+        line_vals = [f'onekernel-bwd({unit})'] if args.onekernel_bwd else [f'fused-bwd({unit})']
 
     configs.append(
         triton.testing.Benchmark(
@@ -325,16 +325,17 @@ def run_benchmark(custom, args):
             torch.testing.assert_close(
                 triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
             )
-            print("Forward outputs match!")
+            print("Forward outputs match")
+
             # Compare gradients
+            torch.testing.assert_close(
+                triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+            )
             torch.testing.assert_close(
                 triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
             )
             torch.testing.assert_close(
                 triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-            )
-            torch.testing.assert_close(
-                triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
             )
             print(f"Backward gradients match for shape: BATCH={BATCH}, HQ={HQ}, HK={HK}, N_CTX_Q={N_CTX_Q}, N_CTX_K={N_CTX_K}, D_HEAD={D_HEAD}")
             return 0

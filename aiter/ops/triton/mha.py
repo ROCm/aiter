@@ -2465,7 +2465,7 @@ def _bwd_dkdvdq_inner(
 
     for iter in range(num_steps):
         # Compute the permuted block index
-        blk_idx = (start_idx + iter) % num_steps
+        blk_idx = iter # (start_idx + iter) % num_steps
 
         curr_m = start_m + blk_idx * step_m
         qT_ptrs = qT_ptrs_start + blk_idx * step_m * stride_q_m
@@ -2635,9 +2635,13 @@ def _bwd_kernel_dkdvdq_causal(
     wid = tl.program_id(0) # workgoup id: 0, ..., NUM_Q_PIDS * BATCH * NUM_K_HEADS - 1
     batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8)
     # In the backward we dont want concurrent workgroups to handle consecutive heads or blocks, so remap them to be far apart.
-    head_q_idx = head_q_idx * 29 % NUM_Q_HEADS
-    seq_k_blk_idx = seq_k_blk_idx * 29 % NUM_K_PIDS
-
+    head_q_idx = (head_q_idx * 29) % NUM_Q_HEADS
+    seq_k_blk_idx = (seq_k_blk_idx) * 29 % NUM_K_PIDS
+    
+    # or regular batch, heads, blocks ordering
+    # batch_idx = wid % BATCH
+    # head_q_idx = (wid // BATCH) % NUM_Q_HEADS
+    # seq_k_blk_idx = (wid // (BATCH * NUM_Q_HEADS)) % NUM_K_PIDS
 
     head_k_idx = head_q_idx // GROUP_SIZE
     num_atomics_concurrent = NUM_SMS // (NUM_Q_HEADS *  BATCH)
@@ -2749,8 +2753,8 @@ def _bwd_kernel_dkdvdq_causal(
 
 
     # when q < k, we may skip the initial masked op
-    # if seq_k_blk_idx < num_blocks_skip:
-    #     num_steps = 0
+    if seq_k_blk_idx < num_blocks_skip:
+        num_steps = 0
 
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx)
@@ -3428,7 +3432,7 @@ def _flash_attn_fused_backward(
 
 
     # Fuses dk,dv and dq computations into one kernel using atomics
-    BLOCK_N = 128 if BLOCK_D_MODEL_POW2 < 160 else 64 # larger head sizes lead to oom
+    BLOCK_N = 64 if ( (BLOCK_D_MODEL_POW2 > 160) or (q.dtype==torch.float32) ) else 128 # larger head sizes lead to oom
     config = {
         "BLOCK_M": 32,
         "BLOCK_N": BLOCK_N,
@@ -3473,6 +3477,8 @@ def _flash_attn_fused_backward(
             **config,
         )
     else:
+        # in non causal inner loop over grouped q heads
+        grid_dkdvdq = (batch * num_k_heads * num_k_pids,) 
         _bwd_kernel_dkdvdq_noncausal[grid_dkdvdq](
             q, k, v, sm_scale, do, dk, dv, dq,
             softmax_lse, delta,
