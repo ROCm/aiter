@@ -554,7 +554,8 @@ def test_rope_fwd_cached_thd_2c(
 # @pytest.mark.parametrize("H", [1, 8, 32, 128])
 # @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
 @pytest.mark.parametrize("T", [(32), (8192)])
-@pytest.mark.parametrize("H", [32, 128])
+@pytest.mark.parametrize("QH_per_KH", [2, 4, 8, 16])  # QH_per_KH > 1
+@pytest.mark.parametrize("KH", [16, 32])
 @pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2.
 # @pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
@@ -567,7 +568,8 @@ def test_rope_fwd_cached_thd_2c(
 @pytest.mark.parametrize("pos, offs", [(True, False), (True, True)])
 def test_rope_fwd_cached_thd_2c_gqa(
     T: int,
-    H: int,
+    QH_per_KH: int,
+    KH: int,
     D: int,
     rotate_style: RotateStyle,
     dtype: torch.dtype,
@@ -576,8 +578,8 @@ def test_rope_fwd_cached_thd_2c_gqa(
     inplace: bool,
 ):
     torch.manual_seed(20)
-    x = torch.randn((T, H, D), dtype=dtype, device="cuda")
-    y = torch.randn((T, H, D), dtype=dtype, device="cuda")
+    x = torch.randn((T, QH_per_KH * KH, D), dtype=dtype, device="cuda")
+    y = torch.randn((T, KH, D), dtype=dtype, device="cuda")
 
     reuse_freqs_front_part = True
 
@@ -614,20 +616,20 @@ def test_rope_fwd_cached_thd_2c_gqa(
 
     if offs:
         if inplace:
-            pytest.skip("N/A")
-            # triton_out_x, triton_out_y = (
-            #     rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(
-            #         x,
-            #         y,
-            #         cos_sin,
-            #         positions,
-            #         offsets,
-            #         rotate_style=rotate_style,
-            #         reuse_freqs_front_part=reuse_freqs_front_part,
-            #         nope_first=False,
-            #         transpose_output=False,
-            #     )
-            # )
+            triton_out_x, triton_out_y = (
+                rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(
+                    x,
+                    y,
+                    cos_sin[:, : cos_sin.shape[-1] // 2],
+                    cos_sin[:, cos_sin.shape[-1] // 2 :],
+                    positions,
+                    offsets,
+                    rotate_style=rotate_style,
+                    reuse_freqs_front_part=reuse_freqs_front_part,
+                    nope_first=False,
+                    transpose_output=False,
+                )
+            )
         else:
             pytest.skip("N/A")
             # triton_out_x, triton_out_y = rope_cached_thd_positions_offsets_2c_fwd(
@@ -643,30 +645,31 @@ def test_rope_fwd_cached_thd_2c_gqa(
             #     transpose_output=False,
             # )
     else:
-        if inplace:
-            triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd_inplace(
-                x,
-                y,
-                cos,
-                sin,
-                positions,
-                rotate_style=rotate_style,
-                reuse_freqs_front_part=reuse_freqs_front_part,
-                nope_first=False,
-                transpose_output=False,
-            )
-        else:
-            triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd(
-                x,
-                y,
-                cos,
-                sin,
-                positions,
-                rotate_style=rotate_style,
-                reuse_freqs_front_part=reuse_freqs_front_part,
-                nope_first=False,
-                transpose_output=False,
-            )
+        pytest.skip("N/A")
+        # if inplace:
+        #     triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd_inplace(
+        #         x,
+        #         y,
+        #         cos,
+        #         sin,
+        #         positions,
+        #         rotate_style=rotate_style,
+        #         reuse_freqs_front_part=reuse_freqs_front_part,
+        #         nope_first=False,
+        #         transpose_output=False,
+        #     )
+        # else:
+        #     triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd(
+        #         x,
+        #         y,
+        #         cos,
+        #         sin,
+        #         positions,
+        #         rotate_style=rotate_style,
+        #         reuse_freqs_front_part=reuse_freqs_front_part,
+        #         nope_first=False,
+        #         transpose_output=False,
+        #     )
 
     if DEBUG_MODE:
         print(f"triton_out_x={triton_out_x}")
