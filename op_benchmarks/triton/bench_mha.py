@@ -189,9 +189,9 @@ def create_benchmark_configs(custom, args):
 
     if mode=="bwd":
         if args.fused_bwd:
-            line_vals = [f'fused-bwd({unit})', f'bwd({unit})']
+            line_vals = [f'fused-bwd({unit})']
         elif args.onekernel_bwd:
-            line_vals = [f'onekernel-bwd({unit})', f'bwd({unit})']
+            line_vals = [f'onekernel-bwd({unit})']
         else:
             line_vals = [f'fused-bwd({unit})', f'onekernel-bwd({unit})', f'bwd({unit})']
     else:
