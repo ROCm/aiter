@@ -1424,6 +1424,7 @@ def _mha_batch_prefill(
     return_lse: bool = False,
     return_softmax: bool = False,
     zero_tensors: bool = False,
+    out: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # causal=true is the same as causal=false in this case
     if max_seqlen_q == 1 and alibi_slopes is None:
@@ -1494,7 +1495,7 @@ def _mha_batch_prefill(
         window_size_right,
         return_lse,
         return_softmax,
-        None,
+        out,
         alibi_slopes,
         None,
         custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
@@ -1520,6 +1521,7 @@ def mha_batch_prefill_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    out=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -1548,6 +1550,7 @@ def mha_batch_prefill_func(
         alibi_slopes=alibi_slopes,
         return_lse=return_lse,
         return_softmax=return_attn_probs and dropout_p > 0,
+        out=out,
     )
     out = out_padded[..., :head_size_v_og]
 
