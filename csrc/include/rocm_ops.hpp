@@ -345,11 +345,11 @@
             py::arg("num_valid_ids"),                  \
             py::arg("out"),                            \
             py::arg("topk"),                           \
+            py::arg("kernelName"),                     \
             py::arg("w1_scale") = std::nullopt,        \
             py::arg("a1_scale") = std::nullopt,        \
             py::arg("block_m") = 32,                   \
-            py::arg("sorted_weights") = std::nullopt,  \
-            py::arg("act_op") = 0);                    \
+            py::arg("sorted_weights") = std::nullopt); \
                                                        \
       m.def("ck_moe_stage2", &ck_moe_stage2,           \
             py::arg("inter_states"),                   \
@@ -360,6 +360,7 @@
             py::arg("num_valid_ids"),                  \
             py::arg("out"),                            \
             py::arg("topk"),                           \
+            py::arg("kernelName"),                     \
             py::arg("w2_scale") = std::nullopt,        \
             py::arg("a2_scale") = std::nullopt,        \
             py::arg("block_m") = 32,                   \

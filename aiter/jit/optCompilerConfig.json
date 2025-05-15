@@ -237,8 +237,9 @@
     "module_moe_ck2stages": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_ck_2stages_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/moe_ck_2stages_kernel.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/moe_ck_2stages_gemm_impl'"
+            "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common.cuh'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.h'"
         ],
         "md_name": "'module_moe_ck2stages'",
         "flags_extra_cc": [],

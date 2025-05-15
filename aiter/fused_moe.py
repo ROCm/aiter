@@ -371,7 +371,7 @@ def get_2stage_cfgs(
                 ck_stage1,
                 activation=activation,
             ),
-            aiter.ck_moe_stage2,
+            aiter.ck_moe_stage2_fwd,
             block_m,
             ksplit,
         )
@@ -389,7 +389,7 @@ def get_2stage_cfgs(
             activation=activation,
             quant_type=q_type,
         ),
-        aiter.ck_moe_stage2,
+        aiter.ck_moe_stage2_fwd,
         block_m,
         ksplit,
     )
