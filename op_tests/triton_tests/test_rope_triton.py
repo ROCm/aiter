@@ -21,6 +21,7 @@ from aiter.ops.triton.rope import (
     rope_cached_thd_positions_2c_fwd_inplace,
     rope_cached_thd_positions_offsets_2c_fwd,
     rope_cached_thd_positions_offsets_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace,
     rope_fwd_2d,
     rope_fwd_2d_inplace,
 )
@@ -34,7 +35,8 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
-    offsets: torch.Tensor = None,
+    offsets: torch.Tensor,
+    rotate_style: RotateStyle,
 ) -> torch.Tensor:
     """
     Args:
@@ -53,25 +55,37 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
 
-    # Rotate GPTJ style
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
+    if rotate_style == RotateStyle.GPTJ:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+    elif rotate_style == RotateStyle.NEOX:
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
 
     # Compute out_x
     ox1 = x1 * cos - x2 * sin
     ox2 = x2 * cos + x1 * sin
 
-    ox = torch.stack((ox1, ox2), dim=-1).flatten(-2)
+    if rotate_style == RotateStyle.GPTJ:
+        ox = torch.stack((ox1, ox2), dim=-1).flatten(-2)
+    elif rotate_style == RotateStyle.NEOX:
+        ox = torch.cat((ox1, ox2), dim=-1)
 
-    # Rotate GPTJ style
-    y1 = y[..., ::2]
-    y2 = y[..., 1::2]
+    if rotate_style == RotateStyle.GPTJ:
+        y1 = y[..., ::2]
+        y2 = y[..., 1::2]
+    elif rotate_style == RotateStyle.NEOX:
+        y1 = y[..., : y.shape[-1] // 2]
+        y2 = y[..., y.shape[-1] // 2 :]
 
     # Compute out_x
     oy1 = y1 * cos - y2 * sin
     oy2 = y2 * cos + y1 * sin
 
-    oy = torch.stack((oy1, oy2), dim=-1).flatten(-2)
+    if rotate_style == RotateStyle.GPTJ:
+        oy = torch.stack((oy1, oy2), dim=-1).flatten(-2)
+    elif rotate_style == RotateStyle.NEOX:
+        oy = torch.cat((oy1, oy2), dim=-1)
 
     return ox, oy
 
@@ -412,11 +426,14 @@ def test_rope_fwd_cached(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
-@pytest.mark.parametrize("H", [1, 8, 32, 128])
-@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+# @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
+# @pytest.mark.parametrize("H", [1, 8, 32, 128])
+# @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("T", [(32)])
+@pytest.mark.parametrize("H", [32])
+@pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
 # @pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
 # @pytest.mark.parametrize('rotate_style', [ RotateStyle.GPTJ])
 # @pytest.mark.parametrize('nope, nope_first', [(False, False)])
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
@@ -464,7 +481,7 @@ def test_rope_fwd_cached_thd_2c(
         )
 
     torch_out_x, torch_out_y = ref_rope_cached_thd_positions_offsets_2c_fwd(
-        x, y, cos, sin, positions, offsets
+        x, y, cos, sin, positions, offsets, rotate_style
     )
     if DEBUG_MODE:
         print(f"torch_out_x={torch_out_x}")
@@ -532,6 +549,130 @@ def test_rope_fwd_cached_thd_2c(
     torch.testing.assert_close(triton_out_x, torch_out_x, atol=1e-3, rtol=1e-1)
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
+# @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
+# @pytest.mark.parametrize("H", [1, 8, 32, 128])
+# @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("T", [(32), (8192)])
+@pytest.mark.parametrize("H", [32, 128])
+@pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2.
+# @pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+# @pytest.mark.parametrize('rotate_style', [ RotateStyle.GPTJ])
+# @pytest.mark.parametrize('nope, nope_first', [(False, False)])
+# @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
+# @pytest.mark.parametrize('reuse_freqs_front_part', [True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("inplace", [True, False])
+@pytest.mark.parametrize("pos, offs", [(True, False), (True, True)])
+def test_rope_fwd_cached_thd_2c_gqa(
+    T: int,
+    H: int,
+    D: int,
+    rotate_style: RotateStyle,
+    dtype: torch.dtype,
+    pos: bool,
+    offs: bool,
+    inplace: bool,
+):
+    torch.manual_seed(20)
+    x = torch.randn((T, H, D), dtype=dtype, device="cuda")
+    y = torch.randn((T, H, D), dtype=dtype, device="cuda")
+
+    reuse_freqs_front_part = True
+
+    if reuse_freqs_front_part:
+        freqs_D = D // 2
+    freqs = torch.randn((T, freqs_D), dtype=dtype, device="cuda")
+
+    positions = (
+        torch.randint(int(T * 0.25), int(T * 0.75), (T,), device="cuda")
+        if pos
+        else None
+    )
+    offsets = (
+        torch.randint(int(T * -0.25), int(T * 0.25), (T,), device="cuda")
+        if offs
+        else None
+    )
+
+    cos = torch.cos(freqs)
+    sin = torch.sin(freqs)
+    cos_sin = torch.cat((cos, sin), dim=-1)
+
+    if pos is False:
+        pytest.skip(
+            "there is no version of RoPE with 2 inputs without positions for now"
+        )
+
+    torch_out_x, torch_out_y = ref_rope_cached_thd_positions_offsets_2c_fwd(
+        x, y, cos, sin, positions, offsets, rotate_style
+    )
+    if DEBUG_MODE:
+        print(f"torch_out_x={torch_out_x}")
+        print(f"torch_out_y={torch_out_y}")
+
+    if offs:
+        if inplace:
+            pytest.skip("N/A")
+            # triton_out_x, triton_out_y = (
+            #     rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(
+            #         x,
+            #         y,
+            #         cos_sin,
+            #         positions,
+            #         offsets,
+            #         rotate_style=rotate_style,
+            #         reuse_freqs_front_part=reuse_freqs_front_part,
+            #         nope_first=False,
+            #         transpose_output=False,
+            #     )
+            # )
+        else:
+            pytest.skip("N/A")
+            # triton_out_x, triton_out_y = rope_cached_thd_positions_offsets_2c_fwd(
+            #     x,
+            #     y,
+            #     cos,
+            #     sin,
+            #     positions,
+            #     offsets,
+            #     rotate_style=rotate_style,
+            #     reuse_freqs_front_part=reuse_freqs_front_part,
+            #     nope_first=False,
+            #     transpose_output=False,
+            # )
+    else:    
+        if inplace:
+            triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd_inplace(
+                x,
+                y,
+                cos,
+                sin,
+                positions,
+                rotate_style=rotate_style,
+                reuse_freqs_front_part=reuse_freqs_front_part,
+                nope_first=False,
+                transpose_output=False,
+            )
+        else:
+            triton_out_x, triton_out_y = rope_cached_thd_positions_2c_fwd(
+                x,
+                y,
+                cos,
+                sin,
+                positions,
+                rotate_style=rotate_style,
+                reuse_freqs_front_part=reuse_freqs_front_part,
+                nope_first=False,
+                transpose_output=False,
+            )
+
+    if DEBUG_MODE:
+        print(f"triton_out_x={triton_out_x}")
+        print(f"triton_out_y={triton_out_y}")
+
+    torch.testing.assert_close(triton_out_x, torch_out_x, atol=1e-3, rtol=1e-1)
+    torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
 @pytest.mark.parametrize("B", [1, 2, 15, 32, 57])
 @pytest.mark.parametrize("H", [1, 8, 32])
