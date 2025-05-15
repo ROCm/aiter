@@ -432,12 +432,10 @@ def test_rope_fwd_cached(
 # @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
 # @pytest.mark.parametrize("H", [1, 8, 32, 128])
 # @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("T", [32])
-@pytest.mark.parametrize("H", [32])
-@pytest.mark.parametrize("D", [64])  # For now, D is power of 2.
-# @pytest.mark.parametrize('rotate_style', [ RotateStyle.NEOX, RotateStyle.GPTJ]) #TODO add support for NEOX
-@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
-# @pytest.mark.parametrize('rotate_style', [ RotateStyle.GPTJ])
+@pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
+@pytest.mark.parametrize("H", [1, 8, 32, 128])
+@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
 # @pytest.mark.parametrize('nope, nope_first', [(False, False)])
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True])
