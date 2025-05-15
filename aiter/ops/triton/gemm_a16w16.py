@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from typing import Optional
 import functools
 import json
@@ -5,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import (
     AITER_TRITON_OPS_PATH,
     AITER_TRITON_CONFIGS_PATH
@@ -106,19 +110,14 @@ def _get_config(
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_gemm_config_dict"):
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/MI300X-GEMM-A16W16.json" 
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A16W16.json" 
         with open(fpath, 'r') as file:
             config = json.load(file)
-        _get_config._gemm_config_dict = config
+        _get_config._config_dict = config
 
-    #TODO: Update this logic
-    if M < 512:
-        return _get_config._gemm_config_dict["small"]
-    elif M >= 512 and M < 1024:
-        return _get_config._gemm_config_dict["medium"]
-    else:
-        return _get_config._gemm_config_dict["large"]
+    return _get_config._config_dict["any"]
 
 # Wrapper for gemm kernel.
 def gemm_a16w16(x, 
