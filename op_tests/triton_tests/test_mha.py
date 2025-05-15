@@ -1,3 +1,4 @@
+import math
 import torch
 import pytest
 import logging
@@ -16,7 +17,7 @@ from aiter.test_mha_common import (
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-DEBUG_MODE = False
+DEBUG_MODE = True
 ATOL_fp8 = 2.5e-1
 RTOL_fp8 = 2.5e-1
 
@@ -186,6 +187,78 @@ def test_mha(
         )
     else:
         torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+@pytest.mark.parametrize("BATCH", [128])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(64, 128)],
+)
+@pytest.mark.parametrize(
+    "NUM_Q_HEADS, NUM_K_HEADS", [(48, 8)]
+)
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("CAUSAL", [(False)])
+@pytest.mark.parametrize(
+    "DROPOUT", [(0.0)]
+)
+def test_int64_strides(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    DROPOUT: float,
+    dtype=torch.float16,
+    device="cuda"
+    ):
+    """
+    In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
+    """
+
+    def _create_tensor_with_large_stride(
+        final_shape: tuple,
+        TARGET_STRIDE_FOR_DIM0,
+    ) -> torch.Tensor:
+        """
+        Nested helper to create a tensor with a specified final_shape and a large stride(0).
+        It uses TARGET_STRIDE_FOR_DIM0, device, and current_dtype from the outer scope.
+        """
+        if len(final_shape) != 4:
+            raise ValueError("This function is designed for 4D tensors (e.g., B, S, H, D).")
+
+        D0, D1, D2, D3 = final_shape
+        elements_multiplied_by_expanded_dim = D2 * D3
+        if elements_multiplied_by_expanded_dim == 0:
+            raise ValueError("Product of dimensions D2 and D3 cannot be zero.")
+
+        expanded_D1 = math.ceil(TARGET_STRIDE_FOR_DIM0 / elements_multiplied_by_expanded_dim)
+        expanded_D1 = max(expanded_D1, D1)
+        dummy_shape = (D0, int(expanded_D1), D2, D3)
+
+        dummy_tensor = torch.randn(dummy_shape, device=device, dtype=dtype)
+        tensor = dummy_tensor[:, :D1, :, :]
+        tensor.requires_grad_(True)
+        return tensor
+
+    # inputs
+    q = _create_tensor_with_large_stride((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), 2^32)
+    k = _create_tensor_with_large_stride((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), 2^32)
+    v = _create_tensor_with_large_stride((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), 2^32)
+    do = torch.randn_like(q)
+
+    triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            causal=CAUSAL
+        )
+
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q, k, v), do.clone()
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
