@@ -35,7 +35,6 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                         std::optional<void *> a1_scale  // [m, 1], token scale
 )
 {
-    std::cout << "Function signature: " << __PRETTY_FUNCTION__ << std::endl;
     // ~~~~~~~~~~~~~~~~~~~~~~~~following start with ck things
     ck::index_t StrideA = K;
     ck::index_t StrideB = K;
