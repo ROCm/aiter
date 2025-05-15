@@ -1967,7 +1967,6 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
     sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
     h_start_idx = h_s * SPLIT_H_SIZE
-    h_end_idx = (h_s + 1) * SPLIT_H_SIZE
 
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
@@ -1976,8 +1975,8 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
 
     x_rotated_mask = (x_offs_d % 2 == 0)[None, :]
 
-    for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
-        x_offs = x_offs_base + h * stride_x_h
+    for h in tl.range(0, SPLIT_H_SIZE, 1, num_stages=num_stages):
+        x_offs = x_offs_base + (h_start_idx + h) * stride_x_h
 
         x = tl.load(x_ptr + x_offs, mask=x_mask)
         y = tl.load(y_ptr + x_offs, mask=x_mask)
@@ -2083,7 +2082,6 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c(
     sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
     h_start_idx = h_s * SPLIT_H_SIZE
-    h_end_idx = (h_s + 1) * SPLIT_H_SIZE
 
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
@@ -2091,10 +2089,9 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c(
     x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
 
     x_rotated_mask = (x_offs_d < D_MODEL_HALF)[None, :]
-    # x_rotated_mask = (x_offs_d[None, :] % 2 == 0)
 
-    for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
-        x_offs = x_offs_base + h * stride_x_h
+    for h in tl.range(0, SPLIT_H_SIZE, 1, num_stages=num_stages):
+        x_offs = x_offs_base + (h_start_idx + h) * stride_x_h
 
         x = tl.load(x_ptr + x_offs, mask=x_mask)
         y = tl.load(y_ptr + x_offs, mask=x_mask)
@@ -2205,11 +2202,11 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa(
     sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
     h_start_idx = h_s * QH_per_G
-    h_end_idx = (h_s + 1) * QH_per_G
 
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
     x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
+    x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
 
     x_rotated_mask = (x_offs_d % 2 == 0)[None, :]
 
@@ -2234,9 +2231,8 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa(
     out_y = out_y.to(y_ptr.dtype.element_ty)
     tl.store(out_y_ptr + y_offs, out_y, mask=x_mask)
 
-    x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
-    for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
-        x_offs = x_offs_base + h * stride_x_h
+    for h in tl.range(0, QH_per_G, 1, num_stages=num_stages):
+        x_offs = x_offs_base + (h_start_idx + h) * stride_x_h
 
         x = tl.load(x_ptr + x_offs, mask=x_mask)
         x_rotated = tl.where(x_rotated_mask, x, -x)
@@ -2331,11 +2327,11 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa(
     sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
     h_start_idx = h_s * QH_per_G
-    h_end_idx = (h_s + 1) * QH_per_G
 
     x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
     x_offs_d = tl.arange(0, D_MODEL)
     x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
+    x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
 
     x_rotated_mask = (x_offs_d < D_MODEL_HALF)[None, :]
 
@@ -2361,9 +2357,8 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa(
     out_y = out_y.to(y_ptr.dtype.element_ty)
     tl.store(out_y_ptr + y_offs, out_y, mask=x_mask)
 
-    x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
-    for h in tl.range(h_start_idx, h_end_idx, 1, num_stages=num_stages):
-        x_offs = x_offs_base + h * stride_x_h
+    for h in tl.range(0, QH_per_G, 1, num_stages=num_stages):
+        x_offs = x_offs_base + (h_start_idx + h) * stride_x_h
 
         x = tl.load(x_ptr + x_offs, mask=x_mask)
         x_rotated = tl.where(x_rotated_mask, x, -x)
