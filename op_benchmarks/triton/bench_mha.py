@@ -326,6 +326,9 @@ def run_benchmark(custom, args):
                 triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
             )
             print("Forward outputs match!")
+            print("triton_dv", triton_dv[1])
+            print("torch_dv", torch_dv[1])
+
             # Compare gradients
             torch.testing.assert_close(
                 triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2

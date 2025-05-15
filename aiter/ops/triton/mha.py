@@ -2464,7 +2464,7 @@ def _bwd_dkdvdq_inner(
 
     for iter in range(num_steps):
         # Compute the permuted block index
-        blk_idx = (start_idx + iter) % num_steps
+        blk_idx = iter # (start_idx + iter) % num_steps
 
         curr_m = start_m + blk_idx * step_m
         qT_ptrs = qT_ptrs_start + blk_idx * step_m * stride_q_m
@@ -2632,11 +2632,13 @@ def _bwd_kernel_dkdvdq_causal(
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
     
     wid = tl.program_id(0) # workgoup id: 0, ..., NUM_Q_PIDS * BATCH * NUM_K_HEADS - 1
-    batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8)
+    # batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8)
     # In the backward we dont want concurrent workgroups to handle consecutive heads or blocks, so remap them to be far apart.
-    head_q_idx = head_q_idx * 29 % NUM_Q_HEADS
-    seq_k_blk_idx = seq_k_blk_idx * 29 % NUM_K_PIDS
-
+    # head_q_idx = (head_q_idx * 29) % NUM_Q_HEADS
+    # seq_k_blk_idx = (seq_k_blk_idx) * 29 % NUM_K_PIDS
+    batch_idx = wid % BATCH
+    head_q_idx = (wid // BATCH) % NUM_Q_HEADS
+    seq_k_blk_idx = (wid // (BATCH * NUM_Q_HEADS)) % NUM_K_PIDS
 
     head_k_idx = head_q_idx // GROUP_SIZE
     num_atomics_concurrent = NUM_SMS // (NUM_Q_HEADS *  BATCH)
@@ -2748,8 +2750,8 @@ def _bwd_kernel_dkdvdq_causal(
     
     
     # when q < k, we may skip the initial masked op
-    # if seq_k_blk_idx < num_blocks_skip:
-    #     num_steps = 0
+    if seq_k_blk_idx < num_blocks_skip:
+        num_steps = 0
 
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx)
@@ -3438,7 +3440,7 @@ def _flash_attn_fused_backward(
     }
     
     num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
-    grid_dkdvdq = (batch * num_k_heads * num_k_pids,) 
+    grid_dkdvdq = (batch * num_q_heads * num_k_pids,) 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     if causal:
         _bwd_kernel_dkdvdq_causal[grid_dkdvdq](
