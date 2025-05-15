@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.ops.shuffle import shuffle_weight
 from einops import rearrange
 from einops import repeat as eirp
 import pandas as pd
@@ -42,6 +43,9 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale_CK(x, weight, x_scale, w_scale, dtype)
 
+@perftest()
+def run_gemm_ck_wpreshuffle(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
+    return aiter.gemm_a8w8_blockscale_wpreshuffle_CK(x, weight, x_scale, w_scale, dtype)
 
 @benchmark()
 def test_gemm(dtype, m, n, k):
@@ -53,14 +57,20 @@ def test_gemm(dtype, m, n, k):
     weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
     x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    weight_shulle = shuffle_weight(weight, layout=(16, 16))
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, dtype)
+    c, avg_c = run_gemm_ck_wpreshuffle(x, weight_shulle, x_scale, w_scale, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
-    return {"us": avg_b}
+    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, ck wpreshuffle avg: {avg_c:<8.2f} us uplift: {avg_a/min(avg_b, avg_c) -1:<5.1%}"
+    print(msg)
+    checkAllclose(a, b, msg="ck:", rtol=1e-2, atol=0.01)
+    checkAllclose(a, c, msg="ck_wpreshuffle: ", rtol=1e-2, atol=0.01)
+    tflops = 2 * m *n *k /avg_c /1e6
+
+    return {"ck": avg_b, "ck_wpreshuffle": avg_c, "ck_wpreshuffle_tflops":tflops}
 
 
 @perftest(num_iters=5)

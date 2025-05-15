@@ -521,32 +521,13 @@ kernels_list = {
 
 default_kernels_dict = {
     # clang-format off
-    ##############| Block| Scale| Scale| Scale|  MPer|  NPer|  KPer| AK1| BK1|MPer| NPer| MXdl| NXdl|  ABlockTransfer|  BBlockTransfer|    CShuffle|    CShuffle|     CBlockTransferClusterLengths|  CBlockTransfer|  Block-wiseGemm|     Block-wiseGemm|
-    ###############| Size| Block| Block| Block| Block| Block| Block|    |    | XDL|  XDL|  Per|  Per|   ThreadCluster|   ThreadCluster| MXdlPerWave| NXdlPerWave| _MBlock_MXdlPerWave_MWaveMPerXdl| ScalarPerVector|    Pipeline    |           Pipeline|
-    ###############|     |     M|     N|     K|      |      |      |    |    |    |     | Wave| Wave| Lengths_K0_M_K1| Lengths_K0_N_K1|  PerShuffle|  PerShuffle| _NBlock_NXdlPerWave_NWaveNPerXdl|   _NWaveNPerXdl|    Scheduler   |           Verision|
-    ###############|     |      |      |      |      |      |      |    |    |    |     |     |     |                |                |            |            |                                 |                |                |                   |
-    # Compute friendly
-    (-1): kernelInstance(
-        256,
-        1,
-        128,
-        128,
-        16,
-        128,
-        256,
-        16,
-        16,
-        16,
-        16,
-        1,
-        2,
-        [16, 16, 1],
-        [16, 16, 1],
-        1,
-        2,
-        [1, 16, 1, 16],
-        [8],
-        "Intrawave",
-        1,
-    ),
+        ##############| Block| Scale| Scale| Scale|  MPer|  NPer|  KPer| AK1| BK1|MPer| NPer| MXdl| NXdl|  ABlockTransfer|  BBlockTransfer|    CShuffle|    CShuffle|     CBlockTransferClusterLengths|  CBlockTransfer|  Block-wiseGemm|     Block-wiseGemm|
+        ###############| Size| Block| Block| Block| Block| Block| Block|    |    | XDL|  XDL|  Per|  Per|   ThreadCluster|   ThreadCluster| MXdlPerWave| NXdlPerWave| _MBlock_MXdlPerWave_MWaveMPerXdl| ScalarPerVector|    Pipeline    |           Pipeline|
+        ###############|     |     M|     N|     K|      |      |      |    |    |    |     | Wave| Wave| Lengths_K0_M_K1| Lengths_K0_N_K1|  PerShuffle|  PerShuffle| _NBlock_NXdlPerWave_NWaveNPerXdl|   _NWaveNPerXdl|    Scheduler   |           Verision|
+        ###############|     |      |      |      |      |      |      |    |    |    |     |     |     |                |                |            |            |                                 |                |                |                   |
+
+        # Compute friendly
+    (-1): kernelInstance( 256,   1,   128,   128,    16,    64,   256, 16,  16,     16,   16,    1,    1,     [16, 16, 1],       [16, 16, 1],           1,           1,                 [1, 16, 1, 16],           [4],        "Intrawave",         1),
+    (-2): kernelInstance( 256,   1,   128,   128,    32,    64,   256, 16,  16,     16,   16,    2,    1,     [16, 16, 1],       [16, 16, 1],           2,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1),
+    (-3): kernelInstance( 256,   1,   128,   128,    64,    64,   128, 16,  16,     32,   32,    1,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1),
 }

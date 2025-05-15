@@ -197,6 +197,15 @@
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), py::arg("kernelId") = 0,                                    \
             py::arg("splitK") = 0);
 
+#define GEMM_A8W8_BLOCKSCALE_WPRESHUFFLE_PYBIND                                                                                                     \
+      m.def("gemm_a8w8_blockscale_wpreshuffle", &gemm_a8w8_blockscale_wpreshuffle, "fp8 blockscale gemm wpreshuffle", py::arg("XQ"), py::arg("WQ"), \
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"));
+
+#define GEMM_A8W8_BLOCKSCALE_WPRESHUFFLE_TUNE_PYBIND                                                                                                                \
+      m.def("gemm_a8w8_blockscale_wpreshuffle_tune", &gemm_a8w8_blockscale_wpreshuffle_tune, "gemm_a8w8_blockscale_wpreshuffle_tune", py::arg("XQ"), py::arg("WQ"), \
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"), py::arg("kernelId") = 0,                                                                        \
+            py::arg("splitK") = 0);
+
 #define GEMM_A8W8_PYBIND                                                        \
       m.def("gemm_a8w8", &gemm_a8w8, "gemm_a8w8", py::arg("XQ"), py::arg("WQ"), \
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"),             \

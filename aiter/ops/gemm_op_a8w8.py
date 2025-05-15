@@ -52,6 +52,14 @@ def gemm_a8w8_blockscale(
     out: Tensor,
 ): ...
 
+@compile_ops("module_gemm_a8w8_blockscale_wpreshuffle", fc_name="gemm_a8w8_blockscale_wpreshuffle")
+def gemm_a8w8_blockscale_wpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+): ...
 
 @compile_ops("module_gemm_a8w8_blockscale_asm", fc_name="flatmm_a8w8_blockscale_asm")
 def flatmm_a8w8_blockscale_asm(
@@ -191,6 +199,22 @@ def gemm_a8w8_blockscale_CK(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, Y)
 
+def gemm_a8w8_blockscale_wpreshuffle_CK(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype=torch.bfloat16
+):
+    assert dtype in [
+        torch.bfloat16,
+        torch.float16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_a8w8_blockscale_wpreshuffle(XQ, WQ, x_scale, w_scale, Y)
 
 def flatmm_a8w8_blockscale_ASM(
     XQ: Tensor,
@@ -229,5 +253,17 @@ def gemm_a8w8_blockscale_tune(
     w_scale: Tensor,
     out: Tensor,
     kernelId: int,
-    splitK=0,
+    splitK = 0
+): ...
+
+
+@compile_ops("module_gemm_a8w8_blockscale_wpreshuffle_tune",fc_name="gemm_a8w8_blockscale_wpreshuffle_tune")
+def gemm_a8w8_blockscale_wpreshuffle_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK = 0
 ): ...
