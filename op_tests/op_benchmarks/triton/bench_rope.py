@@ -324,8 +324,6 @@ def run_benchmark(args):
             cos_sin = torch.cat((cos, sin), dim=-1)
             cos = cos_sin[:, : cos_sin.shape[-1] // 2]
             sin = cos_sin[:, cos_sin.shape[-1] // 2 :]
-            print(x.shape)
-            print(y.shape)
             if offs:
                 if inplace:
                     fn = lambda: rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(  # noqa: E731
