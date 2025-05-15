@@ -599,6 +599,8 @@ def test_rope_fwd_cached_thd_2c_gqa(
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
     cos_sin = torch.cat((cos, sin), dim=-1)
+    cos = cos_sin[:, : cos_sin.shape[-1] // 2]
+    sin = cos_sin[:, cos_sin.shape[-1] // 2 :]
 
     if pos is False:
         pytest.skip(
@@ -618,8 +620,8 @@ def test_rope_fwd_cached_thd_2c_gqa(
                 rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(
                     x,
                     y,
-                    cos_sin[:, : cos_sin.shape[-1] // 2],
-                    cos_sin[:, cos_sin.shape[-1] // 2 :],
+                    cos,
+                    sin,
                     positions,
                     offsets,
                     rotate_style=rotate_style,
@@ -632,8 +634,8 @@ def test_rope_fwd_cached_thd_2c_gqa(
             triton_out_x, triton_out_y = rope_cached_thd_positions_offsets_2c_gqa_fwd(
                 x,
                 y,
-                cos_sin[:, : cos_sin.shape[-1] // 2],
-                cos_sin[:, cos_sin.shape[-1] // 2 :],
+                cos,
+                sin,
                 positions,
                 offsets,
                 rotate_style=rotate_style,
@@ -646,8 +648,8 @@ def test_rope_fwd_cached_thd_2c_gqa(
             triton_out_x, triton_out_y = rope_cached_thd_positions_2c_gqa_fwd_inplace(
                 x,
                 y,
-                cos_sin[:, : cos_sin.shape[-1] // 2],
-                cos_sin[:, cos_sin.shape[-1] // 2 :],
+                cos,
+                sin,
                 positions,
                 rotate_style=rotate_style,
                 reuse_freqs_front_part=reuse_freqs_front_part,
@@ -658,8 +660,8 @@ def test_rope_fwd_cached_thd_2c_gqa(
             triton_out_x, triton_out_y = rope_cached_thd_positions_2c_gqa_fwd(
                 x,
                 y,
-                cos_sin[:, : cos_sin.shape[-1] // 2],
-                cos_sin[:, cos_sin.shape[-1] // 2 :],
+                cos,
+                sin,
                 positions,
                 rotate_style=rotate_style,
                 reuse_freqs_front_part=reuse_freqs_front_part,
