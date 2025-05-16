@@ -201,7 +201,12 @@ def create_benchmark_configs(custom, args):
         line_vals = [f'Triton({unit})', f'Torch({unit})']
 
     if args.test_mode:
-        line_vals = [f'onekernel-bwd({unit})'] if args.onekernel_bwd else [f'fused-bwd({unit})']
+        if  args.onekernel_bwd:
+            line_vals = [f'onekernel-bwd({unit})']
+        elif args.fused_bwd:
+            line_vals = [f'fused-bwd({unit})']
+        else:
+            line_vals = [f'bwd({unit})']
 
     configs.append(
         triton.testing.Benchmark(

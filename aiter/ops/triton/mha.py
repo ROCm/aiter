@@ -1529,9 +1529,9 @@ def _bwd_kernel_dkdv_causal(
     FP8_MAX: tl.constexpr,
 ):
     # seq block, batch, head_k
-    seq_k_blk_idx = tl.program_id(0)
-    batch_idx = tl.program_id(1)
-    head_k_idx = tl.program_id(2)
+    head_k_idx = tl.program_id(0)
+    seq_k_blk_idx = tl.program_id(1)
+    batch_idx = tl.program_id(2)
 
     # Determine q and k start along with seqlen_q and seqlen_k
     q_start = 0
@@ -1836,9 +1836,9 @@ def _bwd_kernel_dq_causal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    seq_q_blk_idx = tl.program_id(0)
-    batch_idx = tl.program_id(1)
-    head_k_idx = tl.program_id(2)
+    head_k_idx = tl.program_id(0)
+    seq_q_blk_idx = tl.program_id(1)
+    batch_idx = tl.program_id(2)
 
     q_start = 0
     k_start = 0
@@ -2117,9 +2117,9 @@ def _bwd_kernel_dkdv_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    bid = tl.program_id(1)
-    hkid = tl.program_id(2)
+    hkid = tl.program_id(0)
+    pid = tl.program_id(1)
+    bid = tl.program_id(2)
 
     q_start = 0
     k_start = 0
@@ -2312,9 +2312,9 @@ def _bwd_kernel_dq_noncausal(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    pid = tl.program_id(0)  # seqlen
-    bid = tl.program_id(1)  # batch
-    hkid = tl.program_id(2)  # head_k
+    hkid = tl.program_id(0)  # head_k
+    pid = tl.program_id(1)  # seqlen
+    bid = tl.program_id(2)  # batch
 
     q_start = 0
     k_start = 0
@@ -3093,12 +3093,21 @@ def _flash_attn_backward(
     # Configs
     # PRE_BLOCK, BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2
     # BLK_SLICE_FACTOR
+    # NUM_WARPS, NUM_STAGES = 4, 1
+    # WAVES_PER_EU = 1
+    # PRE_BLOCK = 128
+    # # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+    # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
+    # BLK_SLICE_FACTOR = 2
+
+
     NUM_WARPS, NUM_STAGES = 4, 1
     WAVES_PER_EU = 1
     PRE_BLOCK = 128
-    # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
     BLK_SLICE_FACTOR = 2
+    matrix_instr_nonkdim=16
+
 
     # init delta
     delta = torch.zeros_like(softmax_lse)
@@ -3142,8 +3151,8 @@ def _flash_attn_backward(
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
 
-    grid_dkdv = ((max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, num_k_heads)
-    grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, num_k_heads)
+    grid_dkdv = (num_k_heads, (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, )
+    grid_dq = (num_k_heads, (max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch)
     if causal:
         _bwd_kernel_dkdv_causal[grid_dkdv](
             q,
