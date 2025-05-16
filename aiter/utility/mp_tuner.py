@@ -6,6 +6,7 @@ import time
 from aiter.test_common import checkAllclose
 from aiter import dtypes
 
+
 def worker(gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2):
     from aiter.test_common import run_perftest
 
@@ -21,21 +22,30 @@ def worker(gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2):
     try:
         res, us = run_perftest(func, *args, **kwargs)
         torch.cuda.synchronize()
-        
+
         if ref is not None:
             if isinstance(ref, torch.Tensor):
                 ref = [ref]
             if isinstance(res, torch.Tensor):
                 res = [res]
-            ref = [el.to(device) if isinstance(el, torch.Tensor) and el.device != device else el for el in ref]
+            ref = [
+                (
+                    el.to(device)
+                    if isinstance(el, torch.Tensor) and el.device != device
+                    else el
+                )
+                for el in ref
+            ]
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
-                        res[i] = res[i].view(-1)[:ref[i].numel()].view(ref[i].shape)
+                        res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
                     if ref[i].dtype.itemsize == 1:
                         ref[i] = ref[i].to(dtypes.fp32)
                         res[i] = res[i].to(dtypes.fp32)
-                    err_ratio = checkAllclose(ref[i], res[i], atol=atol, rtol=rtol, printLog=False)
+                    err_ratio = checkAllclose(
+                        ref[i], res[i], atol=atol, rtol=rtol, printLog=False
+                    )
                     max_err_ratio = max(max_err_ratio, err_ratio)
 
     except Exception as e:

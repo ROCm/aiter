@@ -31,13 +31,16 @@ from functools import lru_cache
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
 
+
 @lru_cache(maxsize=1)
 def init_hipblas():
     aiter.hipb_create_extension()
 
+
 @lru_cache(maxsize=1)
 def init_rocblas():
     aiter.rocb_create_extension()
+
 
 def call_hipb_mm(input, weight, solidx, bias, out_dtype, scale_a=None, scale_b=None):
     init_hipblas()
@@ -51,9 +54,11 @@ def call_hipb_mm(input, weight, solidx, bias, out_dtype, scale_a=None, scale_b=N
         scaleB=scale_b,
     )
 
+
 def call_rocb_mm(inp, w, solidx):
     init_rocblas()
     return aiter.rocb_mm(inp, w, solidx)
+
 
 rtol = 1e-5
 atol = 1
@@ -66,7 +71,16 @@ HALF = torch.tensor(0.5, dtype=dtypes.fp32, device="cuda")
 class Gemm:
 
     def __init__(
-        self, m, n, k, bias, indtype, outdtype, scaleAB=False, rocblas_decode=False, mp=1
+        self,
+        m,
+        n,
+        k,
+        bias,
+        indtype,
+        outdtype,
+        scaleAB=False,
+        rocblas_decode=False,
+        mp=1,
     ):
         self.m = m
         self.k = k
@@ -149,7 +163,6 @@ class Gemm:
         else:
             ref = F.linear(self.inp, self.weights, self.bias).to(self.outdtype)
         return ref
-    
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 20
@@ -167,25 +180,25 @@ class Gemm:
         gtimes = {}
         for solidx in solutions:
             task.append(
-                (solidx,
-                call_hipb_mm,
                 (
-                    self.inp,
-                    self.weights.t(),
                     solidx,
-                    self.bias if self.bias is not None else None,
-                    self.outdtype,
-                    scaleA,
-                    scaleB,
-
-                ),
-                {
-                    "num_warmup": warmi,
-                    "num_iters": coldi,
-                },
-                self.ref if fast_mode == 0 else None,
-                self.rtol,
-                self.atol,
+                    call_hipb_mm,
+                    (
+                        self.inp,
+                        self.weights.t(),
+                        solidx,
+                        self.bias if self.bias is not None else None,
+                        self.outdtype,
+                        scaleA,
+                        scaleB,
+                    ),
+                    {
+                        "num_warmup": warmi,
+                        "num_iters": coldi,
+                    },
+                    self.ref if fast_mode == 0 else None,
+                    self.rtol,
+                    self.atol,
                 )
             )
         ret = mp_tuner(task, self.mp)
@@ -193,14 +206,13 @@ class Gemm:
             if fast_mode == 0:
                 if err_ratio > self.check_err_ratio:
                     continue
-            gtimes[solidx] = us/ 1000.0
+            gtimes[solidx] = us / 1000.0
         self.hipb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
         ).sort_values(by="gtimems")
         self.hipb_gtimedf.to_csv("/tmp/hipb_gtimedf.csv")
         print(">>> HipBlasLt top solutions, Fast Mode", fast_mode)
         print(self.hipb_gtimedf.head(self.topn))
-
 
     def find_rocblas_sols(self):
         if self.scaleAB or self.bias is not None:
@@ -234,24 +246,26 @@ class Gemm:
         gtimes = {}
         for solidx in solutions:
             task.append(
-                (solidx,
-                call_rocb_mm,
                 (
-                    self.inp,
-                    self.weights.t(),
                     solidx,
-                ),
-                {
-                    "num_warmup": warmi,
-                    "num_iters": coldi,
-                })
+                    call_rocb_mm,
+                    (
+                        self.inp,
+                        self.weights.t(),
+                        solidx,
+                    ),
+                    {
+                        "num_warmup": warmi,
+                        "num_iters": coldi,
+                    },
+                )
             )
         ret = mp_tuner(task, self.mp)
         for solidx, us, err_ratio in ret:
             if fast_mode == 0:
                 if err_ratio > self.check_err_ratio:
                     continue
-            gtimes[solidx] = us/ 1000.0
+            gtimes[solidx] = us / 1000.0
         self.rocb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
         ).sort_values(by="gtimems")

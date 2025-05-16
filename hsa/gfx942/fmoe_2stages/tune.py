@@ -237,7 +237,7 @@ def go(
                                 sorted_weights if doweight_stage1 else None,
                             ),
                             {},
-                            (ref)
+                            (ref),
                         )
                     )
 
@@ -270,7 +270,7 @@ def go(
                             sorted_weights if doweight_stage1 else None,
                         ),
                         {},
-                        (ref)
+                        (ref),
                     )
                 )
         if tasks is None and tasks_ck is None:

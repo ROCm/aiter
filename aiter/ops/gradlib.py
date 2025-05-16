@@ -34,7 +34,6 @@ def hipb_mm(
 ) -> torch.Tensor: ...
 
 
-
 @compile_ops("module_hipbsolgemm")
 def hipb_findallsols(
     mat1: torch.Tensor,
@@ -45,7 +44,6 @@ def hipb_findallsols(
     scaleB: Optional[torch.Tensor] = None,
     scaleC: Optional[torch.Tensor] = None,
 ) -> list[int]: ...
-
 
 
 @compile_ops("module_hipbsolgemm")
