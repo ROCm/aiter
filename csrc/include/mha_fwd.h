@@ -73,7 +73,7 @@ float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       const ck_tile::stream_config& stream_config,
                       std::string q_dtype_str,
                       bool is_group_mode,
-                      mask_info mask,
+                      mask_enum mask_type,
                       bias_enum bias_type,
                       bool has_lse);
 
@@ -81,7 +81,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                         const ck_tile::stream_config& stream_config,
                         std::string q_dtype_str,
                         bool is_group_mode,
-                        mask_info mask,
+                        mask_enum mask_type,
                         bias_enum bias_type,
                         bool has_lse);
 
