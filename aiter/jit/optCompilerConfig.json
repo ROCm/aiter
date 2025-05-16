@@ -239,12 +239,13 @@
             "f'{AITER_CSRC_DIR}/pybind/moe_ck_2stages_pybind.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common.cuh'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common_blockscale.cuh'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.h'"
         ],
         "md_name": "'module_moe_ck2stages'",
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"
+            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"  
         ],
         "extra_ldflags": "None",
         "extra_include": [],

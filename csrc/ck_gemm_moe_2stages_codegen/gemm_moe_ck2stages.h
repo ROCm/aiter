@@ -3,16 +3,16 @@
 #pragma once
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
-#include "ck/tensor_operation/gpu/device/impl/device_moe_gemm.hpp"
-#include "ck/tensor_operation/gpu/device/impl/device_gemm_multiple_d_xdl_cshuffle_v3.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 #include "ck/tensor_operation/gpu/element/unary_element_wise_operation.hpp"
+#include "ck/tensor_operation/gpu/device/tensor_layout.hpp"
 
 #include "ck/library/utility/device_memory.hpp"
 #include "ck/library/utility/host_tensor.hpp"
 #include "ck/library/utility/host_tensor_generator.hpp"
 #include "ck/library/utility/literals.hpp"
 #include "ck/library/utility/check_err.hpp"
+
 #include <torch/torch.h>
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 #include <hip/hip_runtime.h>
@@ -277,6 +277,30 @@ struct MulABScaleExpertWeight
     {
         e = ck::type_convert<B16>(ck::type_convert<F32>(c));
     }
+    
+
+    template <typename E, typename C, typename D2>
+    __host__ __device__ constexpr void operator()(E& e, const C& c, const D2& d2) const;
+    // for real kernel use
+    template <>
+    __host__ __device__ constexpr void
+    operator()<F16, float, float>(F16& e, const float& c, const float& d2) const
+    {
+        // for real kernel use
+        e = ck::type_convert<F16>(c * d2);
+    }
+
+    // for reference cpu
+    template <>
+    __host__ __device__ constexpr void
+    operator()<float, float, float>(float& e, const float& c, const float& d2) const
+    {
+        // for reference cpu
+        e = ck::type_convert<F16>(c * d2);
+    }
+
+
+
 };
 
 // d0: ascale, d1: bscale, d2:expert weight

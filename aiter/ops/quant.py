@@ -103,7 +103,7 @@ def get_triton_quant(qType):
         QuantType.No: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor: per_tensor_quant_triton,
         QuantType.per_Token: per_token_quant_triton,
-        QuantType.per_1x128: lambda a, **k: per_token_quant_triton(
+        QuantType.per_128x128: lambda a, **k: per_token_quant_triton(
             a.view(-1, 128), **k
         ),
     }

@@ -9,7 +9,7 @@ from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-#include "gemm_moe_ck2stages_common.cuh"
+#include "gemm_moe_ck2stages_common{quanttype}.cuh"
 
 using A0DataType = {A0DataType};
 using B0DataType = {B0DataType};
@@ -99,6 +99,7 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m)
 
 heuristic_dispatch_dict = {
     "a8w8": [A16W16_A8W8_gemm1_heuristic_dispatch, A16W16_A8W8_gemm2_heuristic_dispatch],
+    "a8w8blkscale": [A16W16_A8W8_gemm1_heuristic_dispatch, A16W16_A8W8_gemm2_heuristic_dispatch],
     "a16w16": [A16W16_A8W8_gemm1_heuristic_dispatch, A16W16_A8W8_gemm2_heuristic_dispatch],
     "a8w4": []
 }
@@ -132,6 +133,7 @@ class ck_moe_2stage_gemm_codegen:
                     os.remove(f_instance)
                 with open(f_instance, "w") as f_ins:
                     stage_instance = STG_INSTANCE_IMPL.format(
+                        quanttype="_blockscale" if "per_128x128" in self.quant_type else "",
                         A0DataType=self.a_dtype,
                         B0DataType=self.b_dtype,
                         AccDataType="F32" if  self.a_dtype != "I8" else "I32",
@@ -242,7 +244,7 @@ if __name__ == "__main__":
         default="per_tensor",
         required=False,
         type=str,
-        choices=["per_tensor", "per_token", "no"],
+        choices=["per_tensor", "per_token", "per_128x128","no"],
         help="select quant_type")
 
     parser.add_argument(
