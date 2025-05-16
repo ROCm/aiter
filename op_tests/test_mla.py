@@ -362,8 +362,7 @@ def test_mla(
     #               msg=f'attn_lse    [golden vs aiter_asm]')
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
-        total_kv * nhead_kv * qk_head_dim
-        + batch_size * mtp * nhead * (qk_head_dim + v_head_dim)
+        total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
     ) * (torch.finfo(dtype).bits // 8)
     checkAllclose(
         out_ref,
@@ -376,6 +375,8 @@ def test_mla(
         "decode:flops": flops,
         "decode:bytes": bytes,
         "decode:asm_576": us_asm_decode,
+        "decode:TFLOPS": flops / us_asm_decode / 1e6,
+        "decode:TB/s": bytes / us_asm_decode / 1e6,
     }
 
 
@@ -387,7 +388,7 @@ block_size = 1
 list_dtype = [(dtypes.bf16, dtypes.bf16)]
 list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]
 list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:]
-list_nhead = [(16, 1), (128, 2)]
+list_nhead = [(16, 1), (128, 2)][:]
 import pandas as pd
 
 for nhead, mtp in list_nhead:
