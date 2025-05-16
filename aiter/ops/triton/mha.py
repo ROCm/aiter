@@ -3678,7 +3678,7 @@ def _flash_attn_onekernel_backward(
     BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 128, 128, 16
 
     onekernel_config = {
-        "BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "num_warps": 8, "num_ctas": 1, "num_stages": 1,
+        "BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": 1, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "num_warps": 8, "num_ctas": 1, "num_stages": 1,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1
