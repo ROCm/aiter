@@ -7,6 +7,7 @@ from aiter.ops.triton.utils.pid_preprocessing import _wid2pid, _remap_XCD
 from aiter.ops.triton.mha_bwd_onekernel import bwd_kernel_causal, bwd_kernel_noncausal
 from aiter.ops.triton.utils.mha_onekernel_utils import is_cdna
 
+
 def get_autotune_configs():
     if True:
         if is_cdna():
@@ -17,54 +18,347 @@ def get_autotune_configs():
             MATRIX_INSTR_NONKDIM = 16
 
             preprocess_autotune_configs = [
-                triton.Config({"PRE_BLOCK": 128, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS), # og config
-                triton.Config({"PRE_BLOCK": 64, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({"PRE_BLOCK": 32, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({"PRE_BLOCK": 16, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config(
+                    {
+                        "PRE_BLOCK": 128,
+                        "waves_per_eu": WAVES_PER_EU,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "PRE_BLOCK": 64,
+                        "waves_per_eu": WAVES_PER_EU,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "PRE_BLOCK": 32,
+                        "waves_per_eu": WAVES_PER_EU,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "PRE_BLOCK": 16,
+                        "waves_per_eu": WAVES_PER_EU,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
             ]
             preprocess_autotune_keys = [
-                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+                "IS_CAUSAL",
+                "dropout_p",
+                "MAX_SEQLENS_Q",
+                "MAX_SEQLENS_K",
+                "ACTUAL_HEAD_DIM",
+                "IS_VARLEN",
+                "HQ",
+                "HK",
             ]
             causal_autotune_configs = [
-                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-
-                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 1,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 2,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
             ]
             causal_autotune_keys = [
-                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+                "IS_CAUSAL",
+                "dropout_p",
+                "MAX_SEQLENS_Q",
+                "MAX_SEQLENS_K",
+                "ACTUAL_HEAD_DIM",
+                "IS_VARLEN",
+                "HQ",
+                "HK",
             ]
             noncausal_autotune_configs = [
-                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
-                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 4,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 4,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 4,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 4,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 8,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),  # og config
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 128,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 8,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 16,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 8,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
+                triton.Config(
+                    {
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 64,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 8,
+                        "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM,
+                    },
+                    num_stages=NUM_STAGES,
+                    num_warps=NUM_WARPS,
+                ),
             ]
             noncausal_autotune_keys = [
-                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+                "IS_CAUSAL",
+                "dropout_p",
+                "MAX_SEQLENS_Q",
+                "MAX_SEQLENS_K",
+                "ACTUAL_HEAD_DIM",
+                "IS_VARLEN",
+                "HQ",
+                "HK",
             ]
-            
-            return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
+
+            return (
+                (preprocess_autotune_configs, preprocess_autotune_keys),
+                (causal_autotune_configs, causal_autotune_keys),
+                (noncausal_autotune_configs, noncausal_autotune_keys),
+            )
         else:
             raise ValueError("Unknown Device Type")
     else:
@@ -77,35 +371,85 @@ def get_autotune_configs():
         BLK_SLICE_FACTOR = 2
 
         assert BLOCK_N1 == BLOCK_M2
-        
+
         # configs for the kernels
         preprocess_autotune_configs = [
-            triton.Config({"PRE_BLOCK": PRE_BLOCK, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+            triton.Config(
+                {"PRE_BLOCK": PRE_BLOCK, "waves_per_eu": WAVES_PER_EU},
+                num_stages=NUM_STAGES,
+                num_warps=NUM_WARPS,
+            ),
         ]
         preprocess_autotune_keys = [
-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            "IS_CAUSAL",
+            "dropout_p",
+            "MAX_SEQLENS_Q",
+            "MAX_SEQLENS_K",
+            "ACTUAL_HEAD_DIM",
+            "IS_VARLEN",
+            "HQ",
+            "HK",
         ]
         causal_autotune_configs = [
-            triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+            triton.Config(
+                {
+                    "BLOCK_M1": BLOCK_M1,
+                    "BLOCK_N1": BLOCK_N1,
+                    "BLOCK_M2": BLOCK_M2,
+                    "BLOCK_N2": BLOCK_N2,
+                    "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR,
+                    "waves_per_eu": WAVES_PER_EU,
+                },
+                num_stages=NUM_STAGES,
+                num_warps=NUM_WARPS,
+            ),
         ]
         causal_autotune_keys = [
-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            "IS_CAUSAL",
+            "dropout_p",
+            "MAX_SEQLENS_Q",
+            "MAX_SEQLENS_K",
+            "ACTUAL_HEAD_DIM",
+            "IS_VARLEN",
+            "HQ",
+            "HK",
         ]
         noncausal_autotune_configs = [
-            triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+            triton.Config(
+                {
+                    "BLOCK_M1": BLOCK_M1,
+                    "BLOCK_N1": BLOCK_N1,
+                    "BLOCK_M2": BLOCK_M2,
+                    "BLOCK_N2": BLOCK_N2,
+                    "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR,
+                    "waves_per_eu": WAVES_PER_EU,
+                },
+                num_stages=NUM_STAGES,
+                num_warps=NUM_WARPS,
+            ),
         ]
         noncausal_autotune_keys = [
-            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
-            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            "IS_CAUSAL",
+            "dropout_p",
+            "MAX_SEQLENS_Q",
+            "MAX_SEQLENS_K",
+            "ACTUAL_HEAD_DIM",
+            "IS_VARLEN",
+            "HQ",
+            "HK",
         ]
-        return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
-    
+        return (
+            (preprocess_autotune_configs, preprocess_autotune_keys),
+            (causal_autotune_configs, causal_autotune_keys),
+            (noncausal_autotune_configs, noncausal_autotune_keys),
+        )
 
 
-(preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys) = get_autotune_configs()
-
+(
+    (preprocess_autotune_configs, preprocess_autotune_keys),
+    (causal_autotune_configs, causal_autotune_keys),
+    (noncausal_autotune_configs, noncausal_autotune_keys),
+) = get_autotune_configs()
 
 
 @triton.jit
@@ -1003,7 +1347,7 @@ def _flash_attn_forward(
         "num_stages": 1,
     }
     # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout or q.dtype==torch.float32:
+    if enable_dropout or q.dtype == torch.float32:
         config = {
             "BLOCK_M": 32,
             "BLOCK_N": 32,
@@ -2433,19 +2777,41 @@ def _bwd_kernel_dq_noncausal(
 
 # Fused backward kernels
 
+
 @triton.jit
 def _bwd_dkdvdq_inner(
-    dk, dv,
-    Q, k, v, DO, DQ, M, D, sm_scale,
-    stride_q_m, stride_q_k,
-    stride_dq_m, stride_dq_k,
-    stride_do_m, stride_do_k,
-    stride_dropout_m, stride_dropout_n,
+    dk,
+    dv,
+    Q,
+    k,
+    v,
+    DO,
+    DQ,
+    M,
+    D,
+    sm_scale,
+    stride_q_m,
+    stride_q_k,
+    stride_dq_m,
+    stride_dq_k,
+    stride_do_m,
+    stride_do_k,
+    stride_dropout_m,
+    stride_dropout_n,
     stride_deltam,
-    dropout_p, philox_seed, batch_philox_offset, dropout_offset,
-    seqlen_q, seqlen_k,
-    start_n, start_m, num_steps,
-    descale_q, descale_k, descale_v, descale_do,
+    dropout_p,
+    philox_seed,
+    batch_philox_offset,
+    dropout_offset,
+    seqlen_q,
+    seqlen_k,
+    start_n,
+    start_m,
+    num_steps,
+    descale_q,
+    descale_k,
+    descale_v,
+    descale_do,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D_MODEL: tl.constexpr,
@@ -2463,7 +2829,7 @@ def _bwd_dkdvdq_inner(
     tl.assume(stride_do_k >= 0)
     tl.assume(stride_deltam >= 0)
 
-    PADDED_HEAD: tl.constexpr = (BLOCK_D_MODEL != BLOCK_D_MODEL_POW2)
+    PADDED_HEAD: tl.constexpr = BLOCK_D_MODEL != BLOCK_D_MODEL_POW2
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M)
     offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -2472,31 +2838,35 @@ def _bwd_dkdvdq_inner(
     # mask to make sure not OOB of seqlen_q
     mask_n = offs_n < seqlen_k
 
-    qT_ptrs_start = Q + offs_m[None, :] * stride_q_m + offs_k[:, None] * stride_q_k #[BLOCK_D_MODEL_POW2, BLOCK_M]
-    dq_ptrs_start = DQ + offs_m[:, None] * stride_dq_m + offs_k[None,:] * stride_dq_k #[BLOCK_M, BLOCK_D_MODEL_POW2]
+    qT_ptrs_start = (
+        Q + offs_m[None, :] * stride_q_m + offs_k[:, None] * stride_q_k
+    )  # [BLOCK_D_MODEL_POW2, BLOCK_M]
+    dq_ptrs_start = (
+        DQ + offs_m[:, None] * stride_dq_m + offs_k[None, :] * stride_dq_k
+    )  # [BLOCK_M, BLOCK_D_MODEL_POW2]
 
-    do_ptrs_start = DO + offs_m[:, None] * stride_do_m + offs_k[None,: ] * stride_do_k
+    do_ptrs_start = DO + offs_m[:, None] * stride_do_m + offs_k[None, :] * stride_do_k
     curr_m = start_m
     step_m = BLOCK_M
     curr_philox_offset = batch_philox_offset
     curr_dropout_offset = dropout_offset
     RCP_LN2: tl.constexpr = 1.4426950408889634
 
-    #Iterate over blocks(BLOCK_M size) of Q while calculating
-    #a fixed block(BLOCK_N) of dk and dv. Note, during backward
-    #pass P has to be recomputed. However, this kernel computes
-    #dV and dK, so we compute we need P^T and S^T. See backward pass
-    #equations
+    # Iterate over blocks(BLOCK_M size) of Q while calculating
+    # a fixed block(BLOCK_N) of dk and dv. Note, during backward
+    # pass P has to be recomputed. However, this kernel computes
+    # dV and dK, so we compute we need P^T and S^T. See backward pass
+    # equations
     #
-    #From Flash Attention Paper:
-    #ForwardPass: S = QkT, P=softmax(S), O=PV
+    # From Flash Attention Paper:
+    # ForwardPass: S = QkT, P=softmax(S), O=PV
     #
-    #BackwardPass equations
-    #dV = P^TdO
-    #dP = dOV^T
-    #dS = dsoftmax(dP)
-    #dQ = dSK
-    #dK = QdS^T
+    # BackwardPass equations
+    # dV = P^TdO
+    # dP = dOV^T
+    # dS = dsoftmax(dP)
+    # dQ = dSK
+    # dK = QdS^T
 
     for iter in range(num_steps):
         # Permute the iteration order to reduce the probability that concurrent workgroups (that share the same q head idx and batch idx) are at the same iteration
@@ -2517,29 +2887,31 @@ def _bwd_dkdvdq_inner(
             mask_qT &= offs_k[:, None] < BLOCK_D_MODEL
             mask_do &= offs_k[None, :] < BLOCK_D_MODEL
 
-        #load qT
+        # load qT
         qT = tl.load(qT_ptrs, mask=mask_qT, other=0.0)
 
-        #dropout
+        # dropout
         if ENABLE_DROPOUT:
-             # NOTE: dropout is transposed because it is used to mask pT
-            philox_offs = (curr_philox_offset +
-                            offs_m[None, :] * stride_dropout_m +
-                            offs_n[:, None] * stride_dropout_n)
+            # NOTE: dropout is transposed because it is used to mask pT
+            philox_offs = (
+                curr_philox_offset
+                + offs_m[None, :] * stride_dropout_m
+                + offs_n[:, None] * stride_dropout_n
+            )
             rand_vals = tl.rand(philox_seed, philox_offs)
             dropout_mask = rand_vals > dropout_p
             dropout_scale = 1.0 / (1 - dropout_p)
 
-        #Load M
+        # Load M
         m = tl.load(M + offs_m * stride_deltam, mask=mask_m, other=0.0)
 
-        #Compute qkT
+        # Compute qkT
         if IS_FP8:
-            qkT = (tl.dot(k, qT) * descale_q * descale_k)
+            qkT = tl.dot(k, qT) * descale_q * descale_k
         else:
             qkT = tl.dot(k, qT)
 
-        #Compute pT(use m and also apply sm_scale)
+        # Compute pT(use m and also apply sm_scale)
         pT = tl.math.exp(qkT * sm_scale - m[None, :])
 
         if MASK:
@@ -2547,28 +2919,38 @@ def _bwd_dkdvdq_inner(
             mask = causal_mask & mask_nm
             pT = tl.where(mask, pT, 0.0)
 
-        #load DO
+        # load DO
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
 
-        #dV
+        # dV
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
             if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(pT_dropout, FP8_MAX)
-                dv += (tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do) * descale_p_dropout * descale_do)
+                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
+                    pT_dropout, FP8_MAX
+                )
+                dv += (
+                    tl.dot((pT_dropout * scale_p_dropout).to(do.type.element_ty), do)
+                    * descale_p_dropout
+                    * descale_do
+                )
             else:
                 dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
                 scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
-                dv += (tl.dot((pT * scale_pT).to(do.type.element_ty), do) * descale_pT * descale_do)
+                dv += (
+                    tl.dot((pT * scale_pT).to(do.type.element_ty), do)
+                    * descale_pT
+                    * descale_do
+                )
             else:
                 dv += tl.dot(pT.to(do.type.element_ty), do)
 
-        #Load delta
+        # Load delta
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
 
-        #Compute dP and dS
+        # Compute dP and dS
         if IS_FP8:
             dpT = tl.dot(v, tl.trans(do)) * descale_v * descale_do
         else:
@@ -2580,19 +2962,24 @@ def _bwd_dkdvdq_inner(
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
 
-        #compute dk
+        # compute dk
         if IS_FP8:
             scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
-            dk += (tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT)) * descale_dsT * descale_q)
+            dk += (
+                tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
+                * descale_dsT
+                * descale_q
+            )
         else:
             dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
-
 
         # We can compute the dq_partial here and do a atomic add to the correct memory location
         # NOTE: Possible problems with the atomic add: contention, is inside a loop which has achieved bad perf before
         # (BLOCK_M, BLOCK_N) x (BLOCK_N, D)
         if IS_FP8:
-            dq_partial = tl.dot((dsT * scale_dsT).to(k.dtype).T, k) * descale_dsT * descale_k
+            dq_partial = (
+                tl.dot((dsT * scale_dsT).to(k.dtype).T, k) * descale_dsT * descale_k
+            )
         else:
             dq_partial = tl.dot(dsT.to(k.dtype).T, k)
         tl.atomic_add(
@@ -2612,21 +2999,63 @@ def _bwd_dkdvdq_inner(
 # )
 @triton.jit
 def _bwd_kernel_dkdvdq_causal(
-    q_ptr, k_ptr, v_ptr, sm_scale, do_ptr, dk_ptr, dv_ptr, dq_ptr,
-    m_ptr, delta_ptr,
-    stride_q_b, stride_q_h, stride_q_m, stride_q_k,
-    stride_k_b, stride_k_h, stride_k_n, stride_k_k,
-    stride_v_b, stride_v_h, stride_v_n, stride_v_k,
-    stride_dk_b, stride_dk_h, stride_dk_n, stride_dk_k,
-    stride_dq_b, stride_dq_h, stride_dq_m, stride_dq_k,
-    stride_delta_b, stride_delta_h, stride_delta_m,
-    stride_do_b, stride_do_h, stride_do_m, stride_do_k,
-    stride_dropout_b, stride_dropout_h, stride_dropout_m, stride_dropout_n,
-    stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
-    cu_seqlens_q, cu_seqlens_k,
-    max_seqlen_q, max_seqlen_k,
-    dropout_mask, dropout_p, philox_seed, philox_offset_base,
-    descale_q_ptr, descale_k_ptr, descale_v_ptr, descale_do_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    sm_scale,
+    do_ptr,
+    dk_ptr,
+    dv_ptr,
+    dq_ptr,
+    m_ptr,
+    delta_ptr,
+    stride_q_b,
+    stride_q_h,
+    stride_q_m,
+    stride_q_k,
+    stride_k_b,
+    stride_k_h,
+    stride_k_n,
+    stride_k_k,
+    stride_v_b,
+    stride_v_h,
+    stride_v_n,
+    stride_v_k,
+    stride_dk_b,
+    stride_dk_h,
+    stride_dk_n,
+    stride_dk_k,
+    stride_dq_b,
+    stride_dq_h,
+    stride_dq_m,
+    stride_dq_k,
+    stride_delta_b,
+    stride_delta_h,
+    stride_delta_m,
+    stride_do_b,
+    stride_do_h,
+    stride_do_m,
+    stride_do_k,
+    stride_dropout_b,
+    stride_dropout_h,
+    stride_dropout_m,
+    stride_dropout_n,
+    stride_descale_q_z,
+    stride_descale_k_z,
+    stride_descale_v_z,
+    stride_descale_do_z,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_mask,
+    dropout_p,
+    philox_seed,
+    philox_offset_base,
+    descale_q_ptr,
+    descale_k_ptr,
+    descale_v_ptr,
+    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -2671,16 +3100,17 @@ def _bwd_kernel_dkdvdq_causal(
     tl.assume(stride_do_k >= 0)
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
-    wid = tl.program_id(0) # workgoup id: 0, ..., NUM_Q_PIDS * BATCH * NUM_K_HEADS - 1
-    batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8)
+    wid = tl.program_id(0)  # workgoup id: 0, ..., NUM_Q_PIDS * BATCH * NUM_K_HEADS - 1
+    batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(
+        wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8
+    )
     # In the backward we dont want concurrent workgroups to handle consecutive heads or blocks, so remap them to be far apart.
     head_q_idx = (head_q_idx * 29) % NUM_Q_HEADS
     seq_k_blk_idx = (seq_k_blk_idx * 29) % NUM_K_PIDS
-    
 
     head_k_idx = head_q_idx // GROUP_SIZE
 
-    #Determine q and k start along with seqlen_q and seqlen_k
+    # Determine q and k start along with seqlen_q and seqlen_k
     q_start = 0
     k_start = 0
     seqlen_q = max_seqlen_q
@@ -2719,28 +3149,34 @@ def _bwd_kernel_dkdvdq_causal(
     else:
         start_delta = start_delta_q_lt_k
 
-    start_n =  seq_k_blk_idx * BLOCK_N
+    start_n = seq_k_blk_idx * BLOCK_N
 
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
     offs_n = start_n + tl.arange(0, BLOCK_N)
     # Mask for loading K and V
     mask_kv = offs_n[:, None] < seqlen_k
-    PADDED_HEAD: tl.constexpr = (BLOCK_D_MODEL != BLOCK_D_MODEL_POW2)
+    PADDED_HEAD: tl.constexpr = BLOCK_D_MODEL != BLOCK_D_MODEL_POW2
     if PADDED_HEAD:
         mask_k = offs_k < BLOCK_D_MODEL
         mask_kv &= mask_k[None, :]
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
-    adj_k = (batch_idx * stride_k_b +
-            head_k_idx * stride_k_h +
-            k_start * stride_k_n + offs_n[:, None] * stride_k_n +
-            offs_k[None, :] * stride_k_k)
-    adj_v = (batch_idx * stride_v_b +
-            head_k_idx * stride_v_h +
-            k_start * stride_v_n + offs_n[:, None] * stride_v_n +
-            offs_k[None, :] * stride_v_k)
+    adj_k = (
+        batch_idx * stride_k_b
+        + head_k_idx * stride_k_h
+        + k_start * stride_k_n
+        + offs_n[:, None] * stride_k_n
+        + offs_k[None, :] * stride_k_k
+    )
+    adj_v = (
+        batch_idx * stride_v_b
+        + head_k_idx * stride_v_h
+        + k_start * stride_v_n
+        + offs_n[:, None] * stride_v_n
+        + offs_k[None, :] * stride_v_k
+    )
     # load K and V: they stay in SRAM throughout the inner loop.
-    k = tl.load(k_ptr + adj_k , mask=mask_kv, other=0.0)
+    k = tl.load(k_ptr + adj_k, mask=mask_kv, other=0.0)
     v = tl.load(v_ptr + adj_v, mask=mask_kv, other=0.0)
 
     # If MQA / GQA, set the K and V head offsets appropriately.
@@ -2766,7 +3202,11 @@ def _bwd_kernel_dkdvdq_causal(
 
     adj_do = batch_idx * stride_do_b + head_q_idx * stride_do_h + q_start * stride_do_m
     do_ptr_adj = do_ptr + adj_do
-    adj_delta = batch_idx * stride_delta_b + head_q_idx * stride_delta_h + q_start * stride_delta_m
+    adj_delta = (
+        batch_idx * stride_delta_b
+        + head_q_idx * stride_delta_h
+        + q_start * stride_delta_m
+    )
     m_ptr_adj = m_ptr + adj_delta
     delta_ptr_adj = delta_ptr + adj_delta
 
@@ -2775,10 +3215,14 @@ def _bwd_kernel_dkdvdq_causal(
     batch_philox_offset = 0
     dropout_offset = 0
     if ENABLE_DROPOUT:
-        batch_philox_offset = (philox_offset_base + batch_idx * stride_dropout_b +
-                                head_q_idx * stride_dropout_h)
-        dropout_offset = (dropout_mask + batch_idx * stride_dropout_b +
-                            head_q_idx * stride_dropout_h)
+        batch_philox_offset = (
+            philox_offset_base
+            + batch_idx * stride_dropout_b
+            + head_q_idx * stride_dropout_h
+        )
+        dropout_offset = (
+            dropout_mask + batch_idx * stride_dropout_b + head_q_idx * stride_dropout_h
+        )
 
     MASK_BLOCK_M: tl.constexpr = BLOCK_M // BLK_SLICE_FACTOR
     # bound the masked operation to q len so it does not have to wast cycles
@@ -2793,26 +3237,51 @@ def _bwd_kernel_dkdvdq_causal(
         descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + head_q_idx)
         descale_k = tl.load(descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx)
         descale_v = tl.load(descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx)
-        descale_do = tl.load(descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx)
+        descale_do = tl.load(
+            descale_do_ptr + batch_idx * stride_descale_do_z + head_q_idx
+        )
     else:
         descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
     # if unaligned start_m is negative, the current N-tile has no block on the
     #   diagonal of causal mask, so everything have no causal mask
     dk, dv = _bwd_dkdvdq_inner(
-        dk, dv,  # output tensors
-        q_ptr_adj, k, v, do_ptr_adj, dq_ptr_adj, m_ptr_adj, delta_ptr_adj, sm_scale, # input tensors
-        stride_q_m, stride_q_k,  # strides for q
-        stride_dq_m, stride_dq_k,  # strides for q
-        stride_do_m, stride_do_k,  # strides for o
-        stride_dropout_m, stride_dropout_n,  # strides for dropout
+        dk,
+        dv,  # output tensors
+        q_ptr_adj,
+        k,
+        v,
+        do_ptr_adj,
+        dq_ptr_adj,
+        m_ptr_adj,
+        delta_ptr_adj,
+        sm_scale,  # input tensors
+        stride_q_m,
+        stride_q_k,  # strides for q
+        stride_dq_m,
+        stride_dq_k,  # strides for q
+        stride_do_m,
+        stride_do_k,  # strides for o
+        stride_dropout_m,
+        stride_dropout_n,  # strides for dropout
         stride_delta_m,
-        dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
-        seqlen_q, seqlen_k,  # max sequence length for q and k
-        start_n, start_m, num_steps,  # iteration numbers
-        descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
-        MASK_BLOCK_M, BLOCK_N,  # block dim
-        BLOCK_D_MODEL, BLOCK_D_MODEL_POW2,  # head dim
+        dropout_p,
+        philox_seed,
+        batch_philox_offset,
+        dropout_offset,  #
+        seqlen_q,
+        seqlen_k,  # max sequence length for q and k
+        start_n,
+        start_m,
+        num_steps,  # iteration numbers
+        descale_q,
+        descale_k,
+        descale_v,
+        descale_do,  # fp8 descale factors from user
+        MASK_BLOCK_M,
+        BLOCK_N,  # block dim
+        BLOCK_D_MODEL,
+        BLOCK_D_MODEL_POW2,  # head dim
         MASK=True,  # causal masking
         ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
         IS_FP8=IS_FP8,
@@ -2824,19 +3293,42 @@ def _bwd_kernel_dkdvdq_causal(
     end_m = start_m + num_steps * BLOCK_M
 
     dk, dv = _bwd_dkdvdq_inner(
-        dk, dv,  # output tensors
-        q_ptr_adj, k, v, do_ptr_adj, dq_ptr_adj, m_ptr_adj, delta_ptr_adj, sm_scale, # input tensors
-        stride_q_m, stride_q_k,  # strides for q
-        stride_dq_m, stride_dq_k,  # strides for dq
-        stride_do_m, stride_do_k,  # strides for o
-        stride_dropout_m, stride_dropout_n,  # strides for dropout
+        dk,
+        dv,  # output tensors
+        q_ptr_adj,
+        k,
+        v,
+        do_ptr_adj,
+        dq_ptr_adj,
+        m_ptr_adj,
+        delta_ptr_adj,
+        sm_scale,  # input tensors
+        stride_q_m,
+        stride_q_k,  # strides for q
+        stride_dq_m,
+        stride_dq_k,  # strides for dq
+        stride_do_m,
+        stride_do_k,  # strides for o
+        stride_dropout_m,
+        stride_dropout_n,  # strides for dropout
         stride_delta_m,
-        dropout_p, philox_seed, batch_philox_offset, dropout_offset,  #
-        seqlen_q, seqlen_k,  # max sequence length for q and k
-        start_n, start_m, num_steps,  # iteration numbers
-        descale_q, descale_k, descale_v, descale_do, # fp8 descale factors from user
-        BLOCK_M, BLOCK_N,  # block dim
-        BLOCK_D_MODEL, BLOCK_D_MODEL_POW2,  # head dim
+        dropout_p,
+        philox_seed,
+        batch_philox_offset,
+        dropout_offset,  #
+        seqlen_q,
+        seqlen_k,  # max sequence length for q and k
+        start_n,
+        start_m,
+        num_steps,  # iteration numbers
+        descale_q,
+        descale_k,
+        descale_v,
+        descale_do,  # fp8 descale factors from user
+        BLOCK_M,
+        BLOCK_N,  # block dim
+        BLOCK_D_MODEL,
+        BLOCK_D_MODEL_POW2,  # head dim
         MASK=False,  # causal masking
         ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
         IS_FP8=IS_FP8,
@@ -2844,10 +3336,13 @@ def _bwd_kernel_dkdvdq_causal(
     )
 
     # Write back dV and dK.
-    offs_dkdv = (batch_idx * stride_dk_b +
-                head_k_idx * stride_dk_h +
-                k_start * stride_dk_n + offs_n[:, None] * stride_dk_n +
-                offs_k[None, :] * stride_dk_k)
+    offs_dkdv = (
+        batch_idx * stride_dk_b
+        + head_k_idx * stride_dk_h
+        + k_start * stride_dk_n
+        + offs_n[:, None] * stride_dk_n
+        + offs_k[None, :] * stride_dk_k
+    )
     tl.atomic_add(dv_ptr + offs_dkdv, dv, mask=mask_kv, sem="relaxed")
     dk *= sm_scale
     tl.atomic_add(dk_ptr + offs_dkdv, dk, mask=mask_kv, sem="relaxed")
@@ -2860,21 +3355,63 @@ def _bwd_kernel_dkdvdq_causal(
 # )
 @triton.jit
 def _bwd_kernel_dkdvdq_noncausal(
-    Q, K, V, sm_scale, DO, DK, DV, DQ,
-    M, Delta,
-    stride_qb, stride_qh, stride_qm, stride_qk,
-    stride_kb, stride_kh, stride_kn, stride_kk,
-    stride_vb, stride_vh, stride_vn, stride_vk,
-    stride_dkb, stride_dkh, stride_dkn, stride_dkk,
-    stride_dqb, stride_dqh, stride_dqm, stride_dqk,
-    stride_deltab, stride_deltah, stride_deltam,
-    stride_dob, stride_doh, stride_dom, stride_dok,
-    stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn,
-    stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
-    cu_seqlens_q, cu_seqlens_k,
-    max_seqlen_q, max_seqlen_k,
-    dropout_mask, dropout_p, philox_seed, philox_offset,
-    descale_q_ptr, descale_k_ptr, descale_v_ptr, descale_do_ptr,
+    Q,
+    K,
+    V,
+    sm_scale,
+    DO,
+    DK,
+    DV,
+    DQ,
+    M,
+    Delta,
+    stride_qb,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kb,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vb,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_dkb,
+    stride_dkh,
+    stride_dkn,
+    stride_dkk,
+    stride_dqb,
+    stride_dqh,
+    stride_dqm,
+    stride_dqk,
+    stride_deltab,
+    stride_deltah,
+    stride_deltam,
+    stride_dob,
+    stride_doh,
+    stride_dom,
+    stride_dok,
+    stride_dropoutb,
+    stride_dropouth,
+    stride_dropoutm,
+    stride_dropoutn,
+    stride_descale_q_z,
+    stride_descale_k_z,
+    stride_descale_v_z,
+    stride_descale_do_z,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_mask,
+    dropout_p,
+    philox_seed,
+    philox_offset,
+    descale_q_ptr,
+    descale_k_ptr,
+    descale_v_ptr,
+    descale_do_ptr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     BATCH,
@@ -2891,7 +3428,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     NUM_SMS: tl.constexpr,
 ):
     # workgroup id
-    wid = tl.program_id(0) # 0, ..., NUM_K_PIDS * BATCH * NUM_K_HEADS - 1
+    wid = tl.program_id(0)  # 0, ..., NUM_K_PIDS * BATCH * NUM_K_HEADS - 1
 
     # Workgroups get launched first along batch dim, then in head_k dim, and then in seq k block dim
     # This is in order to avoid contention for the tl.atomic_add (inside _bwd_dkdvdq_inner) that happens between workgroups that share the same batch and head_k.
@@ -2899,7 +3436,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     hkid = wid // BATCH % NUM_K_HEADS
     pid = wid // (BATCH * NUM_K_HEADS) % NUM_K_PIDS
 
-    num_atomics_concurrent = NUM_SMS // (NUM_K_HEADS *  BATCH)
+    num_atomics_concurrent = NUM_SMS // (NUM_K_HEADS * BATCH)
 
     q_start = 0
     k_start = 0
@@ -2914,7 +3451,6 @@ def _bwd_kernel_dkdvdq_noncausal(
         seqlen_q = q_end - q_start
         seqlen_k = k_end - k_start
 
-
     dk = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
 
@@ -2923,46 +3459,52 @@ def _bwd_kernel_dkdvdq_noncausal(
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
     offs_n = start_n + tl.arange(0, BLOCK_N)
     mask_kv = offs_n[:, None] < seqlen_k
-    PADDED_HEAD: tl.constexpr = (BLOCK_D_MODEL != BLOCK_D_MODEL_POW2)
+    PADDED_HEAD: tl.constexpr = BLOCK_D_MODEL != BLOCK_D_MODEL_POW2
     if PADDED_HEAD:
         mask_kv &= offs_k < BLOCK_D_MODEL
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
-    adj_k = (bid * stride_kb +
-            hkid * stride_kh +
-            k_start * stride_kn +
-            offs_n[:, None] * stride_kn +
-            offs_k[None, :] * stride_kk)
-    adj_v = (bid * stride_vb +
-            hkid * stride_vh +
-            k_start * stride_vn +
-            offs_n[:, None] * stride_vn +
-            offs_k[None, :] * stride_vk)
+    adj_k = (
+        bid * stride_kb
+        + hkid * stride_kh
+        + k_start * stride_kn
+        + offs_n[:, None] * stride_kn
+        + offs_k[None, :] * stride_kk
+    )
+    adj_v = (
+        bid * stride_vb
+        + hkid * stride_vh
+        + k_start * stride_vn
+        + offs_n[:, None] * stride_vn
+        + offs_k[None, :] * stride_vk
+    )
 
     k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
     v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
 
     for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
-        adj_q = (bid * stride_qb + hqid * stride_qh + q_start * stride_qm)
-        adj_dq = (bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm)
+        adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+        adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
 
         Q_ptr = Q + adj_q
-        DQ_ptr = DQ  + adj_dq
+        DQ_ptr = DQ + adj_dq
 
-        adj_do = (bid * stride_dob + hqid * stride_doh + q_start * stride_dom)
+        adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
         DO_ptr = DO + adj_do
-        adj_delta = (bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam)
+        adj_delta = bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
         M_ptr = M + adj_delta
         Delta_ptr = Delta + adj_delta
 
-        #dropout
+        # dropout
         batch_philox_offset = 0
         dropout_offset = 0
         if ENABLE_DROPOUT:
-            batch_philox_offset = philox_offset + bid * stride_dropoutb + \
-                                  hqid * stride_dropouth
-            dropout_offset = dropout_mask + bid * stride_dropoutb + \
-                             hqid * stride_dropouth
+            batch_philox_offset = (
+                philox_offset + bid * stride_dropoutb + hqid * stride_dropouth
+            )
+            dropout_offset = (
+                dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+            )
 
         if IS_FP8:
             descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
@@ -2976,29 +3518,55 @@ def _bwd_kernel_dkdvdq_noncausal(
         num_steps = tl.cdiv(seqlen_q, BLOCK_M)
 
         dk, dv = _bwd_dkdvdq_inner(
-            dk, dv,
-            Q_ptr, k, v, DO_ptr, DQ_ptr, M_ptr, Delta_ptr, sm_scale,
-            stride_qm, stride_qk,
-            stride_dqm, stride_dqk,
-            stride_dom, stride_dok,
-            stride_dropoutm, stride_dropoutn,
+            dk,
+            dv,
+            Q_ptr,
+            k,
+            v,
+            DO_ptr,
+            DQ_ptr,
+            M_ptr,
+            Delta_ptr,
+            sm_scale,
+            stride_qm,
+            stride_qk,
+            stride_dqm,
+            stride_dqk,
+            stride_dom,
+            stride_dok,
+            stride_dropoutm,
+            stride_dropoutn,
             stride_deltam,
-            dropout_p, philox_seed, batch_philox_offset, dropout_offset,
-            seqlen_q, seqlen_k,
-            start_n, start_m, num_steps,
-            descale_q, descale_k, descale_v, descale_do,
-            BLOCK_M, BLOCK_N,
-            BLOCK_D_MODEL, BLOCK_D_MODEL_POW2,
+            dropout_p,
+            philox_seed,
+            batch_philox_offset,
+            dropout_offset,
+            seqlen_q,
+            seqlen_k,
+            start_n,
+            start_m,
+            num_steps,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_D_MODEL,
+            BLOCK_D_MODEL_POW2,
             MASK=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
         )
 
-    adj_dkdv = (bid * stride_dkb +
-                hkid * stride_dkh +
-                k_start * stride_dkn + offs_n[:, None] * stride_dkn +
-                offs_k[None, :] * stride_dkk)
+    adj_dkdv = (
+        bid * stride_dkb
+        + hkid * stride_dkh
+        + k_start * stride_dkn
+        + offs_n[:, None] * stride_dkn
+        + offs_k[None, :] * stride_dkk
+    )
     tl.store(DV + adj_dkdv, dv, mask=mask_kv)
     dk *= sm_scale
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
@@ -3100,14 +3668,12 @@ def _flash_attn_backward(
     # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
     # BLK_SLICE_FACTOR = 2
 
-
     NUM_WARPS, NUM_STAGES = 4, 1
     WAVES_PER_EU = 1
     PRE_BLOCK = 128
     BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
     BLK_SLICE_FACTOR = 2
-    matrix_instr_nonkdim=16
-
+    matrix_instr_nonkdim = 16
 
     # init delta
     delta = torch.zeros_like(softmax_lse)
@@ -3151,7 +3717,11 @@ def _flash_attn_backward(
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
 
-    grid_dkdv = (num_k_heads, (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, )
+    grid_dkdv = (
+        num_k_heads,
+        (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1,
+        batch,
+    )
     grid_dq = (num_k_heads, (max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch)
     if causal:
         _bwd_kernel_dkdv_causal[grid_dkdv](
@@ -3468,9 +4038,10 @@ def _flash_attn_fused_backward(
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
 
-
     # Fuses dk,dv and dq computations into one kernel using atomics
-    BLOCK_N = 64 if ( (BLOCK_D_MODEL_POW2 > 160) or (q.dtype==torch.float32) ) else 128 # larger head sizes lead to oom
+    BLOCK_N = (
+        64 if ((BLOCK_D_MODEL_POW2 > 160) or (q.dtype == torch.float32)) else 128
+    )  # larger head sizes lead to oom
     config = {
         "BLOCK_M": 16,
         "BLOCK_N": BLOCK_N,
@@ -3486,8 +4057,16 @@ def _flash_attn_fused_backward(
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
         _bwd_kernel_dkdvdq_causal[grid_dkdvdq](
-            q, k, v, sm_scale, do, dk, dv, dq,
-            softmax_lse, delta,
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dk,
+            dv,
+            dq,
+            softmax_lse,
+            delta,
             *q_strides,
             *k_strides,
             *v_strides,
@@ -3497,11 +4076,18 @@ def _flash_attn_fused_backward(
             *do_strides,
             *dropout_strides,
             *descale_strides,
-            cu_seqlens_q, cu_seqlens_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            dropout_mask,dropout_p, philox_seed, philox_offset,
-            descale_q, descale_k, descale_v, descale_do,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BATCH=batch,
@@ -3517,10 +4103,18 @@ def _flash_attn_fused_backward(
         )
     else:
         # in non causal inner loop over grouped q heads
-        grid_dkdvdq = (batch * num_k_heads * num_k_pids,) 
+        grid_dkdvdq = (batch * num_k_heads * num_k_pids,)
         _bwd_kernel_dkdvdq_noncausal[grid_dkdvdq](
-            q, k, v, sm_scale, do, dk, dv, dq,
-            softmax_lse, delta,
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dk,
+            dv,
+            dq,
+            softmax_lse,
+            delta,
             *q_strides,
             *k_strides,
             *v_strides,
@@ -3530,11 +4124,18 @@ def _flash_attn_fused_backward(
             *do_strides,
             *dropout_strides,
             *descale_strides,
-            cu_seqlens_q, cu_seqlens_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            dropout_mask,dropout_p, philox_seed, philox_offset,
-            descale_q, descale_k, descale_v, descale_do,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
             BATCH=batch,
@@ -3549,7 +4150,6 @@ def _flash_attn_fused_backward(
             **config,
         )
     return delta
-
 
 
 def _flash_attn_onekernel_backward(
@@ -3682,7 +4282,6 @@ def _flash_attn_onekernel_backward(
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
 
-
     # Fuses dk,dv and dq computations into one kernel using atomics
 
     NUM_WARPS, NUM_STAGES = 4, 1
@@ -3690,28 +4289,39 @@ def _flash_attn_onekernel_backward(
     PRE_BLOCK = 128
     BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
     BLK_SLICE_FACTOR = 2
-    matrix_instr_nonkdim=16
-
+    matrix_instr_nonkdim = 16
 
     onekernel_config = {
         "BLOCK_M1": BLOCK_M1,
-        "BLOCK_N1": BLOCK_N1, 
-        "BLOCK_M2": BLOCK_M2, 
-        "BLOCK_N2": BLOCK_N2, 
-        "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, 
-        "waves_per_eu": WAVES_PER_EU, 
-        "matrix_instr_nonkdim": matrix_instr_nonkdim, 
-        "num_warps": NUM_WARPS, 
-        "num_ctas": 1, 
+        "BLOCK_N1": BLOCK_N1,
+        "BLOCK_M2": BLOCK_M2,
+        "BLOCK_N2": BLOCK_N2,
+        "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR,
+        "waves_per_eu": WAVES_PER_EU,
+        "matrix_instr_nonkdim": matrix_instr_nonkdim,
+        "num_warps": NUM_WARPS,
+        "num_ctas": 1,
         "num_stages": NUM_STAGES,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1
-    grid = (num_k_heads, num_k_pids, batch, )
+    grid = (
+        num_k_heads,
+        num_k_pids,
+        batch,
+    )
     if causal:
         bwd_kernel_causal[grid](
-            q, k, v, sm_scale, do, dq, dk, dv,
-            softmax_lse, delta,
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dq,
+            dk,
+            dv,
+            softmax_lse,
+            delta,
             *q_strides,
             *k_strides,
             *v_strides,
@@ -3721,14 +4331,27 @@ def _flash_attn_onekernel_backward(
             *delta_strides,
             *do_strides,
             *dropout_strides,
-            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
-            None, None,
-            num_q_heads, num_k_heads,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
-            dropout_mask, dropout_p, philox_seed, philox_offset,
+            stride_descale_q_z,
+            stride_descale_k_z,
+            stride_descale_v_z,
+            stride_descale_do_z,
+            None,
+            None,
+            num_q_heads,
+            num_k_heads,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
             alibi_slopes,
-            descale_q, descale_k, descale_v, descale_do,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
             HEAD_DIM=BLOCK_D_MODEL_POW2,
             ACTUAL_HEAD_DIM=head_sz,
             ENABLE_DROPOUT=use_dropout,
@@ -3740,12 +4363,20 @@ def _flash_attn_onekernel_backward(
             FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
-            **onekernel_config
+            **onekernel_config,
         )
     else:
         bwd_kernel_noncausal[grid](
-            q, k, v, sm_scale, do, dq, dk, dv,
-            softmax_lse, delta,
+            q,
+            k,
+            v,
+            sm_scale,
+            do,
+            dq,
+            dk,
+            dv,
+            softmax_lse,
+            delta,
             *q_strides,
             *k_strides,
             *v_strides,
@@ -3755,14 +4386,27 @@ def _flash_attn_onekernel_backward(
             *delta_strides,
             *do_strides,
             *dropout_strides,
-            stride_descale_q_z, stride_descale_k_z, stride_descale_v_z, stride_descale_do_z,
-            None, None,
-            num_q_heads, num_k_heads,
-            cu_seqlens_q, cu_seqlens_k,
-            max_seqlen_q, max_seqlen_k,
-            dropout_mask, dropout_p, philox_seed, philox_offset,
+            stride_descale_q_z,
+            stride_descale_k_z,
+            stride_descale_v_z,
+            stride_descale_do_z,
+            None,
+            None,
+            num_q_heads,
+            num_k_heads,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_mask,
+            dropout_p,
+            philox_seed,
+            philox_offset,
             alibi_slopes,
-            descale_q, descale_k, descale_v, descale_do,
+            descale_q,
+            descale_k,
+            descale_v,
+            descale_do,
             HEAD_DIM=BLOCK_D_MODEL_POW2,
             ACTUAL_HEAD_DIM=head_sz,
             ENABLE_DROPOUT=use_dropout,
@@ -3774,10 +4418,11 @@ def _flash_attn_onekernel_backward(
             FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
-            **onekernel_config
+            **onekernel_config,
         )
 
     return delta
+
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -4024,7 +4669,7 @@ def flash_attn_func(
         return_attn_probs,
         torch.is_grad_enabled(),
         fused_backward,
-        onekernel_backward
+        onekernel_backward,
     )
 
 
@@ -4245,7 +4890,7 @@ def flash_attn_fp8_func(
         return_attn_probs,
         torch.is_grad_enabled(),
         fused_backward,
-        onekerenl_backward
+        onekerenl_backward,
     )
 
 
@@ -4271,7 +4916,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         is_grad_enabled,
         fused_backward,
-        onekerenl_backward
+        onekerenl_backward,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -4769,5 +5414,5 @@ def flash_attn_varlen_fp8_func(
         block_table,
         torch.is_grad_enabled(),
         fused_backward,
-        onekernel_backward
+        onekernel_backward,
     )

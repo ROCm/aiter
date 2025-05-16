@@ -658,9 +658,7 @@ def test_mha_backward_varlen(
 )
 @pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, True)])
 # @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. Fails for seq >=64
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(32, 8)]
-)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(32, 8)])
 @pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("atomic", [False, True])
