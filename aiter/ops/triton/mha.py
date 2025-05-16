@@ -5,6 +5,108 @@ import triton.language as tl
 from typing import Optional, Tuple
 from aiter.ops.triton.utils.pid_preprocessing import _wid2pid, _remap_XCD
 from aiter.ops.triton.mha_bwd_onekernel import bwd_kernel_causal, bwd_kernel_noncausal
+from aiter.ops.triton.utils.mha_onekernel_utils import is_cdna
+
+def get_autotune_configs():
+    if True:
+        if is_cdna():
+            # shared meta-parameters
+            NUM_STAGES = 1
+            NUM_WARPS = 8
+            WAVES_PER_EU = 2
+            MATRIX_INSTR_NONKDIM = 16
+
+            preprocess_autotune_configs = [
+                triton.Config({"PRE_BLOCK": 128, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS), # og config
+                triton.Config({"PRE_BLOCK": 64, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({"PRE_BLOCK": 32, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({"PRE_BLOCK": 16, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+            ]
+            preprocess_autotune_keys = [
+                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            ]
+            causal_autotune_configs = [
+                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 1, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+
+                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 1, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 2, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+            ]
+            causal_autotune_keys = [
+                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            ]
+            noncausal_autotune_configs = [
+                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 4, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),  # og config
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+                triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLK_SLICE_FACTOR': 2, "waves_per_eu": 8, "matrix_instr_nonkdim": MATRIX_INSTR_NONKDIM}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+            ]
+            noncausal_autotune_keys = [
+                "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+                "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+            ]
+            
+            return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
+        else:
+            raise ValueError("Unknown Device Type")
+    else:
+        # meta-parameters
+        # TODO: fix num_stages later
+        NUM_WARPS, NUM_STAGES = 4, 1
+        WAVES_PER_EU = 1
+        PRE_BLOCK = 128
+        BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+        BLK_SLICE_FACTOR = 2
+
+        assert BLOCK_N1 == BLOCK_M2
+        
+        # configs for the kernels
+        preprocess_autotune_configs = [
+            triton.Config({"PRE_BLOCK": PRE_BLOCK, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+        ]
+        preprocess_autotune_keys = [
+            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+        ]
+        causal_autotune_configs = [
+            triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+        ]
+        causal_autotune_keys = [
+            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+        ]
+        noncausal_autotune_configs = [
+            triton.Config({"BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU}, num_stages=NUM_STAGES, num_warps=NUM_WARPS),
+        ]
+        noncausal_autotune_keys = [
+            "IS_CAUSAL", "dropout_p", "MAX_SEQLENS_Q", "MAX_SEQLENS_K", 
+            "ACTUAL_HEAD_DIM", "IS_VARLEN", "HQ", "HK",
+        ]
+        return (preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys)
+    
+
+
+(preprocess_autotune_configs, preprocess_autotune_keys), (causal_autotune_configs, causal_autotune_keys), (noncausal_autotune_configs, noncausal_autotune_keys) = get_autotune_configs()
+
+
 
 @triton.jit
 def cdiv_fn(x, y):
@@ -2570,6 +2672,11 @@ def _bwd_dkdvdq_inner(
     return dk, dv
 
 
+# @triton.autotune(
+#     configs=causal_autotune_configs,
+#     key=causal_autotune_keys,
+#     use_cuda_graph=True,
+# )
 @triton.jit
 def _bwd_kernel_dkdvdq_causal(
     q_ptr, k_ptr, v_ptr, sm_scale, do_ptr, dk_ptr, dv_ptr, dq_ptr,
@@ -2827,6 +2934,11 @@ def _bwd_kernel_dkdvdq_causal(
     tl.atomic_add(dk_ptr + offs_dkdv, dk, mask=mask_kv, sem="relaxed")
 
 
+# @triton.autotune(
+#     configs=noncausal_autotune_configs,
+#     key=causal_autotune_keys,
+#     use_cuda_graph=True,
+# )
 @triton.jit
 def _bwd_kernel_dkdvdq_noncausal(
     Q, K, V, sm_scale, DO, DK, DV, DQ,
@@ -3651,14 +3763,7 @@ def _flash_attn_onekernel_backward(
     BLK_SLICE_FACTOR = 2
 
     onekernel_config = {
-        "BLOCK_M1": BLOCK_M1,
-        "BLOCK_N1": BLOCK_N1,
-        "BLOCK_M2": BLOCK_M2,
-        "BLOCK_N2": BLOCK_N2,
-        "num_warps": NUM_WARPS,
-        "num_stages": NUM_STAGES,
-        "waves_per_eu": WAVES_PER_EU,
-        "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR,
+        "BLOCK_M1": 16, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 16, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "num_warps": 4, "num_ctas": 1, "num_stages": 1,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1

@@ -68,7 +68,7 @@ def _balance_attn_workload(
     return off_z, off_q_head, start_m
 
 def get_autotune_configs():
-    if False:
+    if True:
         if is_cdna():
             # shared meta-parameters
             NUM_STAGES = 1
