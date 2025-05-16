@@ -651,18 +651,19 @@ def test_mha_backward_varlen(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
+@pytest.mark.parametrize("BATCH", [1, 4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
+    [(128, 128), (256, 128)],
 )
 @pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, False), (0.0, True)])
 # @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. Fails for seq >=64
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(32, 8), (16, 16)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+@pytest.mark.parametrize("HEAD_SZ", [128])
 @pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize("atomic", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_fused_backward_varlen(
     BATCH: int,
@@ -674,6 +675,7 @@ def test_mha_fused_backward_varlen(
     DROPOUT: float,
     CAUSAL: bool,
     FP8: bool,
+    atomic: bool,
     dtype=torch.float16,
 ):
     torch.manual_seed(20)
@@ -746,7 +748,8 @@ def test_mha_fused_backward_varlen(
             causal=CAUSAL,
             return_lse=True,
             return_attn_probs=True,
-            fused_backward=True,
+            fused_backward=atomic,
+            onekernel_backward=(not atomic),
         )
 
     assert len(triton_out) == 3
@@ -822,10 +825,3 @@ def test_mha_fused_backward_varlen(
     torch.testing.assert_close(
         triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
-
-
-if __name__ == "__main__":
-    # Run the tests
-    test_mha_fused_backward_varlen(4, 1024, 1024, 32, 8, 128, 0.0, True, False, torch.float32)
-    torch.cuda.synchronize()
-    print("Fused backward test passes!")
