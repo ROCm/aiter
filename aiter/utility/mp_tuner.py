@@ -2,14 +2,13 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 import multiprocessing as mp
-import os
-import pandas as pd
 import time
 from aiter.test_common import checkAllclose
 from aiter import dtypes
 
 def worker(gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2):
     from aiter.test_common import run_perftest
+
     pid = mp.current_process().pid
     gpuID = gpuIDMap[pid]
     device = torch.device(f"cuda:{gpuID}")

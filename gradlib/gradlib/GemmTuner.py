@@ -133,7 +133,7 @@ class Gemm:
                     scale_b=scaleB,
                     out_dtype=self.outdtype,
                 )
-            except RuntimeError as e:
+            except RuntimeError:
                 ref = (
                     F.linear(self.inp.to(dtypes.fp32), self.weights.to(dtypes.fp32))
                     * scaleA

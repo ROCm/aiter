@@ -6,7 +6,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import os
 import aiter
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
+from aiter.test_common import checkAllclose, perftest
 from aiter.dist.parallel_state import graph_capture
 from aiter import dtypes
 import sys
@@ -61,7 +61,7 @@ def run_commun_fwd(tp_size, pp_size, gpuID, input, withGraph=False):
         torch.cuda.synchronize()
         print(gpuID, "finished")
         out = out.cpu()
-    except Exception as e:
+    except Exception:
         logger.error(
             "\n-->[History]: {}".format(
                 "".join(traceback.format_exception(*sys.exc_info()))
@@ -141,7 +141,7 @@ def run_all_reduce_rmsnorm(
         print(f"{gpuID=} finished")
         out = out.cpu()
         residual_out = residual_out.cpu()
-    except Exception as e:
+    except Exception:
         logger.error(
             "\n-->[History]: {}".format(
                 "".join(traceback.format_exception(*sys.exc_info()))
@@ -206,7 +206,7 @@ def run_all_reduce_rmsnorm_quant(
         out = out.cpu()
         residual_out = residual_out.cpu()
         ysacle = ysacle.cpu()
-    except Exception as e:
+    except Exception:
         logger.error(
             "\n-->[History]: {}".format(
                 "".join(traceback.format_exception(*sys.exc_info()))

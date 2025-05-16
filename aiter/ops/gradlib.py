@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-import torch
 from torch import Tensor
 from typing import List, Optional
 from ..jit.core import (
@@ -36,6 +34,7 @@ def hipb_mm(
 ) -> torch.Tensor: ...
 
 
+
 @compile_ops("module_hipbsolgemm")
 def hipb_findallsols(
     mat1: torch.Tensor,
@@ -46,6 +45,7 @@ def hipb_findallsols(
     scaleB: Optional[torch.Tensor] = None,
     scaleC: Optional[torch.Tensor] = None,
 ) -> list[int]: ...
+
 
 
 @compile_ops("module_hipbsolgemm")
