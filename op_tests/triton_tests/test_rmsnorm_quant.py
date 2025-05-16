@@ -231,3 +231,49 @@ def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
     triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
     triton.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
     triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("B", [1, 4, 8])
+@pytest.mark.parametrize("T", [128, 512, 2048])
+@pytest.mark.parametrize("D", [64, 4096])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_rms_norm_dynamic_per_token_fp8_quant(
+    B: int, T: int, D: int, dtype: torch.dtype
+) -> None:
+    B_T = B * T
+    # Use integers to ensure consistent results across layouts,
+    # avoiding discrepancies in floating-point reductions with varying data layouts
+    x = torch.floor(torch.distributions.Uniform(-3, 3).sample((B_T, D))).to(
+        dtype=dtype, device="cuda"
+    )
+    w = torch.floor(torch.distributions.Uniform(-3, 3).sample((D,))).to(
+        dtype=dtype, device="cuda"
+    )
+
+    EPS = 1e-6
+    quant_dtype = torch.float8_e4m3fnuz
+
+    xq_fused_triton = torch.empty(x.shape, dtype=quant_dtype, device="cuda")
+    x_scale_fused = torch.empty(x.shape[0], 1, dtype=torch.float32, device="cuda")
+
+    x_normed = rmsnorm2d_fwd_with_dynamicquant(
+        xq_fused_triton, x, x_scale_fused, w, dump_rms_norm=True
+    )
+
+    ref_x_normed = torch_rmsnorm(x, w, dtype, EPS)
+    ref_xq, ref_x_scale = aiter.pertoken_quant(ref_x_normed, quant_dtype=quant_dtype)
+
+    xq_dequant = xq_fused_triton.to(torch.float32) * x_scale_fused
+    xq_dequant = xq_dequant.to(dtype)
+    ref_xq_dequant = ref_xq.to(torch.float32) * ref_x_scale
+    ref_xq_dequant = xq_dequant.to(dtype)
+
+    if dtype == torch.float32:
+        atol = 1e-5
+        rtol = 1e-5
+    else:
+        atol = 1e-2
+        rtol = 1e-2
+
+    torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    torch.testing.assert_close(x_normed, ref_x_normed, atol=atol, rtol=rtol)

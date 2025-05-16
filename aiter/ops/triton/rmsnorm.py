@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
-
 import torch
 import triton
 import triton.language as tl
+from typing import Optional
 
 
 @triton.jit
@@ -15,10 +14,18 @@ def _per_token_quant(
     row_max,
     row_idx,
     DTYPE_MAX: tl.constexpr,
+    scale_ub_ptr=None,
+    EPS_8BIT: tl.constexpr = 1e-12,
+    CLAMP_MAX: tl.constexpr = False,
+    CLAMP_OUT: tl.constexpr = False,
 ):
     """
     #TODO: Add Doc
     """
+
+    if CLAMP_MAX:
+        ub = tl.load(scale_ub_ptr)
+        row_max = tl.clamp(row_max, EPS_8BIT, ub)
 
     scale_out = row_max / DTYPE_MAX
     scale_out = tl.where(scale_out == 0, 1.0, scale_out)
@@ -27,8 +34,10 @@ def _per_token_quant(
 
     qx = x * scale_recip
 
-    scale_offs = row_idx
-    tl.store(y_scale_ptr + scale_offs, scale_out.to(y_scale_ptr.dtype.element_ty))
+    if CLAMP_OUT:
+        qx = tl.clamp(qx, -DTYPE_MAX, DTYPE_MAX)
+
+    tl.store(y_scale_ptr + row_idx, scale_out.to(y_scale_ptr.dtype.element_ty))
 
     return qx
 
@@ -165,10 +174,16 @@ def _quant_rms_norm_kernel(
     n_cols,
     # Epsilon to avoid division by zero
     epsilon,
+    # Optional pointers
+    scale_ub_ptr,  # Pointer to the scale upper bound tensor
+    out_intermediate_ptr,  # Pointer to the intermediate output tensor
     # Dtype max for quantization
     DTYPE_MAX: tl.constexpr,
     # Meta-parameters
     IS_SMOOTH: tl.constexpr,
+    CLAMP_MAX: tl.constexpr,
+    CLAMP_OUT: tl.constexpr,
+    DUMP_INTERMEDIATE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     USE_BLOCKED: tl.constexpr,
     NUM_PRGMS: tl.constexpr,
@@ -233,6 +248,12 @@ def _quant_rms_norm_kernel(
                 g = tl.load(g_ptrs).to(tl.float32)
                 rms_norm = x * norm_factor * g
 
+                if DUMP_INTERMEDIATE:
+                    tl.store(
+                        out_intermediate_ptr + row_idx * n_cols + cols,
+                        rms_norm.to(out_intermediate_ptr.type.element_ty),
+                    )
+
                 if IS_SMOOTH:
                     x_scale_ptrs = x_scale_ptr + cols
                     x_scale_ptrs = tl.multiple_of(x_scale_ptrs, (16,))
@@ -255,6 +276,13 @@ def _quant_rms_norm_kernel(
             g_ptrs = g_ptr + cols
             g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
             rms_norm = x * norm_factor * g
+
+            if DUMP_INTERMEDIATE:
+                tl.store(
+                    out_intermediate_ptr + row_idx * n_cols + cols,
+                    rms_norm.to(out_intermediate_ptr.type.element_ty),
+                    mask=mask,
+                )
 
             if IS_SMOOTH:
                 x_scale_ptrs = x_scale_ptr + cols
@@ -282,6 +310,9 @@ def _quant_rms_norm_kernel(
                     row_max,
                     row_idx,
                     DTYPE_MAX,
+                    scale_ub_ptr=scale_ub_ptr,
+                    CLAMP_MAX=CLAMP_MAX,
+                    CLAMP_OUT=CLAMP_OUT,
                 )
 
                 output_ptrs = row_output_ptr + cols
@@ -299,6 +330,9 @@ def _quant_rms_norm_kernel(
                 row_max,
                 row_idx,
                 DTYPE_MAX,
+                scale_ub_ptr=scale_ub_ptr,
+                CLAMP_MAX=CLAMP_MAX,
+                CLAMP_OUT=CLAMP_OUT,
             )
 
             output_ptrs = row_output_ptr + cols
@@ -318,6 +352,13 @@ def _quant_rms_norm_kernel(
 
             rms_norm = row * norm_factor * g
 
+            if DUMP_INTERMEDIATE:
+                tl.store(
+                    out_intermediate_ptr + row_idx * n_cols + col_offsets,
+                    rms_norm.to(out_intermediate_ptr.type.element_ty),
+                    mask=mask,
+                )
+
             if IS_SMOOTH:
                 x_scale_ptrs = x_scale_ptr + col_offsets
                 x_scale_ptrs = tl.multiple_of(x_scale_ptrs, (16,))
@@ -333,6 +374,9 @@ def _quant_rms_norm_kernel(
                 row_max,
                 row_idx,
                 DTYPE_MAX,
+                scale_ub_ptr=scale_ub_ptr,
+                CLAMP_MAX=CLAMP_MAX,
+                CLAMP_OUT=CLAMP_OUT,
             )
 
             output_ptrs = output_ptr + row_idx * output_row_stride + col_offsets
@@ -809,6 +853,12 @@ def rmsnorm2d_fwd_with_smoothquant(
     IS_SMOOTH = True
     DTYPE_MAX = get_dtype_max(out.dtype)
 
+    scale_ub = None
+    out_rmsnorm = None
+    CLAMP_MAX = False
+    clamp_out = False
+    dump_rms_norm = False
+
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
     aux = None
     if USE_BLOCKED:
@@ -828,8 +878,13 @@ def rmsnorm2d_fwd_with_smoothquant(
         n_rows,
         n_cols,
         epsilon,
+        scale_ub,
+        out_rmsnorm,
         DTYPE_MAX,
         IS_SMOOTH,
+        CLAMP_MAX,
+        clamp_out,
+        dump_rms_norm,
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
@@ -842,6 +897,9 @@ def rmsnorm2d_fwd_with_dynamicquant(
     yscale: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float = 1e-6,
+    scale_ub: Optional[torch.Tensor] = None,
+    clamp_out: bool = False,
+    dump_rms_norm: bool = False,
 ):
 
     n_rows, n_cols = input.shape
@@ -854,6 +912,11 @@ def rmsnorm2d_fwd_with_dynamicquant(
     xscale = None
     IS_SMOOTH = False
     DTYPE_MAX = get_dtype_max(out.dtype)
+    CLAMP_MAX = scale_ub is not None
+
+    out_rms_norm = None
+    if dump_rms_norm:
+        out_rms_norm = torch.empty_like(input)
 
     # Auxiliary tensor to store the RMSNorm output as fp32 before applying the quantization when using the blocked approach
     aux = None
@@ -874,12 +937,19 @@ def rmsnorm2d_fwd_with_dynamicquant(
         n_rows,
         n_cols,
         epsilon,
+        scale_ub,
+        out_rms_norm,
         DTYPE_MAX,
         IS_SMOOTH,
+        CLAMP_MAX,
+        clamp_out,
+        dump_rms_norm,
         blk_size,
         USE_BLOCKED,
         NUM_PRGMS,
     )
+
+    return out_rms_norm
 
 
 def rmsnorm2d_fwd_with_add_smoothquant(
