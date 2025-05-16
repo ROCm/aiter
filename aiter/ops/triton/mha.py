@@ -453,57 +453,6 @@ def _attn_fwd_inner(
 
 
 @triton.jit
-def _remap_XCD(k, N, NUM_XCD):
-    r = k % NUM_XCD
-    m = k // NUM_XCD
-    q = N // NUM_XCD
-    t = N - NUM_XCD * q
-    u = min(r, t + 1)
-    new_index = u * q + (r - u) * (q - 1) + r + m
-    return new_index
-
-
-@triton.jit
-def _balance_attn_workload(
-    wid,
-    NUM_XCD: tl.constexpr,
-    BATCH,
-    NUM_Q_HEADS,
-    SEQLEN_Q,
-    BLOCK_M,
-):
-    # Traversal strategy along dims: seqlen, q_head, batch
-    # 1. Fastest changing dim is the q_head dim. At every <NUM_XCD>th wid, increase the sequence block id (start_m).
-    # 2. When we are done with <CHUNK_BLOCKS_SIZE> blocks along seqlen, we move to the next set of <NUM_XCD> q_heads.
-    # 3. Batch changes last.
-
-    # so XCD 0 should get workgroups with indices (batch, head q idx, start_m)
-    # (0, 0, 0), (0, 0, 1), (0, 0, 2), ..., (0, 0, CHUNK_BLOCKS_SIZE), (0, NUM_XCD, 0)
-    # XCD 1
-    # (0, 1, 0), (0, 1, 1), (0, 1, 2), ..., (0, 1, CHUNK_BLOCKS_SIZE), (0, NUM_XCD+1, 0)
-    # ...
-    # XCD <NUM_XCD - 1>
-    # (0, NUM_XCD-1, 0), (0, NUM_XCD-1, 1), (0, NUM_XCD-1, 2), ..., (0, NUM_XCD-1, CHUNK_BLOCKS_SIZE), (0, 2 * NUM_XCD-1, 0)
-
-    # Notice that on the same round robin turn, XCDs get the same start_m, i.e. workgroups with equal workloads.
-    # But also consequent sequence blocks are sent to the same XCD, so they can benefit from L2 caching.
-
-    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
-    CHUNK_BLOCKS_SIZE = 1  # (NUM_CUs_PER_XCD // (NUM_Q_HEADS // NUM_K_HEADS))
-    off_q_head = (
-        wid % NUM_XCD + wid // (CHUNK_BLOCKS_SIZE * NUM_XCD) * NUM_XCD
-    ) % NUM_Q_HEADS
-    start_m = (
-        (wid // NUM_XCD) % CHUNK_BLOCKS_SIZE
-        + wid // (CHUNK_BLOCKS_SIZE * NUM_Q_HEADS) * CHUNK_BLOCKS_SIZE
-    ) % NUM_BLOCKS
-    off_z = wid // (NUM_BLOCKS * NUM_Q_HEADS) % BATCH
-    off_q_head = _remap_XCD(off_q_head, NUM_Q_HEADS - 1, NUM_XCD)
-
-    return off_z, off_q_head, start_m
-
-
-@triton.jit
 def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,
@@ -567,20 +516,14 @@ def _attn_fwd(
     BATCH,
     NUM_XCD: tl.constexpr,
 ):
+    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
     wid = tl.program_id(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    off_z, off_q_head, start_m = _balance_attn_workload(
-        wid,
-        NUM_XCD,
-        BATCH,
-        NUM_Q_HEADS,
-        SEQLEN_Q,
-        BLOCK_M,
-    )
+    off_z, off_q_head, start_m = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_BLOCKS, NUM_XCD)
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -693,7 +636,7 @@ def _attn_fwd(
     # alibi slopes
     if alibi_slopes_ptr is not None:
         alibi_offs = off_z * stride_alibi_z + off_q_head * stride_alibi_h
-        alibi_slope = tl.load(alibi_slopes + alibi_offs)
+        alibi_slope = tl.load(alibi_slopes_ptr + alibi_offs)
     else:
         alibi_slope = None
 
@@ -1050,8 +993,6 @@ def _flash_attn_forward(
         s_dmask = None
         dropout_mask = None
 
-    # Best config from ROCm/triton/python/perf-kernels/flash_attention.py::attn_fwd autotuning is BLOCK_M: 128, BLOCK_N: 64, waves_per_eu: 2, num_warps: 4, num_ctas: 1, num_stages: 1
-    # BLOCK_N=64 spills but has higher performance
     # Tuned for MI300x
     config = {
         "BLOCK_M": 128,
@@ -1062,7 +1003,7 @@ def _flash_attn_forward(
         "num_stages": 1,
     }
     # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout:
+    if enable_dropout or q.dtype==torch.float32:
         config = {
             "BLOCK_M": 32,
             "BLOCK_N": 32,
