@@ -626,7 +626,7 @@ def _attn_fwd(
                 + offs_d[None, :] * stride_on
             )
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=out_ptr.type.element_ty)
-            out_mask = (offs_m[:, None] < seqlen_q) & (offs_d < BLOCK_DMODEL)
+            out_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
             tl.store(out_ptr + offs_out, acc, mask=out_mask)
 
             if softmax_lse_ptr is not None:
