@@ -908,23 +908,20 @@ def _flash_attn_forward(
     BLOCK_DMODEL_POW2 = max(BLOCK_DMODEL_POW2, 16)
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
-    if return_lse:
-        if is_varlen:
-            softmax_lse = torch.zeros(
-                (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
-            )
-            stride_lse_z, stride_lse_h, stride_lse_m = (
-                0,
-                softmax_lse.stride(1),
-                softmax_lse.stride(0),
-            )
-        else:
-            softmax_lse = torch.zeros(
-                (batch, num_q_heads, max_seqlen_q), device=q.device, dtype=torch.float32
-            )
-            stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
+    if is_varlen:
+        softmax_lse = torch.zeros(
+            (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
+        )
+        stride_lse_z, stride_lse_h, stride_lse_m = (
+            0,
+            softmax_lse.stride(1),
+            softmax_lse.stride(0),
+        )
     else:
-        softmax_lse = None
+        softmax_lse = torch.zeros(
+            (batch, num_q_heads, max_seqlen_q), device=q.device, dtype=torch.float32
+        )
+        stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
 
     # exp_scores [batch, num_q_heads, seqlen_q, seqlen_k]
     enable_dropout = dropout_p > 0.0
