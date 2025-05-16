@@ -9,10 +9,7 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_OPS_PATH,
-    AITER_TRITON_CONFIGS_PATH
-)
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(
@@ -104,6 +101,7 @@ def _gemm_a16_w16_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -112,19 +110,21 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A16W16.json" 
-        with open(fpath, 'r') as file:
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A16W16.json"
+        with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
     return _get_config._config_dict["any"]
 
+
 # Wrapper for gemm kernel.
-def gemm_a16w16(x, 
-                w, 
-                dtype: Optional[float] = torch.bfloat16,
-                config: Optional[dict] = None,
-                ):
+def gemm_a16w16(
+    x,
+    w,
+    dtype: Optional[float] = torch.bfloat16,
+    config: Optional[dict] = None,
+):
     """
     Computes the 16 bit matmul Y = X x W
 
@@ -160,7 +160,7 @@ def gemm_a16w16(x,
         w.stride(1),
         y.stride(0),
         y.stride(1),
-        **config
+        **config,
     )
 
     return y

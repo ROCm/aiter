@@ -8,10 +8,7 @@ import torch
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_OPS_PATH,
-    AITER_TRITON_CONFIGS_PATH
-)
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
 
 
 # TODO Move this to a common folder. Will need to add future arch list
@@ -192,6 +189,7 @@ def _gemm_a8w8_blockscale_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -200,12 +198,13 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM_BLOCKSCALE-A8W8.json" 
-        with open(fpath, 'r') as file:
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM_BLOCKSCALE-A8W8.json"
+        with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
     return _get_config._config_dict["any"]
+
 
 def gemm_a8w8_blockscale(
     x: torch.Tensor,
@@ -251,7 +250,9 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
     _gemm_a8w8_blockscale_kernel[grid](
         x,
         w,
@@ -273,7 +274,7 @@ def gemm_a8w8_blockscale(
         w_scale.stride(1),
         GROUP_K,
         GROUP_N,
-        **config
+        **config,
     )
 
     return y

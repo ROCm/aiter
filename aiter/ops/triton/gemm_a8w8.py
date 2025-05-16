@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 from typing import Optional
 import functools
 import json
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_OPS_PATH,
-    AITER_TRITON_CONFIGS_PATH
-)
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
+
 
 @triton.heuristics(
     {
@@ -175,6 +173,7 @@ def _gemm_a8w8_kernel(
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -183,12 +182,12 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A8W8.json" 
-        with open(fpath, 'r') as file:
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A8W8.json"
+        with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
-    #TODO: Update this logic
+    # TODO: Update this logic
     return _get_config._config_dict["any"]
 
 
@@ -229,7 +228,7 @@ def gemm_a8w8(
 
     y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    '''
+    """
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
     BLOCK_SIZE_K = 128
@@ -239,12 +238,14 @@ def gemm_a8w8(
     matrix_instr_nonkdim = 16
     num_warps = 4
     num_stages = 2
-    '''
+    """
 
     if config is None:
         config = _get_config(M, N, K)
 
-    grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
     _gemm_a8w8_kernel[grid](
         x,
         w,
@@ -262,16 +263,16 @@ def gemm_a8w8(
         y.stride(0),
         y.stride(1),
         bias is not None,
-        **config
-        #BLOCK_SIZE_M,
-        #BLOCK_SIZE_N,
-        #BLOCK_SIZE_K,
-        #GROUP_SIZE_M,
-        #waves_per_eu=waves_per_eu,
-        #kpack=kpack,
-        #matrix_instr_nonkdim=matrix_instr_nonkdim,
-        #num_warps=num_warps,
-        #num_stages=num_stages,
+        **config,
+        # BLOCK_SIZE_M,
+        # BLOCK_SIZE_N,
+        # BLOCK_SIZE_K,
+        # GROUP_SIZE_M,
+        # waves_per_eu=waves_per_eu,
+        # kpack=kpack,
+        # matrix_instr_nonkdim=matrix_instr_nonkdim,
+        # num_warps=num_warps,
+        # num_stages=num_stages,
     )
 
     return y

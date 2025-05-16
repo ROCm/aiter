@@ -1,13 +1,14 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
 import functools
 import json
 from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_OPS_PATH,
-    AITER_TRITON_CONFIGS_PATH
-)
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
 
 
 @triton.jit
@@ -32,7 +33,7 @@ def is_fp8(x):
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
     }:
-        if arch_supports_fp8():
+        if arch_info.arch_supports_fp8():
             return True
         else:
             raise RuntimeError("This device does not support fp8")
@@ -122,16 +123,16 @@ def cast_varlen_to_fp8(
 
 
 # TODO Move this to a common folder. Will need to add future arch list
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+# def get_arch():
+#    return triton.runtime.driver.active.get_current_target().arch
 
 
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
+# def is_hip():
+#    return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
-def arch_supports_fp8():
-    return is_hip() and get_arch() in ("gfx942")
+# def arch_supports_fp8():
+#    return is_hip() and get_arch() in ("gfx942")
 
 
 @triton.jit
@@ -848,18 +849,21 @@ def _attn_fwd(
     op = acc.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
+
 @functools.lru_cache(maxsize=1024)
-def _get_config_attn_fwd():
+def _get_config_attn_fwd(dropout: bool):
     if not hasattr(_get_config_attn_fwd, "_attn_fwd_config_dict"):
-        print("Open config")
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/MI300X-MHA-FWD.json" 
-        with open(fpath, 'r') as file:
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-FWD.json"
+        with open(fpath, "r") as file:
             config = json.load(file)
         _get_config_attn_fwd._attn_fwd_config_dict = config
 
-    #TODO: Add logic to pick the right config
-    return _get_config_attn_fwd._attn_fwd_config_dict["fwd"]
->>>>>>> 03fb74a4 ([TRITON]: Add Config Support for MHA FWD)
+    if dropout:
+        return _get_config_attn_fwd._attn_fwd_config_dict["dropout"]
+    else:
+        return _get_config_attn_fwd._attn_fwd_config_dict["no_dropout"]
+
 
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -964,19 +968,9 @@ def _flash_attn_forward(
     else:
         s_dmask = None
         dropout_mask = None
-     # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout:
-        config = {
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
-            "waves_per_eu": 1,
-            "num_warps": 2,
-            "num_ctas": 1,
-            "num_stages": 1,
-        }
-    
+
     if config is None:
-        config = _get_config_attn_fwd()
+        config = _get_config_attn_fwd(enable_dropout)
 
     grid = lambda META: (  # noqa: E731
         batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
@@ -2396,6 +2390,18 @@ def _bwd_kernel_dq_noncausal(
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config_attn_bkwd():
+    if not hasattr(_get_config_attn_fwd, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-BKWD.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config_attn_fwd._config_dict = config
+
+    return _get_config_attn_fwd._config_dict["any"]
+
+
 def _flash_attn_backward(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -2420,6 +2426,7 @@ def _flash_attn_backward(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
 
     IS_FP8 = is_fp8(q)
@@ -2485,12 +2492,15 @@ def _flash_attn_backward(
     # Configs
     # PRE_BLOCK, BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2
     # BLK_SLICE_FACTOR
-    NUM_WARPS, NUM_STAGES = 4, 1
-    WAVES_PER_EU = 1
-    PRE_BLOCK = 128
+    # NUM_WARPS, NUM_STAGES = 4, 1
+    # WAVES_PER_EU = 1
+    # PRE_BLOCK = 128
     # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
-    BLK_SLICE_FACTOR = 2
+    # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
+    # BLK_SLICE_FACTOR = 2
+
+    if config is None:
+        config = _get_config_attn_bkwd()
 
     # init delta
     delta = torch.zeros_like(softmax_lse)
@@ -2503,7 +2513,11 @@ def _flash_attn_backward(
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
-    pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, num_q_heads)
+    pre_grid = (
+        triton.cdiv(max_seqlen_q, config["bwd_preprocess"]["PRE_BLOCK"]),
+        batch,
+        num_q_heads,
+    )
     _bwd_preprocess[pre_grid](
         o,
         do,
@@ -2514,7 +2528,7 @@ def _flash_attn_backward(
         cu_seqlens_q,
         max_seqlen_q,
         descale_do,
-        BLOCK_M=PRE_BLOCK,
+        BLOCK_M=config["bwd_preprocess"]["PRE_BLOCK"],
         BLOCK_D_MODEL=head_sz,
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
@@ -2534,8 +2548,19 @@ def _flash_attn_backward(
         dropout_mask = None
         dropout_strides = (0, 0, 0, 0)
 
-    grid_dkdv = ((max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1, batch, num_k_heads)
-    grid_dq = ((max_seqlen_q + BLOCK_M2 - 1) // BLOCK_M2, batch, num_k_heads)
+    # Right now grid is same for causal and non-causal
+    grid_dkdv = (
+        (max_seqlen_k + config["bwd_kernel_dkdv_causal"]["BLOCK_N"] - 1)
+        // config["bwd_kernel_dkdv_causal"]["BLOCK_N"],
+        batch,
+        num_k_heads,
+    )
+    grid_dq = (
+        (max_seqlen_q + config["bwd_kernel_dq_causal"]["BLOCK_M"] - 1)
+        // config["bwd_kernel_dq_causal"]["BLOCK_M"],
+        batch,
+        num_k_heads,
+    )
     if causal:
         _bwd_kernel_dkdv_causal[grid_dkdv](
             q,
@@ -2569,18 +2594,19 @@ def _flash_attn_backward(
             descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M1,
-            BLOCK_N=BLOCK_N1,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            # BLOCK_M=BLOCK_M1,
+            # BLOCK_N=BLOCK_N1,
+            # BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             BLOCK_D_MODEL=head_sz,
             BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
+            # num_warps=NUM_WARPS,
+            # num_stages=NUM_STAGES,
+            # waves_per_eu=WAVES_PER_EU,
+            **config["bwd_kernel_dkdv_causal"],
         )
         _bwd_kernel_dq_causal[grid_dq](
             q,
@@ -2613,18 +2639,19 @@ def _flash_attn_backward(
             descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M2,
-            BLOCK_N=BLOCK_N2,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            # BLOCK_M=BLOCK_M2,
+            # BLOCK_N=BLOCK_N2,
+            # BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             BLOCK_D_MODEL=head_sz,
             BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
+            # num_warps=NUM_WARPS,
+            # num_stages=NUM_STAGES,
+            # waves_per_eu=WAVES_PER_EU,
+            **config["bwd_kernel_dq_causal"],
         )
     else:
         _bwd_kernel_dkdv_noncausal[grid_dkdv](
@@ -2659,18 +2686,19 @@ def _flash_attn_backward(
             descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M1,
-            BLOCK_N=BLOCK_N1,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            # BLOCK_M=BLOCK_M1,
+            # BLOCK_N=BLOCK_N1,
+            # BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             BLOCK_D_MODEL=head_sz,
             BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
+            # num_warps=NUM_WARPS,
+            # num_stages=NUM_STAGES,
+            # waves_per_eu=WAVES_PER_EU,
+            **config["bwd_kernel_dkdv_noncausal"],
         )
 
         _bwd_kernel_dq_noncausal[grid_dq](
@@ -2704,18 +2732,19 @@ def _flash_attn_backward(
             descale_do,
             NUM_Q_HEADS=num_q_heads,
             NUM_K_HEADS=num_k_heads,
-            BLOCK_M=BLOCK_M2,
-            BLOCK_N=BLOCK_N2,
-            BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
+            # BLOCK_M=BLOCK_M2,
+            # BLOCK_N=BLOCK_N2,
+            # BLK_SLICE_FACTOR=BLK_SLICE_FACTOR,
             BLOCK_D_MODEL=head_sz,
             BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            num_warps=NUM_WARPS,
-            num_stages=NUM_STAGES,
-            waves_per_eu=WAVES_PER_EU,
+            # num_warps=NUM_WARPS,
+            # num_stages=NUM_STAGES,
+            # waves_per_eu=WAVES_PER_EU,
+            **config["bwd_kernel_dq_noncausal"],
         )
 
     return delta
@@ -2736,8 +2765,8 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic,
         return_lse,
         return_softmax,
-        is_grad_enabled, 
-        config,
+        is_grad_enabled,
+        config: Optional[dict] = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -2762,7 +2791,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 return_softmax=return_softmax and dropout_p > 0,
                 max_seqlen_q=q.shape[1],
                 max_seqlen_k=k.shape[1],
-                config=config
+                config=config["fwd"] if config is not None else None,
             )
         )
 
@@ -2776,6 +2805,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
+            ctx.config = config
 
         out = out_padded[..., :head_size_og]
         result = [out]
@@ -2814,6 +2844,7 @@ class FlashAttnFunc(torch.autograd.Function):
             dropout_p=ctx.dropout_p,
             philox_seed=ctx.philox_seed,
             philox_offset=ctx.philox_offset,
+            config=ctx.config["bkwd"] if ctx.config is not None else None,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -2914,7 +2945,7 @@ def flash_attn_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        config
+        config,
     )
 
 
@@ -2934,6 +2965,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
+        config: Optional[dict] = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -2952,9 +2984,9 @@ class FlashAttnFP8Func(torch.autograd.Function):
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
-                q,
-                k,
-                v,
+                q_fp8,
+                k_fp8,
+                v_fp8,
                 dropout_p,
                 softmax_scale,
                 causal=causal,
@@ -2970,6 +3002,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                config=config["fwd"] if config is not None else None,
             )
         )
 
@@ -2991,6 +3024,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
+            ctx.config = config
 
         out = out_padded[..., :head_size_og]
         result = [out]
@@ -3042,6 +3076,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
             descale_k=descale_k,
             descale_v=descale_v,
             descale_do=descale_do,
+            config=ctx.config["bkwd"] if ctx.config is not None else None,
         )
         # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         # dk = dk[..., : k_fp8.shape[-1]]
@@ -3061,6 +3096,7 @@ def flash_attn_fp8_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    config: Optional[dict] = None,
 ):
     return FlashAttnFP8Func.apply(
         q,
@@ -3075,6 +3111,7 @@ def flash_attn_fp8_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
+        config,
     )
 
 
@@ -3099,6 +3136,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+        config: Optional[dict] = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3125,6 +3163,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 max_seqlen_k=max_seqlen_k,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
+                config=config["fwd"] if config is not None else None,
             )
         )
         if is_grad:
@@ -3140,6 +3179,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
+            ctx.config = config
         out = out_padded[..., :head_size_og]
 
         result = [out]
@@ -3178,6 +3218,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dropout_p=ctx.dropout_p,
             philox_seed=ctx.philox_seed,
             philox_offset=ctx.philox_offset,
+            config=ctx.config["bkwd"] if ctx.config is not None else None,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
@@ -3186,6 +3227,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
             None,
             None,
             None,
@@ -3220,6 +3262,7 @@ def flash_attn_varlen_func(
     return_lse=False,
     return_attn_probs=False,
     block_table=None,
+    config: Optional[dict] = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -3293,6 +3336,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         block_table,
         torch.is_grad_enabled(),
+        config,
     )
 
 
@@ -3317,6 +3361,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
         return_softmax,
         block_table,
         is_grad_enabled,
+        config: Optional[dict] = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3353,6 +3398,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                config=config["fwd"] if config is not None else None,
             )
         )
         if is_grad:
@@ -3377,6 +3423,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
+            ctx.config = config
         out = out_padded[..., :head_size_og]
         result = [out]
         if return_lse:
@@ -3439,6 +3486,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             descale_k=descale_k,
             descale_v=descale_v,
             descale_do=descale_do,
+            config=ctx.config["bkwd"] if ctx.config is not None else None,
         )
         dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k_fp8.shape[-1]]
@@ -3463,6 +3511,7 @@ def flash_attn_varlen_fp8_func(
     return_lse=False,
     return_attn_probs=False,
     block_table=None,
+    config: Optional[dict] = None,
 ):
     return FlashAttnVarlenFP8Func.apply(
         q,
@@ -3482,4 +3531,5 @@ def flash_attn_varlen_fp8_func(
         return_attn_probs,
         block_table,
         torch.is_grad_enabled(),
+        config,
     )

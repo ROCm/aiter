@@ -9,10 +9,7 @@ import triton
 import triton.language as tl
 from typing import Optional
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_OPS_PATH,
-    AITER_TRITON_CONFIGS_PATH
-)
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(
@@ -185,6 +182,7 @@ def _batched_gemm_a8w8_kernel(
 
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -193,16 +191,17 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-BATCHED_GEMM-A8W8.json" 
-        with open(fpath, 'r') as file:
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-BATCHED_GEMM-A8W8.json"
+        with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
-    #TODO: Update this logic
+    # TODO: Update this logic
     if (M + N) >= 4096:
         return _get_config._config_dict["large"]
     else:
         return _get_config._config_dict["small"]
+
 
 def batched_gemm_a8w8(
     XQ: torch.Tensor,
@@ -287,6 +286,6 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        **config
+        **config,
     )
     return YQ

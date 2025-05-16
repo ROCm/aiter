@@ -10,10 +10,8 @@ import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_OPS_PATH,
-    AITER_TRITON_CONFIGS_PATH
-)
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
+
 
 @triton.heuristics(
     {
@@ -210,6 +208,7 @@ def _gemm_afp4_wfp4_reduce_kernel(
 
     tl.store(c_out_ptrs, c)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -218,8 +217,8 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4.json" 
-        with open(fpath, 'r') as file:
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4.json"
+        with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
@@ -237,6 +236,7 @@ def _get_config(
         return _get_config._config_dict["large"]
     else:
         return _get_config._config_dict["xlarge"]
+
 
 # Wrapper for gemm kernel.
 def gemm_afp4wfp4(
@@ -270,12 +270,19 @@ def gemm_afp4wfp4(
 
     if config["NUM_KSPLIT"] > 1:
         config["SPLITK_BLOCK_SIZE"] = (
-            triton.cdiv((2 * triton.cdiv(K, config["NUM_KSPLIT"])), config["BLOCK_SIZE_K"]) * config["BLOCK_SIZE_K"]
+            triton.cdiv(
+                (2 * triton.cdiv(K, config["NUM_KSPLIT"])), config["BLOCK_SIZE_K"]
+            )
+            * config["BLOCK_SIZE_K"]
         )
         if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
-            y_pp = torch.empty((config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device)
+            y_pp = torch.empty(
+                (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
+            )
         else:
-            y_pp = torch.empty((config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device)
+            y_pp = torch.empty(
+                (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
+            )
 
     if config is None:
         config = _get_config(M, N, K)
@@ -306,7 +313,7 @@ def gemm_afp4wfp4(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
-        **config
+        **config,
     )
 
     if config["NUM_KSPLIT"] > 1:
