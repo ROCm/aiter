@@ -483,7 +483,7 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
-    USE_INT64_STRIDES: tl.constexpr
+    USE_INT64_STRIDES: tl.constexpr,
 ):
     # calculate offsets
     wid = tl.program_id(
@@ -504,7 +504,6 @@ def _attn_fwd(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
-
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -579,7 +578,6 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
-        
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -1120,7 +1118,8 @@ def _flash_attn_forward(
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=8,
-        USE_INT64_STRIDES=os.environ.get('USE_INT64_STRIDES', '0').lower() in ('1', 'true', 'yes'),
+        USE_INT64_STRIDES=os.environ.get("USE_INT64_STRIDES", "0").lower()
+        in ("1", "true", "yes"),
         **config,
     )
 
