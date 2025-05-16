@@ -238,7 +238,7 @@ def _attn_fwd_inner(
     # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
     # The permanent solution is to enable upcasting of tl.constexpr
     # In the meantime, the following workaround provides correctness and does not drop perf
-    if USE_INT64_STRIDES:
+    if False:
         stride_kn = tl.cast(stride_kn_in, tl.int64)
         stride_vk = tl.cast(stride_vk_in, tl.int64)
         stride_sn = tl.cast(stride_sn_in, tl.int64)
@@ -505,6 +505,7 @@ def _attn_fwd(
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
 
+
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
     # computation is done in 32 bit and overflows resulting in segfaults
@@ -536,10 +537,16 @@ def _attn_fwd(
         stride_on = tl.cast(stride_on_in, tl.int64)
         stride_alibi_z = tl.cast(stride_alibi_z_in, tl.int64)
         stride_alibi_h = tl.cast(stride_alibi_h_in, tl.int64)
-        stride_sd_z = tl.cast(stride_sd_z_in, tl.int64)
-        stride_sd_h = tl.cast(stride_sd_h_in, tl.int64)
-        stride_sd_m = tl.cast(stride_sd_m_in, tl.int64)
-        stride_sd_n = tl.cast(stride_sd_n_in, tl.int64)
+        if False:
+            stride_sd_z = tl.cast(stride_sd_z_in, tl.int64)
+            stride_sd_h = tl.cast(stride_sd_h_in, tl.int64)
+            stride_sd_m = tl.cast(stride_sd_m_in, tl.int64)
+            stride_sd_n = tl.cast(stride_sd_n_in, tl.int64)
+        else:
+            stride_sd_z = stride_sd_z_in
+            stride_sd_h = stride_sd_h_in
+            stride_sd_m = stride_sd_m_in
+            stride_sd_n = stride_sd_n_in
         stride_lse_z = tl.cast(stride_lse_z_in, tl.int64)
         stride_lse_h = tl.cast(stride_lse_h_in, tl.int64)
         stride_lse_m = tl.cast(stride_lse_m_in, tl.int64)
