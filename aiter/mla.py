@@ -106,10 +106,10 @@ def mla_decode_fwd(
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
+    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
 

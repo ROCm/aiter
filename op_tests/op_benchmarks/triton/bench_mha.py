@@ -659,18 +659,18 @@ def main():
     args = parse_args()
 
     if args.model:
-        if args.causal is None:  # User didn’t specify -causal
+        if args.causal is None:  # User didn't specify -causal
             args.causal = True
-        if args.layout is None:  # User didn’t specify -layout
+        if args.layout is None:  # User didn't specify -layout
             args.layout = "thd"
         print(
             f"Note: using -model config defaults: causal={args.causal}, layout={args.layout}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
         )
     else:
         # the defaults for causal and varlen when not using the -model
-        if args.causal is None:  # User didn’t specify -causal
+        if args.causal is None:  # User didn't specify -causal
             args.causal = False
-        if args.layout is None:  # User didn’t specify -layout
+        if args.layout is None:  # User didn't specify -layout
             args.layout = "bshd"
 
     custom_config = False

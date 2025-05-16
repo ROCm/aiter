@@ -106,6 +106,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          softmax_scale, // scale_s
                          1,             // scale_p
                          1,             // scale_o
+                         0.0,           // logits_soft_cap
                          stride_q,
                          stride_k,
                          stride_v,
