@@ -3675,10 +3675,26 @@ def _flash_attn_onekernel_backward(
 
 
     # Fuses dk,dv and dq computations into one kernel using atomics
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 128, 128, 16
+
+    NUM_WARPS, NUM_STAGES = 4, 1
+    WAVES_PER_EU = 1
+    PRE_BLOCK = 128
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
+    BLK_SLICE_FACTOR = 2
+    matrix_instr_nonkdim=16
+
 
     onekernel_config = {
-        "BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": 1, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "num_warps": 8, "num_ctas": 1, "num_stages": 1,
+        "BLOCK_M1": BLOCK_M1,
+        "BLOCK_N1": BLOCK_N1, 
+        "BLOCK_M2": BLOCK_M2, 
+        "BLOCK_N2": BLOCK_N2, 
+        "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, 
+        "waves_per_eu": WAVES_PER_EU, 
+        "matrix_instr_nonkdim": matrix_instr_nonkdim, 
+        "num_warps": NUM_WARPS, 
+        "num_ctas": 1, 
+        "num_stages": NUM_STAGES,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1
