@@ -52,3 +52,4 @@ aiter_logs
 # dev
 scripts
 dist
+*.log
