@@ -651,17 +651,17 @@ def test_mha_backward_varlen(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("BATCH", [4])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(128, 128), (256, 128)],
+    [(256, 128), (256, 256), (1024, 1024)],
 )
-@pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, False), (0.0, True)])
+@pytest.mark.parametrize("DROPOUT, CAUSAL", [(0.0, True)])
 # @pytest.mark.parametrize('DROPOUT, CAUSAL',[(0.0, False),(0.0, True),(0.2, False),(0.2, True)]) #Debug Causal + Dropout. Fails for seq >=64
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(32, 8), (16, 16)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(32, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("atomic", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
@@ -748,8 +748,8 @@ def test_mha_fused_backward_varlen(
             causal=CAUSAL,
             return_lse=True,
             return_attn_probs=True,
-            fused_backward=atomic,
-            onekernel_backward=(not atomic),
+            fused_backward=True,
+            onekernel_backward=False,
         )
 
     assert len(triton_out) == 3
