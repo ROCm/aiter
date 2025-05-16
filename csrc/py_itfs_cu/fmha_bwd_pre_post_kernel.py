@@ -13,7 +13,7 @@ from typing import List, Optional
 
 this_dir = os.path.abspath(__file__)
 sys.path.insert(0, str(Path(this_dir).parents[2] / "aiter/"))
-from jit.core import AITER_ROOT_DIR
+from jit.core import get_asm_dir
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -617,12 +617,7 @@ class fmha_bwd_v3_kernel
     {{
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
-        std::string AITER_ASM_DIR;
-        if (const char* env_val = std::getenv("AITER_ASM_DIR")) {{
-            AITER_ASM_DIR = env_val;
-        }} else {{
-            AITER_ASM_DIR = std::string("{F_AITER_ROOT_DIR}/hsa/") + get_gpu_arch_hip() + "/";
-        }}
+        std::string AITER_ASM_DIR = "{F_AITER_ASM_DIR}";
         HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + "fmha_v3_bwd/" + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }}
@@ -2518,7 +2513,7 @@ class FmhaBwdApiPool:
     @property
     def api(self) -> str:
         return FMHA_BWD_KERNEL_HEADER + FMHA_BWD_API.format(
-            F_AITER_ROOT_DIR=AITER_ROOT_DIR
+            F_AITER_ASM_DIR=get_asm_dir()
         )
 
 
