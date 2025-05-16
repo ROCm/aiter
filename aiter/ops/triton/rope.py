@@ -2380,6 +2380,247 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa(
 
 
 @triton.jit
+def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa_one_head(
+    x_ptr: torch.Tensor,
+    y_ptr: torch.Tensor,
+    cos_ptr: torch.Tensor,
+    sin_ptr: torch.Tensor,
+    pos_ptr: torch.Tensor,
+    off_ptr: torch.Tensor,
+    out_x_ptr: torch.Tensor,
+    out_y_ptr: torch.Tensor,
+    stride_x_t,
+    stride_x_h,
+    stride_x_d,
+    stride_y_t,
+    stride_y_h,
+    stride_y_d,
+    stride_cos_t,
+    stride_cos_d,
+    stride_pos_t,
+    stride_out_t,
+    stride_out_h,
+    stride_out_d,
+    T,
+    reuse_freqs_front_part: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    G: tl.constexpr,
+    D_MODEL: tl.constexpr,
+    D_MODEL_HALF: tl.constexpr,
+    HAVE_OFFS: tl.constexpr,
+):
+
+    s = tl.program_id(0)
+    hq = tl.program_id(1)
+
+    tl.assume(stride_x_t > 0)
+    tl.assume(stride_x_h > 0)
+    tl.assume(stride_x_d > 0)
+    tl.assume(stride_y_t > 0)
+    tl.assume(stride_y_h > 0)
+    tl.assume(stride_y_d > 0)
+    tl.assume(stride_cos_t > 0)
+    tl.assume(stride_cos_d > 0)
+    tl.assume(stride_pos_t > 0)
+    tl.assume(stride_out_t > 0)
+    tl.assume(stride_out_h > 0)
+    tl.assume(stride_out_d > 0)
+
+    pos_offs = s * BLOCK_T + tl.arange(0, BLOCK_T)
+    pos_mask = pos_offs < T
+    pos = tl.load(pos_ptr + pos_offs, mask=pos_mask)
+    if HAVE_OFFS:
+        offset = tl.load(off_ptr + pos_offs, mask=pos_mask)
+        cos_offs_t = pos + offset
+    else:
+        cos_offs_t = pos
+
+    if reuse_freqs_front_part:
+        cos_offs_d = tl.arange(0, D_MODEL) // 2
+        cos_mask_d = cos_offs_d < D_MODEL_HALF
+    else:
+        cos_offs_d = tl.arange(0, D_MODEL)
+        cos_mask_d = cos_offs_d < D_MODEL
+
+    cos_mask = (cos_offs_t < T)[:, None] & (cos_mask_d)[None, :]
+    cos_offs = stride_cos_t * cos_offs_t[:, None] + stride_cos_d * cos_offs_d[None, :]
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+
+    x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
+    x_offs_d = tl.arange(0, D_MODEL)
+    x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
+    x_rotated_mask = (x_offs_d % 2 == 0)[None, :]
+
+    x_offs = (
+        x_offs_t[:, None] * stride_x_t
+        + x_offs_d[None, :] * stride_x_d
+        + hq * stride_y_h
+    )
+    x = tl.load(x_ptr + x_offs, mask=x_mask)
+    x_rotated = tl.where(x_rotated_mask, x, -x)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_T, D_MODEL_HALF, 2))
+    x_rotated = tl.flip(x_rotated, 2)
+    x_rotated = tl.reshape(
+        x_rotated,
+        (
+            BLOCK_T,
+            D_MODEL,
+        ),
+    )
+
+    out_x = x * cos + x_rotated * sin
+    out_x = out_x.to(x_ptr.dtype.element_ty)
+    tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
+
+    if hq < G:
+        y_offs = (
+            x_offs_t[:, None] * stride_y_t
+            + x_offs_d[None, :] * stride_y_d
+            + hq * stride_y_h
+        )
+        y = tl.load(y_ptr + y_offs, mask=x_mask)
+        y_rotated = tl.where(x_rotated_mask, y, -y)
+        y_rotated = tl.reshape(y_rotated, (BLOCK_T, D_MODEL_HALF, 2))
+        y_rotated = tl.flip(y_rotated, 2)
+        y_rotated = tl.reshape(
+            y_rotated,
+            (
+                BLOCK_T,
+                D_MODEL,
+            ),
+        )
+
+        out_y = y * cos + y_rotated * sin
+        out_y = out_y.to(y_ptr.dtype.element_ty)
+        tl.store(out_y_ptr + y_offs, out_y, mask=x_mask)
+
+
+@triton.jit
+def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa_one_head(
+    x_ptr: torch.Tensor,
+    y_ptr: torch.Tensor,
+    cos_ptr: torch.Tensor,
+    sin_ptr: torch.Tensor,
+    pos_ptr: torch.Tensor,
+    off_ptr: torch.Tensor,
+    out_x_ptr: torch.Tensor,
+    out_y_ptr: torch.Tensor,
+    stride_x_t,
+    stride_x_h,
+    stride_x_d,
+    stride_y_t,
+    stride_y_h,
+    stride_y_d,
+    stride_cos_t,
+    stride_cos_d,
+    stride_pos_t,
+    stride_out_t,
+    stride_out_h,
+    stride_out_d,
+    T,
+    reuse_freqs_front_part: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    G: tl.constexpr,
+    D_MODEL: tl.constexpr,
+    D_MODEL_HALF: tl.constexpr,
+    HAVE_OFFS: tl.constexpr,
+):
+
+    s = tl.program_id(0)
+    hq = tl.program_id(1)
+
+    tl.assume(stride_x_t > 0)
+    tl.assume(stride_x_h > 0)
+    tl.assume(stride_x_d > 0)
+    tl.assume(stride_y_t > 0)
+    tl.assume(stride_y_h > 0)
+    tl.assume(stride_y_d > 0)
+    tl.assume(stride_cos_t > 0)
+    tl.assume(stride_cos_d > 0)
+    tl.assume(stride_pos_t > 0)
+    tl.assume(stride_out_t > 0)
+    tl.assume(stride_out_h > 0)
+    tl.assume(stride_out_d > 0)
+
+    pos_offs = s * BLOCK_T + tl.arange(0, BLOCK_T)
+    pos_mask = pos_offs < T
+    pos = tl.load(pos_ptr + pos_offs, mask=pos_mask)
+    if HAVE_OFFS:
+        offset = tl.load(off_ptr + pos_offs, mask=pos_mask)
+        cos_offs_t = pos + offset
+    else:
+        cos_offs_t = pos
+
+    if reuse_freqs_front_part:
+        cos_offs_d = tl.arange(0, D_MODEL)
+        cos_offs_d = tl.where(
+            (cos_offs_d < D_MODEL_HALF),
+            cos_offs_d,
+            cos_offs_d - D_MODEL_HALF,
+        ).to(cos_offs_d.dtype)
+        cos_mask_d = cos_offs_d < D_MODEL_HALF
+    else:
+        cos_offs_d = tl.arange(0, D_MODEL)
+        cos_mask_d = cos_offs_d < D_MODEL
+
+    cos_mask = (cos_offs_t < T)[:, None] & (cos_mask_d)[None, :]
+    cos_offs = stride_cos_t * cos_offs_t[:, None] + stride_cos_d * cos_offs_d[None, :]
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+
+    x_offs_t = s * BLOCK_T + tl.arange(0, BLOCK_T)
+    x_offs_d = tl.arange(0, D_MODEL)
+    x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
+    x_rotated_mask = (x_offs_d < D_MODEL_HALF)[None, :]
+
+    x_offs = (
+        x_offs_t[:, None] * stride_x_t
+        + x_offs_d[None, :] * stride_x_d
+        + hq * stride_y_h
+    )
+    x = tl.load(x_ptr + x_offs, mask=x_mask)
+    x_rotated = tl.where(x_rotated_mask, x, -x)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_T, 2, D_MODEL_HALF))
+    x_rotated = tl.flip(x_rotated, 2)
+    x_rotated = tl.reshape(
+        x_rotated,
+        (
+            BLOCK_T,
+            D_MODEL,
+        ),
+    )
+    x_rotated = tl.flip(x_rotated, 1)
+
+    out_x = x * cos + x_rotated * sin
+    out_x = out_x.to(x_ptr.dtype.element_ty)
+    tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
+
+    if hq < G:
+        y_offs = (
+            x_offs_t[:, None] * stride_y_t
+            + x_offs_d[None, :] * stride_y_d
+            + hq * stride_y_h
+        )
+        y = tl.load(y_ptr + y_offs, mask=x_mask)
+        y_rotated = tl.where(x_rotated_mask, y, -y)
+        y_rotated = tl.reshape(y_rotated, (BLOCK_T, 2, D_MODEL_HALF))
+        y_rotated = tl.flip(y_rotated, 2)
+        y_rotated = tl.reshape(
+            y_rotated,
+            (
+                BLOCK_T,
+                D_MODEL,
+            ),
+        )
+        y_rotated = tl.flip(y_rotated, 1)
+
+        out_y = y * cos + y_rotated * sin
+        out_y = out_y.to(y_ptr.dtype.element_ty)
+        tl.store(out_y_ptr + y_offs, out_y, mask=x_mask)
+
+
+@triton.jit
 def _rope_fwd_2d_kernel_neox(
     x_ptr: torch.Tensor,
     cos_h_ptr,
@@ -3516,35 +3757,11 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
     D_MODEL = d
     D_MODEL_HALF = d // 2
 
-    BLOCK_T = 32
+    BLOCK_T = min(max(triton.next_power_of_2(t), 16), 32)
     SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
-
-    # if t >= 8192:
-    #     MIN_NUM_WG = 2048
-    # elif t >= 1024:
-    #     MIN_NUM_WG = 1024
-    # else:
-    #     MIN_NUM_WG = 512
-
-    # if SPLIT_T < MIN_NUM_WG:
-    #     SPLIT_H_SIZE = hx
-    #     SPLIT_H = (triton.next_power_of_2(hx) + SPLIT_H_SIZE - 1) // SPLIT_H_SIZE
-    #     while SPLIT_H * SPLIT_T < MIN_NUM_WG and SPLIT_H_SIZE > 1:
-    #         SPLIT_H_SIZE = SPLIT_H_SIZE // 2
-    #         SPLIT_H = (triton.next_power_of_2(hx) + SPLIT_H_SIZE - 1) // SPLIT_H_SIZE
-    # else:
-    #     SPLIT_H_SIZE = hx
-
-    # SPLIT_H = (triton.next_power_of_2(hx) + SPLIT_H_SIZE - 1) // SPLIT_H_SIZE
-
-    G = hy
-    QH_per_G = hx // hy
-
-    grid = (G, SPLIT_T, 1)
-
+    grid = (SPLIT_T, hx, 1)
     num_warps = 4
     waves_per_eu = 0
-    num_stages = 2 if QH_per_G > 1 else 1
 
     if rotate_style == RotateStyle.GPTJ:
         if have_nope:
@@ -3553,31 +3770,67 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
                 "nope style has not been implemented in RoPE Triton backend."
             )
         else:
-            _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa[grid](
-                x,
-                y,
-                cos,
-                sin,
-                positions,
-                offsets,
-                out_x,
-                out_y,
-                *x.stride(),
-                *y.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out_x.stride(),
-                T=t,
-                reuse_freqs_front_part=reuse_freqs_front_part,
-                BLOCK_T=BLOCK_T,
-                QH_per_G=QH_per_G,
-                D_MODEL=D_MODEL,
-                D_MODEL_HALF=D_MODEL_HALF,
-                HAVE_OFFS=(offsets is not None),
-                num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
-                num_stages=num_stages
-            )
+            if t >= 1024:
+                BLOCK_T = 32
+                SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
+                G = hy
+                QH_per_G = hx // hy
+                grid = (G, SPLIT_T, 1)
+                num_warps = 4
+                waves_per_eu = 0
+                num_stages = 2 if QH_per_G > 1 else 1
+
+                _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa[grid](
+                    x,
+                    y,
+                    cos,
+                    sin,
+                    positions,
+                    offsets,
+                    out_x,
+                    out_y,
+                    *x.stride(),
+                    *y.stride(),
+                    *cos.stride(),
+                    *positions.stride(),
+                    *out_x.stride(),
+                    T=t,
+                    reuse_freqs_front_part=reuse_freqs_front_part,
+                    BLOCK_T=BLOCK_T,
+                    QH_per_G=QH_per_G,
+                    D_MODEL=D_MODEL,
+                    D_MODEL_HALF=D_MODEL_HALF,
+                    HAVE_OFFS=(offsets is not None),
+                    num_warps=num_warps,
+                    waves_per_eu=waves_per_eu,
+                    num_stages=num_stages
+                )
+            else:
+                _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa_one_head[grid](
+                    x,
+                    y,
+                    cos,
+                    sin,
+                    positions,
+                    offsets,
+                    out_x,
+                    out_y,
+                    *x.stride(),
+                    *y.stride(),
+                    *cos.stride(),
+                    *positions.stride(),
+                    *out_x.stride(),
+                    T=t,
+                    reuse_freqs_front_part=reuse_freqs_front_part,
+                    BLOCK_T=BLOCK_T,
+                    G=hy,
+                    D_MODEL=D_MODEL,
+                    D_MODEL_HALF=D_MODEL_HALF,
+                    HAVE_OFFS=(offsets is not None),
+                    num_warps=num_warps,
+                    waves_per_eu=waves_per_eu
+                )
+
     elif rotate_style == RotateStyle.NEOX:
         if have_nope:
             # TODO: add a new kernel for nope
@@ -3585,7 +3838,42 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
                 "nope style has not been implemented in RoPE Triton backend."
             )
         else:
-            _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa[grid](
+            # TODO check boundary
+            # BLOCK_T = 32
+            # SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
+            # G = hy
+            # QH_per_G = hx // hy
+            # grid = (G, SPLIT_T, 1)
+            # num_warps = 4
+            # waves_per_eu = 0
+            # num_stages = 2 if QH_per_G > 1 else 1
+            # _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa[grid](
+            #         x,
+            #         y,
+            #         cos,
+            #         sin,
+            #         positions,
+            #         offsets,
+            #         out_x,
+            #         out_y,
+            #         *x.stride(),
+            #         *y.stride(),
+            #         *cos.stride(),
+            #         *positions.stride(),
+            #         *out_x.stride(),
+            #         T=t,
+            #         reuse_freqs_front_part=reuse_freqs_front_part,
+            #         BLOCK_T=BLOCK_T,
+            #         QH_per_G=QH_per_G,
+            #         D_MODEL=D_MODEL,
+            #         D_MODEL_HALF=D_MODEL_HALF,
+            #         HAVE_OFFS=(offsets is not None),
+            #         num_warps=num_warps,
+            #         waves_per_eu=waves_per_eu,
+            #         num_stages=num_stages
+            #     )
+
+            _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa_one_head[grid](
                 x,
                 y,
                 cos,
@@ -3602,13 +3890,12 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
                 T=t,
                 reuse_freqs_front_part=reuse_freqs_front_part,
                 BLOCK_T=BLOCK_T,
-                QH_per_G=QH_per_G,
+                G=hy,
                 D_MODEL=D_MODEL,
                 D_MODEL_HALF=D_MODEL_HALF,
                 HAVE_OFFS=(offsets is not None),
                 num_warps=num_warps,
-                waves_per_eu=waves_per_eu,
-                num_stages=num_stages
+                waves_per_eu=waves_per_eu
             )
 
     return out_x, out_y

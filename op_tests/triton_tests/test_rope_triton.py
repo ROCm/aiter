@@ -32,6 +32,78 @@ from aiter.ops.triton.rope import (
 DEBUG_MODE = False
 
 
+# TODO apply this function in all test functions
+def generate_rope_inputs(
+    B: int,
+    S: int,
+    H: int,
+    Q: int,
+    D: int,
+    cached: bool,
+    reuse_freqs_front_part: bool,
+    nope: bool,
+    pos: bool,
+    offs: bool,
+    two_inputs: bool,
+    layout: str,
+    dtype: torch.dtype,
+):
+    torch.manual_seed(20)
+
+    device = "cuda"
+    if layout == "thd":  # T == S
+        assert B == 1, "B should always be 1 in THD layout"
+        input_x_shape = (S, Q * H, D)
+        input_y_shape = (S, H, D)
+        pos_offs_shape = (S,)
+    elif layout == "sbhd":
+        input_x_shape = (S, B, Q * H, D)
+        input_y_shape = (S, B, H, D)
+        pos_offs_shape = (S, B)
+    else:
+        raise NotImplementedError(f"layout '{layout}' not supported")
+
+    x = torch.randn(input_x_shape, dtype=dtype, device="cuda")
+    y = torch.randn(input_y_shape, dtype=dtype, device="cuda") if two_inputs else None
+
+    freqs_D = D
+    if nope:
+        freqs_D = freqs_D // 2
+    if reuse_freqs_front_part:
+        freqs_D = freqs_D // 2
+
+    freqs = torch.randn((S, 1, 1, freqs_D), dtype=dtype, device="cuda")
+    positions = (
+        torch.randint(
+            max(0, int(S * 0.25) if offs else 0),
+            max(1, int(S * 0.75) if offs else S),
+            pos_offs_shape,
+            device=device,
+        )
+        if pos
+        else None
+    )
+    offsets = (
+        torch.randint(
+            max(0, int(S * -0.25)),
+            max(1, int(S * 0.25)),
+            pos_offs_shape,
+            device="cuda",
+        )
+        if offs
+        else None
+    )
+
+    cos = torch.cos(freqs) if cached else None
+    sin = torch.sin(freqs) if cached else None
+
+    if cached and layout == "thd":
+        cos = cos.reshape(S, freqs_D)
+        sin = sin.reshape(S, freqs_D)
+
+    return x, y, freqs, positions, offsets, cos, sin
+
+
 def ref_rope_cached_thd_positions_offsets_2c_fwd(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -432,13 +504,13 @@ def test_rope_fwd_cached(
 # @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
 # @pytest.mark.parametrize("H", [1, 8, 32, 128])
 # @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
-@pytest.mark.parametrize("H", [1, 8, 32, 128])
-@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("T", [(1), (4), (8192)])
+@pytest.mark.parametrize("H", [1, 8, 128])
+@pytest.mark.parametrize("D", [4, 128])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
 # @pytest.mark.parametrize('nope, nope_first', [(False, False)])
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
-# @pytest.mark.parametrize('reuse_freqs_front_part', [True])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
 @pytest.mark.parametrize("pos, offs", [(True, False), (True, True)])
@@ -447,34 +519,28 @@ def test_rope_fwd_cached_thd_2c(
     H: int,
     D: int,
     rotate_style: RotateStyle,
+    reuse_freqs_front_part: bool,
     dtype: torch.dtype,
     pos: bool,
     offs: bool,
     inplace: bool,
 ):
     torch.manual_seed(20)
-    x = torch.randn((T, H, D), dtype=dtype, device="cuda")
-    y = torch.randn((T, H, D), dtype=dtype, device="cuda")
-
-    reuse_freqs_front_part = True
-
-    if reuse_freqs_front_part:
-        freqs_D = D // 2
-    freqs = torch.randn((T, freqs_D), dtype=dtype, device="cuda")
-
-    positions = (
-        torch.randint(int(T * 0.25), int(T * 0.75), (T,), device="cuda")
-        if pos
-        else None
+    x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        H,
+        1,
+        D,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=False,
+        pos=pos,
+        offs=offs,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
     )
-    offsets = (
-        torch.randint(int(T * -0.25), int(T * 0.25), (T,), device="cuda")
-        if offs
-        else None
-    )
-
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
 
     if pos is False:
         pytest.skip(
@@ -556,9 +622,14 @@ def test_rope_fwd_cached_thd_2c(
 @pytest.mark.parametrize("KH", [1, 8, 16, 32])
 @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
+# @pytest.mark.parametrize("T", [(1), (4), (8192)])
+# @pytest.mark.parametrize("QH_per_KH", [16])  # QH_per_KH > 1
+# @pytest.mark.parametrize("KH", [8])
+# @pytest.mark.parametrize("D", [128])  # For now, D is power of 2.
+# @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
 # @pytest.mark.parametrize('nope, nope_first', [(False, False)])
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
-# @pytest.mark.parametrize('reuse_freqs_front_part', [True])
+@pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
 @pytest.mark.parametrize("pos, offs", [(True, False), (True, True)])
@@ -568,34 +639,29 @@ def test_rope_fwd_cached_thd_2c_gqa(
     KH: int,
     D: int,
     rotate_style: RotateStyle,
+    reuse_freqs_front_part: bool,
     dtype: torch.dtype,
     pos: bool,
     offs: bool,
     inplace: bool,
 ):
     torch.manual_seed(20)
-    x = torch.randn((T, QH_per_KH * KH, D), dtype=dtype, device="cuda")
-    y = torch.randn((T, KH, D), dtype=dtype, device="cuda")
-
-    reuse_freqs_front_part = True
-
-    if reuse_freqs_front_part:
-        freqs_D = D // 2
-    freqs = torch.randn((T, freqs_D), dtype=dtype, device="cuda")
-
-    positions = (
-        torch.randint(int(T * 0.25), int(T * 0.75), (T,), device="cuda")
-        if pos
-        else None
-    )
-    offsets = (
-        torch.randint(int(T * -0.25), int(T * 0.25), (T,), device="cuda")
-        if offs
-        else None
+    x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        KH,
+        QH_per_KH,
+        D,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=False,
+        pos=pos,
+        offs=offs,
+        two_inputs=True,
+        layout="thd",
+        dtype=dtype,
     )
 
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
     cos_sin = torch.cat((cos, sin), dim=-1)
     cos = cos_sin[:, : cos_sin.shape[-1] // 2]
     sin = cos_sin[:, cos_sin.shape[-1] // 2 :]

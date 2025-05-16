@@ -3,6 +3,7 @@ import sys
 import torch
 import triton
 from triton.testing import runtime
+from op_tests.triton_tests.test_rope_triton import generate_rope_inputs
 from aiter.ops.triton.rope import RotateStyle
 from aiter.ops.triton.rope import (
     rope_fwd,
@@ -26,73 +27,6 @@ from aiter.ops.triton.rope import (
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
 )
-
-
-# TODO: move to aiter/op_tests/triton_tests/test_rope_triton.py
-def generate_rope_inputs(
-    B: int,
-    S: int,
-    H: int,
-    Q: int,
-    D: int,
-    cached: bool,
-    reuse_freqs_front_part: bool,
-    nope: bool,
-    pos: bool,
-    offs: bool,
-    two_inputs: bool,
-    layout: str,
-    dtype: torch.dtype,
-):
-    torch.manual_seed(20)
-
-    device = "cuda"
-    if layout == "thd":  # T == S
-        assert B == 1, "B should always be 1 in THD layout"
-        input_x_shape = (S, Q * H, D)
-        input_y_shape = (S, H, D)
-        pos_offs_shape = (S,)
-    elif layout == "sbhd":
-        input_x_shape = (S, B, Q * H, D)
-        input_y_shape = (S, B, H, D)
-        pos_offs_shape = (S, B)
-    else:
-        raise NotImplementedError(f"layout '{layout}' not supported")
-
-    x = torch.randn(input_x_shape, dtype=dtype, device="cuda")
-    y = torch.randn(input_y_shape, dtype=dtype, device="cuda") if two_inputs else None
-
-    freqs_D = D
-    if nope:
-        freqs_D = freqs_D // 2
-    if reuse_freqs_front_part:
-        freqs_D = freqs_D // 2
-
-    freqs = torch.randn((S, 1, 1, freqs_D), dtype=dtype, device="cuda")
-    positions = (
-        torch.randint(
-            int(S * 0.25) if offs else 0,
-            int(S * 0.75) if offs else S,
-            pos_offs_shape,
-            device=device,
-        )
-        if pos
-        else None
-    )
-    offsets = (
-        torch.randint(int(S * -0.25), int(S * 0.25), pos_offs_shape, device=device)
-        if offs
-        else None
-    )
-
-    cos = torch.cos(freqs) if cached else None
-    sin = torch.sin(freqs) if cached else None
-
-    if cached and layout == "thd":
-        cos = cos.reshape(S, freqs_D)
-        sin = sin.reshape(S, freqs_D)
-
-    return x, y, freqs, positions, offsets, cos, sin
 
 
 def str_to_bool(v, vstr):
@@ -533,7 +467,7 @@ def run_benchmark(args):
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="Benchmark RoPE",
-        description="This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime (the DurationNs column) in results.csv or results.stats.csv. For instance, try \"rocprof --stats python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
+        description="This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime. For instance, try \"rocprofv2 --kernel-trace python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
         allow_abbrev=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
