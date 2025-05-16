@@ -243,7 +243,7 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.h'"
         ],
         "md_name": "'module_moe_ck2stages'",
-        "flags_extra_cc": [],
+        "flags_extra_cc": ["f'-DMOE_STAGE2_ASM_DIR=\\\\\"{CK_DIR}/example/65_gemm_multiply_multiply/hsa/\\\\\"'"],
         "flags_extra_hip": [
             "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"  
         ],
