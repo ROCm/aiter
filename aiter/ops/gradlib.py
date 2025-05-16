@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor
+import torch
 from typing import List, Optional
 from ..jit.core import (
     compile_ops,
