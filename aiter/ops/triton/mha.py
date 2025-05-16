@@ -2513,8 +2513,6 @@ def _bwd_dkdvdq_inner(
     ENABLE_DROPOUT: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    workgroup_id: tl.int32,
-    num_atomics_concurrent: tl.constexpr,
 ):
     tl.assume(stride_q_m >= 0)
     tl.assume(stride_q_k >= 0)
@@ -2559,14 +2557,8 @@ def _bwd_dkdvdq_inner(
     #dQ = dSK
     #dK = QdS^T
 
-
-    # offset_factor = num_steps // num_atomics_concurrent # 3 if num_steps > 1 or num_steps==3 else 1 # coprime with num_steps
-    # Compute a starting index and step based on workgroup_id
-    # Use a simple hash-like function to spread out the starting points
-    # start_idx = (workgroup_id * offset_factor) % num_steps  # 17 is an arbitrary prime to spread indices
-
     for iter in range(num_steps):
-        # Compute the permuted block index
+        # Permute the iteration order to reduce the probability that concurrent workgroups (that share the same q head idx and batch idx) are at the same iteration
         blk_idx = (iter * 29) % num_steps
 
         curr_m = start_m + blk_idx * step_m
@@ -2738,20 +2730,14 @@ def _bwd_kernel_dkdvdq_causal(
     tl.assume(stride_do_k >= 0)
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
-
     wid = tl.program_id(0) # workgoup id: 0, ..., NUM_Q_PIDS * BATCH * NUM_K_HEADS - 1
     batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8)
     # In the backward we dont want concurrent workgroups to handle consecutive heads or blocks, so remap them to be far apart.
     head_q_idx = (head_q_idx * 29) % NUM_Q_HEADS
     seq_k_blk_idx = (seq_k_blk_idx * 29) % NUM_K_PIDS
     
-    # or regular batch, heads, blocks ordering
-    # batch_idx = wid % BATCH
-    # head_q_idx = (wid // BATCH) % NUM_Q_HEADS
-    # seq_k_blk_idx = (wid // (BATCH * NUM_Q_HEADS)) % NUM_K_PIDS
 
     head_k_idx = head_q_idx // GROUP_SIZE
-    num_atomics_concurrent = NUM_SMS // (NUM_Q_HEADS *  BATCH)
 
     #Determine q and k start along with seqlen_q and seqlen_k
     q_start = 0
@@ -2858,7 +2844,6 @@ def _bwd_kernel_dkdvdq_causal(
     len_m = min(len_m, seqlen_q)
     num_steps = tl.cdiv(len_m, MASK_BLOCK_M)
 
-
     # when q < k, we may skip the initial masked op
     if seq_k_blk_idx < num_blocks_skip:
         num_steps = 0
@@ -2891,16 +2876,11 @@ def _bwd_kernel_dkdvdq_causal(
         ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
-        workgroup_id=seq_k_blk_idx,
-        num_atomics_concurrent=num_atomics_concurrent
     )
-
 
     start_m += num_steps * MASK_BLOCK_M
     num_steps = tl.cdiv(seqlen_q - start_m, BLOCK_M)
     end_m = start_m + num_steps * BLOCK_M
-
-
 
     dk, dv = _bwd_dkdvdq_inner(
         dk, dv,  # output tensors
@@ -2920,8 +2900,6 @@ def _bwd_kernel_dkdvdq_causal(
         ENABLE_DROPOUT=ENABLE_DROPOUT,  # activate dropout
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
-        workgroup_id=seq_k_blk_idx,
-        num_atomics_concurrent=num_atomics_concurrent
     )
 
     # Write back dV and dK.
@@ -3074,8 +3052,6 @@ def _bwd_kernel_dkdvdq_noncausal(
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            workgroup_id=pid,
-            num_atomics_concurrent=num_atomics_concurrent,
         )
 
     adj_dkdv = (bid * stride_dkb +
@@ -3552,6 +3528,7 @@ def _flash_attn_fused_backward(
         "num_stages": 1,
         "waves_per_eu": 2,
         "BLK_SLICE_FACTOR": 1,
+        "matrix_instr_nonkdim": 16,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
@@ -3758,12 +3735,12 @@ def _flash_attn_onekernel_backward(
 
     # Fuses dk,dv and dq computations into one kernel using atomics
     NUM_WARPS, NUM_STAGES = 4, 1
-    WAVES_PER_EU = 1
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    BLK_SLICE_FACTOR = 2
+    WAVES_PER_EU = 2
+    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 64, 64, 64, 64
+    BLK_SLICE_FACTOR = 1
 
     onekernel_config = {
-        "BLOCK_M1": 16, "BLOCK_N1": 64, "BLOCK_M2": 64, "BLOCK_N2": 16, "BLK_SLICE_FACTOR": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "num_warps": 4, "num_ctas": 1, "num_stages": 1,
+        "BLOCK_M1": BLOCK_M1, "BLOCK_N1": BLOCK_N1, "BLOCK_M2": BLOCK_M2, "BLOCK_N2": BLOCK_N2, "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR, "waves_per_eu": WAVES_PER_EU, "matrix_instr_nonkdim": 16, "num_warps": NUM_WARPS, "num_ctas": 1, "num_stages": NUM_STAGES,
     }
 
     num_k_pids = (max_seqlen_k + BLOCK_N1 - 1) // BLOCK_N1
