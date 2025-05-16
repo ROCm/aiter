@@ -2560,14 +2560,14 @@ def _bwd_dkdvdq_inner(
     #dK = QdS^T
 
 
-    offset_factor = num_steps // num_atomics_concurrent # 3 if num_steps > 1 or num_steps==3 else 1 # coprime with num_steps
+    # offset_factor = num_steps // num_atomics_concurrent # 3 if num_steps > 1 or num_steps==3 else 1 # coprime with num_steps
     # Compute a starting index and step based on workgroup_id
     # Use a simple hash-like function to spread out the starting points
-    start_idx = (workgroup_id * offset_factor) % num_steps  # 17 is an arbitrary prime to spread indices
+    # start_idx = (workgroup_id * offset_factor) % num_steps  # 17 is an arbitrary prime to spread indices
 
     for iter in range(num_steps):
         # Compute the permuted block index
-        blk_idx = iter # (start_idx + iter) % num_steps
+        blk_idx = (iter * 29) % num_steps
 
         curr_m = start_m + blk_idx * step_m
         qT_ptrs = qT_ptrs_start + blk_idx * step_m * stride_q_m
@@ -2743,7 +2743,7 @@ def _bwd_kernel_dkdvdq_causal(
     batch_idx, head_q_idx, seq_k_blk_idx = _wid2pid(wid, BATCH, NUM_Q_HEADS, NUM_K_PIDS, NUM_XCD=8)
     # In the backward we dont want concurrent workgroups to handle consecutive heads or blocks, so remap them to be far apart.
     head_q_idx = (head_q_idx * 29) % NUM_Q_HEADS
-    seq_k_blk_idx = (seq_k_blk_idx) * 29 % NUM_K_PIDS
+    seq_k_blk_idx = (seq_k_blk_idx * 29) % NUM_K_PIDS
     
     # or regular batch, heads, blocks ordering
     # batch_idx = wid % BATCH
