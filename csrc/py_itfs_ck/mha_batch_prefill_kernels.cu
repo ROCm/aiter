@@ -384,7 +384,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                            stream_config,
                                            q_dtype_str,
                                            true, // is_group_mode
-                                           mask,
+                                           mask.type,
                                            bias_type,
                                            has_lse);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
