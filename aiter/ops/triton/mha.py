@@ -2940,9 +2940,9 @@ class FlashAttnFP8Func(torch.autograd.Function):
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
-                q,
-                k,
-                v,
+                q_fp8,
+                k_fp8,
+                v_fp8,
                 dropout_p,
                 softmax_scale,
                 causal=causal,
