@@ -48,3 +48,8 @@ __pycache__
 # debug folder
 debug
 aiter_logs
+
+# dev
+scripts
+dist
+*.log

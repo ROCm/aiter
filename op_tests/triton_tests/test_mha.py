@@ -16,7 +16,7 @@ from aiter.test_mha_common import (
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-DEBUG_MODE = False
+DEBUG_MODE = True
 ATOL_fp8 = 2.5e-1
 RTOL_fp8 = 2.5e-1
 
