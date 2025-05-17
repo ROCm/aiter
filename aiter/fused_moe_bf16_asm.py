@@ -202,9 +202,7 @@ def asm_moe(
                 a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
                 a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
                 if per_tensor_quant_scale is None:
-                    aiter.dynamic_per_token_scaled_quant(
-                        a8, hidden_states, a8_scale
-                    )
+                    aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
                 else:
                     aiter.static_per_tensor_quant(
                         a8, hidden_states, per_tensor_quant_scale
@@ -358,9 +356,7 @@ def asm_moe_tkw1(
                 a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
                 a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
                 if per_tensor_quant_scale is None:
-                    aiter.dynamic_per_token_scaled_quant(
-                        a8, hidden_states, a8_scale
-                    )
+                    aiter.dynamic_per_token_scaled_quant(a8, hidden_states, a8_scale)
                 else:
                     aiter.static_per_tensor_quant(
                         a8, hidden_states, per_tensor_quant_scale
