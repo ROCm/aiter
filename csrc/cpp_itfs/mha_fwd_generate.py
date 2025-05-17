@@ -133,7 +133,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
-FMHA_FWD_V3_API = """float mha_fwd(mha_fwd_args args,
+FMHA_FWD_V3_API = """
+float mha_fwd(mha_fwd_args args,
               const ck_tile::stream_config& stream_config,
               std::string q_dtype_str,
               bool is_group_mode,
@@ -153,7 +154,9 @@ FMHA_FWD_V3_API = """float mha_fwd(mha_fwd_args args,
                                      mask_type,
                                      bias_type,
                                      has_lse,
-                                     has_dropout);
+                                     has_dropout,
+                                     use_ext_asm);
+
     return fmha_fwd_v3(traits, args, stream_config);
 }"""
 

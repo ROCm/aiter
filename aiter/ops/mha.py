@@ -288,7 +288,7 @@ def _flash_attn_forward(
         ret &= nhead_q % nhead_k == 0
         ret &= mask or nmask
         ret &= return_lse
-        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        # ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -308,7 +308,6 @@ def _flash_attn_forward(
             bias,
             alibi_slopes,
             None,
-            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     else:
         out, softmax_lse, S_dmask, rng_state = mha_fwd(

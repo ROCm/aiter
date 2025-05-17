@@ -29,7 +29,7 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           bias_type,
                           has_lse,
                           has_dropout,
-                          false} // do_fp8_static_quant
+                          false}, // do_fp8_static_quant
           use_ext_asm(use_ext_asm)
     {
     }
