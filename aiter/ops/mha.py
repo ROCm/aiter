@@ -24,8 +24,7 @@ def mha_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-):
-    ...
+): ...
 
 
 @compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd")
@@ -44,8 +43,7 @@ def fmha_v3_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-):
-    ...
+): ...
 
 
 @compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
@@ -71,8 +69,7 @@ def mha_varlen_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> list[Tensor]:
-    ...
+) -> list[Tensor]: ...
 
 
 @compile_ops("module_mha_bwd", fc_name="mha_bwd")
@@ -97,8 +94,7 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-):
-    ...
+): ...
 
 
 @compile_ops("module_fmha_v3_bwd", fc_name="fmha_v3_bwd")
@@ -123,8 +119,7 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-):
-    ...
+): ...
 
 
 @compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
@@ -153,8 +148,7 @@ def mha_varlen_bwd(
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     custom_build_args: Optional[dict] = None,
-):
-    ...
+): ...
 
 
 @compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
@@ -184,8 +178,7 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-):
-    ...
+): ...
 
 
 def maybe_contiguous(x):
@@ -584,7 +577,12 @@ def _flash_attn_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     if can_impl_fmha_v3_bwd():
-        (dq, dk, dv, softmax_d,) = fmha_v3_bwd(
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = fmha_v3_bwd(
             dout,
             q,
             k,
@@ -607,7 +605,12 @@ def _flash_attn_backward(
             None,
         )
     else:
-        (dq, dk, dv, softmax_d,) = mha_bwd(
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = mha_bwd(
             dout,
             q,
             k,
@@ -1132,7 +1135,12 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     if can_impl_fmha_v3_bwd():
-        (dq, dk, dv, softmax_d,) = fmha_v3_varlen_bwd(
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = fmha_v3_varlen_bwd(
             dout,
             q,
             k,
@@ -1160,7 +1168,12 @@ def _flash_attn_varlen_backward(
             None,
         )
     else:
-        (dq, dk, dv, softmax_d,) = mha_varlen_bwd(
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = mha_varlen_bwd(
             dout,
             q,
             k,
@@ -1469,8 +1482,7 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-):
-    ...
+): ...
 
 
 def _mha_batch_prefill(
