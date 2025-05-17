@@ -11,7 +11,7 @@
 
 namespace aiter {
 
-struct __attribute__((packed))
+struct __attribute__((packed)) fmha_fwd_v3_args
 {
     void *ptr_d;
     p2 _p0;
@@ -25,29 +25,28 @@ struct __attribute__((packed))
     p2 _p4;
     float scalar;
     p3 _p5;
-    unsigned int s_seq_len;
+    unsigned int seq_len;
     p3 _p6;
-    unsigned int s_Seqs;
+    unsigned int Seqs;
     p3 _p7;
-    unsigned int s_Ts;
+    unsigned int Ts;
     p3 _p8;
-    unsigned int s_Hs;
+    unsigned int Hs;
     p3 _p9;
-    unsigned int s_BAs;
+    unsigned int BAs;
     p3 _p10;
-    unsigned int s_gqa;
+    unsigned int gqa;
     p3 _p11;
-    unsigned int s_kv_Seqs;
+    unsigned int kv_Seqs;
     p3 _p12;
-    unsigned int s_kv_Hs;
+    unsigned int kv_Hs;
     p3 _p13;
-    unsigned int s_kv_BAs;
+    unsigned int kv_BAs;
     p3 _p14;
-    unsigned int s_opt;
+    unsigned int opt;
     p3 _p15;
 }
 
-// TODO: fix here
 struct fmha_fwd_v3_traits
 {
     int b;
@@ -60,20 +59,42 @@ struct fmha_fwd_v3_traits
     int ts_kv;
 };
 
-// TODO: fix here
-template <ck_tile::index_t HDim_,
-          typename DataType_,
-          int mask_type_,
+template <typename DataType_,
+          ck_tile::index_t HDim_,
+          ck_tile::index_t MaskType,
           bool kIsSEQPad_,
           bool kIsHDPad_>
-struct fmha_fwd_v3_traits_
+struct fmha_fwd_kernel_selector
 {
-    static constexpr ck_tile::index_t HDim    = HDim_;
-    using DataType                            = ck_tile::remove_cvref_t<DataType_>;
-    static constexpr int mask_type            = mask_type_;
-    static constexpr bool kIsSEQPad           = kIsSEQPad_;
-    static constexpr bool kIsHDPad            = kIsHDPad_;
+    using DataType                              = ck_tile::remove_cvref_t<DataType_>;
+    static constexpr ck_tile::index_t HDim      = HDim_;
+    static constexpr ck_tile::index_t MaskType  = mask_type_;
+    static constexpr bool kIsSEQPad             = kIsSEQPad_;
+    static constexpr bool kIsHDPad              = kIsHDPad_;
 };
+
+
+template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Name;
+// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16_causal"; };
+
+template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Buf;
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16_causal.co"; };
+
+template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Ts;
+// ####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; };
+
 
 class fmha_fwd_v3_kernel
 {
@@ -96,16 +117,14 @@ class fmha_fwd_v3_kernel
                            HIP_LAUNCH_PARAM_BUFFER_SIZE,
                            &arg_size,
                            HIP_LAUNCH_PARAM_END};
-        // TODO: FIX here
+
+        int tg_div = (fmha_v3_traits.mask != 0) ? 2 : 1;
+
         int bdx = 512;
-        int gdx = ((q_seq_lens+sub_Q-1)/sub_Q + tg_div - 1)/tg_div;
+        int gdx = ((fmha_v3_traits.s + fmha_v3_traits.sub_qo - 1) / fmha_v3_traits.sub_qo + tg_div - 1) / tg_div;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
-        if(fmha_v3_traits.mask > 0)
-        {
-            int num_tg = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
-            gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
-        }
+
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
                                        gdx,
                                        gdy,
@@ -124,62 +143,81 @@ class fmha_fwd_v3_kernel
     hipFunction_t kernel_func;
 };
 
-template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_>
-float fmha_fwd_v3_(const ck_tile::stream_config& s, fmha_fwd_args a)
+template <typename fmha_fwd_kernel_selector>
+float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
 {
     if(s.log_level_ > 0)
-        std::cout << ", " << fmha_fwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhafwdV3Name<dq_dk_dv_v3_traits_>::fwd_v3_name << std::flush;
+        std::cout << ", " << FmhafwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
     fmha_fwd_v3_args args;
-    args.ptr_dq  = a.dq_ptr;
-    args.ptr_dk  = a.dk_ptr;
-    args.ptr_dv  = a.dv_ptr;
+    args.ptr_d   = a.d_ptr;
     args.ptr_q   = a.q_ptr;
     args.ptr_k   = a.k_ptr;
     args.ptr_v   = a.v_ptr;
-    args.ptr_do  = a.do_ptr;
     args.ptr_lse = a.lse_ptr;
-    args.ptr_d   = a.d_ptr;
+
     args.scalar  = a.scale;
-    args.log2e   = ck_tile::log2e_v<float>;
     args.seq_len = a.seqlen_q;
-
-    args.Ts   = FmhafwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv * a.stride_k * 2;
-    args.Hs   = a.nhead_stride_q * 2;
-    args.BAs  = a.batch_stride_q * 2;
-    args.Seqs = a.stride_q * 2;
-
-    args.ratio    = a.nhead_q / a.nhead_k;
+    args.Seqs    = a.stride_q * 2;
+    args.Ts      = FmhafwdV3Ts<fmha_fwd_kernel_selector>::ts_qo * a.hdim_q * 2;
+    args.Hs      = a.nhead_stride_q * 2;
+    args.BAs     = a.batch_stride_q * 2;
+    args.gqa      = a.nhead_q / a.nhead_k;
+    args.Seqs_kv  = a.stride_k * 2;
     args.Hs_kv    = a.nhead_stride_k * 2;
     args.BAs_kv   = a.batch_stride_k * 2;
-    args.Seqs_kv  = a.stride_k * 2;
-    args.Seqs_dkv = a.stride_dk * 2;
+    args.opt      = 1;
+
     auto traits = fmha_fwd_v3_traits{a.batch,
-                                      a.nhead_q,
-                                      a.seqlen_q,
-                                      a.hdim_q,
-                                      a.mask_type,
-                                      FmhafwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
-                                      FmhafwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv};
-    static thread_local fmha_fwd_v3_kernel impl(FmhafwdV3Name<dq_dk_dv_v3_traits_>::fwd_v3_name, FmhafwdV3Buf<dq_dk_dv_v3_traits_>::fwd_v3_buf); // static here is for thread safety.
+                                     a.nhead_q,
+                                     a.seqlen_q,
+                                     a.hdim_q,
+                                     a.mask_type,
+                                     FmhafwdV3Ts<fmha_fwd_kernel_selector>::ts_qo,
+                                     FmhafwdV3Ts<fmha_fwd_kernel_selector>::ts_kv};
+
+    static thread_local fmha_fwd_v3_kernel impl(FmhafwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name, FmhafwdV3Buf<fmha_fwd_kernel_selector>::fwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
-        [=](const ck_tile::stream_config& s_){ fmha_fwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); },
         [=](const ck_tile::stream_config& s_){ impl.launch_kernel(traits, args, s_); }
     );
 }
 
-// TODO: fix here
-template <typename fmha_fwd_v3_traits_> struct FmhaFwdV3Name;
-template <typename fmha_fwd_v3_traits_> struct FmhaFwdV3Buf;
-template <typename fmha_fwd_v3_traits_> struct FmhaFwdV3Ts;
-
-
 float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s){
     float r = -1;
-/*  
-1.only support bhsd/bshd
-2.LSE is forced to bhsd
-3.Qlen should be equal with KVlen
-*/
+    // TODO: 
+    // 1.only support bhsd/bshd
+    // 2.LSE is forced to bhsd
+    if (t.use_ext_asm == true) {
+        if (t.data_type.compare("bf16") == 0) {
+            if ((t.bias_type == bias_enum::no_bias) && (t.has_dbias == false) && (t.has_dropout == false) && 
+                        (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seq_len_q % 256 == 0) &&
+                        // TODO: need this two?
+                        (t.is_deterministic == false) && (a.hdim_q == a.hdim_v)) {
+                if (t.mask_type == mask_enum::no_mask) {
+                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
+                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                }
+                else if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {
+                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false>;
+                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                }
+            }
+        }
+        else if (t.data_type.compare("fp16") == 0) {
+            if ((t.bias_type == bias_enum::no_bias) && (t.has_dbias == false) && (t.has_dropout == false) && 
+                        (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seq_len_q % 256 == 0) &&
+                        // TODO: need this two?
+                        (t.is_deterministic == false) && (a.hdim_q == a.hdim_v)) {
+                if (t.mask_type == mask_enum::no_mask) {
+                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdFp16, 128, 0, false, false>;
+                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                }
+                else if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {
+                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdFp16, 128, 1, false, false>;
+                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                }
+            }
+        }
+    }
     return r;
 }
 } // namespace aiter
