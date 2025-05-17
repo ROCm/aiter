@@ -275,6 +275,21 @@
             py::arg("rng_state") = std::nullopt,      \
             py::arg("gen") = std::nullopt);
 
+#define MHA_FWD_ASM_PYBIND                                  \
+      m.def("fmha_v3_fwd", &aiter::torch_itfs::fmha_v3_fwd, \
+            py::arg("q"), py::arg("k"), py::arg("v"),       \
+            py::arg("dropout_p"),                           \
+            py::arg("softmax_scale"),                       \
+            py::arg("is_causal"),                           \
+            py::arg("window_size_left"),                    \
+            py::arg("window_size_right"),                   \
+            py::arg("return_softmax_lse"),                  \
+            py::arg("return_dropout_randval"),              \
+            py::arg("out") = std::nullopt,                  \
+            py::arg("bias") = std::nullopt,                 \
+            py::arg("alibi_slopes") = std::nullopt,         \
+            py::arg("gen") = std::nullopt);
+
 #define MHA_FWD_PYBIND                                \
       m.def("mha_fwd", &aiter::torch_itfs::mha_fwd,   \
             py::arg("q"), py::arg("k"), py::arg("v"), \
