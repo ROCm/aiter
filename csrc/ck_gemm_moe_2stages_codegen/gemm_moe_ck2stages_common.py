@@ -85,9 +85,9 @@ a8w8_gemm1_kernels_list= {
 }
 # gemm1 blockscale out:bf16/fp16 AB:fp8/i8
 a8w8_gemm1_blockscale_kernels_list= {
-     0: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
-     1: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
-     2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
+     #0: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
+     0: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        3,),
+     #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
 
 # gemm1 out:bf16/fp16 A:fp8 B:win4 
@@ -124,8 +124,8 @@ a8w8_gemm2_kernels_list= {
 
 # gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8 
 a8w8_gemm2_blockscale_kernels_list= {   
-     0: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
-     1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
+     #0: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
+     #1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
      2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
@@ -148,7 +148,7 @@ gemm2_kernels_dict = {
 bit8_list = ["F8", "I8"]
 bit16_list = ["B16", "F16"]
 bit4_list = ["I4"]
-QuantType_list = ["QuantType.per_128x128"]
+QuantType_list = ["per_128x128"]
 
 def get_gemm1_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, ActOP: bool, MulRoutedWeight: bool) -> list:
     

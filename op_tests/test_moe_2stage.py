@@ -150,6 +150,8 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
+    if qType == aiter.QuantType.per_128x128:
+        BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
     )
@@ -322,7 +324,9 @@ def test_fmoe(
     # #     fc2_scale=w2_scale,
     # # )
     # # checkAllclose(out_ref, out2_ref, msg="[torch] 1_stage vs 2_stage")
-    
+    if qType == aiter.QuantType.per_128x128:
+        BLOCK_SIZE_M = 128
+
     out2_ck, us = run_perftest(
         ck_moe_stage2,
         a2_qt,
@@ -393,7 +397,7 @@ def test_fmoe(
     return {"us": us_fuse, "err": err}
 
 
-list_dtype = [dtypes.bf16, dtypes.fp16][-1]
+list_dtype = [dtypes.bf16, dtypes.fp16]
 list_dtype = [dtypes.fp16, dtypes.fp16]
 list_dim = [(6144, 4096)]
 list_tokenNum = [

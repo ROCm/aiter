@@ -97,7 +97,7 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
                 S<K0_A, K0_M_A, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
                 S<K0_B, K0_N_B, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
                 4,    2,   S<1, 32, 1, 8>, S<2, 1, 1, 1>,
-                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, false, int32_t, A0DataType>;
+                ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, ActOP, Nswizzle, true, MulRoutedWeight, int32_t, A0DataType>;
 
     // clang-format on
 
@@ -245,16 +245,17 @@ void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
         // clang-format off
             < Row, Col, DsLayout, ELayout,
               A0DataType, A1DataType, B0DataType, B1DataType, DsDataType, EDataType, AccDataType, CShuffleDataType,
-              BLOCKSIZE,  Scale_Block_M, Scale_Block_N, Scale_Block_K, 
-              MPerBlock,   NPerBlock,    KPerBlock,
+              AElementOp,  BElementOp, CDEElementOp,   GemmSpec,   
+              256,  Scale_Block_M, Scale_Block_N, Scale_Block_K,
+              MPerBlock,   128,    128,
               AK1,   BK1,
               MNPerXDL,   MNPerXDL,
-              MXDLPerWave, NXDLPerWave,
-              S<K0_A, K0_M, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, AK1, AK1, 0,
-              S<K0_B, K0_N, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, BK1, BK1, 0,
-              //CShuffleMXDLPerWave,    1,   S<1, CShuffleMLane, 1, CShuffleNLane>, S<EVec, D0Vec, D1Vec, D2Vec>,
+              4, 4,
+              S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
+              S<8, 32, 1>, S<1, 0, 2>, S<1, 0, 2>, 2, 16, 16, 0,
               2,    2,   S<1, 32, 1, 8>, S<2, 1, 1, 1>,
               ck::BlockGemmPipelineScheduler::Intrawave, PipelineVer, 0, false, false, false, int32_t, A0DataType>;
+
 
 
     auto a_element_op = AElementOp{};
