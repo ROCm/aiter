@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from aiter.test_common import (
     checkAllclose,
@@ -9,7 +9,7 @@ from aiter.test_common import (
 import torch
 import aiter
 from aiter import dtypes
-from aiter import get_hip_quant, get_torch_quant, get_triton_quant, per_1x32_f4_quant
+from aiter import get_hip_quant, get_torch_quant, get_triton_quant
 import itertools
 
 torch.set_default_device("cuda")
@@ -19,12 +19,12 @@ torch.set_default_device("cuda")
 def test_quant(m, n, q_type, q_dtype, h_dtype):
     dim = (m, n)
 
-    input = torch.randn(dim, dtype=h_dtype) * 111
+    input = torch.randn(dim, dtype=h_dtype)
     ref, ref_scale = get_torch_quant(q_type)(input, quant_dtype=q_dtype)
 
     q_funcs = {
         "triton": get_triton_quant,
-        # "hip": get_hip_quant,
+        "hip": get_hip_quant,
     }
     ret = {}
     for name, q_func in q_funcs.items():
@@ -64,9 +64,9 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
 
 
 list_quant = [
-    # (aiter.QuantType.per_Tensor, dtypes.fp8),
-    # (aiter.QuantType.per_Token, dtypes.fp8),
-    # (aiter.QuantType.per_Token, dtypes.i8),
+    (aiter.QuantType.per_Tensor, dtypes.fp8),
+    (aiter.QuantType.per_Token, dtypes.fp8),
+    (aiter.QuantType.per_Token, dtypes.i8),
     (aiter.QuantType.per_1x32, dtypes.fp4x2),
 ]
 list_dtype = [dtypes.fp16, dtypes.bf16][1:]
@@ -77,8 +77,8 @@ for (
     h_dtype,
 ) in itertools.product(list_quant, list_dtype):
     df = []
-    for n in [4096, 8192]:
-        for m in [1, 16, 32, 64, 128, 192, 256, 512, 1024]:
+    for n in [256, 4096, 8192][:]:
+        for m in [1, 2, 16, 32, 64, 128, 192, 256, 512, 1024, 16384, 163840][:]:
             ret = test_quant(m, n, q_type, q_dtype, h_dtype)
             df.append(ret)
     df = pd.DataFrame(df)

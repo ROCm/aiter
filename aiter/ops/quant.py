@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
@@ -185,13 +185,13 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     shape = x.shape
     device = x.device
     if scale is None:
-        scale = torch.empty(shape[:-1], dtype=dtypes.fp32, device=device)
+        scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=device)
     else:
         raise ValueError("unsupported: static per token quant")
 
-    if quant_dtype == dtypes.fp8:
+    if 1:
         y = torch.empty(shape, dtype=quant_dtype, device=device)
-        dynamic_per_token_scaled_fp8_quant(y, x, scale)
+        dynamic_per_token_scaled_quant(y, x, scale)
     elif quant_dtype == dtypes.i8:
         M, N = x.view(-1, shape[-1]).shape
         y = torch.empty((M, N), dtype=dtypes.i8, device=device)
@@ -209,9 +209,9 @@ def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     if quant_dtype == dtypes.fp8:
         if scale is None:
             scale = torch.empty(1, dtype=dtypes.fp32, device=x.device)
-            dynamic_scaled_fp8_quant(y, x, scale)
+            dynamic_per_tensor_quant(y, x, scale)
         else:
-            static_scaled_fp8_quant(y, x, scale)
+            static_per_tensor_quant(y, x, scale)
     else:
         raise ValueError(f"unsupported: {quant_dtype=}")
     return y, scale.view(1)
@@ -223,7 +223,7 @@ def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     dtypeMax = get_dtype_max(quant_dtype)
     y = torch.empty(shape, dtype=quant_dtype, device=device)
     if scale is None:
-        scale = torch.empty(shape[:-1], dtype=dtypes.fp32, device=device)
+        scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=device)
         triton.quant.dynamic_per_token_fp8_quant(
             y, x, scale, quant_dtype=quant_dtype, dtypeMax=dtypeMax
         )
@@ -262,14 +262,14 @@ def get_torch_act(aType):
 
 
 @compile_ops("module_quant")
-def static_scaled_fp8_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
 
 
 @compile_ops("module_quant")
-def dynamic_scaled_fp8_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
 
 
 @compile_ops("module_quant")
-def dynamic_per_token_scaled_fp8_quant(
+def dynamic_per_token_scaled_quant(
     out: Tensor, input: Tensor, scales: Tensor, scale_ub: Optional[Tensor] = None
 ): ...

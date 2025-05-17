@@ -284,10 +284,10 @@ def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8, printLog=True)
         percent = (num / a.numel()).item()
         if not printLog:
             return percent
+        a_msked = a[mask]
+        b_msked = b[mask]
+        delta = (a_msked - b_msked).abs()
         if percent > 0.01:
-            a_msked = a[mask]
-            b_msked = b[mask]
-            delta = (a_msked - b_msked).abs()
             logger.info(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
