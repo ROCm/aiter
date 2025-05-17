@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -202,11 +202,11 @@ def asm_moe(
                 a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
                 a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
                 if per_tensor_quant_scale is None:
-                    aiter.dynamic_per_token_scaled_fp8_quant(
+                    aiter.dynamic_per_token_scaled_quant(
                         a8, hidden_states, a8_scale
                     )
                 else:
-                    aiter.static_scaled_fp8_quant(
+                    aiter.static_per_tensor_quant(
                         a8, hidden_states, per_tensor_quant_scale
                     )
                     a8_scale.fill_(per_tensor_quant_scale)
@@ -358,11 +358,11 @@ def asm_moe_tkw1(
                 a8 = torch.empty((M, model_dim), dtype=a8_type, device=device)
                 a8_scale = torch.empty(M, dtype=dtypes.fp32, device=device)
                 if per_tensor_quant_scale is None:
-                    aiter.dynamic_per_token_scaled_fp8_quant(
+                    aiter.dynamic_per_token_scaled_quant(
                         a8, hidden_states, a8_scale
                     )
                 else:
-                    aiter.static_scaled_fp8_quant(
+                    aiter.static_per_tensor_quant(
                         a8, hidden_states, per_tensor_quant_scale
                     )
                     a8_scale.fill_(per_tensor_quant_scale)

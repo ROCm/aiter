@@ -520,9 +520,9 @@
       m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
 #define QUANT_PYBIND                                                                   \
-      m.def("static_scaled_fp8_quant", &static_scaled_fp8_quant);                      \
-      m.def("dynamic_scaled_fp8_quant", &dynamic_scaled_fp8_quant);                    \
-      m.def("dynamic_per_token_scaled_fp8_quant", &dynamic_per_token_scaled_fp8_quant, \
+      m.def("static_per_tensor_quant", &static_per_tensor_quant);                      \
+      m.def("dynamic_per_tensor_quant", &dynamic_per_tensor_quant);                    \
+      m.def("dynamic_per_token_scaled_quant", &dynamic_per_token_scaled_quant, \
             py::arg("out"), py::arg("input"),                                          \
             py::arg("scales"), py::arg("scale_ub") = std::nullopt);
 
