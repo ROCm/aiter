@@ -17,7 +17,8 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    mask_enum mask_type,
                    bias_enum bias_type,
                    bool has_lse,
-                   bool has_dropout)
+                   bool has_dropout,
+                   bool use_ext_asm)
         : fmha_fwd_traits{head_size_q,
                           head_size_v,
                           dtype,
@@ -29,8 +30,10 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           has_lse,
                           has_dropout,
                           false} // do_fp8_static_quant
+          use_ext_asm(use_ext_asm)
     {
     }
+    bool use_ext_asm;
 };
 
 struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
@@ -67,7 +70,8 @@ float mha_fwd(mha_fwd_args args,
               bool is_group_mode,
               mask_enum mask_type,
               bias_enum bias_type,
-              bool has_lse);
+              bool has_lse,
+              bool use_ext_asm);
 
 float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       const ck_tile::stream_config& stream_config,
@@ -84,5 +88,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                         mask_enum mask_type,
                         bias_enum bias_type,
                         bool has_lse);
+
+float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s);
 
 } // namespace aiter

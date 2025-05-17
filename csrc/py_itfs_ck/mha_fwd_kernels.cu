@@ -312,7 +312,8 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  false, // is_group_mode
                                  mask.type,
                                  bias_type,
-                                 has_lse);
+                                 has_lse,
+                                 false);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {
