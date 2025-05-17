@@ -1,14 +1,15 @@
-import sys
 import argparse
+import sys
+
+import torch
 import triton
-import triton.language as tl
-from aiter.ops.triton.moe_op import fused_moe as triton_moe
-from utils.moe import generate_moe_alignment, generate_moe_input, get_optimal_moe_config
-from utils.benchmark_utils import (
-    get_model_configs,
-    get_available_models,
-)
-from utils.common import str_to_torch_dtype, torch_to_tl_dtype
+from utils.benchmark_utils import get_available_models, get_model_configs
+
+from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
+from op_benchmarks.triton.utils.common import str_to_torch_dtype, torch_to_tl_dtype
+from op_benchmarks.triton.utils.moe import generate_moe_alignment
+from op_tests.triton_tests.test_moe_mx import alloc_rand
+from op_tests.triton_tests.utils.quant_ref import torch_dynamic_mxfp4_quant
 
 
 def model_benchmark_configs(args):
@@ -17,7 +18,7 @@ def model_benchmark_configs(args):
         config_path=config_file, models="mistral" if args.model is None else args.model
     )
     moe_configs = []
-    M = args.M if args.M else 4096  # check size
+    M = args.M if args.M else 128  # check size
     # M, K, N, E, top_k
 
     for model_name, config in configs.items():
@@ -38,20 +39,9 @@ def model_benchmark_configs(args):
 
 def run_benchmark(args):
     routed_weight = args.routed_weight
-    input_dtype = args.input_dtype
-    aux_dtype = args.aux_dtype
-    group_size = args.group_size
-    has_zp = args.has_zp
-
-    assert (
-        input_dtype != "int4_w4a16" or group_size is not None
-    ), "User has to set group_size explicitly for int4 weight"
-
-    kernel_name = "fused_moe_kernel"
-    if input_dtype in ["int8_w8a16", "int4_w4a16"] and group_size > 0:
-        kernel_name = "fused_moe_kernel_gptq_awq"
-    input_dtype_str = "" if input_dtype is None else input_dtype
-    kernel_name += input_dtype_str + "_" + aux_dtype
+    a_dtype_str = args.a_dtype
+    b_dtype_str = "mxfp4_e2m1"
+    swizzle_mx = args.swizzle_mx
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
@@ -67,21 +57,58 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{kernel_name}-benchmark",
-        args={"aux_dtype": aux_dtype, "input_dtype": input_dtype},
+        plot_name=f"MoE Benchmark {a_dtype_str} x {b_dtype_str}",
+        args={"a_dtype": a_dtype_str, "swizzle_mx": swizzle_mx},
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_moe_gemm(M, N, K, E, top_k, metric, input_dtype, aux_dtype, model=None):
-
-        a, b, triton_out, _, b_zp, a_scale, b_scale = generate_moe_input(
-            M, N, K, top_k, E, group_size, has_zp, input_dtype, aux_dtype
+    def bench_moe_gemm(M, N, K, E, top_k, metric, a_dtype, swizzle_mx, model=None):
+        is_a_mixed_input = a_dtype_str.startswith("mx")
+        is_b_mixed_input = b_dtype_str.startswith("mx")
+        a_dtype = str_to_torch_dtype[a_dtype_str]
+        c_dtype = torch.bfloat16 if is_a_mixed_input else a_dtype
+        fp16_dtype = torch.float16 if a_dtype_str == "fp16" else torch.bfloat16
+        a_tri = alloc_rand((M, K), dtype=fp16_dtype, device="cuda", requires_grad=False)
+        b_tri = alloc_rand(
+            (E, N, K), dtype=fp16_dtype, device="cuda", requires_grad=False
         )
-        config = get_optimal_moe_config(input_dtype, aux_dtype, M)
+        c_tri = torch.zeros(
+            (M, top_k, N), dtype=c_dtype, device="cuda", requires_grad=False
+        )
+        a_scale = torch.tensor([1.00], dtype=torch.float32, device="cuda")
+        b_scale = torch.tensor([1.00] * E, dtype=torch.float32, device="cuda")
+
+        config = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 0,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+        }
+
         topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded = (
             generate_moe_alignment(M, E, top_k, config["BLOCK_SIZE_M"])
         )
-        aux_dtype = str_to_torch_dtype[aux_dtype]
+        # Downcast a tensor to mxfp4 and upcast back for reference
+        if is_a_mixed_input:
+            # swizzle_axis = 0 if swizzle_mx else None
+            # a_tri, a_mx_scales, _ = downcast_to_mxfp(
+            #    a_tri, a_dtype, axis=1, swizzle_axis=swizzle_axis
+            # )
+            a_tri, a_mx_scales = torch_dynamic_mxfp4_quant(a_tri)
+        else:
+            a_mx_scales = None
+        # Downcast b tensor to mxfp4 and upcast back for reference
+        if is_b_mixed_input:
+            # swizzle_axis = 1 if swizzle_mx else None
+            # b_tri, b_mx_scales, _ = downcast_to_mxfp(
+            #    b_tri, b_dtype, axis=2, swizzle_axis=swizzle_axis
+            # )
+            b_tri, b_mx_scales = torch_dynamic_mxfp4_quant(a_tri)
         # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
         flops = 2.0 * M * top_k * K * N
         # The weight is applied on the gemm product which has the shape of (M, top_k, N)
@@ -89,19 +116,20 @@ def run_benchmark(args):
             flops += M * top_k * N
 
         # Variables to compute bandwidth
-        mem_read = a.numel() * a.element_size() + b.numel() * b.element_size()
-        mem_write = triton_out.numel() * triton_out.element_size()
+        mem_read = (
+            a_tri.numel() * a_tri.element_size() + b_tri.numel() * b_tri.element_size()
+        )
+        mem_write = c_tri.numel() * c_tri.element_size()
         mem = mem_read + mem_write
 
-        fp8_w8a8 = input_dtype == "fp8_w8a8"
-        int8_w8a16 = input_dtype == "int8_w8a16"
-        fn = lambda: triton_moe(  # noqa: E731
-            a,
-            b,
-            triton_out,
+        fn = lambda: fused_moe_mxfp4(  # noqa: E731
+            a_tri,
+            b_tri,
+            c_tri,
             a_scale,
             b_scale,
-            b_zp,
+            a_mx_scales,
+            b_mx_scales,
             topk_weights,
             topk_ids,
             sorted_token_ids,
@@ -109,11 +137,10 @@ def run_benchmark(args):
             num_tokens_post_padded,
             routed_weight,
             top_k,
+            swizzle_mx,
+            swizzle_mx,
             config,
-            torch_to_tl_dtype[aux_dtype],
-            fp8_w8a8,
-            int8_w8a16,
-            use_int4_w4a16=False,
+            torch_to_tl_dtype[c_tri.dtype],
         )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -136,7 +163,7 @@ def run_benchmark(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        prog="Benchmark MoE GEMM",
+        prog="Benchmark MoE with micro scaled format",
         allow_abbrev=False,
     )
     parser.add_argument(
@@ -152,19 +179,16 @@ def parse_args():
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
     parser.add_argument("--model", type=str, default=None, help=model_help)
-    parser.add_argument("-M", type=int, default=0, help="M dimension")
-    parser.add_argument(
-        "--group-size", type=int, default=None, help="group_size for int4"
-    )
+    parser.add_argument("-M", type=int, help="M dimension")
     parser.add_argument("--routed-weight", action="store_true")
+    parser.add_argument("--swizzle-mx", action="store_true")
     parser.add_argument(
-        "--input-dtype",
+        "-A",
+        "--a-dtype",
         type=str,
-        choices=["int8_w8a16", "fp8_w8a8", "int4_w4a16", None],
-        default=None,
+        choices=["bf16", "fp16", "fp8_e5m2", "mxfp4_e2m1"],
+        default="mxfp4_e2m1",
     )
-    parser.add_argument("--aux-dtype", default="fp16")
-    parser.add_argument("--has-zp", action="store_true")
     args = parser.parse_args()
     return args
 
