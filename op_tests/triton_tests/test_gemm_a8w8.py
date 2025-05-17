@@ -14,8 +14,8 @@ def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
-    return gemm_a8w8(x, weight, x_scale, w_scale, bias)
+def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=None):
+    return gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
 def is_cdna4():
@@ -81,7 +81,7 @@ def get_x_vals():
     return x_vals
 
 
-def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype):
+def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype, output=False):
 
     x = torch.randn((M, K), dtype=torch.float32, device="cuda")
     max_x = x.abs().float().amax(dim=1, keepdim=True)
@@ -97,26 +97,31 @@ def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype):
 
     bias = torch.rand([1, N], dtype=torch.float32).cuda() * 10
 
-    return x, weight, x_scale, w_scale, bias
+    y = None
+    if output:
+        y = torch.empty((M, N), dtype=out_dtype).cuda()
+
+    return x, weight, x_scale, w_scale, bias, y
 
 
 @pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k",
+    "in_dtype, out_dtype, m, n, k, output",
     [
-        (in_dtype, out_dtype, *shape)
+        (in_dtype, out_dtype, *shape, output)
         for in_dtype in ["fp8e4", "fp8e5", "int8"]
         for out_dtype in ["bf16"]
         for shape in get_x_vals()
+        for output in [True, False]
     ],
 )
-def test_gemm(in_dtype, out_dtype, m, n, k):
+def test_gemm(in_dtype, out_dtype, m, n, k, output):
     in_dtype = name_to_torch_types[in_dtype]
     out_dtype = name_to_torch_types[out_dtype]
-    x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(
-        m, n, k, in_dtype, out_dtype
+    x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+        m, n, k, in_dtype, out_dtype, output
     )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype)
+    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
 
     triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

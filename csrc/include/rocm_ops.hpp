@@ -589,6 +589,7 @@
           .value("No", QuantType::No)                   \
           .value("per_Tensor", QuantType::per_Tensor)   \
           .value("per_Token", QuantType::per_Token)     \
+          .value("per_1x32", QuantType::per_1x32)     \
           .value("per_1x128", QuantType::per_1x128)     \
           .value("per_128x128", QuantType::per_128x128) \
           .export_values();                             \

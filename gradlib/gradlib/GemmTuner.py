@@ -25,9 +25,40 @@ from aiter import dtypes
 import torch
 import torch.nn.functional as F
 from aiter.test_common import perftest
+from aiter.utility.mp_tuner import mp_tuner
+from functools import lru_cache
 
 aiter.rocb_create_extension()
 aiter.hipb_create_extension()
+
+
+@lru_cache(maxsize=1)
+def init_hipblas():
+    aiter.hipb_create_extension()
+
+
+@lru_cache(maxsize=1)
+def init_rocblas():
+    aiter.rocb_create_extension()
+
+
+def call_hipb_mm(input, weight, solidx, bias, out_dtype, scale_a=None, scale_b=None):
+    init_hipblas()
+    return aiter.hipb_mm(
+        input,
+        weight,
+        solidx,
+        bias=bias,
+        out_dtype=out_dtype,
+        scaleA=scale_a,
+        scaleB=scale_b,
+    )
+
+
+def call_rocb_mm(inp, w, solidx):
+    init_rocblas()
+    return aiter.rocb_mm(inp, w, solidx)
+
 
 rtol = 1e-5
 atol = 1
@@ -40,7 +71,16 @@ HALF = torch.tensor(0.5, dtype=dtypes.fp32, device="cuda")
 class Gemm:
 
     def __init__(
-        self, m, n, k, bias, indtype, outdtype, scaleAB=False, rocblas_decode=False
+        self,
+        m,
+        n,
+        k,
+        bias,
+        indtype,
+        outdtype,
+        scaleAB=False,
+        rocblas_decode=False,
+        mp=1,
     ):
         self.m = m
         self.k = k
@@ -53,23 +93,21 @@ class Gemm:
         self.nb = CACHE_INVALIDATE_BUFFERS
         self.inp = torch.randn((self.m, self.k), device="cuda").to(self.indtype)
         self.weights = torch.randn((self.n, self.k), device="cuda").to(self.indtype)
-        # weights2 is used in measurement/warm iters to ensure
-        # HBM fetch for weight tensors
-        self.weights2 = torch.randn((self.nb, self.n, self.k), device="cuda").to(
-            self.indtype
-        )
         self.blob = torch.ones(128 * 1024 * 1024, dtype=dtypes.fp32, device="cuda")
         self.topn = 20  # number of top solutions from each source
         self.hipb_sols = []
         self.rocb_sols = []
         self.rtol = 1e-2
         self.atol = 1e-2
+        self.ref = self.get_gemm_ref()
+        self.check_err_ratio = 0.01
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
         # prefer hipblaslt unless rocblas time is less than this
         # ratio of hipblaslt time
         self.hipb_prefer_ratio = 0.995
         self.rocblas_decode = rocblas_decode
+        self.mp = mp
 
     def find_hipblas_sols(self):
         sols = aiter.hipb_findallsols(
@@ -96,7 +134,7 @@ class Gemm:
         # print(sols)
         self.hipb_sols = sols
 
-    def check_gemm_ref(self, libtype, solidx):
+    def get_gemm_ref(self):
         scaleA = HALF if self.scaleAB else ONE
         scaleB = HALF if self.scaleAB else ONE
         if self.indtype == dtypes.fp8:
@@ -123,74 +161,8 @@ class Gemm:
             if type(ref) is tuple and len(ref) == 2:
                 ref = ref[0]
         else:
-            ref = F.linear(self.inp, self.weights, self.bias)
-        if libtype == "hipblaslt":
-            c = aiter.hipb_mm(
-                self.inp,
-                self.weights.t(),
-                solidx,
-                bias=self.bias,
-                out_dtype=self.outdtype,
-                scaleA=scaleA,
-                scaleB=scaleB,
-            )
-        elif libtype == "rocblas":
-            c = aiter.rocb_mm(self.inp, self.weights.t(), solidx)
-            if self.bias is not None:
-                c += self.bias
-        if torch.allclose(
-            c.to(self.outdtype), ref.to(self.outdtype), atol=self.atol, rtol=self.rtol
-        ):
-            return True
-
-        print(">>>", libtype, "Solidx", solidx, "FAILED reference test", flush=True)
-        # print(ref, flush=True)
-        # print(c, flush=True)
-        return False
-
-    def hipb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
-        @perftest(num_warmup=cold_iters, num_iters=warm_iters)
-        def call_hipb_mm(input, weight, solidx, out_dtype, scale_a=None, scale_b=None):
-            aiter.hipb_mm(
-                input,
-                weight,
-                solidx,
-                out_dtype=out_dtype,
-                scaleA=scale_a,
-                scaleB=scale_b,
-            )
-
-        scaleA = HALF if self.scaleAB else None
-        scaleB = HALF if self.scaleAB else None
-
-        _, gtime = call_hipb_mm(
-            self.inp,
-            self.weights2[random.randint(0, self.nb - 1)].t(),
-            solidx,
-            self.outdtype,
-            scaleA,
-            scaleB,
-        )
-        gtime = gtime / 1000.0
-        # print('>>>hipbtime',solidx)
-        # for i in range(cold_iters):
-        #     aiter.hipb_mm(self.inp,
-        #                            self.weights.t(),
-        #                            solidx,
-        #                            out_dtype=self.outdtype)
-        # self.start.record()
-        # for i in range(warm_iters):
-        #     aiter.hipb_mm(self.inp,
-        #                            self.weights2[random.randint(
-        #                                0, self.nb - 1)].t(),
-        #                            solidx,
-        #                            bias=self.bias,
-        #                            out_dtype=self.outdtype)
-        # self.end.record()
-        # torch.cuda.synchronize()
-        # gtime = self.start.elapsed_time(self.end) / warm_iters
-        # print('>>> Solidx GTime',solidx,gtime,'ms')
-        return gtime
+            ref = F.linear(self.inp, self.weights, self.bias).to(self.outdtype)
+        return ref
 
     def hipb_time_all_sols(self, fast_mode=0, top_sols=0):
         coldi = 20
@@ -201,54 +173,46 @@ class Gemm:
         solutions = self.hipb_sols
         if top_sols:
             solutions = self.hipb_top_sols
+        task = []
+        scaleA = HALF if self.scaleAB else None
+        scaleB = HALF if self.scaleAB else None
+
         gtimes = {}
         for solidx in solutions:
-            gtimes[solidx] = self.hipb_time_sol(
-                solidx, cold_iters=coldi, warm_iters=warmi
+            task.append(
+                (
+                    solidx,
+                    call_hipb_mm,
+                    (
+                        self.inp,
+                        self.weights.t(),
+                        solidx,
+                        self.bias if self.bias is not None else None,
+                        self.outdtype,
+                        scaleA,
+                        scaleB,
+                    ),
+                    {
+                        "num_warmup": warmi,
+                        "num_iters": coldi,
+                    },
+                    self.ref if fast_mode == 0 else None,
+                    self.rtol,
+                    self.atol,
+                )
             )
+        ret = mp_tuner(task, self.mp)
+        for solidx, us, err_ratio in ret:
+            if fast_mode == 0:
+                if err_ratio > self.check_err_ratio:
+                    continue
+            gtimes[solidx] = us / 1000.0
         self.hipb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
         ).sort_values(by="gtimems")
         self.hipb_gtimedf.to_csv("/tmp/hipb_gtimedf.csv")
         print(">>> HipBlasLt top solutions, Fast Mode", fast_mode)
         print(self.hipb_gtimedf.head(self.topn))
-
-    def rocb_time_sol(self, solidx, cold_iters=2, warm_iters=10):
-
-        def rocb_mm_bias(inp, w, solidx, bias):
-            return aiter.rocb_mm(inp, w, solidx) + bias
-
-        def rocb_mm_nobias(inp, w, solidx, _):
-            return aiter.rocb_mm(inp, w, solidx)
-
-        rocb_fun = rocb_mm_bias if self.bias is not None else rocb_mm_nobias
-
-        @perftest(num_warmup=cold_iters, num_iters=warm_iters)
-        def call_rocb_mm(input, weight, solidx, bias):
-            rocb_fun(input, weight, solidx, bias)
-
-        _, gtime = call_rocb_mm(
-            self.inp,
-            self.weights2[random.randint(0, self.nb - 1)].t(),
-            solidx,
-            self.bias,
-        )
-        gtime = gtime / 1000.0
-
-        # for _ in range(cold_iters):
-        #     rocb_fun(self.inp, self.weights.t(), solidx, self.bias)
-
-        # self.start.record()
-        # for _ in range(warm_iters):
-        #     rocb_fun(self.inp, self.weights2[random.randint(0,
-        #                                                     self.nb - 1)].t(),
-        #              solidx, self.bias)
-
-        # self.end.record()
-        # torch.cuda.synchronize()
-        # gtime = self.start.elapsed_time(self.end) / warm_iters
-        # print('>>> RocSolidx GTime',solidx,gtime,'ms')
-        return gtime
 
     def find_rocblas_sols(self):
         if self.scaleAB or self.bias is not None:
@@ -278,9 +242,30 @@ class Gemm:
         solutions = self.rocb_sols
         if top_sols:
             solutions = self.rocb_top_sols
+        task = []
         gtimes = {}
         for solidx in solutions:
-            gtimes[solidx] = self.rocb_time_sol(solidx, coldi, warmi)
+            task.append(
+                (
+                    solidx,
+                    call_rocb_mm,
+                    (
+                        self.inp,
+                        self.weights.t(),
+                        solidx,
+                    ),
+                    {
+                        "num_warmup": warmi,
+                        "num_iters": coldi,
+                    },
+                )
+            )
+        ret = mp_tuner(task, self.mp)
+        for solidx, us, err_ratio in ret:
+            if fast_mode == 0:
+                if err_ratio > self.check_err_ratio:
+                    continue
+            gtimes[solidx] = us / 1000.0
         self.rocb_gtimedf = pd.DataFrame.from_dict(
             gtimes, orient="index", columns=["gtimems"]
         ).sort_values(by="gtimems")
@@ -292,16 +277,14 @@ class Gemm:
         for i in range(warmi):
             self.blob = self.blob + 0.00001
 
-    def functional_check_topn_fastest(self):
+    def functional_get_topn_fastest(self):
         rocb_topn = []
         for solidx in self.rocb_gtimedf.index[: self.topn]:
-            if self.check_gemm_ref(libtype="rocblas", solidx=solidx):
-                rocb_topn.append(solidx)
+            rocb_topn.append(solidx)
         self.rocb_top_sols = rocb_topn
         hipb_topn = []
         for solidx in self.hipb_gtimedf.index[: self.topn]:
-            if self.check_gemm_ref(libtype="hipblaslt", solidx=solidx):
-                hipb_topn.append(solidx)
+            hipb_topn.append(solidx)
         self.hipb_top_sols = hipb_topn
 
     def find_fastest_solution(self):
@@ -313,7 +296,7 @@ class Gemm:
         self.rocb_time_all_sols(fast_mode=1)
         self.warmup()
         self.hipb_time_all_sols(fast_mode=1)
-        self.functional_check_topn_fastest()
+        self.functional_get_topn_fastest()
         self.warmup()
         self.rocb_time_all_sols(fast_mode=0, top_sols=1)
         self.warmup()
@@ -358,12 +341,13 @@ class Gemm:
 
 class GemmTuner:
 
-    def __init__(self, indtype, outdtype, tuned_file=None, rocblas_decode=False):
+    def __init__(self, indtype, outdtype, tuned_file=None, rocblas_decode=False, mp=1):
         self.gemm_problems = pd.DataFrame(columns=["M", "N", "K", "bias"])
         self.indtype = indtype
         self.outdtype = outdtype
         self.rocblas_decode = rocblas_decode
         self.tuned_file = tuned_file
+        self.mp = mp
         if Path(tuned_file).is_file():
             self.tuned_shapes = pd.read_csv(tuned_file)
         else:
@@ -416,6 +400,7 @@ class GemmTuner:
                 outdtype=outdtype,
                 scaleAB=ds["scaleAB"],
                 rocblas_decode=self.rocblas_decode,
+                mp=self.mp,
             )
             gemmobj.find_fastest_solution()
             soldf.loc[i, "libtype"] = gemmobj.best_libtype

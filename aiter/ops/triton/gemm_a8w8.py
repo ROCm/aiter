@@ -182,6 +182,7 @@ def gemm_a8w8(
     w_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT, applies a conversion scale and optionally adds a bias
@@ -195,6 +196,7 @@ def gemm_a8w8(
     - X_scale: First scale tensor with shape (M, 1).
     - W_scale: Second scale tensor with shape (1, N).
     - Bias: Bias tensor with shape (1, N).
+    - Y: Output Matrix Y with shape (M, K). If this is none, then it's created by this API and returned as output
 
     Returns:
     - Y: The output matrix with shape (M, N).
@@ -209,7 +211,8 @@ def gemm_a8w8(
     M, K = x.shape
     K, N = w.shape
 
-    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128

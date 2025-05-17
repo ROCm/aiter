@@ -87,7 +87,7 @@ def run_benchmark(args):
     def bench_gemm_a16w16(M, N, K, layout, metric, provider):
         # NOTE: Assume bias and output has the same dtype
         c_dtype = torch.bfloat16
-        x, w = generate_gemm_a16w16_inputs(M, N, K, c_dtype, layout)
+        x, w, y = generate_gemm_a16w16_inputs(M, N, K, c_dtype, layout, output=True)
         # flops
         flops = 2.0 * M * N * K
         # memory transfer
@@ -96,7 +96,7 @@ def run_benchmark(args):
         mem = mem_read + mem_write
 
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, c_dtype), warmup=25, rep=100  # noqa: E731
+            lambda: gemm_a16w16(x, w, c_dtype, y), warmup=25, rep=100  # noqa: E731
         )
 
         # Return exactly one scalar depending on which metric is active

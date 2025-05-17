@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor
-from typing import Optional
-from ..jit.core import compile_ops
+import torch
+from typing import List, Optional
+from ..jit.core import (
+    compile_ops,
+    CK_DIR,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    AITER_CORE_DIR,
+    AITER_GRADLIB_DIR,
+)
 
 
 @compile_ops("module_hipbsolgemm")
@@ -16,27 +23,27 @@ def hipb_destroy_extension(): ...
 
 @compile_ops("module_hipbsolgemm")
 def hipb_mm(
-    mat1: Tensor,
-    mat2: Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
     solution_index: int,
-    bias: Optional[Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
     out_dtype: Optional[object] = None,
-    scaleA: Optional[Tensor] = None,
-    scaleB: Optional[Tensor] = None,
-    scaleOut: Optional[Tensor] = None,
-): ...
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    scaleOut: Optional[torch.Tensor] = None,
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_hipbsolgemm")
 def hipb_findallsols(
-    mat1: Tensor,
-    mat2: Tensor,
-    bias: Optional[Tensor] = None,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
     out_dtype: Optional[object] = None,
-    scaleA: Optional[Tensor] = None,
-    scaleB: Optional[Tensor] = None,
-    scaleC: Optional[Tensor] = None,
-): ...
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    scaleC: Optional[torch.Tensor] = None,
+) -> list[int]: ...
 
 
 @compile_ops("module_hipbsolgemm")
@@ -52,8 +59,8 @@ def rocb_destroy_extension(): ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_mm(mat1: Tensor, mat2: Tensor, solution_index: int = 0): ...
+def rocb_mm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: int) -> torch.Tensor: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_findallsols(mat1: Tensor, mat2: Tensor): ...
+def rocb_findallsols(arg0: torch.Tensor, arg1: torch.Tensor) -> list[int]: ...

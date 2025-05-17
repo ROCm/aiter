@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -384,7 +384,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                            stream_config,
                                            q_dtype_str,
                                            true, // is_group_mode
-                                           mask,
+                                           mask.type,
                                            bias_type,
                                            has_lse);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
