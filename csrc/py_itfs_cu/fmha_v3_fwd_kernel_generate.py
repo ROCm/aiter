@@ -206,13 +206,13 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
     float r = -1;
     // TODO:
     // 1.only support bhsd/bshd
-    // 2.LSE is forced to bhsd
     if (t.use_ext_asm == true) {{
         if (t.data_type.compare("bf16") == 0) {{
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dbias == false) && (t.has_dropout == false) &&
                         (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seq_len_q % 256 == 0) &&
-                        // TODO: need this two?
-                        (t.is_deterministic == false) && (a.hdim_q == a.hdim_v)) {{
+                        (a.nhead_stride_lse >= a.stride_lse /* lse only support bhsd*/) &&
+                        // TODO: need this?
+                        (a.hdim_q == a.hdim_v)) {{
                 if (t.mask_type == mask_enum::no_mask) {{
                     using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
                     r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
@@ -226,8 +226,9 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
         else if (t.data_type.compare("fp16") == 0) {{
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dbias == false) && (t.has_dropout == false) &&
                         (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seq_len_q % 256 == 0) &&
-                        // TODO: need this two?
-                        (t.is_deterministic == false) && (a.hdim_q == a.hdim_v)) {{
+                        (a.nhead_stride_lse >= a.stride_lse /* lse only support bhsd*/) &&
+                        // TODO: need this?
+                        (a.hdim_q == a.hdim_v)) {{
                 if (t.mask_type == mask_enum::no_mask) {{
                     using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdFp16, 128, 0, false, false>;
                     r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);

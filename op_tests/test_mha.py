@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -303,9 +303,9 @@ def test_flash_attn_output(
 if __name__ == "__main__":
     batch_size = 2
     nheads = 5
-    (seqlen_q, seqlen_k) = (128, 128)
-    d = 64
-    d_v = 64
+    (seqlen_q, seqlen_k) = (512, 512)
+    d = 128
+    d_v = 128
     dropout_p = 0.0
     causal = False
     local = False

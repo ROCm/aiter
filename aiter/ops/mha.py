@@ -256,19 +256,19 @@ def _flash_attn_forward(
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
 
-    batch_stride_q = q.stride(0)
-    stride_q = q.stride(1)
-    nhead_stride_q = q.stride(2)
+    # batch_stride_q = q.stride(0)
+    # stride_q = q.stride(1)
+    # nhead_stride_q = q.stride(2)
 
-    batch_stride_k = k.stride(0)
-    stride_k = k.stride(1)
-    nhead_stride_k = k.stride(2)
+    # batch_stride_k = k.stride(0)
+    # stride_k = k.stride(1)
+    # nhead_stride_k = k.stride(2)
 
-    batch_stride_v = v.stride(0)
-    stride_v = v.stride(1)
-    nhead_stride_v = v.stride(2)
+    # batch_stride_v = v.stride(0)
+    # stride_v = v.stride(1)
+    # nhead_stride_v = v.stride(2)
 
-    # only support bshd/bhsd
+    # TODO: only support bshd/bhsd
 
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
