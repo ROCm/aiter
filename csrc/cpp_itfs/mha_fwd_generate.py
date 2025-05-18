@@ -69,7 +69,7 @@ float mha_fwd(mha_fwd_args args,
               bias_enum bias_type,
               bool has_lse,
               bool use_ext_asm)
-{
+{{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
@@ -86,7 +86,7 @@ float mha_fwd(mha_fwd_args args,
     float r = -1;
     {F_inner_dispatch}
     return r;
-}"""
+}}"""
 
 FMHA_FWD_SPLITKV_API = """
 float mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -136,8 +136,7 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
-COMBINED_API = """
-    t = fmha_fwd_v3(traits, args, stream_config);
+COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
     if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
 """
 
@@ -147,7 +146,7 @@ API_MAP = {
     3: FMHA_FWD_API + FMHA_FWD_SPLITKV_API,
     4: FMHA_BATCH_PREFILL_API,
     5: FMHA_FWD_API + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
-    6: FMHA_FWD_API.format(F_inner_dispatch = COMBINED_API) + FMHA_FWD_SPLITKV_API
+    6: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API
 }
 
 
