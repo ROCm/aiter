@@ -83,8 +83,9 @@ float mha_fwd(mha_fwd_args args,
                                      has_lse,
                                      has_dropout,
                                      use_ext_asm);
-
-    return fmha_fwd(traits, args, stream_config);
+    float r = -1;
+    {F_inner_dispatch}
+    return r;
 }"""
 
 FMHA_FWD_SPLITKV_API = """
@@ -135,32 +136,10 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
-FMHA_FWD_V3_API = """
-float mha_fwd(mha_fwd_args args,
-              const ck_tile::stream_config& stream_config,
-              std::string q_dtype_str,
-              bool is_group_mode,
-              mask_enum mask_type,
-              bias_enum bias_type,
-              bool has_lse,
-              bool use_ext_asm)
-{
-    int head_size_q = args.hdim_q;
-    int head_size_v = args.hdim_v;
-    bool has_dropout = args.p_drop > 0.f;
-    auto traits = get_mha_fwd_traits(head_size_q,
-                                     head_size_v,
-                                     q_dtype_str,
-                                     is_group_mode,
-                                     args.logits_soft_cap > 0.f,
-                                     mask_type,
-                                     bias_type,
-                                     has_lse,
-                                     has_dropout,
-                                     use_ext_asm);
-
-    return fmha_fwd_v3(traits, args, stream_config);
-}"""
+COMBINED_API = """
+    t = fmha_fwd_v3(traits, args, stream_config);
+    if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
+"""
 
 API_MAP = {
     1: FMHA_FWD_API,
@@ -168,7 +147,7 @@ API_MAP = {
     3: FMHA_FWD_API + FMHA_FWD_SPLITKV_API,
     4: FMHA_BATCH_PREFILL_API,
     5: FMHA_FWD_API + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
-    6: FMHA_FWD_V3_API,
+    6: FMHA_FWD_API.format(F_inner_dispatch = COMBINED_API) + FMHA_FWD_SPLITKV_API
 }
 
 
