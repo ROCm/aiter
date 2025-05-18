@@ -7,7 +7,7 @@ from typing import Optional
 from ..jit.core import compile_ops
 import torch.nn.functional as F
 import functools
-from .enum import *
+from .enum import QuantType
 from . import triton
 from ..utility import dtypes, fp4_utils
 
