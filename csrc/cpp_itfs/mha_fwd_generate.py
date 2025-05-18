@@ -141,12 +141,11 @@ COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
 """
 
 API_MAP = {
-    1: FMHA_FWD_API,
+    1: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API),
     2: FMHA_FWD_SPLITKV_API,
-    3: FMHA_FWD_API + FMHA_FWD_SPLITKV_API,
+    3: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API,
     4: FMHA_BATCH_PREFILL_API,
-    5: FMHA_FWD_API + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
-    6: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API
+    5: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
 }
 
 
