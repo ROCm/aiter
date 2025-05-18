@@ -527,7 +527,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_fwd_kernel_generate.py --output_dir {{}}'"
         ]
     },
