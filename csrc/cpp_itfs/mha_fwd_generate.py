@@ -187,7 +187,7 @@ if __name__ == "__main__":
         + "  2: generate mha_fwd v2(ck) c++ api\n"
         + "  3: generate fmha varlen fwd c++ api\n"
         + "  4: generate mha_batch_prefill c++ api\n"
-        + "  5: generate all fmha fwd c++ api, also can be use for PREBUILD"
+        + "  5: generate all fmha fwd c++ api, also can be use for PREBUILD",
     )
 
     args = parser.parse_args()
