@@ -83,9 +83,9 @@ float mha_fwd(mha_fwd_args args,
                                      has_lse,
                                      has_dropout,
                                      use_ext_asm);
-    float r = -1;
+    float t = -1;
     {F_inner_dispatch}
-    return r;
+    return t;
 }}"""
 
 FMHA_FWD_SPLITKV_API = """
@@ -146,7 +146,7 @@ API_MAP = {
     3: FMHA_FWD_API + FMHA_FWD_SPLITKV_API,
     4: FMHA_BATCH_PREFILL_API,
     5: FMHA_FWD_API + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
-    6: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API
+    6: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API
 }
 
 

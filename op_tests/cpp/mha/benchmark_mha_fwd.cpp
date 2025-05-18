@@ -130,7 +130,7 @@ auto create_args(int argc, char* argv[])
         .insert("page_block_size", "0", "paged-kvcache block size. 0 means not use paged-kvcahe")
         .insert("cache_batch_idx", "0", "whether to use index map to the kvcache")
         .insert("warmup", "5", "number of iterations before benchmark the kernel")
-        .insert("repeat", "20", "number of iterations to benchmark the kernel");
+        .insert("repeat", "20", "number of iterations to benchmark the kernel")
         .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
 
     bool result = arg_parser.parse(argc, argv);
