@@ -243,7 +243,7 @@ def _flash_attn_forward(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
         "--receipt 100 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}",
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}",
     ]
 
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
