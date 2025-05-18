@@ -249,20 +249,6 @@ def _flash_attn_forward(
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
 
-    # batch_stride_q = q.stride(0)
-    # stride_q = q.stride(1)
-    # nhead_stride_q = q.stride(2)
-
-    # batch_stride_k = k.stride(0)
-    # stride_k = k.stride(1)
-    # nhead_stride_k = k.stride(2)
-
-    # batch_stride_v = v.stride(0)
-    # stride_v = v.stride(1)
-    # nhead_stride_v = v.stride(2)
-
-    # TODO: only support bshd/bhsd
-
     # mask
     window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
@@ -274,14 +260,14 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret &= bias is None
         ret &= dropout_p == 0.0
-        # TODO: need this?
+        ret &= seqlen_q == seqlen_k
+        ret &= seqlen_q % 256 == 0
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
-        # only support gqa
         ret &= nhead_q % nhead_k == 0
         ret &= mask or nmask
         ret &= return_lse
-        # ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
