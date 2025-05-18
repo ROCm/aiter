@@ -133,6 +133,24 @@ def per_tensor_quant(
     return y.to(quant_dtype), scale.view(1).to(scale_dtype)
 
 
+def per_block_quant_wrapper(block_shape=(1, 128)):
+    def decorator(per_token_quant_func):
+        def wrapper(x, scale=None, quant_dtype=dtypes.i8):
+            blk_m, blk_n = block_shape
+            assert (
+                x.shape[-1] % blk_n == 0
+            ), f"block size {blk_n} not match {x.shape[-1]}"
+            assert blk_m == 1, "only support 1xN block, TODO: support MxN"
+            m, n = x.shape
+            x = x.view(-1, blk_n)
+            y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype)
+            return y.view(m, -1), scale.view(m, -1)
+
+        return wrapper
+
+    return decorator
+
+
 @functools.lru_cache()
 def get_torch_quant(qType):
     tmp = {
@@ -140,6 +158,7 @@ def get_torch_quant(qType):
         QuantType.per_Tensor: per_tensor_quant,
         QuantType.per_Token: pertoken_quant,
         QuantType.per_1x32: per_1x32_f4_quant,
+        QuantType.per_1x128: per_block_quant_wrapper((1, 128))(pertoken_quant),
     }
 
     def raise_NotImplementedError(*a, **k):
@@ -154,7 +173,7 @@ def get_hip_quant(qType):
         QuantType.No: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor: per_tensor_quant_hip,
         QuantType.per_Token: per_token_quant_hip,
-        QuantType.per_1x128: lambda a, **k: per_token_quant_hip(a.view(-1, 128), **k),
+        QuantType.per_1x128: per_block_quant_wrapper((1, 128))(per_token_quant_hip),
     }
 
     def raise_NotImplementedError(*a, **k):
@@ -169,10 +188,8 @@ def get_triton_quant(qType):
         QuantType.No: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor: per_tensor_quant_triton,
         QuantType.per_Token: per_token_quant_triton,
-        QuantType.per_1x128: lambda a, **k: per_token_quant_triton(
-            a.view(-1, 128), **k
-        ),
         QuantType.per_1x32: per_1x32_f4_quant_triton,
+        QuantType.per_1x128: per_block_quant_wrapper((1, 128))(per_token_quant_triton),
     }
 
     def raise_NotImplementedError(*a, **k):

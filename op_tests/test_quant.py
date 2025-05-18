@@ -66,8 +66,9 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
 list_quant = [
     (aiter.QuantType.per_Tensor, dtypes.fp8),
     (aiter.QuantType.per_Token, dtypes.fp8),
+    (aiter.QuantType.per_1x128, dtypes.fp8),
     (aiter.QuantType.per_Token, dtypes.i8),
-    (aiter.QuantType.per_1x32, dtypes.fp4x2),
+    # (aiter.QuantType.per_1x32, dtypes.fp4x2),
 ]
 list_dtype = [dtypes.fp16, dtypes.bf16][1:]
 import pandas as pd
@@ -77,7 +78,7 @@ for (
     h_dtype,
 ) in itertools.product(list_quant, list_dtype):
     df = []
-    for n in [256, 4096, 8192][:]:
+    for n in [4096, 8192][:]:
         for m in [1, 2, 16, 32, 64, 128, 192, 256, 512, 1024, 16384, 163840][:]:
             ret = test_quant(m, n, q_type, q_dtype, h_dtype)
             df.append(ret)

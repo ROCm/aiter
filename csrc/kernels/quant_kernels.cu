@@ -16,7 +16,7 @@ namespace aiter
                                          int64_t cols)
   {
     static constexpr int32_t vec_size = 16 / sizeof(DTYPE_I);
-    using vec_i = ck_tile::ext_vector_t<DTYPE_I, vec_size>;
+    using vec_i = ck_tile::vec_t<DTYPE_I, vec_size>;
     using tb_i = ck_tile::thread_buffer<DTYPE_I, vec_size>;
     const float inverted_DTYPE_MAX = 1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max());
 
@@ -98,9 +98,9 @@ namespace aiter
   {
     const float inverted_scale = 1.0f / (*scale);
     static constexpr int32_t vec_size = 16 / sizeof(DTYPE_O);
-    using vec_i = ck_tile::ext_vector_t<DTYPE_I, vec_size>;
+    using vec_i = ck_tile::vec_t<DTYPE_I, vec_size>;
     using tb_i = ck_tile::thread_buffer<DTYPE_I, vec_size>;
-    using vec_o = ck_tile::ext_vector_t<DTYPE_O, vec_size>;
+    using vec_o = ck_tile::vec_t<DTYPE_O, vec_size>;
     using tb_o = ck_tile::thread_buffer<DTYPE_O, vec_size>;
 
     const int32_t row_offset = blockIdx.x * cols;

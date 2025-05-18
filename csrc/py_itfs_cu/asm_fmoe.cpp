@@ -278,7 +278,7 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
         impl_ptr = &impl_b16;
     }
     TORCH_CHECK(impl_ptr != nullptr,
-                __func__, ": unsupport current input type");
+                __func__, ": unsupport current input type:", input.scalar_type());
     impl_ptr->launch_kernel<uint16_t, uint16_t>(out,
                                                 input,
                                                 gate,
