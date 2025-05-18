@@ -24,6 +24,7 @@ from aiter.ops.triton.rope import (
     rope_cached_thd_positions_2c_gqa_fwd_inplace,
     rope_cached_thd_positions_offsets_2c_gqa_fwd,
     rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace,
+    rope_cached_thd_positions_2c_gqa_fwd_inplace_2,
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
 )
@@ -255,9 +256,8 @@ def run_benchmark(args):
         transpose_output = False
         fn = None
         if Q > 1 and two_inputs and cached and pos and layout == "thd":
-            cos_sin = torch.cat((cos, sin), dim=-1)
-            cos = cos_sin[:, : cos_sin.shape[-1] // 2]
-            sin = cos_sin[:, cos_sin.shape[-1] // 2 :]
+            cos_sin_cache = torch.cat((cos, sin), dim=-1)
+            cos, sin = cos_sin_cache.chunk(2, dim=-1)
             if offs:
                 if inplace:
                     fn = lambda: rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(  # noqa: E731
@@ -287,15 +287,28 @@ def run_benchmark(args):
                     )
             else:
                 if inplace:
-                    fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace(  # noqa: E731
+                    # fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace(  # noqa: E731
+                    #     x,
+                    #     y,
+                    #     cos,
+                    #     sin,
+                    #     positions,
+                    #     rotate_style,
+                    #     reuse_freqs_front_part,
+                    #     nope_first,
+                    #     transpose_output,
+                    # )
+                    x = x.view(len(x), -1)
+                    y = y.view(len(y), -1)
+                    fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace_2(  # noqa: E731
                         x,
                         y,
-                        cos,
-                        sin,
+                        cos_sin_cache,
                         positions,
                         rotate_style,
                         reuse_freqs_front_part,
                         nope_first,
+                        D,
                         transpose_output,
                     )
                 else:
