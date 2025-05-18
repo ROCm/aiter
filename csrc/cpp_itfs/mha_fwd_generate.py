@@ -116,7 +116,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
               bool is_group_mode,
               mask_enum mask_type,
               bias_enum bias_type,
-              bool has_lse)
+              bool has_lse,
+              bool use_ext_asm)
 {
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;

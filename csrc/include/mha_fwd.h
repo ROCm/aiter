@@ -87,7 +87,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                         bool is_group_mode,
                         mask_enum mask_type,
                         bias_enum bias_type,
-                        bool has_lse);
+                        bool has_lse,
+                        bool use_ext_asm);
 
 float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s);
 
