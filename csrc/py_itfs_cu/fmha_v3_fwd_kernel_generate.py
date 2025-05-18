@@ -179,14 +179,14 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
     args.scalar  = a.scale_s;
     args.seq_len = a.seqlen_q;
     args.Seqs    = a.stride_q * 2;
-    args.Ts      = FmhaFwdV3Ts<fmha_fwd_kernel_selector>::ts_qo * a.hdim_q * 2;
+    args.Ts      = FmhaFwdV3Ts<fmha_fwd_kernel_selector>::ts_qo * a.stride_q * 2;
     args.Hs      = a.nhead_stride_q * 2;
     args.BAs     = a.batch_stride_q * 2;
     args.gqa      = a.nhead_q / a.nhead_k;
     args.Seqs_kv  = a.stride_k * 2;
     args.Hs_kv    = a.nhead_stride_k * 2;
     args.BAs_kv   = a.batch_stride_k * 2;
-    args.opt      = 1;
+    args.opt      = 5;
 
     auto traits = fmha_fwd_v3_traits{{a.batch,
                                      a.nhead_q,
@@ -204,37 +204,17 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
 
 float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
-    // TODO:
-    // 1.only support bhsd/bshd
     if (t.use_ext_asm == true) {{
         if (t.data_type.compare("bf16") == 0) {{
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dropout == false) &&
                         (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seqlen_q % 256 == 0) &&
-                        (a.batch_stride_lse >= a.nhead_stride_lse /* lse only support bhsd*/) &&
-                        // TODO: need this?
-                        (a.hdim_q == a.hdim_v)) {{
+                        (a.batch_stride_lse >= a.nhead_stride_lse) && (a.hdim_q == a.hdim_v)) {{
                 if (t.mask_type == mask_enum::no_mask) {{
                     using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
                     r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
                 }}
                 else if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {{
                     using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false>;
-                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
-                }}
-            }}
-        }}
-        else if (t.data_type.compare("fp16") == 0) {{
-            if ((t.bias_type == bias_enum::no_bias) && (t.has_dropout == false) &&
-                        (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seqlen_q % 256 == 0) &&
-                        (a.batch_stride_lse >= a.nhead_stride_lse /* lse only support bhsd*/) &&
-                        // TODO: need this?
-                        (a.hdim_q == a.hdim_v)) {{
-                if (t.mask_type == mask_enum::no_mask) {{
-                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdFp16, 128, 0, false, false>;
-                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
-                }}
-                else if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {{
-                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdFp16, 128, 1, false, false>;
                     r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
                 }}
             }}

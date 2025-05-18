@@ -131,6 +131,7 @@ auto create_args(int argc, char* argv[])
         .insert("cache_batch_idx", "0", "whether to use index map to the kvcache")
         .insert("warmup", "5", "number of iterations before benchmark the kernel")
         .insert("repeat", "20", "number of iterations to benchmark the kernel");
+        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -460,6 +461,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     int stream_warmup = arg_parser.get_int("warmup");
     int stream_repeat = arg_parser.get_int("repeat");
     bool kname        = arg_parser.get_bool("kname");
+    bool fwd_v3       = arg_parser.get_bool("fwd_v3");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -1051,7 +1053,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               mode == mode_enum::group,
                               mask.type,
                               bias.type,
-                              lse);
+                              lse,
+                              fwd_v3);
     }();
 
     if(fwd_ave_time < 0.0f)
