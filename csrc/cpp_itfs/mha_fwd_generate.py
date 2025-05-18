@@ -136,6 +136,10 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
+V2_API = """t = fmha_fwd(traits, args, stream_config);"""
+
+V3_API = """t = fmha_fwd_v3(traits, args, stream_config);"""
+
 COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
     if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
 """
