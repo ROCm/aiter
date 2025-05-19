@@ -7,13 +7,63 @@ import triton
 import triton.language as tl
 
 
-def fp32_to_fp4_e2m1fn_x2(x):
+def f32_to_mxfp4(x):
     FP4_EBITS, FP4_MBITS = 2, 1
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
     x = pack_uint4(x)
     # x = x.view(dtypes.fp4x2) # to(fp32) for this datatype gives all 0 for torch...
     x = x.view(torch.uint8)
     return x
+
+
+def mxfp4_to_f32(x):
+    # 2 because we pack fp4 in uint8.
+    x = x.repeat_interleave(2, dim=1)
+    x[:, ::2] = x[:, ::2] & 0xF
+    x[:, 1::2] = x[:, 1::2] >> 4
+    mxfp4_list = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
+    return mxfp4_in_f32[x.long()]
+
+
+def f32_to_e8m0(x):
+    u32 = x.view(torch.int32)
+    exponent = ((u32 >> 23) & 0xFF).to(torch.uint8)
+    nan_case = exponent == 0xFF
+    round_case = ((u32 & 0x400000) > 0) & (
+        ((u32 & 0x200000) > 0) | ((u32 & 0x1FFFFF) > 0) | (exponent > 0)
+    )
+    exponent[round_case] += 1
+    exponent[nan_case] = 0xFF
+    return exponent.view(dtypes.fp8_e8m0)
+
+
+def e8m0_to_f32(scale_e8m0_biased):
+    scale_e8m0_biased = scale_e8m0_biased.view(torch.uint8)
+    zero_case = scale_e8m0_biased == 0
+    nan_case = scale_e8m0_biased == 0b11111111
+    scale_f32 = scale_e8m0_biased.to(torch.int32) << 23
+    scale_f32[zero_case] = 0x00400000
+    scale_f32[nan_case] = 0x7F800001
+    scale_f32 = scale_f32.view(dtypes.fp32)
+    return scale_f32
 
 
 def down_size(size):
