@@ -214,6 +214,7 @@ def test_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
+    torch.manual_seed(20)
 
     def _create_tensor_with_large_stride(
         final_shape: tuple,
@@ -236,14 +237,16 @@ def test_int64_strides(
         dummy_shape = (D0, int(expanded_D1), D2, D3)
 
         dummy_tensor = torch.randn(dummy_shape, device=device, dtype=dtype)
-        tensor = dummy_tensor[:, :D1, :, :]
-        tensor.requires_grad_(True)
-        return tensor
+        return dummy_tensor[:, :D1, :, :]
 
     # inputs
-    q = _create_tensor_with_large_stride((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), 2**32)
-    k = _create_tensor_with_large_stride((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), 2**32)
-    v = _create_tensor_with_large_stride((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), 2**32)
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device=device, dtype=dtype)
+    seqlen_max =  2**32
+    k = _create_tensor_with_large_stride((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), seqlen_max)
+    v = _create_tensor_with_large_stride((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), seqlen_max)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
     do = torch.randn_like(q)
 
     # print functions
