@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
@@ -125,7 +125,7 @@ void mla_decode_stage1_asm_fwd(torch::Tensor &Q,                 //   [num_seqs,
     }
 
     TORCH_CHECK(impl_ptr != nullptr,
-                __func__, ": unsupport current input type");
+                __func__, ": unsupport current Q_type:", Q.scalar_type());
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
@@ -209,7 +209,7 @@ void mla_prefill_asm_fwd(torch::Tensor &Q,                 //   [num_seqs, num_h
     }
 
     TORCH_CHECK(impl_ptr != nullptr,
-                __func__, ": unsupport current input type");
+                __func__, ": unsupport current Q_type:", Q.scalar_type());
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q, // gdx

@@ -21,7 +21,8 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   mask_enum mask_type,
                                   bias_enum bias_type,
                                   bool has_lse,
-                                  bool has_dropout)
+                                  bool has_dropout,
+                                  bool use_ext_asm)
 {{
     return mha_fwd_traits(head_size_q,
                           head_size_v,
@@ -31,7 +32,8 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           mask_type,
                           bias_type,
                           has_lse,
-                          has_dropout);
+                          has_dropout,
+                          use_ext_asm);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
@@ -65,8 +67,9 @@ float mha_fwd(mha_fwd_args args,
               bool is_group_mode,
               mask_enum mask_type,
               bias_enum bias_type,
-              bool has_lse)
-{
+              bool has_lse,
+              bool use_ext_asm)
+{{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
@@ -78,9 +81,12 @@ float mha_fwd(mha_fwd_args args,
                                      mask_type,
                                      bias_type,
                                      has_lse,
-                                     has_dropout);
-    return fmha_fwd(traits, args, stream_config);
-}"""
+                                     has_dropout,
+                                     use_ext_asm);
+    float t = -1;
+    {F_inner_dispatch}
+    return t;
+}}"""
 
 FMHA_FWD_SPLITKV_API = """
 float mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -111,7 +117,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
               bool is_group_mode,
               mask_enum mask_type,
               bias_enum bias_type,
-              bool has_lse)
+              bool has_lse,
+              bool use_ext_asm)
 {
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -124,16 +131,27 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      mask_type,
                                      bias_type,
                                      has_lse,
-                                     has_dropout);
+                                     has_dropout,
+                                     use_ext_asm);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
+V2_API = """t = fmha_fwd(traits, args, stream_config);"""
+
+V3_API = """t = fmha_fwd_v3(traits, args, stream_config);"""
+
+COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
+    if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
+"""
+
 API_MAP = {
-    1: FMHA_FWD_API,
-    2: FMHA_FWD_SPLITKV_API,
-    3: FMHA_FWD_API + FMHA_FWD_SPLITKV_API,
+    1: FMHA_FWD_API.format(F_inner_dispatch=V3_API),
+    2: FMHA_FWD_API.format(F_inner_dispatch=V2_API),
+    3: FMHA_FWD_API.format(F_inner_dispatch=V2_API) + FMHA_FWD_SPLITKV_API,
     4: FMHA_BATCH_PREFILL_API,
-    5: FMHA_FWD_API + FMHA_FWD_SPLITKV_API + FMHA_BATCH_PREFILL_API,
+    5: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API)
+    + FMHA_FWD_SPLITKV_API
+    + FMHA_BATCH_PREFILL_API,
 }
 
 
@@ -165,9 +183,9 @@ if __name__ == "__main__":
         "--receipt",
         default=0,
         required=False,
-        help="codegen receipt. 1: generate mha_fwd c++ api\n"
-        + "  2: generate mha_fwd_splitkv c++ api\n"
-        + "  3: generate fmha varlen fwd c++ api, also can be use for PREBUILD\n"
+        help="codegen receipt. 1: generate mha_fwd asm c++ api\n"
+        + "  2: generate mha_fwd v2(ck) c++ api\n"
+        + "  3: generate fmha varlen fwd c++ api\n"
         + "  4: generate mha_batch_prefill c++ api\n"
         + "  5: generate all fmha fwd c++ api, also can be use for PREBUILD",
     )

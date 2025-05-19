@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
+fmha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                                    bool has_dropout_randval,
                                    const mask_info &mask,
                                    // sizes
@@ -135,21 +135,20 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          drop_seed_offset};
 }
 
-std::vector<at::Tensor>
-mha_fwd(at::Tensor &q, // [b, sq, hq, d]
-        const at::Tensor &k, // [b, sk, hk, d]
-        const at::Tensor &v, // [b, sk, hk, d_v]
-        float p_dropout,
-        float softmax_scale,
-        bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        bool return_softmax_lse,
-        bool return_dropout_randval,
-        std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
-        std::optional<const at::Tensor> bias_,   // [sq, sk]
-        std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
-        std::optional<at::Generator> gen_)
+std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
+                                    const at::Tensor &k, // [b, sk, hk, d]
+                                    const at::Tensor &v, // [b, sk, hk, d_v]
+                                    float p_dropout,
+                                    float softmax_scale,
+                                    bool is_causal,
+                                    int window_size_left,
+                                    int window_size_right,
+                                    bool return_softmax_lse,
+                                    bool return_dropout_randval,
+                                    std::optional<at::Tensor> out_,          // [b, sq, hq, d_v]
+                                    std::optional<const at::Tensor> bias_,   // [sq, sk]
+                                    std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+                                    std::optional<at::Generator> gen_)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -283,7 +282,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
         ck_tile::stream_config stream_config{stream};
 
         auto args =
-            get_ck_fmha_fwd_args(
+            get_asm_fmha_fwd_args(
                 has_lse,
                 return_dropout_randval,
                 mask,
@@ -313,7 +312,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  mask.type,
                                  bias_type,
                                  has_lse,
-                                 false);
+                                 true);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

@@ -2084,7 +2084,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
                                      float logits_soft_cap,
                                      torch::Tensor& k_scale,
                                      torch::Tensor& v_scale,
-                                     const c10::optional<torch::Tensor>& fp8_out_scale)
+                                     const std::optional<torch::Tensor>& fp8_out_scale)
 {
     const int num_kv_heads = kv_cache_layout == "HND" ? key_cache.size(1) : key_cache.size(2);
     int num_seqs           = query.size(0);
@@ -2296,7 +2296,7 @@ void paged_attention_ragged(
     float logits_soft_cap,
     torch::Tensor& k_scale,
     torch::Tensor& v_scale,
-    const c10::optional<torch::Tensor>& fp8_out_scale,
+    const std::optional<torch::Tensor>& fp8_out_scale,
     int64_t partition_size)
 {
     const int head_size = query.size(2);

@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 void paged_attention_ragged(
@@ -23,5 +23,5 @@ void paged_attention_ragged(
     float logits_soft_cap,
     torch::Tensor& k_scale,
     torch::Tensor& v_scale,
-    const c10::optional<torch::Tensor>& fp8_out_scale,
+    const std::optional<torch::Tensor>& fp8_out_scale,
     int64_t partition_size);
