@@ -219,10 +219,6 @@ def test_int64_strides(
         final_shape: tuple,
         TARGET_STRIDE_FOR_DIM0,
     ) -> torch.Tensor:
-        """
-        Nested helper to create a tensor with a specified final_shape and a large stride(0).
-        It uses TARGET_STRIDE_FOR_DIM0, device, and current_dtype from the outer scope.
-        """
         if len(final_shape) != 4:
             raise ValueError(
                 "This function is designed for 4D tensors (e.g., B, S, H, D)."
