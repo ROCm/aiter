@@ -39,7 +39,7 @@ def run_triton(x, w, x_scales, w_scales, out, dtype=dtypes.bf16):
     return out
 
 
-@perftest(num_warmup=50, num_rotate_args=1)
+@perftest()
 def run_gemm_asm(x, weightshuffle, x_scale, w_scale, out, bias=None, dtype=dtypes.bf16):
     return aiter.gemm_a4w4_asm(x, weightshuffle, x_scale, w_scale, out, bias)
 
