@@ -15,6 +15,7 @@ mha_varlen_fwd(at::Tensor& q,                  // [total_q, hq, d]
                int max_seqlen_k,
                float p_dropout,
                float softmax_scale,
+               float logits_soft_cap,
                bool zero_tensors,
                bool is_causal,
                int window_size_left,

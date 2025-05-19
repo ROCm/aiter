@@ -42,7 +42,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DENABLE_FP8'"
+            "'-DENABLE_FP8'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -474,7 +475,8 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -485,6 +487,29 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
+        ]
+    },
+    "module_mha_batch_prefill": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_batch_prefill_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_batch_prefill_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 1)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'"
         ]
     },
     "module_fmha_v3_bwd": {
@@ -536,7 +561,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -557,7 +582,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -588,14 +613,15 @@
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'"
         ]
     },
     "libmha_bwd": {
         "srcs": [],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [

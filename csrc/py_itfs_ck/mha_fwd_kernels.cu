@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -106,6 +106,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          softmax_scale, // scale_s
                          1,             // scale_p
                          1,             // scale_o
+                         0.0,           // logits_soft_cap
                          stride_q,
                          stride_k,
                          stride_v,
@@ -309,7 +310,7 @@ mha_fwd(at::Tensor &q, // [b, sq, hq, d]
                                  stream_config,
                                  q_dtype_str,
                                  false, // is_group_mode
-                                 mask,
+                                 mask.type,
                                  bias_type,
                                  has_lse);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");

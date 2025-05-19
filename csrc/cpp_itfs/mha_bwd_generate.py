@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
 import argparse
@@ -17,7 +17,7 @@ mha_bwd_traits get_mha_bwd_traits(int head_size_q,
                                   int head_size_v,
                                   std::string dtype,
                                   bool is_group_mode,
-                                  const mask_info &mask,
+                                  mask_enum mask_type,
                                   bias_enum bias_type,
                                   bool has_dbias,
                                   bool has_dropout,
@@ -31,7 +31,7 @@ mha_bwd_traits get_mha_bwd_traits(int head_size_q,
                           head_size_v,
                           dtype,
                           is_group_mode,
-                          mask,
+                          mask_type,
                           bias_type,
                           has_dbias,
                           has_dropout,
@@ -47,7 +47,7 @@ float mha_bwd(mha_bwd_args args,
               const ck_tile::stream_config& stream_config,
               std::string q_dtype_str,
               bool is_group_mode,
-              mask_info mask,
+              mask_enum mask_type,
               bias_enum bias_type,
               bool has_dbias,
               bool is_store_randval,
@@ -60,11 +60,11 @@ float mha_bwd(mha_bwd_args args,
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0;
     // bool enable_ailib = args.alibi_slopes_ptr == nullptr;
-    auto traits = get_mha_bwd_traits(head_size_q, 
+    auto traits = get_mha_bwd_traits(head_size_q,
                                      head_size_v,
                                      q_dtype_str,
                                      is_group_mode,
-                                     mask,
+                                     mask_type,
                                      bias_type,
                                      has_dbias,
                                      has_dropout,

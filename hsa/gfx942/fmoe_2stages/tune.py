@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -160,7 +160,7 @@ def go(
             ref, ref_scale = aiter.pertoken_quant(
                 ref.view(ref.shape[0], -1, 128), quant_dtype=q_dtype_a
             )
-            ref = ref.view(ref.shape[0], topk, -1).to(dtypes.fp32)
+            ref = ref.view(ref.shape[0], topk, -1)
             ref_scale = ref_scale.view(token, -1)
 
         tasks = []
@@ -222,7 +222,7 @@ def go(
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                out.view(dtypes.bf16),
+                                out,
                                 blockM,
                                 el,
                                 0,
@@ -236,6 +236,8 @@ def go(
                                 w1_scale,
                                 sorted_weights if doweight_stage1 else None,
                             ),
+                            {},
+                            (ref),
                         )
                     )
 
@@ -267,6 +269,8 @@ def go(
                             w1_scale,
                             sorted_weights if doweight_stage1 else None,
                         ),
+                        {},
+                        (ref),
                     )
                 )
         if tasks is None and tasks_ck is None:
@@ -275,22 +279,9 @@ def go(
         rets = mp_tuner(tasks + tasks_ck)
 
         profileDF = []
-        for (tag, block_m), us, _ in rets:
+        for (tag, block_m), us, err in rets:
             if us == float("inf"):
                 continue
-            if q_type == QuantType.per_128x128:
-                scale = (
-                    _[token:, ...]
-                    .view(-1)[: (token * topk * inter_dim * 4 // 128)]
-                    .view(dtypes.fp32)
-                    .view(token, -1)
-                )
-                _ = _[:token, :, :].to(dtypes.fp32)
-            err = checkAllclose(
-                ref.to("cpu"),
-                _.to(ref.dtype),
-                msg=f"[{tag:<50}]: {us:.2f}us ......      ",
-            )
             profileDF.append(
                 [
                     token,

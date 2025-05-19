@@ -2,12 +2,14 @@ import argparse
 import sys
 import torch
 import triton
-from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
-from op_tests.triton_tests.test_gemm_a8w8 import (
-    generate_gemm_a8w8_inputs,
-    name_to_torch_types,
+from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+from op_tests.triton_tests.test_gemm_a8w8_blockscale import (
+    generate_gemm_a8w8_blockscale_inputs,
 )
 from utils.benchmark_utils import get_model_configs, get_available_models
+
+
+block_shape = (128, 128)
 
 
 def model_benchmark_shapes(args):
@@ -81,21 +83,24 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8(M, N, K, metric, provider):
-        # NOTE: Assume bias and output has the same dtype
-        c_dtype = name_to_torch_types["bf16"]
-        x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(
-            M, N, K, name_to_torch_types["fp8e4"], c_dtype
+    def bench_gemm_a8w8_blockscale(M, N, K, metric, provider):
+        block_shape_n, block_shape_k = block_shape
+
+        c_dtype = torch.bfloat16
+        x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+            M, N, K, block_shape_n, block_shape_k, output=True
         )
         # flops
         flops = 2.0 * M * N * K
         # memory transfer
         mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
-        mem_write = (M * N) * bias.element_size()
+        mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
         mem = mem_read + mem_write
 
         ms = triton.testing.do_bench(
-            lambda: gemm_a8w8(x, weight, x_scale, w_scale, bias, c_dtype),  # noqa: E731
+            lambda: gemm_a8w8_blockscale(
+                x, weight, x_scale, w_scale, c_dtype, y
+            ),  # noqa: E731
             warmup=25,
             rep=100,
         )
@@ -112,7 +117,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_gemm_a8w8_blockscale.run(save_path=".", print_data=True)
 
 
 def parse_args():
