@@ -293,7 +293,7 @@ def test_fmoe(
     if qType == aiter.QuantType.per_Token:
         out1_ref = out1_ref.view(token, -1)
     
-    if qType == aiter.QuantType.per_Token:    
+    if qType == aiter.QuantType.per_128x128:    
         a2_qt, a2_scale = aiter.pertoken_quant(out1_ref.view(token, -1, 128), quant_dtype=AQDType)
         a2_qt = a2_qt.view(token, topk, -1)
         a2_scale = a2_scale.view(token, topk, -1)  
