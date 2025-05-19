@@ -7,7 +7,7 @@ from typing import Optional
 from ..jit.core import compile_ops
 import torch.nn.functional as F
 import functools
-from .enum import QuantType
+from .enum import QuantType, ActivationType
 from . import triton
 from ..utility import dtypes, fp4_utils
 
@@ -99,9 +99,9 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     )
     y = fp4_utils.fp32_to_fp4_e2m1fn_x2(y)
     y = y.view(m, -1)
-    scale = scale_e8m0_biased.view(m, -1).view(dtypes.fp8_e8m0)
+    scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     scale_padded = torch.empty(
-        (m + 31) // 32 * 32, (n // block_size + 7) // 8 * 8, dtype=dtypes.fp8_e8m0
+        (m + 31) // 32 * 32, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
     ).fill_(0x7F)
     scale_padded[:m, : n // block_size] = scale
     scale = scale_padded
@@ -117,7 +117,7 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
         scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
         scale = scale.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
         scale = scale.view(sm, sn)
-    return y, scale
+    return y, scale.view(dtypes.fp8_e8m0)
 
 
 def per_tensor_quant(
@@ -173,6 +173,7 @@ def get_hip_quant(qType):
         QuantType.No: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor: per_tensor_quant_hip,
         QuantType.per_Token: per_token_quant_hip,
+        QuantType.per_1x32: per_block_quant_wrapper((1, 32))(per_token_quant_hip),
         QuantType.per_1x128: per_block_quant_wrapper((1, 128))(per_token_quant_hip),
     }
 
