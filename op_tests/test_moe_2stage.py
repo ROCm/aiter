@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import itertools
@@ -163,27 +163,42 @@ def test_fmoe(
         w1_qt, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
         w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
     elif qType == aiter.QuantType.per_128x128:
+
         def weight_per_128x128_quant(weight, quant_dtype):
-            E, dim1, dim2 = weight.shape  
-            weight_blocks = weight.view(E, dim1 // 128, 128, dim2 // 128, 128)  # [E, num_blocks_dim1, 128, num_blocks_dim2, 128]
-            weight_blocks = weight_blocks.permute(0, 1, 3, 2, 4).contiguous()   # [E, num_blocks_dim1, num_blocks_dim2, 128, 128]
-            weight_blocks = weight_blocks.view(E, -1, 128 * 128)                # [E, num_blocks, 128*128]
-            weight_qt, weight_scale = aiter.pertoken_quant(weight_blocks, quant_dtype=quant_dtype)
-            weight_qt = weight_qt.view(E, dim1 // 128, dim2 // 128, 128, 128)     # [E, num_blocks_dim1, num_blocks_dim2, 128, 128]
-            weight_qt = weight_qt.permute(0, 1, 3, 2, 4).contiguous()            # [E, num_blocks_dim1, 128, num_blocks_dim2, 128]
-            weight_qt = weight_qt.view(E, dim1, dim2)                            # [E, dim1, dim2]
-            weight_scale = weight_scale.view(E, dim1 // 128, dim2 // 128)        # [E, num_blocks_dim1, num_blocks_dim2]
+            E, dim1, dim2 = weight.shape
+            weight_blocks = weight.view(
+                E, dim1 // 128, 128, dim2 // 128, 128
+            )  # [E, num_blocks_dim1, 128, num_blocks_dim2, 128]
+            weight_blocks = weight_blocks.permute(
+                0, 1, 3, 2, 4
+            ).contiguous()  # [E, num_blocks_dim1, num_blocks_dim2, 128, 128]
+            weight_blocks = weight_blocks.view(
+                E, -1, 128 * 128
+            )  # [E, num_blocks, 128*128]
+            weight_qt, weight_scale = aiter.pertoken_quant(
+                weight_blocks, quant_dtype=quant_dtype
+            )
+            weight_qt = weight_qt.view(
+                E, dim1 // 128, dim2 // 128, 128, 128
+            )  # [E, num_blocks_dim1, num_blocks_dim2, 128, 128]
+            weight_qt = weight_qt.permute(
+                0, 1, 3, 2, 4
+            ).contiguous()  # [E, num_blocks_dim1, 128, num_blocks_dim2, 128]
+            weight_qt = weight_qt.view(E, dim1, dim2)  # [E, dim1, dim2]
+            weight_scale = weight_scale.view(
+                E, dim1 // 128, dim2 // 128
+            )  # [E, num_blocks_dim1, num_blocks_dim2]
             return weight_qt, weight_scale
 
         w1_qt, w1_scale = weight_per_128x128_quant(w1, quant_dtype=WQDType)
-        w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)  
+        w2_qt, w2_scale = weight_per_128x128_quant(w2, quant_dtype=WQDType)
     else:
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
     w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
     w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
-    
+
     if qType == aiter.QuantType.per_128x128:
         triton_quant = aiter.get_triton_quant(aiter.QuantType.per_128x128)
         _, us_aq1 = run_perftest(
@@ -192,10 +207,12 @@ def test_fmoe(
             quant_dtype=AQDType,
         )
     if qType == aiter.QuantType.per_128x128:
-        a1_qt, a1_scale = aiter.pertoken_quant(input.view(token, -1, 128), quant_dtype=AQDType)
+        a1_qt, a1_scale = aiter.pertoken_quant(
+            input.view(token, -1, 128), quant_dtype=AQDType
+        )
         a1_qt = a1_qt.view(token, model_dim)
         a1_scale = a1_scale.squeeze(-1)
-    else:    
+    else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
     # w1_scale = w1_scale.fill_(1)
     # a1_scale = a1_scale.fill_(1)
@@ -250,7 +267,7 @@ def test_fmoe(
         actType,
         quant_type=qType,
         sorted_weights=sorted_weights if doweight_stage1 else None,
-        needTrace=True
+        needTrace=True,
     )
 
     checkAllclose(
@@ -276,6 +293,7 @@ def test_fmoe(
     #         sorted_expert_ids,
     #         num_valid_ids,
     #         out1_asm,
+    #         topk,
     #         kernelName="fmoe_stage1_bf16_pertokenFp8_g1u1_128x128_pf2",
     #         w1_scale=w1_scale,
     #         a1_scale=a1_scale,
@@ -292,14 +310,15 @@ def test_fmoe(
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_Token:
         out1_ref = out1_ref.view(token, -1)
-    
-    if qType == aiter.QuantType.per_128x128:    
-        a2_qt, a2_scale = aiter.pertoken_quant(out1_ref.view(token, -1, 128), quant_dtype=AQDType)
-        a2_qt = a2_qt.view(token, topk, -1)
-        a2_scale = a2_scale.view(token, topk, -1)  
+    if qType == aiter.QuantType.per_128x128:
+        a2_qt, a2_scale = aiter.pertoken_quant(
+            out1_ref.view(token, -1, 128), quant_dtype=AQDType
+        )
+        a2_scale = a2_scale.view(token, topk, -1)
     else:
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
-    # a2_scale = a2_scale.fill_(1)
+    a2_qt = a2_qt.view(token, topk, -1)
+
     out2_ref, us_ref = run_perftest(
         torch_moe_stage2,
         a2_qt,
@@ -373,20 +392,19 @@ def test_fmoe(
     #     msg=f"ck_moe_2stages:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     # )
 
-    # out2_aiter, us_fuse = run_perftest(
-    #     fused_moe,
-    #     input,
-    #     w1_qt_aiter,
-    #     w2_qt_aiter,
-    #     topk_weights,
-    #     topk_ids,
-    #     w1_scale=w1_scale,
-    #     w2_scale=w2_scale,
-    #     quant_type=qType,
-    #     activation=actType,
-    #     doweight_stage1=doweight_stage1,
-    # )
-    out2_aiter, us_fuse = out2_ref, us_ref
+    out2_aiter, us_fuse = run_perftest(
+        fused_moe,
+        input,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        topk_weights,
+        topk_ids,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        quant_type=qType,
+        activation=actType,
+        doweight_stage1=doweight_stage1,
+    )
 
     err = checkAllclose(
         out2_ref,
@@ -398,7 +416,6 @@ def test_fmoe(
 
 
 list_dtype = [dtypes.bf16, dtypes.fp16]
-list_dtype = [dtypes.fp16, dtypes.fp16]
 list_dim = [(6144, 4096)]
 list_tokenNum = [
     1,
@@ -414,11 +431,11 @@ list_tokenNum = [
     163840,
 ][:3]
 list_quant = [
-    # (aiter.QuantType.No, None, None),  # a16w16
-    #(aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
-    #(aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.No, None, None),  # a16w16
+    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:]
 list_doweight_stage1 = [False, True][:]

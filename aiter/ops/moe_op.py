@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from torch import Tensor
 from typing import Optional
-from ..jit.core import (
-    compile_ops,
-    AITER_CSRC_DIR
-)
+from ..jit.core import compile_ops, AITER_CSRC_DIR
 from .enum import ActivationType, Enum, QuantType
 from ..utility import dtypes
 import functools
@@ -240,26 +237,46 @@ def ck_moe_stage2(
 ): ...
 
 
-dtype_dict = {
+dtype2str_dict = {
     dtypes.fp16: "f16",
     dtypes.bf16: "b16",
     dtypes.fp8: "f8",
     dtypes.i8: "i8",
-    dtypes.i32: "i4"
+    dtypes.i32: "i4",
 }
 
+
 @functools.lru_cache(maxsize=1024)
-def get_moe_stage_module(input_dtype, weight_dtype, output_dtype, activation, quant_type, mul_routed_weight_stage):
-    Adtype = dtype_dict[input_dtype]
-    Bdtype = dtype_dict[weight_dtype]
-    Cdtype = dtype_dict[output_dtype]
+def get_moe_stage_module(
+    input_dtype,
+    weight_dtype,
+    output_dtype,
+    activation,
+    quant_type,
+    mul_routed_weight_stage,
+):
+    Adtype = dtype2str_dict[input_dtype]
+    Bdtype = dtype2str_dict[weight_dtype]
+    Cdtype = dtype2str_dict[output_dtype]
 
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
-    md_name = ("_").join(["module_moe_ck2stages", Adtype, Bdtype, Cdtype, act, quant_type, f"mulWeightStage{mul_routed_weight_stage}"])
-    
-    blob_gen_cmd = [f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -w {{}}"]
+    md_name = ("_").join(
+        [
+            "module_moe_ck2stages",
+            Adtype,
+            Bdtype,
+            Cdtype,
+            act,
+            quant_type,
+            f"mulWeightStage{mul_routed_weight_stage}",
+        ]
+    )
+
+    blob_gen_cmd = [
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -w {{}}"
+    ]
 
     return md_name, blob_gen_cmd
 
@@ -280,7 +297,7 @@ def ck_moe_stage1_fwd(
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
-): 
+):
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
 
     md_name, blob_gen_cmd = get_moe_stage_module(
@@ -308,6 +325,7 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
+    return out
 
 
 def ck_moe_stage2_fwd(
@@ -320,13 +338,13 @@ def ck_moe_stage2_fwd(
     out: Tensor,
     topk: int,
     kernelName: str = "",
-    w1_scale: Optional[Tensor] = None,
-    a1_scale: Optional[Tensor] = None,
+    w2_scale: Optional[Tensor] = None,
+    a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
-): 
+):
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
 
     md_name, blob_gen_cmd = get_moe_stage_module(
@@ -337,7 +355,7 @@ def ck_moe_stage2_fwd(
         quant_type,
         mul_routed_weight_stage,
     )
-    
+
     ck_moe_stage2(
         inter_states,
         w1,
@@ -348,9 +366,10 @@ def ck_moe_stage2_fwd(
         out,
         topk,
         kernelName,
-        w1_scale,
-        a1_scale,
+        w2_scale,
+        a2_scale,
         block_m,
         sorted_weights,
         custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
+    return out

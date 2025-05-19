@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 
 @dataclass
@@ -17,7 +17,7 @@ class kernelInstanceGEMM1:
     CDEElementOp: str = "TypeCast"
     QuantType: str = "per_tensor"
     stage:int = 1
-    
+
     @property
     def name(self) -> str:
         return ("_").join([
@@ -48,7 +48,7 @@ class kernelInstanceGEMM2:
     CDEElementOp: str = "TypeCast"
     QuantType: str = "per_tensor"
     stage:int = 2
-    
+
     @property
     def name(self) -> str:
         return ("_").join([
@@ -64,9 +64,9 @@ class kernelInstanceGEMM2:
             "MulRoutedWeight" + str(int( self.MulRoutedWeight)),
         ])
 
-# gemm1 out&AB:bf16/fp16 
+# gemm1 out&AB:bf16/fp16
 a16w16_gemm1_kernels_list= {
-#   id: kernel:             BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| MWaves| NWaves|GemmPipelineVersion    
+#   id: kernel:             BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| MWaves| NWaves|GemmPipelineVersion
      0: kernelInstanceGEMM1(       256,        32,       128,       128,     1,       4,        1,),
      1: kernelInstanceGEMM1(       256,        32,       128,        64,     1,       4,        1,),
      2: kernelInstanceGEMM1(       256,        64,       128,       128,     1,       4,        1,),
@@ -90,7 +90,7 @@ a8w8_gemm1_blockscale_kernels_list= {
      #2: kernelInstanceGEMM1(       256,      128,        128,       128,     1,       4,        3,),
 }
 
-# gemm1 out:bf16/fp16 A:fp8 B:win4 
+# gemm1 out:bf16/fp16 A:fp8 B:win4
 a8w4_gemm1_kernels_list= {
      0: kernelInstanceGEMM1(       256,       32,        128,       128,     1,       4,        1,),
      1: kernelInstanceGEMM1(       256,       64,        128,       128,     1,       4,        1,),
@@ -107,29 +107,29 @@ gemm1_kernels_dict = {
 
 
 a16w16_gemm2_kernels_list= {
-#   id: kernel:             BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| MWaves| NWaves|GemmPipelineVersion 
-# gemm2 out&AB:bf16/fp16 
+#   id: kernel:             BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| MWaves| NWaves|GemmPipelineVersion
+# gemm2 out&AB:bf16/fp16
      0: kernelInstanceGEMM2(       256,        32,       128,       128,     1,       4,         1,),
      1: kernelInstanceGEMM2(       256,        64,       128,       128,     1,       4,         1,),
      2: kernelInstanceGEMM2(       256,       128,       128,        64,     1,       4,         1,),
      3: kernelInstanceGEMM2(       256,       128,       256,        64,     1,       4,         3,),
 }
-# gemm2 out:bf16/fp16 AB:fp8/i8 
-a8w8_gemm2_kernels_list= {   
+# gemm2 out:bf16/fp16 AB:fp8/i8
+a8w8_gemm2_kernels_list= {
      0: kernelInstanceGEMM2(       256,       32,        128,       256,     1,       4,         1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       256,     1,       4,         1,),
      2: kernelInstanceGEMM2(       256,      128,        128,       128,     1,       4,         1,),
      3: kernelInstanceGEMM2(       256,      128,        256,       128,     1,       4,         3,),
 }
 
-# gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8 
-a8w8_gemm2_blockscale_kernels_list= {   
+# gemm2 MXDLPerWave out:bf16/fp16 AB:fp8/i8
+a8w8_gemm2_blockscale_kernels_list= {
      #0: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
      #1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        1,),
      2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
-# gemm2 out:bf16/fp16 A:fp8 B:in4 
+# gemm2 out:bf16/fp16 A:fp8 B:in4
 a8w4_gemm2_kernels_list= {
      0: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,         1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,         1,),
@@ -145,13 +145,13 @@ gemm2_kernels_dict = {
 }
 
 
-bit8_list = ["F8", "I8"]
-bit16_list = ["B16", "F16"]
-bit4_list = ["I4"]
+bit8_list = ["F8", "I8", "f8", "i8"]
+bit16_list = ["B16", "F16", "b16", "f16"]
+bit4_list = ["I4", "i4"]
 QuantType_list = ["per_128x128"]
 
 def get_gemm1_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, ActOP: bool, MulRoutedWeight: bool) -> list:
-    
+
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         tag = "a16w16"
     elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype and QuantType in QuantType_list:
@@ -186,7 +186,7 @@ def get_gemm2_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: 
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         tag = "a16w16"
     elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype and QuantType in QuantType_list:
-        tag = "a8w8blkscale"        
+        tag = "a8w8blkscale"
     elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
         tag = "a8w8"
     elif Adtype in bit8_list and Bdtype in bit4_list and Adtype == "F8":
@@ -210,4 +210,3 @@ def get_gemm2_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: 
             else:
                 kernel.CDEElementOp = "TypeCast"
     return tag, kernels_list
- 

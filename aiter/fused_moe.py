@@ -353,25 +353,31 @@ def get_2stage_cfgs(
     if cfg is None:
         block_m = get_block_size_M(token, topk, expert, inter_dim)
         ksplit = 0
-        tag = ""
+        kernelName1 = ""
+        kernelName2 = ""
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
-        tag = cfg["tag"]
+        kernelName1 = cfg["kernelName1"]
+        kernelName2 = cfg["kernelName2"]
 
-    # war
-    if q_dtype_w in [dtypes.bf16, dtypes.fp16, torch.uint32]:
-        tag = "ck"
-
+    tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(f"[fused_moe] using {'default' if cfg is None else tag} for {keys} ")
 
-    if "ck" in tag:
+    if "ck" in kernelName1 or q_dtype_w in [dtypes.bf16, dtypes.fp16, torch.uint32]:
         return (
             functools.partial(
-                ck_stage1,
+                aiter.ck_moe_stage1_fwd,
+                kernelName=kernelName1,
                 activation=activation,
+                quant_type=q_type,
             ),
-            aiter.ck_moe_stage2_fwd,
+            functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+            ),
             block_m,
             ksplit,
         )
@@ -385,11 +391,16 @@ def get_2stage_cfgs(
     return (
         functools.partial(
             asm_stage1,
-            kernelName=tag,
+            kernelName=kernelName1,
             activation=activation,
             quant_type=q_type,
         ),
-        aiter.ck_moe_stage2_fwd,
+        functools.partial(
+            aiter.ck_moe_stage2_fwd,
+            kernelName=kernelName2,
+            activation=activation,
+            quant_type=q_type,
+        ),
         block_m,
         ksplit,
     )
@@ -469,6 +480,7 @@ def fused_moe_2stages(
         sorted_expert_ids,
         num_valid_ids,
         a2,
+        topk,
         block_m=block_m,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
@@ -502,9 +514,9 @@ def fused_moe_2stages(
         num_valid_ids,
         moe_out,
         topk,
-        w2_scale,
-        a2_scale,
-        block_size_M,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
     )
 
@@ -527,6 +539,7 @@ def asm_stage1(
     sorted_expert_ids,
     num_valid_ids,
     out,  # [token_num, topk, inter_dim]
+    topk,
     block_m: int,
     kernelName: str = "",
     ksplit: int = 0,
@@ -540,7 +553,7 @@ def asm_stage1(
     if quant_type != QuantType.per_128x128:
         out = out.view(dtype)
     device = out.device
-    token_num, topk, _ = out.shape
+    token_num, _, _ = out.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     if quant_type == QuantType.per_Tensor:
@@ -579,47 +592,6 @@ def asm_stage1(
             aiter.silu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
         else:
             aiter.gelu_and_mul(out, tmp_out.view(dtypes.fp32).to(dtype))
-    return out
-
-
-def ck_stage1(
-    input,  # [token, model_dim]
-    w1,  # [E, inter_dim*2, model_dim]
-    w2,  # [E, model_dim, inter_dim]
-    sorted_ids,  # [max_num_tokens_padded]
-    sorted_expert_ids,  # [max_num_m_blocks]
-    num_valid_ids,  # [1]
-    out,  # [token_num, topk, inter_dim]
-    block_m=32,
-    activation=ActivationType.Silu,
-    a1_scale=None,
-    w1_scale=None,
-    sorted_weights=None,
-):
-    _, topk, _ = out.shape
-    # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
-
-    if activation == ActivationType.Silu:
-        act_op = 1
-    else:
-        act_op = 0
-
-    aiter.ck_moe_stage1(
-        input,
-        w1,
-        w2,
-        sorted_ids,
-        sorted_expert_ids,
-        num_valid_ids,
-        out,
-        topk,
-        w1_scale,
-        a1_scale,
-        block_m,
-        sorted_weights,
-        act_op,
-    )
-
     return out
 
 
