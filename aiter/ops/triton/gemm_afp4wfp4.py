@@ -8,7 +8,9 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
+        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
+        and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
@@ -202,6 +204,44 @@ def _gemm_afp4_wfp4_reduce_kernel(
     tl.store(c_out_ptrs, c)
 
 
+def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
+    # heuristics for make "EVEN_K == True" as much as possible
+    NUM_KSPLIT_STEP = 4
+    BLOCK_SIZE_K_STEP = 4
+    SPLITK_BLOCK_SIZE = (
+        triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+    )
+    while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
+        # print(K, SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT)
+        # print(K % (SPLITK_BLOCK_SIZE // 2) == 0, SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0, K % (BLOCK_SIZE_K // 2) == 0)
+
+        if (
+            K % (SPLITK_BLOCK_SIZE // 2) == 0
+            and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
+            and K % (BLOCK_SIZE_K // 2) == 0
+        ):
+            break
+        elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
+            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+        elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
+            if NUM_KSPLIT > 1:
+                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            elif BLOCK_SIZE_K > 16:
+                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
+            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+        else:
+            break
+
+        SPLITK_BLOCK_SIZE = (
+            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        )
+
+    # print(K, SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2, NUM_KSPLIT)
+    # print(K % (SPLITK_BLOCK_SIZE // 2) == 0, SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0, K % (BLOCK_SIZE_K // 2) == 0)
+    return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
+
+
 # Wrapper for gemm kernel.
 def gemm_afp4wfp4(
     x,
@@ -244,9 +284,10 @@ def gemm_afp4wfp4(
         cache_modifier = ".cg"
 
         NUM_KSPLIT = 4
-        SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, BLOCK_SIZE_K, NUM_KSPLIT
         )
+
         if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
         else:
@@ -264,9 +305,10 @@ def gemm_afp4wfp4(
         cache_modifier = ".cg"
 
         NUM_KSPLIT = 4
-        SPLITK_BLOCK_SIZE = (
-            triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, BLOCK_SIZE_K, NUM_KSPLIT
         )
+
         if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
             y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
         else:
