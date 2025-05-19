@@ -485,6 +485,11 @@ def _attn_fwd(
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
 ):
+    # print("stride_qz_in:", stride_qz_in)
+    # print("stride_kz_in:", stride_kz_in)
+    print("stride_kz_in + stride_vz_in:", stride_kz_in + stride_vz_in)
+    return
+
     # calculate offsets
     wid = tl.program_id(
         0
