@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
+fmha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                                    bool has_dropout_randval,
                                    const mask_info &mask,
                                    // sizes
@@ -282,7 +282,7 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
         ck_tile::stream_config stream_config{stream};
 
         auto args =
-            get_ck_fmha_fwd_args(
+            get_asm_fmha_fwd_args(
                 has_lse,
                 return_dropout_randval,
                 mask,
