@@ -234,6 +234,17 @@
         py::arg("dv") = std::nullopt, py::arg("alibi_slopes") = std::nullopt,  \
         py::arg("rng_state") = std::nullopt, py::arg("gen") = std::nullopt);
 
+#define MHA_BWD_PYBIND                                                         \
+  m.def("mha_bwd", &aiter::torch_itfs::mha_bwd, py::arg("dout"), py::arg("q"), \
+        py::arg("k"), py::arg("v"), py::arg("out"), py::arg("softmax_lse"),    \
+        py::arg("dropout_p"), py::arg("softmax_scale"), py::arg("is_causal"),  \
+        py::arg("window_size_left"), py::arg("window_size_right"),             \
+        py::arg("deterministic"), py::arg("dq") = std::nullopt,                \
+        py::arg("dk") = std::nullopt, py::arg("dv") = std::nullopt,            \
+        py::arg("dbias") = std::nullopt, py::arg("bias") = std::nullopt,       \
+        py::arg("alibi_slopes") = std::nullopt,                                \
+        py::arg("rng_state") = std::nullopt, py::arg("gen") = std::nullopt);
+
 #define MHA_FWD_ASM_PYBIND                                                     \
   m.def("fmha_v3_fwd", &aiter::torch_itfs::fmha_v3_fwd, py::arg("q"),          \
         py::arg("k"), py::arg("v"), py::arg("dropout_p"),                      \
@@ -254,15 +265,18 @@
         py::arg("alibi_slopes") = std::nullopt,                                \
         py::arg("gen") = std::nullopt);
 
-#define MHA_FWD_PYBIND                                                         \
-  m.def("mha_fwd", &aiter::torch_itfs::mha_fwd, py::arg("q"), py::arg("k"),    \
-        py::arg("v"), py::arg("dropout_p"), py::arg("softmax_scale"),          \
+#define MHA_VARLEN_BWD_PYBIND                                                  \
+  m.def("mha_varlen_bwd", &aiter::torch_itfs::mha_varlen_bwd, py::arg("dout"), \
+        py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"),              \
+        py::arg("softmax_lse"), py::arg("cu_seqlens_q"),                       \
+        py::arg("cu_seqlens_k"), py::arg("max_seqlen_q"),                      \
+        py::arg("max_seqlen_k"), py::arg("dropout_p"),                         \
+        py::arg("softmax_scale"), py::arg("zero_tensors"),                     \
         py::arg("is_causal"), py::arg("window_size_left"),                     \
-        py::arg("window_size_right"), py::arg("return_softmax_lse"),           \
-        py::arg("return_dropout_randval"), py::arg("out") = std::nullopt,      \
-        py::arg("bias") = std::nullopt,                                        \
-        py::arg("alibi_slopes") = std::nullopt,                                \
-        py::arg("gen") = std::nullopt);
+        py::arg("window_size_right"), py::arg("deterministic"),                \
+        py::arg("dq") = std::nullopt, py::arg("dk") = std::nullopt,            \
+        py::arg("dv") = std::nullopt, py::arg("alibi_slopes") = std::nullopt,  \
+        py::arg("rng_state") = std::nullopt, py::arg("gen") = std::nullopt);
 
 #define MHA_VARLEN_FWD_PYBIND                                                  \
   m.def(                                                                       \
@@ -289,21 +303,6 @@
       py::arg("return_softmax_lse"), py::arg("return_dropout_randval"),        \
       py::arg("out") = std::nullopt, py::arg("bias") = std::nullopt,           \
       py::arg("alibi_slopes") = std::nullopt, py::arg("gen") = std::nullopt);
-
-#define MOE_CK_2STAGES_PYBIND                                                  \
-  m.def("ck_moe_stage1", &ck_moe_stage1, py::arg("hidden_states"),             \
-        py::arg("w1"), py::arg("w2"), py::arg("sorted_token_ids"),             \
-        py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),                \
-        py::arg("out"), py::arg("topk"), py::arg("w1_scale") = std::nullopt,   \
-        py::arg("a1_scale") = std::nullopt, py::arg("block_m") = 32,           \
-        py::arg("sorted_weights") = std::nullopt, py::arg("act_op") = 0);      \
-                                                                               \
-  m.def("ck_moe_stage2", &ck_moe_stage2, py::arg("inter_states"),              \
-        py::arg("w1"), py::arg("w2"), py::arg("sorted_token_ids"),             \
-        py::arg("sorted_expert_ids"), py::arg("num_valid_ids"),                \
-        py::arg("out"), py::arg("topk"), py::arg("w2_scale") = std::nullopt,   \
-        py::arg("a2_scale") = std::nullopt, py::arg("block_m") = 32,           \
-        py::arg("sorted_weights") = std::nullopt);
 
 #define MOE_CK_2STAGES_PYBIND                                                  \
   m.def("ck_moe_stage1", &ck_moe_stage1, py::arg("hidden_states"),             \
@@ -426,19 +425,17 @@
   m.def("layernorm2d_with_add_smoothquant_asm",                                \
         &layernorm2d_with_add_smoothquant_asm);
 
+#define POS_ENCODING_PYBIND                                                    \
+  m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding");        \
+  m.def("batched_rotary_embedding", &batched_rotary_embedding,                 \
+        "batched_rotary_embedding");
+
 #define QUANT_PYBIND                                                           \
   m.def("static_per_tensor_quant", &static_per_tensor_quant);                  \
   m.def("dynamic_per_tensor_quant", &dynamic_per_tensor_quant);                \
   m.def("dynamic_per_token_scaled_quant", &dynamic_per_token_scaled_quant,     \
         py::arg("out"), py::arg("input"), py::arg("scales"),                   \
         py::arg("scale_ub") = std::nullopt);
-
-#define QUANT_PYBIND                                                           \
-  m.def("static_scaled_fp8_quant", &static_scaled_fp8_quant);                  \
-  m.def("dynamic_scaled_fp8_quant", &dynamic_scaled_fp8_quant);                \
-  m.def("dynamic_per_token_scaled_fp8_quant",                                  \
-        &dynamic_per_token_scaled_fp8_quant, py::arg("out"), py::arg("input"), \
-        py::arg("scales"), py::arg("scale_ub") = std::nullopt);
 
 #define RMSNORM_PYBIND                                                         \
   m.def("rms_norm_cu", &rms_norm,                                              \
@@ -499,6 +496,13 @@
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt, \
         py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt);   \
   m.def("getHipblasltKernelName", &getHipblasltKernelName);
+
+#define ROCSOLGEMM_PYBIND                                                      \
+  m.def("rocb_create_extension", &rocb_create_extension, "create_extension");  \
+  m.def("rocb_destroy_extension", &rocb_destroy_extension,                     \
+        "destroy_extension");                                                  \
+  m.def("rocb_mm", &RocSolIdxBlas, "mm");                                      \
+  m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
 
 #define AITER_ENUM_PYBIND                                                      \
   pybind11::enum_<QuantType>(m, "QuantType")                                   \
