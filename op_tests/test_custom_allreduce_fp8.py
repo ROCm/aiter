@@ -56,7 +56,7 @@ def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
         graph = torch.cuda.CUDAGraph()
         with graph_capture() as gc:
             with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x, open_fp8_quant = True)
+                out = tensor_model_parallel_all_reduce(x, open_fp8_quant=True)
         out.fill_(0)
 
         @perftest()
@@ -79,6 +79,7 @@ def allreduce_custom(tp_size, pp_size, rankID, x, withGraph=False):
         destroy_distributed_environment()
         torch.cuda.empty_cache()
     return out
+
 
 @benchmark()
 def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
