@@ -23,7 +23,6 @@ from aiter.test_common import (
     perftest,
     benchmark,
 )
-from aiter import dtypes
 from multiprocessing import set_start_method, Pool, freeze_support
 import logging
 
