@@ -525,7 +525,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                              stream_config,
                                              q_dtype_str,
                                              true, //is_group_mode
-                                             mask,
+                                             mask.type,
                                              bias_type,
                                              has_lse);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
@@ -565,9 +565,10 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                                      stream_config,
                                      q_dtype_str,
                                      true, //is_group_mode
-                                     mask,
+                                     mask.type,
                                      bias_type,
-                                     has_lse);
+                                     has_lse,
+                                     false);
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }

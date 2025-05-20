@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from aiter.test_common import (
     checkAllclose,
@@ -37,6 +37,13 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
             atol=1e-3,
             msg=f"{name}: dynamic quant",
         )
+        checkAllclose(
+            ref_scale.to(dtypes.fp32),
+            scale.to(dtypes.fp32),
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"{name}: dynamic quant scale",
+        )
         ret[f"{name} dq"] = us1
         ret[f"{name} dq err"] = err1
         if q_type == aiter.QuantType.per_Tensor:
@@ -59,9 +66,11 @@ def test_quant(m, n, q_type, q_dtype, h_dtype):
 list_quant = [
     (aiter.QuantType.per_Tensor, dtypes.fp8),
     (aiter.QuantType.per_Token, dtypes.fp8),
+    (aiter.QuantType.per_1x128, dtypes.fp8),
     (aiter.QuantType.per_Token, dtypes.i8),
+    # (aiter.QuantType.per_1x32, dtypes.fp4x2),
 ]
-list_dtype = [dtypes.fp16, dtypes.bf16][:]
+list_dtype = [dtypes.fp16, dtypes.bf16][1:]
 import pandas as pd
 
 for (
@@ -69,8 +78,8 @@ for (
     h_dtype,
 ) in itertools.product(list_quant, list_dtype):
     df = []
-    for n in [4096, 8192]:
-        for m in [1, 16, 32, 64, 128, 192, 256, 512, 1024]:
+    for n in [4096, 8192][:]:
+        for m in [1, 2, 16, 32, 64, 128, 192, 256, 512, 1024, 16384, 163840][:]:
             ret = test_quant(m, n, q_type, q_dtype, h_dtype)
             df.append(ret)
     df = pd.DataFrame(df)

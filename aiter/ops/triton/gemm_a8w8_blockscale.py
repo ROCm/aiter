@@ -192,6 +192,7 @@ def gemm_a8w8_blockscale(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -201,6 +202,7 @@ def gemm_a8w8_blockscale(
     - W: Matrix W with shape (N, K).
     - X_scale: Scale tensor for X with shape (M, *scale_k).
     - W_scale: Scale tensor for W with shape (**scale_n, *scale_k).
+    - Y: Output Matrix Y with shape (M, K). If this is none, then it's created by this API and returned as output
 
     Returns:
     - Y: The output matrix with shape (M, N).
@@ -224,7 +226,8 @@ def gemm_a8w8_blockscale(
     # Check constraints.
     assert x.shape[1] == w.shape[0], "Incompatible dimensions!!!"
 
-    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     BLOCK_SIZE_M = 128
     BLOCK_SIZE_N = 128
