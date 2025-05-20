@@ -120,6 +120,7 @@ def run_ck(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        0,
         dropout_p,
         causal=causal,
         window_size=window_size,

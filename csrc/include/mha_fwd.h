@@ -12,7 +12,7 @@ struct mha_fwd_traits : public fmha_fwd_traits {
   mha_fwd_traits(int head_size_q, int head_size_v, std::string dtype,
                  bool is_group_mode, bool has_logits_soft_cap,
                  const mask_info &mask, bias_enum bias_type, bool has_lse,
-                 bool has_dropout)
+                 bool has_dropout, bool is_chunked_prefill)
       : fmha_fwd_traits{head_size_q,
                         head_size_v,
                         dtype,
@@ -23,7 +23,8 @@ struct mha_fwd_traits : public fmha_fwd_traits {
                         bias_type,
                         has_lse,
                         has_dropout,
-                        false} // do_fp8_static_quant
+                        false, // do_fp8_static_quant
+                        is_chunked_prefill}
   {}
 };
 

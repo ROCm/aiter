@@ -21,7 +21,8 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   const mask_info &mask,
                                   bias_enum bias_type,
                                   bool has_lse,
-                                  bool has_dropout)
+                                  bool has_dropout,
+                                  bool is_chunked_prefill = false)
 {{
     return mha_fwd_traits(head_size_q,
                           head_size_v,
@@ -31,7 +32,8 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           mask,
                           bias_type,
                           has_lse,
-                          has_dropout);
+                          has_dropout,
+                          is_chunked_prefill);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
@@ -78,7 +80,8 @@ float mha_fwd(mha_fwd_args args,
                                      mask,
                                      bias_type,
                                      has_lse,
-                                     has_dropout);
+                                     has_dropout,
+                                     args.min_seqlen_q == 0);
     return fmha_fwd(traits, args, stream_config);
 }"""
 
