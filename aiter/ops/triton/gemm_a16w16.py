@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
+import functools
+import sys
+import json
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
-
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
 
 @triton.heuristics(
     {
@@ -98,13 +102,29 @@ def _gemm_a16_w16_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-# Wrapper for gemm kernel.
-def gemm_a16w16(
-    x,
-    w,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
 ):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A16W16.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict["any"]
+
+
+# Wrapper for gemm kernel.
+def gemm_a16w16(x, 
+                w, 
+                dtype: Optional[float] = torch.bfloat16,
+                y: Optional[torch.Tensor] = None,
+                config: Optional[dict] = None,
+                ):
     """
     Computes the 16 bit matmul Y = X x W
 
@@ -124,15 +144,9 @@ def gemm_a16w16(
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    BLOCK_SIZE_M = 256
-    BLOCK_SIZE_N = 256
-    BLOCK_SIZE_K = 64
-    GROUP_SIZE_M = 4
-    waves_per_eu = 2
-    kpack = 1
-    matrix_instr_nonkdim = 16
-    num_warps = 8
-    num_stages = 2
+    if config is None:
+        config = _get_config(M, N, K)
+
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -149,15 +163,7 @@ def gemm_a16w16(
         w.stride(1),
         y.stride(0),
         y.stride(1),
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        kpack=kpack,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **config,
     )
 
     return y

@@ -5,9 +5,12 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-
+from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
+    
     if layout[0] == "T":
         x = torch.randn((M, K), dtype=dtype).cuda()
     else:
@@ -21,8 +24,11 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype).cuda()
+        out_dtype = None,
+    else:
+        out_dtype = dtype
 
-    return x, weight, y
+    return x, weight, out_dtype, y
 
 
 def get_x_vals():
@@ -64,13 +70,13 @@ def get_x_vals():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
-    x, w, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
 
     torch_out = torch.matmul(x, w)
 
     if output:
-        triton_out = gemm_a16w16(x, w, dtype, y)
+        triton_out = gemm_a16w16(x, w, out_dtype, y)
     else:
-        triton_out = gemm_a16w16(x, w, dtype)
+        triton_out = gemm_a16w16(x, w, out_dtype)
 
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
