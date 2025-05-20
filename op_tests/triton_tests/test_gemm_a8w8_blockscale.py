@@ -27,8 +27,8 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
-    return gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
+def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
+    return gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y)
 
 
 def is_cdna4():
@@ -87,7 +87,9 @@ def get_x_vals():
     return x_vals
 
 
-def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
+def generate_gemm_a8w8_blockscale_inputs(
+    M, N, K, block_shape_n, block_shape_k, dtype=torch.bfloat16, output=False
+):
     scale_n = (N + block_shape_n - 1) // block_shape_n
     scale_k = (K + block_shape_k - 1) // block_shape_k
 
@@ -97,21 +99,37 @@ def generate_gemm_a8w8_blockscale_inputs(M, N, K, block_shape_n, block_shape_k):
     x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
 
-    return x, weight, x_scale, w_scale
+    y = None
+    if output:
+        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+
+    return x, weight, x_scale, w_scale, y
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K", [(dtype, *shape) for dtype in ["bf16"] for shape in get_x_vals()]
+    "dtype, M, N, K, output",
+    [
+        (dtype, *shape, output)
+        for output in [True, False]
+        for dtype in ["bf16"]
+        for shape in get_x_vals()
+    ],
 )
-def test_gemm(dtype, M, N, K):
+def test_gemm(dtype, M, N, K, output):
     block_shape_n, block_shape_k = block_shape
 
     dtype = name_to_torch_types[dtype]
-    x, weight, x_scale, w_scale = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, block_shape_n, block_shape_k
+    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+        M,
+        N,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype,
+        output,
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, dtype)
+    b = run_triton(x, weight, x_scale, w_scale, dtype, y)
 
     triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

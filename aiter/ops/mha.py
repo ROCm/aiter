@@ -27,6 +27,25 @@ def mha_fwd(
 ): ...
 
 
+@compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd")
+def fmha_v3_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+): ...
+
+
 @compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
 def mha_varlen_fwd(
     q: Tensor,
@@ -225,27 +244,69 @@ def _flash_attn_forward(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
         "--receipt 100 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}",
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}",
     ]
 
+    (_, seqlen_q, nhead_q, hdim_q) = q.shape
+    (_, seqlen_k, nhead_k, hdim_v) = v.shape
+
+    # mask
+    window_size_left = -1 if window_size_left >= seqlen_k else window_size_left
+    window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
+    mask = causal and window_size_left == -1  # causal mask
+    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+
+    def can_impl_fmha_v3_fwd():
+        # basic
+        ret = alibi_slopes is None
+        ret &= bias is None
+        ret &= dropout_p == 0.0
+        ret &= seqlen_q == seqlen_k
+        ret &= seqlen_q % 256 == 0
+        ret &= hdim_q == hdim_v
+        ret &= hdim_q == 128
+        ret &= nhead_q % nhead_k == 0
+        ret &= mask or nmask
+        ret &= return_lse
+        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = mha_fwd(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size_left,
-        window_size_right,
-        return_lse,
-        return_softmax,
-        None,
-        bias,
-        alibi_slopes,
-        None,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
-    )
+    if can_impl_fmha_v3_fwd():
+        out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            None,
+            bias,
+            alibi_slopes,
+            None,
+        )
+    else:
+        out, softmax_lse, S_dmask, rng_state = mha_fwd(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            None,
+            bias,
+            alibi_slopes,
+            None,
+            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        )
     return out, softmax_lse, S_dmask, rng_state
 
 
@@ -498,7 +559,6 @@ def _flash_attn_backward(
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
         ret &= mask or nmask or swa
         ret &= np() or pssk() or pddv() or psskddv()
-        ret &= "gfx942" in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
 
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -1058,7 +1118,6 @@ def _flash_attn_varlen_backward(
         ret &= hdim_q >= 64 and hdim_q <= 128 and hdim_q % 8 == 0
         ret &= mask or nmask
         ret &= pssk() or psskddv()
-        ret &= "gfx942" in torch.cuda.get_device_properties("cuda").gcnArchName
 
         return ret
 
@@ -1221,9 +1280,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = (
-            ctx.saved_tensors
-        )
+        (
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            rng_state,
+        ) = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None

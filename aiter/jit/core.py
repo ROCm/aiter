@@ -502,7 +502,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
-                hipify = d_args["hipify"]
+                hipify = d_args.get("hipify", True)
                 build_module(
                     md_name,
                     srcs,

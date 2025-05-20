@@ -84,8 +84,8 @@ def run_benchmark(args):
     def bench_gemm_a8w8(M, N, K, metric, provider):
         # NOTE: Assume bias and output has the same dtype
         c_dtype = name_to_torch_types["bf16"]
-        x, weight, x_scale, w_scale, bias = generate_gemm_a8w8_inputs(
-            M, N, K, name_to_torch_types["fp8e4"], c_dtype
+        x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+            M, N, K, name_to_torch_types["fp8e4"], c_dtype, output=True
         )
         # flops
         flops = 2.0 * M * N * K
@@ -95,7 +95,9 @@ def run_benchmark(args):
         mem = mem_read + mem_write
 
         ms = triton.testing.do_bench(
-            lambda: gemm_a8w8(x, weight, x_scale, w_scale, bias, c_dtype),  # noqa: E731
+            lambda: gemm_a8w8(
+                x, weight, x_scale, w_scale, bias, c_dtype, y
+            ),  # noqa: E731
             warmup=25,
             rep=100,
         )

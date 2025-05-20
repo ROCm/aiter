@@ -271,16 +271,19 @@ def get_trace_perf(prof, num_iters):
     return df.at[avg_name, "device_time_sum"]
 
 
-def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
+def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8, printLog=True):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = (~isClose).to("cpu")
     if isClose.all():
-        logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
+        if printLog:
+            logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
         return 0
     else:
         num = mask.sum()
         printNum = min(printNum, num)
         percent = (num / a.numel()).item()
+        if not printLog:
+            return percent
         a_msked = a[mask]
         b_msked = b[mask]
         delta = (a_msked - b_msked).abs()

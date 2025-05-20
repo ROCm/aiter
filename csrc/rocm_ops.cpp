@@ -33,6 +33,7 @@
 #include "torch/mha_bwd.h"
 #include "torch/mha_fwd.h"
 #include "torch/mha_v3_bwd.h"
+#include "torch/mha_v3_fwd.h"
 #include "torch/mha_v3_varlen_bwd.h"
 #include "torch/mha_varlen_bwd.h"
 #include "torch/mha_varlen_fwd.h"
@@ -50,6 +51,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   MHA_FWD_PYBIND;
   MHA_BWD_PYBIND;
   MHA_BATCH_PREFILL_PYBIND;
+  MHA_FWD_ASM_PYBIND
   MHA_BWD_ASM_PYBIND;
   MHA_VARLEN_BWD_ASM_PYBIND;
   GEMM_A8W8_PYBIND;
@@ -70,6 +72,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   QUANT_PYBIND;
   ATTENTION_ASM_PYBIND;
   ATTENTION_RAGGED_PYBIND;
+  ATTENTION_V1_PYBIND;
   MOE_OP_PYBIND;
   ROPE_GENERAL_FWD_PYBIND;
   ROPE_GENERAL_BWD_PYBIND;
