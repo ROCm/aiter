@@ -180,8 +180,8 @@ def _dynamic_mxfp4_quant_kernel(
     stride_x_fp4_n_in,
     stride_bs_m_in,
     stride_bs_n_in,
-    M: tl.constexpr,
-    N: tl.constexpr,
+    M,
+    N,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     NUM_ITER: tl.constexpr,
@@ -345,9 +345,9 @@ def dynamic_mxfp4_quant(
             BLOCK_SIZE_M = 32
             BLOCK_SIZE_N = 128
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]),
-        triton.cdiv(N, META["BLOCK_SIZE_N"] * META["NUM_ITER"]),
+    grid = (
+        triton.cdiv(M, BLOCK_SIZE_M),
+        triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
     _dynamic_mxfp4_quant_kernel[grid](
