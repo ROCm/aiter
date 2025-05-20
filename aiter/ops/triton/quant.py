@@ -323,7 +323,6 @@ def dynamic_mxfp4_quant(
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     blockscale_e8m0 = torch.empty(
         ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
-        # (M, (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE),
         dtype=torch.uint8,
         device=x.device,
     ).T
