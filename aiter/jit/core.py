@@ -139,7 +139,7 @@ def validate_and_update_archs():
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str):
     ret = os.system(
-        f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -"
+        f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -Wno-unused-command-line-argument -"
     )
     if ret == 0:
         return [flag_hip]
@@ -274,8 +274,7 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm",
-            "--amdgpu-kernarg-preload-count=16",
+            "-mllvm --amdgpu-kernarg-preload-count=16",
             # "-v", "--save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
@@ -290,20 +289,21 @@ def build_module(
         if hip_version > Version('5.5.00000'):
             flags_hip += hip_flag_checker("-mllvm --lsr-drop-solution=1")
         if hip_version > Version("5.7.23302"):
-            flags_hip += hip_flag_checker("-fno-offload-uniform-block")
+            flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
-            flags_hip += hip_flag_checker("-mllvm -enable-post-misched=0")
+            flags_hip += ["-mllvm -enable-post-misched=0"]
         if hip_version > Version("6.2.41132"):
-            flags_hip += hip_flag_checker(
-                "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"
-            )
+            flags_hip += ["-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"]
         if hip_version > Version("6.2.41133"):
-            flags_hip += hip_flag_checker("-mllvm -amdgpu-coerce-illegal-types=1")
+            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        for i in reversed(range(len(flags_hip))):
+            if not hip_flag_checker(flags_hip[i]):
+                del flags_hip[i]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
