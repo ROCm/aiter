@@ -191,7 +191,7 @@ def _dynamic_mxfp4_quant_kernel(
     SCALING_MODE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
-    _pid_n = tl.program_id(1) * NUM_ITER
+    _start_n = tl.program_id(1) * NUM_ITER
     # cast strides to int64, in case M*N > max int32
     stride_x_m = tl.cast(stride_x_m_in, tl.int64)
     stride_x_n = tl.cast(stride_x_n_in, tl.int64)
@@ -200,7 +200,7 @@ def _dynamic_mxfp4_quant_kernel(
     stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
     stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
 
-    for pid_n in tl.range(_pid_n, min(_pid_n + NUM_ITER, N), num_stages=NUM_STAGES):
+    for pid_n in tl.range(_start_n, min(_start_n + NUM_ITER, N), num_stages=NUM_STAGES):
         x_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
@@ -327,6 +327,7 @@ def dynamic_mxfp4_quant(
         device=x.device,
     ).T
 
+    # for large N values
     if M <= 32:
         NUM_ITER = 1
         BLOCK_SIZE_M = triton.next_power_of_2(M)
@@ -343,6 +344,16 @@ def dynamic_mxfp4_quant(
         if N <= 16384:
             BLOCK_SIZE_M = 32
             BLOCK_SIZE_N = 128
+
+    # for small N values
+    if N <= 1024:
+        NUM_ITER = 1
+        NUM_STAGES = 1
+        NUM_WARPS = 4
+        BLOCK_SIZE_N = min(256, triton.next_power_of_2(N))
+        # BLOCK_SIZE_N needs to be multiple of 32
+        BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+        BLOCK_SIZE_M = min(8, triton.next_power_of_2(M))
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
