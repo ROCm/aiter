@@ -285,7 +285,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 
 def get_compiler_abi_compatibility_and_version(
-    compiler, torch_exclude = False
+    compiler, torch_exclude=False
 ) -> Tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
