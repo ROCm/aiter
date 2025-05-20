@@ -217,8 +217,8 @@ def _dynamic_mxfp4_quant_kernel(
         x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
         # Calculate scale
         amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-        amax = amax.to(tl.uint32, bitcast=True)
-        amax = (amax + 0x200000) & 0xFF800000
+        amax = amax.to(tl.int32, bitcast=True)
+        amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
         amax = amax.to(tl.float32, bitcast=True)
         scale_e8m0_unbiased = tl.log2(amax).floor() - 2
         scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
