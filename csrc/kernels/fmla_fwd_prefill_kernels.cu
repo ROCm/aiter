@@ -83,6 +83,9 @@ struct FlashMlaPrefillKernelTrait
     static constexpr int32_t kNumPrefetchV  = 1;
     static constexpr int32_t kNumPrefetchKV = ck_tile::max(kNumPrefetchK, kNumPrefetchV);
 
+    using QKWarpTile = ck_tile::sequence<16, 16, 16>;
+    using KVWarpTile = ck_tile::sequence<16, 16, 16>;
+
     static_assert(kSizeD % 64 == 0);
     static_assert(kSizeDV % 64 == 0);
     static_assert(kSizeD >= kSizeDV);
@@ -283,12 +286,11 @@ public:
     {
         using BlockTile     = ck_tile::sequence<Traits::kBlockM, Traits::kBlockN0, Traits::kBlockK0>;
         using BlockWarps    = ck_tile::sequence<Traits::kNumWarps, 1, 1>;
-        using WarpTile      = ck_tile::sequence<16, 16, 16>;
-        using TileGemmShape = ck_tile::TileGemmShape<BlockTile, BlockWarps, WarpTile>;
+        using TileGemmShape = ck_tile::TileGemmShape<BlockTile, BlockWarps, typename Traits::QKWarpTile>;
 
         using GemmProblem = ck_tile::BlockGemmProblem<scalar_t, scalar_t, acc_t, Traits::kNumThreads, TileGemmShape>;
 
-        constexpr int32_t kWarpGemmM = WarpTile::at(ck_tile::number<0>{});
+        constexpr int32_t kWarpGemmM = Traits::QKWarpTile::at(ck_tile::number<0>{});
         static_assert((kWarpGemmM == 4) || (kWarpGemmM == 16) || (kWarpGemmM == 32));
 
         constexpr auto warp_gemm = []()
@@ -319,34 +321,35 @@ public:
         return ck_tile::BlockGemmARegBSmemCRegV2<GemmProblem, BlockGemmPolicy>{};
     }
 
+    CK_TILE_HOST_DEVICE static constexpr auto GetKVWarpGemm()
+    {
+        if constexpr(std::is_same_v<scalar_t, ck_tile::fp8_t> && std::is_same_v<acc_t, float>)
+        {
+            return ck_tile::WarpGemmMfmaFp8Fp8F32M32N32K16SwizzleBTransposedCDistribution<>{};
+        }
+        else
+        {
+            return ck_tile::WarpGemmMfmaDispatcher<
+                scalar_t, scalar_t, acc_t,
+                Traits::KVWarpTile::at(ck_tile::number<0>{}),
+                Traits::KVWarpTile::at(ck_tile::number<1>{}),
+                Traits::KVWarpTile::at(ck_tile::number<2>{}),
+                true>{};
+        }
+    }
+
     CK_TILE_HOST_DEVICE static constexpr auto GetKVBlockGemm()
     {
         using BlockTile     = ck_tile::sequence<Traits::kBlockM, Traits::kBlockN1, Traits::kBlockK1>;
         using BlockWarps    = ck_tile::sequence<Traits::kNumWarps, 1, 1>;
-        using WarpTile      = ck_tile::sequence<16, 16, 16>;
-        using TileGemmShape = ck_tile::TileGemmShape<BlockTile, BlockWarps, WarpTile>;
+        using TileGemmShape = ck_tile::TileGemmShape<BlockTile, BlockWarps, typename Traits::KVWarpTile>;
 
         constexpr int32_t kNumWarps   = Traits::kNumWarps;
         constexpr int32_t kNumThreads = kNumWarps * ck_tile::get_warp_size();
 
         using GemmProblem = ck_tile::BlockGemmProblem<scalar_t, scalar_t, acc_t, kNumThreads, TileGemmShape>;
 
-        auto warp_gemm = [&]()
-        {
-            if constexpr(std::is_same_v<scalar_t, ck_tile::fp8_t> && std::is_same_v<acc_t, float>)
-            {
-                return ck_tile::WarpGemmMfmaFp8Fp8F32M32N32K16SwizzleBTransposedCDistribution<>{};
-            }
-            else
-            {
-                return ck_tile::WarpGemmMfmaDispatcher<
-                    scalar_t, scalar_t, acc_t,
-                    WarpTile::at(ck_tile::number<0>{}),
-                    WarpTile::at(ck_tile::number<1>{}),
-                    WarpTile::at(ck_tile::number<2>{}),
-                    true>{};
-            }
-        }();
+        auto warp_gemm = GetKVWarpGemm();
 
         using WarpGemm = ck_tile::remove_cvref_t<decltype(warp_gemm)>;
 
