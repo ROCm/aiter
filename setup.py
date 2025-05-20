@@ -41,7 +41,7 @@ if IS_ROCM:
 
     if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
         exclude_ops = ["libmha_fwd", "libmha_bwd"]
-        all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
+        all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list

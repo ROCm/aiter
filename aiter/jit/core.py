@@ -388,7 +388,7 @@ def build_module(
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
-def get_args_of_build(ops_name: str, exclue=[]):
+def get_args_of_build(ops_name: str, exclude=[]):
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -438,8 +438,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
-                    # exclude
-                    if ops_name in exclue:
+                    if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
