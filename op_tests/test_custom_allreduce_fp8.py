@@ -103,54 +103,27 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
-    print('ref max', ref.max(), ref.min())
-    # -----
+
     a = ref.clone().cuda()
     a.to(float)
-    # =====
-    # int_part = torch.trunc(a)
-    # fp_part = a - int_part
-    # fp8_part = fp_part.to(torch.float8_e4m3fnuz)
-    # fp16_quanted_ref = fp8_part.float().to(torch.float16)
-    # fp16_quanted_ref += int_part.to(torch.float16)
-    # =====
-    # int_part = torch.trunc(a)
-    # fp_part = a - int_part
-    # qtype = QuantType.per_1x128
-    # quant_function = get_hip_quant(qtype)
-    # fp8_output, scale = quant_function(fp_part, quant_dtype=dtypes.i8)
-    # fp32_output = fp8_output.to(torch.float) * scale[:, None]
-    # fp16_quanted_ref = fp32_output.to(torch.float16).reshape(128, 8192)
-    # fp16_quanted_ref += int_part.to(torch.float16)
-    # =====
     qtype = QuantType.per_1x128
     quant_function = get_hip_quant(qtype)
     a = a.reshape(8192, 128)
-    print(a.shape)
     fp8_output, scale = quant_function(a, quant_dtype=torch.float8_e4m3fnuz)
-    print(fp8_output.shape, scale.shape, fp8_output.dtype, scale.dtype)
-    fp32_output = fp8_output.to(torch.float) * scale#[:, None]
-    print(fp32_output.shape)
+    fp32_output = fp8_output.to(torch.float) * scale
     fp16_quanted_ref = fp32_output.to(torch.float16).reshape(128, 8192)
-    # -----
     for out, us in rets:
         gpu_id = out.device.index
-        print('--- ', out.device.index)
         ori_ref = ref.clone()
         ori_tensor = ori_ref[gpu_id * 16 : (gpu_id + 1) * 16][:]
         c = fp16_quanted_ref.clone()
         c[gpu_id * 16 : (gpu_id + 1) * 16][:] = ori_tensor
-        # scaled_ref[gpu_id * 16 : (gpu_id + 1) * 16][:] = ori_tensor
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         checkAllclose(c.cpu(), out.cpu(), msg=msg)
-        # checkAllclose(ref, c.cpu(), msg=msg)
-        # checkAllclose(ref, out.to(ref), msg=msg)
 
 
 if __name__ == "__main__":
     freeze_support()
-    for dtype in [torch.float16]:#[dtypes.bf16, dtypes.fp16]:
+    for dtype in [torch.float16]:
         for shape in [(128, 8192)]:
             test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
-            # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
-
