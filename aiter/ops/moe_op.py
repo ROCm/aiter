@@ -8,7 +8,7 @@ from ..jit.core import compile_ops, AITER_CSRC_DIR
 from .enum import ActivationType, Enum, QuantType
 from ..utility import dtypes
 import functools
-
+torch.int4 = getattr(torch, "int4", torch.uint32)
 
 @compile_ops("module_moe_asm")
 def topk_softmax(
@@ -242,7 +242,7 @@ dtype2str_dict = {
     dtypes.bf16: "b16",
     dtypes.fp8: "f8",
     dtypes.i8: "i8",
-    dtypes.i32: "i4",
+    torch.uint32: "i4",
 }
 
 
@@ -299,7 +299,6 @@ def ck_moe_stage1_fwd(
     activation: ActivationType = ActivationType.Silu,
 ):
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
-
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
