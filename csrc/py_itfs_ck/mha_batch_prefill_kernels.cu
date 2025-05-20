@@ -386,7 +386,8 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                                            true, // is_group_mode
                                            mask.type,
                                            bias_type,
-                                           has_lse);
+                                           has_lse,
+                                           false);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
     }
     else
