@@ -46,6 +46,10 @@ def run_gemm_asm(x, weightshuffle, x_scale, w_scale, out, bias=None, dtype=dtype
 
 @benchmark()
 def test_gemm(dtype, M, N, K):
+    from aiter.jit.utils.chip_info import get_gfx
+
+    if get_gfx() not in ["gfx950"]:
+        return
     quant_func = aiter.get_torch_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
