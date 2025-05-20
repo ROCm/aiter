@@ -84,9 +84,8 @@ float mha_fwd(mha_fwd_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     args.min_seqlen_q == 0);
                                      use_ext_asm,
-                                     args.min_seqlen_q == 0);
+                                     args.min_seqlen_q != 0);
     float t = -1;
     {F_inner_dispatch}
     return t;

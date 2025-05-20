@@ -878,6 +878,12 @@ def _flash_attn_varlen_forward(
         else:
             md_name += "_dropout"
             filter_fwd += "_dropout*"
+        if min_seqlen_q == 0:
+            md_name += "_nchunked"
+            filter_fwd += "_nchunked*"
+        else:
+            md_name += "_chunked"
+            filter_fwd += "_chunked*"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -1331,6 +1337,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dq,
             dk,
             dv,
+            None,
             None,
             None,
             None,

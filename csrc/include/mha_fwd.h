@@ -25,7 +25,7 @@ struct mha_fwd_traits : public fmha_fwd_traits {
                         has_lse,
                         has_dropout,
                         false, // do_fp8_static_quant
-                        is_chunked_prefill}
+                        is_chunked_prefill},
         use_ext_asm(use_ext_asm) {}
   bool use_ext_asm;
 };
