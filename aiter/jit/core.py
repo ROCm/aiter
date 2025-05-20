@@ -287,7 +287,7 @@ def build_module(
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
         if hip_version > Version('5.5.00000'):
-            flags_hip += hip_flag_checker("-mllvm --lsr-drop-solution=1")
+            flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
             flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
