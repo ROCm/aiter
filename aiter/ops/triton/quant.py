@@ -175,11 +175,11 @@ def _dynamic_mxfp4_quant_kernel(
     x_fp4_ptr,
     bs_ptr,
     stride_x_m_in,
-    stride_x_n,
+    stride_x_n_in,
     stride_x_fp4_m_in,
-    stride_x_fp4_n,
+    stride_x_fp4_n_in,
     stride_bs_m_in,
-    stride_bs_n,
+    stride_bs_n_in,
     M: tl.constexpr,
     N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -192,10 +192,13 @@ def _dynamic_mxfp4_quant_kernel(
 ):
     pid_m = tl.program_id(0)
     _pid_n = tl.program_id(1) * NUM_ITER
-    # cast strides to int64 in case M*N > max int32
+    # cast strides to int64, in case M*N > max int32
     stride_x_m = tl.cast(stride_x_m_in, tl.int64)
+    stride_x_n = tl.cast(stride_x_n_in, tl.int64)
     stride_x_fp4_m = tl.cast(stride_x_fp4_m_in, tl.int64)
+    stride_x_fp4_n = tl.cast(stride_x_fp4_n_in, tl.int64)
     stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
+    stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
 
     for pid_n in tl.range(_pid_n, min(_pid_n + NUM_ITER, N), num_stages=NUM_STAGES):
         x_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
