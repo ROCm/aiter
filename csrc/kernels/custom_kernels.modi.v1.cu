@@ -367,8 +367,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     for (int i = 0; i < YTILE; i++)
       for (int n = 0; n < N; n++) sum[n][i] = 0;
 
-    bigType bigA[N][UNRL];
-    bigType bigB[YTILE][UNRL];
+    bigType bigA[N][UNRL][2];
+    bigType bigB[YTILE][UNRL][2];
     //----------------------------------------------------
     // Fetch weight matrix B in interleaved K-split!
     // - Each thread (lane) is fetching 8 elements (A_Chunk)
@@ -386,8 +386,41 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     //
     // TODO: Logic below will only work when K is multiple of 8
     //----------------------------------------------------
+
+  uint32_t k1 = 0;
+  #pragma unroll
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+        uint32_t k_ = k + threadIdx.x * A_CHUNK;
+        if (k_ >= K) break;
+
+        const scalar_t* B_ = &B[(m + 0) * K + k_];
+        bigB[0][k2][0].h8 = (loadnt((scalar8*)(&B_[0 * K])));
+        if constexpr (YTILE >= 2) bigB[1][k2][0].h8 = (loadnt((scalar8*)(&B_[1 * K])));
+        if constexpr (YTILE >= 3) bigB[2][k2][0].h8 = (loadnt((scalar8*)(&B_[2 * K])));
+        if constexpr (YTILE >= 4) bigB[3][k2][0].h8 = (loadnt((scalar8*)(&B_[3 * K])));
+        if constexpr (YTILE >= 5) bigB[4][k2][0].h8 = (loadnt((scalar8*)(&B_[4 * K])));
+        if constexpr (YTILE >= 6) bigB[5][k2][0].h8 = (loadnt((scalar8*)(&B_[5 * K])));
+        if constexpr (YTILE >= 7) bigB[6][k2][0].h8 = (loadnt((scalar8*)(&B_[6 * K])));
+        if constexpr (YTILE >= 8) bigB[7][k2][0].h8 = (loadnt((scalar8*)(&B_[7 * K])));
+      }
+
+  #pragma unroll
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+        uint32_t k_ = k + threadIdx.x * A_CHUNK;
+        if (k_ >= K) break;
+        for (int n = 0; n < N; n++) {
+          bigA[n][k2][0] = *((const bigType*)(&(s[k_ + K * n])));
+        }
+      }
+
+    k1 += THRDS * A_CHUNK * UNRL;
+    uint32_t compute_loop_k_cnt = 0;
     // for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
-    for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
+    for (; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
+      uint32_t load_k_reg_tile = (compute_loop_k_cnt + 1) % 2;
+      uint32_t compute_k_reg_tile = compute_loop_k_cnt % 2;
       // Fetch the weight matrix from memory!
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
@@ -396,31 +429,27 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         if (k_ >= K) break;
 
         const scalar_t* B_ = &B[(m + 0) * K + k_];
-        bigB[0][k2].h8 = (loadnt((scalar8*)(&B_[0 * K])));
-        asm volatile("s_waitcnt vmcnt(%0)" :: "i"(7));
+        bigB[0][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[0 * K])));
         //----------------------------------------------------
         // The following code with YTILE > 1 has to be deleted
         //----------------------------------------------------
-        if constexpr (YTILE >= 2) bigB[1][k2].h8 = (loadnt((scalar8*)(&B_[1 * K])));
-        if constexpr (YTILE >= 3) bigB[2][k2].h8 = (loadnt((scalar8*)(&B_[2 * K])));
-        if constexpr (YTILE >= 4) bigB[3][k2].h8 = (loadnt((scalar8*)(&B_[3 * K])));
-        if constexpr (YTILE >= 5) bigB[4][k2].h8 = (loadnt((scalar8*)(&B_[4 * K])));
-        if constexpr (YTILE >= 6) bigB[5][k2].h8 = (loadnt((scalar8*)(&B_[5 * K])));
-        if constexpr (YTILE >= 7) bigB[6][k2].h8 = (loadnt((scalar8*)(&B_[6 * K])));
-        if constexpr (YTILE >= 8) bigB[7][k2].h8 = (loadnt((scalar8*)(&B_[7 * K])));
+        if constexpr (YTILE >= 2) bigB[1][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[1 * K])));
+        if constexpr (YTILE >= 3) bigB[2][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[2 * K])));
+        if constexpr (YTILE >= 4) bigB[3][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[3 * K])));
+        if constexpr (YTILE >= 5) bigB[4][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[4 * K])));
+        if constexpr (YTILE >= 6) bigB[5][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[5 * K])));
+        if constexpr (YTILE >= 7) bigB[6][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[6 * K])));
+        if constexpr (YTILE >= 8) bigB[7][k2][load_k_reg_tile].h8 = (loadnt((scalar8*)(&B_[7 * K])));
       }
 
-      // Fetch activation matrix from either just LDS or from both LDS / memory
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
 
-        // Fetch A activation matrix in interleaved fashion from LDS or memory
-
         for (int n = 0; n < N; n++) {
-          bigA[n][k2] = *((const bigType*)(&(s[k_ + K * n])));
+          bigA[n][k2][load_k_reg_tile] = *((const bigType*)(&(s[k_ + K * n])));
         }
       }
 
@@ -436,35 +465,79 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         for (uint32_t n = 0; n < N; n++) {
   #pragma unroll
           for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-            DOT2C(sum[n][0], bigA[n][k2].f[b], bigB[0][k2].f[b])
+            DOT2C(sum[n][0], bigA[n][k2][compute_k_reg_tile].f[b], bigB[0][k2][compute_k_reg_tile].f[b])
             //----------------------------------------------------
             // The following code with YTILE > 1
             //----------------------------------------------------
             if constexpr (YTILE >= 2) {
-              DOT2C(sum[n][1], bigA[n][k2].f[b], bigB[1][k2].f[b]);
+              DOT2C(sum[n][1], bigA[n][k2][compute_k_reg_tile].f[b], bigB[1][k2][compute_k_reg_tile].f[b]);
             }
             if constexpr (YTILE >= 3) {
-              DOT2C(sum[n][2], bigA[n][k2].f[b], bigB[2][k2].f[b]);
+              DOT2C(sum[n][2], bigA[n][k2][compute_k_reg_tile].f[b], bigB[2][k2][compute_k_reg_tile].f[b]);
             }
             if constexpr (YTILE >= 4) {
-              DOT2C(sum[n][3], bigA[n][k2].f[b], bigB[3][k2].f[b]);
+              DOT2C(sum[n][3], bigA[n][k2][compute_k_reg_tile].f[b], bigB[3][k2][compute_k_reg_tile].f[b]);
             }
             if constexpr (YTILE >= 5) {
-              DOT2C(sum[n][4], bigA[n][k2].f[b], bigB[4][k2].f[b]);
+              DOT2C(sum[n][4], bigA[n][k2][compute_k_reg_tile].f[b], bigB[4][k2][compute_k_reg_tile].f[b]);
             }
             if constexpr (YTILE >= 6) {
-              DOT2C(sum[n][5], bigA[n][k2].f[b], bigB[5][k2].f[b]);
+              DOT2C(sum[n][5], bigA[n][k2][compute_k_reg_tile].f[b], bigB[5][k2][compute_k_reg_tile].f[b]);
             }
             if constexpr (YTILE >= 7) {
-              DOT2C(sum[n][6], bigA[n][k2].f[b], bigB[6][k2].f[b]);
+              DOT2C(sum[n][6], bigA[n][k2][compute_k_reg_tile].f[b], bigB[6][k2][compute_k_reg_tile].f[b]);
             }
             if constexpr (YTILE >= 8) {
-              DOT2C(sum[n][7], bigA[n][k2].f[b], bigB[7][k2].f[b]);
+              DOT2C(sum[n][7], bigA[n][k2][compute_k_reg_tile].f[b], bigB[7][k2][compute_k_reg_tile].f[b]);
             }
           }
         }
       }
+      compute_loop_k_cnt++;
     }
+
+
+      k1 -= THRDS * A_CHUNK * UNRL;
+      uint32_t compute_k_reg_tile = compute_loop_k_cnt % 2;
+  #pragma unroll
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+        uint32_t k_ = k + threadIdx.x * A_CHUNK;
+        if (k_ >= K) break;
+  #pragma unroll
+        for (uint32_t n = 0; n < N; n++) {
+  #pragma unroll
+          for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+            DOT2C(sum[n][0], bigA[n][k2][compute_k_reg_tile].f[b], bigB[0][k2][compute_k_reg_tile].f[b])
+            //----------------------------------------------------
+            // The following code with YTILE > 1
+            //----------------------------------------------------
+            if constexpr (YTILE >= 2) {
+              DOT2C(sum[n][1], bigA[n][k2][compute_k_reg_tile].f[b], bigB[1][k2][compute_k_reg_tile].f[b]);
+            }
+            if constexpr (YTILE >= 3) {
+              DOT2C(sum[n][2], bigA[n][k2][compute_k_reg_tile].f[b], bigB[2][k2][compute_k_reg_tile].f[b]);
+            }
+            if constexpr (YTILE >= 4) {
+              DOT2C(sum[n][3], bigA[n][k2][compute_k_reg_tile].f[b], bigB[3][k2][compute_k_reg_tile].f[b]);
+            }
+            if constexpr (YTILE >= 5) {
+              DOT2C(sum[n][4], bigA[n][k2][compute_k_reg_tile].f[b], bigB[4][k2][compute_k_reg_tile].f[b]);
+            }
+            if constexpr (YTILE >= 6) {
+              DOT2C(sum[n][5], bigA[n][k2][compute_k_reg_tile].f[b], bigB[5][k2][compute_k_reg_tile].f[b]);
+            }
+            if constexpr (YTILE >= 7) {
+              DOT2C(sum[n][6], bigA[n][k2][compute_k_reg_tile].f[b], bigB[6][k2][compute_k_reg_tile].f[b]);
+            }
+            if constexpr (YTILE >= 8) {
+              DOT2C(sum[n][7], bigA[n][k2][compute_k_reg_tile].f[b], bigB[7][k2][compute_k_reg_tile].f[b]);
+            }
+          }
+        }
+      }
+
+
 
     //----------------------------------------------------
     // Final reduction step using shuffle

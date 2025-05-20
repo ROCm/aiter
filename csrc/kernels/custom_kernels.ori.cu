@@ -397,7 +397,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
         const scalar_t* B_ = &B[(m + 0) * K + k_];
         bigB[0][k2].h8 = (loadnt((scalar8*)(&B_[0 * K])));
-        asm volatile("s_waitcnt vmcnt(%0)" :: "i"(7));
         //----------------------------------------------------
         // The following code with YTILE > 1 has to be deleted
         //----------------------------------------------------

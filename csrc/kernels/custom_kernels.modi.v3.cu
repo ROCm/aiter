@@ -293,6 +293,44 @@ void LLGemm1(void* in_a, void* in_b, void* out_c, const int M, const int K, cuda
     V0 += (s.x + s.y);                                                                                              \
   }
 
+// template <typename scalar_t, typename scalar8, int A_CHUNK>
+// union bigType2 {
+//   scalar_t h[A_CHUNK];
+//   float f[A_CHUNK / 2];
+//   float2 f2[A_CHUNK / 4];
+//   double d[A_CHUNK / 4];
+//   scalar8 h8;
+// };
+
+template <typename TO>
+__device__ __forceinline__ void cp_async_global_load(const void* input_addr, TO& output) {
+    uint64_t addr64 = reinterpret_cast<uint64_t>(input_addr);
+    uint32_t addr_lo = static_cast<uint32_t>(addr64);
+    uint32_t addr_hi = static_cast<uint32_t>(addr64 >> 32);
+
+    // asm volatile(
+    //     "global_load_dwordx4 %0, %1, %2, %3, %4, %5, off nt"
+    //     : "=v"(output.f[0]),        // vdst (start)
+    //       "=v"(output.f[1]),    // vdst+1
+    //       "=v"(output.f[2]),    // vdst+2
+    //       "=v"(output.f[3])     // vdst+3
+    //     : "v"(addr_lo),               // vaddr_lo (low 32-bit)
+    //       "v"(addr_hi)                // vaddr_hi (high 32-bit)
+    // );
+
+    asm volatile("" : "=v"(output.f[0]), "=v"(output.f[1]), "=v"(output.f[2]), "=v"(output.f[3]) : "0"(16), "1"(19));
+    asm volatile("" : "=v"(addr_lo), "=v"(addr_hi) : "0"(16), "1"(17));
+    asm volatile(
+      "global_load_dwordx4 v[%0:%3], v[%4:%5], off nt"
+      : "=v"(output.f[0]),   // vdst_start (e.g., v24)
+        "=v"(output.f[1]),   // vdst+1    (e.g., v25)
+        "=v"(output.f[2]),   // vdst+2    (e.g., v26)
+        "=v"(output.f[3])    // vdst+3    (e.g., v27)
+      : "v"(addr_lo),        // vaddr_lo (e.g., v20)
+        "v"(addr_hi)         // vaddr_hi (e.g., v21)
+    );
+}
+
 #if defined(__HIP__MI300_MI250__)  // TODO: Add NAVI support
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
@@ -300,6 +338,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_sml_(const int K, const int M, const scalar_t* B, const scalar_t* __restrict__ A, scalar_t* C,
                      const int _WvPrGrp, const int CuCount) {
   using scalar8 = __attribute__((__vector_size__((A_CHUNK / 2) * sizeof(float)))) float;
+  // using bigType = bigType2<scalar_t, scalar8, A_CHUNK>;
   union bigType {
     scalar_t h[A_CHUNK];
     float f[A_CHUNK / 2];
@@ -367,104 +406,191 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     for (int i = 0; i < YTILE; i++)
       for (int n = 0; n < N; n++) sum[n][i] = 0;
 
-    bigType bigA[N][UNRL];
-    bigType bigB[YTILE][UNRL];
-    //----------------------------------------------------
-    // Fetch weight matrix B in interleaved K-split!
-    // - Each thread (lane) is fetching 8 elements (A_Chunk)
-    // - Each wave will fetch 64*8=> 512 elements (1024B)
-    // - YTILE represents the number of column being serviced
-    //   by wave
-    // - Loop for fetching weight matrix (B) are unrolled
-    //
-    // Fetch activation matrix A from LDS
-    // - Loop for fetching activation matrix (A) are unrolled
-    //
-    // Finally, do the matrix multiplication in an unrolled
-    // fashion. This provides lot of food for compiler
-    // scheduling.
-    //
-    // TODO: Logic below will only work when K is multiple of 8
-    //----------------------------------------------------
-    // for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
-    for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
-      // Fetch the weight matrix from memory!
-  #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
-        uint32_t k_ = k + threadIdx.x * A_CHUNK;
+
+    bigType bigA[N][2 * UNRL];
+    bigType bigB[YTILE][2 * UNRL];
+    // Preloading phase
+    uint32_t buf = 0;
+    uint32_t base_k = 0;
+
+    // Preload initial misaligned data
+    #pragma unroll
+    for (uint32_t k2 = 0; k2 < UNRL; ++k2) {
+        const uint32_t k = base_k + k2 * THRDS * A_CHUNK;
+        const uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
 
-        const scalar_t* B_ = &B[(m + 0) * K + k_];
-        bigB[0][k2].h8 = (loadnt((scalar8*)(&B_[0 * K])));
-        asm volatile("s_waitcnt vmcnt(%0)" :: "i"(7));
-        //----------------------------------------------------
-        // The following code with YTILE > 1 has to be deleted
-        //----------------------------------------------------
-        if constexpr (YTILE >= 2) bigB[1][k2].h8 = (loadnt((scalar8*)(&B_[1 * K])));
-        if constexpr (YTILE >= 3) bigB[2][k2].h8 = (loadnt((scalar8*)(&B_[2 * K])));
-        if constexpr (YTILE >= 4) bigB[3][k2].h8 = (loadnt((scalar8*)(&B_[3 * K])));
-        if constexpr (YTILE >= 5) bigB[4][k2].h8 = (loadnt((scalar8*)(&B_[4 * K])));
-        if constexpr (YTILE >= 6) bigB[5][k2].h8 = (loadnt((scalar8*)(&B_[5 * K])));
-        if constexpr (YTILE >= 7) bigB[6][k2].h8 = (loadnt((scalar8*)(&B_[6 * K])));
-        if constexpr (YTILE >= 8) bigB[7][k2].h8 = (loadnt((scalar8*)(&B_[7 * K])));
-      }
+        // Load B matrix tiles
+        const scalar_t* B_ptr = &B[(m + 0) * K + k_];
+        // bigB[0][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[0 * K]));
+        // cp_async_global_load<bigType>((void*)(&B_ptr[0 * K]), bigB[0][buf * UNRL + k2]);
+        asm volatile(
+          "global_load_dwordx4 %0, %1, off nt"
+          : "=v"(bigB[0][buf * UNRL + k2].h8)
+          : "v"(&B_ptr[0 * K])
+        );
+        asm volatile("s_waitcnt vmcnt(%0)" :: "i"(0));
+        if constexpr (YTILE >= 2) bigB[1][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[1 * K]));
+        if constexpr (YTILE >= 3) bigB[2][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[2 * K]));
+        if constexpr (YTILE >= 4) bigB[3][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[3 * K]));
+        if constexpr (YTILE >= 5) bigB[4][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[4 * K]));
+        if constexpr (YTILE >= 6) bigB[5][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[5 * K]));
+        if constexpr (YTILE >= 7) bigB[6][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[6 * K]));
+        if constexpr (YTILE >= 8) bigB[7][buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[7 * K]));
 
-      // Fetch activation matrix from either just LDS or from both LDS / memory
-  #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
-        uint32_t k_ = k + threadIdx.x * A_CHUNK;
-        if (k_ >= K) break;
-
-        // Fetch A activation matrix in interleaved fashion from LDS or memory
-
-        for (int n = 0; n < N; n++) {
-          bigA[n][k2] = *((const bigType*)(&(s[k_ + K * n])));
+        // Load A matrix tiles from shared memory
+        for (int n = 0; n < N; ++n) {
+            bigA[n][buf * UNRL + k2] = *((const bigType*)(&s[k_ + K * n]));
         }
-      }
-
-      // Do the matrix multiplication in interleaved manner
-  #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
-        uint32_t k_ = k + threadIdx.x * A_CHUNK;
-        if (k_ >= K) break;
-        // Do the matrix multiplication of activation and weight matrix
-        // - Remember the accumulation is happening for K-split of 64!
-  #pragma unroll
-        for (uint32_t n = 0; n < N; n++) {
-  #pragma unroll
-          for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-            DOT2C(sum[n][0], bigA[n][k2].f[b], bigB[0][k2].f[b])
-            //----------------------------------------------------
-            // The following code with YTILE > 1
-            //----------------------------------------------------
-            if constexpr (YTILE >= 2) {
-              DOT2C(sum[n][1], bigA[n][k2].f[b], bigB[1][k2].f[b]);
-            }
-            if constexpr (YTILE >= 3) {
-              DOT2C(sum[n][2], bigA[n][k2].f[b], bigB[2][k2].f[b]);
-            }
-            if constexpr (YTILE >= 4) {
-              DOT2C(sum[n][3], bigA[n][k2].f[b], bigB[3][k2].f[b]);
-            }
-            if constexpr (YTILE >= 5) {
-              DOT2C(sum[n][4], bigA[n][k2].f[b], bigB[4][k2].f[b]);
-            }
-            if constexpr (YTILE >= 6) {
-              DOT2C(sum[n][5], bigA[n][k2].f[b], bigB[5][k2].f[b]);
-            }
-            if constexpr (YTILE >= 7) {
-              DOT2C(sum[n][6], bigA[n][k2].f[b], bigB[6][k2].f[b]);
-            }
-            if constexpr (YTILE >= 8) {
-              DOT2C(sum[n][7], bigA[n][k2].f[b], bigB[7][k2].f[b]);
-            }
-          }
-        }
-      }
+        scalar_t* a_addr0 = &s[k_ + 0 * K];
+        scalar_t* a_addr1 = &s[k_ + 1 * K];
+        scalar_t* a_addr2 = &s[k_ + 2 * K];
+        scalar_t* a_addr3 = &s[k_ + 3 * K];
+        // asm volatile(
+        //   "global_load_dwordx4 %0, %5, off nt\n\t"
+        //   "ds_read_b128 %1, %6\n\t"
+        //   "ds_read_b128 %2, %7\n\t"
+        //   "ds_read_b128 %3, %8\n\t"
+        //   "ds_read_b128 %4, %9\n\t"
+        //   : "=v"(bigB[0][buf * UNRL + k2].h8),
+        //     "=v"(bigA[0][buf * UNRL + k2].h8),
+        //     "=v"(bigA[1][buf * UNRL + k2].h8),
+        //     "=v"(bigA[2][buf * UNRL + k2].h8),
+        //     "=v"(bigA[3][buf * UNRL + k2].h8)
+        //   : "v"(&B_ptr[0 * K]),
+        //     "v"(*((int*)(&a_addr0))),
+        //     "v"(*((int*)(&a_addr1))),
+        //     "v"(*((int*)(&a_addr2))),
+        //     "v"(*((int*)(&a_addr3)))
+        //   : "memory"
+        // );
+        // asm volatile(
+        //   "ds_read_b128 %0, %4\n\t"
+        //   "ds_read_b128 %1, %5\n\t"
+        //   "ds_read_b128 %2, %6\n\t"
+        //   "ds_read_b128 %3, %7\n\t"
+        //   :  "=v"(bigA[0][buf * UNRL + k2].h8),
+        //     "=v"(bigA[1][buf * UNRL + k2].h8),
+        //     "=v"(bigA[2][buf * UNRL + k2].h8),
+        //     "=v"(bigA[3][buf * UNRL + k2].h8)
+        //   :  "v"(*((int*)(&a_addr0))),
+        //     "v"(*((int*)(&a_addr1))),
+        //     "v"(*((int*)(&a_addr2))),
+        //     "v"(*((int*)(&a_addr3)))
+        //   : "memory"
+        // );
     }
+    base_k += THRDS * A_CHUNK * UNRL;
+    buf ^= 1;  // Toggle buffer index
+
+
+    // Main processing loop for aligned blocks
+    for (; base_k < K; base_k += THRDS * A_CHUNK * UNRL) {
+        const uint32_t load_buf = buf;
+        const uint32_t compute_buf = buf ^ 1;
+
+        // Pipeline: Load next block while computing current
+        // Phase 1: Initiate async load
+        #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; ++k2) {
+            const uint32_t k_ = base_k + k2 * THRDS * A_CHUNK + threadIdx.x * A_CHUNK;
+            if (k_ >= K) break;
+
+            // Load B matrix with non-temporal hint
+            const scalar_t* B_ptr = &B[(m + 0) * K + k_];
+            bigB[0][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[0 * K]));
+            if constexpr (YTILE >= 2) bigB[1][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[1 * K]));
+            if constexpr (YTILE >= 3) bigB[2][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[2 * K]));
+            if constexpr (YTILE >= 4) bigB[3][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[3 * K]));
+            if constexpr (YTILE >= 5) bigB[4][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[4 * K]));
+            if constexpr (YTILE >= 6) bigB[5][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[5 * K]));
+            if constexpr (YTILE >= 7) bigB[6][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[6 * K]));
+            if constexpr (YTILE >= 8) bigB[7][load_buf * UNRL + k2].h8 = loadnt((scalar8*)(&B_ptr[7 * K]));
+
+            // Load A matrix from shared memory
+            for (int n = 0; n < N; ++n) {
+                bigA[n][load_buf * UNRL + k2] = *((const bigType*)(&s[k_ + K * n]));
+            }
+        }
+
+        // Phase 2: Compute previous block
+        #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; ++k2) {
+            // Matrix multiply-accumulate
+            #pragma unroll
+            for (uint32_t n = 0; n < N; ++n) {
+                #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; ++b) {
+                    DOT2C(sum[n][0], bigA[n][compute_buf * UNRL + k2].f[b], bigB[0][compute_buf * UNRL + k2].f[b])
+                    if constexpr (YTILE >= 2) {
+                      DOT2C(sum[n][1], bigA[n][compute_buf * UNRL + k2].f[b], bigB[1][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 3) {
+                      DOT2C(sum[n][2], bigA[n][compute_buf * UNRL + k2].f[b], bigB[2][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 4) {
+                      DOT2C(sum[n][3], bigA[n][compute_buf * UNRL + k2].f[b], bigB[3][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 5) {
+                      DOT2C(sum[n][4], bigA[n][compute_buf * UNRL + k2].f[b], bigB[4][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 6) {
+                      DOT2C(sum[n][5], bigA[n][compute_buf * UNRL + k2].f[b], bigB[5][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 7) {
+                      DOT2C(sum[n][6], bigA[n][compute_buf * UNRL + k2].f[b], bigB[6][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 8) {
+                      DOT2C(sum[n][7], bigA[n][compute_buf * UNRL + k2].f[b], bigB[7][compute_buf * UNRL + k2].f[b]);
+                    }
+                }
+            }
+        }
+        buf ^= 1;  // Swap buffers
+    }
+
+    // Final computation for last complete block
+    {
+        base_k -= THRDS * A_CHUNK * UNRL;
+        const uint32_t compute_buf = buf ^ 1;
+        #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; ++k2) {
+            const uint32_t k_ = base_k + k2 * THRDS * A_CHUNK + threadIdx.x * A_CHUNK;
+            if (k_ >= K) break;
+
+            // Final MAC operations
+            #pragma unroll
+            for (uint32_t n = 0; n < N; ++n) {
+                #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; ++b) {
+                    DOT2C(sum[n][0], bigA[n][compute_buf * UNRL + k2].f[b], bigB[0][compute_buf * UNRL + k2].f[b])
+                    if constexpr (YTILE >= 2) {
+                      DOT2C(sum[n][1], bigA[n][compute_buf * UNRL + k2].f[b], bigB[1][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 3) {
+                      DOT2C(sum[n][2], bigA[n][compute_buf * UNRL + k2].f[b], bigB[2][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 4) {
+                      DOT2C(sum[n][3], bigA[n][compute_buf * UNRL + k2].f[b], bigB[3][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 5) {
+                      DOT2C(sum[n][4], bigA[n][compute_buf * UNRL + k2].f[b], bigB[4][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 6) {
+                      DOT2C(sum[n][5], bigA[n][compute_buf * UNRL + k2].f[b], bigB[5][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 7) {
+                      DOT2C(sum[n][6], bigA[n][compute_buf * UNRL + k2].f[b], bigB[6][compute_buf * UNRL + k2].f[b]);
+                    }
+                    if constexpr (YTILE >= 8) {
+                      DOT2C(sum[n][7], bigA[n][compute_buf * UNRL + k2].f[b], bigB[7][compute_buf * UNRL + k2].f[b]);
+                    }
+                }
+            }
+        }
+    }
+
+
 
     //----------------------------------------------------
     // Final reduction step using shuffle

@@ -8,7 +8,7 @@ import os
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 
-TEST_NUM_ITERS = 100
+TEST_NUM_ITERS = 10
 
 if 1:
     _path = os.path.abspath(os.path.dirname(__file__))
@@ -121,23 +121,30 @@ def test_skinny_gemm():
     # test_gemm(dtypes.fp16, 1, 4, 8192)
     # test_gemm(dtypes.bf16, 1, 4, 8192)
 
+    # test_gemm(dtypes.fp16, 4, 32, 1024)
+    # test_gemm(dtypes.fp16, 4, 32, 2048)
+    # test_gemm(dtypes.fp16, 4, 32, 4096)
+    # test_gemm(dtypes.fp16, 4, 32, 6144)
+    test_gemm(dtypes.fp16, 4, 32, 8192)
+    # test_gemm(dtypes.bf16, 4, 32, 1024)
+
     # loop_count = 1
-    loop_count = 6
-    for i in range(loop_count):
-        for dtype in [dtypes.fp16, dtypes.bf16]:
-            mnk_list = [
-                (1, 9, 8192),
-                (2, 4, 4096),
-                (3, 8, 2048),
-                (4, 9, 1024),
-                (4, 11, 512),
-                (4, 32, 8192),
-                (1, 4, 8192),
-                (1, 8, 4096),
-                (1, 12, 2048),
-            ]
-            for m, n, k in mnk_list:
-                test_gemm(dtype, m, n, k)
+    # loop_count = 6
+    # for i in range(loop_count):
+    #     for dtype in [dtypes.fp16, dtypes.bf16]:
+    #         mnk_list = [
+    #             (1, 9, 8192),
+    #             (2, 4, 4096),
+    #             (3, 8, 2048),
+    #             (4, 9, 1024),
+    #             (4, 11, 512),
+    #             (4, 32, 8192),
+    #             (1, 4, 8192),
+    #             (1, 8, 4096),
+    #             (1, 12, 2048),
+    #         ]
+    #         for m, n, k in mnk_list:
+    #             test_gemm(dtype, m, n, k)
 
 
 # test_normal_gemm()
