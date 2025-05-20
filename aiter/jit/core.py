@@ -293,8 +293,10 @@ def build_module(
         if hip_version > Version("6.1.40090"):
             flags_hip += ["-mllvm -enable-post-misched=0"]
         if hip_version > Version("6.2.41132"):
-            flags_hip += ["-mllvm -amdgpu-early-inline-all=true",
-                           "-mllvm -amdgpu-function-calls=false"]
+            flags_hip += [
+                "-mllvm -amdgpu-early-inline-all=true",
+                "-mllvm -amdgpu-function-calls=false",
+            ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
 
