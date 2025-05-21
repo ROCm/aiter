@@ -1275,7 +1275,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 // Kernel Entry
 //
 
-template <typename Traits, typename scalar_t, typename acc_t, bool kIsCausal, bool kDoSplit>
+template <typename Traits, typename scalar_t, typename acc_t, typename out_t, bool kIsCausal, bool kDoSplit>
 __launch_bounds__(Traits::kNumThreads, Traits::kWaveOccupancy)
 __global__ void kn_fmla_fwd_splictkv_prefill(
     const FlashMlaPrefillFwdParams params)
@@ -1331,7 +1331,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                            int64_t(hqid) * params.stride_h_lseacc +     // head offset
                            int64_t(bid) * params.stride_b_lseacc +      // batch offset
                            int64_t(split_id) * params.stride_sp_lseacc; // split offset
-        acc_t* p_out_acc = reinterpret_cast<acc_t*>(params.p_output_accum) +
+        out_t* p_out_acc = reinterpret_cast<out_t*>(params.p_output_accum) +
                            int64_t(hqid) * params.stride_h_oacc +      // head offset
                            int64_t(bid) * params.stride_b_oacc +       // batch offset
                            int64_t(split_id) * params.stride_sp_oacc;  // split offset
@@ -1349,7 +1349,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         auto out_acc_dram_window =
             ck_tile::make_tile_window(out_acc_dram, out_acc_dram_window_lengths, {mid, 0});
 
-        kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t, acc_t>(
+        kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t, out_t>(
             q_dram_window,
             k_page_block_navigator,
             v_page_block_navigator,
@@ -1367,9 +1367,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         // Assuming lse is in shape [b, h, s] and is contiguous
         acc_t* p_lse = reinterpret_cast<acc_t*>(params.p_softmax_lse) +
                        (int64_t(bid) * params.size_h + hqid) * params.size_s; // batch+head offset
-        scalar_t* p_out = reinterpret_cast<scalar_t*>(params.p_output) +
-                          int64_t(hqid) * params.stride_h_o +   // head offset
-                          int64_t(bid) * params.stride_b_o;     // batch offset
+        out_t* p_out = reinterpret_cast<out_t*>(params.p_output) +
+                       int64_t(hqid) * params.stride_h_o +   // head offset
+                       int64_t(bid) * params.stride_b_o;     // batch offset
 
         auto lse_dram_window_lengths =
             ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{});
@@ -1384,7 +1384,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         auto out_dram_window =
             ck_tile::make_tile_window(out_dram, out_dram_window_lengths, {mid, 0});
 
-        kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t, scalar_t>(
+        kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t, out_t>(
             q_dram_window,
             k_page_block_navigator,
             v_page_block_navigator,
@@ -1399,14 +1399,14 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     }    
 }
 
-template <typename Traits, int32_t kMaxSplits, typename scalar_t, typename acc_t>
+template <typename Traits, int32_t kMaxSplits, typename out_t, typename in_t>
 __global__ void kn_fmla_fwd_splictkv_prefill_combine(
     const FlashMlaPrefillFwdParams params)
 {
-    using Policy  = FlashMlaCombineKernelPolicy<Traits, scalar_t, acc_t>;
+    using Policy  = FlashMlaCombineKernelPolicy<Traits, out_t, in_t>;
     using index_t = int64_t;
 
-    __shared__ acc_t lds_lse_scale[kMaxSplits];
+    __shared__ in_t lds_lse_scale[kMaxSplits];
 
     const int32_t bidx = blockIdx.z;
 
@@ -1425,20 +1425,20 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
 
     if (ck_tile::get_warp_id() == 0)
     {
-        const acc_t* p_lse_accum = reinterpret_cast<acc_t*>(params.p_softmax_lseaccum) + offset_lse_accum;
-        acc_t* p_lse             = reinterpret_cast<acc_t*>(params.p_softmax_lse) + offset_lse;
+        const in_t* p_lse_accum = reinterpret_cast<in_t*>(params.p_softmax_lseaccum) + offset_lse_accum;
+        in_t* p_lse             = reinterpret_cast<in_t*>(params.p_softmax_lse) + offset_lse;
 
         constexpr int32_t kNumLsePerThr = ck_tile::integer_divide_ceil(kMaxSplits, ck_tile::get_warp_size());
-        acc_t local_lse[kNumLsePerThr];
+        in_t local_lse[kNumLsePerThr];
 
         // Load thread local LSE and get local max LSE
-        acc_t max_lse = -ck_tile::numeric<acc_t>::infinity();
+        in_t max_lse = -ck_tile::numeric<in_t>::infinity();
         #pragma unroll
         for (int32_t i = 0; i < kNumLsePerThr; ++i)
         {
             const int32_t split_idx = i * ck_tile::get_warp_size() + lane_id;
-            const acc_t lse =
-                (split_idx < num_splits) ? p_lse_accum[split_idx * size_hs] : -ck_tile::numeric<acc_t>::infinity();
+            const in_t lse =
+                (split_idx < num_splits) ? p_lse_accum[split_idx * size_hs] : -ck_tile::numeric<in_t>::infinity();
             local_lse[i] = lse;
             max_lse = ck_tile::max(max_lse, lse);
         }
@@ -1451,7 +1451,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
         }
 
         // Get sum of LSE
-        acc_t sum_lse = 0.f;
+        in_t sum_lse = 0.f;
         #pragma unroll
         for (int32_t i = 0; i < kNumLsePerThr; ++i)
         {
@@ -1464,8 +1464,8 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
         }
 
         // Get global LSE
-        acc_t global_lse = ((sum_lse == 0.f) || (sum_lse != sum_lse)) ?
-            ck_tile::numeric<acc_t>::infinity() : (ck_tile::log(sum_lse) + max_lse);
+        in_t global_lse = ((sum_lse == 0.f) || (sum_lse != sum_lse)) ?
+            ck_tile::numeric<in_t>::infinity() : (ck_tile::log(sum_lse) + max_lse);
         if (lane_id == 0)
         {
             *p_lse = global_lse;
@@ -1491,13 +1491,13 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
     auto oaccu_window =
         Policy::MakeOaccuTileWindow(params.p_output_accum, shidx, size_hs, split_offset, num_splits);
 
-    auto reg_out = ck_tile::make_static_distributed_tensor<acc_t>(
+    auto reg_out = ck_tile::make_static_distributed_tensor<in_t>(
         decltype(ck_tile::load_tile(oaccu_window))::get_tile_distribution());
     ck_tile::set_tile(reg_out, 0.f);
 
     for (int32_t split_idx = 0; split_idx < num_splits; ++split_idx)
     {
-        const acc_t lse_scale = lds_lse_scale[split_idx];
+        const in_t lse_scale = lds_lse_scale[split_idx];
         auto oaccu = ck_tile::load_tile(oaccu_window);
         ck_tile::sweep_tile(oaccu, [&](auto idx) {
             reg_out(idx) += lse_scale * oaccu(idx);
@@ -1506,16 +1506,16 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
     }
 
     auto dram_out = Policy::MakeOutputTileWindow(
-        static_cast<scalar_t*>(params.p_output) +
+        static_cast<out_t*>(params.p_output) +
         bidx * params.stride_b_o + hidx * params.stride_h_o + sidx * params.stride_s_o);
-    ck_tile::store_tile(dram_out, ck_tile::cast_tile<scalar_t>(reg_out));
+    ck_tile::store_tile(dram_out, ck_tile::cast_tile<out_t>(reg_out));
 }
 
 // =====================================================================================================================
 // Dispatch
 //
 
-template <typename Traits, typename scalar_t, typename acc_t, bool kIsCausal>
+template <typename Traits, typename scalar_t, typename acc_t, typename out_t, bool kIsCausal>
 void dispatch_fmla_fwd_splictkv_prefill(
     const FlashMlaPrefillFwdParams& params)
 {
@@ -1527,7 +1527,9 @@ void dispatch_fmla_fwd_splictkv_prefill(
 
     if (params.num_splits > 1)
     {
-        auto kn_attn = &kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, kIsCausal, true>;
+        // out_t is not take into consideration when doing splits because combine shader is always expected to do
+        // the final output type conversion.
+        auto kn_attn = &kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, acc_t, kIsCausal, true>;
         auto kn_comb =
             (params.num_splits <= 32)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 32,  scalar_t, acc_t> :
             // (params.num_splits <= 64)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 64,  scalar_t, acc_t> :
@@ -1540,7 +1542,7 @@ void dispatch_fmla_fwd_splictkv_prefill(
     }
     else
     {
-        auto kn_attn = &kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, kIsCausal, false>;
+        auto kn_attn = &kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, kIsCausal, false>;
         kn_attn<<<grid_attn, Traits::kNumThreads, 0, stream>>>(params);
     }
 }
@@ -1549,42 +1551,44 @@ void dispatch_fmla_fwd_splictkv_prefill(
 // Interfaces
 //
 
-#define DISPATCH_FMLA_TYPES(TYPE, IS_CAUSAL, NAME, ...) \
-    switch ((TYPE))                                     \
-    {                                                   \
-        case at::ScalarType::BFloat16:                  \
-        {                                               \
-            using scalar_t = ck_tile::bf16_t;           \
-            if ((IS_CAUSAL))                            \
-            {                                           \
-                constexpr bool Is_causal = true;        \
-                __VA_ARGS__;                            \
-            }                                           \
-            else                                        \
-            {                                           \
-                constexpr bool Is_causal = false;       \
-                __VA_ARGS__;                            \
-            }                                           \
-            break;                                      \
-        }                                               \
-        case at::ScalarType::Half:                      \
-        {                                               \
-            using scalar_t = ck_tile::fp16_t;           \
-            if ((IS_CAUSAL))                            \
-            {                                           \
-                constexpr bool Is_causal = true;        \
-                __VA_ARGS__;                            \
-            }                                           \
-            else                                        \
-            {                                           \
-                constexpr bool Is_causal = false;       \
-                __VA_ARGS__;                            \
-            }                                           \
-            break;                                      \
-        }                                               \
-        default:                                        \
-            TORCH_CHECK(false, NAME " does't support ", \
-                        toString((TYPE)), ".");         \
+#define DISPATCH_FMLA_TYPES(TYPE, IS_CAUSAL, NAME, ...)                      \
+    switch ((TYPE))                                                          \
+    {                                                                        \
+        case at::ScalarType::BFloat16:                                       \
+        {                                                                    \
+            using scalar_t = ck_tile::bf16_t;                                \
+            using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>; \
+            if ((IS_CAUSAL))                                                 \
+            {                                                                \
+                constexpr bool Is_causal = true;                             \
+                __VA_ARGS__;                                                 \
+            }                                                                \
+            else                                                             \
+            {                                                                \
+                constexpr bool Is_causal = false;                            \
+                __VA_ARGS__;                                                 \
+            }                                                                \
+            break;                                                           \
+        }                                                                    \
+        case at::ScalarType::Half:                                           \
+        {                                                                    \
+            using scalar_t = ck_tile::fp16_t;                                \
+            using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>; \
+            if ((IS_CAUSAL))                                                 \
+            {                                                                \
+                constexpr bool Is_causal = true;                             \
+                __VA_ARGS__;                                                 \
+            }                                                                \
+            else                                                             \
+            {                                                                \
+                constexpr bool Is_causal = false;                            \
+                __VA_ARGS__;                                                 \
+            }                                                                \
+            break;                                                           \
+        }                                                                    \
+        default:                                                             \
+            TORCH_CHECK(false, NAME " does't support ",                      \
+                        toString((TYPE)), ".");                              \
     }
 
 int num_splits_heuristic(int batch_nhead_mblocks, int num_SMs, int num_n_blocks, int max_splits)
@@ -1674,10 +1678,14 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 {
     //                                        dqk  dv   m0  n0  n1  #warp
     using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4>;
+    constexpr bool kForceOutAcc = true;
+    using acc_t = float;
 
     torch::Tensor vcache = value_cache.data_ptr() ? value_cache : key_cache;
 
     auto opts = query.options();
+    static_assert(std::is_same_v<acc_t, float>);
+    auto opts_acc = opts.dtype(torch::kFloat32);
 
     const int32_t batch_size = query.size(0);
     const int32_t seqlen_q_ori = query.size(1);
@@ -1690,17 +1698,14 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const int32_t page_block_size = key_cache.size(1);
     const int32_t num_heads_k = key_cache.size(2);
 
-    auto output = torch::empty({batch_size, seqlen_q_ori, num_heads_q, head_size_v}, opts);
-    auto softmax_lse = torch::empty({batch_size, num_heads_q, seqlen_q_ori}, opts.dtype(torch::kFloat32));
+    const int32_t num_splits = calculate_num_splits<Traits>(batch_size, num_heads_q, seqlen_q_ori);
+    const bool    do_splits = num_splits > 1;
 
-    torch::Tensor softmax_lseaccum;
-    torch::Tensor output_accum;
-    int32_t num_splits = calculate_num_splits<Traits>(batch_size, num_heads_q, seqlen_q_ori);
-    if (num_splits > 1)
-    {
-        output_accum = torch::empty({batch_size, num_splits, seqlen_q_ori, num_heads_q, head_size_v}, opts.dtype(torch::kFloat32));
-        softmax_lseaccum = torch::empty({batch_size, num_splits, num_heads_q, seqlen_q_ori}, opts.dtype(torch::kFloat32));
-    }
+    // Combine shader, which only exists when num_splits > 1, will conduct type convert by default and force.
+    // Thus, kForceOutAcc doesn't work in this case.
+    auto output = torch::empty({batch_size, seqlen_q_ori, num_heads_q, head_size_v},
+                               (kForceOutAcc && !do_splits) ? opts_acc : opts);
+    auto softmax_lse = torch::empty({batch_size, num_heads_q, seqlen_q_ori}, opts_acc);
 
     FlashMlaPrefillFwdParams params = {};
 
@@ -1713,8 +1718,6 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.p_value            = vcache.data_ptr();
     params.p_output           = output.data_ptr();
     params.p_softmax_lse      = softmax_lse.data_ptr();
-    params.p_softmax_lseaccum = (num_splits > 1) ? softmax_lseaccum.data_ptr() : nullptr;
-    params.p_output_accum     = (num_splits > 1) ? output_accum.data_ptr() : nullptr;
 
     params.size_b                   = batch_size;
     params.size_s                   = seqlen_q_ori;
@@ -1736,23 +1739,33 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.stride_b_o = output.stride(0);
     params.stride_s_o = output.stride(1);
     params.stride_h_o = output.stride(2);
-    params.stride_b_oacc = (num_splits > 1) ? output_accum.stride(0) : 0;
-    params.stride_h_oacc = (num_splits > 1) ? output_accum.stride(3) : 0;
-    params.stride_sp_oacc = (num_splits > 1) ? output_accum.stride(1) : 0;
-    params.stride_s_oacc = (num_splits > 1) ? output_accum.stride(2) : 0;
-    params.stride_b_lseacc = (num_splits > 1) ? softmax_lseaccum.stride(0) : 0;
-    params.stride_h_lseacc = (num_splits > 1) ? softmax_lseaccum.stride(2) : 0;
-    params.stride_sp_lseacc = (num_splits > 1) ? softmax_lseaccum.stride(1) : 0;
 
-	using acc_t = float;
+    if (num_splits > 1)
+    {
+        auto output_accum =
+            torch::empty({batch_size, num_splits, seqlen_q_ori, num_heads_q, head_size_v}, opts_acc);
+        auto softmax_lseaccum =
+            torch::empty({batch_size, num_splits, num_heads_q, seqlen_q_ori}, opts_acc);
+
+        params.p_softmax_lseaccum = softmax_lseaccum.data_ptr();
+        params.p_output_accum     = output_accum.data_ptr();
+        params.stride_b_oacc      = output_accum.stride(0);
+        params.stride_h_oacc      = output_accum.stride(3);
+        params.stride_sp_oacc     = output_accum.stride(1);
+        params.stride_s_oacc      = output_accum.stride(2);
+        params.stride_b_lseacc    = softmax_lseaccum.stride(0);
+        params.stride_h_lseacc    = softmax_lseaccum.stride(2);
+        params.stride_sp_lseacc   = softmax_lseaccum.stride(1);
+    }
+
     DISPATCH_FMLA_TYPES(
         query.scalar_type(),
         is_causal,
         "fmla_fwd",
         [&](){
-            dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, Is_causal>(params);
+            dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, Is_causal>(params);
         }();
     );
 
-    return {output, softmax_lse};
+    return {output.to(opts), softmax_lse};
 }
