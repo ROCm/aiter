@@ -45,7 +45,7 @@ def mxfp4_to_f32(x):
 
 def f32_to_e8m0(x):
     u32 = x.view(torch.int32)
-    exponent = ((u32 >> 23) & 0xFF).to(torch.uint8)
+    exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
     nan_case = exponent == 0xFF
     round_case = ((u32 & 0x400000) > 0) & (
         ((u32 & 0x200000) > 0) | ((u32 & 0x1FFFFF) > 0) | (exponent > 0)

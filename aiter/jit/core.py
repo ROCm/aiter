@@ -275,7 +275,7 @@ def build_module(
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
             "-mllvm --amdgpu-kernarg-preload-count=16",
-            # "-v", "--save-temps",
+            # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
@@ -304,9 +304,7 @@ def build_module(
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
-        for i in reversed(range(len(flags_hip))):
-            if not hip_flag_checker(flags_hip[i]):
-                del flags_hip[i]
+        flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
