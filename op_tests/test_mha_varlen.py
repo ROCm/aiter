@@ -113,7 +113,7 @@ def run_ck(
     else:
         bias_unpad = None
 
-    out_unpad = aiter.flash_attn_varlen_func(
+    out_unpad, _, S_dmask = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
         v_unpad,
@@ -231,8 +231,8 @@ def test_flash_attn_varlen_func(
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
-    return_lse = False
-    return_attn_probs = False 
+    return_lse = True
+    return_attn_probs = True 
 
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True
@@ -286,18 +286,17 @@ def test_flash_attn_varlen_func(
     elif bias_type == "alibi":
         alibi_slopes = torch.rand(batch_size, nheads, device="cuda", dtype=dtypes.fp32)
 
-    # dout = torch.randn(
-    #     batch_size,
-    #     seqlen_q,
-    #     nheads,
-    #     d_v,
-    #     device="cuda",
-    #     dtype=dtype,
-    #     requires_grad=True,
-    # )
-    dout = None
+    dout = torch.randn(
+        batch_size,
+        seqlen_q,
+        nheads,
+        d_v,
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
 
-    out, dropout_mask = run_ck(
+    out, dropout_mask, dq, dk, dv = run_ck(
         q,
         k,
         v,
@@ -315,7 +314,7 @@ def test_flash_attn_varlen_func(
         return_attn_probs,
     )
 
-    out_ref = run_torch(
+    out_ref, dq_ref, dk_ref, dv_ref = run_torch(
         q,
         k,
         v,
@@ -330,7 +329,7 @@ def test_flash_attn_varlen_func(
         window_size,
     )
 
-    out_pt = run_torch(
+    out_pt, dq_pt, dk_pt, dv_pt = run_torch(
         q,
         k,
         v,
@@ -356,20 +355,20 @@ def test_flash_attn_varlen_func(
     if bias_type == "bias":
         pytest.skip("Does not support varlen bwd for bias")
 
-    # print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    # print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    # print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    # print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    # print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    # print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-    #
-    # dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    # dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    # dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    # assert (dq - dq_ref).abs().max().item() <= dq_tol
-    # assert (dk - dk_ref).abs().max().item() <= dk_tol
-    # assert (dv - dv_ref).abs().max().item() <= dv_tol
+    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+
+    assert (dq - dq_ref).abs().max().item() <= dq_tol
+    assert (dk - dk_ref).abs().max().item() <= dk_tol
+    assert (dv - dv_ref).abs().max().item() <= dv_tol
 
 
 if __name__ == "__main__":
@@ -379,7 +378,7 @@ if __name__ == "__main__":
     d = 192
     d_v = 192
     dropout_p = 0.
-    min_seqlen_qs = 1
+    min_seqlen_q = 1
     causal = True
     local = False
     bias_type = "no"
