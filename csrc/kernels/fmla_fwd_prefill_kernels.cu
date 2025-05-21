@@ -1154,7 +1154,15 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     {
                         constexpr auto ij = ck_tile::make_tuple(id0, id1);
                         ck_tile::static_for<0, n1_loops, 1>{}([&](auto n1_id){
+#if 1
+                            acc_t o_acc_v = o_acc[n1_id](ij);
+                            asm volatile("v_mul_f32 %[v_o_acc], %[v_tmp], %[v_o_acc]\n"
+                                        : [v_o_acc] "+v"(o_acc_v)
+                                        : [v_tmp] "v"(temp_i));
+                            o_acc[n1_id](ij) = o_acc_v;
+#else
                             o_acc[n1_id](ij) *= temp_i;
+#endif
                         });
                     });
             });
@@ -1256,7 +1264,18 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         }();
         ck_tile::sweep_tile_span(o_spans[ck_tile::number<1>{}], [&](auto id1) {
             constexpr auto ij = ck_tile::make_tuple(id0, id1);
-            ck_tile::static_for<0, n1_loops, 1>{}([&](auto n1_id){o_acc[n1_id](ij) *= tmp;});
+            ck_tile::static_for<0, n1_loops, 1>{}([&](auto n1_id)
+            {
+#if 1
+                acc_t o_acc_v = o_acc[n1_id](ij);
+                asm volatile("v_mul_f32 %[v_o_acc], %[v_tmp], %[v_o_acc]\n"
+                             : [v_o_acc] "+v"(o_acc_v)
+                             : [v_tmp] "v"(tmp));
+                o_acc[n1_id](ij) = o_acc_v;
+#else
+                o_acc[n1_id](ij) *= tmp;
+#endif
+            });
         });
     });
 
