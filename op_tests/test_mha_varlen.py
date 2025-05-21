@@ -77,6 +77,7 @@ def run_ck(
     v,
     query_padding_mask,
     key_padding_mask,
+    min_seqlen_q=0,
     bias=None,
     alibi_slopes=None,
     dout=None,
@@ -112,7 +113,7 @@ def run_ck(
     else:
         bias_unpad = None
 
-    out_unpad, _, S_dmask = aiter.flash_attn_varlen_func(
+    out_unpad = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
         v_unpad,
@@ -120,8 +121,8 @@ def run_ck(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        0,
-        dropout_p,
+        min_seqlen_q=min_seqlen_q,
+        dropout_p=dropout_p,
         causal=causal,
         window_size=window_size,
         bias=bias_unpad,
@@ -130,11 +131,12 @@ def run_ck(
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
     )
-
     out = output_pad_fn(out_unpad)
+
     if dropout_p > 0.0:
         (_, seqlen_q, _, d) = q.shape
         (_, seqlen_k, _, d) = k.shape
+        S_dmask = fwd_reg[-1]
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
             S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
@@ -172,6 +174,7 @@ def run_ck(
 @pytest.mark.parametrize("bias_type", ["no", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("min_seqlen_q", [0, 1])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("nheads", [9])
@@ -214,6 +217,7 @@ def test_flash_attn_varlen_func(
     seqlen_k,
     d,
     d_v,
+    min_seqlen_q,
     dropout_p,
     causal,
     local,
@@ -228,7 +232,7 @@ def test_flash_attn_varlen_func(
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
     return_lse = True
-    return_attn_probs = True
+    return_attn_probs = True 
 
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True
@@ -298,6 +302,7 @@ def test_flash_attn_varlen_func(
         v,
         query_padding_mask,
         key_padding_mask,
+        min_seqlen_q,
         attn_bias,
         alibi_slopes,
         dout,
@@ -372,26 +377,29 @@ if __name__ == "__main__":
     (seqlen_q, seqlen_k) = (4, 4)
     d = 192
     d_v = 192
-    dropout_p = 0.5
-    causal = False
+    dropout_p = 0.
+    min_seqlen_qs = [1, 0]
+    causal = True
     local = False
     bias_type = "no"
     deterministic = True
     mha_type = "mha"
     dtype = dtypes.bf16
 
-    test_flash_attn_varlen_func(
-        batch_size,
-        nheads,
-        seqlen_q,
-        seqlen_k,
-        d,
-        d_v,
-        dropout_p,
-        causal,
-        local,
-        bias_type,
-        deterministic,
-        mha_type,
-        dtype,
-    )
+    for min_seqlen_q in min_seqlen_qs:
+        test_flash_attn_varlen_func(
+            batch_size,
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            d,
+            d_v,
+            min_seqlen_q,
+            dropout_p,
+            causal,
+            local,
+            bias_type,
+            deterministic,
+            mha_type,
+            dtype,
+        )
