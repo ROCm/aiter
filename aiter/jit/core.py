@@ -139,7 +139,8 @@ def validate_and_update_archs():
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str):
     ret = os.system(
-        f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -Wno-unused-command-line-argument -"
+        # f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -Wno-unused-command-line-argument -"
+        f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null"
     )
     if ret == 0:
         return [flag_hip]
@@ -275,7 +276,7 @@ def build_module(
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
             "-mllvm --amdgpu-kernarg-preload-count=16",
-            # "-v", "--save-temps",
+            # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
