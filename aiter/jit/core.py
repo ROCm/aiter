@@ -139,7 +139,6 @@ def validate_and_update_archs():
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str):
     ret = os.system(
-        # f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -Wno-unused-command-line-argument -"
         f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null"
     )
     if ret == 0:
