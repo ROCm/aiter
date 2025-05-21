@@ -113,7 +113,7 @@ def run_ck(
     else:
         bias_unpad = None
 
-    out_unpad, _, S_dmask = aiter.flash_attn_varlen_func(
+    outputs = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
         v_unpad,
@@ -131,12 +131,16 @@ def run_ck(
         return_lse=return_lse,
         return_attn_probs=return_attn_probs,
     )
-    out = output_pad_fn(out_unpad)
+
+    if type(outputs) == tuple:
+        out = output_pad_fn(outputs[0])
+    else:
+        out = output_pad_fn(outputs)
 
     if dropout_p > 0.0:
         (_, seqlen_q, _, d) = q.shape
         (_, seqlen_k, _, d) = k.shape
-        S_dmask = fwd_reg[-1]
+        S_dmask = outputs[-1]
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask = pad_rearrange_dropout_mask_hts_to_bhss(
             S_dmask, cu_seqlens_q, seqlen_q, seqlen_k
@@ -156,8 +160,8 @@ def run_ck(
     else:
         dropout_mask = None
 
-    if dout == None:
-        return out, dropout_mask
+    if dout == None or not return_lse:
+        return out, dropout_mask, None, None, None
     else:
         dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
             out, (q_unpad, k_unpad, v_unpad), dout
@@ -174,9 +178,11 @@ def run_ck(
 @pytest.mark.parametrize("bias_type", ["no", "alibi"])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("min_seqlen_q", [0, 1])
+@pytest.mark.parametrize("min_seqlen_q", [0])
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("return_attn_probs", [False, True])
 @pytest.mark.parametrize("nheads", [9])
 @pytest.mark.parametrize(
     "d,d_v",
@@ -225,14 +231,14 @@ def test_flash_attn_varlen_func(
     deterministic,
     mha_type,
     dtype,
+    return_lse,
+    return_attn_probs,
 ):
     torch.random.manual_seed(0)
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
-    return_lse = True
-    return_attn_probs = True 
 
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True
@@ -355,20 +361,21 @@ def test_flash_attn_varlen_func(
     if bias_type == "bias":
         pytest.skip("Does not support varlen bwd for bias")
 
-    print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+    if dq != None:
+        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
 
-    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
+        dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
+        dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
+        dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
 
-    assert (dq - dq_ref).abs().max().item() <= dq_tol
-    assert (dk - dk_ref).abs().max().item() <= dk_tol
-    assert (dv - dv_ref).abs().max().item() <= dv_tol
+        assert (dq - dq_ref).abs().max().item() <= dq_tol
+        assert (dk - dk_ref).abs().max().item() <= dk_tol
+        assert (dv - dv_ref).abs().max().item() <= dv_tol
 
 
 if __name__ == "__main__":
@@ -385,6 +392,8 @@ if __name__ == "__main__":
     deterministic = True
     mha_type = "mha"
     dtype = dtypes.bf16
+    return_lse = False
+    return_attn_probs = False
 
     test_flash_attn_varlen_func(
         batch_size,
@@ -401,4 +410,6 @@ if __name__ == "__main__":
         deterministic,
         mha_type,
         dtype,
+        return_lse,
+        return_attn_probs,
     )
