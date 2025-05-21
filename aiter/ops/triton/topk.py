@@ -130,7 +130,7 @@ def topk_stage1_kernel(
             x_val = tl.where(
                 cols == chunk_select_idx,
                 tl.constexpr(torch.finfo(torch.float32).min),
-                
+
                 x_val,
             )
         else:
@@ -263,7 +263,7 @@ def topk_stage2_kernel(
 
     FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max)
     mask_index_val = tl.constexpr(torch.iinfo(torch.int32).min) if DESCENDING else tl.constexpr(torch.iinfo(torch.int32).max)
-    
+
 
     chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
     chunk_index_val = tl.load(chunk_index + cols, mask=mask, other=mask_index_val).to(
@@ -325,7 +325,7 @@ def two_stage_topk(x, k, dim=-1, largest=True, sorted=True):
     )
     stage2_elem_cnt = chunk_num * k
     BLOCK_SIZE = triton.next_power_of_2(stage2_elem_cnt)
- 
+
     topk_stage2_kernel[batch_size,](
         stage2_out,
         stage2_out_idx,
