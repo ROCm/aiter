@@ -297,7 +297,7 @@ void dynamic_per_token_scaled_quant(
             scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
             cols); });
   }
-#if defined(__gfx950__)
+#if defined(__Float4_e2m1fn_x2)
   else if (out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
   {
     AITER_DISPATCH_FLOATING16_TYPES(

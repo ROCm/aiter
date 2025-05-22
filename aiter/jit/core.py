@@ -299,7 +299,8 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-
+        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+            flags_hip += ["-D__Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
