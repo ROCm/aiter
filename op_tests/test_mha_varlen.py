@@ -132,7 +132,7 @@ def run_ck(
         return_attn_probs=return_attn_probs,
     )
 
-    if type(outputs) == tuple:
+    if type(outputs) is tuple:
         out = output_pad_fn(outputs[0])
     else:
         out = output_pad_fn(outputs)
@@ -160,7 +160,7 @@ def run_ck(
     else:
         dropout_mask = None
 
-    if dout == None or not return_lse:
+    if dout is None or not return_lse:
         return out, dropout_mask, None, None, None
     else:
         dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
@@ -363,7 +363,7 @@ def test_flash_attn_varlen_func(
     if bias_type == "bias":
         pytest.skip("Does not support varlen bwd for bias")
 
-    if dq != None:
+    if dq is not None:
         print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
         print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
         print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")

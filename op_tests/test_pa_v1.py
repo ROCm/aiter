@@ -68,7 +68,6 @@ def kv_cache_factory(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
-    scale = head_size**-0.5
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     key_caches: List[torch.Tensor] = []

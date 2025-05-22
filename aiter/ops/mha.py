@@ -879,11 +879,11 @@ def _flash_attn_varlen_forward(
             md_name += "_dropout"
             filter_fwd += "_dropout*"
         if min_seqlen_q == 0:
-            md_name += "_nchunked"
-            filter_fwd += "_nchunked*"
+            md_name += "_nskip"
+            filter_fwd += "_nskip*"
         else:
-            md_name += "_chunked"
-            filter_fwd += "_chunked*"
+            md_name += "_skip"
+            filter_fwd += "_skip*"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)

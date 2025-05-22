@@ -23,7 +23,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bool has_lse,
                                   bool has_dropout,
                                   bool use_ext_asm,
-                                  bool is_chunked_prefill = false)
+                                  bool skip_min_seqlen_q = false)
 {{
     return mha_fwd_traits(head_size_q,
                           head_size_v,
@@ -35,7 +35,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           has_lse,
                           has_dropout,
                           use_ext_asm,
-                          is_chunked_prefill);
+                          skip_min_seqlen_q);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
