@@ -81,7 +81,7 @@ def _gemm_afp4_wfp4_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        remap_xcd(pid, GRID_MN)
+        pid = remap_xcd(pid, GRID_MN)
 
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
@@ -266,9 +266,9 @@ def _get_config(
         if BLK_M == 32:
             return _get_config._config_dict["medium_M32"]
         elif BLK_M == 64:
-            return _get_config._config_dict["medium_M64"]
+            return _get_config._config_dict["medium_M64"][str(N)]
         elif BLK_M == 128:
-            return _get_config._config_dict["medium_M128"]
+            return _get_config._config_dict["medium_M128"][str(N)]
     elif M <= 256:
         return _get_config._config_dict["large"]
     else:
@@ -310,7 +310,7 @@ def gemm_afp4wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    print(f"AFP4WFP4_config={config}")
+    #print(f"AFP4WFP4_config={config}")
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
