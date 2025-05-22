@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
 from aiter.test_common import (
     checkAllclose,
     benchmark,
     run_perftest,
     perftest,
-    tensor_load,
 )
-from einops import rearrange
+from aiter import dtypes
+import pandas as pd
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -28,12 +27,10 @@ def test_nofuse(
 
     M, _ = hidden_states.shape
 
-    topk_weights = torch.empty(
-        M, topk, dtype=torch.float32, device=hidden_states.device
-    )
-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+    topk_weights = torch.empty(M, topk, dtype=dtypes.fp32, device=hidden_states.device)
+    topk_ids = torch.empty(M, topk, dtype=dtypes.i32, device=hidden_states.device)
     token_expert_indicies = torch.empty(
-        M, topk, dtype=torch.int32, device=hidden_states.device
+        M, topk, dtype=dtypes.i32, device=hidden_states.device
     )
 
     aiter.topk_softmax(
@@ -72,8 +69,9 @@ def test_topk_softmax(dtype, m, n, E, topk):
         hidden_states, gating_output, topk, True
     )
     msg = f"[perf] {m=}, {n=}, {E=}, {topk=}, dtype: {dtype}, ref avg: {avg_a:<8.2f} us, b avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
-    checkAllclose(topk_weights_a, topk_weights_b, atol=0.03, msg=msg)
+    err = checkAllclose(topk_weights_a, topk_weights_b, atol=0.03, msg=msg)
     checkAllclose(topk_ids_a, topk_ids_b, atol=0, msg="topk_ids")
+    return {"err": err, "us": avg_b}
 
 
 @aiter.test_common.benchmark()
@@ -95,8 +93,8 @@ def test_biased_grouped_topk(
         num_warmup=1,
     )
     w_ref = w_ref * scale_factor
-    w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=torch.float32)
-    id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=torch.int32)
+    w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
+    id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
     _, us_aiter = run_perftest(
         aiter.biased_grouped_topk,
         gating_output,
@@ -116,12 +114,13 @@ def test_biased_grouped_topk(
     # print(f'{id_aiter=}')
     # print(f'  {w_ref=}')
     # print(f'{w_aiter=}')
-    checkAllclose(w_ref, w_aiter, msg=f"topk_weights [golden vs aiter]")
+    err = checkAllclose(w_ref, w_aiter, msg="topk_weights [golden vs aiter]")
     checkAllclose(
         id_ref,
         id_aiter,
         msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
+    return {"err": err, "us": us_aiter}
 
 
 @benchmark()
@@ -150,8 +149,8 @@ def test_grouped_topk(
         num_warmup=1,
     )
     w_ref = w_ref * scale_factor
-    w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=torch.float32)
-    id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=torch.int32)
+    w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
+    id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
     _, us_aiter = run_perftest(
         aiter.grouped_topk,
         gating_output,
@@ -165,10 +164,10 @@ def test_grouped_topk(
     )
     id_ref, _ref = torch.sort(id_ref)
     id_aiter, _aiter = torch.sort(id_aiter)
-    checkAllclose(
+    err = checkAllclose(
         w_ref.gather(1, _ref),
         w_aiter.gather(1, _aiter),
-        msg=f"topk_weights [golden vs aiter]",
+        msg="topk_weights [golden vs aiter]",
     )
     checkAllclose(
         id_ref,
@@ -176,24 +175,35 @@ def test_grouped_topk(
         msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
 
+    return {"err": err, "us": us_aiter}
 
-for dtype in [torch.float16, torch.bfloat16]:
+
+df = []
+for dtype in [dtypes.fp16, dtypes.bf16]:
     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256][-2:-1]:
         for n in [4096, 8192, 16384, 32768, 65536][1:2]:
-            test_topk_softmax(dtype, m, n, 32, 5)
+            ret = test_topk_softmax(dtype, m, n, 32, 5)
+            df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
 
-
-# for token in [16][:]:
-for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000][:]:
+df = []
+for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384][:]:
     # DeepSeek-R1
     topk = 8
     group = 8
     topk_group = 4
     expert = 256
-    dtype = torch.bfloat16
+    dtype = dtypes.bf16
     need_renorm = True
-    test_biased_grouped_topk(token, expert, group, topk, topk_group, need_renorm, dtype)
+    ret = test_biased_grouped_topk(
+        token, expert, group, topk, topk_group, need_renorm, dtype
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
 
+df = []
 for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000]:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
@@ -201,9 +211,9 @@ for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000]:
         group = 8
         topk_group = 4
         expert = 256
-        dtype = torch.bfloat16
+        dtype = dtypes.bf16
         need_renorm = True
-        test_grouped_topk(
+        ret = test_grouped_topk(
             token,
             expert,
             group,
@@ -214,3 +224,6 @@ for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000]:
             scale_factor=1.5,
             scoring_func=scoring_func,
         )
+        df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")

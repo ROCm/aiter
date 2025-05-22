@@ -3,10 +3,10 @@
 
 import torch
 import torch.nn.functional as F
-import numpy as np
 import aiter
 import argparse
 from aiter.test_common import checkAllclose, perftest
+from aiter import dtypes
 
 
 @perftest()
@@ -53,7 +53,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale=None, y_scale_dtype=
             )
     elif x_scale is None:
         y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
-        output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+        output = torch.empty(input.shape, dtype=dtypes.i8, device="cuda")
         if residual is None:
             residual_out = None
             aiter.layernorm2d_fwd_with_dynamicquant(
@@ -66,7 +66,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale=None, y_scale_dtype=
             )
     else:
         y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
-        output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+        output = torch.empty(input.shape, dtype=dtypes.i8, device="cuda")
         if residual is None:
             residual_out = None
             aiter.layernorm2d_fwd_with_smoothquant(
@@ -92,7 +92,7 @@ def run_ck(input, weight, bias, eps, residual=None, x_scale=None, y_scale_dtype=
 @perftest()
 def run_asm(input, weight, bias, eps, residual, x_scale, y_scale_dtype):
     y_scale = torch.empty(input.shape[0], 1, dtype=y_scale_dtype, device="cuda")
-    output = torch.empty(input.shape, dtype=torch.int8, device="cuda")
+    output = torch.empty(input.shape, dtype=dtypes.i8, device="cuda")
     residual_out = torch.empty_like(input)
     aiter.layernorm2d_with_add_smoothquant_asm(
         output, input, residual, residual_out, x_scale, y_scale, weight, bias, eps
@@ -111,7 +111,7 @@ def test_layernorm2d_instance(dtype, m, n):
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     )
     checkAllclose(a, b)
-    print(f"[passed~]")
+    print("[passed~]")
 
 
 def test_layernorm2d_fuseAdd_instance(dtype, m, n):
@@ -128,7 +128,7 @@ def test_layernorm2d_fuseAdd_instance(dtype, m, n):
     )
     checkAllclose(a, b, rtol=1e-2, atol=1e-1)
     checkAllclose(res_a, res_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_layernorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleType):
@@ -149,7 +149,7 @@ def test_layernorm2d_fuseSmoothquant_instance(dtype, m, n, xscaleType, yscaleTyp
     )
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscaleType):
@@ -193,14 +193,14 @@ def test_layernorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscal
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
-    print(f" [passed~]")
+    print(" [passed~]")
     print(
         f"[perf] dim: {dim}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
     )
     checkAllclose(a, c, rtol=0, atol=1)
     checkAllclose(res_a, res_c)
     checkAllclose(yscale_a, yscale_c, rtol=1e-2, atol=1e-2)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_layernorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
@@ -220,7 +220,7 @@ def test_layernorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
     )
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(yscale_a, yscale_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_layernorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
@@ -242,12 +242,12 @@ def test_layernorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
     checkAllclose(a, b, rtol=0, atol=1)
     checkAllclose(res_a, res_b)
     checkAllclose(yscale_a, yscale_b)
-    print(f" [passed~]")
+    print(" [passed~]")
 
 
 def test_layernorm2d():
     print("\nstart layernorm2d test")
-    for dtype in [torch.float16, torch.bfloat16]:
+    for dtype in [dtypes.fp16, dtypes.bf16]:
         for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
             for n in [4096, 8192, 16384, 32768, 65536]:
                 test_layernorm2d_instance(dtype, m, n)
@@ -255,7 +255,7 @@ def test_layernorm2d():
 
 def test_layernorm2d_fuseAdd():
     print("\nstart layernorm2d fuse add test")
-    for dtype in [torch.float16, torch.bfloat16]:
+    for dtype in [dtypes.fp16, dtypes.bf16]:
         for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
             for n in [4096, 8192, 16384, 32768, 65536]:
                 test_layernorm2d_fuseAdd_instance(dtype, m, n)
@@ -263,8 +263,8 @@ def test_layernorm2d_fuseAdd():
 
 def test_layernorm2d_fuseSmoothquant():
     print("\nstart layernorm2d fuse Smoothquant test")
-    for scaleType in [torch.float32]:
-        for dtype in [torch.float16, torch.bfloat16]:
+    for scaleType in [dtypes.fp32]:
+        for dtype in [dtypes.fp16, dtypes.bf16]:
             for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
                 for n in [10, 4096, 8192]:
                     test_layernorm2d_fuseSmoothquant_instance(
@@ -274,8 +274,8 @@ def test_layernorm2d_fuseSmoothquant():
 
 def test_layernorm2d_fuseAdd_Smoothquant():
     print("\nstart layernorm2d fuse add Smoothquant test")
-    for scaleType in [torch.float32]:
-        for dtype in [torch.bfloat16]:
+    for scaleType in [dtypes.fp32]:
+        for dtype in [dtypes.bf16]:
             for m in [2, 4, 8, 16, 32, 64, 128, 256]:
                 for n in [8192]:
                     test_layernorm2d_fuseAdd_Smoothquant_instance(
@@ -285,8 +285,8 @@ def test_layernorm2d_fuseAdd_Smoothquant():
 
 def test_layernorm2d_fuseDynamicquant():
     print("\nstart layernorm2d fuse Smoothquant test")
-    for scaleType in [torch.float32]:
-        for dtype in [torch.float16, torch.bfloat16]:
+    for scaleType in [dtypes.fp32]:
+        for dtype in [dtypes.fp16, dtypes.bf16]:
             for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
                 for n in [1024, 2048]:
                     test_layernorm2d_fuseDynamicquant_instance(
@@ -296,8 +296,8 @@ def test_layernorm2d_fuseDynamicquant():
 
 def test_layernorm2d_fuseAdd_Dynamicquant():
     print("\nstart layernorm2d fuse add Smoothquant test")
-    for scaleType in [torch.float32]:
-        for dtype in [torch.float16, torch.bfloat16]:
+    for scaleType in [dtypes.fp32]:
+        for dtype in [dtypes.fp16, dtypes.bf16]:
             for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
                 for n in [1024, 2048]:
                     test_layernorm2d_fuseAdd_Dynamicquant_instance(

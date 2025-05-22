@@ -7,7 +7,8 @@ import aiter
 from aiter.test_common import checkAllclose, run_perftest
 from aiter.fused_moe import torch_moe, moe_sorting, fused_topk
 from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant, ck_moe
+from aiter import pertoken_quant
+from aiter import dtypes
 from einops import rearrange
 
 BLOCK_SIZE_M = 32
@@ -29,7 +30,7 @@ def torch_moe_blockscale(
     fc2_scale=None,
     expert_mask=None,
 ):
-    computeType = torch.float
+    computeType = dtypes.fp32
     hidden_states = hidden_states.to(computeType)
     w1 = w1.to(computeType)
     w2 = w2.to(computeType)
@@ -38,7 +39,7 @@ def torch_moe_blockscale(
     B, D = hidden_states.shape
     topk = topk_weight.shape[1]
     if expert_mask is not None:
-        local_expert_hash = expert_mask.cumsum(0, dtype=torch.int32) - 1
+        local_expert_hash = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
         local_expert_hash[expert_mask == 0] = -1
         topk_ids = local_expert_hash[topk_ids]
 
@@ -136,7 +137,7 @@ def asm_moe_test(
     model_dim = hidden_states.shape[-1]
     topk = topk_ids.shape[-1]
     E = w1.shape[0]
-    sorted_token_ids, sorted_weight_buf, sorted_expert_ids, num_valid_ids, out_asm = (
+    sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, out_asm = (
         moe_sorting(topk_ids, topk_weights, E, model_dim, dtype)
     )
     scale_blk_n, scale_blk_k = scale_blk
@@ -146,7 +147,7 @@ def asm_moe_test(
         w1,
         w2,
         sorted_token_ids,
-        sorted_weight_buf,
+        sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
         topk,
@@ -185,7 +186,7 @@ def test_fmoe(
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     scale_blk_n, scale_blk_k = scale_blks
-    quant_dtype = torch.float8_e4m3fnuz
+    quant_dtype = dtypes.fp8
 
     # block quant w1
     tmp = rearrange(
@@ -285,7 +286,7 @@ def test_fmoe(
     checkAllclose(out_ref, out_asm, rtol=0.05, atol=0.05, msg=msg)
 
 
-for dtype in [torch.bfloat16]:
+for dtype in [dtypes.bf16]:
     for m in [1, 2, 5, 16, 32, 163840]:
         for dim in [7168]:
             for idim in [256]:

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 #include "moe_op.h"
+#include "py_itfs_common.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -94,7 +95,7 @@ public:
                        torch::Tensor &w1,                // [expert, inter_dim, dim] N,K
                        torch::Tensor &w2,                // [expert, dim, inter_dim]
                        torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                       torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                       torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                        torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                        torch::Tensor &num_valid_ids,     // [1]
                        uint32_t topk,                    //
@@ -155,7 +156,7 @@ public:
             args.ptr_SMQ = nullptr;
         }
         args.ptr_STP = sorted_token_ids.data_ptr();
-        args.ptr_SW = sorted_weight_buf.data_ptr();
+        args.ptr_SW = sorted_weights.data_ptr();
         args.ptr_SEP = sorted_expert_ids.data_ptr();
         args.dim = dim;
         args.inter_dim = inter_dim;
@@ -258,7 +259,7 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
           torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
           torch::Tensor &down,              // [expert, dim, inter_dim]
           torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-          torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+          torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
           torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
           torch::Tensor &num_valid_ids,     // [1]
           uint32_t topk                     //
@@ -277,13 +278,13 @@ void fmoe(torch::Tensor &out,               // [token_cnt, dim]
         impl_ptr = &impl_b16;
     }
     TORCH_CHECK(impl_ptr != nullptr,
-                __func__, ": unsupport current input type");
+                __func__, ": unsupport current input type:", input.scalar_type());
     impl_ptr->launch_kernel<uint16_t, uint16_t>(out,
                                                 input,
                                                 gate,
                                                 down,
                                                 sorted_token_ids,
-                                                sorted_weight_buf,
+                                                sorted_weights,
                                                 sorted_expert_ids,
                                                 num_valid_ids,
                                                 topk);
@@ -294,7 +295,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                     torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
                     torch::Tensor &down,              // [expert, dim, inter_dim]
                     torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                    torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                     torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                     torch::Tensor &num_valid_ids,     // [1]
                     uint32_t topk,                    //
@@ -385,7 +386,7 @@ void fmoe_int8_g1u0(torch::Tensor &out,               // [token_cnt, dim]
                                                gate,
                                                down,
                                                sorted_token_ids,
-                                               sorted_weight_buf,
+                                               sorted_weights,
                                                sorted_expert_ids,
                                                num_valid_ids,
                                                topk,
@@ -400,7 +401,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
                torch::Tensor &down,                           // [expert, dim, inter_dim]
                torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,              // [max_num_tokens_padded]
+               torch::Tensor &sorted_weights,                 // [max_num_tokens_padded]
                torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
                torch::Tensor &num_valid_ids,                  // [1]
                uint32_t topk,                                 //
@@ -514,7 +515,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
             TORCH_CHECK(false, __func__, "No valid kernel selected!");
         }
     }
-    else if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
+    else if (input.dtype() == torch_fp8)
     {
         static std::unordered_map<int, FMoeKernelConfig> multix_kernel_fp8_configs = {
             {512, {"fmoe_fp8_g1u1_multix_subGU_512", "fmoe_fp8_g1u1_multix_subGU_512.co", 512}},
@@ -593,7 +594,7 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
                                                gate,
                                                down,
                                                sorted_token_ids,
-                                               sorted_weight_buf,
+                                               sorted_weights,
                                                sorted_expert_ids,
                                                num_valid_ids,
                                                topk,
@@ -605,19 +606,19 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
 }
 
 void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt, dim]
-               torch::Tensor &input,                          // [token_cnt, dim] M,K
-               torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
-               torch::Tensor &down,                           // [expert, dim, inter_dim]
-               torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
-               torch::Tensor &sorted_weight_buf,              // [max_num_tokens_padded]
-               torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
-               torch::Tensor &num_valid_ids,                  // [1]
-               uint32_t topk,                                 //
-               torch::Tensor &input_scale,                    // [token_cnt, 1]
-               torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
-               torch::Tensor &fc2_scale,                      // [expert, 1, dim]
-               std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
-               ActivationType activation)
+                    torch::Tensor &input,                          // [token_cnt, dim] M,K
+                    torch::Tensor &gate,                           // [expert, inter_dim*2, dim] N,K
+                    torch::Tensor &down,                           // [expert, dim, inter_dim]
+                    torch::Tensor &sorted_token_ids,               // [max_num_tokens_padded]
+                    torch::Tensor &sorted_weights,                 // [max_num_tokens_padded]
+                    torch::Tensor &sorted_expert_ids,              // [max_num_m_blocks]
+                    torch::Tensor &num_valid_ids,                  // [1]
+                    uint32_t topk,                                 //
+                    torch::Tensor &input_scale,                    // [token_cnt, 1]
+                    torch::Tensor &fc1_scale,                      // [expert, 1, inter_dim]
+                    torch::Tensor &fc2_scale,                      // [expert, 1, dim]
+                    std::optional<torch::Tensor> fc2_smooth_scale, // [expert, 1, inter_dim]
+                    ActivationType activation)
 {
     struct FMoeKernelConfig
     {
@@ -633,8 +634,7 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
     const int block_m = 32; // fmoe sorting kernel and fmoe kernel only support 32 for now
     const int estimated_sub_X_cnt = (token_cnt * topk + block_m - 1) / block_m;
 
-
-    if (input.dtype() == at::ScalarType::Float8_e4m3fnuz)
+    if (input.dtype() == torch_fp8)
     {
         static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_configs = {
             {512, {"fmoe_fp8_g1u1_subGU_512_silu_tkw1", "fmoe/silu/fmoe_fp8_g1u1_subGU_512_silu_tkw1.co", 512}},
@@ -696,7 +696,7 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
     }
     else
     {
-        TORCH_CHECK(false, __func__, " Input only supput Fp8!");
+        TORCH_CHECK(false, __func__, " Unsupported input dtype:", input.dtype());
     }
 
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
@@ -704,7 +704,7 @@ void fmoe_g1u1_tkw1(torch::Tensor &out,                            // [token_cnt
                                                gate,
                                                down,
                                                sorted_token_ids,
-                                               sorted_weight_buf,
+                                               sorted_weights,
                                                sorted_expert_ids,
                                                num_valid_ids,
                                                topk,
@@ -720,7 +720,7 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                         torch::Tensor &gate,              // [expert, inter_dim, dim] N,K
                         torch::Tensor &down,              // [expert, dim, inter_dim]
                         torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                        torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                        torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                         torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                         torch::Tensor &num_valid_ids,     // [1]
                         uint32_t topk,                    //
@@ -736,7 +736,7 @@ void fmoe_int8_g1u0_a16(torch::Tensor &out,               // [token_cnt, dim]
                                                 gate,
                                                 down,
                                                 sorted_token_ids,
-                                                sorted_weight_buf,
+                                                sorted_weights,
                                                 sorted_expert_ids,
                                                 num_valid_ids,
                                                 topk,
@@ -752,7 +752,7 @@ void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
                    torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
                    torch::Tensor &down,              // [expert, dim, inter_dim]
                    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                   torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                   torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                    torch::Tensor &num_valid_ids,     // [1]
                    uint32_t topk,                    //
@@ -772,7 +772,7 @@ void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
         static FMoeKernel impl_int8_320("fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
         impl_ptr = &impl_int8_320;
     }
-    else if (gate.dtype() == at::ScalarType::Float8_e4m3fnuz)
+    else if (gate.dtype() == torch_fp8)
     {
         int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
         if (selectedTile == 512)
@@ -798,7 +798,7 @@ void fmoe_g1u1_a16(torch::Tensor &out,               // [token_cnt, dim]
                                                      gate,
                                                      down,
                                                      sorted_token_ids,
-                                                     sorted_weight_buf,
+                                                     sorted_weights,
                                                      sorted_expert_ids,
                                                      num_valid_ids,
                                                      topk,
@@ -814,7 +814,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
                               torch::Tensor &gate,              // [expert, inter_dim*2, dim] N,K
                               torch::Tensor &down,              // [expert, dim, inter_dim]
                               torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-                              torch::Tensor &sorted_weight_buf, // [max_num_tokens_padded]
+                              torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
                               torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
                               torch::Tensor &num_valid_ids,     // [1]
                               uint32_t topk,                    //
@@ -836,12 +836,12 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
     {
         if (enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
         {
-            static FMoeKernel impl_256("fmoe_fp8_blockscale_g1u1_subGU_256", "fmoe_fp8_blockscale_g1u1_subGU_256.co", 256);
+            static FMoeKernel impl_256("_ZN5aiter34fmoe_fp8_blockscale_g1u1_subGU_256E", "/fmoe/fmoe_fp8_blockscale_g1u1_subGU_256.co", 256);
             impl_ptr = &impl_256;
         }
         else
         {
-            static FMoeKernel impl_256_novs("fmoe_fp8_blockscale_g1u1_novs_subGU_256", "fmoe_fp8_blockscale_g1u1_novs_subGU_256.co", 256);
+            static FMoeKernel impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256E", "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256.co", 256);
             impl_ptr = &impl_256_novs;
         }
     }
@@ -853,7 +853,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor &out,               // [token_cnt, d
                                                       gate,
                                                       down,
                                                       sorted_token_ids,
-                                                      sorted_weight_buf,
+                                                      sorted_weights,
                                                       sorted_expert_ids,
                                                       num_valid_ids,
                                                       topk,

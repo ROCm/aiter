@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
+#include "py_itfs_common.h"
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -113,16 +114,16 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                 static AiterAsmKernel impl_a16w8_f16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_f16_2tg_g8_i8.co");
                 impl_ptr = &impl_a16w8_f16_i8;
             }
-            else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            else if (K.dtype() == torch_fp8)
             {
                 if (high_precision.value() == 0)
                 {
-                    static AiterAsmKernel impl_a16w8_f16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_f16_2tg_g8_f8.co");
+                    static AiterAsmKernel impl_a16w8_f16_f8("_ZN5aiter32pa_fp16_pertokenFp8_a16w8_2tg_g8E", "/pa/pa_fp16_pertokenFp8_a16w8_2tg_g8.co");
                     impl_ptr = &impl_a16w8_f16_f8;
                 }
                 else if (high_precision.value() == 1)
                 {
-                    static AiterAsmKernel impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16("pa_a16w8_2tg_g8_f8_q_fp16_tail_bf16", "pa_a16w8_2tg_g8_f8_q_fp16_tail_bf16.co");
+                    static AiterAsmKernel impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16("_ZN5aiter45pa_bf16_pertokenFp8_a16w8_g8_q_fp16_tail_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_g8_q_fp16_tail_bf16.co");
                     impl_ptr = &impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16;
                 }
                 else
@@ -136,24 +137,24 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
         {
             if (K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
             {
-                static AiterAsmKernel impl_a16w8_b16_i8("pa_a16w8_2tg_g8_i8", "pa_a16w8_b16_2tg_g8_i8.co");
+                static AiterAsmKernel impl_a16w8_b16_i8("_ZN5aiter33pa_bf16_pertokenInt8_a16w8_2tg_g8E", "/pa/pa_bf16_pertokenInt8_a16w8_2tg_g8.co");
                 impl_ptr = &impl_a16w8_b16_i8;
             }
-            else if (K.dtype() == at::ScalarType::Float8_e4m3fnuz)
+            else if (K.dtype() == torch_fp8)
             {
                 if (high_precision.value() == 0)
                 {
-                    static AiterAsmKernel impl_a16w8_b16_f8("pa_a16w8_2tg_g8_f8", "pa_a16w8_b16_2tg_g8_f8.co");
+                    static AiterAsmKernel impl_a16w8_b16_f8("_ZN5aiter32pa_bf16_pertokenFp8_a16w8_2tg_g8E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8.co");
                     impl_ptr = &impl_a16w8_b16_f8;
                 }
                 else if (high_precision.value() == 1)
                 {
-                    static AiterAsmKernel impl_a16w8_b16_f8_tail_bf16("pa_a16w8_2tg_g8_f8_tail_bf16", "pa_a16w8_bf16_2tg_g8_f8_tail_bf16.co");
+                    static AiterAsmKernel impl_a16w8_b16_f8_tail_bf16("_ZN5aiter42pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16.co");
                     impl_ptr = &impl_a16w8_b16_f8_tail_bf16;
                 }
                 else if (high_precision.value() == 2)
                 {
-                    static AiterAsmKernel impl_a16w8_b16_f8_gemm1_bf16("pa_a16w8_2tg_g8_f8_gemm1_bf16", "pa_a16w8_bf16_2tg_g8_f8_gemm1_bf16.co");
+                    static AiterAsmKernel impl_a16w8_b16_f8_gemm1_bf16("_ZN5aiter43pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16.co");
                     impl_ptr = &impl_a16w8_b16_f8_gemm1_bf16;
                 }
                 else
@@ -177,12 +178,12 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
         }
         else if (Q.dtype() == at::ScalarType::BFloat16)
         {
-            static AiterAsmKernel impl_a16w16_b16("pa_kernel_func", "pa_a16w16_b16.co");
+            static AiterAsmKernel impl_a16w16_b16("_ZN5aiter22pa_bf16_noquant_a16w16E", "/pa/pa_bf16_noquant_a16w16.co");
             impl_ptr = &impl_a16w16_b16;
         }
     }
     TORCH_CHECK(impl_ptr != nullptr,
-                __func__, ": unsupport current input type");
+                __func__, ": unsupport current Q_type:", Q.scalar_type());
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,

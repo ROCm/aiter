@@ -2,12 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
-from op_tests.triton.utils import mla_decode_ref, mla_extend_ref
 from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.test_mha_common import attention_ref
-from einops import rearrange
+from aiter import dtypes
 import random
 import itertools
 
@@ -317,7 +314,7 @@ def test_mla(
     #     num_kv_splits = 16
     #     attn_logits = torch.empty(
     #         (total_q, nhead, num_kv_splits, v_head_dim + 1),
-    #         dtype=torch.float32,
+    #         dtype=dtypes.fp32,
     #     )
     #     _, us_ref = run_perftest(
     #         mla_decode_ref.decode_attention_fwd,
@@ -363,6 +360,10 @@ def test_mla(
     #               msg=f'attn_logits [golden vs aiter_asm]')
     # checkAllclose(lse_ref, attn_lse,
     #               msg=f'attn_lse    [golden vs aiter_asm]')
+    flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    bytes = (
+        total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
+    ) * (torch.finfo(dtype).bits // 8)
     checkAllclose(
         out_ref,
         out_asm,
@@ -371,7 +372,11 @@ def test_mla(
     return {
         "prefill:ck_192": us_aiter,
         "prefill:asm_576": us_asm,
+        "decode:flops": flops,
+        "decode:bytes": bytes,
         "decode:asm_576": us_asm_decode,
+        "decode:TFLOPS": flops / us_asm_decode / 1e6,
+        "decode:TB/s": bytes / us_asm_decode / 1e6,
     }
 
 
@@ -380,10 +385,10 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
-list_dtype = [(torch.bfloat16, torch.bfloat16)]
+list_dtype = [(dtypes.bf16, dtypes.bf16)]
 list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]
 list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:]
-list_nhead = [(16, 1), (128, 2)]
+list_nhead = [(16, 1), (128, 2)][:]
 import pandas as pd
 
 for nhead, mtp in list_nhead:
@@ -406,7 +411,6 @@ for nhead, mtp in list_nhead:
             mtp=mtp,
         )
         df.append(ret)
-
     df = pd.DataFrame(df)
-    # df.to_csv("mla_prefill.csv")
+    # df.to_csv(f"mla_mtp{mtp}.csv")
     aiter.logger.info(f"summary:\n{df}")

@@ -5,9 +5,11 @@
 
 import torch
 import aiter
+from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
+from .jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -83,8 +85,7 @@ def _fwd_kernel_stage2_asm(
 @functools.lru_cache()
 def get_meta_param(num_kv_splits, device, bs, nhead):
     if num_kv_splits is None:
-        device_properties = torch.cuda.get_device_properties(device)
-        cu_num = device_properties.multi_processor_count
+        cu_num = get_cu_num()
         num_kv_splits = min(16, max(1, cu_num // bs))
 
     get_mgc = {16: 64, 128: 16}
@@ -108,10 +109,10 @@ def mla_decode_fwd(
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
+    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
 
@@ -120,7 +121,7 @@ def mla_decode_fwd(
     if nhead == 16:
         logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
-            dtype=torch.float,
+            dtype=dtypes.fp32,
             device=device,
         )
         assert (
@@ -132,7 +133,7 @@ def mla_decode_fwd(
             if num_kv_splits == 1
             else torch.empty(
                 (total_s, num_kv_splits, nhead, v_head_dim),
-                dtype=torch.float,
+                dtype=dtypes.fp32,
                 device=device,
             )
         )
@@ -140,7 +141,7 @@ def mla_decode_fwd(
         assert False, f"{nhead=} not supported"
 
     attn_lse = torch.empty(
-        (total_s, num_kv_splits, nhead, 1), dtype=torch.float, device=device
+        (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
 
     aiter.mla_decode_stage1_asm_fwd(
@@ -161,7 +162,7 @@ def mla_decode_fwd(
     Lv = v_head_dim
     BLOCK_DV = triton.next_power_of_2(Lv)
     grid = (bs, nhead, max_seqlen_q)
-    extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+    extra_kargs = {"waves_per_eu": 4}
     _fwd_kernel_stage2_asm[grid](
         logits,
         attn_lse,
@@ -212,10 +213,10 @@ def mla_prefill_fwd(
 
     logits = o.view(bs, num_kv_splits, nhead, v_head_dim)
     # logits = torch.empty(
-    #     (bs, num_kv_splits, nhead, v_head_dim), dtype=torch.float, device=device
+    #     (bs, num_kv_splits, nhead, v_head_dim), dtype=dtypes.fp32, device=device
     # )
     attn_lse = torch.empty(
-        (bs, num_kv_splits, nhead, 1), dtype=torch.float, device=device
+        (bs, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
 
     aiter.mla_prefill_asm_fwd(

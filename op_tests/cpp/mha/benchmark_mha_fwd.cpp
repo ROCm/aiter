@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "mha_fwd.h"
 #include "ck_tile/host.hpp"
 #include "ck_tile/ref/naive_attention.hpp"
@@ -66,6 +66,7 @@ auto create_args(int argc, char* argv[])
                 "0",
                 "scale factor of S. 0 means equal to 1/sqrt(hdim).\n"
                 "note when squant=1, this value will be modified by range_q/k")
+        .insert("logits_soft_cap", "0", "attention logits soft capping value.")
         .insert("range_q", "16", "per-tensor quantization range of q. used if squant=1.")
         .insert("range_k", "16", "per-tensor quantization range of k. used if squant=1.")
         .insert("range_v", "16", "per-tensor quantization range of v. used if squant=1.")
@@ -130,7 +131,8 @@ auto create_args(int argc, char* argv[])
         .insert("page_block_size", "0", "paged-kvcache block size. 0 means not use paged-kvcahe")
         .insert("cache_batch_idx", "0", "whether to use index map to the kvcache")
         .insert("warmup", "5", "number of iterations before benchmark the kernel")
-        .insert("repeat", "20", "number of iterations to benchmark the kernel");
+        .insert("repeat", "20", "number of iterations to benchmark the kernel")
+        .insert("fwd_v3", "0", "if set to 1, some cases will call the fwd v3 kernel");
 
     bool result = arg_parser.parse(argc, argv);
     return std::make_tuple(result, arg_parser);
@@ -407,6 +409,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
     if(scale_s == .0f)
         scale_s = 1.0 / ck_tile::sqrt(static_cast<float>(hdim_q)); // TODO: q ? v ?
 
+    const float logits_soft_cap = arg_parser.get_float("logits_soft_cap");
+
     std::string squant_str = arg_parser.get_str("squant");
     bool squant            = [&]() {
         if(squant_str == "auto")
@@ -460,6 +464,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
     int stream_warmup = arg_parser.get_int("warmup");
     int stream_repeat = arg_parser.get_int("repeat");
     bool kname        = arg_parser.get_bool("kname");
+    bool fwd_v3       = arg_parser.get_bool("fwd_v3");
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -965,6 +970,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.scale_p = scale_p;
             args.scale_o = scale_o;
 
+            args.logits_soft_cap = logits_soft_cap;
+
             args.stride_bias =
                 (bias.type == bias_enum::alibi ? (bias.rank_info == 0 ? 0 : nhead) : stride_bias);
             args.stride_o          = stride_o;
@@ -1037,7 +1044,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                           stream_config,
                                           data_type,
                                           mode == mode_enum::group,
-                                          mask,
+                                          mask.type,
                                           bias.type,
                                           lse);
         }
@@ -1049,9 +1056,10 @@ bool run(const ck_tile::ArgParser& arg_parser)
                               stream_config,
                               data_type,
                               mode == mode_enum::group,
-                              mask,
+                              mask.type,
                               bias.type,
-                              lse);
+                              lse,
+                              fwd_v3);
     }();
 
     if(fwd_ave_time < 0.0f)
@@ -1252,6 +1260,16 @@ bool run(const ck_tile::ArgParser& arg_parser)
             ck_tile::identity{},
             ck_tile::identity{},
             ck_tile::scales(scale_s));
+
+        if(0.f < logits_soft_cap)
+        {
+            ck_tile::reference_unary_elementwise<SaccDataType, SaccDataType, SaccDataType>(
+                s_host_ref, s_host_ref, [logits_soft_cap](SaccDataType logits) {
+                    return ck_tile::type_convert<SaccDataType>(
+                        logits_soft_cap *
+                        std::tanhf(ck_tile::type_convert<float>(logits / logits_soft_cap)));
+                });
+        }
 
         if(bias.type == bias_enum::elementwise_bias)
         {

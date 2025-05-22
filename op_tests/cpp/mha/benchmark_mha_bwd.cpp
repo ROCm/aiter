@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.
-
+// Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "mha_bwd.h"
 #include "ck_tile/host.hpp"
 #include "utils.hpp"
@@ -576,7 +575,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                     stream_config,
                                     data_type,
                                     mode == mode_enum::group,
-                                    mask,
+                                    mask.type,
                                     bias.type,
                                     use_dbias,
                                     s_randval,
@@ -824,7 +823,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                    stream_config_v,
                    data_type,
                    mode == mode_enum::group,
-                   mask,
+                   mask.type,
                    bias.type,
                    use_dbias,
                    s_randval,

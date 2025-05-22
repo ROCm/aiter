@@ -3,9 +3,9 @@
 
 import random
 from typing import List, Optional, Tuple, Union
-import itertools
 import torch
 import aiter
+from aiter import dtypes
 from aiter import paged_attn as ops
 from aiter.test_common import (
     checkAllclose,
@@ -19,8 +19,8 @@ from aiter import pertoken_quant
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
+    "bfloat16": dtypes.bf16,
+    "float": dtypes.fp32,
     "fp8": torch.uint8,
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
@@ -105,7 +105,7 @@ def kv_cache_factory(
     return k_caches, v_caches
 
 
-FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
+FLOAT32_BYTES = torch.finfo(dtypes.fp32).bits // 8
 # This will change depending on the compute capability.
 # - 512 as a buffer
 MAX_SEQ_LEN = 65536
@@ -113,8 +113,8 @@ MAX_SEQ_LEN = 65536
 # Reduce NUM_BLOCKS when it happens.
 NUM_BLOCKS = 32768  # Arbitrary values for testing
 PARTITION_SIZE = 512
-# flshattF and tritonflashattF supported: {torch.float16, torch.bfloat16}
-DTYPES = [torch.half, torch.bfloat16]
+# flshattF and tritonflashattF supported: {dtypes.fp16, dtypes.bf16}
+DTYPES = [torch.half, dtypes.bf16]
 NUM_GEN_SEQS = [7]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
 NUM_HEADS = [(40, 40), (64, 8)]  # Arbitrary values for testing
@@ -163,7 +163,7 @@ def ref_masked_attention(
     attn_weights = attn_weights.view(nqhead, q_len, ctx_len)
     # if v_scale != 1.0:
     #     attn_weights, p_scale = aiter.per_tensor_quant(
-    #         attn_weights,  quant_dtype=torch.int8)
+    #         attn_weights,  quant_dtype=dtypes.i8)
     #     # attn_weights,  quant_dtype=key.dtype)
     #     # attn_weights = attn_weights.float()*p_scale
 
@@ -177,8 +177,8 @@ def pertoken_quant_kvcache_symm(
     k_cache: torch.Tensor,
     # [num_blocks, num_heads, head_size, block_size]
     v_cache: torch.Tensor,
-    quant_dtype: torch.dtype,  # e.g. torch.float8_e4m3fnuz
-    scale_dtype: torch.dtype = torch.float32,
+    quant_dtype: torch.dtype,  # e.g. dtypes.fp8
+    scale_dtype: torch.dtype = dtypes.fp32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = k_cache.shape[0]
     num_heads = k_cache.shape[1]
@@ -271,9 +271,9 @@ def run_native(
             int(block_table[j // block_size]) * block_size + (j % block_size)
             for j in range(ctx_len)
         ]
-        if k_cache.dtype == torch.float8_e4m3fnuz:
-            keys = k_cache.view(torch.int8)[idx].view(torch.float8_e4m3fnuz)
-            values = v_cache.view(torch.int8)[idx].view(torch.float8_e4m3fnuz)
+        if k_cache.dtype == dtypes.fp8:
+            keys = k_cache.view(dtypes.i8)[idx].view(dtypes.fp8)
+            values = v_cache.view(dtypes.i8)[idx].view(dtypes.fp8)
         else:
             keys = k_cache[idx]
             values = v_cache[idx]
@@ -496,7 +496,7 @@ def test_paged_attention(
     num_query_heads, num_kv_heads = num_heads
     alibi_slopes = None
     if use_alibi:
-        alibi_slopes = torch.randn(num_query_heads, dtype=torch.float)
+        alibi_slopes = torch.randn(num_query_heads, dtype=dtypes.fp32)
     assert num_query_heads % num_kv_heads == 0
     num_queries_per_kv = num_query_heads // num_kv_heads
     max_seq_len = ctx_lens
@@ -587,9 +587,9 @@ def test_paged_attention(
 
     for quant_algo_, cache_type_ in [
         (0, k_cache.dtype),
-        (2, torch.float8_e4m3fnuz),
-        (2, torch.int8),
-        (4, torch.float8_e4m3fnuz),
+        (2, dtypes.fp8),
+        (2, dtypes.i8),
+        (4, dtypes.fp8),
     ]:
         quant_algo = ck_naive_quant_algo[quant_algo_]
         if quant_algo == "NO":
@@ -625,10 +625,10 @@ def test_paged_attention(
             )
 
             k_scale_asm = torch.empty(
-                num_blocks, num_kv_heads, block_size, dtype=torch.float32, device=device
+                num_blocks, num_kv_heads, block_size, dtype=dtypes.fp32, device=device
             )
             v_scale_asm = torch.empty(
-                num_blocks, num_kv_heads, block_size, dtype=torch.float32, device=device
+                num_blocks, num_kv_heads, block_size, dtype=dtypes.fp32, device=device
             )
             k_scale_asm.fill_(k_scale_.item())
             v_scale_asm.fill_(v_scale_.item())
@@ -697,11 +697,11 @@ def test_paged_attention(
             )
 
             if (
-                dtype in [torch.bfloat16, torch.float16]
+                dtype in [dtypes.bf16, dtypes.fp16]
                 and quant_algo_ == 2
-                and cache_type_ == torch.float8_e4m3fnuz
+                and cache_type_ == dtypes.fp8
             ):
-                if dtype == torch.bfloat16:
+                if dtype == dtypes.bf16:
                     high_precision_list = [1, 2]
                 else:
                     high_precision_list = [1]
@@ -804,7 +804,7 @@ def test_paged_attention(
 
 for num_heads in [(4, 1), (8, 1), (32, 8)]:
     for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097]:
-        for dtype in [torch.float16, torch.bfloat16]:
+        for dtype in [dtypes.fp16, dtypes.bf16]:
             test_paged_attention(
                 ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )

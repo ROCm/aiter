@@ -2,9 +2,7 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
-from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
-import torch.nn.functional as F
+from ..jit.core import compile_ops
 
 MD_NAME = "module_cache"
 
@@ -27,7 +25,7 @@ def reshape_and_cache(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
-    asm_layout: bool
+    asm_layout: bool,
 ): ...
 
 
@@ -39,9 +37,10 @@ def reshape_and_cache_flash(
     value_cache: Tensor,
     slot_mapping: Tensor,
     kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
+    k_scale: Tensor,
+    v_scale: Tensor,
 ): ...
+
 
 @compile_ops("module_cache")
 def reshape_and_cache_with_pertoken_quant(
@@ -52,8 +51,9 @@ def reshape_and_cache_with_pertoken_quant(
     k_dequant_scales: Tensor,
     v_dequant_scales: Tensor,
     slot_mapping: Tensor,
-    asm_layout: bool
+    asm_layout: bool,
 ): ...
+
 
 @compile_ops("module_cache")
 def reshape_and_cache_with_block_quant(
@@ -64,7 +64,7 @@ def reshape_and_cache_with_block_quant(
     k_dequant_scales: Tensor,
     v_dequant_scales: Tensor,
     slot_mapping: Tensor,
-    asm_layout: bool
+    asm_layout: bool,
 ): ...
 
 

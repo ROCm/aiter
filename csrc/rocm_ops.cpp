@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "activation.h"
 #include "attention.h"
 #include "attention_ragged.h"
@@ -29,10 +29,12 @@
 #include "hipbsolgemm.cuh"
 #include "aiter_enum.h"
 
+#include "torch/mha_batch_prefill.h"
 #include "torch/mha_varlen_fwd.h"
 #include "torch/mha_varlen_bwd.h"
 #include "torch/mha_bwd.h"
 #include "torch/mha_fwd.h"
+#include "torch/mha_v3_fwd.h"
 #include "torch/mha_v3_bwd.h"
 #include "torch/mha_v3_varlen_bwd.h"
 
@@ -49,6 +51,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       MHA_VARLEN_BWD_PYBIND;
       MHA_FWD_PYBIND;
       MHA_BWD_PYBIND;
+      MHA_BATCH_PREFILL_PYBIND;
+      MHA_FWD_ASM_PYBIND
       MHA_BWD_ASM_PYBIND;
       MHA_VARLEN_BWD_ASM_PYBIND;
       GEMM_A8W8_PYBIND;
