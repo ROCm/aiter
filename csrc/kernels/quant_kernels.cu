@@ -227,7 +227,7 @@ void static_per_tensor_quant(torch::Tensor &out,         // [..., d]
   dim3 block(256);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  VLLM_DISPATCH_FLOATING_TYPES(
+  AITER_DISPATCH_FLOATING16_TYPES(
       input.scalar_type(), "scaled_quant_kernel", [&]
       {using input_dtype= typename t2ck<scalar_t>::type;
     aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -246,7 +246,7 @@ void dynamic_per_tensor_quant(torch::Tensor &out,         // [..., d]
   dim3 block(256);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  VLLM_DISPATCH_FLOATING_TYPES(
+  AITER_DISPATCH_FLOATING16_TYPES(
       input.scalar_type(), "scaled_quant_kernel", [&]
       {using input_dtype= typename t2ck<scalar_t>::type;
       vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(scale.data_ptr<float>(), 1, 0.0f);
@@ -275,7 +275,7 @@ void dynamic_per_token_scaled_quant(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (out.dtype() == torch_fp8)
   {
-    VLLM_DISPATCH_FLOATING_TYPES(
+    AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_token_scaled_quant_kernel", [&]
         { using input_dtype= typename t2ck<scalar_t>::type;
     aiter::dynamic_per_token_scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -286,7 +286,7 @@ void dynamic_per_token_scaled_quant(
   }
   else if (out.dtype() == torch::kInt8)
   {
-    VLLM_DISPATCH_FLOATING_TYPES(
+    AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_token_scaled_quant_kernel", [&]
         { using input_dtype= typename t2ck<scalar_t>::type;
     aiter::dynamic_per_token_scaled_quant_kernel<<<grid, block, 0, stream>>>(
@@ -298,7 +298,7 @@ void dynamic_per_token_scaled_quant(
 #if defined(__gfx950__)
   else if (out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
   {
-    VLLM_DISPATCH_FLOATING_TYPES(
+    AITER_DISPATCH_FLOATING16_TYPES(
         input.scalar_type(), "dynamic_per_token_scaled_quant_kernel", [&]
         { using input_dtype= typename t2ck<scalar_t>::type;
       aiter::dynamic_per_token_scaled_quant_kernel<<<grid, block, 0, stream>>>(
