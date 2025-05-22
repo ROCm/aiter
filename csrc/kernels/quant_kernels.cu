@@ -295,6 +295,7 @@ void dynamic_per_token_scaled_quant(
             scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
             cols); });
   }
+#if defined(__gfx950__)
   else if (out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
   {
     VLLM_DISPATCH_FLOATING_TYPES(
@@ -307,6 +308,7 @@ void dynamic_per_token_scaled_quant(
           scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
           cols); });
   }
+#endif
   else
   {
     TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
