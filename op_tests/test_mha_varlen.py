@@ -137,7 +137,7 @@ def run_ck(
     else:
         out = output_pad_fn(outputs)
 
-    if dropout_p > 0.0:
+    if dropout_p > 0.0 and return_attn_probs:
         (_, seqlen_q, _, d) = q.shape
         (_, seqlen_k, _, d) = k.shape
         S_dmask = outputs[-1]
@@ -239,7 +239,6 @@ def test_flash_attn_varlen_func(
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
-
     q = torch.randn(
         batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype, requires_grad=True
     )
@@ -301,6 +300,9 @@ def test_flash_attn_varlen_func(
         dtype=dtype,
         requires_grad=True,
     )
+
+    if dropout_p > 0:
+        return_attn_probs = True
 
     out, dropout_mask, dq, dk, dv = run_ck(
         q,
@@ -384,7 +386,7 @@ if __name__ == "__main__":
     (seqlen_q, seqlen_k) = (4, 4)
     d = 192
     d_v = 192
-    dropout_p = 0.
+    dropout_p = 0.0
     min_seqlen_q = 1
     causal = True
     local = False
