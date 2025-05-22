@@ -285,7 +285,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 
 def get_compiler_abi_compatibility_and_version(
-    compiler, torch_exclude
+    compiler, torch_exclude=False
 ) -> Tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
@@ -327,15 +327,12 @@ def get_compiler_abi_compatibility_and_version(
             versionstr = subprocess.check_output(
                 [compiler, "-dumpfullversion", "-dumpversion"]
             )
-            version = versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip().split(".")
-        else:
-            minimum_required_version = MINIMUM_MSVC_VERSION
-            compiler_info = subprocess.check_output(compiler, stderr=subprocess.STDOUT)
             match = re.search(
                 r"(\d+)\.(\d+)\.(\d+)",
-                compiler_info.decode(*SUBPROCESS_DECODE_ARGS).strip(),
+                versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
             )
             version = ["0", "0", "0"] if match is None else list(match.groups())
+
     except Exception:
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
