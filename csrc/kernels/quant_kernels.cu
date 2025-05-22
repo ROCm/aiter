@@ -9,13 +9,15 @@
 #include <hipcub/hipcub.hpp>
 #include "vec_convert.h"
 
+const int32_t BlockSize = 256;
+
 namespace aiter
 {
   template <typename DTYPE_I, typename DTYPE_O>
   __device__ float data_to_per_row_scale(const DTYPE_I *__restrict__ input,
                                          int cols)
   {
-    static constexpr int32_t vec_size_i = 16 / sizeof(DTYPE_I);
+    static constexpr int32_t vec_size_i = 16 / sizeof(DTYPE_O);
     static constexpr int32_t vec_size_o = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
     using vec_i = ck_tile::vec_t<DTYPE_I, vec_size_i>;
     using tb_i = ck_tile::thread_buffer<DTYPE_I, vec_size_o>;
@@ -34,9 +36,9 @@ namespace aiter
     vec_i vec_nxt;
     vec_i vec_cur;
     // size_t vec_idx = threadIdx.x * vec_size_i;
-    // size_t vec_stride = blockDim.x * vec_size_i;
+    // size_t vec_stride = BlockSize * vec_size_i;
     size_t vec_idx = threadIdx.x;
-    size_t vec_stride = blockDim.x;
+    size_t vec_stride = BlockSize;
     if (vec_idx < num_vecs)
     {
       // vec_cur = ck_tile::bit_cast<vec_i>(buffer_i.template get<tb_i>(vec_idx, row_offset, true));
@@ -67,13 +69,13 @@ namespace aiter
     if (num_elems_tail > 0)
     {
       auto *tmp_i = reinterpret_cast<DTYPE_I const *>(input_vecs + num_vecs);
-      for (size_t j = threadIdx.x; j < num_elems_tail; j += blockDim.x)
+      for (size_t j = threadIdx.x; j < num_elems_tail; j += BlockSize)
       {
         absMax = max(absMax, abs(ck_tile::type_convert<float>(tmp_i[j])));
       }
     }
 
-    using BlockReduce = hipcub::BlockReduce<float, 256>;
+    using BlockReduce = hipcub::BlockReduce<float, BlockSize>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     absMax = BlockReduce(temp_storage).Reduce(absMax, hipcub::Max());
 
@@ -133,13 +135,13 @@ namespace aiter
     // const int32_t num_vecs = (cols + vec_size_i - 1) / vec_size_i * vec_size_i;
     const int32_t num_elems_tail = cols % vec_size_i;
     const int32_t num_vecs = cols / vec_size_i;
-    const int32_t tail_thread = num_vecs % blockDim.x;
+    const int32_t tail_thread = num_vecs % BlockSize;
     vec_i vec_nxt;
     vec_i vec_cur;
     // size_t vec_idx = threadIdx.x * vec_size_i;
-    // size_t vec_stride = blockDim.x * vec_size_i;
+    // size_t vec_stride = BlockSize * vec_size_i;
     size_t vec_idx = threadIdx.x;
-    size_t vec_stride = blockDim.x;
+    size_t vec_stride = BlockSize;
     if (vec_idx < num_vecs)
     {
       // vec_cur = ck_tile::bit_cast<vec_i>(buffer_i.template get<tb_i>(vec_idx, row_offset, true));
@@ -167,7 +169,7 @@ namespace aiter
     {
       auto *out_ptr2 = (out + row_offset);
       auto *tmp_i = reinterpret_cast<DTYPE_I const *>(input_vecs + num_vecs);
-      for (size_t j = threadIdx.x; j < num_elems_tail; j += blockDim.x)
+      for (size_t j = threadIdx.x; j < num_elems_tail; j += BlockSize)
       {
         out_ptr2[num_vecs * vec_size_i + j] =
             ck_tile::type_convert<DTYPE_O>(ck_tile::type_convert<float>(tmp_i[j]) * inverted_scale);
@@ -224,7 +226,7 @@ void static_per_tensor_quant(torch::Tensor &out,         // [..., d]
   int cols = input.size(-1);
   int rows = input.numel() / cols;
   dim3 grid(rows);
-  dim3 block(256);
+  dim3 block(BlockSize);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AITER_DISPATCH_FLOATING16_TYPES(
@@ -243,7 +245,7 @@ void dynamic_per_tensor_quant(torch::Tensor &out,         // [..., d]
   int cols = input.size(-1);
   int rows = input.numel() / cols;
   dim3 grid(rows);
-  dim3 block(256);
+  dim3 block(BlockSize);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AITER_DISPATCH_FLOATING16_TYPES(
@@ -269,7 +271,7 @@ void dynamic_per_token_scaled_quant(
   int const cols = input.size(-1);
   int const rows = input.numel() / cols;
   dim3 const grid(rows);
-  dim3 const block(256);
+  dim3 const block(BlockSize);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
