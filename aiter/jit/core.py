@@ -127,7 +127,15 @@ CK_DIR = f"{bd_dir}/ck"
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx940",
+        "gfx941",
+        "gfx942",
+        "gfx1100",
+        "gfx950",
+    ]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -387,7 +395,7 @@ def build_module(
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
-def get_args_of_build(ops_name: str, exclue=[]):
+def get_args_of_build(ops_name: str, exclude=[]):
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -437,8 +445,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
-                    # exclude
-                    if ops_name in exclue:
+                    if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
