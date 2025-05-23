@@ -171,11 +171,13 @@ namespace ck_tile
     CK_TILE_TYPE_CONVERT(fp8, fp32, 4)
     CK_TILE_TYPE_CONVERT(fp8, fp32, 8)
     CK_TILE_TYPE_CONVERT(fp8, fp32, 16)
+    CK_TILE_TYPE_CONVERT(fp8, fp32, 32)
 
     CK_TILE_TYPE_CONVERT(int8, fp32, 2)
     CK_TILE_TYPE_CONVERT(int8, fp32, 4)
     CK_TILE_TYPE_CONVERT(int8, fp32, 8)
     CK_TILE_TYPE_CONVERT(int8, fp32, 16)
+    CK_TILE_TYPE_CONVERT(int8, fp32, 32)
 #undef CK_TILE_TYPE_CONVERT
 
     // 4 bit vec convert
@@ -205,14 +207,17 @@ namespace ck_tile
     CK_TILE_TYPE_CONVERT(fp4x2, fp32, 4)
     CK_TILE_TYPE_CONVERT(fp4x2, fp32, 8)
     CK_TILE_TYPE_CONVERT(fp4x2, fp32, 16)
+    CK_TILE_TYPE_CONVERT(fp4x2, fp32, 32)
 
     CK_TILE_TYPE_CONVERT(fp4x2, fp16, 4)
     CK_TILE_TYPE_CONVERT(fp4x2, fp16, 8)
     CK_TILE_TYPE_CONVERT(fp4x2, fp16, 16)
+    CK_TILE_TYPE_CONVERT(fp4x2, fp16, 32)
 
     CK_TILE_TYPE_CONVERT(fp4x2, bf16, 4)
     CK_TILE_TYPE_CONVERT(fp4x2, bf16, 8)
     CK_TILE_TYPE_CONVERT(fp4x2, bf16, 16)
+    CK_TILE_TYPE_CONVERT(fp4x2, bf16, 32)
 #undef CK_TILE_TYPE_CONVERT
 
 } // namespace aiter
