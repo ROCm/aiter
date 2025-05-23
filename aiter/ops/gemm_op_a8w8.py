@@ -75,6 +75,7 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 
 @functools.lru_cache(maxsize=1024)
+@torch.compiler.disable(recursive=False)
 def get_CKGEMM_config(
     M: int,
     N: int,
