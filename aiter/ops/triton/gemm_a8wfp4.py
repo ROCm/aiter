@@ -48,7 +48,8 @@ def _gemm_a8wfp4_kernel(
     cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
-    A and B inputs are in the microscale fp4 (mxfp4) format.
+    A is in fp8 e4m3 format.
+    B is in the microscale fp4 (mxfp4) format.
     A_scales and B_scales are in e8m0 format.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
@@ -87,27 +88,32 @@ def _gemm_a8wfp4_kernel(
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
     if (pid_k * SPLITK_BLOCK_SIZE // 2) < K:
-
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2)
 
-        # Create pointers for first block of A and B input matrices
-        # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
-        offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
-        offs_k_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_k
+        # Create pointers for first block of A matrix which is int8/fp8
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_ak = tl.arange(0, BLOCK_SIZE_K)
+        offs_ak_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_ak
         a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
-        )
-        b_ptrs = b_ptr + (
-            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        )
-        # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
+            offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
         )
         a_scale_ptrs = (
-            a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks[None, :] * stride_ask
+            a_scales_ptr + offs_am * stride_asm
+        )
+        a_scales = tl.load(a_scale_ptrs)
+        a_scales_fake = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
+
+        # Create pointers for first block of B matrix
+        # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_bk = tl.arange(0, BLOCK_SIZE_K // 2)
+        offs_bk_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_bk
+        b_ptrs = b_ptr + (
+            offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+        )
+        # Create pointers for the first block of B scales
+        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
+            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
         )
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
@@ -117,9 +123,7 @@ def _gemm_a8wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
-            # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -128,21 +132,21 @@ def _gemm_a8wfp4_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0
+                    a_ptrs, mask=offs_ak[None, :] < K - k * (BLOCK_SIZE_K), other=0
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
+                    b_ptrs, mask=offs_bk[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator += tl.dot_scaled(a, a_scales_fake, "e4m3", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
-            a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
+            a_ptrs += (BLOCK_SIZE_K) * stride_ak
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
             a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
             b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
 
-        c = accumulator.to(c_ptr.type.element_ty)
+        c = accumulator.to(c_ptr.type.element_ty) * a_scales[:, None]
 
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
