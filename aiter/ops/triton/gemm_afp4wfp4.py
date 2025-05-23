@@ -254,7 +254,7 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
@@ -266,9 +266,9 @@ def _get_config(
         if BLK_M == 32:
             return _get_config._config_dict["medium_M32"]
         elif BLK_M == 64:
-            return _get_config._config_dict["medium_M64"][str(N)]
+            return _get_config._config_dict["medium_M64"]
         elif BLK_M == 128:
-            return _get_config._config_dict["medium_M128"][str(N)]
+            return _get_config._config_dict["medium_M128"]
     elif M <= 256:
         return _get_config._config_dict["large"]
     else:
