@@ -213,8 +213,8 @@ def _gemm_afp4_wfp4_reduce_kernel(
 
 def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
-    NUM_KSPLIT_STEP = 4
-    BLOCK_SIZE_K_STEP = 4
+    NUM_KSPLIT_STEP = 2
+    BLOCK_SIZE_K_STEP = 2
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
