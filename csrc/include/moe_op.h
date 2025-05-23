@@ -4,11 +4,6 @@
 #include <torch/extension.h>
 #include "aiter_enum.h"
 
-void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
-                  torch::Tensor &token_expert_indices,
-                  torch::Tensor &gating_output,
-                  bool need_renorm);
-
 void biased_grouped_topk(
     torch::Tensor &gating_output,   // [num_tokens, num_experts]
     torch::Tensor &correction_bias, // [num_expert]
@@ -28,12 +23,6 @@ void grouped_topk(
     bool need_renorm,
     std::string scoring_func = "softmax",
     const float routed_scaling_factor = 1.);
-
-void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
-                          int64_t block_size, torch::Tensor sorted_token_ids,
-                          torch::Tensor experts_ids,
-                          torch::Tensor token_nums,
-                          torch::Tensor num_tokens_post_pad);
 
 void fmoe(torch::Tensor &out,               // [token_cnt, dim]
           torch::Tensor &input,             // [token_cnt, dim] M,K
@@ -154,4 +143,20 @@ void moe_stage1_g1u1(torch::Tensor &input,             // [token_cnt, model_dim]
                      std::optional<torch::Tensor> w1_scale, // [expert, 1, inter_dim], gate(up) scale
                      std::optional<torch::Tensor> sorted_weights);
 
+
+namespace aiter {
+
+void topk_softmax(torch::Tensor &topk_weights, torch::Tensor &topk_indices,
+                  torch::Tensor &token_expert_indices,
+                  torch::Tensor &gating_output,
+                  bool need_renorm);
+
+void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+                          int64_t block_size, torch::Tensor sorted_token_ids,
+                          torch::Tensor experts_ids,
+                          torch::Tensor token_nums,
+                          torch::Tensor num_tokens_post_pad);
+
 void moe_sum(torch::Tensor &input, torch::Tensor &output);
+
+} // namespace aiter

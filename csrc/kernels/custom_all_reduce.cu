@@ -25,6 +25,8 @@
 using fptr_t = int64_t;
 static_assert(sizeof(void *) == sizeof(fptr_t));
 
+namespace aiter {
+
 fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
                       const std::vector<std::string> &handles,
                       const std::vector<int64_t> &offsets, int64_t rank,
@@ -205,3 +207,5 @@ torch::Tensor allocate_meta_buffer(int64_t size)
 }
 
 #endif
+
+} // namespace aiter

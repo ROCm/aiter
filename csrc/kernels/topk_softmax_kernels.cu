@@ -440,8 +440,8 @@ struct TopkConstants
 
 template <int EXPERTS, int WARPS_PER_TB>
 void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished, float *output, int *indices,
-                                     int *source_row, const int num_rows, const int k, 
-                                     const int start_expert, const int end_expert, 
+                                     int *source_row, const int num_rows, const int k,
+                                     const int start_expert, const int end_expert,
                                      const int output_stride, const int indices_stride,
                                      const bool need_renorm, cudaStream_t stream)
 {
@@ -465,7 +465,7 @@ void topkGatingSoftmaxLauncherHelper(const float *input, const bool *finished, f
         topkGatingSoftmax<VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG, false><<<num_blocks, block_dim, 0, stream>>>(
             input, finished, output, num_rows, indices, source_row, k, start_expert, end_expert, output_stride, indices_stride);
     }
-    
+
 
 }
 
@@ -535,7 +535,7 @@ template <typename scalar_t, int TOPK>
 __global__ void moe_sum_kernel(
     scalar_t* __restrict__ out,           // [..., d]
     const scalar_t* __restrict__ input,   // [..., topk, d]
-    const int d) 
+    const int d)
 {
     const int64_t token_idx = blockIdx.x;
     for (int64_t idx = threadIdx.x; idx < d; idx += blockDim.x) {
@@ -543,7 +543,7 @@ __global__ void moe_sum_kernel(
         #pragma unroll
         for (int k = 0; k < TOPK; ++k) {
             x += VLLM_LDG(&input[token_idx * TOPK * d + k * d + idx]);
-        }        
+        }
         out[token_idx * d + idx] = x;
     }
 }
@@ -551,12 +551,14 @@ __global__ void moe_sum_kernel(
 } // namespace moe
 } // namespace vllm
 
+namespace aiter {
+
 void topk_softmax(
     torch::Tensor& topk_weights,                // [num_tokens, topk]
     torch::Tensor& topk_indices,                // [num_tokens, topk]
     torch::Tensor& token_expert_indices,        // [num_tokens, topk]
     torch::Tensor& gating_output,               // [num_tokens, num_experts]
-    bool need_renorm)               
+    bool need_renorm)
 {
     const int num_experts = gating_output.size(-1);
     const int num_tokens = gating_output.numel() / num_experts;
@@ -594,29 +596,29 @@ void moe_sum(
     const int hidden_size = input.size(-1);
     const int num_tokens = output.numel() / hidden_size;
     const int topk = input.size(1);
-    
+
     dim3 grid(num_tokens);
     dim3 block(std::min(hidden_size, 1024));
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    
+
     switch (topk) {
     case 2:
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "moe_sum_kernel", [&] {
                 vllm::moe::moe_sum_kernel<scalar_t, 2>
-                    <<<grid, block, 0, stream>>>(output.data_ptr<scalar_t>(), 
-                    input.data_ptr<scalar_t>(), hidden_size);                
+                    <<<grid, block, 0, stream>>>(output.data_ptr<scalar_t>(),
+                    input.data_ptr<scalar_t>(), hidden_size);
             });
         break;
-    
+
     case 4:
         VLLM_DISPATCH_FLOATING_TYPES(
             input.scalar_type(), "moe_sum_kernel", [&] {
                 vllm::moe::moe_sum_kernel<scalar_t, 4>
-                    <<<grid, block, 0, stream>>>(output.data_ptr<scalar_t>(), 
-                    input.data_ptr<scalar_t>(), hidden_size);                
+                    <<<grid, block, 0, stream>>>(output.data_ptr<scalar_t>(),
+                    input.data_ptr<scalar_t>(), hidden_size);
             });
         break;
 
@@ -632,3 +634,5 @@ void moe_sum(
         break;
     }
 }
+
+} // namespace aiter
