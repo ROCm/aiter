@@ -2,18 +2,12 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
-from aiter.ops.triton.utils.tuning_util import aiter_register_input_generator
-from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
-@aiter_register_input_generator("gemm_afp4wfp4")
-def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
+def generate_gemm_a8wfp4_inputs(M, N, K):
     torch.manual_seed(5)
-    if isinstance(dtype, str):
-        dtype = str_to_torch_dtype[dtype]
-
     # 34 is two packed e2m1 values 0010 which is 1.0.
     x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
     x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
@@ -31,15 +25,8 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     )
     x_scales = x_scales.T
     w_scales = w_scales.T
-    
-    y = None
-    if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
-        out_dtype = None,
-    else:
-        out_dtype = dtype
 
-    return x, w, x_scales, w_scales, out_dtype, y
+    return x, w, x_scales, w_scales
 
 
 def get_x_vals():
@@ -76,6 +63,7 @@ def get_x_vals():
     ]
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
+    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     return x_vals
 
 
@@ -129,19 +117,15 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
-def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
+def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype):
     if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales, out_dtype, y = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output)
-    
+    x, w, x_scales, w_scales = generate_gemm_a8wfp4_inputs(M, N, K)
+    out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=dtype)
+
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
-    if output:
-        triton_out = gemm_a8wfp4(x, w, x_scales, w_scales, dtype, y)
-    else:
-        triton_out = gemm_a8wfp4(x, w, x_scales, w_scales, dtype)
+    gemm_a8wfp4(x, w, out, x_scales, w_scales, dtype)
 
-
-    torch.testing.assert_close(torch_out, triton_out)
+    torch.testing.assert_close(torch_out, out)
