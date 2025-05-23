@@ -49,3 +49,8 @@ __pycache__
 debug
 aiter_logs
 *.log
+
+
+scripts
+*.csv
+gpucore*
