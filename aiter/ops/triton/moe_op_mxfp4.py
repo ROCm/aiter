@@ -5,7 +5,7 @@ from typing import Any, Dict
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 
-@tl.constexpr_function
+@tl.constexpr
 def get_scaled_dot_format_string(dtype: tl.dtype):
     mapping = {
         tl.float16: "fp16",
@@ -44,7 +44,7 @@ def _write_zeros_to_output(
     }
 )
 @triton.jit
-def _fused_moe_kernel_mxfp4(
+def _fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -314,20 +314,20 @@ def _fused_moe_kernel_mxfp4(
                 # if SWIZZLE_MX_A:
                 #    a_mx_scales = _unswizzle_mx_block(tl.load(a_mx_scale_ptrs))
                 # else:
-                mask_ak_scale = offs_scale_ak < (K - k * PACKED_BLOCK_K_A) // (
+                mask_ak_scale = offs_scale_ak < tl.cdiv((K - k * PACKED_BLOCK_K_A), (
                     MX_PACK_DIVISOR // A_PACK_DIVISOR
-                )
+                ))
                 a_mx_scales = tl.load(
-                    a_mx_scale_ptrs, mask=mask_ak_scale[None, :], other=0.0
+                    a_mx_scale_ptrs, mask=(token_mask[:, None] & mask_ak_scale[None, :]), other=0.0
                 )
             else:
                 a_mx_scales = None
             # if SWIZZLE_MX_B:
             #    b_mx_scales = _unswizzle_mx_block(tl.load(b_mx_scale_ptrs))
             # else:
-            mask_bk_scale = offs_scale_bk < (K - k * PACKED_BLOCK_K_B) // (
+            mask_bk_scale = offs_scale_bk < tl.cdiv((K - k * PACKED_BLOCK_K_B), (
                 MX_PACK_DIVISOR // B_PACK_DIVISOR
-            )
+            ))
             b_mx_scales = tl.load(
                 b_mx_scale_ptrs, mask=mask_bk_scale[None, :], other=0.0
             )
@@ -419,7 +419,7 @@ def fused_moe_mxfp4(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-    _fused_moe_kernel_mxfp4[grid](
+    _fused_moe_kernel[grid](
         A,
         B,
         C,

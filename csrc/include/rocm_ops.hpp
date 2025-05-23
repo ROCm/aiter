@@ -387,7 +387,8 @@
             py::arg("a1_scale") = std::nullopt,        \
             py::arg("block_m") = 32,                   \
             py::arg("sorted_weights") = std::nullopt,  \
-            py::arg("act_op") = 0);                    \
+            py::arg("act_op") = 0,                     \
+            py::arg("pipe_ver") = 1);                  \
                                                        \
       m.def("ck_moe_stage2", &ck_moe_stage2,           \
             py::arg("inter_states"),                   \
@@ -401,7 +402,8 @@
             py::arg("w2_scale") = std::nullopt,        \
             py::arg("a2_scale") = std::nullopt,        \
             py::arg("block_m") = 32,                   \
-            py::arg("sorted_weights") = std::nullopt); \
+            py::arg("sorted_weights") = std::nullopt,  \
+            py::arg("pipe_ver") = 1);                  \
 
 #define MOE_CK_PYBIND                                                               \
       m.def("ck_moe", &ck_moe,                                                      \
