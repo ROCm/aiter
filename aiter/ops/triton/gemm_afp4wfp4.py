@@ -250,6 +250,7 @@ def gemm_afp4wfp4(
     x_scales,
     w_scales,
     dtype: Optional[float] = torch.bfloat16,
+    nonkdim: int = 32,
 ):
     """
     Computes the matmul Y = X x W
@@ -337,7 +338,7 @@ def gemm_afp4wfp4(
         kpack = 1
         num_warps = 8
         num_stages = 2
-        matrix_instr_nonkdim = 32
+        matrix_instr_nonkdim = nonkdim
         cache_modifier = None
 
         NUM_KSPLIT = 1

@@ -31,7 +31,6 @@ def generate_gemm_afp4wfp4_inputs(M, N, K):
 
 
 def get_x_vals():
-
     x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
     x_vals += [
@@ -128,5 +127,7 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype):
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     gemm_afp4wfp4(x, w, out, x_scales, w_scales, dtype)
+    # to test with mfma16, please enable the line below
+    gemm_afp4wfp4(x, w, out, x_scales, w_scales, dtype, nonkdim=16)
 
     torch.testing.assert_close(torch_out, out)
