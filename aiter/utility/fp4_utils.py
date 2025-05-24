@@ -232,6 +232,11 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
+    stride_x_m = tl.cast(stride_x_m, tl.int64)
+    stride_x_n = tl.cast(stride_x_n, tl.int64)
+    stride_x_fp4_m = tl.cast(stride_x_fp4_m, tl.int64)
+    stride_x_fp4_n = tl.cast(stride_x_fp4_n, tl.int64)
+
     x_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE + tl.arange(0, MXFP4_QUANT_BLOCK_SIZE)
     x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
