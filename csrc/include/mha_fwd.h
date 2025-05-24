@@ -12,7 +12,8 @@ struct mha_fwd_traits : public fmha_fwd_traits {
   mha_fwd_traits(int head_size_q, int head_size_v, std::string dtype,
                  bool is_group_mode, bool has_logits_soft_cap,
                  mask_enum mask_type, bias_enum bias_type, bool has_lse,
-                 bool has_dropout, bool use_ext_asm)
+                 bool has_dropout, bool use_ext_asm,
+                 bool skip_min_seqlen_q)
       : fmha_fwd_traits{head_size_q,
                         head_size_v,
                         dtype,
@@ -23,7 +24,8 @@ struct mha_fwd_traits : public fmha_fwd_traits {
                         bias_type,
                         has_lse,
                         has_dropout,
-                        false}, // do_fp8_static_quant
+                        false, // do_fp8_static_quant
+                        skip_min_seqlen_q},
         use_ext_asm(use_ext_asm) {}
   bool use_ext_asm;
 };
