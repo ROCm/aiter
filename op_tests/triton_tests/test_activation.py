@@ -4,10 +4,10 @@ import pytest
 from .test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 
-DEBUG_MODE = True
+DEBUG_MODE = False
 
 
-def torch_silu_mul_and_mxfp4_quant(
+def torch_act_mul_and_mxfp4_quant(
     input: torch.Tensor, activation: str
 ) -> torch.Tensor:
     """
@@ -63,7 +63,7 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str):
         print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
         print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
 
-    torch_out, torch_scale = torch_silu_mul_and_mxfp4_quant(x, activation=activation)
+    torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation)
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
