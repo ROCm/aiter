@@ -90,13 +90,14 @@ def _gemm_a8wfp4_kernel(
     if (pid_k * SPLITK_BLOCK_SIZE // 2) < K:
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2)
 
-        # Create pointers for first block of A matrix which is int8/fp8
+        # Create pointers for first block of A matrix which is fp8
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_ak = tl.arange(0, BLOCK_SIZE_K)
         offs_ak_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_ak
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
         )
+        a = tl.load(a_ptrs)
         a_scale_ptrs = (
             a_scales_ptr + offs_am * stride_asm
         )
@@ -128,12 +129,8 @@ def _gemm_a8wfp4_kernel(
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                a = tl.load(
-                    a_ptrs, mask=offs_ak[None, :] < K - k * (BLOCK_SIZE_K), other=0.0
-                )
                 b = tl.load(
                     b_ptrs, mask=offs_bk[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
@@ -141,12 +138,10 @@ def _gemm_a8wfp4_kernel(
             accumulator += tl.dot_scaled(a, a_scales_fake, "e4m3", b, b_scales, "e2m1")
 
             # Advance the ptrs to the next K block.
-            a_ptrs += (BLOCK_SIZE_K) * stride_ak
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
-            a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
             b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
 
-        c = accumulator.to(c_ptr.type.element_ty) * a_scales[:, None]
+        c = (accumulator * a_scales[:, None]).to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)

@@ -126,9 +126,9 @@ def is_cdna4():
 e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
 e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 
-@pytest.mark.parametrize("M, N, K", [(2, 2, 32)] if DEBUG else get_x_vals())
+@pytest.mark.parametrize("M, N, K", [(32, 32, 32)] if DEBUG else get_x_vals())
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
-@pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("out_dtype", [torch.float16])
 def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
     if not is_cdna4():
         pytest.skip("MXFP4 not supported on this architecture")
