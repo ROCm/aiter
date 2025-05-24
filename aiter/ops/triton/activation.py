@@ -163,7 +163,7 @@ def act_mul_and_mxfp4_quant(
     """
     # Assume x is 2D-Tensor for now
     M, N = x.shape
-    # Activating and storing results in uint8 results in a feature dimension of N/4
+    # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
     assert N % 4 == 0
 
     # This is fixed by spec for MXFP4. Do not tune this.
