@@ -7,9 +7,7 @@ from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 DEBUG_MODE = False
 
 
-def torch_act_mul_and_mxfp4_quant(
-    input: torch.Tensor, activation: str
-) -> torch.Tensor:
+def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch.Tensor:
     """
     The fused kernel casts the original input to float32 and does all the arithmetic
     and bit operations in float32.
