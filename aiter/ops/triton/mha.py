@@ -126,7 +126,7 @@ def is_hip():
 
 
 def arch_supports_fp8():
-    return is_hip() and get_arch() in ("gfx942", "gfx950")
+    return is_hip() and get_arch() in ("gfx942")
 
 
 @triton.jit
@@ -190,9 +190,9 @@ def _attn_fwd_inner(
     q,
     k_ptrs,
     v_ptrs,
-    stride_kn,
-    stride_vk,
-    stride_sn,
+    stride_kn_in,
+    stride_vk_in,
+    stride_sn_in,
     start_m,
     seqlen_k,
     seqlen_q,
@@ -226,6 +226,19 @@ def _attn_fwd_inner(
     FP8_MAX: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    stride_kn = tl.cast(stride_kn_in, tl.int64)
+    stride_vk = tl.cast(stride_vk_in, tl.int64)
+    stride_sn = tl.cast(stride_sn_in, tl.int64)
 
     # loop over k, v, and update accumulator
 
@@ -350,57 +363,6 @@ def _attn_fwd_inner(
 
 
 @triton.jit
-def _remap_XCD(k, N, NUM_XCD):
-    r = k % NUM_XCD
-    m = k // NUM_XCD
-    q = N // NUM_XCD
-    t = N - NUM_XCD * q
-    u = min(r, t + 1)
-    new_index = u * q + (r - u) * (q - 1) + r + m
-    return new_index
-
-
-@triton.jit
-def _balance_attn_workload(
-    wid,
-    NUM_XCD: tl.constexpr,
-    BATCH,
-    NUM_Q_HEADS,
-    SEQLEN_Q,
-    BLOCK_M,
-):
-    # Traversal strategy along dims: seqlen, q_head, batch
-    # 1. Fastest changing dim is the q_head dim. At every <NUM_XCD>th wid, increase the sequence block id (start_m).
-    # 2. When we are done with <CHUNK_BLOCKS_SIZE> blocks along seqlen, we move to the next set of <NUM_XCD> q_heads.
-    # 3. Batch changes last.
-
-    # so XCD 0 should get workgroups with indices (batch, head q idx, start_m)
-    # (0, 0, 0), (0, 0, 1), (0, 0, 2), ..., (0, 0, CHUNK_BLOCKS_SIZE), (0, NUM_XCD, 0)
-    # XCD 1
-    # (0, 1, 0), (0, 1, 1), (0, 1, 2), ..., (0, 1, CHUNK_BLOCKS_SIZE), (0, NUM_XCD+1, 0)
-    # ...
-    # XCD <NUM_XCD - 1>
-    # (0, NUM_XCD-1, 0), (0, NUM_XCD-1, 1), (0, NUM_XCD-1, 2), ..., (0, NUM_XCD-1, CHUNK_BLOCKS_SIZE), (0, 2 * NUM_XCD-1, 0)
-
-    # Notice that on the same round robin turn, XCDs get the same start_m, i.e. workgroups with equal workloads.
-    # But also consequent sequence blocks are sent to the same XCD, so they can benefit from L2 caching.
-
-    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
-    CHUNK_BLOCKS_SIZE = 1  # (NUM_CUs_PER_XCD // (NUM_Q_HEADS // NUM_K_HEADS))
-    off_q_head = (
-        wid % NUM_XCD + wid // (CHUNK_BLOCKS_SIZE * NUM_XCD) * NUM_XCD
-    ) % NUM_Q_HEADS
-    start_m = (
-        (wid // NUM_XCD) % CHUNK_BLOCKS_SIZE
-        + wid // (CHUNK_BLOCKS_SIZE * NUM_Q_HEADS) * CHUNK_BLOCKS_SIZE
-    ) % NUM_BLOCKS
-    off_z = wid // (NUM_BLOCKS * NUM_Q_HEADS) % BATCH
-    off_q_head = _remap_XCD(off_q_head, NUM_Q_HEADS - 1, NUM_XCD)
-
-    return off_z, off_q_head, start_m
-
-
-@triton.jit
 def _attn_fwd(
     q_ptr: torch.Tensor,
     k_ptr: torch.Tensor,
@@ -413,34 +375,34 @@ def _attn_fwd(
     s_dmask_ptr: torch.Tensor,
     dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
-    stride_qz,
-    stride_qh,
-    stride_qm,
-    stride_qk,
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    stride_kk,
-    stride_vz,
-    stride_vh,
-    stride_vn,
-    stride_vk,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_oz,
-    stride_oh,
-    stride_om,
-    stride_on,
-    stride_alibi_z,
-    stride_alibi_h,
-    stride_sd_z,
-    stride_sd_h,
-    stride_sd_m,
-    stride_sd_n,
-    stride_lse_z,
-    stride_lse_h,
-    stride_lse_m,
+    stride_qz_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qk_in,
+    stride_kz_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kk_in,
+    stride_vz_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vk_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_oz_in,
+    stride_oh_in,
+    stride_om_in,
+    stride_on_in,
+    stride_alibi_z_in,
+    stride_alibi_h_in,
+    stride_sd_z_in,
+    stride_sd_h_in,
+    stride_sd_m_in,
+    stride_sd_n_in,
+    stride_lse_z_in,
+    stride_lse_h_in,
+    stride_lse_m_in,
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
@@ -461,28 +423,53 @@ def _attn_fwd(
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
     VARLEN: tl.constexpr,
-    BATCH,
-    NUM_XCD: tl.constexpr,
 ):
     # calculate offsets
-    wid = tl.program_id(
-        0
-    )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
-    # num blocks along seqlen
+    off_z = tl.program_id(0)  # batch
+    off_q_head = tl.program_id(1)  # num_q_heads
+    start_m = tl.program_id(2)  # seqlen_q
 
-    off_z, off_q_head, start_m = _balance_attn_workload(
-        wid,
-        NUM_XCD,
-        BATCH,
-        NUM_Q_HEADS,
-        SEQLEN_Q,
-        BLOCK_M,
-    )
-
-    # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    stride_qz = tl.cast(stride_qz_in, tl.int64)
+    stride_qh = tl.cast(stride_qh_in, tl.int64)
+    stride_qm = tl.cast(stride_qm_in, tl.int64)
+    stride_qk = tl.cast(stride_qk_in, tl.int64)
+    stride_kz = tl.cast(stride_kz_in, tl.int64)
+    stride_kh = tl.cast(stride_kh_in, tl.int64)
+    stride_kn = tl.cast(stride_kn_in, tl.int64)
+    stride_kk = tl.cast(stride_kk_in, tl.int64)
+    stride_vz = tl.cast(stride_vz_in, tl.int64)
+    stride_vh = tl.cast(stride_vh_in, tl.int64)
+    stride_vn = tl.cast(stride_vn_in, tl.int64)
+    stride_vk = tl.cast(stride_vk_in, tl.int64)
+    stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+    stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+    stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+    stride_oz = tl.cast(stride_oz_in, tl.int64)
+    stride_oh = tl.cast(stride_oh_in, tl.int64)
+    stride_om = tl.cast(stride_om_in, tl.int64)
+    stride_on = tl.cast(stride_on_in, tl.int64)
+    stride_alibi_z = tl.cast(stride_alibi_z_in, tl.int64)
+    stride_alibi_h = tl.cast(stride_alibi_h_in, tl.int64)
+    stride_sd_z = tl.cast(stride_sd_z_in, tl.int64)
+    stride_sd_h = tl.cast(stride_sd_h_in, tl.int64)
+    stride_sd_m = tl.cast(stride_sd_m_in, tl.int64)
+    stride_sd_n = tl.cast(stride_sd_n_in, tl.int64)
+    stride_lse_z = tl.cast(stride_lse_z_in, tl.int64)
+    stride_lse_h = tl.cast(stride_lse_h_in, tl.int64)
+    stride_lse_m = tl.cast(stride_lse_m_in, tl.int64)
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -797,8 +784,7 @@ def _attn_fwd(
         RCP_LN2: tl.constexpr = 1.4426950408889634
         LN2: tl.constexpr = 0.6931471824645996
         # compute log-sum-exp in base 2 units
-        # mi_base2 = m_i * RCP_LN2
-        mi_base2 = m_i * RCP_LN2 * sm_scale
+        mi_base2 = m_i * RCP_LN2
         softmax_lse = mi_base2 + tl.math.log2(l_i)
         # convert back to natural units
         softmax_lse *= LN2
@@ -952,27 +938,14 @@ def _flash_attn_forward(
     # Tuned for MI300x
     config = {
         "BLOCK_M": 128,
-        "BLOCK_N": 64,
+        "BLOCK_N": 128,
         "waves_per_eu": 2,
         "num_warps": 4,
         "num_ctas": 1,
         "num_stages": 1,
     }
-    # Dropout significantly increases VGPR usage so use small tiles
-    if enable_dropout:
-        config = {
-            "BLOCK_M": 32,
-            "BLOCK_N": 32,
-            "waves_per_eu": 1,
-            "num_warps": 2,
-            "num_ctas": 1,
-            "num_stages": 1,
-        }
 
-    grid = lambda META: (  # noqa: E731
-        batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
-    )
-
+    grid = lambda META: (batch, num_q_heads, triton.cdiv(seqlen_q, META["BLOCK_M"]))
     _attn_fwd[grid](
         q,
         k,
@@ -1019,8 +992,6 @@ def _flash_attn_forward(
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
-        BATCH=batch,
-        NUM_XCD=8,
         **config,
     )
 
@@ -2445,7 +2416,7 @@ def _flash_attn_backward(
             q.shape[1],
             q.shape[2],
         )
-        _, num_k_heads = max_seqlen_k, k.shape[1]
+        seqlen_k, num_k_heads = max_seqlen_k, k.shape[1]
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
         k_strides = (0, k.stride(1), k.stride(0), k.stride(2))
@@ -2458,7 +2429,7 @@ def _flash_attn_backward(
     else:
         # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
         batch, seqlen_q, num_q_heads, head_sz = q.shape
-        _, num_k_heads = k.shape[1], k.shape[2]
+        seqlen_k, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
@@ -3382,15 +3353,15 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             out,
             softmax_lse,
             cu_seqlens_q,
-            cu_seqlens_k,
+            cu_seqlens_q,
             descale_q,
             descale_k,
             descale_v,
         ) = ctx.saved_tensors
         dq, dk, dv = (
-            torch.zeros_like(q_fp8, dtype=torch.float32),
-            torch.zeros_like(k_fp8, dtype=torch.float32),
-            torch.zeros_like(v_fp8, dtype=torch.float32),
+            torch.zeros_like(q, dtype=torch.float32),
+            torch.zeros_like(k, dtype=torch.float32),
+            torch.zeros_like(v, dtype=torch.float32),
         )
         head_size_v_og = do.size(3)
         do_padded = do
@@ -3399,7 +3370,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
 
         fp8_dtype = torch.float8_e4m3fnuz
         do_padded_fp8, descale_do = cast_varlen_to_fp8(
-            do_padded, fp8_dtype, "thd", cu_seqlens_q
+            dout_padded, fp8_dtype, "thd", cu_seqlens_q
         )
 
         _flash_attn_backward(
@@ -3417,8 +3388,8 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             ctx.causal,
             cu_seqlens_q,
             cu_seqlens_k,
-            max_seqlen_q=ctx.max_seqlen_q,
-            max_seqlen_k=ctx.max_seqlen_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             dropout_p=ctx.dropout_p,
             philox_seed=ctx.philox_seed,
             philox_offset=ctx.philox_offset,
@@ -3427,9 +3398,9 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             descale_v=descale_v,
             descale_do=descale_do,
         )
-        dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
-        dk = dk[..., : k_fp8.shape[-1]]
-        dv = dv[..., : v_fp8.shape[-1]]
+        dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : k.shape[-1]]
+        dv = dv[..., : v.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None
 
 
