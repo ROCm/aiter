@@ -127,15 +127,7 @@ CK_DIR = f"{bd_dir}/ck"
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     # List of allowed architectures
-    allowed_archs = [
-        "native",
-        "gfx90a",
-        "gfx940",
-        "gfx941",
-        "gfx942",
-        "gfx1100",
-        "gfx950",
-    ]
+    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -249,6 +241,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
+    hipify=True,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -292,27 +285,21 @@ def build_module(
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
-        if hip_version > Version("5.5.00000"):
-            flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
-            flags_hip += ["-fno-offload-uniform-block"]
+            flags_hip += hip_flag_checker("-fno-offload-uniform-block")
         if hip_version > Version("6.1.40090"):
-            flags_hip += ["-mllvm -enable-post-misched=0"]
+            flags_hip += hip_flag_checker("-mllvm -enable-post-misched=0")
         if hip_version > Version("6.2.41132"):
-            flags_hip += [
-                "-mllvm -amdgpu-early-inline-all=true",
-                "-mllvm -amdgpu-function-calls=false",
-            ]
+            flags_hip += hip_flag_checker(
+                "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"
+            )
         if hip_version > Version("6.2.41133"):
-            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+            flags_hip += hip_flag_checker("-mllvm -amdgpu-coerce-illegal-types=1")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
-        for i in reversed(range(len(flags_hip))):
-            if not hip_flag_checker(flags_hip[i]):
-                del flags_hip[i]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
@@ -365,6 +352,7 @@ def build_module(
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                hipify=hipify,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -394,7 +382,7 @@ def build_module(
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
-def get_args_of_build(ops_name: str, exclude=[]):
+def get_args_of_build(ops_name: str, exclue=[]):
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -444,7 +432,8 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
-                    if ops_name in exclude:
+                    # exclude
+                    if ops_name in exclue:
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
@@ -510,6 +499,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
+                hipify = d_args.get("hipify", True)
                 build_module(
                     md_name,
                     srcs,
@@ -522,6 +512,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_python_module,
                     is_standalone,
                     torch_exclude,
+                    hipify,
                 )
                 if is_python_module:
                     module = get_module(md_name)

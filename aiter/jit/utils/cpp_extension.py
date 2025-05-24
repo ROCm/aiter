@@ -285,7 +285,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 
 def get_compiler_abi_compatibility_and_version(
-    compiler, torch_exclude=False
+    compiler, torch_exclude
 ) -> Tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
@@ -327,12 +327,15 @@ def get_compiler_abi_compatibility_and_version(
             versionstr = subprocess.check_output(
                 [compiler, "-dumpfullversion", "-dumpversion"]
             )
+            version = versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip().split(".")
+        else:
+            minimum_required_version = MINIMUM_MSVC_VERSION
+            compiler_info = subprocess.check_output(compiler, stderr=subprocess.STDOUT)
             match = re.search(
                 r"(\d+)\.(\d+)\.(\d+)",
-                versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
+                compiler_info.decode(*SUBPROCESS_DECODE_ARGS).strip(),
             )
             version = ["0", "0", "0"] if match is None else list(match.groups())
-
     except Exception:
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
@@ -1114,6 +1117,7 @@ def _jit_compile(
     is_standalone,
     keep_intermediates=True,
     torch_exclude=False,
+    hipify=True,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1160,7 +1164,7 @@ def _jit_compile(
                         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
                         torch_path = os.path.join(_TORCH_PATH, "*")
 
-                    if IS_HIP_EXTENSION and with_cuda:
+                    if IS_HIP_EXTENSION and with_cuda and hipify:
                         hipify_result = hipify_python.hipify(
                             project_directory=build_directory,
                             output_directory=build_directory,

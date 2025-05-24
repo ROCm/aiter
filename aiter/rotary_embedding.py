@@ -1,9 +1,9 @@
-# Copyright © Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
 # coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.33.2/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+# Copyright (C) 2023-2025 The vLLM team.
+# Copyright (C) 2022-2025 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
 # and OPT implementations in this library. It has been modified from its

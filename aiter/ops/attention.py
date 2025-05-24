@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from typing import Optional
@@ -66,6 +66,27 @@ def paged_attention_rocm(
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     block_size: int,
+    max_context_len: int,
+    alibi_slopes: Optional[torch.Tensor],
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    fp8_out_scale: Optional[torch.Tensor],
+    partition_size: int,
+): ...
+
+
+@compile_ops("module_pa_v1")
+def paged_attention_v1(
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
     max_context_len: int,
     alibi_slopes: Optional[torch.Tensor],
     kv_cache_dtype: str,
