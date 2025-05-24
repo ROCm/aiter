@@ -12,7 +12,7 @@ const auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
 const auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 #endif
 #else
-const auto torch_fp8 = at::detail::getCUDAHooks().isGPUArch(0, {"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
+const auto torch_fp8 = at::detail::getCUDAHooks().isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
 #endif
 
 // clang-format off
