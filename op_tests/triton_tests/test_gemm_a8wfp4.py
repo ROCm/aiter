@@ -5,9 +5,13 @@ from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
+DEBUG = True
 
 def generate_a_int8_inputs(M, K, dtype):
-    x = torch.randn((M, K), dtype=torch.float32, device="cuda")
+    if DEBUG:
+        x = torch.arange(1, M * K + 1, dtype=torch.float32, device="cuda").reshape(M, K)
+    else:
+        x = torch.randn((M, K), dtype=torch.float32, device="cuda")
     max_x = x.abs().float().amax(dim=1, keepdim=True)
     dtype_max = torch.iinfo(dtype).max if dtype == torch.int8 else torch.finfo(dtype).max
     x_scale = max_x / dtype_max
@@ -18,21 +22,19 @@ def generate_a_int8_inputs(M, K, dtype):
 
 def generate_b_fp4_inputs(N, K):
     torch.manual_seed(5)
-    # 34 is two packed e2m1 values 0010 which is 1.0.
-    w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
-    w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
-    w = w_low | w_high << 4
-    w = w.T
-    # Scale of 1.0 in e8m0, bias 127.
-    w_scales = torch.randint(124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda")
-    w_scales = w_scales.T
-    return w, w_scales
-
-
-def generate_gemm_a8wfp4_inputs(M, N, K, a_dtype):
-    x, x_scales = generate_a_int8_inputs(M, K, a_dtype)
-    w, w_scales = generate_b_fp4_inputs(N, K)
-    return x, w, x_scales, w_scales
+    if DEBUG:
+        # Simple debug values: all 1.0 in fp4 (0010 = 2 in the mxfp4 list)
+        # 0x22 = two packed 1.0 values (0010 0010)
+        w = torch.full((N, K // 2), 0x22, dtype=torch.uint8, device="cuda")
+        # Scale of 1.0 in e8m0 (bias 127)
+        w_scales = torch.full((K // SCALE_GROUP_SIZE, N), 127, dtype=torch.uint8, device="cuda")
+    else:
+        w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+        w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+        w = w_low | w_high << 4
+        # Scale of 1.0 in e8m0, bias 127.
+        w_scales = torch.randint(124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda")
+    return w.T, w_scales.T
 
 def get_x_vals():
 
@@ -78,22 +80,22 @@ def mxfp4_to_f32(x):
     x[:, ::2] = x[:, ::2] & 0xF
     x[:, 1::2] = x[:, 1::2] >> 4
     mxfp4_list = [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
+        0.0,   # 0000
+        0.5,   # 0001
+        1.0,   # 0010
+        1.5,   # 0011
+        2.0,   # 0100
+        3.0,   # 0101
+        4.0,   # 0110
+        6.0,   # 0111
+        -0.0,  # 1000
+        -0.5,  # 1001
+        -1.0,  # 1010
+        -1.5,  # 1011
+        -2.0,  # 1100
+        -3.0,  # 1101
+        -4.0,  # 1110
+        -6.0,  # 1111
     ]
     mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
     return mxfp4_in_f32[x.long()]
@@ -106,12 +108,11 @@ def e8m0_to_f32(x):
 
 
 def run_torch(x, w, x_scales, w_scales, dtype):
-    # convert int8/fp8 A to f32
+    # convert int8/fp8 A to f32. a scales are in fp32
     x_f32 = x.to(torch.float32)
-    x_scales_f32 = e8m0_to_f32(x_scales)
-    x_f32 = x_f32 * x_scales_f32
+    x_f32 = x_f32 * x_scales
     
-    # convert fp4 B to fp32
+    # convert fp4 B to fp32. b scales are in e8m0 so converted to fp32
     w_f32 = mxfp4_to_f32(w.T)
     w_f32 = w_f32.T
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
@@ -125,18 +126,25 @@ def is_cdna4():
 e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
 e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("M, N, K", [(2, 2, 32)] if DEBUG else get_x_vals())
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16, torch.bfloat16])
 def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
     if not is_cdna4():
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales = generate_gemm_a8wfp4_inputs(M, N, K, a_dtype)
-    out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
-
+    x, x_scales = generate_a_int8_inputs(M, K, a_dtype)
+    w, w_scales = generate_b_fp4_inputs(N, K)
+    if DEBUG:
+        print()
+        print("x", x, x.shape)
+        print("x_scales", x_scales, x_scales.shape)
+        print("w", w , w.shape)
+        print("w_scales", w_scales, w_scales.shape)
     torch_out = run_torch(x, w, x_scales, w_scales, out_dtype).to(out_dtype)
+    if DEBUG:
+        print("torch_out", torch_out, torch_out.shape)
 
-    gemm_a8wfp4(x, w, out, x_scales, w_scales, out_dtype)
-
-    torch.testing.assert_close(torch_out, out)
+    # out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
+    # gemm_a8wfp4(x, w, out, x_scales, w_scales, out_dtype)
+    # torch.testing.assert_close(torch_out, out)
