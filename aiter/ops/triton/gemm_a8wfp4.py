@@ -132,7 +132,7 @@ def _gemm_a8wfp4_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a = tl.load(
-                    a_ptrs, mask=offs_ak[None, :] < K - k * (BLOCK_SIZE_K), other=0
+                    a_ptrs, mask=offs_ak[None, :] < K - k * (BLOCK_SIZE_K), other=0.0
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_bk[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0

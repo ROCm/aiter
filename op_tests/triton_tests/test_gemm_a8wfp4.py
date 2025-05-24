@@ -145,6 +145,11 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
     if DEBUG:
         print("torch_out", torch_out, torch_out.shape)
 
-    # out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
-    # gemm_a8wfp4(x, w, out, x_scales, w_scales, out_dtype)
-    # torch.testing.assert_close(torch_out, out)
+    if DEBUG:
+        out = torch.zeros(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
+    else:
+        out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
+    gemm_a8wfp4(x, w, out, x_scales, w_scales, out_dtype)
+    if DEBUG:
+        print("out:", out)
+    torch.testing.assert_close(torch_out, out)
