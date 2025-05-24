@@ -126,7 +126,7 @@ def is_cdna4():
 e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
 e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 
-@pytest.mark.parametrize("M, N, K", [(32, 32, 32)] if DEBUG else get_x_vals())
+@pytest.mark.parametrize("M, N, K", [(2, 2, 32)] if DEBUG else get_x_vals())
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
 def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
@@ -151,5 +151,5 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
         out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
     gemm_a8wfp4(x, w, out, x_scales, w_scales, out_dtype)
     if DEBUG:
-        print("out:", out)
+        print("out:", out, out.shape)
     torch.testing.assert_close(torch_out, out)
