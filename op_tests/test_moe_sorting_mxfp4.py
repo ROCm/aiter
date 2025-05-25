@@ -98,6 +98,8 @@ for dtype in [dtypes.bf16]:
         df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
+
+df = []
 for dtype in [dtypes.bf16]:
     for (
         dim,
