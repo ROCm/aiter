@@ -6,6 +6,20 @@ import triton
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
+import os
+
+TRITON_HIP_PRESHUFFLE_SCALES = (
+    os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
+)
+
+
+def shuffle_scales(scales: torch.Tensor):
+    sm, sn = scales.shape
+    scales = scales.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+    scales = scales.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    scales = scales.view(sm, sn)
+    return scales
+
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -32,11 +46,14 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     )
     x_scales = x_scales.T
     w_scales = w_scales.T
-    
+    if TRITON_HIP_PRESHUFFLE_SCALES:
+        x_scales = shuffle_scales(x_scales)
+        w_scales = shuffle_scales(w_scales)
+
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype).cuda()
-        out_dtype = None,
+        out_dtype = (None,)
     else:
         out_dtype = dtype
 
@@ -136,14 +153,15 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales, out_dtype, y = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output)
-    
+    x, w, x_scales, w_scales, out_dtype, y = generate_gemm_afp4wfp4_inputs(
+        M, N, K, dtype, output
+    )
+
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if output:
         triton_out = gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y)
     else:
         triton_out = gemm_afp4wfp4(x, w, x_scales, w_scales, dtype)
-
 
     torch.testing.assert_close(torch_out, triton_out)
