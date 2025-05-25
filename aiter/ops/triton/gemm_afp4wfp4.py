@@ -14,11 +14,12 @@ import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.tuning_util import aiter_register
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
-        and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0), 
+        and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
         "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
@@ -45,6 +46,7 @@ def _gemm_afp4_wfp4_kernel(
     stride_bsn,
     stride_bsk,
     # Meta-parameters
+    IS_SCALE_SHUFFLED: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -111,22 +113,52 @@ def _gemm_afp4_wfp4_kernel(
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-        )
-        a_scale_ptrs = (
-            a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks[None, :] * stride_ask
-        )
-        # B scales are N x K even though B operand is K x N.
-        b_scale_ptrs = (
-            b_scales_ptr + offs_bn[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
-        )
+        if IS_SCALE_SHUFFLED:
+            offs_asm = (
+                pid_m * (BLOCK_SIZE_M // 32) + tl.arange(0, (BLOCK_SIZE_M // 32))
+            ) % M
+            offs_asn = (
+                pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, (BLOCK_SIZE_N // 32))
+            ) % N
+            offs_ks = (
+                pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) * 32
+            ) + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE * 32)
+            a_scale_ptrs = (
+                a_scales_ptr
+                + offs_asm[:, None] * stride_asm
+                + offs_ks[None, :] * stride_ask
+            )
+            # B scales are N x K even though B operand is K x N.
+            b_scale_ptrs = (
+                b_scales_ptr
+                + offs_asn[:, None] * stride_bsn
+                + offs_ks[None, :] * stride_bsk
+            )
+        else:
+            offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
+                0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
+            )
+            a_scale_ptrs = (
+                a_scales_ptr
+                + offs_am[:, None] * stride_asm
+                + offs_ks[None, :] * stride_ask
+            )
+            # B scales are N x K even though B operand is K x N.
+            b_scale_ptrs = (
+                b_scales_ptr
+                + offs_bn[:, None] * stride_bsn
+                + offs_ks[None, :] * stride_bsk
+            )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
+            if IS_SCALE_SHUFFLED:
+                tl.reshape(a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE))
+                tl.reshape(b_scales, (BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE))
+
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -249,6 +281,7 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # print(K % (SPLITK_BLOCK_SIZE // 2) == 0, SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0, K % (BLOCK_SIZE_K // 2) == 0)
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -264,7 +297,6 @@ def _get_config(
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
-
 
     if M < 32:
         return _get_config._config_dict["small"]
@@ -313,12 +345,19 @@ def gemm_afp4wfp4(
     M, K = x.shape
     K, N = w.shape
 
+    XS_M, _ = x_scales.shape
+    XS_N, _ = w_scales.shape
+
+    IS_SCALE_SHUFFLED = False
+    if XS_M == M // 32 and XS_N == N // 32:
+        IS_SCALE_SHUFFLED = True
+
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
         config = _get_config(M, N, K)
-    #print(f"AFP4WFP4_config={config}")
+    # print(f"AFP4WFP4_config={config}")
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -367,6 +406,7 @@ def gemm_afp4wfp4(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
+        IS_SCALE_SHUFFLED,
         **config,
     )
 
