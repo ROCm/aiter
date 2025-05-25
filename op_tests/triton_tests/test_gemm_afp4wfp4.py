@@ -14,11 +14,12 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
 
 
 def shuffle_scales(scales: torch.Tensor):
-    sm, sn = scales.shape
-    scales = scales.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    scales = scales.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    scales = scales.view(sm, sn)
-    return scales
+    scales_shuffled = scales.clone()
+    sm, sn = scales_shuffled.shape
+    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    scales_shuffled = scales_shuffled.view(sm, sn)
+    return scales_shuffled
 
 
 # Note this is specified by the HW and cannot be changed.
@@ -47,8 +48,11 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     x_scales = x_scales.T
     w_scales = w_scales.T
     if TRITON_HIP_PRESHUFFLE_SCALES:
-        x_scales = shuffle_scales(x_scales)
-        w_scales = shuffle_scales(w_scales)
+        x_scales_shuffled = shuffle_scales(x_scales)
+        w_scales_shuffled = shuffle_scales(w_scales)
+    else:
+        x_scales_shuffled = x_scales
+        w_scales_shuffled = w_scales
 
     y = None
     if output:
@@ -57,7 +61,7 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     else:
         out_dtype = dtype
 
-    return x, w, x_scales, w_scales, out_dtype, y
+    return x, w, x_scales, w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y
 
 
 def get_x_vals():
@@ -153,15 +157,15 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales, out_dtype, y = generate_gemm_afp4wfp4_inputs(
-        M, N, K, dtype, output
+    x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
+        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output)
     )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     if output:
-        triton_out = gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, y)
+        triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype, y)
     else:
-        triton_out = gemm_afp4wfp4(x, w, x_scales, w_scales, dtype)
+        triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype)
 
     torch.testing.assert_close(torch_out, triton_out)
