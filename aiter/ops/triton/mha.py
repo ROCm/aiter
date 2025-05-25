@@ -126,7 +126,7 @@ def is_hip():
 
 
 def arch_supports_fp8():
-    return is_hip() and get_arch() in ("gfx942")
+    return is_hip() and get_arch() in ("gfx942", "gfx950")
 
 
 @triton.jit
