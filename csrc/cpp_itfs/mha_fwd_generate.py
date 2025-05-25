@@ -22,8 +22,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bias_enum bias_type,
                                   bool has_lse,
                                   bool has_dropout,
-                                  bool use_ext_asm,
-                                  bool skip_min_seqlen_q = false)
+                                  bool use_ext_asm)
 {{
     return mha_fwd_traits(head_size_q,
                           head_size_v,
@@ -34,8 +33,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           bias_type,
                           has_lse,
                           has_dropout,
-                          use_ext_asm,
-                          skip_min_seqlen_q);
+                          use_ext_asm);
 }}
 
 mha_fwd_splitkv_traits get_mha_fwd_splitkv_traits(int head_size_q,
@@ -84,8 +82,7 @@ float mha_fwd(mha_fwd_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     use_ext_asm,
-                                     args.min_seqlen_q != 0);
+                                     use_ext_asm);
     float t = -1;
     {F_inner_dispatch}
     return t;

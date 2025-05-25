@@ -3,9 +3,11 @@
 #pragma once
 #include "aiter_hip_common.h"
 
-namespace ck_tile {
-template <typename T, int N> using vec_t = array<T, N>;
-// using vec_t = ext_vector_t<T, N>;
+namespace ck_tile
+{
+    template <typename T, int N>
+    using vec_t = array<T, N>;
+    // using vec_t = ext_vector_t<T, N>;
 
     using int8x2_v = vec_t<int8_t, 2>;
     using fp8x2_v = vec_t<fp8_t, 2>;
@@ -77,17 +79,21 @@ template <typename T, int N> using vec_t = array<T, N>;
 #endif
     }
 
-// convert any to fp32x?_t one by one
-template <typename Y, typename X, index_t N,
-          std::enable_if_t<(std::is_same_v<Y, fp32_t>), bool> = false>
-CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x) {
-  using fp32xX_t = vec_t<Y, N>;
-  fp32xX_t tmp;
-  for (size_t i = 0; i < N; i++) {
-    tmp[i] = type_convert<Y>(x[i]);
-  }
-  return tmp;
-}
+    // convert any to fp32x?_t one by one
+    template <typename Y,
+              typename X,
+              index_t N,
+              std::enable_if_t<(std::is_same_v<Y, fp32_t>), bool> = false>
+    CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x)
+    {
+        using fp32xX_t = vec_t<Y, N>;
+        fp32xX_t tmp;
+        for (size_t i = 0; i < N; i++)
+        {
+            tmp[i] = type_convert<Y>(x[i]);
+        }
+        return tmp;
+    }
 
     template <typename Y,
               typename X,
@@ -214,4 +220,4 @@ CK_TILE_HOST_DEVICE constexpr vec_t<Y, N> vec_convert(vec_t<X, N> x) {
     CK_TILE_TYPE_CONVERT(fp4x2, bf16, 32)
 #undef CK_TILE_TYPE_CONVERT
 
-} // namespace ck_tile
+} // namespace aiter

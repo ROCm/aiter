@@ -1,4 +1,4 @@
-# CK gemm a8w8 tune
+# CK gemm a8w8 blockscale tune
 
 1. Install aiter:
 `cd $aiter_path`
