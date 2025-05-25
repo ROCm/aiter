@@ -294,12 +294,14 @@ def build_module(
                 "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"
             )
         if hip_version > Version("6.2.41133"):
-            flags_hip += hip_flag_checker("-mllvm -amdgpu-coerce-illegal-types=1")
-
+            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+            flags_hip += ["-D__Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):

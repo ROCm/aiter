@@ -179,13 +179,17 @@
       "LLMM1(Tensor in_a, Tensor in_b, Tensor! out_c, int rows_per_block) -> " \
       "()");
 
-#define GEMM_A8W8_ASM_PYBIND                                                   \
-  m.def("gemm_a8w8_asm", &gemm_a8w8_asm,                                       \
-        "Asm gemm a8w8 ,  weight should be shuffle to layout(32,16)",          \
-        py::arg("XQ"), py::arg("WQ"), py::arg("x_scale"), py::arg("w_scale"),  \
-        py::arg("Out"), py::arg("bias"), py::arg("sub_m") = 128,               \
-        py::arg("sub_n") = 128, py::arg("pad_a") = 0, py::arg("pad_b") = 0,    \
-        py::arg("pad_c") = 0, py::arg("splitK") = 0);
+#define GEMM_A4W4_ASM_PYBIND                        \
+      m.def("gemm_a4w4_asm", &gemm_a4w4_asm,        \
+            "Asm gemm a4w4",                        \
+            py::arg("A"), py::arg("B"),             \
+            py::arg("A_scale"), py::arg("B_scale"), \
+            py::arg("out"), py::arg("bias"),        \
+            py::arg("alpha") = 1.0, py::arg("beta") = 0.0);
+
+#define GEMM_A8W8_BLOCKSCALE_PYBIND                                                                             \
+      m.def("gemm_a8w8_blockscale", &gemm_a8w8_blockscale, "fp8 blockscale gemm", py::arg("XQ"), py::arg("WQ"), \
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"));
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND                                            \
   m.def("gemm_a8w8_blockscale", &gemm_a8w8_blockscale, "fp8 blockscale gemm",  \
@@ -278,33 +282,57 @@
         py::arg("dv") = std::nullopt, py::arg("alibi_slopes") = std::nullopt,  \
         py::arg("rng_state") = std::nullopt, py::arg("gen") = std::nullopt);
 
-#define MHA_VARLEN_FWD_PYBIND                                                  \
-  m.def(                                                                       \
-      "mha_varlen_fwd", &aiter::torch_itfs::mha_varlen_fwd, py::arg("q"),      \
-      py::arg("k"), py::arg("v"), py::arg("cu_seqlens_q"),                     \
-      py::arg("cu_seqlens_k"), py::arg("max_seqlen_q"),                        \
-      py::arg("max_seqlen_k"), py::arg("min_seqlen_q"),                        \
-      py::arg("dropout_p"), py::arg("softmax_scale"),                          \
-      py::arg("logits_soft_cap"), py::arg("zero_tensors"),                     \
-      py::arg("is_causal"), py::arg("window_size_left"),                       \
-      py::arg("window_size_right"), py::arg("return_softmax_lse"),             \
-      py::arg("return_dropout_randval"), py::arg("out") = std::nullopt,        \
-      py::arg("block_table") = std::nullopt, py::arg("bias") = std::nullopt,   \
-      py::arg("alibi_slopes") = std::nullopt, py::arg("gen") = std::nullopt);
+#define MHA_BATCH_PREFILL_PYBIND                                        \
+      m.def("mha_batch_prefill", &aiter::torch_itfs::mha_batch_prefill, \
+            py::arg("q"), py::arg("k"), py::arg("v"),                   \
+            py::arg("cu_seqlens_q"),                                    \
+            py::arg("kv_indptr"),                                       \
+            py::arg("kv_page_indices"),                                 \
+            py::arg("max_seqlen_q"),                                    \
+            py::arg("max_seqlen_k"),                                    \
+            py::arg("dropout_p"),                                       \
+            py::arg("softmax_scale"),                                   \
+            py::arg("logits_soft_cap"),                                 \
+            py::arg("zero_tensors"),                                    \
+            py::arg("is_causal"),                                       \
+            py::arg("window_size_left"),                                \
+            py::arg("window_size_right"),                               \
+            py::arg("return_softmax_lse"),                              \
+            py::arg("return_dropout_randval"),                          \
+            py::arg("out") = std::nullopt,                              \
+            py::arg("bias") = std::nullopt,                             \
+            py::arg("alibi_slopes") = std::nullopt,                     \
+            py::arg("gen") = std::nullopt);
 
-#define MHA_BATCH_PREFILL_PYBIND                                               \
-  m.def(                                                                       \
-      "mha_batch_prefill", &aiter::torch_itfs::mha_batch_prefill,              \
-      py::arg("q"), py::arg("k"), py::arg("v"), py::arg("cu_seqlens_q"),       \
-      py::arg("kv_indptr"), py::arg("kv_page_indices"),                        \
-      py::arg("max_seqlen_q"), py::arg("max_seqlen_k"), py::arg("dropout_p"),  \
-      py::arg("softmax_scale"), py::arg("logits_soft_cap"),                    \
-      py::arg("zero_tensors"), py::arg("is_causal"),                           \
-      py::arg("window_size_left"), py::arg("window_size_right"),               \
-      py::arg("return_softmax_lse"), py::arg("return_dropout_randval"),        \
-      py::arg("skip_min_seqlen_q"),                                            \
-      py::arg("out") = std::nullopt, py::arg("bias") = std::nullopt,           \
-      py::arg("alibi_slopes") = std::nullopt, py::arg("gen") = std::nullopt);
+#define MOE_CK_2STAGES_PYBIND                         \
+      m.def("ck_moe_stage1", &ck_moe_stage1,          \
+            py::arg("hidden_states"),                 \
+            py::arg("w1"),                            \
+            py::arg("w2"),                            \
+            py::arg("sorted_token_ids"),              \
+            py::arg("sorted_expert_ids"),             \
+            py::arg("num_valid_ids"),                 \
+            py::arg("out"),                           \
+            py::arg("topk"),                          \
+            py::arg("w1_scale") = std::nullopt,       \
+            py::arg("a1_scale") = std::nullopt,       \
+            py::arg("block_m") = 32,                  \
+            py::arg("sorted_weights") = std::nullopt, \
+            py::arg("act_op") = 0);                   \
+                                                      \
+      m.def("ck_moe_stage2", &ck_moe_stage2,          \
+            py::arg("inter_states"),                  \
+            py::arg("w1"),                            \
+            py::arg("w2"),                            \
+            py::arg("sorted_token_ids"),              \
+            py::arg("sorted_expert_ids"),             \
+            py::arg("num_valid_ids"),                 \
+            py::arg("out"),                           \
+            py::arg("topk"),                          \
+            py::arg("w2_scale") = std::nullopt,       \
+            py::arg("a2_scale") = std::nullopt,       \
+            py::arg("block_m") = 32,                  \
+            py::arg("sorted_weights") = std::nullopt);
 
 #define MOE_CK_2STAGES_PYBIND                                                  \
   m.def("ck_moe_stage1", &ck_moe_stage1, py::arg("hidden_states"),             \
@@ -427,10 +455,12 @@
   m.def("layernorm2d_with_add_smoothquant_asm",                                \
         &layernorm2d_with_add_smoothquant_asm);
 
-#define POS_ENCODING_PYBIND                                                    \
-  m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding");        \
-  m.def("batched_rotary_embedding", &batched_rotary_embedding,                 \
-        "batched_rotary_embedding");
+#define QUANT_PYBIND                                                           \
+      m.def("static_per_tensor_quant", &static_per_tensor_quant);              \
+      m.def("dynamic_per_tensor_quant", &dynamic_per_tensor_quant);            \
+      m.def("dynamic_per_token_scaled_quant", &dynamic_per_token_scaled_quant, \
+            py::arg("out"), py::arg("input"),                                  \
+            py::arg("scales"), py::arg("scale_ub") = std::nullopt);
 
 #define QUANT_PYBIND                                                           \
   m.def("static_per_tensor_quant", &static_per_tensor_quant);                  \
@@ -499,24 +529,17 @@
         py::arg("scaleB") = std::nullopt, py::arg("scaleC") = std::nullopt);   \
   m.def("getHipblasltKernelName", &getHipblasltKernelName);
 
-#define ROCSOLGEMM_PYBIND                                                      \
-  m.def("rocb_create_extension", &rocb_create_extension, "create_extension");  \
-  m.def("rocb_destroy_extension", &rocb_destroy_extension,                     \
-        "destroy_extension");                                                  \
-  m.def("rocb_mm", &RocSolIdxBlas, "mm");                                      \
-  m.def("rocb_findallsols", &RocFindAllSolIdxBlas, "rocblas_find_all_sols");
-
-#define AITER_ENUM_PYBIND                                                      \
-  pybind11::enum_<QuantType>(m, "QuantType")                                   \
-      .value("No", QuantType::No)                                              \
-      .value("per_Tensor", QuantType::per_Tensor)                              \
-      .value("per_Token", QuantType::per_Token)                                \
-      .value("per_1x32", QuantType::per_1x32)                                  \
-      .value("per_1x128", QuantType::per_1x128)                                \
-      .value("per_128x128", QuantType::per_128x128)                            \
-      .export_values();                                                        \
-  pybind11::enum_<ActivationType>(m, "ActivationType")                         \
-      .value("No", ActivationType::No)                                         \
-      .value("Silu", ActivationType::Silu)                                     \
-      .value("Gelu", ActivationType::Gelu)                                     \
-      .export_values();
+#define AITER_ENUM_PYBIND                                  \
+      pybind11::enum_<QuantType>(m, "QuantType")           \
+          .value("No", QuantType::No)                      \
+          .value("per_Tensor", QuantType::per_Tensor)      \
+          .value("per_Token", QuantType::per_Token)        \
+          .value("per_1x32", QuantType::per_1x32)          \
+          .value("per_1x128", QuantType::per_1x128)        \
+          .value("per_128x128", QuantType::per_128x128)    \
+          .export_values();                                \
+      pybind11::enum_<ActivationType>(m, "ActivationType") \
+          .value("No", ActivationType::No)                 \
+          .value("Silu", ActivationType::Silu)             \
+          .value("Gelu", ActivationType::Gelu)             \
+          .export_values();
