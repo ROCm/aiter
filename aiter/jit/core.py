@@ -127,7 +127,15 @@ CK_DIR = f"{bd_dir}/ck"
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx940",
+        "gfx941",
+        "gfx942",
+        "gfx1100",
+        "gfx950",
+    ]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -285,14 +293,17 @@ def build_module(
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        if hip_version > Version("5.5.00000"):
+            flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
-            flags_hip += hip_flag_checker("-fno-offload-uniform-block")
+            flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
-            flags_hip += hip_flag_checker("-mllvm -enable-post-misched=0")
+            flags_hip += ["-mllvm -enable-post-misched=0"]
         if hip_version > Version("6.2.41132"):
-            flags_hip += hip_flag_checker(
-                "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"
-            )
+            flags_hip += [
+                "-mllvm -amdgpu-early-inline-all=true",
+                "-mllvm -amdgpu-function-calls=false",
+            ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
@@ -384,7 +395,7 @@ def build_module(
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
-def get_args_of_build(ops_name: str, exclue=[]):
+def get_args_of_build(ops_name: str, exclude=[]):
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -435,7 +446,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                     if ops_name.endswith("tune"):
                         continue
                     # exclude
-                    if ops_name in exclue:
+                    if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
