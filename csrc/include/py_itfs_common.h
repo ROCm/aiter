@@ -5,14 +5,31 @@
 #include <torch/all.h>
 #include "aiter_hip_common.h"
 
+bool static isGPUArch(const std::vector<std::string> &archs)
+{
+    hipDeviceProp_t props;
+
+    hipGetDeviceProperties(&props, 0);
+
+    std::string device_arch = props.gcnArchName;
+    for (std::string arch : archs)
+    {
+        size_t substring = device_arch.find(arch);
+        if (substring != std::string::npos)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 #ifdef __HIP_DEVICE_COMPILE__
 #if CK_TILE_USE_OCP_FP8
-const auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
+const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fn;
 #else
-const auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
+const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 #endif
 #else
-const auto torch_fp8 = at::detail::getCUDAHooks().isGPUArch(0, {"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
+const auto torch_fp8 = isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
 #endif
 
 // clang-format off

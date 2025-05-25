@@ -69,40 +69,31 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
     F8E8M0_EXP_BIAS = 127
-    F4E2M1_MAX = 6
+    F4E2M1_MAX = 6.0
     MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
+    # dtypeMax = F4E2M1_MAX
+    dtypeMax = 2.0**MAX_POW2
 
     m, n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
-    max_abs = max_abs.view(torch.int32)
-    max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
+    # max_abs = max_abs.view(torch.int32)
+    # max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
 
     # fp8e8m0fnu_from_fp32_value
-    largest_p2_lt_max_abs = torch.floor(torch.log2(max_abs))
-    scale_e8m0_unbiased = largest_p2_lt_max_abs - MAX_POW2
-    scale_e8m0_unbiased = torch.clamp(
-        scale_e8m0_unbiased, -1 * F8E8M0_EXP_BIAS, F8E8M0_EXP_BIAS
-    )
-    scale_e8m0_biased = scale_e8m0_unbiased.to(torch.uint8) + F8E8M0_EXP_BIAS
+    scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
 
     # Float8_e8m0fnu to float
-    zero_case = scale_e8m0_biased == 0
-    nan_case = scale_e8m0_biased == 0b11111111
-    scale_f32 = scale_e8m0_biased.to(torch.int32) << 23
-    scale_f32[zero_case] = 0x00400000
-    scale_f32[nan_case] = 0x7F800001
-    scale_f32 = scale_f32.view(dtypes.fp32)
+    scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
 
-    y, _ = pertoken_quant(
-        x, scale_f32.view(-1, 1), quant_dtype=dtypes.fp32, dtypeMax=F4E2M1_MAX
-    )
-    y = fp4_utils.fp32_to_fp4_e2m1fn_x2(y)
+    y = x.float() / scale_f32.view(-1, 1)
+    y = fp4_utils.f32_to_mxfp4(y)
     y = y.view(m, -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     scale_padded = torch.empty(
         (m + 31) // 32 * 32, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
     ).fill_(0x7F)
+
     scale_padded[:m, : n // block_size] = scale
     scale = scale_padded
     sm, sn = scale.shape
@@ -114,8 +105,8 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
         scale = scale.permute(0, 2, 1).contiguous()
         scale = scale.view(sm, sn)
     elif shuffle:
-        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-        scale = scale.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
         scale = scale.view(sm, sn)
     return y, scale.view(dtypes.fp8_e8m0)
 
@@ -173,7 +164,7 @@ def get_hip_quant(qType):
         QuantType.No: lambda *a, **k: (a[0], None),
         QuantType.per_Tensor: per_tensor_quant_hip,
         QuantType.per_Token: per_token_quant_hip,
-        QuantType.per_1x32: per_block_quant_wrapper((1, 32))(per_token_quant_hip),
+        QuantType.per_1x32: per_1x32_f4_quant_hip,
         QuantType.per_1x128: per_block_quant_wrapper((1, 128))(per_token_quant_hip),
     }
 
@@ -220,6 +211,31 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     else:
         raise ValueError(f"unsupported: {quant_dtype=}")
     return y, scale
+
+
+def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2):
+    m, n = x.shape
+    assert quant_dtype == dtypes.fp4x2
+    assert n % 2 == 0
+    device = x.device
+    if scale is None:
+        scale = (
+            torch.empty(
+                (
+                    (m + 31) // 32 * 32,
+                    (n // 32 + 7) // 8 * 8,
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            .fill_(0x7F)
+            .view(dtypes.fp8_e8m0)
+        )
+    else:
+        raise ValueError("unsupported: static per token quant")
+    y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
+    dynamic_per_token_scaled_quant(y, x.view(-1, 32), scale)
+    return y.view(torch.uint8), scale
 
 
 def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
