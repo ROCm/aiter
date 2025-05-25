@@ -1165,39 +1165,36 @@ def _jit_compile(
                         torch_path = os.path.join(_TORCH_PATH, "*")
 
                     if IS_HIP_EXTENSION and with_cuda and hipify:
-                        try:
-                            hipify_result = hipify_python.hipify(
-                                project_directory=build_directory,
-                                output_directory=build_directory,
-                                header_include_dirs=(
-                                    extra_include_paths
-                                    if extra_include_paths is not None
-                                    else []
-                                ),
-                                extra_files=[os.path.abspath(s) for s in sources],
-                                ignores=[
-                                    _join_rocm_home("*"),
-                                    torch_path,
-                                ],  # no need to hipify ROCm or PyTorch headers
-                                show_detailed=verbose,
-                                show_progress=verbose,
-                                is_pytorch_extension=True,
-                                hipify_extra_files_only=True,  # don't hipify everything in includes path
-                                clean_ctx=clean_ctx,
+                        hipify_result = hipify_python.hipify(
+                            project_directory=build_directory,
+                            output_directory=build_directory,
+                            header_include_dirs=(
+                                extra_include_paths
+                                if extra_include_paths is not None
+                                else []
+                            ),
+                            extra_files=[os.path.abspath(s) for s in sources],
+                            ignores=[
+                                _join_rocm_home("*"),
+                                torch_path,
+                            ],  # no need to hipify ROCm or PyTorch headers
+                            show_detailed=verbose,
+                            show_progress=verbose,
+                            is_pytorch_extension=True,
+                            hipify_extra_files_only=True,  # don't hipify everything in includes path
+                            clean_ctx=clean_ctx,
+                        )
+
+                        hipified_sources = set()
+                        for source in sources:
+                            s_abs = os.path.abspath(source)
+                            hipified_sources.add(
+                                hipify_result[s_abs].hipified_path
+                                if s_abs in hipify_result
+                                else s_abs
                             )
 
-                            hipified_sources = set()
-                            for source in sources:
-                                s_abs = os.path.abspath(source)
-                                hipified_sources.add(
-                                    hipify_result[s_abs].hipified_path
-                                    if s_abs in hipify_result
-                                    else s_abs
-                                )
-
-                            sources = list(hipified_sources)
-                        except Exception:
-                            pass
+                        sources = list(hipified_sources)
 
                     _write_ninja_file_and_build_library(
                         name=name,

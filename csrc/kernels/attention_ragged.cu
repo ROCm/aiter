@@ -229,7 +229,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
                                         HEAD_SIZE,                        \
                                         HEAD_SIZE,                        \
                                         PARTITION_SIZE,                   \
-                                        NPAR_LOOPS, (BLOCK_SIZE > 1)>     \
+                                        NPAR_LOOPS,                       \
+                                        ENABLE_LAST_PAGE_LENS>            \
         <<<reduce_grid, reduce_block, 0, stream>>>(out_ptr,               \
                                                    exp_sums_ptr,          \
                                                    max_logits_ptr,        \
@@ -345,6 +346,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, WARP_SIZE);
     // reduction kernel supports upto 8 NPAR_loops * 64 (warp_size) * 256 (partition size) = 128K
     // context length
+    constexpr bool ENABLE_LAST_PAGE_LENS = BLOCK_SIZE > 1;
     switch(npar_loops)
     {
     case 1: LAUNCH_CUSTOM_REDUCTION(1); break;
