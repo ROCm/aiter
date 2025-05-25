@@ -970,7 +970,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.scale_p = scale_p;
             args.scale_o = scale_o;
 
-            args.logits_soft_cap = logits_soft_cap;
+            // args.logits_soft_cap = logits_soft_cap;
 
             args.stride_bias =
                 (bias.type == bias_enum::alibi ? (bias.rank_info == 0 ? 0 : nhead) : stride_bias);

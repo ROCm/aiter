@@ -338,7 +338,6 @@
             py::arg("max_seqlen_k"),                              \
             py::arg("dropout_p"),                                 \
             py::arg("softmax_scale"),                             \
-            py::arg("logits_soft_cap"),                           \
             py::arg("zero_tensors"),                              \
             py::arg("is_causal"),                                 \
             py::arg("window_size_left"),                          \
@@ -361,7 +360,6 @@
             py::arg("max_seqlen_k"),                                     \
             py::arg("dropout_p"),                                        \
             py::arg("softmax_scale"),                                    \
-            py::arg("logits_soft_cap"),                                  \
             py::arg("zero_tensors"),                                     \
             py::arg("is_causal"),                                        \
             py::arg("window_size_left"),                                 \

@@ -123,7 +123,7 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     args.scale_p         = 1;
     args.scale_o         = 1;
 
-    args.logits_soft_cap = logits_soft_cap;
+    // args.logits_soft_cap = logits_soft_cap;
 
     args.stride_q             = stride_q;
     args.stride_k             = stride_k;

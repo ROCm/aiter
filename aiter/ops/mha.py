@@ -57,7 +57,7 @@ def mha_varlen_fwd(
     max_seqlen_k: int,
     dropout_p: float,
     softmax_scale: float,
-    logits_soft_cap: float,
+    # logits_soft_cap: float,
     zero_tensors: bool,
     is_causal: bool,
     window_size_left: int,
@@ -819,7 +819,7 @@ def _flash_attn_varlen_forward(
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
-    logits_soft_cap: float = 0.0,
+    # logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
     bias: Optional[torch.Tensor] = None,
@@ -843,12 +843,12 @@ def _flash_attn_varlen_forward(
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
             filter_fwd += "bf16*"
-        if 0.0 < logits_soft_cap:
-            md_name += "_logits"
-            filter_fwd += "_logits*"
-        else:
-            md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
+        # if 0.0 < logits_soft_cap:
+        #     md_name += "_logits"
+        #     filter_fwd += "_logits*"
+        # else:
+        #     md_name += "_nlogits"
+        #     filter_fwd += "_nlogits*"
         if bias is not None:
             md_name += "_bias"
             filter_fwd += "_bias*"
@@ -898,12 +898,12 @@ def _flash_attn_varlen_forward(
             md_name += "_bf16"
             filter_fwd_splitkv1 += "bf16*"
             filter_fwd_splitkv2 += "bf16*"
-        if 0.0 < logits_soft_cap:
-            md_name += "_logits"
-            filter_fwd += "_logits*"
-        else:
-            md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
+        # if 0.0 < logits_soft_cap:
+        #     md_name += "_logits"
+        #     filter_fwd += "_logits*"
+        # else:
+        #     md_name += "_nlogits"
+        #     filter_fwd += "_nlogits*"
         if bias is not None:
             md_name += "_bias"
             filter_fwd_splitkv2 += "_bias*"
@@ -953,7 +953,7 @@ def _flash_attn_varlen_forward(
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        logits_soft_cap,
+        # logits_soft_cap,
         zero_tensors,
         causal,
         window_size_left,
@@ -1201,7 +1201,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        logits_soft_cap,
+        # logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -1236,7 +1236,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dropout_p,
             softmax_scale,
             causal=causal,
-            logits_soft_cap=logits_soft_cap,
+            # logits_soft_cap=logits_soft_cap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
             bias=bias,
@@ -1356,7 +1356,7 @@ def flash_attn_varlen_func(
     max_seqlen_k,
     dropout_p=0.0,
     softmax_scale=None,
-    logits_soft_cap=0.0,
+    # logits_soft_cap=0.0,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     bias=None,
@@ -1432,7 +1432,7 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        logits_soft_cap,
+        # logits_soft_cap,
         causal,
         window_size,
         bias,
@@ -1458,7 +1458,7 @@ def mha_batch_prefill(
     max_seqlen_k: int,
     dropout_p: float,
     softmax_scale: float,
-    logits_soft_cap: float,
+    # logits_soft_cap: float,
     zero_tensors: bool,
     is_causal: bool,
     window_size_left: int,
@@ -1483,7 +1483,7 @@ def _mha_batch_prefill(
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
-    logits_soft_cap: float = 0.0,
+    # logits_soft_cap: float = 0.0,
     window_size_left: int = -1,
     window_size_right: int = -1,
     alibi_slopes: Optional[torch.Tensor] = None,
@@ -1504,12 +1504,12 @@ def _mha_batch_prefill(
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
         filter_fwd += "bf16*"
-    if 0.0 < logits_soft_cap:
-        md_name += "_logits"
-        filter_fwd += "_logits*"
-    else:
-        md_name += "_nlogits"
-        filter_fwd += "_nlogits*"
+    # if 0.0 < logits_soft_cap:
+    #     md_name += "_logits"
+    #     filter_fwd += "_logits*"
+    # else:
+    #     md_name += "_nlogits"
+    #     filter_fwd += "_nlogits*"
     if alibi_slopes is None:
         md_name += "_nbias"
         filter_fwd += "_nbias*"
@@ -1554,7 +1554,7 @@ def _mha_batch_prefill(
         max_seqlen_k,
         dropout_p,
         softmax_scale,
-        logits_soft_cap,
+        # logits_soft_cap,
         zero_tensors,
         causal,
         window_size_left,
@@ -1580,7 +1580,7 @@ def mha_batch_prefill_func(
     max_seqlen_k,
     dropout_p=0.0,
     softmax_scale=None,
-    logits_soft_cap=0.0,
+    # logits_soft_cap=0.0,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     alibi_slopes=None,
@@ -1610,7 +1610,7 @@ def mha_batch_prefill_func(
         dropout_p,
         softmax_scale,
         causal=causal,
-        logits_soft_cap=logits_soft_cap,
+        # logits_soft_cap=logits_soft_cap,
         window_size_left=window_size[0],
         window_size_right=window_size[1],
         alibi_slopes=alibi_slopes,
