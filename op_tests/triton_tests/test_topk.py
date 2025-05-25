@@ -1,6 +1,7 @@
 import pytest
 import torch
 from aiter.ops.triton.topk import topk as triton_topk
+
 DEVICE = "cuda"
 
 # FLOAT_DTYPES = [torch.float16, torch.float32, torch.bfloat16]
@@ -15,11 +16,13 @@ BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
 DIM2 = [16, 128256]
 K = [2, 8]
 
+
 def _to_cpu(res: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """Move `res` to CPU so it matches `ref`’s device."""
     if res.device.type != "cpu":
         res = res.cpu()
     return res
+
 
 def _assert_close(
     res: torch.Tensor,
@@ -36,12 +39,21 @@ def _assert_close(
     rtol = RESOLUTION[dtype]
     torch.testing.assert_close(res, ref, atol=atol, rtol=rtol, equal_nan=equal_nan)
 
-def _assert_equal(res: torch.Tensor, ref: torch.Tensor, *, equal_nan: bool = False) -> None:
+
+def _assert_equal(
+    res: torch.Tensor, ref: torch.Tensor, *, equal_nan: bool = False
+) -> None:
     res = _to_cpu(res, ref)
     torch.testing.assert_close(res, ref, atol=0, rtol=0, equal_nan=equal_nan)
 
-TEST_assert_close = lambda *a, **kw: _assert_close(*a, **kw)
-TEST_assert_equal = lambda *a, **kw: _assert_equal(*a, **kw)
+
+def TEST_assert_close(*a, **kw):
+    return _assert_close(*a, **kw)
+
+
+def TEST_assert_equal(*a, **kw):
+    return _assert_equal(*a, **kw)
+
 
 # ─────────────────────────────── tests ──────────────────────────────────────
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)

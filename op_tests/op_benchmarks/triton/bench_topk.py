@@ -63,7 +63,7 @@ def _flopmem_two_stage(B: int, M: int, K: int, chunk: int, elem_size: int) -> _F
 @dataclass
 class RoofDot:
     batch: int
-    I: float  # FLOPs / byte
+    AI: float  # FLOPs / byte
     P: float  # FLOPs / s
 
 
@@ -94,7 +94,7 @@ def _collect_roof_points(M: int, K: int) -> List[RoofDot]:
 
 
 def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None:
-    I_vals = [p.I for p in points]
+    I_vals = [p.AI for p in points]
     P_vals = [p.P for p in points]
     labels = [str(p.batch) for p in points]
 
@@ -125,7 +125,7 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
         color="grey",
     )
 
-    plt.xlabel("Arithmetic intensity  I  [FLOPs / byte]")
+    plt.xlabel("Arithmetic intensity  AI  [FLOPs / byte]")
     plt.ylabel("Throughput  P  [FLOPs/s]")
     plt.title(f"Roofline  (M={M}, K={K}) – Triton Top‑K")
     plt.grid(True, which="both", ls=":", lw=0.6)
@@ -161,9 +161,15 @@ def bench_latency(batch, provider, *, dim2: int, k: int):
     x = torch.rand(batch, dim2, device=DEVICE, dtype=torch.float32)
 
     if provider == "torch":
-        fn = lambda: x.topk(k, dim=1, largest=True, sorted=True)
+
+        def fn():
+            return x.topk(k, dim=1, largest=True, sorted=True)
+
     elif provider == "triton":
-        fn = lambda: triton_topk(x, k, largest=True, sorted=True)
+
+        def fn():
+            return triton_topk(x, k, largest=True, sorted=True)
+
     else:
         raise ValueError(provider)
 
@@ -192,9 +198,15 @@ def bench_memory(batch, provider, *, dim2: int, k: int):
     x = torch.rand(batch, dim2, device=DEVICE, dtype=torch.float32)
 
     if provider == "torch":
-        fn = lambda: x.topk(k, dim=1, largest=True, sorted=True)
+
+        def fn():
+            return x.topk(k, dim=1, largest=True, sorted=True)
+
     elif provider == "triton":
-        fn = lambda: triton_topk(x, k, largest=True, sorted=True)
+
+        def fn():
+            return triton_topk(x, k, largest=True, sorted=True)
+
     else:
         raise ValueError(provider)
 
