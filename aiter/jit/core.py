@@ -127,7 +127,15 @@ CK_DIR = f"{bd_dir}/ck"
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx940",
+        "gfx941",
+        "gfx942",
+        "gfx1100",
+        "gfx950",
+    ]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -138,9 +146,7 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str):
-    ret = os.system(
-        f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -Wno-unused-command-line-argument -"
-    )
+    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
         return [flag_hip]
     else:
@@ -275,7 +281,7 @@ def build_module(
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
             "-mllvm --amdgpu-kernarg-preload-count=16",
-            # "-v", "--save-temps",
+            # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
@@ -299,14 +305,13 @@ def build_module(
             ]
         if hip_version > Version("6.2.41133"):
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
-
+        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+            flags_hip += ["-D__Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
-        for i in reversed(range(len(flags_hip))):
-            if not hip_flag_checker(flags_hip[i]):
-                del flags_hip[i]
+        flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
