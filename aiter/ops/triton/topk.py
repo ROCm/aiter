@@ -14,24 +14,27 @@ import triton.language as tl
 import triton.language.core as core
 from triton.language.standard import _log2, zeros_like
 
+
 # 1-STAGE KERNEL (tiny rows)
 @triton.jit
 def _topk_kernel(
-    X, OUT_V, OUT_I,
-    stride_xm, stride_ovm, stride_oim,
+    X,
+    OUT_V,
+    OUT_I,
+    stride_xm,
+    stride_ovm,
+    stride_oim,
     M: tl.constexpr,
     K: tl.constexpr,
-    BLOCK: tl.constexpr
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row_ptr = X + pid * stride_xm
-    offs  = tl.arange(0, BLOCK)
-    mask  = offs < M
+    offs = tl.arange(0, BLOCK)
+    mask = offs < M
     FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min)
-    vals  = tl.load(row_ptr + offs,
-                    mask=mask,
-                    other=FILL_VALUE).to(tl.float32)
-    idxs  = offs.to(tl.int64)
+    vals = tl.load(row_ptr + offs, mask=mask, other=FILL_VALUE).to(tl.float32)
+    idxs = offs.to(tl.int64)
 
     out_v_ptr = OUT_V + pid * stride_ovm
     out_i_ptr = OUT_I + pid * stride_oim
@@ -39,15 +42,17 @@ def _topk_kernel(
     # unrolled exactly K iterations — no break/continue needed
     for j in core.static_range(0, K):
         vmax = tl.max(vals, axis=0)
-        eq   = vals == vmax
-        big  = tl.where(eq, tl.zeros_like(idxs),
-                        tl.zeros_like(idxs) + BLOCK)   # BLOCK as int64
-        arg  = tl.min(idxs + big, axis=0)
+        eq = vals == vmax
+        big = tl.where(
+            eq, tl.zeros_like(idxs), tl.zeros_like(idxs) + BLOCK
+        )  # BLOCK as int64
+        arg = tl.min(idxs + big, axis=0)
 
         tl.store(out_v_ptr + j, vmax)
         tl.store(out_i_ptr + j, arg)
 
         vals = tl.where(idxs == arg, FILL_VALUE, vals)
+
 
 def _pick_block(m: int, k: int) -> int:
     blk = max(128, k)
@@ -82,10 +87,17 @@ def one_stage_topk(
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
 
     _topk_kernel[(B,)](
-        x.contiguous(), out_v, out_i,
-        x.stride(0), out_v.stride(0), out_i.stride(0),
-        M=M, K=k, BLOCK=BLOCK,
-        num_warps=4, num_stages=2,
+        x.contiguous(),
+        out_v,
+        out_i,
+        x.stride(0),
+        out_v.stride(0),
+        out_i.stride(0),
+        M=M,
+        K=k,
+        BLOCK=BLOCK,
+        num_warps=4,
+        num_stages=2,
     )
     return out_v, out_i
 
@@ -114,14 +126,19 @@ def topk_stage1_kernel(
     cols = tl.arange(0, CHUNK_SIZE)
     mask = (chunk_offset + cols) < N
 
-    FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max)
+    FILL_VALUE = tl.constexpr(
+        torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max
+    )
     x_val = tl.load(x_ptr + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
     for k_idx in range(k):
         if DESCENDING:
-            chunk_select_val, chunk_select_idx = tl.max(x_val, axis=0, return_indices=True)
+            chunk_select_val, chunk_select_idx = tl.max(
+                x_val, axis=0, return_indices=True
+            )
         else:
-            chunk_select_val, chunk_select_idx = tl.min(x_val, axis=0, return_indices=True)
-
+            chunk_select_val, chunk_select_idx = tl.min(
+                x_val, axis=0, return_indices=True
+            )
 
         tl.store(y_ptr + k_idx, chunk_select_val)
         tl.store(index_ptr + k_idx, chunk_select_idx + chunk_offset)
@@ -130,7 +147,6 @@ def topk_stage1_kernel(
             x_val = tl.where(
                 cols == chunk_select_idx,
                 tl.constexpr(torch.finfo(torch.float32).min),
-
                 x_val,
             )
         else:
@@ -139,6 +155,7 @@ def topk_stage1_kernel(
                 tl.constexpr(torch.finfo(torch.float32).max),
                 x_val,
             )
+
 
 @triton.jit
 def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
@@ -240,6 +257,7 @@ def argsort(x, ids, dim: tl.constexpr, descending: core.constexpr):
         x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending, n_dims)
     return x, ids
 
+
 @triton.jit
 def topk_stage2_kernel(
     y_ptr,
@@ -261,9 +279,14 @@ def topk_stage2_kernel(
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
 
-    FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max)
-    mask_index_val = tl.constexpr(torch.iinfo(torch.int32).min) if DESCENDING else tl.constexpr(torch.iinfo(torch.int32).max)
-
+    FILL_VALUE = tl.constexpr(
+        torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max
+    )
+    mask_index_val = (
+        tl.constexpr(torch.iinfo(torch.int32).min)
+        if DESCENDING
+        else tl.constexpr(torch.iinfo(torch.int32).max)
+    )
 
     chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
     chunk_index_val = tl.load(chunk_index + cols, mask=mask, other=mask_index_val).to(
@@ -344,6 +367,7 @@ def two_stage_topk(x, k, dim=-1, largest=True, sorted=True):
 # dispatcher
 MAX_TINY_ROW = 1024
 
+
 def topk(
     x: torch.Tensor,
     k: int,
@@ -364,12 +388,13 @@ def topk(
         x = x.contiguous()
 
     row_len = x.shape[-1]
-    if (row_len <= tiny_row_thresh):
-    # if (row_len <= tiny_row_thresh) and (k <= 8):
+    if row_len <= tiny_row_thresh:
+        # if (row_len <= tiny_row_thresh) and (k <= 8):
         return one_stage_topk(
-            x.view(-1, row_len), k,
-            largest=largest, sorted=sorted, dim=-1,
+            x.view(-1, row_len),
+            k,
+            largest=largest,
+            sorted=sorted,
+            dim=-1,
         )
-    return two_stage_topk(
-        x, k, dim=dim, largest=largest, sorted=sorted
-    )
+    return two_stage_topk(x, k, dim=dim, largest=largest, sorted=sorted)
