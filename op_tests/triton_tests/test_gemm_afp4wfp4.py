@@ -16,9 +16,10 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
 def shuffle_scales(scales: torch.Tensor):
     scales_shuffled = scales.clone()
     sm, sn = scales_shuffled.shape
+    scales_shuffled = scales_shuffled.view()
     scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
     scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    scales_shuffled = scales_shuffled.view(sm, sn)
+    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
     return scales_shuffled
 
 
