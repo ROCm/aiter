@@ -16,13 +16,20 @@ torch.set_printoptions(threshold=float("inf"))
 
 @perftest()
 def run_torch(scale, sorted_ids, num_valid_ids, token_num):
-    sm, sn = scale.shape
+    topk = 1
+    if len(scale.shape) == 3:
+        topk = scale.shape[1]
+        scale = scale.view(-1, scale.shape[-1])
     sorted_ids[num_valid_ids:] = token_num
+    topk_ids = sorted_ids >> 24
     sorted_ids = sorted_ids & 0xFFFFFF
     mask = sorted_ids == token_num
+    if topk > 1:
+        sorted_ids = sorted_ids * topk + topk_ids
     sorted_ids[mask] = 0  # set to 0 to avoid overflow
     scale = scale[sorted_ids]
     scale[mask] = 0
+    sm, sn = scale.shape
     tmp = torch.zeros(
         ((sm + 31) // 32 * 32, sn), dtype=scale.dtype, device=scale.device
     )
@@ -36,7 +43,7 @@ def run_torch(scale, sorted_ids, num_valid_ids, token_num):
 
 
 @benchmark()
-def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size):
+def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage):
     input = torch.randn((token_num, model_dim), dtype=dtype)
     score = torch.randn((token_num, E), dtype=dtype)
 
@@ -48,10 +55,12 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size):
         model_dim,
         dtype,
     )
-    M = sorted_ids.shape[0]
-    scale = torch.arange(M * model_dim // 32, dtype=torch.uint8)
-    scale = scale.view(M, model_dim // 32)
-
+    if stage == "stage1":
+        scale = torch.arange(token_num * model_dim // 32, dtype=torch.uint8)
+        scale = scale.view(token_num, model_dim // 32)
+    else:
+        scale = torch.arange(token_num * topk * model_dim // 32, dtype=torch.uint8)
+        scale = scale.view(token_num, topk, model_dim // 32)
     ref, us_ref = run_torch(scale.clone(), sorted_ids.clone(), num_valid_ids, token_num)
     sorted_mxfp4_scale, us = run_perftest(
         fp4_utils.moe_mxfp4_sort,
@@ -74,10 +83,10 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size):
 
 
 df = []
-list_dim = [256, 4096, 6144, 8192][:]
+list_dim = [4096, 6144, 8192][:]
 list_E = [32, 256, 257, 512][:]
 list_topk = [5, 8][:]
-list_m = [1, 31, 64, 128, 256, 163840][:]
+list_m = [1, 31, 64, 128, 256, 10000, 163840][:]
 for dtype in [dtypes.bf16]:
     for (
         dim,
@@ -85,7 +94,18 @@ for dtype in [dtypes.bf16]:
         topk,
         m,
     ) in itertools.product(list_dim, list_E, list_topk, list_m):
-        ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32)
+        ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage1")
+        df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")
+for dtype in [dtypes.bf16]:
+    for (
+        dim,
+        E,
+        topk,
+        m,
+    ) in itertools.product(list_dim, list_E, list_topk, list_m):
+        ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")

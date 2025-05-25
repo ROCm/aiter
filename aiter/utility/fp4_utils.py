@@ -413,6 +413,7 @@ def _moe_mxfp4_sort_kernel(
     N_i: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    TOPK: tl.constexpr,
 ):
     pid_m = tl.program_id(0) * 2
     pid_n = tl.program_id(1) * 2
@@ -436,16 +437,20 @@ def _moe_mxfp4_sort_kernel(
         sorted_ids = tl.load(
             sorted_ids_ptr + sorted_ids_offs, mask=sorted_ids_mask, other=token_num
         )
+        topk_ids = sorted_ids >> 24
         sorted_ids = sorted_ids & 0xFFFFFF
 
         # Sort the blockscale tensor based on the sorted ids
-        blockscale_e8m0_offs_m = sorted_ids
+        if TOPK == 1:
+            blockscale_e8m0_offs_m = sorted_ids
+        else:
+            blockscale_e8m0_offs_m = sorted_ids * TOPK + topk_ids
         blockscale_e8m0_offs_n = pid_n * BLOCK_SIZE_N + n + tl.arange(0, BLOCK_SIZE_N)
         blockscale_e8m0_offs = (
             blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
             + blockscale_e8m0_offs_n[None, :] * stride_blockscale_e8m0_n
         )
-        blockscale_e8m0_mask = (blockscale_e8m0_offs_m < token_num)[:, None] & (
+        blockscale_e8m0_mask = (sorted_ids < token_num)[:, None] & (
             blockscale_e8m0_offs_n < N_i
         )[None, :]
         blockscale_e8m0_sub = tl.load(
@@ -498,6 +503,10 @@ def moe_mxfp4_sort(
     BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
 
     # Assume blockscale_e8m0 is 2D-Tensor for now
+    topk = 1
+    if len(blockscale_e8m0.shape) == 3:
+        topk = blockscale_e8m0.shape[1]
+        blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
     M_i, N_i = blockscale_e8m0.shape
     M_o, N_o = sorted_ids.shape[0], N_i
     assert (N_i // 2) % 2 == 0
@@ -527,6 +536,7 @@ def moe_mxfp4_sort(
         N_i=N_i,
         BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
         BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
+        TOPK=topk,
     )
 
     # Reshape the output to the final shape
