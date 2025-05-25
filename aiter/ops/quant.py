@@ -105,8 +105,8 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
         scale = scale.permute(0, 2, 1).contiguous()
         scale = scale.view(sm, sn)
     elif shuffle:
-        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-        scale = scale.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
+        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
         scale = scale.view(sm, sn)
     return y, scale.view(dtypes.fp8_e8m0)
 

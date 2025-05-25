@@ -319,10 +319,8 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     bs_offs_4 = bs_offs_n[None, :] % 8
     bs_offs_5 = bs_offs_4 % 4
     bs_offs_4 = bs_offs_4 // 4
-    bs_offs_6 = bs_offs_5 % 1
     bs_offs = (
-        bs_offs_6
-        + bs_offs_1
+        bs_offs_1
         + bs_offs_4 * 2
         + bs_offs_2 * 2 * 2
         + bs_offs_5 * 2 * 2 * 16

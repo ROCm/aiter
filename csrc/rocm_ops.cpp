@@ -19,6 +19,7 @@
 #include "smoothquant.h"
 #include "aiter_operator.h"
 #include "asm_gemm_a8w8.h"
+#include "asm_gemm_a4w4.h"
 #include <torch/extension.h>
 #include "gemm_a8w8.h"
 #include "batched_gemm_a8w8.h"
