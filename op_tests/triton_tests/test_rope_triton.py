@@ -27,7 +27,6 @@ from aiter.ops.triton.rope import (
     rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace,
     rope_fwd_2d,
     rope_fwd_2d_inplace,
-    rope_cached_thd_positions_2c_gqa_fwd_inplace_2,
 )
 
 DEBUG_MODE = False
@@ -502,12 +501,9 @@ def test_rope_fwd_cached(
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-# @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
-# @pytest.mark.parametrize("H", [1, 8, 32, 128])
-# @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("T", [(1), (4), (8192)])
-@pytest.mark.parametrize("H", [1, 8, 128])
-@pytest.mark.parametrize("D", [4, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
+@pytest.mark.parametrize("H", [1, 8, 32, 128])
+@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
 # @pytest.mark.parametrize('nope, nope_first', [(False, False)])
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
@@ -618,16 +614,11 @@ def test_rope_fwd_cached_thd_2c(
     torch.testing.assert_close(triton_out_y, torch_out_y, atol=1e-3, rtol=1e-1)
 
 
-# @pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
-# @pytest.mark.parametrize("QH_per_KH", [2, 4, 8, 16])  # QH_per_KH > 1
-# @pytest.mark.parametrize("KH", [1, 8, 16, 32])
-# @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-# @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
-@pytest.mark.parametrize("T", [(1), (4), (8192)])
-@pytest.mark.parametrize("QH_per_KH", [16])  # QH_per_KH > 1
-@pytest.mark.parametrize("KH", [8])
-@pytest.mark.parametrize("D", [128])  # For now, D is power of 2.
-@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+@pytest.mark.parametrize("T", [(4), (6), (100), (320), (500), (8192)])
+@pytest.mark.parametrize("QH_per_KH", [2, 4, 8, 16])  # QH_per_KH > 1
+@pytest.mark.parametrize("KH", [1, 8, 16, 32])
+@pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
 # @pytest.mark.parametrize('nope, nope_first', [(False, False)])
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
@@ -709,32 +700,17 @@ def test_rope_fwd_cached_thd_2c_gqa(
             )
     else:
         if inplace:
-            # triton_out_x, triton_out_y = rope_cached_thd_positions_2c_gqa_fwd_inplace(
-            #     x,
-            #     y,
-            #     cos,
-            #     sin,
-            #     positions,
-            #     rotate_style=rotate_style,
-            #     reuse_freqs_front_part=reuse_freqs_front_part,
-            #     nope_first=False,
-            #     transpose_output=False,
-            # )
-            x = x.view(len(x), -1)
-            y = y.view(len(y), -1)
-            triton_out_x, triton_out_y = rope_cached_thd_positions_2c_gqa_fwd_inplace_2(
+            triton_out_x, triton_out_y = rope_cached_thd_positions_2c_gqa_fwd_inplace(
                 x,
                 y,
-                cos_sin_cache,
+                cos,
+                sin,
                 positions,
                 rotate_style=rotate_style,
                 reuse_freqs_front_part=reuse_freqs_front_part,
                 nope_first=False,
-                head_size=D,
                 transpose_output=False,
             )
-            triton_out_x = triton_out_x.view(len(triton_out_x), -1, D)
-            triton_out_y = triton_out_y.view(len(triton_out_y), -1, D)
         else:
             triton_out_x, triton_out_y = rope_cached_thd_positions_2c_gqa_fwd(
                 x,
