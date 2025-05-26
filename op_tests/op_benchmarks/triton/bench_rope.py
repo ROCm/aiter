@@ -132,7 +132,7 @@ def run_benchmark(args):
     two_inputs = str_to_bool(two_inputs, "two_inputs")
     inplace = str_to_bool(inplace, "inplace")
 
-    Q = Q if two_inputs == True else 1
+    Q = Q if two_inputs == True else 1  # noqa: E712
     is_mha = True if Q == 1 else False
 
     rep = args.repeat
