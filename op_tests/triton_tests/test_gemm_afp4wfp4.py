@@ -157,6 +157,20 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    if TRITON_HIP_PRESHUFFLE_SCALES:
+        if M % 32 > 0:
+            pytest.skip(
+                f"M = {M} is not divisible by 32, skip this test for preshuffled scales tests"
+            )
+        elif N % 32 > 0:
+            pytest.skip(
+                f"N = {N} is not divisible by 32, skip this test for preshuffled scales tests"
+            )
+        elif K % 256 > 0:
+            pytest.skip(
+                f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
+            )
+
     x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
         generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output)
     )
