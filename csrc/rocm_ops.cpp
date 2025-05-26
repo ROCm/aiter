@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "activation.h"
 #include "attention.h"
 #include "attention_ragged.h"
@@ -19,6 +19,7 @@
 #include "smoothquant.h"
 #include "aiter_operator.h"
 #include "asm_gemm_a8w8.h"
+#include "asm_gemm_a4w4.h"
 #include <torch/extension.h>
 #include "gemm_a8w8.h"
 #include "batched_gemm_a8w8.h"
@@ -29,10 +30,12 @@
 #include "hipbsolgemm.cuh"
 #include "aiter_enum.h"
 
+#include "torch/mha_batch_prefill.h"
 #include "torch/mha_varlen_fwd.h"
 #include "torch/mha_varlen_bwd.h"
 #include "torch/mha_bwd.h"
 #include "torch/mha_fwd.h"
+#include "torch/mha_v3_fwd.h"
 #include "torch/mha_v3_bwd.h"
 #include "torch/mha_v3_varlen_bwd.h"
 
@@ -49,6 +52,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       MHA_VARLEN_BWD_PYBIND;
       MHA_FWD_PYBIND;
       MHA_BWD_PYBIND;
+      MHA_BATCH_PREFILL_PYBIND;
+      MHA_FWD_ASM_PYBIND
       MHA_BWD_ASM_PYBIND;
       MHA_VARLEN_BWD_ASM_PYBIND;
       GEMM_A8W8_PYBIND;
@@ -58,6 +63,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       MOE_CK_PYBIND;
       // BATCHED_GEMM_A8W8_TUNE_PYBIND;
       GEMM_A8W8_ASM_PYBIND;
+      GEMM_A4W4_ASM_PYBIND;
       ACTIVATION_PYBIND;
       ATTENTION_ASM_MLA_PYBIND;
       ATTENTION_CK_PYBIND;

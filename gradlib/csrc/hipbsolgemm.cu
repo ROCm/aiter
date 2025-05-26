@@ -98,7 +98,8 @@ namespace
       {at::kChar, HIP_R_8I}
 #ifdef ENABLE_TORCH_FP8
       ,
-      {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ}
+      {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},
+      {at::kFloat8_e4m3fn, HIP_R_8F_E4M3}
 #endif
   };
 

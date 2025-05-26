@@ -20,10 +20,9 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.test_common import (
     checkAllclose,
     perftest,
-    tensor_dump,
-    tensor_load,
     benchmark,
 )
+from aiter import dtypes
 from multiprocessing import set_start_method, Pool, freeze_support
 import logging
 
@@ -104,7 +103,7 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
 
 if __name__ == "__main__":
     freeze_support()
-    for dtype in [torch.bfloat16, torch.float16]:
+    for dtype in [dtypes.bf16, dtypes.fp16]:
         for shape in [(128, 8192)]:
             test_allreduce_custom(8, 1, shape, dtype, withGraph=True)
             # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)

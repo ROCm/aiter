@@ -1,6 +1,5 @@
-from enum import Enum
-from typing import List, Optional
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from ..jit.core import compile_ops
+from enum import Enum as Enum
 
 
 @compile_ops("module_aiter_enum", "ActivationType")

@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import warnings
 import os
 import sys
 import shutil
 
-from setuptools import setup, find_packages
-from packaging.version import parse, Version
+from setuptools import setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
@@ -16,9 +14,6 @@ sys.path.insert(0, f"{this_dir}/aiter/")
 from jit import core
 from jit.utils.cpp_extension import (
     BuildExtension,
-    CppExtension,
-    CUDAExtension,
-    ROCM_HOME,
     IS_HIP_EXTENSION,
 )
 
@@ -39,14 +34,16 @@ else:
 
 FORCE_CXX11_ABI = False
 
+PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+
 if IS_ROCM:
     assert os.path.exists(
         ck_dir
-    ), f'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
+    ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
-    if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
-        exclude_ops = ["bench_mha_fwd", "bench_mha_bwd"]
-        all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
+    if PREBUILD_KERNELS == 1:
+        exclude_ops = ["libmha_fwd", "libmha_bwd"]
+        all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list
@@ -99,9 +96,18 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+setup_requires = [
+    "packaging",
+    "psutil",
+    "ninja",
+    "setuptools_scm",
+]
+if PREBUILD_KERNELS == 1:
+    setup_requires.append("pandas")
+
 setup(
     name=PACKAGE_NAME,
-    version="0.1.0",
+    use_scm_version=True,
     packages=["aiter_meta", "aiter"],
     include_package_data=True,
     package_data={
@@ -116,16 +122,12 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11",
+        "pybind11>=2.13,<3",
         # "ninja",
         "pandas",
         "einops",
     ],
-    setup_requires=[
-        "packaging",
-        "psutil",
-        "ninja",
-    ],
+    setup_requires=setup_requires,
 )
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):

@@ -5,10 +5,13 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 
-@triton.heuristics({
-    'EVEN_K':lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0, 
-    'GRID_MN':lambda args: triton.cdiv(args['M'], args['BLOCK_SIZE_M']) * triton.cdiv(args['N'], args['BLOCK_SIZE_N'])
-})
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
+        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
+    }
+)
 @triton.jit
 def _gemm_a16_w16_kernel(
     a_ptr,
@@ -93,25 +96,30 @@ def _gemm_a16_w16_kernel(
 
 
 # Wrapper for gemm kernel.
-def gemm_a16w16(x, 
-                w, 
-                dtype: Optional[float] = torch.bfloat16,
-                ):
+def gemm_a16w16(
+    x,
+    w,
+    dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+):
     """
     Computes the 16 bit matmul Y = X x W
 
     Key parameters:
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
+    - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
+    - Y: Output Matrix Y with shape (M, N). If this is none, then it's created by this API and returned as output
 
     Returns:
     - Y: The output matrix with shape (M, N).
     """
-    
+
     M, K = x.shape
     K, N = w.shape
 
-    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    if y is None:
+        y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     BLOCK_SIZE_M = 256
     BLOCK_SIZE_N = 256
@@ -122,8 +130,9 @@ def gemm_a16w16(x,
     matrix_instr_nonkdim = 16
     num_warps = 8
     num_stages = 2
-
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    grid = lambda META: (  # noqa: E731
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
     _gemm_a16_w16_kernel[grid](
         x,
         w,

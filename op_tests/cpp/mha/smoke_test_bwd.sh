@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 #!/bin/sh
-# TODO: run this script from CK root or build directory
-EXE="$(find . -name bench_mha_bwd -type f | head -n 1)"
+EXE="$(find . -name benchmark_mha_bwd -type f | head -n 1)"
 KNAME=1
 
 export CK_WARMUP=0

@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 /*
  * @Script: topk_softmax_kernels_group.cu
  * @Author: valarLip
  * @Email: lingpeng.jin@amd.com
  * @Create At: 2025-03-01 12:16:14
  * @Last Modified By: valarLip
- * @Last Modified At: 2025-03-04 22:27:28
+ * @Last Modified At: 2025-05-02 15:52:13
  * @Description: This is description.
  */
 
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "dispatch_utils.h"
+#include "py_itfs_common_hip.h"
+#include <hipcub/util_type.hpp>
+#include <hipcub/hipcub.hpp>
 
 #define WARP_SIZE 64
 namespace aiter
@@ -22,18 +25,18 @@ namespace aiter
     template <typename T, typename F>
     __device__ constexpr T wave_reduce(T local, F reduce_f)
     {
-      constexpr int reduce_stage = 6; // 1<<6=64
-      T v_local = local;
+        constexpr int reduce_stage = 6; // 1<<6=64
+        T v_local = local;
 #pragma unroll
-      for (int i_stage = 0; i_stage < reduce_stage; i_stage++)
-      {
-        int src_lane = __lane_id() ^ (1 << i_stage);
-        int32_t v_remote_tmp =
-            __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
-        T v_remote = __builtin_bit_cast(T, v_remote_tmp);
-        v_local = reduce_f(v_local, v_remote);
-      }
-      return v_local;
+        for (int i_stage = 0; i_stage < reduce_stage; i_stage++)
+        {
+            int src_lane = __lane_id() ^ (1 << i_stage);
+            int32_t v_remote_tmp =
+                __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
+            T v_remote = __builtin_bit_cast(T, v_remote_tmp);
+            v_local = reduce_f(v_local, v_remote);
+        }
+        return v_local;
     }
 
     __inline__ __device__ void warpReduceMax(float &val, int &idx)
@@ -80,9 +83,9 @@ namespace aiter
         __syncthreads();
     }
 
-    template <typename DTYPE_I, typename fvec, int NUM_GRP, bool need_renorm, bool isBiased, bool isSoftmax>
+    template <typename DTYPE_I, typename f32vec, int NUM_GRP, bool need_renorm, bool isBiased, bool isSoftmax>
     __global__ void grouped_topk_kernel(
-        const DTYPE_I *__restrict__ gating_output,   // [num_tokens, hidden_size]
+        DTYPE_I *__restrict__ gating_output,         // [num_tokens, hidden_size]
         const DTYPE_I *__restrict__ correction_bias, // [num_expert]
         float *__restrict__ topk_weights,            // [num_tokens, topk]
         int *__restrict__ topk_ids,                  // [num_tokens, topk]
@@ -106,9 +109,6 @@ namespace aiter
         float *group_scores = reinterpret_cast<float *>(ptr);
         ptr += NUM_GRP * sizeof(float);
 
-        bool *group_mask = reinterpret_cast<bool *>(ptr);
-        ptr += NUM_GRP * sizeof(bool);
-
         int *topk_indices = reinterpret_cast<int *>(ptr);
         ptr += topk * sizeof(int);
 
@@ -120,20 +120,33 @@ namespace aiter
 
         // float *topk_values_f = reinterpret_cast<float *>(ptr);
 
-        fvec *scores_vec = reinterpret_cast<fvec *>(scores);
-        constexpr uint32_t vec_size = sizeof(fvec) / sizeof(float);
+        f32vec *scores_vec = reinterpret_cast<f32vec *>(scores);
+        using cktype_i = typename t2ck<DTYPE_I>::type;
+        static constexpr int vec_size = ck_tile::vector_traits<f32vec>::vector_size;
+        using vec_i = ck_tile::ext_vector_t<cktype_i, vec_size>;
+        const int num_experts_vec = num_experts / vec_size;
 
         if constexpr (!isSoftmax)
         {
-            for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+            auto const *input_ptr = gating_output + token_idx * num_experts;
+            for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
             {
-                float gating = static_cast<float>(gating_output[token_idx * num_experts + e]);
-                gating = 1.0f / (1.0f + expf(-gating));
+                vec_i tmp = reinterpret_cast<vec_i const *>(input_ptr)[e];
+                vec_i tmp2;
                 if constexpr (isBiased)
+                    tmp2 = reinterpret_cast<vec_i const *>(correction_bias)[e];
+                f32vec gating;
+#pragma unroll
+                for (size_t i = 0; i < vec_size; i++)
                 {
-                    gating += correction_bias[e];
+                    gating[i] = ck_tile::type_convert<float>(tmp[i]);
+                    gating[i] = 1.0f / (1.0f + expf(-gating[i]));
+                    if constexpr (isBiased)
+                    {
+                        gating[i] += ck_tile::type_convert<float>(tmp2[i]);
+                    }
                 }
-                scores[e] = gating;
+                scores_vec[e] = gating;
             }
             __syncthreads();
         }
@@ -175,7 +188,8 @@ namespace aiter
                 thread_sum += scores[e];
             }
             __syncthreads();
-            thread_sum = wave_reduce(thread_sum, [](float a, float b) { return a + b; });
+            thread_sum = wave_reduce(thread_sum, [](float a, float b)
+                                     { return a + b; });
             for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
             {
                 scores[e] /= thread_sum;
@@ -185,7 +199,6 @@ namespace aiter
 
         if constexpr (isBiased)
         {
-#pragma unroll
             for (int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
             {
                 float max1 = -INFINITY, max2 = -INFINITY;
@@ -205,7 +218,6 @@ namespace aiter
                     }
                 }
                 group_scores[g] = max1 + max2;
-                group_mask[g] = false;
             }
             __syncthreads();
         }
@@ -225,7 +237,6 @@ namespace aiter
                     }
                 }
                 group_scores[g] = max1;
-                group_mask[g] = false;
             }
             __syncthreads();
         }
@@ -233,9 +244,9 @@ namespace aiter
         for (int k = 0; k < topk_group; k++)
         {
             float max_val = -INFINITY;
-            int max_idx = -1;
+            int max_idx = NUM_GRP;
 #pragma unroll
-            for (int g = threadIdx.x; g < NUM_GRP; g += blockDim.x)
+            for (int g = 0; g < NUM_GRP; g++)
             {
                 if (group_scores[g] > max_val)
                 {
@@ -243,61 +254,54 @@ namespace aiter
                     max_idx = g;
                 }
             }
-            warpReduceMax(max_val, max_idx);
-            if (threadIdx.x == 0 && max_idx != -1)
-            {
-                group_mask[max_idx] = true;
-                group_scores[max_idx] = -INFINITY;
-            }
-            __syncthreads();
+            group_scores[max_idx] = -INFINITY;
         }
 
-        // lip: TODO we can do vec here if experts_per_group%vec_size==0
-        for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+        for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         {
-            int group_idx = e / experts_per_group;
-            if (!group_mask[group_idx])
+            int group_idx = e * vec_size / experts_per_group;
+            if (group_scores[group_idx] != -INFINITY)
             {
-                scores[e] = -INFINITY;
+                scores_vec[e] = -INFINITY;
             }
         }
         __syncthreads();
 
+        using kvp = hipcub::KeyValuePair<int, float>;
+        using BlockReduce = hipcub::BlockReduce<kvp, WARP_SIZE>;
+        __shared__ typename BlockReduce::TempStorage tmpStorage;
+        kvp thread_kvp;
+        hipcub::ArgMax arg_max;
+
         float sum = 0.0f;
         for (int k = 0; k < topk; ++k)
         {
-            float max_val = -INFINITY;
-            int max_idx = -1;
+            float max_val = scores[k];
+            int max_idx = k;
 
-            for (int e = threadIdx.x; e < num_experts / vec_size; e += blockDim.x)
+            for (int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
             {
-                union
-                {
-                    fvec vec;
-                    float f[vec_size];
-                } tmp;
-                tmp.vec = scores_vec[e];
+                f32vec tmp = scores_vec[e];
 #pragma unroll
                 for (size_t i = 0; i < vec_size; i++)
                 {
-                    if (tmp.f[i] > max_val)
+                    if (tmp[i] > max_val)
                     {
-                        max_val = tmp.f[i];
+                        max_val = tmp[i];
                         max_idx = e * vec_size + i;
                     }
                 }
             }
-
-            warpReduceMax(max_val, max_idx);
+            thread_kvp.key = max_idx;
+            thread_kvp.value = max_val;
+            const kvp result_kvp = BlockReduce(tmpStorage).Reduce(thread_kvp, arg_max);
+            // warpReduceMax(max_val, max_idx);
             // blockReduceMax(max_val, max_idx);
 
             if (threadIdx.x == 0)
             {
-                if (max_idx == -1)
-                {
-                    max_idx = k;
-                    max_val = scores[max_idx];
-                }
+                max_val = result_kvp.value;
+                max_idx = result_kvp.key;
                 if constexpr (isBiased)
                 {
                     max_val -= correction_bias[max_idx];
@@ -335,18 +339,21 @@ namespace aiter
     }
 } // namespace aiter end
 
-#define LAUNCH_KERNEL()      \
-    switch (num_experts % 4) \
-    {                        \
-    case 0:                  \
-        LAUNCHER2(float4)    \
-        break;               \
-    case 2:                  \
-        LAUNCHER2(float2)    \
-        break;               \
-    default:                 \
-        LAUNCHER2(float)     \
-        break;               \
+#define LAUNCH_KERNEL()                                    \
+    switch (num_experts % 4)                               \
+    {                                                      \
+    case 0:                                                \
+        using vec4_type = ck_tile::ext_vector_t<float, 4>; \
+        LAUNCHER2(vec4_type)                               \
+        break;                                             \
+    case 2:                                                \
+        using vec2_type = ck_tile::ext_vector_t<float, 2>; \
+        LAUNCHER2(vec2_type)                               \
+        break;                                             \
+    default:                                               \
+        using vec1_type = ck_tile::ext_vector_t<float, 1>; \
+        LAUNCHER2(vec1_type)                               \
+        break;                                             \
     }
 #define LAUNCHER2(VEC_F)                                                        \
     switch (num_expert_group)                                                   \
@@ -394,33 +401,31 @@ namespace aiter
         }                                                                             \
     }
 
-#define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)    \
-    VLLM_DISPATCH_FLOATING_TYPES(                                                                \
-        gating_output.scalar_type(), "biased_grouped_topk_kernel", [&]                           \
-        { aiter::grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax> \
-              <<<grid, block, shared_mem_size, stream>>>(                                        \
-                  gating_output.data_ptr<scalar_t>(),                                            \
-                  correction_bias.data_ptr<scalar_t>(),                                          \
-                  topk_weights.data_ptr<float>(),                                                \
-                  topk_ids.data_ptr<int>(),                                                      \
-                  stride_tk,                                                                     \
-                  num_experts,                                                                   \
-                  topk,                                                                          \
-                  topk_grp, num_tokens, routed_scaling_factor); });
+#define LAUNCHER_biased_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                                                                            \
+    VLLM_DISPATCH_FLOATING_TYPES(                                                                                                                                        \
+        gating_output.scalar_type(), "biased_grouped_topk_kernel", [&]                                                                                                   \
+        { hipLaunchKernelGGL((aiter::grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), dim3(grid), dim3(block), shared_mem_size, stream, \
+                             gating_output.data_ptr<scalar_t>(),                                                                                                         \
+                             correction_bias.data_ptr<scalar_t>(),                                                                                                       \
+                             topk_weights.data_ptr<float>(),                                                                                                             \
+                             topk_ids.data_ptr<int>(),                                                                                                                   \
+                             stride_tk,                                                                                                                                  \
+                             num_experts,                                                                                                                                \
+                             topk,                                                                                                                                       \
+                             topk_grp, num_tokens, routed_scaling_factor); });
 
-#define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)           \
-    VLLM_DISPATCH_FLOATING_TYPES(                                                                \
-        gating_output.scalar_type(), "grouped_topk_kernel", [&]                                  \
-        { aiter::grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax> \
-              <<<grid, block, shared_mem_size, stream>>>(                                        \
-                  gating_output.data_ptr<scalar_t>(),                                            \
-                  nullptr,                                                                       \
-                  topk_weights.data_ptr<float>(),                                                \
-                  topk_ids.data_ptr<int>(),                                                      \
-                  stride_tk,                                                                     \
-                  num_experts,                                                                   \
-                  topk,                                                                          \
-                  topk_grp, num_tokens, routed_scaling_factor); });
+#define LAUNCHER_grouped_topk_kernel(VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax)                                                                                   \
+    VLLM_DISPATCH_FLOATING_TYPES(                                                                                                                                        \
+        gating_output.scalar_type(), "grouped_topk_kernel", [&]                                                                                                          \
+        { hipLaunchKernelGGL((aiter::grouped_topk_kernel<scalar_t, VEC_F, NUM_GRP, need_renorm, isBiased, isSoftmax>), dim3(grid), dim3(block), shared_mem_size, stream, \
+                             gating_output.data_ptr<scalar_t>(),                                                                                                         \
+                             nullptr,                                                                                                                                    \
+                             topk_weights.data_ptr<float>(),                                                                                                             \
+                             topk_ids.data_ptr<int>(),                                                                                                                   \
+                             stride_tk,                                                                                                                                  \
+                             num_experts,                                                                                                                                \
+                             topk,                                                                                                                                       \
+                             topk_grp, num_tokens, routed_scaling_factor); });
 
 void biased_grouped_topk(
     torch::Tensor &gating_output,   // [num_tokens, num_experts]
@@ -430,7 +435,7 @@ void biased_grouped_topk(
     int num_expert_group,
     int topk_grp,
     bool need_renorm,
-    const float routed_scaling_factor=1.)
+    const float routed_scaling_factor = 1.)
 {
     const bool isBiased = true;
     bool isSoftmax = false;
@@ -444,14 +449,13 @@ void biased_grouped_topk(
     dim3 grid(num_tokens);
     dim3 block(64);
     size_t shared_mem_size = (num_experts * sizeof(float) +
-                              num_expert_group * sizeof(float) +
-                              num_expert_group * sizeof(bool) +
+                              (num_expert_group + 1) * sizeof(float) +
                               topk * sizeof(int) +
                               topk * sizeof(float) + 255) &
                              ~255;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     LAUNCH_KERNEL()
 }
@@ -479,14 +483,13 @@ void grouped_topk(
     dim3 grid(num_tokens);
     dim3 block(64);
     size_t shared_mem_size = (num_experts * sizeof(float) +
-                              num_expert_group * sizeof(float) +
-                              num_expert_group * sizeof(bool) +
+                              (num_expert_group + 1) * sizeof(float) +
                               topk * sizeof(int) +
                               topk * sizeof(float) + 255) &
                              ~255;
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(gating_output));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(gating_output));
+    const hipStream_t stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
 
     LAUNCH_KERNEL()
 }

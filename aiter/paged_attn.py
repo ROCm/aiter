@@ -1,28 +1,32 @@
-'''
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- '''
+"""
+* Copyright © Advanced Micro Devices, Inc. All rights reserved.
+* Copyright (c) 2024, The vLLM team.
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*      http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+"""
 
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 import torch
 import aiter as ops
-
+from aiter import dtypes
 from dataclasses import dataclass
+
+
 # from vllm.utils import is_hip
 def is_hip():
     return True
+
+
 # if HAS_TRITON:
 # from vllm.attention.ops.prefix_prefill import context_attention_fwd
 
@@ -30,8 +34,10 @@ def is_hip():
 _PARTITION_SIZE = 512 if not is_hip() else 1024
 _PARTITION_SIZE_ROCM = 256
 _DEVICE_PROPERTIES = torch.cuda.get_device_properties("cuda")
-_ON_NAVI = hasattr(_DEVICE_PROPERTIES, "gcnArchName") and \
-            "gfx1" in torch.cuda.get_device_properties("cuda").gcnArchName
+_ON_NAVI = (
+    hasattr(_DEVICE_PROPERTIES, "gcnArchName")
+    and "gfx1" in torch.cuda.get_device_properties("cuda").gcnArchName
+)
 
 
 # page attention ops
@@ -57,11 +63,26 @@ def paged_attention_v1(
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
     ops.paged_attention_v1(
-        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
-        seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
-        k_scale, v_scale, tp_rank, blocksparse_local_blocks,
-        blocksparse_vert_stride, blocksparse_block_size,
-        blocksparse_head_sliding_step)
+        out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        alibi_slopes,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        tp_rank,
+        blocksparse_local_blocks,
+        blocksparse_vert_stride,
+        blocksparse_block_size,
+        blocksparse_head_sliding_step,
+    )
 
 
 def paged_attention_v2(
@@ -89,16 +110,35 @@ def paged_attention_v2(
     blocksparse_head_sliding_step: int = 0,
 ) -> None:
     ops.paged_attention_v2(
-        out, exp_sum, max_logits, tmp_out, query, key_cache, value_cache,
-        num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len,
-        alibi_slopes, kv_cache_dtype, k_scale, v_scale, tp_rank,
-        blocksparse_local_blocks, blocksparse_vert_stride,
-        blocksparse_block_size, blocksparse_head_sliding_step)
+        out,
+        exp_sum,
+        max_logits,
+        tmp_out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        alibi_slopes,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        tp_rank,
+        blocksparse_local_blocks,
+        blocksparse_vert_stride,
+        blocksparse_block_size,
+        blocksparse_head_sliding_step,
+    )
 
 
 @dataclass
 class PagedAttentionMetadata:
     """Metadata for PagedAttention."""
+
     # (batch_size,). The length of sequences (entire tokens seen so far) per
     # sequence.
     seq_lens_tensor: Optional[torch.Tensor]
@@ -113,14 +153,23 @@ class PagedAttentionMetadata:
     block_tables: Optional[torch.Tensor]
 
 
-def _use_rocm_custom_paged_attention(qtype: torch.dtype, head_size: int,
-                                    block_size: int, gqa_ratio: int,
-                                    max_seq_len: int) -> bool:
+def _use_rocm_custom_paged_attention(
+    qtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    gqa_ratio: int,
+    max_seq_len: int,
+) -> bool:
     # rocm custom page attention not support on navi (gfx1*)
-    return (not _ON_NAVI and (qtype == torch.half or qtype == torch.bfloat16)
-            and (head_size == 64 or head_size == 128)
-            and (block_size == 16 or block_size == 32)
-            and (gqa_ratio >= 1 and gqa_ratio <= 16) and max_seq_len <= 65536)
+    return (
+        not _ON_NAVI
+        and (qtype == torch.half or qtype == dtypes.bf16)
+        and (head_size == 64 or head_size == 128)
+        and (block_size == 16 or block_size == 32)
+        and (gqa_ratio >= 1 and gqa_ratio <= 16)
+        and max_seq_len <= 65536
+    )
+
 
 class PagedAttention:
     @staticmethod
@@ -146,8 +195,7 @@ class PagedAttention:
         num_blocks = kv_cache.shape[1]
 
         key_cache = kv_cache[0]
-        key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x,
-                                   -1, x)
+        key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x, -1, x)
         value_cache = kv_cache[1]
         value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
         return key_cache, value_cache
@@ -162,7 +210,7 @@ class PagedAttention:
         kv_cache_dtype: str,
         k_scale: float,
         v_scale: float,
-        asm_layout=False
+        asm_layout=False,
     ) -> None:
         ops.reshape_and_cache(
             key,
@@ -173,7 +221,7 @@ class PagedAttention:
             kv_cache_dtype,
             k_scale,
             v_scale,
-            asm_layout
+            asm_layout,
         )
 
     @staticmethod
@@ -195,20 +243,20 @@ class PagedAttention:
         blocksparse_vert_stride: int = 0,
         blocksparse_block_size: int = 64,
         blocksparse_head_sliding_step: int = 0,
-        fp8_out_scale=None
+        fp8_out_scale=None,
     ) -> torch.Tensor:
         # Whether to use rocm custom paged attention or not
         num_seqs, num_heads, head_size = query.shape
         block_size = value_cache.shape[3]
         gqa_ratio = num_heads // num_kv_heads
         use_custom = _use_rocm_custom_paged_attention(
-            query.dtype, head_size, block_size, gqa_ratio,
-            max_seq_len)
+            query.dtype, head_size, block_size, gqa_ratio, max_seq_len
+        )
         output = torch.empty_like(query)
         if use_custom:
             max_num_partitions = (
-                (max_seq_len + _PARTITION_SIZE_ROCM - 1) //
-                _PARTITION_SIZE_ROCM)
+                max_seq_len + _PARTITION_SIZE_ROCM - 1
+            ) // _PARTITION_SIZE_ROCM
             assert _PARTITION_SIZE_ROCM % block_size == 0
             tmp_output = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions, head_size),
@@ -217,14 +265,13 @@ class PagedAttention:
             )
             exp_sums = torch.empty(
                 size=(num_seqs, num_heads, max_num_partitions),
-                dtype=torch.float32,
+                dtype=dtypes.fp32,
                 device=output.device,
             )
             max_logits = torch.empty_like(exp_sums)
             cpa_fp8_out = False
             if fp8_out_scale is not None:
-                output = torch.empty_like(output,
-                                        dtype=torch.float8_e4m3fnuz)
+                output = torch.empty_like(output, dtype=dtypes.fp8)
                 cpa_fp8_out = True
             ops.paged_attention_rocm(
                 output,
@@ -250,15 +297,17 @@ class PagedAttention:
             if cpa_fp8_out:
                 return output.view(num_seqs, num_heads * head_size)
         else:
-            max_num_partitions = ((max_seq_len + _PARTITION_SIZE - 1) //
-                                _PARTITION_SIZE)
+            max_num_partitions = (max_seq_len + _PARTITION_SIZE - 1) // _PARTITION_SIZE
             if blocksparse_vert_stride is not None and blocksparse_vert_stride > 1:
                 # use blocksparse paged attention
                 block_size = value_cache.size(-1)
-                assert (blocksparse_block_size > 0 and
-                        blocksparse_block_size % block_size == 0), \
-                    (f"{blocksparse_block_size=} needs to be a multiple of"
-                    f"{block_size=} used in block_tables.")
+                assert (
+                    blocksparse_block_size > 0
+                    and blocksparse_block_size % block_size == 0
+                ), (
+                    f"{blocksparse_block_size=} needs to be a multiple of"
+                    f"{block_size=} used in block_tables."
+                )
 
             # NOTE(woosuk): We use a simple heuristic to decide whether to use
             # PagedAttention V1 or V2. If the number of partitions is 1, we use
@@ -267,8 +316,9 @@ class PagedAttention:
             # to parallelize.
             # TODO(woosuk): Tune this heuristic.
             # For context len > 8192, use V2 kernel to avoid shared memory shortage.
-            use_v1 = (max_seq_len <= 8192
-                    and (max_num_partitions == 1 or num_seqs * num_heads > 512))
+            use_v1 = max_seq_len <= 8192 and (
+                max_num_partitions == 1 or num_seqs * num_heads > 512
+            )
 
             if use_v1:
                 # Run PagedAttention V1.
@@ -303,7 +353,7 @@ class PagedAttention:
                 )
                 exp_sums = torch.empty(
                     size=(num_seqs, num_heads, max_num_partitions),
-                    dtype=torch.float32,
+                    dtype=dtypes.fp32,
                     device=output.device,
                 )
                 max_logits = torch.empty_like(exp_sums)

@@ -1,3 +1,8 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
 
@@ -8,7 +13,7 @@ struct mha_bwd_traits : public fmha_bwd_traits
                    int head_size_v,
                    std::string dtype,
                    bool is_group_mode,
-                   const mask_info& mask,
+                   mask_enum mask_type,
                    bias_enum bias_type,
                    bool has_dbias,
                    bool has_dropout,
@@ -21,7 +26,7 @@ struct mha_bwd_traits : public fmha_bwd_traits
                           head_size_v,
                           dtype,
                           is_group_mode,
-                          mask.type,
+                          mask_type,
                           bias_type,
                           has_dbias,
                           has_dropout,
@@ -43,7 +48,7 @@ float mha_bwd(mha_bwd_args args,
               const ck_tile::stream_config& stream_config,
               std::string q_dtype_str,
               bool is_group_mode,
-              mask_info mask,
+              mask_enum mask_type,
               bias_enum bias_type,
               bool has_dbias,
               bool is_store_randval,

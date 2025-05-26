@@ -2,15 +2,10 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
-from typing import List, Optional
+from typing import Optional
 from ..jit.core import (
     compile_ops,
-    CK_DIR,
-    AITER_CSRC_DIR,
-    AITER_ROOT_DIR,
-    AITER_CORE_DIR,
 )
 from .enum import ActivationType, Enum, QuantType
 
@@ -182,13 +177,12 @@ def moe_stage1_g1u1(
     kernelName: str,
     block_m: int,
     ksplit: int = 0,
-    activation: Enum = ActivationType.Silu,
-    quant_type: Enum = QuantType.No,
-    a1_scale: Optional[Tensor] = None,
-    w1_scale: Optional[Tensor] = None,
-    doweight_stage1: bool = False,
-    sorted_weights: Optional[Tensor] = None # do sorted weight multiply in stage1
-): ...
+    activation: ActivationType = ActivationType.Silu,
+    quant_type: QuantType = QuantType.No,
+    a1_scale: Optional[torch.Tensor] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    sorted_weights: Optional[torch.Tensor] = None,
+) -> None: ...
 
 
 @compile_ops("module_moe")
@@ -221,6 +215,7 @@ def ck_moe_stage1(
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
+    act_op: Optional[int] = 0,
 ): ...
 
 

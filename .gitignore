@@ -1,3 +1,6 @@
+# aiter version
+aiter/_version.py
+
 # Prerequisites
 *.d
 
@@ -45,3 +48,4 @@ __pycache__
 # debug folder
 debug
 aiter_logs
+*.log

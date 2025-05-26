@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -403,7 +403,7 @@ fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
                                  stream_config,
                                  q_dtype_str,
                                  true,   // is_group_mode
-                                 mask,
+                                 mask.type,
                                  bias_type,
                                  false,  // has_dbias
                                  false,  // is_store_randval

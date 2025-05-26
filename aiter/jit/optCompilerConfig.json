@@ -42,7 +42,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DENABLE_FP8'"
+            "'-DENABLE_FP8'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -191,6 +192,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_gemm_a4w4_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a4w4_asm_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w4.cpp'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cpp'",
@@ -217,7 +230,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_ASM_DIR}/fmoe_2stages/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'"
     },
     "module_moe": {
         "srcs": [
@@ -242,7 +255,9 @@
         ],
         "md_name": "'module_moe_ck2stages'",
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
@@ -400,7 +415,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": ["f'{AITER_CSRC_DIR}/include/ck_tile'"],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -440,6 +455,27 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_fmha_v3_fwd": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cpp'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_fwd_asm_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 1 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_fwd_kernel_generate.py --output_dir {{}}'"
+        ]
+    },
     "module_mha_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
@@ -470,7 +506,8 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -481,6 +518,29 @@
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
+        ]
+    },
+    "module_mha_batch_prefill": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/mha_batch_prefill_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/mha_batch_prefill_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'",
+            "f'-DCK_TILE_ATTENTION_USE_SOFTSIGN_ASM={os.environ.get(\"CK_TILE_ATTENTION_USE_SOFTSIGN_ASM\", 1)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'"
         ]
     },
     "module_fmha_v3_bwd": {
@@ -499,7 +559,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_bwd_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
@@ -519,7 +579,7 @@
         ],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_bwd_kernel_generate.py --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 2 --output_dir {{}}'"
         ]
     },
@@ -532,7 +592,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -553,7 +613,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -565,10 +625,8 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
-    "bench_mha_fwd": {
-        "srcs": [
-            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_fwd.cpp'"
-        ],
+    "libmha_fwd": {
+        "srcs": [],
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
@@ -581,22 +639,21 @@
         ],
         "verbose": "False",
         "is_python_module": "False",
-        "is_standalone": "True",
+        "is_standalone": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd --receipt 600 --output_dir {{}}'",
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill --receipt 600 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 5 --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_fwd_kernel_generate.py --output_dir {{}}'"
         ]
     },
-    "bench_mha_bwd": {
-        "srcs": [
-            "f'{AITER_CORE_DIR}/op_tests/cpp/mha/benchmark_mha_bwd.cpp'"
-        ],
+    "libmha_bwd": {
+        "srcs": [],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
-            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 3)}'"
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -604,11 +661,11 @@
         ],
         "verbose": "False",
         "is_python_module": "False",
-        "is_standalone": "True",
+        "is_standalone": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": [
             "f'{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd --receipt 600 --output_dir {{}}'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_bwd_pre_post_kernel.py --receipt 1 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/fmha_v3_bwd_kernel_generate.py --receipt 1 --filter \"*@*_ndeterministic@*_nbias*_dropout*_ndeterministic*\" --output_dir {{}}'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },

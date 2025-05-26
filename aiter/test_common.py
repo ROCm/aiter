@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.profiler as tpf
@@ -8,6 +8,8 @@ import copy
 import numpy as np
 import pandas as pd
 from aiter import logger
+
+pd.set_option("display.max_rows", 200)
 
 
 def perftest(
@@ -19,12 +21,14 @@ def perftest(
             if num < 1:
                 gpu_id = torch.cuda.current_device()
 
-                iter_used_memory, inputSize, _, _ = device_memory_profiling(func, *args, **kwargs)
+                iter_used_memory, inputSize, _, _ = device_memory_profiling(
+                    func, *args, **kwargs
+                )
 
                 properties = torch.cuda.get_device_properties(gpu_id)
                 free_memory = torch.cuda.mem_get_info(gpu_id)[0]
                 cache_size = min(
-                    properties.L2_cache_size * 64 * 128,
+                    getattr(properties, "L2_cache_size", 4096 * 1024) * 64 * 128,
                     (free_memory - iter_used_memory + inputSize) * 0.9,
                 )
                 cache_size = max(cache_size, 0)
@@ -32,9 +36,9 @@ def perftest(
                 # print(f"{iter_used_memory=}, {inputSize=}, {cache_size=}, {free_memory=}, {num=}")
             num = min(num, num_iters)
 
-            rotate_args =[
-                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num-1)
-            ] +  [(args, kwargs)]
+            rotate_args = [
+                (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
+            ] + [(args, kwargs)]
 
             run_iters(num_warmup, func, *args, **kwargs)
             if int(os.environ.get("AITER_LOG_MORE", 0)):
@@ -103,7 +107,14 @@ def benchmark():
 def device_memory_profiling(func, *args, **kwargs):
     gpu_id = torch.cuda.current_device()
     inputSize = (
-        sum([el.nbytes for el in args if isinstance(el, torch.Tensor) and el.device.index == gpu_id]) + 1
+        sum(
+            [
+                el.nbytes
+                for el in args
+                if isinstance(el, torch.Tensor) and el.device.index == gpu_id
+            ]
+        )
+        + 1
     )
     torch.cuda.reset_peak_memory_stats(gpu_id)
     cuda_memory_before = (
@@ -224,11 +235,11 @@ def get_trace_perf(prof, num_iters):
             r["device_type"] = device_type
             r["device_index"] = str(d["device_index"].iat[0])
             if device_type == "CUDA":
-                r["device_time_total"] = r["self_device_time_total"]
-                r["host_time_total"] = 0
+                r["device_time_sum"] = r["self_device_time_total"]
+                r["host_time_sum"] = 0
             else:
-                r["host_time_total"] = r["self_device_time_total"]
-                r["device_time_total"] = 0
+                r["host_time_sum"] = r["self_device_time_total"]
+                r["device_time_sum"] = 0
 
         rets.append(r)
     df = pd.DataFrame(rets)
@@ -236,38 +247,43 @@ def get_trace_perf(prof, num_iters):
     cols = [
         "name",
         "cnt",
-        "host_time_total",
-        "device_time_total",
+        "host_time_sum",
+        "device_time_sum",
         "device_type",
         "device_index",
     ]
     cols = [el for el in cols if el in df.columns]
-    df = df[(df.host_time_total > 0) | (df.device_time_total > 0)]
+    df = df[(df.host_time_sum > 0) | (df.device_time_sum > 0)]
 
     timerList = [
-        "host_time_total",
-        "device_time_total",
+        "host_time_sum",
+        "device_time_sum",
     ]
     df = df[cols].sort_values(timerList, ignore_index=True)
     avg_name = "[avg us/iter]"
     for el in timerList:
         df.at[avg_name, el] = df[el].sum() / num_iters
     if int(os.environ.get("AITER_LOG_MORE", 0)):
+        pd.set_option("display.expand_frame_repr", False)
         pd.set_option("display.max_colwidth", 90)
+        pd.set_option("display.float_format", "{:,.1f}".format)
         logger.info(f"{df}")
-    return df.at[avg_name, "device_time_total"]
+    return df.at[avg_name, "device_time_sum"]
 
 
-def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8):
+def checkAllclose(a, b, rtol=1e-2, atol=1e-2, msg="", printNum=8, printLog=True):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
     mask = (~isClose).to("cpu")
     if isClose.all():
-        logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
+        if printLog:
+            logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
         return 0
     else:
         num = mask.sum()
         printNum = min(printNum, num)
         percent = (num / a.numel()).item()
+        if not printLog:
+            return percent
         a_msked = a[mask]
         b_msked = b[mask]
         delta = (a_msked - b_msked).abs()
