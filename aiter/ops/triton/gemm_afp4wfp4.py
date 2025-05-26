@@ -155,8 +155,8 @@ def _gemm_afp4_wfp4_kernel(
             a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
             if IS_SCALE_SHUFFLED:
-                tl.reshape(a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE))
-                tl.reshape(b_scales, (BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE))
+                a_scales = tl.reshape(a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE))
+                b_scales = tl.reshape(b_scales, (BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE))
 
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
@@ -378,6 +378,7 @@ def gemm_afp4wfp4(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+        config["matrix_instr_nonkdim"] = 16
 
     grid = lambda META: (  # noqa: E731
         (
