@@ -178,8 +178,12 @@ def _gemm_afp4_wfp4_kernel(
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
-            a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
-            b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
+            if IS_SCALE_SHUFFLED:
+                a_scale_ptrs += BLOCK_SIZE_K * stride_ask
+                b_scale_ptrs += BLOCK_SIZE_K * stride_bsk
+            else:
+                a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
+                b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
 
         c = accumulator.to(c_ptr.type.element_ty)
 
