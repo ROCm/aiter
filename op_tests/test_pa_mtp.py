@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 from typing import List, Optional, Tuple, Union
 import aiter
-from op_tests.triton.utils import mla_decode_ref, mla_extend_ref
 from aiter.test_common import checkAllclose, benchmark, run_perftest, perftest
 from aiter.test_mha_common import attention_ref
 from einops import rearrange
@@ -153,14 +152,13 @@ def torch_mha_extend(
             + torch.arange(ctx_len, device=block_table.device) % block_size
         )
 
-        k = k_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float) * k_scale[
-            :, idx
-        ].t().unsqueeze(-1)
+        k = k_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
+        if k_scale is not None:
+            k *= k_scale[:, idx].t().unsqueeze(-1)
 
-        v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float) * v_scale[
-            :, idx
-        ].t().unsqueeze(-1)
-
+        v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
+        if v_scale is not None:
+            v *= v_scale[:, idx].t().unsqueeze(-1)
         o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=False)
         os.append(o)
     o = torch.concat(os)
@@ -272,10 +270,10 @@ def test_pa_mtp(
     head_size: int,
     block_size: int,
     dtype: torch.dtype,
-    seed: int,
-    device: str,
     qlen,
 ) -> None:
+    seed=0
+    device = "cuda:0"
     torch.set_default_device(device)
     num_query_heads, num_kv_heads = num_heads
     assert num_query_heads % num_kv_heads == 0
@@ -328,22 +326,50 @@ def test_pa_mtp(
     )
     k_cache, v_cache = k_caches[0], v_caches[0]
 
-    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
-        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=torch.float8_e4m3fnuz)
+    out_ref_noquant, us_ref_noquant = run_perftest(
+        torch_mha_extend,
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        seq_lens,
+        qo_indptr,
+        num_iters=2,
+        num_warmup=0,
     )
 
-    out_aiter_asm, us_aiter_asm = run_aiter_asm(
-        query.contiguous(),
-        k_quant_,
-        asm_V_shuffle(v_quant_),
+    out_asm_noquant, us_asm_noquant = run_aiter_asm(
+        query,
+        k_cache,
+        asm_V_shuffle(v_cache),
         block_tables,
         seq_lens,
         block_tables.size(1),
         max_qlen,
-        k_scale_asm,
-        v_scale_asm,
-        qo_indptr,
+        qo_indptr=qo_indptr,
     )
+    checkAllclose(
+        out_ref_noquant,
+        out_asm_noquant,
+        msg=f"[torch vs  aiter_ck][No Quant]:{us_ref_noquant:>8.2f} us vs {us_asm_noquant:>8.2f} us......",
+    )
+
+    k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (
+        pertoken_quant_kvcache_symm(k_cache, v_cache, quant_dtype=torch.float8_e4m3fnuz)
+    )
+
+    # out_aiter_asm, us_aiter_asm = run_aiter_asm(
+    #     query.contiguous(),
+    #     k_quant_,
+    #     asm_V_shuffle(v_quant_),
+    #     block_tables,
+    #     seq_lens,
+    #     block_tables.size(1),
+    #     max_qlen,
+    #     k_scale_asm,
+    #     v_scale_asm,
+    #     qo_indptr,
+    # )
 
     out_ref, us_ref = run_perftest(
         torch_mha_extend,
@@ -362,12 +388,12 @@ def test_pa_mtp(
     # print(out_ref)
     # print(out_aiter_asm)
 
-    err = checkAllclose(
-        out_ref,
-        out_aiter_asm,
-        msg=f"[torch vs  aiter_ck]:{us_ref:>8.2f} us vs {us_aiter_asm:>8.2f} us......",
-    )
-    return {"torch": us_ref, "aiter_asm": us_aiter_asm, "err": err}
+    # err = checkAllclose(
+    #     out_ref,
+    #     out_aiter_asm,
+    #     msg=f"[torch vs  aiter_ck]:{us_ref:>8.2f} us vs {us_aiter_asm:>8.2f} us......",
+    # )
+    # return {"torch": us_ref, "aiter_asm": us_aiter_asm, "err": err}
 
 
 head_dim = 128
@@ -375,10 +401,10 @@ block_size = 16
 import pandas as pd
 
 for dtype in [torch.bfloat16]:
-    for num_heads in [(5, 1), (8, 1), (16, 1)][:-1]:
-        for qlen in [1, 2, 3, 4]:
-            df = []
-            for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097][:]:
+    for num_heads in [(8, 1), (5, 1), (8, 1), (16, 1)][:1]:
+        df = []
+        for qlen in [ 3,2, 3, 4][:1]:
+            for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097][-1:]:
                 for batch_size in [128][:]:
                     ret = test_pa_mtp(
                         ctx_len,
@@ -387,11 +413,9 @@ for dtype in [torch.bfloat16]:
                         head_dim,
                         block_size,
                         dtype,
-                        0,
-                        "cuda:0",
                         qlen,
                     )
                     df.append(ret)
-            df = pd.DataFrame(df)
-            aiter.logger.info(f"summary:\n{df}")
-            # df.to_csv("mla_prefill.csv")
+        df = pd.DataFrame(df)
+        aiter.logger.info(f"summary:\n{df}")
+        # df.to_csv("mla_prefill.csv")

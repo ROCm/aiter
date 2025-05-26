@@ -112,23 +112,43 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     AiterAsmKernel *impl_ptr = nullptr;
     if (qo_indptr && max_qlen > 1)
     {
-        TORCH_CHECK(Q.dtype() == at::ScalarType::BFloat16 && K_QScale && K.dtype() == at::ScalarType::Float8_e4m3fnuz,
-                    __func__, ": qo_indptr only support bf16 asm pa with fp8 kv cache");
-
-        if (gqa_ratio <= 8)
+        if (K.dtype() == at::ScalarType::BFloat16)
         {
-            static AiterAsmKernel impl_a16w8_1tg_g8_f8_gqa8_qlen("pa_a16w8_1tg_g8_f8_gqa8_qlen", "pa_a16w8_1tg_g8_f8_gqa8_qlen.co");
-            impl_ptr = &impl_a16w8_1tg_g8_f8_gqa8_qlen;
+            if (gqa_ratio <= 8)
+            {
+                static AiterAsmKernel impl_bf16_noquant_a16w16_gqa8_qlen("_ZN5aiter32pa_bf16_noquant_a16w16_gqa8_qlenE", "/pa/pa_bf16_noquant_a16w16_gqa8_qlen.co");
+                impl_ptr = &impl_bf16_noquant_a16w16_gqa8_qlen;
+            }
+            // else if (gqa_ratio <= 16)
+            // {
+            //     static AiterAsmKernel impl_a16w16_1tg_g8_f8_gqa16_qlen("pa_bf16_noquant_a16w16_gqa8_qlen", "/pa/pa_bf16_noquant_a16w16_gqa8_qlen.co");
+            //     impl_ptr = &impl_a16w16_1tg_g8_f8_gqa16_qlen;
+            // }
+            else
+            {
+                TORCH_CHECK(false,
+                            __func__, ": gqa_ratio only support less 16 on bf16 asm pa with qo_indptr !!!");
+            }
         }
-        else if (gqa_ratio <= 16)
-        {
-            static AiterAsmKernel impl_a16w16_1tg_g8_f8_gqa16_qlen("pa_a16w8_1tg_g8_f8_gqa16_qlen", "pa_a16w8_1tg_g8_f8_gqa16_qlen.co");
-            impl_ptr = &impl_a16w16_1tg_g8_f8_gqa16_qlen;
-        }
-        else
-        {
-            TORCH_CHECK(false,
-                        __func__, ": gqa_ratio only support less 16 on bf16 asm pa with qo_indptr !!!");
+        else{
+            TORCH_CHECK(Q.dtype() == at::ScalarType::BFloat16 && K_QScale && K.dtype() == at::ScalarType::Float8_e4m3fnuz,
+                        __func__, ": qo_indptr only support bf16 asm pa with fp8 kv cache");
+    
+            if (gqa_ratio <= 8)
+            {
+                static AiterAsmKernel impl_a16w8_1tg_g8_f8_gqa8_qlen("pa_a16w8_1tg_g8_f8_gqa8_qlen", "pa_a16w8_1tg_g8_f8_gqa8_qlen.co");
+                impl_ptr = &impl_a16w8_1tg_g8_f8_gqa8_qlen;
+            }
+            else if (gqa_ratio <= 16)
+            {
+                static AiterAsmKernel impl_a16w16_1tg_g8_f8_gqa16_qlen("pa_a16w8_1tg_g8_f8_gqa16_qlen", "pa_a16w8_1tg_g8_f8_gqa16_qlen.co");
+                impl_ptr = &impl_a16w16_1tg_g8_f8_gqa16_qlen;
+            }
+            else
+            {
+                TORCH_CHECK(false,
+                            __func__, ": gqa_ratio only support less 16 on bf16 asm pa with qo_indptr !!!");
+            }
         }
     }
     else if (K_QScale)
