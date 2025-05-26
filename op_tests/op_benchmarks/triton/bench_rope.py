@@ -24,7 +24,6 @@ from aiter.ops.triton.rope import (
     rope_cached_thd_positions_2c_gqa_fwd_inplace,
     rope_cached_thd_positions_offsets_2c_gqa_fwd,
     rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace,
-    rope_cached_thd_positions_2c_gqa_fwd_inplace_2,
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
 )
@@ -287,28 +286,15 @@ def run_benchmark(args):
                     )
             else:
                 if inplace:
-                    # fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace(  # noqa: E731
-                    #     x,
-                    #     y,
-                    #     cos,
-                    #     sin,
-                    #     positions,
-                    #     rotate_style,
-                    #     reuse_freqs_front_part,
-                    #     nope_first,
-                    #     transpose_output,
-                    # )
-                    x = x.view(len(x), -1)
-                    y = y.view(len(y), -1)
-                    fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace_2(  # noqa: E731
+                    fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace(  # noqa: E731
                         x,
                         y,
-                        cos_sin_cache,
+                        cos,
+                        sin,
                         positions,
                         rotate_style,
                         reuse_freqs_front_part,
                         nope_first,
-                        D,
                         transpose_output,
                     )
                 else:
