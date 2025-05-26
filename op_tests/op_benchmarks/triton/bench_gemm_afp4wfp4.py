@@ -80,7 +80,9 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4_blockscale(M, N, K, metric, provider):
         c_dtype = torch.bfloat16
-        x, w, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(M, N, K, c_dtype)
+        x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(
+            M, N, K, c_dtype
+        )
         # flops
         flops = 2.0 * M * N * K
         # memory transfer
