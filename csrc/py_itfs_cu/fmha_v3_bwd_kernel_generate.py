@@ -14,6 +14,7 @@ from typing import List, Optional
 this_dir = os.path.abspath(__file__)
 sys.path.insert(0, str(Path(this_dir).parents[2] / "aiter/"))
 from jit.core import get_asm_dir
+from jit.utils.chip_info import get_gfx
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -527,7 +528,8 @@ template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Ts;
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      0,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      1,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      2,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
-template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      0,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
+// This kernel will be replaced with new fx950 kernel
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      0,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = {F_tile_size_kv}; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      1,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      2,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      0,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
@@ -2377,151 +2379,18 @@ class FmhaBwdDQDKDVTileSize:
 
 # TODO: design a more practical way to do it
 # this is current supported tile size & pipeline.
+# fmt: off
 def get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype: str) -> Optional[dict]:
     if dtype == "fp16" or dtype == "bf16":
         return {
-            "32": [
-                FmhaBwdDQDKDVTileSize(
-                    32,
-                    128,
-                    32,
-                    32,
-                    32,
-                    32,
-                    64,
-                    32,
-                    32,
-                    1,
-                    4,
-                    1,
-                    4,
-                    1,
-                    1,
-                    2,
-                    2,
-                    1,
-                    16,
-                    16,
-                    32,
-                    16,
-                    16,
-                    16,
-                    1,
-                ),
-                "kr_ktr_vr_iglp",
-                "kr_ktr_vr",
-            ],
-            "64": [
-                FmhaBwdDQDKDVTileSize(
-                    32,
-                    128,
-                    64,
-                    32,
-                    64,
-                    32,
-                    32,
-                    64,
-                    64,
-                    1,
-                    4,
-                    1,
-                    4,
-                    1,
-                    1,
-                    1,
-                    4,
-                    1,
-                    16,
-                    16,
-                    32,
-                    16,
-                    16,
-                    16,
-                    1,
-                ),
-                "kr_ktr_vr_iglp",
-                "kr_ktr_vr",
-            ],
-            "128": [
-                FmhaBwdDQDKDVTileSize(
-                    16,
-                    128,
-                    128,
-                    16,
-                    128,
-                    16,
-                    32,
-                    128,
-                    128,
-                    1,
-                    4,
-                    1,
-                    4,
-                    1,
-                    1,
-                    1,
-                    4,
-                    1,
-                    16,
-                    16,
-                    32,
-                    16,
-                    16,
-                    16,
-                    1,
-                ),
-                "kr_ktr_vr_iglp",
-                "kr_ktr_vr",
-            ],
-            "256": [
-                FmhaBwdDQDKDVTileSize(
-                    16,
-                    64,
-                    256,
-                    16,
-                    256,
-                    16,
-                    32,
-                    256,
-                    256,
-                    1,
-                    4,
-                    1,
-                    4,
-                    1,
-                    1,
-                    1,
-                    4,
-                    1,
-                    16,
-                    16,
-                    32,
-                    16,
-                    16,
-                    16,
-                    1,
-                ),
-                "kr_ktr_vr_iglp",
-                "kr_ktr_vr",
-            ],
+            "32":  [FmhaBwdDQDKDVTileSize(32, 128, 32,  32, 32,  32, 64, 32,  32,  1, 4, 1, 4, 1, 1, 2, 2, 1, 16, 16, 32, 16, 16, 16, 1), "kr_ktr_vr_iglp", "kr_ktr_vr"],
+            "64":  [FmhaBwdDQDKDVTileSize(32, 128, 64,  32, 64,  32, 32, 64,  64,  1, 4, 1, 4, 1, 1, 1, 4, 1, 16, 16, 32, 16, 16, 16, 1), "kr_ktr_vr_iglp", "kr_ktr_vr"],
+            "128": [FmhaBwdDQDKDVTileSize(16, 128, 128, 16, 128, 16, 32, 128, 128, 1, 4, 1, 4, 1, 1, 1, 4, 1, 16, 16, 32, 16, 16, 16, 1), "kr_ktr_vr_iglp", "kr_ktr_vr"],
+            "256": [FmhaBwdDQDKDVTileSize(16, 64,  256, 16, 256, 16, 32, 256, 256, 1, 4, 1, 4, 1, 1, 1, 4, 1, 16, 16, 32, 16, 16, 16, 1), "kr_ktr_vr_iglp", "kr_ktr_vr"],
         }
     else:
         return None
-
-
-class FmhaBwdApiPool:
-    @property
-    def api(self) -> str:
-        return FMHA_BWD_KERNEL_HEADER + FMHA_BWD_API.format(
-            F_AITER_ASM_DIR=get_asm_dir()
-        )
-
-
-def get_bwd_dq_dk_dv_blobs() -> FmhaBwdApiPool:
-    # TODO: we don't support tuning yet, so pick up one value for pad
-    #       support this in future
-    api_pool = FmhaBwdApiPool()
-    return api_pool
+# fmt: on
 
 
 FMHA_BWD_DOT_DO_O_KERNEL_BODY = """
@@ -2844,26 +2713,6 @@ def write_single_bwd_convert_dq_kernel(
     (autogen_dir / kernel.filename).write_text(kernel.template)
 
 
-def write_bwd_api(api_pool: FmhaBwdApiPool, autogen_dir: Path) -> None:
-    (autogen_dir / FMHA_BWD_API_FILENAME).write_text(api_pool.api)
-
-
-def write_bwd_blobs(output_dir: Path, filter_list: str, receipt: int) -> None:
-    api_pool = FmhaBwdApiPool()
-    write_bwd_api(api_pool, output_dir)
-
-    if receipt == 0:
-        filter_list = filter_list.split("@")
-        filter_list.extend([""] * (3 - len(filter_list)))
-
-        kernels = get_bwd_dot_do_o_blobs(filter_list[0])
-        for kernel in kernels:
-            write_single_bwd_dot_do_o_kernel(kernel, output_dir)
-        kernels = get_bwd_convert_dq_blobs(filter_list[1])
-        for kernel in kernels:
-            write_single_bwd_convert_dq_kernel(kernel, output_dir)
-
-
 def write_blobs(
     output_dir: Optional[str], filters_list: List[str], receipt: int
 ) -> None:
@@ -2874,8 +2723,21 @@ def write_blobs(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for kernel_filter in filters_list:
-        write_bwd_blobs(output_dir, kernel_filter, receipt)
+    ts_kv = 192 if get_gfx() == "gfx942" else 256
+    dqdkdv_kernel = FMHA_BWD_KERNEL_HEADER + FMHA_BWD_API.format(F_AITER_ASM_DIR=get_asm_dir(), F_tile_size_kv=ts_kv)
+    (output_dir / FMHA_BWD_API_FILENAME).write_text(dqdkdv_kernel)
+
+    if receipt == 0:
+        for kernel_filter in filters_list:
+            filter_list = filter_list.split("@")
+            filter_list.extend([""] * (3 - len(filter_list)))
+
+            kernels = get_bwd_dot_do_o_blobs(filter_list[0])
+            for kernel in kernels:
+                write_single_bwd_dot_do_o_kernel(kernel, output_dir)
+            kernels = get_bwd_convert_dq_blobs(filter_list[1])
+            for kernel in kernels:
+                write_single_bwd_convert_dq_kernel(kernel, output_dir)
 
 
 if __name__ == "__main__":
@@ -2907,8 +2769,6 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-    api_list = ["bwd"]
     filter_list = args.filter.split(",")
-    filter_list.extend([""] * (len(api_list) - len(filter_list)))
 
     write_blobs(args.output_dir, filter_list, int(args.receipt))
