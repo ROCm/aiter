@@ -94,9 +94,7 @@ MoeKernel moe_stage1_heuristic_dispatch(int block_m)
 """
 
 
-
-
-A16W16_A8W8_gemm2_heuristic_dispatch ="""
+A16W16_A8W8_gemm2_heuristic_dispatch = """
 MoeKernel moe_stage2_heuristic_dispatch(int block_m)
 {{
     if (block_m == 32)
@@ -123,13 +121,10 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m)
 """
 
 
-A8W8_blockscale_gemm2_heuristic_dispatch ="""
+A8W8_blockscale_gemm2_heuristic_dispatch = """
 MoeKernel moe_stage2_heuristic_dispatch(int block_m)
 {{
-    if (block_m == 128)
-    {{
-        return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 128, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
-    }}
+
     if (block_m == 64)
     {{
         return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
@@ -147,15 +142,33 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m)
 
 
 heuristic_dispatch_dict = {
-    "a8w8": [A16W16_A8W8_gemm1_heuristic_dispatch, A16W16_A8W8_gemm2_heuristic_dispatch],
-    "a8w8blkscale": [A8W8_blockscale_gemm1_heuristic_dispatch, A8W8_blockscale_gemm2_heuristic_dispatch],
-    "a16w16": [A16W16_A8W8_gemm1_heuristic_dispatch, A16W16_A8W8_gemm2_heuristic_dispatch],
-    "a8w4": []
+    "a8w8": [
+        A16W16_A8W8_gemm1_heuristic_dispatch,
+        A16W16_A8W8_gemm2_heuristic_dispatch,
+    ],
+    "a8w8blkscale": [
+        A8W8_blockscale_gemm1_heuristic_dispatch,
+        A8W8_blockscale_gemm2_heuristic_dispatch,
+    ],
+    "a16w16": [
+        A16W16_A8W8_gemm1_heuristic_dispatch,
+        A16W16_A8W8_gemm2_heuristic_dispatch,
+    ],
+    "a8w4": [],
 }
 
 
 class ck_moe_2stage_gemm_codegen:
-    def __init__(self, working_path, a_dtype, b_dtype, c_dtype, quant_type, activation, mul_routed_weight_stage):
+    def __init__(
+        self,
+        working_path,
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        quant_type,
+        activation,
+        mul_routed_weight_stage,
+    ):
         self.working_path = working_path
         self.a_dtype = a_dtype.upper()
         self.b_dtype = b_dtype.upper()
@@ -164,11 +177,26 @@ class ck_moe_2stage_gemm_codegen:
         self.activation = activation
         self.mul_routed_weight_stage = mul_routed_weight_stage
         self.nswizzle = False
-        
+
     def generate_instance_and_lookUpTable(self):
-        _, gemm1_kernel_list = get_gemm1_kernels_list(self.a_dtype, self.b_dtype, self.nswizzle, self.quant_type, self.activation, self.mul_routed_weight_stage==1)
-        tag, gemm2_kernel_list = get_gemm2_kernels_list(self.a_dtype, self.b_dtype, self.nswizzle, self.quant_type, self.mul_routed_weight_stage==2)
-        kernel_list = list(gemm1_kernel_list.values()) + list(gemm2_kernel_list.values())
+        _, gemm1_kernel_list = get_gemm1_kernels_list(
+            self.a_dtype,
+            self.b_dtype,
+            self.nswizzle,
+            self.quant_type,
+            self.activation,
+            self.mul_routed_weight_stage == 1,
+        )
+        tag, gemm2_kernel_list = get_gemm2_kernels_list(
+            self.a_dtype,
+            self.b_dtype,
+            self.nswizzle,
+            self.quant_type,
+            self.mul_routed_weight_stage == 2,
+        )
+        kernel_list = list(gemm1_kernel_list.values()) + list(
+            gemm2_kernel_list.values()
+        )
         f_lookUpTable = os.path.join(self.working_path, "gemm_moe_ck2stages_lookup.h")
         if os.path.exists(f_lookUpTable):
             os.remove(f_lookUpTable)
@@ -177,20 +205,24 @@ class ck_moe_2stage_gemm_codegen:
             for kernel in kernel_list:
                 ## generate instance
                 os.makedirs(os.path.join(self.working_path, "instances"), exist_ok=True)
-                f_instance = os.path.join(self.working_path, "instances" ,f"{kernel.name}.cu")
+                f_instance = os.path.join(
+                    self.working_path, "instances", f"{kernel.name}.cu"
+                )
                 if os.path.exists(f_instance):
                     os.remove(f_instance)
                 with open(f_instance, "w") as f_ins:
                     stage_instance = STG_INSTANCE_IMPL.format(
-                        quanttype="_blockscale" if "per_128x128" in self.quant_type else "",
+                        quanttype=(
+                            "_blockscale" if "per_128x128" in self.quant_type else ""
+                        ),
                         A0DataType=self.a_dtype,
                         B0DataType=self.b_dtype,
-                        AccDataType="F32" if  self.a_dtype != "I8" else "I32",
+                        AccDataType="F32" if self.a_dtype != "I8" else "I32",
                         EDataType=self.c_dtype,
                         CDEElementOp=kernel.CDEElementOp,
                         Nswizzle=str(self.nswizzle).lower(),
-                        PerTensorQuant= str(self.quant_type!="per_token").lower(),
-                        ActOP = int(self.activation=="silu"),
+                        PerTensorQuant=str(self.quant_type != "per_token").lower(),
+                        ActOP=int(self.activation == "silu"),
                         Stage=kernel.stage,
                         BlockSize=kernel.BLOCK_SIZE,
                         MPerBlock=kernel.MPerBlock,
@@ -199,7 +231,10 @@ class ck_moe_2stage_gemm_codegen:
                         MWaves=kernel.MWaves,
                         NWaves=kernel.NWaves,
                         PipelineVer=kernel.GemmPipelineVersion,
-                        MulRoutedWeight=str(self.mul_routed_weight_stage == kernel.stage).lower())
+                        MulRoutedWeight=str(
+                            self.mul_routed_weight_stage == kernel.stage
+                        ).lower(),
+                    )
                     f_ins.write(stage_instance)
 
                 ## generate lookUpTable
@@ -207,12 +242,12 @@ class ck_moe_2stage_gemm_codegen:
                     kernel_tag=kernel.name,
                     A0DataType=self.a_dtype,
                     B0DataType=self.b_dtype,
-                    AccDataType="F32" if  self.a_dtype != "I8" else "I32",
+                    AccDataType="F32" if self.a_dtype != "I8" else "I32",
                     EDataType=self.c_dtype,
                     CDEElementOp=kernel.CDEElementOp,
                     Nswizzle=str(self.nswizzle).lower(),
-                    PerTensorQuant= str(self.quant_type!="per_token").lower(),
-                    ActOP = int(self.activation=="silu"),
+                    PerTensorQuant=str(self.quant_type != "per_token").lower(),
+                    ActOP=int(self.activation == "silu"),
                     Stage=kernel.stage,
                     BlockSize=kernel.BLOCK_SIZE,
                     MPerBlock=kernel.MPerBlock,
@@ -221,109 +256,129 @@ class ck_moe_2stage_gemm_codegen:
                     MWaves=kernel.MWaves,
                     NWaves=kernel.NWaves,
                     PipelineVer=kernel.GemmPipelineVersion,
-                    MulRoutedWeight=str(self.mul_routed_weight_stage == kernel.stage).lower())
+                    MulRoutedWeight=str(
+                        self.mul_routed_weight_stage == kernel.stage
+                    ).lower(),
+                )
                 f_lookup.write(lookup_ele)
             f_lookup.write(LOOKUP_end)
-        f_heuristic_dispatch = os.path.join(self.working_path, "gemm_moe_ck2stages_heuristic_dispatch.hpp")
+        f_heuristic_dispatch = os.path.join(
+            self.working_path, "gemm_moe_ck2stages_heuristic_dispatch.hpp"
+        )
         if os.path.exists(f_heuristic_dispatch):
             os.remove(f_heuristic_dispatch)
-        gemm1_heuristic_dispatch, gemm2_heuristic_dispatch = heuristic_dispatch_dict[tag]
+        gemm1_heuristic_dispatch, gemm2_heuristic_dispatch = heuristic_dispatch_dict[
+            tag
+        ]
         with open(f_heuristic_dispatch, "w") as f_h:
             gemm1_heuristic_dispatch_str = gemm1_heuristic_dispatch.format(
                 A0DataType=self.a_dtype,
                 B0DataType=self.b_dtype,
-                AccDataType="F32" if  self.a_dtype != "I8" else "I32",
+                AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType=self.c_dtype,
                 CDEElementOp=kernel_list[0].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
-                PerTensorQuant= str(self.quant_type!="per_token").lower(),
-                ActOP = str(int(self.activation=="silu")),
-                MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower())
+                PerTensorQuant=str(self.quant_type != "per_token").lower(),
+                ActOP=str(int(self.activation == "silu")),
+                MulRoutedWeight=str(self.mul_routed_weight_stage == 1).lower(),
+            )
             f_h.write(gemm1_heuristic_dispatch_str)
 
             gemm2_heuristic_dispatch_str = gemm2_heuristic_dispatch.format(
                 A0DataType=self.a_dtype,
                 B0DataType=self.b_dtype,
-                AccDataType="F32" if  self.a_dtype != "I8" else "I32",
+                AccDataType="F32" if self.a_dtype != "I8" else "I32",
                 EDataType=self.c_dtype,
                 CDEElementOp=kernel_list[-1].CDEElementOp,
                 Nswizzle=str(self.nswizzle).lower(),
-                PerTensorQuant= str(self.quant_type!="per_token").lower(),
-                ActOP = int(self.activation=="silu"),
-                MulRoutedWeight=str(self.mul_routed_weight_stage == 2).lower())
+                PerTensorQuant=str(self.quant_type != "per_token").lower(),
+                ActOP=int(self.activation == "silu"),
+                MulRoutedWeight=str(self.mul_routed_weight_stage == 2).lower(),
+            )
             f_h.write(gemm2_heuristic_dispatch_str)
-       
-
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate ck 2stage gemm instance.")
-    
+
     # Add arguments
     parser.add_argument(
-        "-a", 
-        "--a_dtype", 
+        "-a",
+        "--a_dtype",
         default="f8",
         required=False,
         type=str,
         choices=["f8", "i8", "f16", "b16"],
-        help="select input dtype")
+        help="select input dtype",
+    )
 
     parser.add_argument(
-        "-b", 
-        "--b_dtype", 
+        "-b",
+        "--b_dtype",
         default="f8",
         required=False,
         type=str,
         choices=["f8", "i8", "f16", "b16", "i4"],
-        help="select weight dtype")
+        help="select weight dtype",
+    )
 
     parser.add_argument(
-        "-c", 
-        "--c_dtype", 
+        "-c",
+        "--c_dtype",
         default="b16",
         required=False,
         type=str,
         choices=["f16", "b16"],
-        help="select out dtype")
+        help="select out dtype",
+    )
 
     parser.add_argument(
-        "-q", 
-        "--quant_type", 
+        "-q",
+        "--quant_type",
         default="per_tensor",
         required=False,
         type=str,
-        choices=["per_tensor", "per_token", "per_128x128","no"],
-        help="select quant_type")
+        choices=["per_tensor", "per_token", "per_128x128", "no"],
+        help="select quant_type",
+    )
 
     parser.add_argument(
-        "-act", 
-        "--activation", 
+        "-act",
+        "--activation",
         default="silu",
         required=False,
         type=str,
         choices=["silu", "gelu"],
-        help="select activation")
+        help="select activation",
+    )
 
     parser.add_argument(
-        "-m", 
-        "--mul_routed_weight_stage", 
+        "-m",
+        "--mul_routed_weight_stage",
         default=2,
         required=False,
         type=int,
         choices=[1, 2],
-        help="select quant_type")
-    
+        help="select quant_type",
+    )
+
     parser.add_argument(
         "-w",
         "--working_path",
         default="./",
         required=False,
-        help="the path where all the blobs are going to be generated"
+        help="the path where all the blobs are going to be generated",
     )
-
 
     args = parser.parse_args()
 
-    codegen = ck_moe_2stage_gemm_codegen(args.working_path, args.a_dtype, args.b_dtype, args.c_dtype, args.quant_type, args.activation, args.mul_routed_weight_stage)
+    codegen = ck_moe_2stage_gemm_codegen(
+        args.working_path,
+        args.a_dtype,
+        args.b_dtype,
+        args.c_dtype,
+        args.quant_type,
+        args.activation,
+        args.mul_routed_weight_stage,
+    )
     codegen.generate_instance_and_lookUpTable()

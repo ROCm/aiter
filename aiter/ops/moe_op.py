@@ -8,7 +8,9 @@ from ..jit.core import compile_ops, AITER_CSRC_DIR
 from .enum import ActivationType, Enum, QuantType
 from ..utility import dtypes
 import functools
+
 torch.int4 = getattr(torch, "int4", torch.uint32)
+
 
 @compile_ops("module_moe_asm")
 def topk_softmax(

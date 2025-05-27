@@ -12,7 +12,7 @@ using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 
 // API for user aiter.ck_moe_stage1(...)
 
-template <int stage=1>
+template <int stage = 1>
 MoeKernel moe_dispatch(std::string &kernelName, int block_m)
 {
     static const auto lookup = []
@@ -41,18 +41,18 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m)
 }
 
 void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
-    torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-    torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-    torch::Tensor &num_valid_ids,     // [1]
-    torch::Tensor &out,               // [m * topk, inter_dim]
-    int topk,
-    std::string &kernelName,
-    std::optional<torch::Tensor> w1_scale        = std::nullopt, // [e, 1, n], gate(up) scale
-    std::optional<torch::Tensor> a1_scale        = std::nullopt, // [m, 1], token scale
-    std::optional<int> block_m                   = 32,
-    std::optional<torch::Tensor> sorted_weights  = std::nullopt)
+                   torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                   torch::Tensor &num_valid_ids,     // [1]
+                   torch::Tensor &out,               // [m * topk, inter_dim]
+                   int topk,
+                   std::string &kernelName,
+                   std::optional<torch::Tensor> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
+                   std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
+                   std::optional<int> block_m = 32,
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
     at::cuda::getCurrentCUDAStream().stream();
@@ -84,26 +84,25 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     }
 
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock);
-    
-    kernel(at::cuda::getCurrentCUDAStream().stream(), 
-    tokens, sorted_size, N, K, topk, 
-    hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);
+
+    kernel(at::cuda::getCurrentCUDAStream().stream(),
+           tokens, sorted_size, N, K, topk,
+           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);
 }
 
-
 void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
-    torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-    torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-    torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
-    torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
-    torch::Tensor &num_valid_ids,     // [1]
-    torch::Tensor &out,               // [max_num_tokens_padded, inter_dim]
-    int topk,
-    std::string &kernelName,
-    std::optional<torch::Tensor> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
-    std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
-    std::optional<int> block_m = 32,
-    std::optional<torch::Tensor> sorted_weights = std::nullopt)
+                   torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                   torch::Tensor &num_valid_ids,     // [1]
+                   torch::Tensor &out,               // [max_num_tokens_padded, inter_dim]
+                   int topk,
+                   std::string &kernelName,
+                   std::optional<torch::Tensor> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
+                   std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
+                   std::optional<int> block_m = 32,
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt)
 {
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")
@@ -130,10 +129,10 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-    
+
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock);
-    
-    kernel(at::cuda::getCurrentCUDAStream().stream(), 
-    tokens, sorted_size, N, K, topk, 
-    inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr);
+
+    kernel(at::cuda::getCurrentCUDAStream().stream(),
+           tokens, sorted_size, N, K, topk,
+           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr);
 }

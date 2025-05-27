@@ -126,7 +126,7 @@ a8w8_gemm2_kernels_list= {
 a8w8_gemm2_blockscale_kernels_list= {
      #0: kernelInstanceGEMM2(       256,       32,        128,       128,     1,       4,        1,),
      1: kernelInstanceGEMM2(       256,       64,        128,       128,     1,       4,        3,),
-    #  2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
+     #2: kernelInstanceGEMM2(       256,      128,        128,       128,     2,       2,        3,),
 }
 
 # gemm2 out:bf16/fp16 A:fp8 B:in4

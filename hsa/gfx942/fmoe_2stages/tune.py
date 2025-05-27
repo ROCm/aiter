@@ -170,11 +170,11 @@ def go(
             print("no moe solution(g1u0) can tune for ", line)
             continue
         act_type = eval(act_type)
-        input = torch.randn((token, model_dim), dtype=dtype)
+        input = torch.randn((token, model_dim), dtype=dtype) / 10
         if use_g1u1:
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
         else:
-            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype)
+            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
         w1_qt, w1_scale = weight_quant(w1, q_type, quant_dtype=q_dtype_w)
         w2_qt, w2_scale = weight_quant(w2, q_type, quant_dtype=q_dtype_w)

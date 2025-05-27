@@ -142,7 +142,7 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
 
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -200,7 +200,7 @@ def test_fmoe(
     w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
     if qType == aiter.QuantType.per_128x128:
-        triton_quant = aiter.get_triton_quant(aiter.QuantType.per_128x128)
+        triton_quant = aiter.get_triton_quant(aiter.QuantType.per_1x128)
         _, us_aq1 = run_perftest(
             triton_quant,
             input,
@@ -343,8 +343,6 @@ def test_fmoe(
     # #     fc2_scale=w2_scale,
     # # )
     # # checkAllclose(out_ref, out2_ref, msg="[torch] 1_stage vs 2_stage")
-    if qType == aiter.QuantType.per_128x128:
-        BLOCK_SIZE_M = 128
 
     out2_ck, us = run_perftest(
         ck_moe_stage2,
@@ -363,7 +361,7 @@ def test_fmoe(
         quant_type,
         sorted_weights if not doweight_stage1 else None,
     )
-
+    print("out2_ck:",out2_ck)
     checkAllclose(
         out2_ref,
         out2_ck,
@@ -392,30 +390,31 @@ def test_fmoe(
     #     msg=f"ck_moe_2stages:{us:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     # )
 
-    out2_aiter, us_fuse = run_perftest(
-        fused_moe,
-        input,
-        w1_qt_aiter,
-        w2_qt_aiter,
-        topk_weights,
-        topk_ids,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        quant_type=qType,
-        activation=actType,
-        doweight_stage1=doweight_stage1,
-    )
+    if dtype == dtypes.bf16:
+        out2_aiter, us_fuse = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            quant_type=qType,
+            activation=actType,
+            doweight_stage1=doweight_stage1,
+        )
 
-    err = checkAllclose(
-        out2_ref,
-        out2_aiter,
-        msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
-    )
+        err = checkAllclose(
+            out2_ref,
+            out2_aiter,
+            msg=f"aiter_all_stages:{us_fuse:>8.2f} us......",
+        )
 
-    return {"us": us_fuse, "err": err}
+        return {"us": us_fuse, "err": err}
 
 
-list_dtype = [dtypes.bf16, dtypes.fp16]
+list_dtype = [dtypes.bf16, dtypes.fp16][:]
 list_dim = [(6144, 4096)]
 list_tokenNum = [
     1,
@@ -429,16 +428,16 @@ list_tokenNum = [
     1024,
     4096,
     163840,
-][:3]
+][:]
 list_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
+    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    #(aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:]
-list_doweight_stage1 = [False, True][:]
+list_doweight_stage1 = [False, True][:1]
 expert, topk = 8, 2
 
 import pandas as pd

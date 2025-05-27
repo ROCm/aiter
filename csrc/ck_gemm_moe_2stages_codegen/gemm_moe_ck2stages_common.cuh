@@ -25,11 +25,11 @@ template <
     int ActOP>
 void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
-                        void *&hidden_states,           // [m, k], input token
-                        void *&w1,                      // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
-                        void *&w2,                      // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
-                        void *&sorted_token_ids,        // [max_num_tokens_padded]
-                        void *&sorted_expert_ids,       // [max_num_m_blocks]
+                        void *&hidden_states,     // [m, k], input token
+                        void *&w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                        void *&w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                        void *&sorted_token_ids,  // [max_num_tokens_padded]
+                        void *&sorted_expert_ids, // [max_num_m_blocks]
                         void *&sorted_weights,
                         void *&num_valid_ids,           // [1]
                         void *&out,                     // [max_num_tokens_padded, inter_dim]
@@ -58,7 +58,6 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     using PassThrough = ck::tensor_operation::element_wise::PassThrough;
     using AElementOp = PassThrough;
     using BElementOp = PassThrough;
-
 
     static constexpr auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default;
     static constexpr ck::index_t MNPerXDL = 16;
@@ -146,22 +145,21 @@ void ck_moe_stage1_gemm(const hipStream_t &stream, int tokens, int sorted_size, 
     invoker.Run(argument, StreamConfig{stream});
 }
 
-#define CK_MOE_STAGE1_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                             \
+#define CK_MOE_STAGE1_GEMM_DEFINE(BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, PipelineVer)                                                                                                                     \
     template void ck_moe_stage1_gemm<A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, BLOCKSIZE, MPerfBlock, NPerBlock, KPerBlock, MWaves, NWaves, Nswizzle, PerTensorQuant, MulRoutedWeight, ActOP>( \
-        const hipStream_t &stream,                                                                                                                                          \
-        int tokens, int sorted_size, int N, int K,                                                                                                                          \
-        int topk,                                                                                                                                                           \
-        void *&hidden_states,                                                                                                                                               \
-        void *&w1,                                                                                                                                                          \
-        void *&w2,                                                                                                                                                          \
-        void *&sorted_token_ids,                                                                                                                                            \
-        void *&sorted_expert_ids,                                                                                                                                           \
-        void *&sorted_weights,                                                                                                                                              \
-        void *&num_valid_ids,                                                                                                                                               \
-        void *&out,                                                                                                                                                         \
-        std::optional<void *> w1_scale,                                                                                                                                     \
+        const hipStream_t &stream,                                                                                                                                                                                              \
+        int tokens, int sorted_size, int N, int K,                                                                                                                                                                              \
+        int topk,                                                                                                                                                                                                               \
+        void *&hidden_states,                                                                                                                                                                                                   \
+        void *&w1,                                                                                                                                                                                                              \
+        void *&w2,                                                                                                                                                                                                              \
+        void *&sorted_token_ids,                                                                                                                                                                                                \
+        void *&sorted_expert_ids,                                                                                                                                                                                               \
+        void *&sorted_weights,                                                                                                                                                                                                  \
+        void *&num_valid_ids,                                                                                                                                                                                                   \
+        void *&out,                                                                                                                                                                                                             \
+        std::optional<void *> w1_scale,                                                                                                                                                                                         \
         std::optional<void *> a1_scale);
-
 
 template <
     typename A0DataType,
@@ -179,7 +177,7 @@ template <
     bool Nswizzle,
     bool PerTensorQuant,
     bool MulRoutedWeight,
-    int ActOP=0>
+    int ActOP = 0>
 void ck_moe_stage2_gemm(const hipStream_t &stream, int tokens, int sorted_size, int N, int K,
                         int topk,
                         void *&inter_states,            // [max_num_tokens_padded, k], input token
