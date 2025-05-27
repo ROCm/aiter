@@ -2729,13 +2729,13 @@ def write_blobs(
 
     if receipt == 0:
         for kernel_filter in filters_list:
-            filter_list = filter_list.split("@")
-            filter_list.extend([""] * (3 - len(filter_list)))
+            kernel_filter = kernel_filter.split("@")
+            kernel_filter.extend([""] * (3 - len(kernel_filter)))
 
-            kernels = get_bwd_dot_do_o_blobs(filter_list[0])
+            kernels = get_bwd_dot_do_o_blobs(kernel_filter[0])
             for kernel in kernels:
                 write_single_bwd_dot_do_o_kernel(kernel, output_dir)
-            kernels = get_bwd_convert_dq_blobs(filter_list[1])
+            kernels = get_bwd_convert_dq_blobs(kernel_filter[1])
             for kernel in kernels:
                 write_single_bwd_convert_dq_kernel(kernel, output_dir)
 
