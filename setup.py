@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import sys
@@ -34,14 +34,16 @@ else:
 
 FORCE_CXX11_ABI = False
 
+PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+
 if IS_ROCM:
     assert os.path.exists(
         ck_dir
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
-    if int(os.environ.get("PREBUILD_KERNELS", 0)) == 1:
+    if PREBUILD_KERNELS == 1:
         exclude_ops = ["libmha_fwd", "libmha_bwd"]
-        all_opts_args_build = core.get_args_of_build("all", exclue=exclude_ops)
+        all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
         all_opts_args_build["srcs"] = new_list
@@ -94,6 +96,15 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+setup_requires = [
+    "packaging",
+    "psutil",
+    "ninja",
+    "setuptools_scm",
+]
+if PREBUILD_KERNELS == 1:
+    setup_requires.append("pandas")
+
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
@@ -111,17 +122,12 @@ setup(
     cmdclass={"build_ext": NinjaBuildExtension},
     python_requires=">=3.8",
     install_requires=[
-        "pybind11",
+        "pybind11>=2.13,<3",
         # "ninja",
         "pandas",
         "einops",
     ],
-    setup_requires=[
-        "packaging",
-        "psutil",
-        "ninja",
-        "setuptools_scm",
-    ],
+    setup_requires=setup_requires,
 )
 
 if os.path.exists("aiter_meta") and os.path.isdir("aiter_meta"):

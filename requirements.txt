@@ -2,4 +2,4 @@ pandas
 pytest
 psutil
 einops
-pybind11
+pybind11>=2.13,<3
