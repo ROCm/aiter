@@ -6,6 +6,8 @@
 #include <map>
 #include <vector>
 
+namespace aiter {
+
 void swap_blocks(torch::Tensor &src, torch::Tensor &dst,
                  const torch::Tensor &block_mapping);
 
@@ -44,3 +46,5 @@ void reshape_and_cache_with_block_quant(torch::Tensor &key, torch::Tensor &value
 // Just for unittest
 void convert_fp8(torch::Tensor &dst_cache, torch::Tensor &src_cache,
                  const double scale, const std::string &kv_cache_dtype);
+
+} // namespace aiter

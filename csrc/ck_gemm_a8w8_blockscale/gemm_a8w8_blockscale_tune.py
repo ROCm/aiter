@@ -70,7 +70,7 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
         )
     return tunedf
 
