@@ -3505,7 +3505,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     D_MODEL_HALF = d // 2
 
     BLOCK_T = 32
-    SPLIT_T = (t + BLOCK_T - 1) // BLOCK_T
+    SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
 
     if t >= 8192:
         MIN_NUM_WG = 2048
@@ -3773,7 +3773,7 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
     D_MODEL_HALF = d // 2
 
     BLOCK_T = min(max(triton.next_power_of_2(t), 16), 32)
-    SPLIT_T = (t + BLOCK_T - 1) // BLOCK_T
+    SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
     grid = (SPLIT_T, hx, 1)
     num_warps = 4
     waves_per_eu = 0
@@ -3787,7 +3787,7 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
         else:
             if t >= 1024:
                 BLOCK_T = 32
-                SPLIT_T = (t + BLOCK_T - 1) // BLOCK_T
+                SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
                 G = hy
                 QH_per_G = hx // hy
                 grid = (G, SPLIT_T, 1)
@@ -3855,7 +3855,7 @@ def _rope_cached_thd_positions_offsets_2c_gqa_fwd(
         else:
             # TODO check boundary
             # BLOCK_T = 32
-            # SPLIT_T = (t + BLOCK_T - 1) // BLOCK_T
+            # SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
             # G = hy
             # QH_per_G = hx // hy
             # grid = (G, SPLIT_T, 1)
