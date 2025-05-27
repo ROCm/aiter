@@ -530,8 +530,8 @@ template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,    
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,      false,      2,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 // This kernel will be replaced with new fx950 kernel
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      0,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = {F_tile_size_kv}; }};
-template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      1,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
-template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      2,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      1,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = {F_tile_size_kv}; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      2,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = {F_tile_size_kv}; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      0,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      1,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,      false,      2,    false,   false>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
