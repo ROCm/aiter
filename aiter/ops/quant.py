@@ -90,13 +90,14 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     y = fp4_utils.f32_to_mxfp4(y)
     y = y.view(m, -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
-    scale_padded = torch.empty(
-        (m + 31) // 32 * 32, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
-    ).fill_(0x7F)
+    if shuffle:
+        scale_padded = torch.empty(
+            (m + 255) // 256 * 256, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
+        ).fill_(0x7F)
 
-    scale_padded[:m, : n // block_size] = scale
-    scale = scale_padded
-    sm, sn = scale.shape
+        scale_padded[:m, : n // block_size] = scale
+        scale = scale_padded
+        sm, sn = scale.shape
 
     if shuffle == 2:
         scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
@@ -267,10 +268,10 @@ def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2):
+def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     assert quant_dtype == dtypes.fp4x2
     # y, scale = triton.quant.dynamic_mxfp4_quant(x)
-    y, scale = fp4_utils.dynamic_mxfp4_quant(x)
+    y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle)
     return y, scale
 
 
