@@ -25,6 +25,7 @@ def shuffle_scales(scales: torch.Tensor):
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
+
 def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     torch.manual_seed(5)
     if isinstance(dtype, str):

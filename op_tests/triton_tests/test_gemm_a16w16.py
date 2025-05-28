@@ -7,10 +7,11 @@ import pytest
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
+
 def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
-    
+
     if layout[0] == "T":
         x = torch.randn((M, K), dtype=dtype).cuda()
     else:
@@ -24,7 +25,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype).cuda()
-        out_dtype = None,
+        out_dtype = (None,)
     else:
         out_dtype = dtype
 

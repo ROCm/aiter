@@ -83,6 +83,7 @@ def get_x_vals():
     ]
     return x_vals
 
+
 def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype, output=False):
 
     x = torch.randn((M, K), dtype=torch.float32, device="cuda")
