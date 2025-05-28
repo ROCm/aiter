@@ -8,6 +8,7 @@ ctypes_map = {
     str: ctypes.c_char_p,
 }
 
+
 def torch_to_c_types(*args):
     c_args = []
     for arg in args:
@@ -37,6 +38,7 @@ hip_types_map = {
     torch.float: "float",
     torch.float32: "float",
 }
+
 
 def torch_to_hip_types(*types):
     return [hip_types_map[t] for t in types]

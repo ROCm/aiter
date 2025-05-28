@@ -1,5 +1,12 @@
 from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, transfer_hsaco, AITER_CORE_DIR, get_default_func_name, not_built, run_lib
+from csrc.cpp_itfs.utils import (
+    compile_template_op,
+    transfer_hsaco,
+    AITER_CORE_DIR,
+    get_default_func_name,
+    not_built,
+    run_lib,
+)
 from aiter.aot.triton.compile import compile_kernel
 import triton
 
@@ -12,9 +19,20 @@ with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla/asm_mla_decode_fwd.cpp.jinja", "r
 mgcs = {16: 64, 128: 16}
 
 
-def compile(gqa_ratio: int, page_size: int, q_dtype: str, kv_dtype: str, num_kv_splits:int, v_head_dim:int, func_name: str = None):
+def compile(
+    gqa_ratio: int,
+    page_size: int,
+    q_dtype: str,
+    kv_dtype: str,
+    num_kv_splits: int,
+    v_head_dim: int,
+    func_name: str = None,
+):
     if func_name is None:
-        func_name = get_default_func_name(MD_NAME, (gqa_ratio, page_size, q_dtype, kv_dtype, num_kv_splits, v_head_dim))
+        func_name = get_default_func_name(
+            MD_NAME,
+            (gqa_ratio, page_size, q_dtype, kv_dtype, num_kv_splits, v_head_dim),
+        )
 
     if not_built(func_name):
         if gqa_ratio == 16:
@@ -24,36 +42,67 @@ def compile(gqa_ratio: int, page_size: int, q_dtype: str, kv_dtype: str, num_kv_
             hsaco_path = f"{AITER_CORE_DIR}/hsa/mla/mla_a16w16_dec_subQ128_mqa128.co"
             kernel_name = "mla_a16w16_dec_subQ128_mqa128"
         else:
-            raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support gqa_ratio 16 or 128 for now")
+            raise ValueError(
+                f"{asm_mla_decode_fwd.__name__}: only support gqa_ratio 16 or 128 for now"
+            )
 
         bin_size, bin_data = transfer_hsaco(hsaco_path)
-        triton_kernel, triton_header, triton_source = compile_kernel(f"{AITER_CORE_DIR}/aiter/mla.py", "_fwd_kernel_stage2_asm", f"*fp32:16,*fp32:16,*bf16:16,*i32:16,*i32:16,i32,i32,i32,i32,i32,i32,i32,i32,{num_kv_splits},{triton.next_power_of_2(v_head_dim)},{v_head_dim},{mgcs[gqa_ratio]}", "bs,nheads,max_seqlen_q", 4, 2, "decode_mla_stage2_asm", waves_per_eu=4, kpack=2, matrix_instr_nonkdim=16)
+        triton_kernel, triton_header, triton_source = compile_kernel(
+            f"{AITER_CORE_DIR}/aiter/mla.py",
+            "_fwd_kernel_stage2_asm",
+            f"*fp32:16,*fp32:16,*bf16:16,*i32:16,*i32:16,i32,i32,i32,i32,i32,i32,i32,i32,{num_kv_splits},{triton.next_power_of_2(v_head_dim)},{v_head_dim},{mgcs[gqa_ratio]}",
+            "bs,nheads,max_seqlen_q",
+            4,
+            2,
+            "decode_mla_stage2_asm",
+            waves_per_eu=4,
+            kpack=2,
+            matrix_instr_nonkdim=16,
+        )
 
-        return compile_template_op(src_template, MD_NAME, ["../utils.h", "../../include", triton_header], [triton_source], bin_size=bin_size, bin_data=bin_data, page_size=page_size, q_dtype=q_dtype, kv_dtype=kv_dtype, triton_header=triton_header, kernel_name=kernel_name, triton_kernel=triton_kernel, num_kv_splits=num_kv_splits, func_name=func_name)
+        return compile_template_op(
+            src_template,
+            MD_NAME,
+            ["../utils.h", "../../include", triton_header],
+            [triton_source],
+            bin_size=bin_size,
+            bin_data=bin_data,
+            page_size=page_size,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            triton_header=triton_header,
+            kernel_name=kernel_name,
+            triton_kernel=triton_kernel,
+            num_kv_splits=num_kv_splits,
+            func_name=func_name,
+        )
     else:
         return run_lib(func_name)
 
 
-def asm_mla_decode_fwd(q,         # [num_seqs, num_heads, head_size]
-                       kv_buffer,    # [num_seqs, num_heads, max_num_partitions]
-                       output,
-                       qo_indptr,
-                       kv_indptr, # [num_seqs, num_heads, head_size]
-                       kv_page_indices,  # [num_blocks, num_heads, head_size/x, block_size, x]
-                       kv_last_page_lens,  # [num_blocks, num_heads, head_size, block_size]
-                       max_seqlen_q,
-                       softmax_scale=None,
-                       logit_cap=0.0,
-                       num_kv_splits=None,  # for experts only!!!
-                       logits=None,
-                       attn_lse=None,
+def asm_mla_decode_fwd(
+    q,  # [num_seqs, num_heads, head_size]
+    kv_buffer,  # [num_seqs, num_heads, max_num_partitions]
+    output,
+    qo_indptr,
+    kv_indptr,  # [num_seqs, num_heads, head_size]
+    kv_page_indices,  # [num_blocks, num_heads, head_size/x, block_size, x]
+    kv_last_page_lens,  # [num_blocks, num_heads, head_size, block_size]
+    max_seqlen_q,
+    softmax_scale=None,
+    logit_cap=0.0,
+    num_kv_splits=None,  # for experts only!!!
+    logits=None,
+    attn_lse=None,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
-    
+
     if q.dtype != torch.bfloat16:
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support dtype == torch.bfloat16 for now")
-    
+        raise ValueError(
+            f"{asm_mla_decode_fwd.__name__}: only support dtype == torch.bfloat16 for now"
+        )
+
     num_kv_heads = kv_buffer.size(2)
     num_seqs = q.size(0)
     num_heads = q.size(1)
@@ -62,16 +111,22 @@ def asm_mla_decode_fwd(q,         # [num_seqs, num_heads, head_size]
     v_head_dim = output.size(2)
 
     if num_kv_heads != 1:
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support num_kv_heads==1 for now")
-    
+        raise ValueError(
+            f"{asm_mla_decode_fwd.__name__}: only support num_kv_heads==1 for now"
+        )
+
     if head_size != kv_buffer.size(3):
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support head_size == KV.size(3) for now")
+        raise ValueError(
+            f"{asm_mla_decode_fwd.__name__}: only support head_size == KV.size(3) for now"
+        )
 
     if logit_cap > 0:
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support logit_cap==0 for now")
-    
+        raise ValueError(
+            f"{asm_mla_decode_fwd.__name__}: only support logit_cap==0 for now"
+        )
+
     gqa_ratio = num_heads // num_kv_heads
-    
+
     if softmax_scale is None:
         softmax_scale = 1.0 / (head_size**0.5)
 
@@ -82,25 +137,66 @@ def asm_mla_decode_fwd(q,         # [num_seqs, num_heads, head_size]
 
     if logits is None:
         logits = torch.empty(
-            (num_seqs, num_kv_splits, num_heads, v_head_dim), dtype=torch.float, device=q.device)
+            (num_seqs, num_kv_splits, num_heads, v_head_dim),
+            dtype=torch.float,
+            device=q.device,
+        )
     if attn_lse is None:
         attn_lse = torch.empty(
-            (num_seqs, num_kv_splits, num_heads,  1), dtype=torch.float, device=q.device)
-        
+            (num_seqs, num_kv_splits, num_heads, 1), dtype=torch.float, device=q.device
+        )
+
     if num_kv_splits != logits.size(1):
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: num_kv_splits != logits.size(1)")
+        raise ValueError(
+            f"{asm_mla_decode_fwd.__name__}: num_kv_splits != logits.size(1)"
+        )
 
     if gqa_ratio == 16 and max_seqlen_q != 1:
-        raise ValueError(f"{asm_mla_decode_fwd.__name__}: only support max_seqlen_q==1 when gqa_ratio==16")
-    
-    func = compile(gqa_ratio, page_size, "__hip_bfloat16", "__hip_bfloat16", num_kv_splits, v_head_dim)
+        raise ValueError(
+            f"{asm_mla_decode_fwd.__name__}: only support max_seqlen_q==1 when gqa_ratio==16"
+        )
 
-    func(*torch_to_c_types(q, kv_buffer, qo_indptr, kv_indptr, kv_page_indices, kv_last_page_lens, max_seqlen_q, softmax_scale, logits, attn_lse, output, num_seqs, num_heads, num_kv_heads, q.stride(0), kv_buffer.stride(0), attn_lse.stride(0), attn_lse.stride(1), attn_lse.stride(2), output.stride(0), output.stride(1), torch.cuda.current_stream()))
-    return logits, attn_lse 
+    func = compile(
+        gqa_ratio,
+        page_size,
+        "__hip_bfloat16",
+        "__hip_bfloat16",
+        num_kv_splits,
+        v_head_dim,
+    )
+
+    func(
+        *torch_to_c_types(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            kv_last_page_lens,
+            max_seqlen_q,
+            softmax_scale,
+            logits,
+            attn_lse,
+            output,
+            num_seqs,
+            num_heads,
+            num_kv_heads,
+            q.stride(0),
+            kv_buffer.stride(0),
+            attn_lse.stride(0),
+            attn_lse.stride(1),
+            attn_lse.stride(2),
+            output.stride(0),
+            output.stride(1),
+            torch.cuda.current_stream(),
+        )
+    )
+    return logits, attn_lse
 
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--gqa_ratio", type=int, required=True)
     parser.add_argument("--page_size", type=int, required=True)
