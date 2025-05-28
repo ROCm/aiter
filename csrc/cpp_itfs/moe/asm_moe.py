@@ -404,7 +404,7 @@ def asm_moe(
             if expert_mask is not None:
                 local_expert_hash = expert_mask.cumsum(0, dtype=torch.int32)
                 local_expert_hash[local_expert_hash > 0] -= 1
-                token_ids_mask = local_expert_hash[topk_ids]
+
         if inter_dim * lastdim_mul == w1.shape[1]:
             gate_fusion = "g1u0"
         elif inter_dim * 2 * lastdim_mul == w1.shape[1]:

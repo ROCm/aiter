@@ -8,7 +8,7 @@ from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from aiter import pertoken_quant
 from enum import Enum
 from einops import rearrange
-from cpp.pa.pa import paged_attention_rocm
+from csrc.cpp_itfs.pa.pa import paged_attention_rocm
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -65,7 +65,6 @@ def kv_cache_factory(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
-    scale = head_size**-0.5
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     key_caches: List[torch.Tensor] = []
@@ -349,7 +348,6 @@ def run_aiter(
 
     num_seqs, num_heads, head_size = query.shape
     block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
-    gqa_ratio = num_heads // num_kv_heads
 
     output = torch.empty_like(query)
     max_num_partitions = (
@@ -373,7 +371,7 @@ def run_aiter(
     if fp8_out_scale is not None:
         output = torch.empty_like(output, dtype=torch.float8_e4m3fnuz)
         cpa_fp8_out = True
-    paged_attention_ragged(
+    paged_attention_rocm(
         output,
         workspace_buffer,
         query,
@@ -638,14 +636,15 @@ def test_paged_attention(
         # prepare flashinfer format-compatible parameters
         # TODO: pass list of context_length instead
         def convert_to_kv_indptr_last_page_lens(fixed_context_length):
-            get_num_blocks = lambda context_length: (
-                context_length + block_size - 1
-            ) // (block_size)
-            get_last_page_len = lambda context_length: (
-                context_length % block_size
-                if context_length % block_size > 0
-                else block_size
-            )
+            def get_num_blocks(context_length):
+                return (context_length + block_size - 1) // (block_size)
+
+            def get_last_page_len(context_length):
+                return (
+                    context_length % block_size
+                    if context_length % block_size > 0
+                    else block_size
+                )
 
             context_lengths = [fixed_context_length] * num_seqs
             num_blocks_list = [

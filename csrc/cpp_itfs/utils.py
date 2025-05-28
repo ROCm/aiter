@@ -42,7 +42,7 @@ clean:
 
 def get_hip_version():
     version = subprocess.run(
-        f"/opt/rocm/bin/hipconfig --version", shell=True, capture_output=True, text=True
+        "/opt/rocm/bin/hipconfig --version", shell=True, capture_output=True, text=True
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 

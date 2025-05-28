@@ -98,6 +98,7 @@ def paged_attention_rocm(
     kv_block_stride = key_cache.stride(0)
     kv_head_stride = key_cache.stride(1)
     gqa_ratio = int(num_heads / num_kv_heads)
+    max_num_partitions = int(math.ceil(max_context_len / 256))
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     func = compile(
         gqa_ratio,
