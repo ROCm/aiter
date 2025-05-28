@@ -7,7 +7,6 @@ from aiter.fused_moe_bf16_asm import torch_moe
 from csrc.cpp_itfs.moe.asm_moe import asm_moe
 from aiter.fused_moe_gelu import fused_experts
 from aiter import ck_moe
-from op_tests.int4_utils import *
 from aiter import ActivationType
 
 BLOCK_SIZE_M = 32
