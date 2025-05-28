@@ -77,7 +77,7 @@ bool _is_weak_contiguous(torch::Tensor &t)
 }
 
 void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
-                 cudaStream_t stream)
+                 cudaStream_t stream, bool open_fp8_quant)
 {
   auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
   TORCH_CHECK(_is_weak_contiguous(out));
@@ -92,8 +92,17 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
   }
   case at::ScalarType::Half:
   {
-    fa->allreduce<half>(stream, reinterpret_cast<half *>(inp.data_ptr()),
-                        reinterpret_cast<half *>(out.data_ptr()), out.numel());
+    // support case: 512 threads per block, half 8 pack, split into 8 pieces
+    if (open_fp8_quant && inp.numel() % (4096 * 8) == 0)
+    {
+      fa->runFp8QuantKernel(stream, reinterpret_cast<half *>(inp.data_ptr()),
+                          reinterpret_cast<half *>(out.data_ptr()), out.numel());
+    }
+    else
+    {
+      fa->allreduce<half>(stream, reinterpret_cast<half *>(inp.data_ptr()),
+                          reinterpret_cast<half *>(out.data_ptr()), out.numel());
+    }
     break;
   }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -111,13 +120,13 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
   }
 }
 
-void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out)
+void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant)
 {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());
-  _all_reduce(_fa, inp, out, stream);
+  _all_reduce(_fa, inp, out, stream, open_fp8_quant);
 }
 
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
@@ -133,7 +142,7 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
               "registered buffer is too small to contain the input");
   AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp.data_ptr(),
                                 input_size, cudaMemcpyDeviceToDevice, stream));
-  _all_reduce(_fa, reg_buffer, out, stream);
+  _all_reduce(_fa, reg_buffer, out, stream, false);
 }
 
 void dispose(fptr_t _fa)
