@@ -3,14 +3,14 @@
 
 from typing import Optional
 import functools
-import sys
 import json
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+
 
 @triton.heuristics(
     {
@@ -119,12 +119,13 @@ def _get_config(
 
 
 # Wrapper for gemm kernel.
-def gemm_a16w16(x, 
-                w, 
-                dtype: Optional[float] = torch.bfloat16,
-                y: Optional[torch.Tensor] = None,
-                config: Optional[dict] = None,
-                ):
+def gemm_a16w16(
+    x,
+    w,
+    dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+):
     """
     Computes the 16 bit matmul Y = X x W
 
