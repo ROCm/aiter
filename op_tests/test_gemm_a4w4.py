@@ -22,9 +22,11 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     x_f32 = fp4_utils.mxfp4_to_f32(x)
     w_f32 = fp4_utils.mxfp4_to_f32(w)
     # Next convert the e8m0 scales to f32.
+    x_scales = x_scales[:m]
     x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1)
     x_scales_f32 = fp4_utils.e8m0_to_f32(x_scales)
     x_f32 = x_f32 * x_scales_f32
+    w_scales = w_scales[:n]
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1)
     w_scales_f32 = fp4_utils.e8m0_to_f32(w_scales)
     w_f32 = w_f32 * w_scales_f32
@@ -50,34 +52,34 @@ def test_gemm(dtype, M, N, K):
 
     if get_gfx() not in ["gfx950"]:
         return
-    quant_func = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
     w = torch.randn((N, K), dtype=dtype)
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
-    x, x_scales_shffle = quant_func(x, shuffle=True)
-    w, w_scales_shffle = quant_func(w, shuffle=True)
+    x, x_scales_shuffle = quant_func(x, shuffle=True)
+    w, w_scales_shuffle = quant_func(w, shuffle=True)
     out1 = torch.empty(M, N, dtype=dtype)
-    out2 = torch.empty(M, N, dtype=dtype)
+    out2 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
     bias_f32 = torch.zeros(M, N, dtype=dtype)
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
 
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
     b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
-    checkAllclose(a, b, msg="triton")
+    err0 = checkAllclose(a, b, msg="triton")
     avg_c = None
     tflops_c = None
     tbs_c = None
-    if M % 256 == 0 and N % 256 == 0:
-        # currently, the asm kernel only supports M % 256 == 0 and N % 256 == 0
-        c, avg_c = run_gemm_asm(x, w, x_scales_shffle, w_scales_shffle, out2, bias_f32)
-        checkAllclose(a, c, msg="asm")
-        tflops_c = M * N * K * 2 / avg_c / 1e6
-        tbs_c = (x.nbytes + w.nbytes) / avg_c / 1e6
+    c, avg_c = run_gemm_asm(x, w, x_scales_shuffle, w_scales_shuffle, out2, bias_f32)
+    err1 = checkAllclose(a, c[:M], msg="asm   ")
+    tflops_c = M * N * K * 2 / avg_c / 1e6
+    tbs_c = (x.nbytes + w.nbytes) / avg_c / 1e6
     return {
         "triton": avg_b,
         "asm": avg_c,
+        "triton err": err0,
+        "asm err": err1,
         "asm TFLPOS": tflops_c,
         "asm TB/s": tbs_c,
     }
@@ -94,8 +96,24 @@ for dtype in [dtypes.bf16]:
         (32768, 16384, 53248),
         (32768, 18432, 16384),
         (32768, 16384, 16384),
+        (128, 106496, 16384),
+        (128, 16384, 53248),
+        (128, 18432, 16384),
+        (128, 16384, 16384),
+        (64, 106496, 16384),
+        (64, 16384, 53248),
+        (64, 18432, 16384),
+        (64, 16384, 16384),
+        (32, 106496, 16384),
+        (32, 16384, 53248),
+        (32, 18432, 16384),
+        (32, 16384, 16384),
         # qkv_proj
         (1, 1280, 8192),
+        (64, 1280, 8192),
+        (127, 1280, 8192),
+        (129, 1280, 8192),
+        (65, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
         (128, 1280, 8192),

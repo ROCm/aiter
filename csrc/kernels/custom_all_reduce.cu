@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@
 // fake pointer type, must match fptr_t type in ops.h
 using fptr_t = int64_t;
 static_assert(sizeof(void *) == sizeof(fptr_t));
+
+namespace aiter {
 
 fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
                       const std::vector<std::string> &handles,
@@ -75,7 +77,7 @@ bool _is_weak_contiguous(torch::Tensor &t)
 }
 
 void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
-                 cudaStream_t stream)
+                 cudaStream_t stream, bool open_fp8_quant)
 {
   auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
   TORCH_CHECK(_is_weak_contiguous(out));
@@ -90,8 +92,17 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
   }
   case at::ScalarType::Half:
   {
-    fa->allreduce<half>(stream, reinterpret_cast<half *>(inp.data_ptr()),
-                        reinterpret_cast<half *>(out.data_ptr()), out.numel());
+    // support case: 512 threads per block, half 8 pack, split into 8 pieces
+    if (open_fp8_quant && inp.numel() % (4096 * 8) == 0)
+    {
+      fa->runFp8QuantKernel(stream, reinterpret_cast<half *>(inp.data_ptr()),
+                          reinterpret_cast<half *>(out.data_ptr()), out.numel());
+    }
+    else
+    {
+      fa->allreduce<half>(stream, reinterpret_cast<half *>(inp.data_ptr()),
+                          reinterpret_cast<half *>(out.data_ptr()), out.numel());
+    }
     break;
   }
 #if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
@@ -109,13 +120,13 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
   }
 }
 
-void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out)
+void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant)
 {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
   TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
   TORCH_CHECK_EQ(inp.numel(), out.numel());
-  _all_reduce(_fa, inp, out, stream);
+  _all_reduce(_fa, inp, out, stream, open_fp8_quant);
 }
 
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
@@ -131,7 +142,7 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
               "registered buffer is too small to contain the input");
   AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer.data_ptr(), inp.data_ptr(),
                                 input_size, cudaMemcpyDeviceToDevice, stream));
-  _all_reduce(_fa, reg_buffer, out, stream);
+  _all_reduce(_fa, reg_buffer, out, stream, false);
 }
 
 void dispose(fptr_t _fa)
@@ -205,3 +216,5 @@ torch::Tensor allocate_meta_buffer(int64_t size)
 }
 
 #endif
+
+} // namespace aiter

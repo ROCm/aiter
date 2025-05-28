@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -138,6 +138,8 @@ namespace vllm
   }
 } // namespace vllm
 
+namespace aiter {
+
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
                           int64_t block_size, torch::Tensor sorted_token_ids,
                           torch::Tensor experts_ids,
@@ -166,3 +168,5 @@ void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
             num_tokens_post_pad.data_ptr<int32_t>(), num_experts, block_size,
             topk_ids.numel()); });
 }
+
+} // namespace aiter
