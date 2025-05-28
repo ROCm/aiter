@@ -70,6 +70,10 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
     EVEN_M_N: tl.constexpr,
     SCALING_MODE: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    scaleN: tl.constexpr,
+    scaleM_pad: tl.constexpr,
+    scaleN_pad: tl.constexpr,
+    SHUFFLE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
@@ -123,13 +127,39 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-        if EVEN_M_N:
-            tl.store(bs_ptr + bs_offs, bs_e8m0)
+        if SHUFFLE:
+            bs_offs_0 = bs_offs_m[:, None] // 32
+            bs_offs_1 = bs_offs_m[:, None] % 32
+            bs_offs_2 = bs_offs_1 % 16
+            bs_offs_1 = bs_offs_1 // 16
+            bs_offs_3 = bs_offs_n[None, :] // 8
+            bs_offs_4 = bs_offs_n[None, :] % 8
+            bs_offs_5 = bs_offs_4 % 4
+            bs_offs_4 = bs_offs_4 // 4
+            bs_offs = (
+                bs_offs_1
+                + bs_offs_4 * 2
+                + bs_offs_2 * 2 * 2
+                + bs_offs_5 * 2 * 2 * 16
+                + bs_offs_3 * 2 * 2 * 16 * 4
+                + bs_offs_0 * 2 * 16 * scaleN
+            )
+            bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+            bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
+                None, :
+            ]
+            bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
         else:
+            bs_offs = (
+                bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+            )
             bs_mask = (bs_offs_m < M)[:, None] & (
                 bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
             )[None, :]
+        if EVEN_M_N:
+            tl.store(bs_ptr + bs_offs, bs_e8m0)
+        else:
+
             tl.store(
                 bs_ptr + bs_offs,
                 bs_e8m0,
@@ -141,6 +171,7 @@ def act_mul_and_mxfp4_quant(
     x: torch.Tensor,
     activation: Literal["silu", "gelu", "gelu_tanh"],
     scaling_mode: str = "even",
+    shuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation function and quantize the result to MX FP4 format.
@@ -172,11 +203,17 @@ def act_mul_and_mxfp4_quant(
     MXFP4_QUANT_BLOCK_SIZE = 32
     N_half = N // 2
     x_fp4 = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
+    scaleM = triton.cdiv(M, 32) * 32
+    scaleN_valid = triton.cdiv(N_half, MXFP4_QUANT_BLOCK_SIZE)
+    scaleN = triton.cdiv(scaleN_valid, 8) * 8
     blockscale_e8m0 = torch.empty(
-        ((N_half + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
+        (
+            triton.cdiv(M, 256) * 256,
+            scaleN,
+        ),
         dtype=torch.uint8,
         device=x.device,
-    ).T
+    )
 
     # for large N values
     if M <= 32:
@@ -218,6 +255,10 @@ def act_mul_and_mxfp4_quant(
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         SCALING_MODE=0,
         ACTIVATION=activation,
+        scaleN=scaleN_valid,
+        scaleM_pad=scaleM,
+        scaleN_pad=scaleN,
+        SHUFFLE=shuffle,
         NUM_ITER=NUM_ITER,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_N=BLOCK_SIZE_N,
