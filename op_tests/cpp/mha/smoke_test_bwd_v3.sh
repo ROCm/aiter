@@ -62,8 +62,32 @@ run_group_mode() {
     done
 }
 
+# Current native gfx950 kernels has seqlen restriction
+run_gfx950_bwd_v3() {
+    for prec in "bf16" ; do
+    for perm in 0 1 ; do
+    for v3_atomic_fp32 in 1 ; do
+    for v3_bf16_cvt in 0 1 2 ; do
+    for mask in 0 1 ; do
+    for batch in 1 3 4 6 8 ; do
+    for head in 1 4 7 8 19 32 64 ; do
+    for seq in 256 512 1024 ; do
+
+    $EXE -prec=$prec -b=$batch -h=$head -d=128 -s=$seq -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -v3_bf16_cvt=$v3_bf16_cvt -mode=0 -kname=$KNAME $COMMON_ARGS
+
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+    done
+}
+
 set -x
 run_bwd_v3
 run_hd192
 run_group_mode
+# run_gfx950_bwd_v3
 set +x
