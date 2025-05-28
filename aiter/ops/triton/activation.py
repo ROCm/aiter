@@ -125,14 +125,14 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            tl.store(bs_ptr + bs_offs, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS))
+            tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
             bs_mask = (bs_offs_m < M)[:, None] & (
                 bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
             )[None, :]
             tl.store(
                 bs_ptr + bs_offs,
-                bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+                bs_e8m0,
                 mask=bs_mask,
             )
 
