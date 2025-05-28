@@ -201,9 +201,9 @@ def _attn_fwd_inner(
     q,
     k_ptrs,
     v_ptrs,
-    stride_kn_in,
-    stride_vk_in,
-    stride_sn_in,
+    stride_kn,
+    stride_vk,
+    stride_sn,
     start_m,
     seqlen_k,
     seqlen_q,
@@ -238,18 +238,6 @@ def _attn_fwd_inner(
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
 
-    # NOTE:
-    # Workaround for int64 strides, In the absence of strides being int64, parts of offset
-    # computation is done in 32 bit and overflows resulting in segfaults
-    # If input strides are defined as int64, it disables vectorized loads which drops perf
-    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
-    # because strides are tl.constexpr and cannot be upcasted
-    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
-    # The permanent solution is to enable upcasting of tl.constexpr
-    # In the meantime, the following workaround provides correctness and does not drop perf
-    stride_kn = tl.cast(stride_kn_in, tl.int64)
-    stride_vk = tl.cast(stride_vk_in, tl.int64)
-    stride_sn = tl.cast(stride_sn_in, tl.int64)
     # loop over k, v, and update accumulator
 
     for start_n in range(block_min, block_max, BLOCK_N):
@@ -436,34 +424,34 @@ def _attn_fwd(
     s_dmask_ptr: torch.Tensor,
     dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
-    stride_qz_in,
-    stride_qh_in,
-    stride_qm_in,
-    stride_qk_in,
-    stride_kz_in,
-    stride_kh_in,
-    stride_kn_in,
-    stride_kk_in,
-    stride_vz_in,
-    stride_vh_in,
-    stride_vn_in,
-    stride_vk_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
-    stride_oz_in,
-    stride_oh_in,
-    stride_om_in,
-    stride_on_in,
-    stride_alibi_z_in,
-    stride_alibi_h_in,
-    stride_sd_z_in,
-    stride_sd_h_in,
-    stride_sd_m_in,
-    stride_sd_n_in,
-    stride_lse_z_in,
-    stride_lse_h_in,
-    stride_lse_m_in,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_descale_q_z,
+    stride_descale_k_z,
+    stride_descale_v_z,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_on,
+    stride_alibi_z,
+    stride_alibi_h,
+    stride_sd_z,
+    stride_sd_h,
+    stride_sd_m,
+    stride_sd_n,
+    stride_lse_z,
+    stride_lse_h,
+    stride_lse_m,
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
