@@ -123,48 +123,7 @@
     }
 
 #define CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, Nswizzle, isPerTensorQuant, MPerBlock, MulRoutedWeight, ActOP)                                                                            \
-    if (ActOP == 0)     \
-    {   \
-        if (isPerTensorQuant)                                                                                                                                                                                                                                                                                                                                               \
-        {                                                                                                                                                                                                                                                                                                                                                                   \
-            if (MPerBlock == 128)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 128, 128 / sizeof(A0DataType), 1, 4, Nswizzle, true, MulRoutedWeight, 0>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
-            else if (MPerBlock == 64)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 64, 128 / sizeof(A0DataType), 1, 4, Nswizzle, true, MulRoutedWeight, 0>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
-            else if (MPerBlock == 32)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 32, 128 / sizeof(A0DataType), 1, 4, Nswizzle, true, MulRoutedWeight, 0>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
-        }                                                                                                                                                                                                                                                                                                                                                                   \
-        else                                                                                                                                                                                                                                                                                                                                                                \
-        {                                                                                                                                                                                                                                                                                                                                                                   \
-            if (MPerBlock == 128)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 128, 128 / sizeof(A0DataType), 1, 4, Nswizzle, false, MulRoutedWeight, 0>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
-            else if (MPerBlock == 64)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 64, 128 / sizeof(A0DataType), 1, 4, Nswizzle, false, MulRoutedWeight, 0>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
-            else if (MPerBlock == 32)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 32, 128 / sizeof(A0DataType), 1, 4, Nswizzle, false, MulRoutedWeight, 0>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
-        }   \
-    }\
-    else if (ActOP == 1)                                                                                       \
-    {   \
-        if (isPerTensorQuant)                                                                                                                                                                                                                                                                                                                                               \
-        {                                                                                                                                                                                                                                                                                                                                                                   \
-            if (MPerBlock == 128)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 128, 128 / sizeof(A0DataType), 1, 4, Nswizzle, true, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
-            else if (MPerBlock == 64)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 64, 128 / sizeof(A0DataType), 1, 4, Nswizzle, true, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
-            else if (MPerBlock == 32)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 32, 128 / sizeof(A0DataType), 1, 4, Nswizzle, true, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
-        }                                                                                                                                                                                                                                                                                                                                                                   \
-        else                                                                                                                                                                                                                                                                                                                                                                \
-        {                                                                                                                                                                                                                                                                                                                                                                   \
-            if (MPerBlock == 128)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 128, 128 / sizeof(A0DataType), 1, 4, Nswizzle, false, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
-            else if (MPerBlock == 64)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 64, 128 / sizeof(A0DataType), 1, 4, Nswizzle, false, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
-            else if (MPerBlock == 32)                                                                                                                                                                                                                                                                                                                                      \
-                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 32, 128 / sizeof(A0DataType), 1, 4, Nswizzle, false, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr); \
-        }   \
-    }                                                                                                                                                                                                                                                                                                                                                                  \
+                ck_moe_stage1_gemm_mxfp4<A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, 128, 128 / sizeof(A0DataType), 2, 2, Nswizzle, true, MulRoutedWeight, 1>(at::cuda::getCurrentCUDAStream().stream(), tokens, sorted_size, N, K, topk, hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr,  num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr);  \
 
 
 #define CK_MOE_STAGE1_GEMM_IMPL_INT4(A0DataType, B0DataType, AccDataType, EDataType, CDEElementOp, PipelineVer, Nswizzle, isPerTensorQuant, MPerBlock, MulRoutedWeight, ActOP)                                                                            \
@@ -505,56 +464,56 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         using AccDataType = F32;
         using CDEElementOp = MulABScaleExpertWeight;
         const bool Nswizzle = false;
-        if (PipelineVer == PipelineVersion::v1) 
-        {
-            if (sorted_weights.has_value()) 
-            {
-                if (out.dtype() == at::ScalarType::Half)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
-                }
-                else if (out.dtype() == at::ScalarType::BFloat16)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
-                }
-            }
-            else
-            {
-                if (out.dtype() == at::ScalarType::Half)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
-                }
-                else if (out.dtype() == at::ScalarType::BFloat16)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
-                }
-            }
-        }
-        else 
-        {
-            if (sorted_weights.has_value()) 
-            {
-                if (out.dtype() == at::ScalarType::Half)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
-                }
-                else if (out.dtype() == at::ScalarType::BFloat16)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
-                }
-            }
-            else
-            {
-                if (out.dtype() == at::ScalarType::Half)
-                {
-                    CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
-                }
-                else if (out.dtype() == at::ScalarType::BFloat16)
+        // if (PipelineVer == PipelineVersion::v1) 
+        // {
+            // if (sorted_weights.has_value()) 
+            // {
+                // if (out.dtype() == at::ScalarType::Half)
+                // {
+                //     CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
+                // }
+                // else if (out.dtype() == at::ScalarType::BFloat16)
+                // {
+                //     CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
+                // }
+            // }
+            // else
+            // {
+            //     if (out.dtype() == at::ScalarType::Half)
+            //     {
+            //         CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
+            //     }
+            //     else if (out.dtype() == at::ScalarType::BFloat16)
+            //     {
+            //         CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v1, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
+            //     }
+            // }
+        // }
+        // else 
+        // {
+        //     if (sorted_weights.has_value()) 
+        //     {
+        //         if (out.dtype() == at::ScalarType::Half)
+        //         {
+        //             CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, true, act_op);
+        //         }
+                // else if (out.dtype() == at::ScalarType::BFloat16)
                 {
                     CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
                 }
-            }
-        }
+            // }
+        //     else
+        //     {
+        //         if (out.dtype() == at::ScalarType::Half)
+        //         {
+        //             CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, F16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
+        //         }
+        //         else if (out.dtype() == at::ScalarType::BFloat16)
+        //         {
+        //             CK_MOE_STAGE1_GEMM_IMPL_MXFP4(A0DataType, A1DataType, B0DataType, B1DataType, AccDataType, B16, CDEElementOp, PipelineVersion::v3, Nswizzle, isPerTensorQuant, MPerBlock, false, act_op);
+        //         }
+        //     }
+    //     }
     }
 }
 
