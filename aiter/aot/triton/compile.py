@@ -14,7 +14,6 @@ import triton
 try:
     old_compiler = True
     from triton.compiler.code_generator import kernel_suffix
-    from triton.backends.compiler import AttrsDescriptor
 except ImportError:
     old_compiler = False
 
