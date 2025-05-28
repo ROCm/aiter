@@ -261,35 +261,45 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_asm = (
-            pid_m * (BLOCK_SIZE_M // 32) + tl.arange(0, (BLOCK_SIZE_M // 32))
-        ) % M
+
         offs_asn = (
             pid_n * (BLOCK_SIZE_N // 32) + tl.arange(0, (BLOCK_SIZE_N // 32))
         ) % N
         offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) * 32) + tl.arange(
             0, BLOCK_SIZE_K // SCALE_GROUP_SIZE * 32
         )
-        a_scale_ptrs = (
-            a_scales_ptr
-            + offs_asm[:, None] * stride_asm
-            + offs_ks[None, :] * stride_ask
-        )
-        # B scales are N x K even though B operand is K x N.
+            # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr
             + offs_asn[:, None] * stride_bsn
             + offs_ks[None, :] * stride_bsk
         )
 
+        if BLOCK_SIZE_M < 32:
+            a_scale_ptrs = (
+                a_scales_ptr
+                + offs_am[:, None] * stride_asm
+                + offs_ks[None, :] * stride_ask
+            )
+        else:
+            offs_asm = (
+                pid_m * (BLOCK_SIZE_M // 32) + tl.arange(0, (BLOCK_SIZE_M // 32))
+            ) % M
+            a_scale_ptrs = (
+                a_scales_ptr
+                + offs_asm[:, None] * stride_asm
+                + offs_ks[None, :] * stride_ask
+            )
+
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
-            a_scales = tl.reshape(
-                a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-            )
+            if BLOCK_SIZE_M >= 32:
+                a_scales = tl.reshape(
+                    a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
             b_scales = tl.reshape(
                 b_scales, (BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
             )
@@ -314,7 +324,10 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
-            a_scale_ptrs += BLOCK_SIZE_K * stride_ask
+            if BLOCK_SIZE_M < 32:
+                a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
+            else:
+                a_scale_ptrs += BLOCK_SIZE_K * stride_ask
             b_scale_ptrs += BLOCK_SIZE_K * stride_bsk
 
         c = accumulator.to(c_ptr.type.element_ty)
@@ -624,7 +637,6 @@ def gemm_afp4wfp4_preshuffled_scales(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    config["BLOCK_SIZE_M"] = max(config["BLOCK_SIZE_M"], 32)
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
     grid = lambda META: (  # noqa: E731
         (
@@ -687,4 +699,3 @@ def gemm_afp4wfp4_preshuffled_scales(
         )
 
     return y
-
