@@ -364,12 +364,12 @@ def batched_gemm_afp4wfp4(
         BLOCK_SIZE_M = 256
         BLOCK_SIZE_N = 256
         BLOCK_SIZE_K = 256
-        GROUP_SIZE_M = 32
+        GROUP_SIZE_M = 64
         waves_per_eu = 1
         kpack = 1
         num_warps = 8
         num_stages = 2
-        matrix_instr_nonkdim = 32
+        matrix_instr_nonkdim = 16
         cache_modifier = None
 
         NUM_KSPLIT = 1
