@@ -384,7 +384,6 @@ def asm_moe(
     num_tokens, topk = topk_ids.shape
     device = hidden_states.device
     lastdim_mul = 8 if w1.dtype in {torch.int32, torch.uint32} else 1
-    token_ids_mask = None
     if fc1_smooth_scale is None:
         gate_fusion = "g1u0"
     elif a16:
