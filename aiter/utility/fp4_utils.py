@@ -364,12 +364,12 @@ def dynamic_mxfp4_quant(
     MXFP4_QUANT_BLOCK_SIZE = 32
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    scaleM = (M + 31) // 32 * 32
+    scaleM = triton.cdiv(M, 32) * 32
     scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
     scaleN = triton.cdiv(scaleN_valid, 8) * 8
     blockscale_e8m0 = torch.empty(
         (
-            scaleM * 8,  # pad to 256
+            triton.cdiv(M, 256) * 256,
             scaleN,
         ),
         dtype=torch.uint8,
