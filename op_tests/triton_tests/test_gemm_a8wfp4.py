@@ -57,23 +57,28 @@ def generate_b_fp4_inputs(N, K):
         else:
             w_scale = torch.ones((N, 1), dtype=torch.float32, device="cuda")
         w_scaled = w_fp32 / w_scale
+        if DEBUG:
+            print("w_scaled:", w_scaled)
         
         # find nearest MXFP4 value for each element
         w_fp4_indices = torch.zeros((N, K), dtype=torch.uint8, device="cuda")
         mxfp4_values = torch.tensor(MXFP4_TABLE, device="cuda", dtype=torch.float32)
-        for i in range(N):
-            for j in range(K):
-                # Find closest value in MXFP4 lookup table
-                diffs = (mxfp4_values - w_scaled[i, j]).abs()
-                w_fp4_indices[i, j] = diffs.argmin()
+        diffs = (w_scaled.unsqueeze(-1) - mxfp4_values.view(1, 1, -1)).abs()
+        w_fp4_indices = diffs.argmin(dim=-1).to(torch.uint8)
+        if DEBUG:
+            print("w_fp4_indices:", w_fp4_indices)
 
         # pack two FP4 values into one uint8. 1.0 is 0010 in fp4. See the MXFP4 table. Two packed 1.0 values (0010 0010). Which is 0x22 in hex or 34 in uint8.
         w_packed = torch.zeros((N, K // 2), dtype=torch.uint8, device="cuda")
         w_packed = (w_fp4_indices[:, 1::2] << 4) | w_fp4_indices[:, ::2]
+        if DEBUG:
+            print("w_packed:", w_packed)
         
         # convert scale factor to e8m0 format
         w_scales_e8m0 = (torch.log2(w_scale) + 127).round().clamp(0, 255).to(torch.uint8)
         w_scales_e8m0 = w_scales_e8m0.T.repeat(K // SCALE_GROUP_SIZE, 1)
+        if DEBUG:
+            print("w_scales_e8m0:", w_scales_e8m0)
         
         w = w_packed
         w_scales = w_scales_e8m0
@@ -157,15 +162,23 @@ def is_cdna4():
 e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
 e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 
-# @pytest.mark.parametrize("M, N, K", get_x_vals())
-# @pytest.mark.parametrize("M, N, K", [(512, 512, 512)])
-# @pytest.mark.parametrize("M, N, K", [(64, 64, 32)])
-@pytest.mark.parametrize("M, N, K", [(2, 2, 32)])
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+# @pytest.mark.parametrize("M, N, K", [
+#     # (2, 2, 32),
+#     # (64, 64, 32),
+#     # (512, 512, 512),
+#     # (1024, 1024, 1024),
+#     (9728,8192,65536)
+#     ])
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
 def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
     if not is_cdna4():
         pytest.skip("MXFP4 not supported on this architecture")
+
+    # clean up to avoid hangs in large tests
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     x, x_scales = generate_a_8bit_inputs(M, K, a_dtype)
     w, w_scales = generate_b_fp4_inputs(N, K)
