@@ -9,8 +9,27 @@ SCALE_GROUP_SIZE = 32
 
 # Debug flags
 DEBUG = True
-DEBUG_INPUT = False
+DEBUG_INPUT = True
 ZERO_OUTPUT = True
+
+MXFP4_TABLE = [
+        0.0,   # 0000
+        0.5,   # 0001
+        1.0,   # 0010
+        1.5,   # 0011
+        2.0,   # 0100
+        3.0,   # 0101
+        4.0,   # 0110
+        6.0,   # 0111
+        -0.0,  # 1000
+        -0.5,  # 1001
+        -1.0,  # 1010
+        -1.5,  # 1011
+        -2.0,  # 1100
+        -3.0,  # 1101
+        -4.0,  # 1110
+        -6.0,  # 1111
+    ]
 
 def generate_a_8bit_inputs(M, K, dtype):
     if DEBUG_INPUT:
@@ -29,11 +48,35 @@ def generate_a_8bit_inputs(M, K, dtype):
 def generate_b_fp4_inputs(N, K):
     torch.manual_seed(5)
     if DEBUG_INPUT:
-        # all 1.0 in fp4 (0010 = 2 in the mxfp4 list)
-        # 0x22 = two packed 1.0 values (0010 0010)
-        w = torch.full((N, K // 2), 0x22, dtype=torch.uint8, device="cuda")
-        # Scale of 1.0 in e8m0 (bias 127)
-        w_scales = torch.full((K // SCALE_GROUP_SIZE, N), 127, dtype=torch.uint8, device="cuda")
+        # scale up
+        w_fp32 = torch.ones((N, K), dtype=torch.float32, device="cuda")
+        if False:
+            max_w = w_fp32.abs().float().amax(dim=1, keepdim=True)
+            mxfp4_max = 6.0
+            w_scale = max_w / mxfp4_max  # 1.0 / 6.0 ≈ 0.1667
+        else:
+            w_scale = torch.ones((N, 1), dtype=torch.float32, device="cuda")
+        w_scaled = w_fp32 / w_scale
+        
+        # find nearest MXFP4 value for each element
+        w_fp4_indices = torch.zeros((N, K), dtype=torch.uint8, device="cuda")
+        mxfp4_values = torch.tensor(MXFP4_TABLE, device="cuda", dtype=torch.float32)
+        for i in range(N):
+            for j in range(K):
+                # Find closest value in MXFP4 lookup table
+                diffs = (mxfp4_values - w_scaled[i, j]).abs()
+                w_fp4_indices[i, j] = diffs.argmin()
+
+        # pack two FP4 values into one uint8. 1.0 is 0010 in fp4. See the MXFP4 table. Two packed 1.0 values (0010 0010). Which is 0x22 in hex or 34 in uint8.
+        w_packed = torch.zeros((N, K // 2), dtype=torch.uint8, device="cuda")
+        w_packed = (w_fp4_indices[:, 1::2] << 4) | w_fp4_indices[:, ::2]
+        
+        # convert scale factor to e8m0 format
+        w_scales_e8m0 = (torch.log2(w_scale) + 127).round().clamp(0, 255).to(torch.uint8)
+        w_scales_e8m0 = w_scales_e8m0.T.repeat(K // SCALE_GROUP_SIZE, 1)
+        
+        w = w_packed
+        w_scales = w_scales_e8m0
     else:
         w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
         w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
@@ -85,25 +128,7 @@ def mxfp4_to_f32(x):
     x = x.repeat_interleave(2, dim=1)
     x[:, ::2] = x[:, ::2] & 0xF
     x[:, 1::2] = x[:, 1::2] >> 4
-    mxfp4_list = [
-        0.0,   # 0000
-        0.5,   # 0001
-        1.0,   # 0010
-        1.5,   # 0011
-        2.0,   # 0100
-        3.0,   # 0101
-        4.0,   # 0110
-        6.0,   # 0111
-        -0.0,  # 1000
-        -0.5,  # 1001
-        -1.0,  # 1010
-        -1.5,  # 1011
-        -2.0,  # 1100
-        -3.0,  # 1101
-        -4.0,  # 1110
-        -6.0,  # 1111
-    ]
-    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
+    mxfp4_in_f32 = torch.tensor(MXFP4_TABLE, dtype=torch.float32, device="cuda")
     return mxfp4_in_f32[x.long()]
 
 
@@ -132,8 +157,10 @@ def is_cdna4():
 e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
 e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 
+# @pytest.mark.parametrize("M, N, K", get_x_vals())
 # @pytest.mark.parametrize("M, N, K", [(512, 512, 512)])
-@pytest.mark.parametrize("M, N, K", [(64, 64, 32)])
+# @pytest.mark.parametrize("M, N, K", [(64, 64, 32)])
+@pytest.mark.parametrize("M, N, K", [(2, 2, 32)])
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
 def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
@@ -184,8 +211,8 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
     if DEBUG:
         print("out:", triton_out, triton_out.shape)
 
-    np.savetxt(f"gemm_torch.csv", torch_out.cpu().numpy(), delimiter=",", fmt="%.6f")
-    np.savetxt(f"gemm_triton.csv", triton_out.cpu().numpy(), delimiter=",", fmt="%.6f")
+    # np.savetxt(f"gemm_torch.csv", torch_out.cpu().numpy(), delimiter=",", fmt="%.6f")
+    # np.savetxt(f"gemm_triton.csv", triton_out.cpu().numpy(), delimiter=",", fmt="%.6f")
 
 
     # torch.testing.assert_close(torch_out, out, atol=0.01, rtol=1e-2)
