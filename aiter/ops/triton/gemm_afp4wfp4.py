@@ -583,7 +583,6 @@ def gemm_afp4wfp4(
     return y
 
 # Wrapper for gemm kernel.
-@aiter_register(module=sys.modules[__name__], kernels=["_gemm_afp4_wfp4_kernel_preshuffled_scales"])
 def gemm_afp4wfp4_preshuffled_scales(
     x,
     w,
