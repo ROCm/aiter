@@ -55,7 +55,7 @@
     "num_warps": 8,
     "num_stages": 2,
     "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 32,
+    "matrix_instr_nonkdim": 16,
     "cache_modifier": ".cg",
     "NUM_KSPLIT": 1
   }, 
@@ -67,7 +67,7 @@
     "num_warps": 8,
     "num_stages": 2,
     "waves_per_eu": 1,
-    "matrix_instr_nonkdim": 32,
+    "matrix_instr_nonkdim": 16,
     "cache_modifier": null,
     "NUM_KSPLIT": 1
   }
