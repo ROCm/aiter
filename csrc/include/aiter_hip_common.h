@@ -95,7 +95,6 @@ private:
 public:
     AiterAsmKernelFast(const char *name, void *hsaco)
     {
-        const char *AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         HIP_CALL(hipModuleLoadData(&module, hsaco));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
