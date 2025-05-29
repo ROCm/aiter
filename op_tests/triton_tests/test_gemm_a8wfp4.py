@@ -8,7 +8,7 @@ from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
 SCALE_GROUP_SIZE = 32
 
 # Debug flags
-DEBUG = True
+DEBUG = False
 DEBUG_INPUT = True
 ZERO_OUTPUT = True
 

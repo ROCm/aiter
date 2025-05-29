@@ -111,7 +111,7 @@ def _gemm_a8wfp4_kernel(
         else:
             a = tl.load(a_ptrs)
             a_scales = tl.load(a_scale_ptrs)
-        a_scales_fake = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
+        a_ones_scale = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8) # 1.0 in e8mo
         # print("a:", a)
         # print("a_scales:", a_scales)
 
@@ -165,7 +165,10 @@ def _gemm_a8wfp4_kernel(
             # print("b:", b)
             # print("b_scales:", b_scales)
 
-            accumulator += tl.dot_scaled(a, a_scales_fake, "e4m3", b, b_scales, "e2m1")
+            # specify the format of the inputs. In this case fp8(e4m3) & fp4(e2m1). scale factors must be in e8m0 format
+            dot_result = tl.dot_scaled(a, a_ones_scale, "e4m3", b, b_scales, "e2m1") # dot_scaled outputs fp32
+            # print("dot_result:", dot_result)
+            accumulator += dot_result
 
             # Advance the ptrs to the next K block.
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
