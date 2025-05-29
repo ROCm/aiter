@@ -1,7 +1,7 @@
 {
   "small": {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 256,
     "GROUP_SIZE_M": 1,
     "num_warps": 4,
@@ -13,7 +13,7 @@
   },
   "medium_M32": {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 512,
     "GROUP_SIZE_M": 2,
     "num_warps": 4,
@@ -25,7 +25,7 @@
   },
   "medium_M64": {
     "BLOCK_SIZE_M": 32,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 512,
     "GROUP_SIZE_M": 2,
     "num_warps": 4,
@@ -37,7 +37,7 @@
   },
   "medium_M128": {
     "BLOCK_SIZE_M": 64,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 128,
     "BLOCK_SIZE_K": 512,
     "GROUP_SIZE_M": 2,
     "num_warps": 4,
