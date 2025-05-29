@@ -320,13 +320,6 @@ def input_helper(
     )
 
 
-torch_to_tl_dtype = {
-    torch.float16: tl.float16,
-    torch.bfloat16: tl.bfloat16,
-    torch.float32: tl.float32,
-}
-
-
 # TODO (64, 7186, 128, 2, 8), (64, 3584, 128, 2, 8), (4, 4, 8, 1, 2), (64, 1792, 128, 2, 8), (64, 64, 128, 2, 8) don't work because of the percision issue with atomics
 @pytest.mark.parametrize(
     "M, N, K, top_k, E",
