@@ -53,3 +53,4 @@ aiter_logs
 
 scripts
 *.csv
+gpucore*
