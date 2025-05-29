@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
+from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 
 DEBUG_MODE = False
 
@@ -343,31 +344,6 @@ def alloc_rand(shape, device, dtype, requires_grad=True):
         return tmp.to(dtype).requires_grad_(requires_grad)
     return torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
 
-
-# OCP mixed-format fp4 (mxfp4) has two elements packed in one uint8
-str_to_torch_dtype = {
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp8_e4m3": (
-        torch.float8_e4m3fn if get_cdna_version() == 4 else torch.float8_e4m3fnuz
-    ),
-    "fp8_e5m2": torch.float8_e5m2 if get_cdna_version() == 4 else torch.float8_e5m2fnuz,
-    "mxfp4_e2m1": torch.uint8,
-}
-
-torch_to_tl_dtype = {
-    torch.float32: tl.float32,
-    torch.bfloat16: tl.bfloat16,
-    torch.float16: tl.float16,
-    torch.float8_e4m3fn: tl.float8e4nv,
-    torch.float8_e4m3fnuz: tl.float8e4b8,
-    torch.float8_e5m2: tl.float8e5,
-    torch.float8_e5m2fnuz: tl.float8e5b16,
-    torch.uint8: tl.uint8,
-}
-
-
 # Note: Eventually all these combinations will be supported
 # Hardware native OCP
 # ("fp8_e5m2", "mxfp4_e2m1"),
@@ -505,7 +481,7 @@ def test_fused_moe(
         swizzle_mx_scale,
         swizzle_mx_scale,
         config,
-        torch_to_tl_dtype[c_tri.dtype],
+        torch_to_triton_dtype[c_tri.dtype],
     )
 
     # Torch
