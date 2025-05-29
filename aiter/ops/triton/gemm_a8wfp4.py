@@ -89,14 +89,14 @@ def _gemm_a8wfp4_kernel(
     # We assume 32 elements along K share the same scale.
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
-    if (pid_k * SPLITK_BLOCK_SIZE // 2) < K:
-        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2)
+    if (pid_k * SPLITK_BLOCK_SIZE) < K:
+        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         # load A block which is 8 bits. Currently fp8 e4m3
         offs_am_raw = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_am = offs_am_raw % M # module used for boundary checking but causes issues when size is below M. We use the raw offsets when that is the case.
         offs_ak = tl.arange(0, BLOCK_SIZE_K)
-        offs_ak_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_ak
+        offs_ak_split = pid_k * (SPLITK_BLOCK_SIZE) + offs_ak
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
         )
@@ -134,11 +134,11 @@ def _gemm_a8wfp4_kernel(
         )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        for k in range(0, num_k_iter):
             # Load the next block of B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if RAW_MASKED_LOADS:
-                b_k_mask = offs_bk[:, None] < K - k * (BLOCK_SIZE_K // 2)
+                b_k_mask = (offs_bk[:, None] + k * (BLOCK_SIZE_K // 2)) < (K // 2 - pid_k * (SPLITK_BLOCK_SIZE // 2))
                 b_n_mask = offs_bn_raw[None, :] < N
                 b_mask = b_k_mask & b_n_mask
                 if EVEN_K:
@@ -147,9 +147,8 @@ def _gemm_a8wfp4_kernel(
                     b = tl.load(
                         b_ptrs, mask=b_mask, other=0)
                 # Calculate the actual number of scale groups (minimum 1)
-                k_scale_offset = k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE) 
-                num_scale_groups = max(1, K // SCALE_GROUP_SIZE)  # At least 1 scale group
-                bs_k_mask = ((offs_ks + k_scale_offset)[None, :] < num_scale_groups)
+                k_scale_offset = k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                bs_k_mask = ((offs_ks + k_scale_offset)[None, :] < (K // SCALE_GROUP_SIZE))
                 bs_n_scale_mask = (offs_bn_raw[:, None] < N)
                 bs_mask = bs_k_mask & bs_n_scale_mask
                 b_scales = tl.load(b_scale_ptrs, mask=bs_mask, other=0)
@@ -464,7 +463,7 @@ def gemm_a8wfp4(
         REDUCE_BLOCK_SIZE_N = (
             128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 64
         )
-        ACTUAL_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),

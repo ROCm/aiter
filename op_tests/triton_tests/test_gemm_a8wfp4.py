@@ -8,7 +8,7 @@ from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
 SCALE_GROUP_SIZE = 32
 
 # Debug flags
-DEBUG = False
+DEBUG = True
 DEBUG_INPUT = True
 ZERO_OUTPUT = True
 
@@ -168,17 +168,19 @@ e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 #     # (64, 64, 32),
 #     # (512, 512, 512),
 #     # (1024, 1024, 1024),
-#     (9728,8192,65536)
+#     # (9728,8192,65536),
+#     (1,1280,8192)
 #     ])
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
-def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
+def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True):
     if not is_cdna4():
         pytest.skip("MXFP4 not supported on this architecture")
 
     # clean up to avoid hangs in large tests
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if CLEAR_GPUS:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     x, x_scales = generate_a_8bit_inputs(M, K, a_dtype)
     w, w_scales = generate_b_fp4_inputs(N, K)
@@ -222,7 +224,7 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype):
         triton_out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=out_dtype)
     gemm_a8wfp4(x, w, triton_out, x_scales, w_scales, out_dtype)
     if DEBUG:
-        print("out:", triton_out, triton_out.shape)
+        print("triton_out:", triton_out, triton_out.shape)
 
     # np.savetxt(f"gemm_torch.csv", torch_out.cpu().numpy(), delimiter=",", fmt="%.6f")
     # np.savetxt(f"gemm_triton.csv", triton_out.cpu().numpy(), delimiter=",", fmt="%.6f")
