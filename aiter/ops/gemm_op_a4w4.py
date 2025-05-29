@@ -50,3 +50,13 @@ def gemm_a4w4_asm(
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
 ) -> torch.Tensor: ...
+
+
+@compile_ops("module_gemm_a4w4_blockscale")
+def gemm_a4w4_blockscale(
+    XQ: Tensor,  # XQ:[M, K/2] f4x2
+    WQ: Tensor,  # WQ:[N, K/2] f4x2
+    x_scale: Tensor,  # x_scale:[M, K/32] e8m0 paded
+    w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
+    out: Tensor,  # Out:[M, N] bf16
+): ...

@@ -196,6 +196,10 @@
             py::arg("out"), py::arg("bias"),        \
             py::arg("alpha") = 1.0, py::arg("beta") = 0.0);
 
+#define GEMM_A4W4_BLOCKSCALE_PYBIND                                                                             \
+      m.def("gemm_a4w4_blockscale", &gemm_a4w4_blockscale, "fp4 blockscale gemm", py::arg("XQ"), py::arg("WQ"), \
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"));
+
 #define GEMM_A8W8_BLOCKSCALE_PYBIND                                                                             \
       m.def("gemm_a8w8_blockscale", &gemm_a8w8_blockscale, "fp8 blockscale gemm", py::arg("XQ"), py::arg("WQ"), \
             py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"));
