@@ -153,6 +153,8 @@ def test_fmoe(
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
         w2_qt, w2_scale = aiter.pertoken_quant(w2.view(E, -1), quant_dtype=WQDType)
+        w1_qt = w1_qt.view(w1.shape)
+        w2_qt = w2_qt.view(w2.shape)
     elif qType == aiter.QuantType.per_Token and WQDType == torch.int4:  # int4 w quant
         w1_qt, w1_scale = aiter.pertoken_quant(w1, quant_dtype=dtypes.i8, dtypeMax=7)
         w2_qt, w2_scale = aiter.pertoken_quant(w2, quant_dtype=dtypes.i8, dtypeMax=7)
@@ -160,8 +162,8 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
-    w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+    w1_qt_aiter = w1_qt
+    w2_qt_aiter = w2_qt
 
     a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
     # w1_scale = w1_scale.fill_(1)
@@ -376,8 +378,8 @@ list_quant = [
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
-list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:]
-list_doweight_stage1 = [False, True][:]
+list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
+list_doweight_stage1 = [False, True][:1]
 expert, topk = 8, 2
 
 import pandas as pd
@@ -410,3 +412,17 @@ for (
         df.append(ret)
     df = pd.DataFrame(df)
     aiter.logger.info(f"summary:\n{df}")
+# ret = test_fmoe(
+#     dtypes.bf16,
+#     128,
+#     7168,
+#     256,
+#     256,
+#     8,
+#     aiter.ActivationType.Silu,
+#     aiter.QuantType.per_1x32,
+#     dtypes.fp4x2,
+#     dtypes.fp4x2,
+#     use_g1u1=True,
+#     doweight_stage1=False,
+# )
