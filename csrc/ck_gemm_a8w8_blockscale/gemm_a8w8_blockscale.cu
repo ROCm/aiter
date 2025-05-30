@@ -29,6 +29,23 @@ using BlockwiseKernelMap = std::unordered_map<
     BlockwiseKernel, 
     IntTupleHash>;
 
+template <typename DDataType, typename EDataType = DDataType>
+BlockwiseKernel blockwise_heuristic_dispatch(int M, int N, int K)
+{
+  if (M <= 16)
+  {
+    return a8w8_blockscale_1x128x128_256x16x64x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_4_1x1_intrawave_v1<DDataType, EDataType>;
+  }
+  else if (M <= 32)
+  {
+    return a8w8_blockscale_1x128x128_256x32x64x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8_2x1_intrawave_v1<DDataType, EDataType>;
+  }
+  else
+  {
+    return a8w8_blockscale_1x128x128_256x64x64x128_16x16_32x32_8x32x1_8x32x1_1x32x1x8_8_1x1_intrawave_v1<DDataType, EDataType>;
+  }
+}
+
 // Helper function to return the next largest power of 2
 static constexpr int nextPow2(unsigned int num)
 {
@@ -83,7 +100,7 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
       return it->second;
     }
     // Otherwise, use heuristics.
-    return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<DDataType, EDataType>;
+    return blockwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
 
 torch::Tensor gemm_a8w8_blockscale(

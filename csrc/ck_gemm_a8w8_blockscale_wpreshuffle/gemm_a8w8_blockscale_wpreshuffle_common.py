@@ -29,7 +29,7 @@ class kernelInstance:
     @property
     def name(self) -> str:
         return ("_").join([
-            "a8w8_blockscale",
+            "a8w8_blockscale_wpreshuffle",
             ("x").join(map(lambda x: str(x), [
                 self.ScaleBlockM, self.ScaleBlockN, self.ScaleBlockK])),
             ("x").join(map(lambda x: str(x), [
@@ -49,16 +49,16 @@ class kernelInstance:
 
 kernels_list = {
     # clang-format off
-        ##############| Block| Scale| Scale| Scale|  MPer|  NPer|  KPer| AK1| BK1|MPer| NPer| MXdl| NXdl|  ABlockTransfer|  BBlockTransfer|    CShuffle|    CShuffle|     CBlockTransferClusterLengths|  CBlockTransfer|  Block-wiseGemm|     Block-wiseGemm|
-        ###############| Size| Block| Block| Block| Block| Block| Block|    |    | XDL|  XDL|  Per|  Per|   ThreadCluster|   ThreadCluster| MXdlPerWave| NXdlPerWave| _MBlock_MXdlPerWave_MWaveMPerXdl| ScalarPerVector|    Pipeline    |           Pipeline|
-        ###############|     |     M|     N|     K|      |      |      |    |    |    |     | Wave| Wave| Lengths_K0_M_K1| Lengths_K0_N_K1|  PerShuffle|  PerShuffle| _NBlock_NXdlPerWave_NWaveNPerXdl|   _NWaveNPerXdl|    Scheduler   |           Verision|
-        ###############|     |      |      |      |      |      |      |    |    |    |     |     |     |                |                |            |            |                                 |                |                |                   |
+     ###############| Block| Scale| Scale| Scale|  MPer|  NPer|  KPer| AK1| BK1|MPer| NPer| MXdl| NXdl|  ABlockTransfer|  BBlockTransfer|    CShuffle|    CShuffle|     CBlockTransferClusterLengths|  CBlockTransfer|  Block-wiseGemm|     Block-wiseGemm|
+     ###############| Size| Block| Block| Block| Block| Block| Block|    |    | XDL|  XDL|  Per|  Per|   ThreadCluster|   ThreadCluster| MXdlPerWave| NXdlPerWave| _MBlock_MXdlPerWave_MWaveMPerXdl| ScalarPerVector|    Pipeline    |           Pipeline|
+     ###############|     |     M|     N|     K|      |      |      |    |    |    |     | Wave| Wave| Lengths_K0_M_K1| Lengths_K0_N_K1|  PerShuffle|  PerShuffle| _NBlock_NXdlPerWave_NWaveNPerXdl|   _NWaveNPerXdl|    Scheduler   |           Verision|
+     ###############|     |      |      |      |      |      |      |    |    |    |     |     |     |                |                |            |            |                                 |                |                |                   |
 
         # Compute friendly
-    0: kernelInstance(  256,   1,   128,   128,   128,   128,   128,   16,  16,   32,   32,    2,    2,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
-    1: kernelInstance(  256,   1,   128,   128,   128,    64,   128,   16,  16,   32,   32,    2,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
-    2: kernelInstance(  256,   1,   128,   128,    64,   128,   128,   16,  16,   32,   32,    1,    2,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
-    3: kernelInstance(  256,   1,   128,   128,    64,    64,   128,   16,  16,   32,   32,    1,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
+    0: kernelInstance(  256,   1,   128,   128,   128,   128,   128,   16,  16,   16,   16,    4,    4,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
+    1: kernelInstance(  256,   1,   128,   128,   128,    64,   128,   16,  16,   16,   16,    4,    2,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
+    2: kernelInstance(  256,   1,   128,   128,    64,   128,   128,   16,  16,   16,   16,    4,    2,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
+    3: kernelInstance(  256,   1,   128,   128,    64,    64,   128,   16,  16,   16,   16,    4,    1,     [8, 32, 1],        [8, 32, 1],            2,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         3 ),
     
         # Memory friendly                    
     4:  kernelInstance( 256,   1,   128,   128,    16,   256,   128,  8,  16,     16,   16,    1,    4,     [16, 16, 1],       [8, 32, 1],            1,           2,                 [1, 16, 1, 16],           [8],        "Intrawave",         1, ),
@@ -67,19 +67,19 @@ kernels_list = {
     7:  kernelInstance( 256,   1,   128,   128,    16,   128,   256, 16,  16,     16,   16,    1,    2,     [16, 16, 1],       [16, 16, 1],           1,           2,                 [1, 16, 1, 16],           [8],        "Intrawave",         1, ),
     8:  kernelInstance( 256,   1,   128,   128,    16,    64,   256, 16,  16,     16,   16,    1,    1,     [16, 16, 1],       [16, 16, 1],           1,           1,                 [1, 16, 1, 16],           [4],        "Intrawave",         1, ),
     
-    9:  kernelInstance( 256,   1,   128,   128,    32,   256,   128, 16,  16,     32,   32,    1,    2,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
-    10: kernelInstance( 256,   1,   128,   128,    32,   128,   128, 16,  16,     32,   32,    1,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    9:  kernelInstance( 256,   1,   128,   128,    32,   256,   128, 16,  16,     16,   16,    2,    4,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    10: kernelInstance( 256,   1,   128,   128,    32,   128,   128, 16,  16,     16,   16,    2,    2,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
     11: kernelInstance( 256,   1,   128,   128,    32,    64,   128, 16,  16,     16,   16,    2,    1,     [8, 32, 1],        [8, 32, 1],            2,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
     
-    12: kernelInstance( 256,   1,   128,   128,    32,   128,   256, 16,  16,     32,   32,    1,    1,     [16, 16, 1],       [16, 16, 1],           1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    12: kernelInstance( 256,   1,   128,   128,    32,   128,   256, 16,  16,     16,   16,    2,    2,     [16, 16, 1],       [16, 16, 1],           2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
     13: kernelInstance( 256,   1,   128,   128,    32,    64,   256, 16,  16,     16,   16,    2,    1,     [16, 16, 1],       [16, 16, 1],           2,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
     
-    14: kernelInstance( 256,   1,   128,   128,    64,   256,   128, 16,  16,     32,   32,    2,    2,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
-    15: kernelInstance( 256,   1,   128,   128,    64,   128,   128, 16,  16,     32,   32,    2,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
-    16: kernelInstance( 256,   1,   128,   128,    64,    64,   128, 16,  16,     32,   32,    1,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    14: kernelInstance( 256,   1,   128,   128,    64,   256,   128, 16,  16,     16,   16,    4,    4,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    15: kernelInstance( 256,   1,   128,   128,    64,   128,   128, 16,  16,     16,   16,    4,    2,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    16: kernelInstance( 256,   1,   128,   128,    64,    64,   128, 16,  16,     16,   16,    2,    2,     [8, 32, 1],        [8, 32, 1],            2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
     
-    17: kernelInstance( 256,   1,   128,   128,    64,   128,   256, 16,  16,     32,   32,    2,    1,     [16, 16, 1],       [16, 16, 1],           1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
-    18: kernelInstance( 256,   1,   128,   128,    64,    64,   256, 16,  16,     32,   32,    1,    1,     [16, 16, 1],       [16, 16, 1],           1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, )
+    17: kernelInstance( 256,   1,   128,   128,    64,   128,   256, 16,  16,     16,   16,    4,    2,     [16, 16, 1],       [16, 16, 1],           2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, ),
+    18: kernelInstance( 256,   1,   128,   128,    64,    64,   256, 16,  16,     16,   16,    2,    2,     [16, 16, 1],       [16, 16, 1],           2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         1, )
     # clang-format on
 }
 
@@ -96,6 +96,6 @@ default_kernels_dict = {
         # Compute friendly
     (-1): kernelInstance( 256,   1,   128,   128,    16,    64,   256, 16,  16,     16,   16,    1,    1,     [16, 16, 1],       [16, 16, 1],           1,           1,                 [1, 16, 1, 16],           [4],        "Intrawave",         1),
     (-2): kernelInstance( 256,   1,   128,   128,    32,    64,   256, 16,  16,     16,   16,    2,    1,     [16, 16, 1],       [16, 16, 1],           2,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1),
-    (-3): kernelInstance( 256,   1,   128,   128,    64,    64,   128, 16,  16,     32,   32,    1,    1,     [8, 32, 1],        [8, 32, 1],            1,           1,                 [1, 32, 1, 8],            [8],        "Intrawave",         1),
-    
+    (-3): kernelInstance( 256,   1,   128,   128,   128,   128,   128, 16,  16,     16,   16,    4,    4,      [8, 32, 1],        [8, 32, 1],           2,           2,                 [1, 32, 1, 8],            [8],        "Intrawave",         3),
+    (-4): kernelInstance( 256,   1,   128,   128,    16,   128,   256, 16,  16,     16,   16,    1,    2,     [16, 16, 1],       [16, 16, 1],           1,           2,                 [1, 16, 1, 16],           [8],        "Intrawave",         1),
 }

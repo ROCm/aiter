@@ -10,6 +10,7 @@
 #include "custom_all_reduce.h"
 #include "communication_asm.h"
 #include "gemm_a8w8_blockscale.h"
+#include "gemm_a8w8_blockscale_wpreshuffle.h"
 #include "custom.h"
 #include "moe_op.h"
 #include "moe_sorting.h"
