@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, List
 
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -39,26 +40,6 @@ def moe_set_quant_func(func):
     """
     global _MOE_A_QUANT_FUNC
     _MOE_A_QUANT_FUNC = func
-
-
-@triton.jit
-def _write_zeros_to_output(
-    c_ptr,
-    stride_cm,
-    stride_cn,
-    pid_n,
-    N,
-    offs_token,
-    token_mask,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    compute_type,
-):
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.heuristics(
@@ -1014,12 +995,12 @@ def fused_moe_silu(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: Dict[str, Any],
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: Optional[List[int]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     #TODO: Add doc

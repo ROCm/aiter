@@ -7,6 +7,8 @@ import triton.language as tl
 from typing import Any, Dict, Optional, List
 
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -49,26 +51,6 @@ def tanh(x):
 @triton.jit
 def gelu(x):
     return 0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
-
-
-@triton.jit
-def _write_zeros_to_output(
-    c_ptr,
-    stride_cm,
-    stride_cn,
-    pid_n,
-    N,
-    offs_token,
-    token_mask,
-    BLOCK_SIZE_M,
-    BLOCK_SIZE_N,
-    compute_type,
-):
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=compute_type)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 @triton.heuristics(
@@ -160,43 +142,9 @@ def _fused_moe_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     NUM_XCDS: tl.constexpr = 8
+    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
-    ## pid remapping on xcds
-    # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
-    # When GRID_MN cannot divide NUM_XCDS, some xcds will have
-    # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
-    # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
-    # Compute current XCD and local pid within the XCD
-    xcd = pid % NUM_XCDS
-    local_pid = pid // NUM_XCDS
-    # Calculate new pid based on the new grouping
-    # Note that we need to consider the following two cases:
-    # 1. the current pid is on a tall xcd
-    # 2. the current pid is on a short xcd
-    if xcd < tall_xcds:
-        pid = xcd * pids_per_xcd + local_pid
-    else:
-        pid = (
-            tall_xcds * pids_per_xcd
-            + (xcd - tall_xcds) * (pids_per_xcd - 1)
-            + local_pid
-        )
-
-    if GROUP_SIZE_M == 1:
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-    else:
-        num_pid_in_group = GROUP_SIZE_M * num_pid_n
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-        pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
-    # ----------------------------------------------------------
     # Create pointers for the first blocks of A and B.
     # We will advance this pointer as we move in the K direction
     # and accumulate
@@ -403,15 +351,15 @@ def _fused_moe_persistent_kernel(
     # -----------------------------------------------------------
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
+    NUM_XCDS: tl.constexpr = 8
+
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    # num_tiles = num_pid_m * num_pid_n
     tile_id = start_pid
 
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    # offs_token = tl.zeros((BLOCK_SIZE_M,), dtype=tl.int32)
-    # token_mask = tl.zeros((BLOCK_SIZE_M,), dtype=tl.int1)
 
     # Load tile-invariant runtime constant
     num_tiles = num_pid_m * num_pid_n
@@ -420,15 +368,9 @@ def _fused_moe_persistent_kernel(
     num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
 
     for _ in range(0, num_valid_tiles):
-        if GROUP_SIZE_M == 1:
-            pid_m = tile_id // num_pid_n
-            pid_n = tile_id % num_pid_n
-        else:
-            group_id = tile_id // num_pid_in_group
-            first_pid_m = group_id * GROUP_SIZE_M
-            group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-            pid_m = first_pid_m + ((tile_id % num_pid_in_group) % group_size_m)
-            pid_n = (tile_id % num_pid_in_group) // group_size_m
+        tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
+        pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
+
         # Compute the mask
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
@@ -546,11 +488,11 @@ def fused_moe_gelu(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: Dict[str, Any],
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     block_shape: Optional[List[int]] = None,
+    config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     #TODO: Add doc

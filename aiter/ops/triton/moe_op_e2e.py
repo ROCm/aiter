@@ -7,6 +7,7 @@ import triton.language as tl
 from typing import Any, Dict, Optional
 
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -38,13 +39,6 @@ def moe_set_quant_func(func):
     """
     global _MOE_A_QUANT_FUNC
     _MOE_A_QUANT_FUNC = func
-
-
-torch_to_tl_dtype = {
-    torch.float16: tl.float16,
-    torch.bfloat16: tl.bfloat16,
-    torch.float32: tl.float32,
-}
 
 
 @triton.heuristics(
@@ -620,9 +614,9 @@ def e2e_moe(
     num_tokens_post_padded: torch.Tensor,
     mul_routed_weight: bool,
     top_k: int,
-    config: Dict[str, Any],
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
+    config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     #TODO: Add doc
@@ -766,7 +760,7 @@ def e2e_moe(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             atomic_num_stages=atomic_num_stages,
-            dtype=torch_to_tl_dtype[dtype],
+            dtype=torch_to_triton_dtype[dtype],
             **config,
         )
 
