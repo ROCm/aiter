@@ -288,10 +288,14 @@ def test_pa_mtp(
     total_qo = qo_indptr[-1].item()
     max_qlen = seq_lens_qo.max().item()
 
-    query = torch.empty_strided(
-        (total_qo, num_query_heads, head_size),
-        ((num_query_heads + 2 * num_kv_heads) * head_size, head_size, 1),
+    qkv = torch.randn(
+        total_qo,
+        num_query_heads + 2 * num_kv_heads,
+        head_size,
         dtype=dtype,
+    )
+    query, key, value = torch.split(
+        qkv, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*uniform_range)
 
@@ -381,7 +385,7 @@ def test_pa_mtp(
         "No Quant": us_asm_noquant,
         "Quant": us_aiter_asm,
         "err_noquant": err_noquant,
-        "err": err,
+        "err quant": err,
     }
 
 
@@ -392,7 +396,7 @@ import pandas as pd
 for dtype in [torch.bfloat16]:
     df = []
     for num_heads in [(5, 1), (8, 1), (16, 1)][:-1]:
-        for qlen in [1, 2, 4, 3, 4][1:3]:
+        for qlen in [1, 2, 3, 4][1:]:
             for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097][:]:
                 for batch_size in [128][:]:
                     ret = test_pa_mtp(
