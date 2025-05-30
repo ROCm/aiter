@@ -3,6 +3,7 @@ from csrc.cpp_itfs.utils import (
     compile_template_op,
     transfer_hsaco,
     AITER_CORE_DIR,
+    GPU_ARCH,
     get_default_func_name,
     not_built,
     run_lib,
@@ -35,16 +36,12 @@ def compile(
         )
 
     if not_built(func_name):
-        if gqa_ratio == 16:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/mla/mla_stage1_a16w16_bf16.co"
-            kernel_name = "mla_stage1_a16w16_bf16"
-        elif gqa_ratio == 128:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/mla/mla_a16w16_dec_subQ128_mqa128.co"
-            kernel_name = "mla_a16w16_dec_subQ128_mqa128"
+        if gqa_ratio == 128:
+            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
+            kernel_name = "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E"
         else:
-            raise ValueError(
-                f"{asm_mla_decode_fwd.__name__}: only support gqa_ratio 16 or 128 for now"
-            )
+            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co"
+            kernel_name = "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E"
 
         bin_size, bin_data = transfer_hsaco(hsaco_path)
         triton_kernel, triton_header, triton_source = compile_kernel(

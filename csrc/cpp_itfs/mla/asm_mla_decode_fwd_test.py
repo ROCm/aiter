@@ -382,7 +382,7 @@ block_size = 1
 list_dtype = [(torch.bfloat16, torch.bfloat16)]
 list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]
 list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:]
-list_nhead = [(16, 1), (128, 2)]
+list_nhead = [(16, 1), (128, 1)]
 
 for nhead, mtp in list_nhead:
     df = []

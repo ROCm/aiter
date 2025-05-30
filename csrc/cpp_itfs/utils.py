@@ -11,6 +11,9 @@ import hashlib
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+GPU_ARCH = subprocess.run(
+    "/opt/rocm/bin/offload-arch", shell=True, capture_output=True, text=True
+).stdout.strip()
 
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
