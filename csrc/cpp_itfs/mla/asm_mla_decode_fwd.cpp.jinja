@@ -120,5 +120,8 @@ void {{func_name}}(void* Q,                 //   [num_seqs, num_heads, head_size
                         1,                     // bdy
                         1,                     // bdz
                         reinterpret_cast<hipStream_t>(stream)});
+    if(num_heads == 128 && {{num_kv_splits}} == 1){
+        return;
+    }
     {{triton_kernel}}(reinterpret_cast<hipStream_t>(stream), logits, attn_lse, output, qo_indptr, kv_indptr, attn_lse_stride_0, attn_lse_stride_2, attn_lse_stride_1, output_stride_0, output_stride_1, num_seqs, num_heads, max_seqlen_q);
 }
