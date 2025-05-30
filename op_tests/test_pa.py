@@ -396,10 +396,11 @@ def run_aiter_asm(
         block_tables,
         seq_lens,
         max_num_blocks,
-        k_scale,
-        v_scale,
-        None,
-        high_precision,
+        max_qlen=1,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=None,
+        high_precision=high_precision,
     )
 
 
