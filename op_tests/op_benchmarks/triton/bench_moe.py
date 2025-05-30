@@ -1,15 +1,17 @@
+import sys
+import argparse
+import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.types import (
+        torch_to_triton_dtype,
+        str_to_torch_dtype)
+from aiter.ops.triton.moe_op import fused_moe as triton_moe
+from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
 from utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
-    torch_to_tl_dtype,
 )
-from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
-import torch
-import argparse
-from aiter.ops.triton.moe_op import fused_moe as triton_moe
-import sys
 
 
 def model_benchmark_configs(args):
@@ -91,12 +93,12 @@ def fused_moe(
             num_tokens_post_padded,
             routed_weight,
             top_k,
-            config,
-            torch_to_tl_dtype[dtype],
+            torch_to_triton_dtype[dtype],
             use_fp8_w8a8=False,
             use_int8_w8a16=False,
             use_int4_w4a16=True,
             block_shape=(0, group_size),
+            config=config,
         )
     else:
         (
@@ -139,11 +141,11 @@ def fused_moe(
             num_tokens_post_padded,
             routed_weight,
             top_k,
-            config,
-            torch_to_tl_dtype[dtype],
+            torch_to_triton_dtype[dtype],
             fp8_w8a8,
             int8_w8a16,
             use_int4_w4a16=False,
+            config=config,
         )
 
 
@@ -154,8 +156,8 @@ def run_benchmark(args):
     int4_w4a16 = args.int4_w4a16
     group_size = args.group_size
     has_zp = args.has_zp
-    dtype = arg_to_torch_dtype[args.dtype]
-    fp8_type = arg_to_torch_dtype[args.fp8_type]
+    dtype = str_to_torch_dtype[args.dtype]
+    fp8_type = str_to_torch_dtype[args.fp8_type]
 
     if int4_w4a16:
         assert group_size != None, "set group_size with -group_size"
@@ -271,15 +273,6 @@ def parse_args():
     parser.add_argument("-fp8_type", default="e5m2fnuz")
     args = parser.parse_args()
     return args
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-    "e5m2fnuz": torch.float8_e5m2fnuz,
-    "e4m3fnuz": torch.float8_e4m3fnuz,
-}
 
 
 def main():

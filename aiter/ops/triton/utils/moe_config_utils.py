@@ -77,8 +77,8 @@ def get_optimal_moe_config(
     dtype_str = get_config_dtype_str(
         dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16
     )
+    #print(f"dtype_str={dtype_str}")
     configs = get_moe_configs(dtype_str)
-    configs = None
     if configs is not None:
         if configs:
             if M < M_THRESHOLD_SMALL:
@@ -101,6 +101,7 @@ def get_optimal_moe_config(
             "kpack": 1,
         }
 
+    #print(f"config={config}")
     return config
 
 
