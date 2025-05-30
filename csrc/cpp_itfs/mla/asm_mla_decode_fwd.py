@@ -78,13 +78,13 @@ def compile(
 
 
 def asm_mla_decode_fwd(
-    q,  # [num_seqs, num_heads, head_size]
-    kv_buffer,  # [num_seqs, num_heads, max_num_partitions]
-    output,
-    qo_indptr,
-    kv_indptr,  # [num_seqs, num_heads, head_size]
-    kv_page_indices,  # [num_blocks, num_heads, head_size/x, block_size, x]
-    kv_last_page_lens,  # [num_blocks, num_heads, head_size, block_size]
+    q,  # [total_query_len, num_heads, head_size]
+    kv_buffer,  # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    output,  # [total_query_len, num_heads, head_size]
+    qo_indptr,  # [num_seqs + 1]
+    kv_indptr,  # [num_seqs + 1]
+    kv_page_indices,  # [num_page_used]
+    kv_last_page_lens,  # [batch_size]
     max_seqlen_q,
     softmax_scale=None,
     logit_cap=0.0,
@@ -101,11 +101,12 @@ def asm_mla_decode_fwd(
         )
 
     num_kv_heads = kv_buffer.size(2)
-    num_seqs = q.size(0)
+    total_query_len = q.size(0)
     num_heads = q.size(1)
     head_size = q.size(2)
     page_size = kv_buffer.size(1)
     v_head_dim = output.size(2)
+    num_seqs = qo_indptr.size(0) - 1
 
     if num_kv_heads != 1:
         raise ValueError(
@@ -134,13 +135,15 @@ def asm_mla_decode_fwd(
 
     if logits is None:
         logits = torch.empty(
-            (num_seqs, num_kv_splits, num_heads, v_head_dim),
+            (total_query_len, num_kv_splits, num_heads, v_head_dim),
             dtype=torch.float,
             device=q.device,
         )
     if attn_lse is None:
         attn_lse = torch.empty(
-            (num_seqs, num_kv_splits, num_heads, 1), dtype=torch.float, device=q.device
+            (total_query_len, num_kv_splits, num_heads, 1),
+            dtype=torch.float,
+            device=q.device,
         )
 
     if num_kv_splits != logits.size(1):
