@@ -7,7 +7,7 @@ on:
     branches: [ "main" ]
 
 jobs:
-  3rdparty:
+  3rdparty_check:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
