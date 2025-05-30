@@ -1,0 +1,19 @@
+name: Check Repository Dependency
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  check-b-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: 'recursive'
+
+      - name: Verify B repository
+        run: ./.github/scripts/check_deps.sh
