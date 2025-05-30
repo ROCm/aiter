@@ -7,7 +7,7 @@ on:
     branches: [ "main" ]
 
 jobs:
-  check-b-repo:
+  3rdparty:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -15,5 +15,5 @@ jobs:
         with:
           submodules: 'recursive'
 
-      - name: Verify B repository
+      - name: Verify 3rdparty commits
         run: ./.github/scripts/check_deps.sh
