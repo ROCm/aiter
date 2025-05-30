@@ -3,13 +3,14 @@ from csrc.cpp_itfs.utils import (
     compile_template_op,
     transfer_hsaco,
     AITER_CORE_DIR,
+    GPU_ARCH,
     get_default_func_name,
     not_built,
     run_lib,
 )
 from aiter.aot.triton.compile import compile_kernel
 import triton
-
+import functools
 
 MD_NAME = "asm_mla_decode_fwd"
 warpSize = 64
@@ -17,6 +18,18 @@ with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla/asm_mla_decode_fwd.cpp.jinja", "r
     src_template = Template(f.read())
 
 mgcs = {16: 64, 128: 16}
+
+
+@functools.lru_cache()
+def get_meta_param(num_kv_splits, device, bs):
+    import torch
+
+    if num_kv_splits is None:
+        device_props = torch.cuda.get_device_properties(device)
+        cu_num = device_props.multi_processor_count
+        num_kv_splits = min(16, max(1, cu_num // bs))
+
+    return num_kv_splits
 
 
 def compile(
@@ -35,16 +48,12 @@ def compile(
         )
 
     if not_built(func_name):
-        if gqa_ratio == 16:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/mla/mla_stage1_a16w16_bf16.co"
-            kernel_name = "mla_stage1_a16w16_bf16"
-        elif gqa_ratio == 128:
-            hsaco_path = f"{AITER_CORE_DIR}/hsa/mla/mla_a16w16_dec_subQ128_mqa128.co"
-            kernel_name = "mla_a16w16_dec_subQ128_mqa128"
+        if gqa_ratio == 128:
+            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
+            kernel_name = "_ZN5aiter41mla_dec_stage1_bf16_a16w16_subQ128_mqa128E"
         else:
-            raise ValueError(
-                f"{asm_mla_decode_fwd.__name__}: only support gqa_ratio 16 or 128 for now"
-            )
+            hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co"
+            kernel_name = "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E"
 
         bin_size, bin_data = transfer_hsaco(hsaco_path)
         triton_kernel, triton_header, triton_source = compile_kernel(
@@ -56,8 +65,6 @@ def compile(
             2,
             "decode_mla_stage2_asm",
             waves_per_eu=4,
-            kpack=2,
-            matrix_instr_nonkdim=16,
         )
 
         return compile_template_op(
@@ -81,13 +88,13 @@ def compile(
 
 
 def asm_mla_decode_fwd(
-    q,  # [num_seqs, num_heads, head_size]
-    kv_buffer,  # [num_seqs, num_heads, max_num_partitions]
-    output,
-    qo_indptr,
-    kv_indptr,  # [num_seqs, num_heads, head_size]
-    kv_page_indices,  # [num_blocks, num_heads, head_size/x, block_size, x]
-    kv_last_page_lens,  # [num_blocks, num_heads, head_size, block_size]
+    q,  # [total_query_len, num_heads, head_size]
+    kv_buffer,  # [num_page, page_size, num_kv_heads, kv_lora_rank + qk_rope_head_dim]
+    output,  # [total_query_len, num_heads, head_size]
+    qo_indptr,  # [num_seqs + 1]
+    kv_indptr,  # [num_seqs + 1]
+    kv_page_indices,  # [num_page_used]
+    kv_last_page_lens,  # [batch_size]
     max_seqlen_q,
     softmax_scale=None,
     logit_cap=0.0,
@@ -104,11 +111,12 @@ def asm_mla_decode_fwd(
         )
 
     num_kv_heads = kv_buffer.size(2)
-    num_seqs = q.size(0)
-    num_heads = q.size(1)
+    total_query_len = output.size(0)
+    num_heads = output.size(1)
     head_size = q.size(2)
     page_size = kv_buffer.size(1)
     v_head_dim = output.size(2)
+    num_seqs = qo_indptr.size(0) - 1
 
     if num_kv_heads != 1:
         raise ValueError(
@@ -131,19 +139,38 @@ def asm_mla_decode_fwd(
         softmax_scale = 1.0 / (head_size**0.5)
 
     if num_kv_splits is None:
-        device_props = torch.cuda.get_device_properties(q.device)
-        cu_num = device_props.multi_processor_count
-        num_kv_splits = min(16, max(1, cu_num // num_seqs))
+        num_kv_splits = get_meta_param(num_kv_splits, q.device, num_seqs)
 
     if logits is None:
-        logits = torch.empty(
-            (num_seqs, num_kv_splits, num_heads, v_head_dim),
-            dtype=torch.float,
-            device=q.device,
-        )
+        if num_heads == 16:
+            logits = torch.empty(
+                (total_query_len, num_kv_splits, num_heads, v_head_dim),
+                dtype=torch.float,
+                device=q.device,
+            )
+            if max_seqlen_q != 1:
+                raise ValueError(
+                    f"{asm_mla_decode_fwd.__name__}: only support max_seqlen_q==1 when n_head==16, but got {max_seqlen_q}"
+                )
+        elif num_heads == 128:
+            logits = (
+                output.view((total_query_len, num_kv_splits, num_heads, v_head_dim))
+                if num_kv_splits == 1
+                else torch.empty(
+                    (total_query_len, num_kv_splits, num_heads, v_head_dim),
+                    dtype=torch.float,
+                    device=q.device,
+                )
+            )
+        else:
+            raise ValueError(
+                f"{asm_mla_decode_fwd.__name__}: only support n_head==16 or n_head==128 for now"
+            )
     if attn_lse is None:
         attn_lse = torch.empty(
-            (num_seqs, num_kv_splits, num_heads, 1), dtype=torch.float, device=q.device
+            (total_query_len, num_kv_splits, num_heads, 1),
+            dtype=torch.float,
+            device=q.device,
         )
 
     if num_kv_splits != logits.size(1):
@@ -191,6 +218,8 @@ def asm_mla_decode_fwd(
             torch.cuda.current_stream(),
         )
     )
+    if num_kv_splits == 1 and num_heads == 128:
+        return logits.view(total_query_len, num_heads, v_head_dim), attn_lse
     return logits, attn_lse
 
 

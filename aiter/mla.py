@@ -9,7 +9,7 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
-from .jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
