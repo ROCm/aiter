@@ -2,10 +2,16 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #define ACTIVATION_PYBIND                                                                                      \
-      m.def("silu_and_mul", &aiter::silu_and_mul, "Activation function used in SwiGLU.");                      \
+      m.def("silu_and_mul", &aiter::silu_and_mul,                                                              \
+            py::arg("out"), py::arg("input"), py::arg("act_first") = true,                                     \
+            "Activation function used in SwiGLU.");                                                            \
       m.def("scaled_silu_and_mul", &aiter::scaled_silu_and_mul, "Activation function used in scaled SwiGLU."); \
-      m.def("gelu_and_mul", &aiter::gelu_and_mul, "Activation function used in GELU.");                        \
-      m.def("gelu_tanh_and_mul", &aiter::gelu_tanh_and_mul, "Activation function used in GELU tanh.");
+      m.def("gelu_and_mul", &aiter::gelu_and_mul,                                                              \
+            py::arg("out"), py::arg("input"), py::arg("act_first") = true,                                     \
+            "Activation function used in GELU.");                                                              \
+      m.def("gelu_tanh_and_mul", &aiter::gelu_tanh_and_mul,                                                    \
+            py::arg("out"), py::arg("input"), py::arg("act_first") = true,                                     \
+            "Activation function used in GELU tanh.");
 
 #define AITER_OPERATOR_PYBIND                                                     \
       m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
