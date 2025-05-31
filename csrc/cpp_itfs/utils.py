@@ -14,7 +14,7 @@ AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 GPU_ARCH = subprocess.run(
     "/opt/rocm/bin/offload-arch", shell=True, capture_output=True, text=True
 ).stdout.strip()
-
+GPU_ARCH = os.environ.get("GPU_ARCHS", GPU_ARCH)
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
@@ -51,7 +51,7 @@ def get_hip_version():
 
 
 def validate_and_update_archs():
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    archs = GPU_ARCH.split(";")
     # List of allowed architectures
     allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
 
@@ -160,10 +160,7 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
-    return (
-        not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
-        or os.environ.get("AITER_FORCE_COMPILE", "0") == "1"
-    )
+    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
 
 
 def compile_template_op(

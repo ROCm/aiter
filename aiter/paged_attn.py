@@ -1,6 +1,6 @@
 """
-* Copyright © Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (c) 2024, The vLLM team.
+* Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+* Copyright (C) 2024-2025, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -289,8 +289,8 @@ class PagedAttention:
                 max_seq_len,
                 alibi_slopes,
                 kv_cache_dtype,
-                k_scale,
-                v_scale,
+                torch.tensor(k_scale, device=output.device),
+                torch.tensor(v_scale, device=output.device),
                 fp8_out_scale if cpa_fp8_out else None,
                 _PARTITION_SIZE_ROCM,
             )
