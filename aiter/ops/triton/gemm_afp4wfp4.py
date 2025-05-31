@@ -15,6 +15,45 @@ from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONF
 from aiter.ops.triton.utils.tuning_util import aiter_register
 
 
+# kernel_name_m_n_k_bm_bn_bk_numsplit_wpeu_nw_ns_mfma16/32
+def make_gemm_repr(base_name):
+
+    def matmul_repr(specialization):
+        signature = specialization.signature
+        constants = specialization.constants
+        convert_dtype = lambda dtype: "fp4" if "u8" in dtype else dtype
+        dtypes = "x".join([convert_dtype(f"{signature[i][1:]}") for i in ["a_ptr", "b_ptr"]])
+        blocks = "blk" + "x".join([f"{constants[i]}" for i in ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"]])
+        blocks += f"_split{constants['NUM_KSPLIT']}"
+        return f"{base_name}_{dtypes}_{blocks}"
+
+    return matmul_repr
+
+
+def gemm_launch_metadata(grid, kernel, args):
+    ret = dict()
+    M, N, K = args["M"], args["N"], args["K"]
+    a, b, c = args["a_ptr"], args["b_ptr"], args["c_ptr"]
+    a_scale, b_scale = args["a_scales_ptr"], args["b_scales_ptr"]
+    a_bytes = a.numel() * a.element_size()
+    b_bytes = b.numel() * b.element_size()
+    c_bytes = c.numel() * c.element_size()
+    as_bytes = a_scale.numel() * a_scale.element_size()
+    bs_bytes = b_scale.numel() * b_scale.element_size()
+    bytes = a_bytes + b_bytes + c_bytes + as_bytes + bs_bytes
+    nbits = 4 if a.dtype == torch.uint8 and b.dtype == torch.uint8 else a.dtype.itemsize * 8
+    # ret[f"flops{nbits}"] = 2.0 * M * N * K
+    ret["bytes"] = int(bytes)
+    wpe = kernel.waves_per_eu
+    num_stages = kernel.num_stages
+    num_warps = kernel.num_warps
+    mfma_size = kernel.matrix_instr_nonkdim
+    ret["name"] = f"{kernel.name} [M{M}-N{N}-K{K}-wpe{wpe}-nS{num_stages}-nW{num_warps}-mfma{mfma_size}]"
+
+    return ret
+
+
+gemm_noPreshuffle_repr = make_gemm_repr("gemm_noPreshuffle")
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -24,7 +63,7 @@ from aiter.ops.triton.utils.tuning_util import aiter_register
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=gemm_noPreshuffle_repr, launch_metadata=gemm_launch_metadata)
 def _gemm_afp4_wfp4_kernel(
     a_ptr,
     b_ptr,
@@ -165,7 +204,7 @@ def _gemm_afp4_wfp4_kernel(
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
 
-
+gemm_preshuffle_repr = make_gemm_repr("gemm_preshuffle")
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -175,7 +214,7 @@ def _gemm_afp4_wfp4_kernel(
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=gemm_preshuffle_repr, launch_metadata=gemm_launch_metadata)
 def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     a_ptr,
     b_ptr,
@@ -617,7 +656,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     M, K = x.shape
     K, N = w.shape
-    
+
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
