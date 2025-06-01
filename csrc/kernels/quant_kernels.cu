@@ -3,9 +3,7 @@
 
 #include "quant_common.cuh"
 #include "dispatch_utils.h"
-
 #include <c10/cuda/CUDAGuard.h>
-
 #include <hipcub/hipcub.hpp>
 #include "vec_convert.h"
 #include "rocprim/rocprim.hpp"
