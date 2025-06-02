@@ -666,7 +666,10 @@ class fmha_dq_shuffle_kernel
                                        NULL,
                                        reinterpret_cast<void**>(&config)));
     }}
-}}
+    private:
+    hipModule_t module;
+    hipFunction_t kernel_func;
+}};
 
 class fmha_bwd_v3_kernel
 {{
@@ -877,8 +880,8 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
         [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
-        [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_);
-        {F_dq_shuffle_kernel_call} }}
+        [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}{F_dq_shuffle_kernel_call}
+
     );
 }}
 
@@ -2403,7 +2406,8 @@ DQ_SHUFFLE_KERNEL_DEFINE = """if(s.log_level_ > 0)
 
     static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_bf16_dq_shuffle", "fmha_bwd_bf16_dq_shuffle.co"); // static here is for thread safety."""
 
-DQ_SHUFFLE_KERNEL_CALL = """[=](const ck_tile::stream_config& s_){{ impl_dq_shuffle.launch_kernel(traits, args, s_);"""
+DQ_SHUFFLE_KERNEL_CALL = """,
+        [=](const ck_tile::stream_config& s_){{ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_);"""
 
 # GEMM0: Q@K=S^T
 # GEMM1: P^T@dO^T=dV(This was chosen as G1 to match fwd, but N1 must be equal to headdim_v)
