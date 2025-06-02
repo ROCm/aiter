@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -110,7 +110,7 @@ def run_aiter(
         k_scale = None
         v_scale = None
         aiter.reshape_and_cache(
-            key, value, k_cache, v_cache, slot_mapping, "auto", 1.0, 1.0, asm_layout
+            key, value, k_cache, v_cache, slot_mapping, "auto", asm_layout=asm_layout
         )
     return k_cache, v_cache, k_scale, v_scale
 
