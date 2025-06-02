@@ -655,6 +655,15 @@
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+#define MHA_V3_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_fwd_ck, \
+          py::arg("q"),                       \
+          py::arg("k"),                       \
+          py::arg("v"),                       \
+          py::arg("softmax_scale"),           \
+          py::arg("is_causal"));
+
 #define MHA_BATCH_PREFILL_PYBIND                  \
     m.def("mha_batch_prefill",                    \
           &aiter::torch_itfs::mha_batch_prefill,  \
