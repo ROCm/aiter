@@ -2407,7 +2407,7 @@ DQ_SHUFFLE_KERNEL_DEFINE = """if(s.log_level_ > 0)
     static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_bf16_dq_shuffle", "fmha_bwd_bf16_dq_shuffle.co"); // static here is for thread safety."""
 
 DQ_SHUFFLE_KERNEL_CALL = """,
-        [=](const ck_tile::stream_config& s_){{ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_);"""
+        [=](const ck_tile::stream_config& s_){ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_); }"""
 
 # GEMM0: Q@K=S^T
 # GEMM1: P^T@dO^T=dV(This was chosen as G1 to match fwd, but N1 must be equal to headdim_v)
