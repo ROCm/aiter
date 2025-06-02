@@ -35,7 +35,8 @@ namespace vllm
 {
 
   // Activation and gating kernel template.
-  template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &)>
+  template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t &),
+            bool act_first>
   __global__ void act_and_mul_kernel(
       scalar_t *__restrict__ out,         // [..., d]
       const scalar_t *__restrict__ input, // [..., 2, d]
@@ -46,7 +47,7 @@ namespace vllm
     {
       const scalar_t x = VLLM_LDG(&input[token_idx * 2 * d + idx]);
       const scalar_t y = VLLM_LDG(&input[token_idx * 2 * d + d + idx]);
-      out[token_idx * d + idx] = ACT_FN(x) * y;
+      out[token_idx * d + idx] = act_first ? ACT_FN(x) * y : x * ACT_FN(y);
     }
   }
 
@@ -102,18 +103,25 @@ namespace vllm
 } // namespace vllm
 
 // Launch activation and gating kernel.
-#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                                                                     \
-  int d = input.size(-1) / 2;                                                                                     \
-  int64_t num_tokens = input.numel() / input.size(-1);                                                            \
-  dim3 grid(num_tokens);                                                                                          \
-  dim3 block(std::min(d, 1024));                                                                                  \
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));                                               \
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();                                                   \
-  VLLM_DISPATCH_FLOATING_TYPES(                                                                                   \
-      input.scalar_type(), "act_and_mul_kernel", [&] { vllm::act_and_mul_kernel<scalar_t, KERNEL<scalar_t>>       \
-                                                           <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(), \
-                                                                                        input.data_ptr<scalar_t>(), d); });
-// Launch activation and gating kernel.
+// Use ACT_FIRST (bool) indicating whether to apply the activation function
+// first.
+#define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL, ACT_FIRST)                 \
+  int d = input.size(-1) / 2;                                            \
+  int64_t num_tokens = input.numel() / input.size(-1);                   \
+  dim3 grid(num_tokens);                                                 \
+  dim3 block(std::min(d, 1024));                                         \
+  if (num_tokens == 0) {                                                 \
+    return;                                                              \
+  }                                                                      \
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));      \
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();          \
+  VLLM_DISPATCH_FLOATING_TYPES(                                          \
+      input.scalar_type(), "act_and_mul_kernel", [&] {                   \
+        vllm::act_and_mul_kernel<scalar_t, KERNEL<scalar_t>, ACT_FIRST>  \
+            <<<grid, block, 0, stream>>>(out.data_ptr<scalar_t>(),       \
+                                         input.data_ptr<scalar_t>(), d); \
+      });
+
 #ifdef USE_ROCM
   #define LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(KERNEL)                \
     int d = input.size(-1) / 2;                                       \
@@ -126,7 +134,7 @@ namespace vllm
         input.scalar_type(), "scaled_act_and_mul_kernel", [&] {       \
           vllm::scaled_act_and_mul_kernel<scalar_t, KERNEL<scalar_t>> \
               <<<grid, block, 0, stream>>>(                           \
-                  reinterpret_cast<fp8_type*>(out.data_ptr()),               \
+                  reinterpret_cast<fp8_type*>(out.data_ptr()),        \
                   input.data_ptr<scalar_t>(), d,                      \
                   1.0 / (*scale.data_ptr<float>()));                  \
         });
@@ -135,28 +143,43 @@ namespace vllm
 namespace aiter {
 
 void silu_and_mul(torch::Tensor &out,   // [..., d]
-                  torch::Tensor &input) // [..., 2 * d]
+                  torch::Tensor &input, // [..., 2 * d]
+                  bool act_first)
 {
-  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel);
+  if (act_first) {
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, true);
+  } else {
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel, false);
+  }
 }
 
 void scaled_silu_and_mul(torch::Tensor &out,   // [..., d]
-                  torch::Tensor &input, // [..., 2 * d]
-		  torch::Tensor &scale)
+                         torch::Tensor &input, // [..., 2 * d]
+		                     torch::Tensor &scale)
 {
   LAUNCH_SCALED_ACTIVATION_GATE_KERNEL(vllm::silu_kernel);
 }
 
 void gelu_and_mul(torch::Tensor &out,   // [..., d]
-                  torch::Tensor &input) // [..., 2 * d]
+                  torch::Tensor &input, // [..., 2 * d]
+                  bool act_first)
 {
-  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel);
+  if (act_first) {
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel, true);
+  } else {
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_kernel, false);
+  }
 }
 
 void gelu_tanh_and_mul(torch::Tensor &out,   // [..., d]
-                       torch::Tensor &input) // [..., 2 * d]
+                       torch::Tensor &input, // [..., 2 * d]
+                       bool act_first)
 {
-  LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel);
+  if (act_first) {
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel, true);
+  } else {
+    LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel, false);
+  }
 }
 
 } // namespace aiter
