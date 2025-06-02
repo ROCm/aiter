@@ -2408,6 +2408,7 @@ DQ_SHUFFLE_KERNEL_DEFINE = """if(s.log_level_ > 0)
 DQ_SHUFFLE_KERNEL_CALL = """,
         [=](const ck_tile::stream_config& s_){ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_); }"""
 
+
 # GEMM0: Q@K=S^T
 # GEMM1: P^T@dO^T=dV(This was chosen as G1 to match fwd, but N1 must be equal to headdim_v)
 # GEMM2: dO@V=dP^T(This was chosen as G2 because of the calculation order)
