@@ -2394,7 +2394,6 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
 }} // namespace aiter
 """
 
-# fmt: off
 DQ_SHUFFLE_KERNEL_DEFINE = """if(s.log_level_ > 0)
         std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
     fmha_bwd_dq_shuffle_args dq_shuffule_args;
@@ -2408,7 +2407,6 @@ DQ_SHUFFLE_KERNEL_DEFINE = """if(s.log_level_ > 0)
 
 DQ_SHUFFLE_KERNEL_CALL = """,
         [=](const ck_tile::stream_config& s_){ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_); }"""
-# fmt: on
 
 # GEMM0: Q@K=S^T
 # GEMM1: P^T@dO^T=dV(This was chosen as G1 to match fwd, but N1 must be equal to headdim_v)
