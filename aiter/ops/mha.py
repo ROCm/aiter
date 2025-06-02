@@ -334,9 +334,10 @@ def _flash_attn_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
-    logger.warning(
-        "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
-    )
+    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
+        logger.warning(
+            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
+        )
     md_name = "mha_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
     filter2 = "*"  # get_bwd_convert_dq_blobs()
