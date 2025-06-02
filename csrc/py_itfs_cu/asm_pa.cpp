@@ -40,6 +40,8 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int GQA;
     p3 _p18;
+    void *ptr_QTP;
+    p2 _p19;
 };
 
 const float f_log2E = log2f(expf(1));
@@ -50,9 +52,11 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
                      torch::Tensor &block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor &context_lens, //   [num_seqs]
                      int max_num_blocks,
-                     std::optional<torch::Tensor> &K_QScale,
-                     std::optional<torch::Tensor> &V_QScale,
-                     std::optional<torch::Tensor> &out_,
+                     int max_qlen = 1,
+                     std::optional<torch::Tensor> K_QScale = std::nullopt,
+                     std::optional<torch::Tensor> V_QScale = std::nullopt,
+                     std::optional<torch::Tensor> out_ = std::nullopt,
+                     std::optional<torch::Tensor> qo_indptr = std::nullopt,
                      std::optional<int> high_precision = 1)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
@@ -99,13 +103,55 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
     args.Bs = stride_KV_blk;
     args.KVs = stride_KV_head;
     args.GQA = gqa_ratio;
+    args.ptr_QTP = qo_indptr ? qo_indptr.value().data_ptr() : nullptr;
     // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << " kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs << std::endl;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     AiterAsmKernel *impl_ptr = nullptr;
-    if (K_QScale)
+    if (qo_indptr && max_qlen > 1)
+    {
+        if (K.dtype() == at::ScalarType::BFloat16)
+        {
+            if (gqa_ratio <= 8)
+            {
+                static AiterAsmKernel impl_bf16_noquant_a16w16_gqa8_qlen("_ZN5aiter32pa_bf16_noquant_a16w16_gqa8_qlenE", "/pa/pa_bf16_noquant_a16w16_gqa8_qlen.co");
+                impl_ptr = &impl_bf16_noquant_a16w16_gqa8_qlen;
+            }
+            // else if (gqa_ratio <= 16)
+            // {
+            //     static AiterAsmKernel impl_a16w16_1tg_g8_f8_gqa16_qlen("pa_bf16_noquant_a16w16_gqa8_qlen", "/pa/pa_bf16_noquant_a16w16_gqa8_qlen.co");
+            //     impl_ptr = &impl_a16w16_1tg_g8_f8_gqa16_qlen;
+            // }
+            else
+            {
+                TORCH_CHECK(false,
+                            __func__, ": gqa_ratio only support less 16 on bf16 asm pa with qo_indptr !!!");
+            }
+        }
+        else{
+            TORCH_CHECK(Q.dtype() == at::ScalarType::BFloat16 && K_QScale && K.dtype() == torch_fp8,
+                        __func__, ": qo_indptr only support bf16 asm pa with fp8 kv cache");
+
+            if (gqa_ratio <= 8)
+            {
+                static AiterAsmKernel impl_a16w8_1tg_g8_f8_gqa8_qlen("_ZN5aiter35pa_bf16_pertokenFp8_a16w8_gqa8_qlenE", "/pa/pa_bf16_pertokenFp8_a16w8_gqa8_qlen.co");
+                impl_ptr = &impl_a16w8_1tg_g8_f8_gqa8_qlen;
+            }
+            else if (gqa_ratio <= 16)
+            {
+                static AiterAsmKernel impl_a16w16_1tg_g8_f8_gqa16_qlen("_ZN5aiter36pa_bf16_pertokenFp8_a16w8_gqa16_qlenE", "/pa/pa_bf16_pertokenFp8_a16w8_gqa16_qlen.co");
+                impl_ptr = &impl_a16w16_1tg_g8_f8_gqa16_qlen;
+            }
+            else
+            {
+                TORCH_CHECK(false,
+                            __func__, ": gqa_ratio only support less 16 on bf16 asm pa with qo_indptr !!!");
+            }
+        }
+    }
+    else if (K_QScale)
     {
         if (Q.dtype() == at::ScalarType::Half)
         {
