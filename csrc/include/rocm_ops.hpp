@@ -718,6 +718,15 @@
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
           py::arg("cu_seqlens_k_padded") = std::nullopt);
 
+#define MHA_V3_FWD_CK_PYBIND                  \
+    m.def("fmha_v3_fwd_ck",                   \
+          &aiter::torch_itfs::fmha_v3_fwd_ck, \
+          py::arg("q"),                       \
+          py::arg("k"),                       \
+          py::arg("v"),                       \
+          py::arg("softmax_scale"),           \
+          py::arg("is_causal"));
+
 #define MHA_BATCH_PREFILL_PYBIND                  \
     m.def("mha_batch_prefill",                    \
           &aiter::torch_itfs::mha_batch_prefill,  \

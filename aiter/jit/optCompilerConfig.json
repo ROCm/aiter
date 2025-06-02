@@ -693,6 +693,31 @@
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}'"
         ]
     },
+    "module_fmha_v3_fwd_ck": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fmha_v3_fwd_ck_kernels.cu'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/fmha_fwd_v3.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_bf16_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/01_fmha/instances/fmha_fwd_v3_d128_fp16_nmask.cpp'",
+            "f'{AITER_CSRC_DIR}/pybind/fmha_v3_fwd_ck_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'",
+            "'--save-temps'",
+            "'-mllvm --amdgpu-disable-packed-fp32=1'",
+            "'-DCK_TILE_DISABLE_PACKED_FP32=1'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": []
+    },
     "module_mha_batch_prefill": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
