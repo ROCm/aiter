@@ -5,12 +5,12 @@ import triton.language as tl
 
 from typing import Optional, Tuple
 
-# env vars
-USE_INT64_STRIDES = os.environ.get("USE_INT64_STRIDES", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# global parameters
+_USE_INT64_STRIDES = False
+
+def mha_set_use_int64_strides(value: bool):
+    global _USE_INT64_STRIDES
+    _USE_INT64_STRIDES = value
 
 
 @triton.jit
@@ -1103,7 +1103,7 @@ def _flash_attn_forward(
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=8,
-        USE_INT64_STRIDES=USE_INT64_STRIDES,
+        USE_INT64_STRIDES=_USE_INT64_STRIDES,
         **config,
     )
 
@@ -3001,7 +3001,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
@@ -3046,7 +3046,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
@@ -3093,7 +3093,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
@@ -3139,7 +3139,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            USE_INT64_STRIDES=USE_INT64_STRIDES,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,

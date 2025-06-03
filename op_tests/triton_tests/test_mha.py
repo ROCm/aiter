@@ -7,6 +7,7 @@ from aiter.ops.triton.mha import (
     flash_attn_fp8_func,
     flash_attn_varlen_func,
     flash_attn_varlen_fp8_func,
+    mha_set_use_int64_strides
 )
 from aiter.test_mha_common import (
     attention_ref,
@@ -210,6 +211,10 @@ def test_mha_int64_strides(
     """
     torch.manual_seed(20)
 
+    # use int64 strides. 
+    mha_set_use_int64_strides(True) # NOTE: if you set this to false this test case will segfault
+
+    # generate inputs with large strides
     def _generate_input(
         batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
     ) -> torch.Tensor:
