@@ -3,14 +3,7 @@
 
 import torch
 from typing import List, Optional
-from ..jit.core import (
-    compile_ops,
-    CK_DIR,
-    AITER_CSRC_DIR,
-    AITER_ROOT_DIR,
-    AITER_CORE_DIR,
-    AITER_GRADLIB_DIR,
-)
+from ..jit.core import compile_ops
 
 
 @compile_ops("module_hipbsolgemm")
