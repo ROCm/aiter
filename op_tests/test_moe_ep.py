@@ -238,7 +238,12 @@ def test_fmoe_ep(
             print("asm g1u1 only support quant/smoothquant Now")
         else:
             out_b, avg_b = asm_moe_test(
-                input, w1_qt_aiter, w2_qt_aiter, topk_weights, topk_ids, expert_mask=expert_mask
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                expert_mask=expert_mask,
             )
 
         # test ck moe
