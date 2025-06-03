@@ -5,18 +5,13 @@ import torch
 import aiter
 from aiter.test_common import (
     checkAllclose,
-    benchmark,
     run_perftest,
     perftest,
 )
 from aiter.fused_moe import (
     fused_topk,
-    moe_sorting,
     fused_moe,
-    torch_moe_stage1,
-    torch_moe_stage2,
     torch_moe,
-    get_block_size_M,
 )
 
 from aiter.fused_moe_bf16_asm import asm_moe
