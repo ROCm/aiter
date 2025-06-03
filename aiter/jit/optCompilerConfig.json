@@ -19,7 +19,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": ["f'{AITER_CSRC_DIR}/include/ck_tile'"],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -46,7 +46,7 @@
             "f'-DCK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT={os.environ.get(\"CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT\", 0)}'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": ["f'{AITER_CSRC_DIR}/include/ck_tile'"],
         "verbose": "False",
         "blob_gen_cmd": "''",
         "hipify": "False"
@@ -61,7 +61,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": ["f'{AITER_CSRC_DIR}/include/ck_tile'"],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -88,7 +88,7 @@
             "'-DENABLE_FP8'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": ["f'{AITER_CSRC_DIR}/include/ck_tile'"],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
@@ -155,7 +155,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv'"
     },
     "module_batched_gemm_a8w8": {
         "srcs": [
@@ -168,7 +168,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_batched_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv'"
     },
     "module_gemm_a8w8": {
         "srcs": [
@@ -181,7 +181,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_blockscale": {
         "srcs": [
@@ -194,7 +194,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_CORE_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_asm": {
         "srcs": [
