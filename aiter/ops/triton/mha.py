@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 # global parameters
 _USE_INT64_STRIDES = False
 
+
 def mha_set_use_int64_strides(value: bool):
     global _USE_INT64_STRIDES
     _USE_INT64_STRIDES = value
