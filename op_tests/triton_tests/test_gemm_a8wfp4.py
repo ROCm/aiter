@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
 import triton
 import pytest
@@ -44,7 +47,6 @@ def generate_fp32_tensors(M, N, K, debug_type):
         w_fp32 = torch.ones((N, K), dtype=torch.float32, device="cuda")
     elif debug_type == INPUT_TYPE.RANDOM:
         # default to random
-        torch.manual_seed(5)  # for reproducibility
         x_fp32 = torch.randn((M, K), dtype=torch.float32, device="cuda")
         w_fp32 = torch.randn((N, K), dtype=torch.float32, device="cuda")
     elif debug_type == INPUT_TYPE.INCREMENTAL:
@@ -283,6 +285,7 @@ e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
 @pytest.mark.parametrize("a_dtype", [e4m3_type]) # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
 def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True):
+    torch.manual_seed(42)  # for reproducibility
     if not is_cdna4():
         pytest.skip("MXFP4 not supported on this architecture")
 
