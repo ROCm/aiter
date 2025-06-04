@@ -273,7 +273,7 @@ def run_aiter_for_asmpa(
     quantCfg={},
     ori_block_size = 128
 ):
-    aiter.reshape_and_cache_with_block_quant_for_asmpa(
+    aiter.reshape_and_cache_with_block_quant_for_asm_pa(
         key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout, ori_block_size
     )
     return k_cache, v_cache, k_scale, v_scale

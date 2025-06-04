@@ -71,7 +71,7 @@ def reshape_and_cache_with_block_quant(
 
 
 @compile_ops("module_cache")
-def reshape_and_cache_with_block_quant_for_asmpa(
+def reshape_and_cache_with_block_quant_for_asm_pa(
     key: Tensor, # [batch_size, seq_len, num_heads, head_size]
     value: Tensor, # [batch_size, seq_len, num_heads, head_size]
     key_cache: Tensor, # [num_blocks, num_heads, head_size/x, block_size:16, x]

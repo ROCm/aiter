@@ -1479,7 +1479,7 @@ void reshape_and_cache_with_block_quant(
     }
 }
 
-void reshape_and_cache_with_block_quant_for_asmpa(
+void reshape_and_cache_with_block_quant_for_asm_pa(
     torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
     torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
     torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]

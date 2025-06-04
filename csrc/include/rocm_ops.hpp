@@ -196,9 +196,9 @@
           "                        Tensor! v_dequant_scales,"                      \
           "                        Tensor slot_mapping,"                           \
           "                        const bool asm_layout) -> ()");                 \
-    m.def("reshape_and_cache_with_block_quant_for_asmpa",                          \
-          &aiter::reshape_and_cache_with_block_quant_for_asmpa,                    \
-          "reshape_and_cache_with_block_quant_for_asmpa(Tensor key, Tensor value," \
+    m.def("reshape_and_cache_with_block_quant_for_asm_pa",                          \
+          &aiter::reshape_and_cache_with_block_quant_for_asm_pa,                    \
+          "reshape_and_cache_with_block_quant_for_asm_pa(Tensor key, Tensor value," \
           "                        Tensor! key_cache,"                             \
           "                        Tensor! value_cache,"                           \
           "                        Tensor! k_dequant_scales,"                      \
