@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (C) 2024-2025, The vLLM team.
+ * Copyright (C) 2024-2025, The aiter team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -94,7 +94,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
 
 } // namespace aiter
 
-namespace vllm {
+namespace aiter {
 
 // Grid: (num_layers, num_pairs)
 template <typename scalar_t>
@@ -127,7 +127,7 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
     }
 }
 
-} // namespace vllm
+} // namespace aiter
 
 namespace aiter {
 
@@ -174,7 +174,7 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
     const at::cuda::OptionalCUDAGuard device_guard(cache_device);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
-                                              vllm::copy_blocks_kernel<scalar_t>
+                                              aiter::copy_blocks_kernel<scalar_t>
                                                   <<<grid, block, 0, stream>>>(
                                                       key_cache_ptrs_tensor.data_ptr<int64_t>(),
                                                       value_cache_ptrs_tensor.data_ptr<int64_t>(),
@@ -185,11 +185,11 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
 
 } // namespace aiter
 
-namespace vllm {
+namespace aiter {
 
 template <typename scalar_t,
           typename cache_t,
-          Fp8KVCacheDataType kv_dt,
+          vllm::Fp8KVCacheDataType kv_dt,
           bool asmLayout          = false,
           typename slot_mapping_t = int64_t>
 __global__ void
@@ -253,7 +253,7 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
         }
         scalar_t tgt_key   = key[src_key_idx];
         scalar_t tgt_value = value[src_value_idx];
-        if constexpr(kv_dt == Fp8KVCacheDataType::kAuto)
+        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
         {
             key_cache[tgt_key_idx]     = tgt_key;
             value_cache[tgt_value_idx] = tgt_value;
@@ -268,7 +268,7 @@ reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num
     }
 }
 
-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+template <typename scalar_t, typename cache_t, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ key,         // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value,       // [num_tokens, num_heads, head_size]
@@ -309,7 +309,7 @@ __global__ void reshape_and_cache_flash_kernel(
                                           head_idx * head_size + head_offset;
         scalar_t tgt_key   = key[src_key_idx];
         scalar_t tgt_value = value[src_value_idx];
-        if constexpr(kv_dt == Fp8KVCacheDataType::kAuto)
+        if constexpr(kv_dt == vllm::Fp8KVCacheDataType::kAuto)
         {
             key_cache[tgt_key_value_idx]   = tgt_key;
             value_cache[tgt_key_value_idx] = tgt_value;
@@ -325,68 +325,6 @@ __global__ void reshape_and_cache_flash_kernel(
 }
 
 namespace impl {
-template <typename DType, typename SType>
-__device__ DType type_convert(SType);
-
-template <>
-__device__ float type_convert<float, __half>(__half x)
-{
-    return __half2float(x);
-}
-
-template <>
-__device__ float type_convert<float, __hip_bfloat16>(__hip_bfloat16 x)
-{
-    return __bfloat162float(x);
-}
-
-template <>
-__device__ hip_fp8 type_convert<hip_fp8, float>(float x)
-{
-    hip_fp8 f8{x};
-    return f8;
-}
-
-template <>
-__device__ float type_convert<float, hip_fp8>(hip_fp8 x)
-{
-    return float(x);
-}
-
-template <>
-__device__ int8_t type_convert<int8_t, float>(float x)
-{
-    return static_cast<int8_t>(x);
-}
-
-template <>
-__device__ float type_convert<float, int8_t>(int8_t x)
-{
-    return static_cast<float>(x);
-}
-
-template <>
-__device__ float type_convert<float, float>(float x)
-{
-    return x;
-}
-
-template <typename T, typename F>
-__device__ constexpr T wave_reduce(T local, F reduce_f)
-{
-    constexpr int reduce_stage = 6; // 1<<6=64
-    T v_local                  = local;
-#pragma unroll
-    for(int i_stage = 0; i_stage < reduce_stage; i_stage++)
-    {
-        int src_lane = __lane_id() ^ (1 << i_stage);
-        int32_t v_remote_tmp =
-            __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
-        T v_remote = __builtin_bit_cast(T, v_remote_tmp);
-        v_local    = reduce_f(v_local, v_remote);
-    }
-    return v_local;
-}
 
 __device__ float abs(float x)
 {
@@ -477,7 +415,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
         return max_;
     }();
 
-    float k_max = impl::wave_reduce(k_local_max, f_max_f32);
+    float k_max = wave_reduce(k_local_max, f_max_f32);
 
     float v_local_max = [&]() {
         float max_ = v_local_dim[0];
@@ -488,7 +426,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
         }
         return max_;
     }();
-    float v_max = impl::wave_reduce(v_local_max, f_max_f32);
+    float v_max = wave_reduce(v_local_max, f_max_f32);
 
     float k_token_scale = k_max / dtypeMax;
     float v_token_scale = v_max / dtypeMax;
@@ -765,7 +703,7 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
             const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
             const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
             float tmp_k             = ck_tile::type_convert<float>(key[src_k_idx]) * k_block_scale;
-            float tmp_v             = ck_tile::type_convert<float>(value[src_v_idx]) * v_block_scale;
+            float tmp_v = ck_tile::type_convert<float>(value[src_v_idx]) * v_block_scale;
 
             const int x_idx    = current_d / x;
             const int x_offset = current_d % x;
@@ -1052,13 +990,13 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
         }
     }
 }
-} // namespace vllm
+} // namespace aiter
 
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
 #define CALL_RESHAPE_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                                          \
-    vllm::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>                                      \
+    aiter::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>                                     \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(key.data_ptr()),                    \
                                      reinterpret_cast<KV_T*>(value.data_ptr()),                  \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
@@ -1074,7 +1012,7 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
                                      v_scale.has_value() ? v_scale->data_ptr<float>() : nullptr);
 
 #define CALL_RESHAPE_AND_CACHE_ASM(KV_T, CACHE_T, KV_DTYPE)                                      \
-    vllm::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, true>                                \
+    aiter::reshape_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, true>                               \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(key.data_ptr()),                    \
                                      reinterpret_cast<KV_T*>(value.data_ptr()),                  \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),           \
@@ -1132,7 +1070,7 @@ void reshape_and_cache(
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
 #define CALL_RESHAPE_AND_CACHE_FLASH(KV_T, CACHE_T, KV_DTYPE)                            \
-    vllm::reshape_and_cache_flash_kernel<KV_T, CACHE_T, KV_DTYPE>                        \
+    aiter::reshape_and_cache_flash_kernel<KV_T, CACHE_T, KV_DTYPE>                       \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(key.data_ptr()),            \
                                      reinterpret_cast<KV_T*>(value.data_ptr()),          \
                                      reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),   \
@@ -1181,139 +1119,139 @@ void reshape_and_cache_flash(
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
-#define CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(KV_T, CACHE_T, dequant_scale_t)                \
-    if(asm_layout)                                                                                \
-    {                                                                                             \
-        vllm::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t, true> \
-            <<<grid, block, 0, stream>>>(                                                         \
-                reinterpret_cast<KV_T*>(key.data_ptr()),                                          \
-                reinterpret_cast<KV_T*>(value.data_ptr()),                                        \
-                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                 \
-                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                               \
-                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                  \
-                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                  \
-                slot_mapping.data_ptr<int64_t>(),                                                 \
-                key_stride,                                                                       \
-                value_stride,                                                                     \
-                num_heads,                                                                        \
-                head_size,                                                                        \
-                block_size,                                                                       \
-                x,                                                                                \
-                num_tokens,                                                                       \
-                max_kv_tokens);                                                                   \
-    }                                                                                             \
-    else                                                                                          \
-    {                                                                                             \
-        vllm::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t>       \
-            <<<grid, block, 0, stream>>>(                                                         \
-                reinterpret_cast<KV_T*>(key.data_ptr()),                                          \
-                reinterpret_cast<KV_T*>(value.data_ptr()),                                        \
-                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                 \
-                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                               \
-                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                  \
-                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                  \
-                slot_mapping.data_ptr<int64_t>(),                                                 \
-                key_stride,                                                                       \
-                value_stride,                                                                     \
-                num_heads,                                                                        \
-                head_size,                                                                        \
-                block_size,                                                                       \
-                x,                                                                                \
-                num_tokens,                                                                       \
-                max_kv_tokens);                                                                   \
+#define CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(KV_T, CACHE_T, dequant_scale_t)                 \
+    if(asm_layout)                                                                                 \
+    {                                                                                              \
+        aiter::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t, true> \
+            <<<grid, block, 0, stream>>>(                                                          \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                           \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                         \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                  \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
+                slot_mapping.data_ptr<int64_t>(),                                                  \
+                key_stride,                                                                        \
+                value_stride,                                                                      \
+                num_heads,                                                                         \
+                head_size,                                                                         \
+                block_size,                                                                        \
+                x,                                                                                 \
+                num_tokens,                                                                        \
+                max_kv_tokens);                                                                    \
+    }                                                                                              \
+    else                                                                                           \
+    {                                                                                              \
+        aiter::reshape_and_cache_with_per_token_quant_kernel<KV_T, CACHE_T, dequant_scale_t>       \
+            <<<grid, block, 0, stream>>>(                                                          \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                           \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                         \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                  \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
+                slot_mapping.data_ptr<int64_t>(),                                                  \
+                key_stride,                                                                        \
+                value_stride,                                                                      \
+                num_heads,                                                                         \
+                head_size,                                                                         \
+                block_size,                                                                        \
+                x,                                                                                 \
+                num_tokens,                                                                        \
+                max_kv_tokens);                                                                    \
     }
 
-#define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(KV_T, CACHE_T, dequant_scale_t)               \
-    if(asm_layout)                                                                            \
-    {                                                                                         \
-        vllm::reshape_and_cache_with_block_quant_kernel<KV_T, CACHE_T, dequant_scale_t, true> \
-            <<<grid, block, 0, stream>>>(                                                     \
-                reinterpret_cast<KV_T*>(key.data_ptr()),                                      \
-                reinterpret_cast<KV_T*>(value.data_ptr()),                                    \
-                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                             \
-                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                           \
-                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),              \
-                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),              \
-                slot_mapping.data_ptr<int64_t>(),                                             \
-                key_stride,                                                                   \
-                value_stride,                                                                 \
-                num_heads,                                                                    \
-                num_blocks,                                                                   \
-                head_size,                                                                    \
-                block_size,                                                                   \
-                x,                                                                            \
-                num_tokens,                                                                   \
-                seq_len);                                                                     \
-    }                                                                                         \
-    else                                                                                      \
-    {                                                                                         \
-        vllm::reshape_and_cache_with_block_quant_kernel<KV_T, CACHE_T, dequant_scale_t>       \
-            <<<grid, block, 0, stream>>>(                                                     \
-                reinterpret_cast<KV_T*>(key.data_ptr()),                                      \
-                reinterpret_cast<KV_T*>(value.data_ptr()),                                    \
-                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                             \
-                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                           \
-                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),              \
-                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),              \
-                slot_mapping.data_ptr<int64_t>(),                                             \
-                key_stride,                                                                   \
-                value_stride,                                                                 \
-                num_heads,                                                                    \
-                num_blocks,                                                                   \
-                head_size,                                                                    \
-                block_size,                                                                   \
-                x,                                                                            \
-                num_tokens,                                                                   \
-                seq_len);                                                                     \
+#define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(KV_T, CACHE_T, dequant_scale_t)                \
+    if(asm_layout)                                                                             \
+    {                                                                                          \
+        aiter::reshape_and_cache_with_block_quant_kernel<KV_T, CACHE_T, dequant_scale_t, true> \
+            <<<grid, block, 0, stream>>>(                                                      \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                       \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                     \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                              \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                            \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),               \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),               \
+                slot_mapping.data_ptr<int64_t>(),                                              \
+                key_stride,                                                                    \
+                value_stride,                                                                  \
+                num_heads,                                                                     \
+                num_blocks,                                                                    \
+                head_size,                                                                     \
+                block_size,                                                                    \
+                x,                                                                             \
+                num_tokens,                                                                    \
+                seq_len);                                                                      \
+    }                                                                                          \
+    else                                                                                       \
+    {                                                                                          \
+        aiter::reshape_and_cache_with_block_quant_kernel<KV_T, CACHE_T, dequant_scale_t>       \
+            <<<grid, block, 0, stream>>>(                                                      \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                       \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                     \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                              \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                            \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),               \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),               \
+                slot_mapping.data_ptr<int64_t>(),                                              \
+                key_stride,                                                                    \
+                value_stride,                                                                  \
+                num_heads,                                                                     \
+                num_blocks,                                                                    \
+                head_size,                                                                     \
+                block_size,                                                                    \
+                x,                                                                             \
+                num_tokens,                                                                    \
+                seq_len);                                                                      \
     }
 
-#define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(KV_T, CACHE_T, dequant_scale_t)         \
-    if(asm_layout)                                                                                \
-    {                                                                                             \
-        vllm::reshape_and_cache_with_block_quant_kernel_for_asmpa<KV_T,                           \
-                                                                  CACHE_T,                        \
-                                                                  dequant_scale_t,                \
-                                                                  true>                           \
-            <<<grid, block, 0, stream>>>(                                                         \
-                reinterpret_cast<KV_T*>(key.data_ptr()),                                          \
-                reinterpret_cast<KV_T*>(value.data_ptr()),                                        \
-                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                 \
-                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                               \
-                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                  \
-                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                  \
-                slot_mapping.data_ptr<int64_t>(),                                                 \
-                key_stride,                                                                       \
-                value_stride,                                                                     \
-                num_heads,                                                                        \
-                num_blocks,                                                                       \
-                head_size,                                                                        \
-                block_size,                                                                       \
-                x,                                                                                \
-                num_tokens,                                                                       \
-                seq_len,                                                                          \
-                ori_block_size);                                                                  \
-    }                                                                                             \
-    else                                                                                          \
-    {                                                                                             \
-        vllm::reshape_and_cache_with_block_quant_kernel_for_asmpa<KV_T, CACHE_T, dequant_scale_t> \
-            <<<grid, block, 0, stream>>>(                                                         \
-                reinterpret_cast<KV_T*>(key.data_ptr()),                                          \
-                reinterpret_cast<KV_T*>(value.data_ptr()),                                        \
-                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                 \
-                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                               \
-                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                  \
-                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                  \
-                slot_mapping.data_ptr<int64_t>(),                                                 \
-                key_stride,                                                                       \
-                value_stride,                                                                     \
-                num_heads,                                                                        \
-                num_blocks,                                                                       \
-                head_size,                                                                        \
-                block_size,                                                                       \
-                x,                                                                                \
-                num_tokens,                                                                       \
-                seq_len,                                                                          \
-                ori_block_size);                                                                  \
+#define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(KV_T, CACHE_T, dequant_scale_t)          \
+    if(asm_layout)                                                                                 \
+    {                                                                                              \
+        aiter::reshape_and_cache_with_block_quant_kernel_for_asmpa<KV_T,                           \
+                                                                   CACHE_T,                        \
+                                                                   dequant_scale_t,                \
+                                                                   true>                           \
+            <<<grid, block, 0, stream>>>(                                                          \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                           \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                         \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                  \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
+                slot_mapping.data_ptr<int64_t>(),                                                  \
+                key_stride,                                                                        \
+                value_stride,                                                                      \
+                num_heads,                                                                         \
+                num_blocks,                                                                        \
+                head_size,                                                                         \
+                block_size,                                                                        \
+                x,                                                                                 \
+                num_tokens,                                                                        \
+                seq_len,                                                                           \
+                ori_block_size);                                                                   \
+    }                                                                                              \
+    else                                                                                           \
+    {                                                                                              \
+        aiter::reshape_and_cache_with_block_quant_kernel_for_asmpa<KV_T, CACHE_T, dequant_scale_t> \
+            <<<grid, block, 0, stream>>>(                                                          \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                           \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                         \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                  \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                                \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                   \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                   \
+                slot_mapping.data_ptr<int64_t>(),                                                  \
+                key_stride,                                                                        \
+                value_stride,                                                                      \
+                num_heads,                                                                         \
+                num_blocks,                                                                        \
+                head_size,                                                                         \
+                block_size,                                                                        \
+                x,                                                                                 \
+                num_tokens,                                                                        \
+                seq_len,                                                                           \
+                ori_block_size);                                                                   \
     }
 
 namespace aiter {
@@ -1570,9 +1508,9 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
 }
 } // namespace aiter
 
-namespace vllm {
+namespace aiter {
 
-template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
+template <typename Tout, typename Tin, vllm::Fp8KVCacheDataType kv_dt>
 __global__ void convert_fp8_kernel(const Tin* __restrict__ src_cache,
                                    Tout* __restrict__ dst_cache,
                                    const float scale,
@@ -1582,14 +1520,14 @@ __global__ void convert_fp8_kernel(const Tin* __restrict__ src_cache,
     for(int i = threadIdx.x; i < block_stride; i += blockDim.x)
     {
         int64_t idx    = block_idx * block_stride + i;
-        dst_cache[idx] = fp8::scaled_convert<Tout, Tin, kv_dt>(src_cache[idx], scale);
+        dst_cache[idx] = vllm::fp8::scaled_convert<Tout, Tin, kv_dt>(src_cache[idx], scale);
     }
 }
 
-} // namespace vllm
+} // namespace aiter
 
 #define CALL_CONVERT_FP8(Tout, Tin, KV_DTYPE)                                       \
-    vllm::convert_fp8_kernel<Tout, Tin, KV_DTYPE>                                   \
+    aiter::convert_fp8_kernel<Tout, Tin, KV_DTYPE>                                  \
         <<<grid, block, 0, stream>>>(reinterpret_cast<Tin*>(src_cache.data_ptr()),  \
                                      reinterpret_cast<Tout*>(dst_cache.data_ptr()), \
                                      scale,                                         \
