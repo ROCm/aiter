@@ -10,6 +10,7 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 DEBUG = False
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
@@ -98,18 +99,20 @@ def _gemm_a8wfp4_kernel(
         # Set up base A offsets
         offs_am_raw = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_am = offs_am_raw % M
-        
+
         # Load A scales once (they're per-row)
         a_scale_ptrs = a_scales_ptr + offs_am * stride_asm
         if RAW_MASKED_LOADS:
-            a_scale_mask = (offs_am < M)
+            a_scale_mask = offs_am < M
             a_scales = tl.load(a_scale_ptrs, mask=a_scale_mask)
         else:
             a_scales = tl.load(a_scale_ptrs)
-        a_ones_scale = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8) # 1.0 in e8m0
+        a_ones_scale = tl.full(
+            (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE), 127, dtype=tl.uint8
+        )  # 1.0 in e8m0
 
-        # Set up base B offsets  
-        offs_bn_raw = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N))
+        # Set up base B offsets
+        offs_bn_raw = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_bn = offs_bn_raw % N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -125,29 +128,35 @@ def _gemm_a8wfp4_kernel(
                 a = tl.load(a_ptrs, mask=a_mask)
             else:
                 a = tl.load(a_ptrs)
-            
+
             # B loading stays mostly the same, but fix the offsets
-            offs_bk = tl.arange(0, BLOCK_SIZE_K // 2) + k * (BLOCK_SIZE_K // 2)  # Add k offset
+            offs_bk = tl.arange(0, BLOCK_SIZE_K // 2) + k * (
+                BLOCK_SIZE_K // 2
+            )  # Add k offset
             offs_bk_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_bk
             b_ptrs = b_ptr + (
                 offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
             )
-            offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE) + tl.arange(
-                0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
+            offs_ks = (
+                (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE))
+                + k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
             )
             b_scale_ptrs = (
-                b_scales_ptr + offs_bn[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
+                b_scales_ptr
+                + offs_bn[:, None] * stride_bsn
+                + offs_ks[None, :] * stride_bsk
             )
             if RAW_MASKED_LOADS:
-                b_k_mask = (offs_bk_split[:, None] < (K // 2))
+                b_k_mask = offs_bk_split[:, None] < (K // 2)
                 b_n_mask = offs_bn_raw[None, :] < N
                 b_mask = b_k_mask & b_n_mask
                 if EVEN_K:
                     b = tl.load(b_ptrs, mask=b_mask, cache_modifier=cache_modifier)
                 else:
                     b = tl.load(b_ptrs, mask=b_mask, other=0)
-                bs_k_mask = (offs_ks[None, :] < (K // SCALE_GROUP_SIZE))
-                bs_n_scale_mask = (offs_bn_raw[:, None] < N)
+                bs_k_mask = offs_ks[None, :] < (K // SCALE_GROUP_SIZE)
+                bs_n_scale_mask = offs_bn_raw[:, None] < N
                 bs_mask = bs_k_mask & bs_n_scale_mask
                 b_scales = tl.load(b_scale_ptrs, mask=bs_mask, other=0)
             else:
@@ -173,6 +182,7 @@ def _gemm_a8wfp4_kernel(
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
+
 
 @triton.jit
 def _gemm_afp4_wfp4_reduce_kernel(
@@ -270,7 +280,7 @@ def gemm_a8wfp4(
 ):
     """
     Computes the matmul Y = X @ W.T (where W.T is the logical transpose of unpacked W)
-    
+
     X is in fp8 e4m3 format.
     W is in packed microscale fp4 (mxfp4) format, where 2 fp4 values are packed per uint8.
     x_scales are in fp32 format (one scale per row of X).
@@ -287,7 +297,7 @@ def gemm_a8wfp4(
     Returns:
     - y: The output matrix with shape (M, N) containing X @ W.T
 
-    Note: 
+    Note:
     - W is stored in packed format where each uint8 contains 2 fp4 values
     - The logical shape of W after unpacking would be (K, N)
     - Every 32 consecutive elements in the K dimension of W share one e8m0 scale
@@ -296,9 +306,13 @@ def gemm_a8wfp4(
 
     M, K = x.shape
     K_packed, N = w.shape
-    assert K_packed == K // 2, f"Inconsistent shapes: x has K={K} but w has K_packed={K_packed}, expected {K//2}"
-    assert x_scales.shape[0] == M and w_scales.shape == (N, K // 32), \
-        f"Scale shapes incorrect: x_scales should be ({M}, 1), got {x_scales.shape}; w_scales should be ({N}, {K//32}), got {w_scales.shape}"
+    assert (
+        K_packed == K // 2
+    ), f"Inconsistent shapes: x has K={K} but w has K_packed={K_packed}, expected {K//2}"
+    assert x_scales.shape[0] == M and w_scales.shape == (
+        N,
+        K // 32,
+    ), f"Scale shapes incorrect: x_scales should be ({M}, 1), got {x_scales.shape}; w_scales should be ({N}, {K//32}), got {w_scales.shape}"
 
     if M < 32:
         BLOCK_SIZE_M = 16
@@ -381,15 +395,19 @@ def gemm_a8wfp4(
         ),
     )
 
-    y_final =  y if NUM_KSPLIT == 1 else y_pp
+    y_final = y if NUM_KSPLIT == 1 else y_pp
     stride_am, stride_ak = x.stride()
     stride_bk, stride_bn = w.stride()
-    stride_ck, stride_cm, stride_cn = (0, y.stride(0), y.stride(1)) if NUM_KSPLIT == 1 else y_pp.stride()
+    stride_ck, stride_cm, stride_cn = (
+        (0, y.stride(0), y.stride(1)) if NUM_KSPLIT == 1 else y_pp.stride()
+    )
     stride_asm, stride_ask = x_scales.stride()
     stride_bsn, stride_bsk = w_scales.stride()
 
     if DEBUG:
-        print("grid:", grid({"BLOCK_SIZE_M": BLOCK_SIZE_M, "BLOCK_SIZE_N": BLOCK_SIZE_N}) )
+        print(
+            "grid:", grid({"BLOCK_SIZE_M": BLOCK_SIZE_M, "BLOCK_SIZE_N": BLOCK_SIZE_N})
+        )
         print("x:", x)
         print("w:", w)
         print("y_final:", y_final)
