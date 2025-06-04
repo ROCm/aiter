@@ -193,12 +193,12 @@ template <typename scalar_t,
           bool asmLayout          = false,
           typename slot_mapping_t = int64_t>
 __global__ void
-reshape_and_cache_kernel(const scalar_t* __restrict__ key,                // [num_tokens, num_heads, head_size]
-                         const scalar_t* __restrict__ value,              // [num_tokens, num_heads, head_size]
-                         cache_t* __restrict__ key_cache,                 // [num_blocks, num_heads, head_size/x,
-                                                                          // block_size, x]
-                         cache_t* __restrict__ value_cache,               // [num_blocks, num_heads, head_size,
-                                                                          // block_size]
+reshape_and_cache_kernel(const scalar_t* __restrict__ key,   // [num_tokens, num_heads, head_size]
+                         const scalar_t* __restrict__ value, // [num_tokens, num_heads, head_size]
+                         cache_t* __restrict__ key_cache,    // [num_blocks, num_heads, head_size/x,
+                                                             // block_size, x]
+                         cache_t* __restrict__ value_cache,  // [num_blocks, num_heads, head_size,
+                                                             // block_size]
                          const slot_mapping_t* __restrict__ slot_mapping, // [num_tokens]
                          const int key_stride,
                          const int value_stride,
@@ -408,10 +408,10 @@ template <typename scalar_t,
           bool asmLayout = false,
           int wg_size    = 256>
 __global__ void reshape_and_cache_with_per_token_quant_kernel(
-    const scalar_t* __restrict__ key,               // [num_tokens, num_heads, head_size]
-    const scalar_t* __restrict__ value,             // [num_tokens, num_heads, head_size]
-    cache_t* __restrict__ key_cache,                // [num_blocks, num_heads, head_size/x, block_size, x]
-    cache_t* __restrict__ value_cache,              // [num_blocks, num_heads, head_size, block_size]
+    const scalar_t* __restrict__ key,   // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value, // [num_tokens, num_heads, head_size]
+    cache_t* __restrict__ key_cache,    // [num_blocks, num_heads, head_size/x, block_size, x]
+    cache_t* __restrict__ value_cache,  // [num_blocks, num_heads, head_size, block_size]
     dequant_scale_t* __restrict__ k_dequant_scales, // [num_heads, max_kv_tokens]
     dequant_scale_t* __restrict__ v_dequant_scales, // [num_heads, max_kv_tokens]
     const int64_t* __restrict__ slot_mapping,       // [num_tokens]
@@ -422,9 +422,9 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const int block_size,
     const int x,
     const int num_tokens,
-    const int max_kv_tokens,
-    float dtypeMax)
+    const int max_kv_tokens)
 {
+    float dtypeMax              = ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max());
     const int32_t tokens_per_wg = wg_size / warpSize;
 
     // every wave compute one token, one head, all the headim
@@ -461,8 +461,8 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
         const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
         if(current_d < head_size)
         {
-            k_local_dim[i_d] = impl::type_convert<float>(key[src_k_idx]);
-            v_local_dim[i_d] = impl::type_convert<float>(value[src_v_idx]);
+            k_local_dim[i_d] = ck_tile::type_convert<float>(key[src_k_idx]);
+            v_local_dim[i_d] = ck_tile::type_convert<float>(value[src_v_idx]);
         }
     }
 
@@ -505,7 +505,7 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     if constexpr(asmLayout)
     {
         // [num_blocks, num_heads, block_size]
-        scale_idx                   = block_size * num_heads * block_idx + block_size * head_idx + block_offset;
+        scale_idx = block_size * num_heads * block_idx + block_size * head_idx + block_offset;
         k_dequant_scales[scale_idx] = k_token_scale;
         v_dequant_scales[scale_idx] = v_token_scale;
     }
@@ -547,8 +547,8 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
             tgt_value_idx = block_idx * num_heads * head_size * block_size +
                             head_idx * head_size * block_size + i_d * block_size + block_offset;
         }
-        key_cache[tgt_key_idx]     = impl::type_convert<cache_t>(k_local_dim[i]);
-        value_cache[tgt_value_idx] = impl::type_convert<cache_t>(v_local_dim[i]);
+        key_cache[tgt_key_idx]     = ck_tile::type_convert<cache_t>(k_local_dim[i]);
+        value_cache[tgt_value_idx] = ck_tile::type_convert<cache_t>(v_local_dim[i]);
     }
 }
 
@@ -559,10 +559,10 @@ template <typename scalar_t,
           bool asmLayout = false,
           int wg_size    = 256>
 __global__ void reshape_and_cache_with_block_quant_kernel(
-    const scalar_t* __restrict__ key,               // [batch_size, seq_len, num_heads, head_size]
-    const scalar_t* __restrict__ value,             // [batch_size, seq_len, num_heads, head_size]
-    cache_t* __restrict__ key_cache,                // [num_blocks, num_heads, head_size/x, block_size, x]
-    cache_t* __restrict__ value_cache,              // [num_blocks, num_heads, head_size, block_size]
+    const scalar_t* __restrict__ key,   // [batch_size, seq_len, num_heads, head_size]
+    const scalar_t* __restrict__ value, // [batch_size, seq_len, num_heads, head_size]
+    cache_t* __restrict__ key_cache,    // [num_blocks, num_heads, head_size/x, block_size, x]
+    cache_t* __restrict__ value_cache,  // [num_blocks, num_heads, head_size, block_size]
     dequant_scale_t* __restrict__ k_dequant_scales, // [num_heads, num_blocks]
     dequant_scale_t* __restrict__ v_dequant_scales, // [num_heads, num_blocks]
     const int64_t* __restrict__ slot_mapping,       // [num_tokens]
@@ -574,9 +574,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
     const int block_size,
     const int x,
     const int num_tokens,
-    const int seq_len,
-    float dtypeMax)
+    const int seq_len)
 {
+    float dtypeMax          = ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max());
     int64_t first_token_idx = blockIdx.x * seq_len + blockIdx.y * block_size;
     int64_t slot_idx;
     int64_t block_idx;
@@ -656,8 +656,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
             const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
             const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
 
-            k_max_val = f_absmax_f32(k_max_val, impl::type_convert<float>(key[src_k_idx]));
-            v_max_val = f_absmax_f32(v_max_val, impl::type_convert<float>(value[src_v_idx]));
+            k_max_val = f_absmax_f32(k_max_val, ck_tile::type_convert<float>(key[src_k_idx]));
+            v_max_val = f_absmax_f32(v_max_val, ck_tile::type_convert<float>(value[src_v_idx]));
         }
     }
 
@@ -696,9 +696,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
                     int x_offset           = (id + threadIdx.x) % x;
                     int64_t cache_idx =
                         tgt_value_idx + x_idx * block_size * x + block_offset_local * x + x_offset;
-                    float tmp            = impl::type_convert<float>(key_cache[cache_idx]);
+                    float tmp            = ck_tile::type_convert<float>(key_cache[cache_idx]);
                     tmp                  = tmp * k_block_scale_global / k_block_scale;
-                    key_cache[cache_idx] = impl::type_convert<cache_t>(tmp);
+                    key_cache[cache_idx] = ck_tile::type_convert<cache_t>(tmp);
                 }
             }
             k_dequant_scales[scale_idx] = k_block_scale;
@@ -724,18 +724,18 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
                         int head_offset             = (id + threadIdx.x) % head_size;
                         int block_offset_local_divX = block_offset_local / x;
                         int x_idx                   = block_offset_local % x;
-                        cache_idx                   = tgt_value_idx + block_offset_local_divX * head_size * x +
+                        cache_idx = tgt_value_idx + block_offset_local_divX * head_size * x +
                                     head_offset * x + x_idx;
                     }
                     else
                     {
                         int block_offset_local = (id + threadIdx.x) / head_size;
                         int head_offset        = (id + threadIdx.x) % head_size;
-                        cache_idx              = tgt_value_idx + head_offset * block_size + block_offset_local;
+                        cache_idx = tgt_value_idx + head_offset * block_size + block_offset_local;
                     }
-                    float tmp              = impl::type_convert<float>(value_cache[cache_idx]);
+                    float tmp              = ck_tile::type_convert<float>(value_cache[cache_idx]);
                     tmp                    = tmp * v_block_scale_global / v_block_scale;
-                    value_cache[cache_idx] = impl::type_convert<cache_t>(tmp);
+                    value_cache[cache_idx] = ck_tile::type_convert<cache_t>(tmp);
                 }
             }
             v_dequant_scales[scale_idx] = v_block_scale;
@@ -750,6 +750,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
         k_dequant_scales[scale_idx] = k_block_scale;
         v_dequant_scales[scale_idx] = v_block_scale;
     }
+    k_block_scale = 1 / k_block_scale;
+    v_block_scale = 1 / v_block_scale;
 
     // now let's store out
     for(int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
@@ -762,8 +764,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
 
             const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
             const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
-            float tmp_k             = impl::type_convert<float>(key[src_k_idx]) / k_block_scale;
-            float tmp_v             = impl::type_convert<float>(value[src_v_idx]) / v_block_scale;
+            float tmp_k             = ck_tile::type_convert<float>(key[src_k_idx]) * k_block_scale;
+            float tmp_v             = ck_tile::type_convert<float>(value[src_v_idx]) * v_block_scale;
 
             const int x_idx    = current_d / x;
             const int x_offset = current_d % x;
@@ -787,8 +789,266 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
                                 head_idx * head_size * block_size + current_d * block_size +
                                 block_offset_local;
             }
-            key_cache[tgt_key_idx]     = impl::type_convert<cache_t>(tmp_k);
-            value_cache[tgt_value_idx] = impl::type_convert<cache_t>(tmp_v);
+            key_cache[tgt_key_idx]     = ck_tile::type_convert<cache_t>(tmp_k);
+            value_cache[tgt_value_idx] = ck_tile::type_convert<cache_t>(tmp_v);
+        }
+    }
+}
+
+// TODO: this is for kv block quant for asm pa
+template <typename scalar_t,
+          typename cache_t,
+          typename dequant_scale_t,
+          bool asmLayout = false,
+          int wg_size    = 256>
+__global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
+    const scalar_t* __restrict__ key,   // [batch_size, seq_len, num_heads, head_size]
+    const scalar_t* __restrict__ value, // [batch_size, seq_len, num_heads, head_size]
+    cache_t* __restrict__ key_cache,    // [num_blocks, num_heads, head_size/x, block_size:16, x]
+    cache_t* __restrict__ value_cache,  // [num_blocks, num_heads, head_size, block_size:16]
+    dequant_scale_t* __restrict__ k_dequant_scales, // [num_heads,
+                                                    // num_blocks/(ori_block_size/block_size:16)]
+    dequant_scale_t* __restrict__ v_dequant_scales, // [num_heads,
+                                                    // num_blocks/(ori_block_size/block_size:16)]
+    const int64_t* __restrict__ slot_mapping,       // [num_tokens]
+    const int key_stride,
+    const int value_stride,
+    const int num_heads,
+    const int num_blocks,
+    const int head_size,
+    const int block_size,
+    const int x,
+    const int num_tokens,
+    const int seq_len,
+    const int ori_block_size)
+{
+    float dtypeMax          = ck_tile::type_convert<float>(ck_tile::numeric<cache_t>::max());
+    int64_t first_token_idx = blockIdx.x * seq_len + blockIdx.y * ori_block_size;
+    int64_t slot_idx;
+    int64_t block_idx;
+    int64_t block_offset;
+    if(blockIdx.y * ori_block_size >= seq_len)
+    {
+        int64_t preTg_block_idx = slot_mapping[first_token_idx - ori_block_size] / ori_block_size;
+        first_token_idx         = blockIdx.x * seq_len + seq_len - 1;
+        slot_idx                = slot_mapping[first_token_idx];
+        block_idx               = slot_idx / ori_block_size;
+        if(preTg_block_idx == block_idx)
+        {
+            return;
+        }
+        block_offset = slot_idx % ori_block_size;
+    }
+    else
+    {
+        slot_idx     = slot_mapping[first_token_idx];
+        block_idx    = slot_idx / ori_block_size;
+        block_offset = slot_idx % ori_block_size;
+    }
+
+    if(slot_idx < 0)
+    {
+        // Padding token that should be ignored.
+        return;
+    }
+    const int32_t head_idx = blockIdx.z;
+
+    // fix first_token_idx to real block first_token_idx
+    if(blockIdx.y > 0 && block_offset > 0)
+    {
+        __shared__ int64_t idx_smem[2];
+        if(threadIdx.x < ori_block_size)
+        {
+            int64_t token_idx  = first_token_idx - (threadIdx.x + 1);
+            int64_t block_idx1 = slot_mapping[token_idx] / ori_block_size;
+            int64_t slot_idx2  = slot_mapping[token_idx + 1];
+            int64_t block_idx2 = slot_idx2 / ori_block_size;
+            if(block_idx1 != block_idx2 && block_idx2 == block_idx)
+            {
+                idx_smem[0] = token_idx + 1;
+                idx_smem[1] = slot_idx2;
+            }
+        }
+        __syncthreads();
+        first_token_idx = idx_smem[0];
+        slot_idx        = idx_smem[1];
+    }
+
+    block_offset = slot_idx % ori_block_size;
+
+    int tokens_in_block = 0;
+    if(first_token_idx + threadIdx.x < num_tokens)
+    {
+        tokens_in_block = slot_mapping[first_token_idx + threadIdx.x] / ori_block_size;
+        tokens_in_block = tokens_in_block == block_idx ? 1 : 0;
+    }
+    int numtokens_in_block = block_reduce(tokens_in_block, [](float a, float b) { return a + b; });
+
+    auto f_absmax_f32 = [](float v_0_, float v_1_) {
+        return __builtin_fmaxf(impl::abs(v_0_), impl::abs(v_1_));
+    };
+    auto f_max_f32 = [](float v_0_, float v_1_) { return __builtin_fmaxf(v_0_, v_1_); };
+
+    float k_max_val = 1e-6;
+    float v_max_val = 1e-6;
+#pragma unroll
+    for(int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
+    {
+        if((id + threadIdx.x) < numtokens_in_block * head_size)
+        {
+            int64_t token_idx = (id + threadIdx.x) / head_size + first_token_idx;
+            int current_d     = (id + threadIdx.x) % head_size;
+
+            const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
+            const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
+
+            k_max_val = f_absmax_f32(k_max_val, ck_tile::type_convert<float>(key[src_k_idx]));
+            v_max_val = f_absmax_f32(v_max_val, ck_tile::type_convert<float>(value[src_v_idx]));
+        }
+    }
+
+    k_max_val = block_reduce(k_max_val, f_max_f32);
+    v_max_val = block_reduce(v_max_val, f_max_f32);
+
+    float k_block_scale = k_max_val / dtypeMax;
+    float v_block_scale = v_max_val / dtypeMax;
+
+    int64_t scale_idx;
+    if constexpr(asmLayout)
+    {
+        scale_idx = block_idx * num_heads + head_idx;
+    }
+    else
+    {
+        scale_idx = head_idx * num_blocks / (ori_block_size / block_size) + block_idx;
+    }
+
+    if(block_offset > 0)
+    {
+        float k_block_scale_global = k_dequant_scales[scale_idx];
+        float v_block_scale_global = v_dequant_scales[scale_idx];
+
+        if(k_block_scale_global < k_block_scale)
+        {
+            int64_t tgt_key_idx = block_idx * num_heads * head_size * ori_block_size +
+                                  head_idx * head_size * block_size;
+#pragma unroll
+            for(int id = 0; id < block_offset * head_size; id += blockDim.x)
+            {
+                if(id + threadIdx.x < block_offset * head_size)
+                {
+                    int block_offset_local = (id + threadIdx.x) / head_size;
+                    int cur_block_id       = block_offset_local / block_size;
+                    block_offset_local     = block_offset_local % block_size;
+                    int x_idx              = (id + threadIdx.x) % head_size / x;
+                    int x_offset           = (id + threadIdx.x) % x;
+                    int64_t cache_idx      = tgt_key_idx +
+                                        cur_block_id * num_heads * head_size * block_size +
+                                        x_idx * block_size * x + block_offset_local * x + x_offset;
+                    float tmp            = ck_tile::type_convert<float>(key_cache[cache_idx]);
+                    tmp                  = tmp * k_block_scale_global / k_block_scale;
+                    key_cache[cache_idx] = ck_tile::type_convert<cache_t>(tmp);
+                }
+            }
+            k_dequant_scales[scale_idx] = k_block_scale;
+        }
+        else
+        {
+            k_block_scale = k_block_scale_global;
+        }
+
+        if(v_block_scale_global < v_block_scale)
+        {
+            int64_t tgt_value_idx = block_idx * num_heads * head_size * ori_block_size +
+                                    head_idx * head_size * block_size;
+#pragma unroll
+            for(int id = 0; id < block_offset * head_size; id += blockDim.x)
+            {
+                if(id + threadIdx.x < block_offset * head_size)
+                {
+                    int64_t cache_idx;
+                    int block_offset_local = (id + threadIdx.x) / head_size;
+                    int cur_block_id       = block_offset_local / block_size;
+                    block_offset_local     = block_offset_local % block_size;
+                    if constexpr(asmLayout)
+                    {
+                        int head_offset             = (id + threadIdx.x) % head_size;
+                        int block_offset_local_divX = block_offset_local / x;
+                        int x_idx                   = block_offset_local % x;
+                        cache_idx =
+                            tgt_value_idx + cur_block_id * num_heads * head_size * block_size +
+                            block_offset_local_divX * head_size * x + head_offset * x + x_idx;
+                    }
+                    else
+                    {
+                        int head_offset = (id + threadIdx.x) % head_size;
+                        cache_idx       = tgt_value_idx +
+                                    cur_block_id * num_heads * head_size * block_size +
+                                    head_offset * block_size + block_offset_local;
+                    }
+                    float tmp              = ck_tile::type_convert<float>(value_cache[cache_idx]);
+                    tmp                    = tmp * v_block_scale_global / v_block_scale;
+                    value_cache[cache_idx] = ck_tile::type_convert<cache_t>(tmp);
+                }
+            }
+            v_dequant_scales[scale_idx] = v_block_scale;
+        }
+        else
+        {
+            v_block_scale = v_block_scale_global;
+        }
+    }
+    else
+    {
+        k_dequant_scales[scale_idx] = k_block_scale;
+        v_dequant_scales[scale_idx] = v_block_scale;
+    }
+    k_block_scale = 1 / k_block_scale;
+    v_block_scale = 1 / v_block_scale;
+
+    // now let's store out
+    block_idx = block_idx * (ori_block_size / block_size);
+    for(int id = 0; id < numtokens_in_block * head_size; id += blockDim.x)
+    {
+        if((id + threadIdx.x) < numtokens_in_block * head_size)
+        {
+            int token_idx           = (id + threadIdx.x) / head_size + first_token_idx;
+            int current_d           = (id + threadIdx.x) % head_size;
+            int block_offset_local  = token_idx - first_token_idx + block_offset;
+            int64_t block_idx_local = block_offset_local / block_size + block_idx;
+            block_offset_local      = block_offset_local % block_size;
+
+            const int64_t src_k_idx = token_idx * key_stride + head_idx * head_size + current_d;
+            const int64_t src_v_idx = token_idx * value_stride + head_idx * head_size + current_d;
+            float tmp_k             = ck_tile::type_convert<float>(key[src_k_idx]) * k_block_scale;
+            float tmp_v = ck_tile::type_convert<float>(value[src_v_idx]) * v_block_scale;
+
+            const int x_idx    = current_d / x;
+            const int x_offset = current_d % x;
+            //[num_blocks, num_heads, head_size/X, block_size, X]
+            const int64_t tgt_key_idx = block_idx_local * num_heads * head_size * block_size +
+                                        head_idx * head_size * block_size + x_idx * block_size * x +
+                                        block_offset_local * x + x_offset;
+
+            int64_t tgt_value_idx;
+            if constexpr(asmLayout)
+            { //[num_blocks, num_heads, block_size/X, head_size, X]
+                const int x_idx    = block_offset_local / x;
+                const int x_offset = block_offset_local % x;
+                tgt_value_idx      = block_idx_local * num_heads * head_size * block_size +
+                                head_idx * head_size * block_size + x_idx * head_size * x +
+                                current_d * x + x_offset;
+            }
+            else
+            { //[num_blocks, num_heads, head_size, block_size]
+                tgt_value_idx = block_idx_local * num_heads * head_size * block_size +
+                                head_idx * head_size * block_size + current_d * block_size +
+                                block_offset_local;
+            }
+            // printf("tgt_key_idx%d, src_k_idx: %d, tmp_k:%f, k_block_scale:%f\n",tgt_key_idx,
+            // src_k_idx, tmp_k, k_block_scale);
+            key_cache[tgt_key_idx]     = ck_tile::type_convert<cache_t>(tmp_k);
+            value_cache[tgt_value_idx] = ck_tile::type_convert<cache_t>(tmp_v);
         }
     }
 }
@@ -940,8 +1200,7 @@ void reshape_and_cache_flash(
                 block_size,                                                                       \
                 x,                                                                                \
                 num_tokens,                                                                       \
-                max_kv_tokens,                                                                    \
-                dtypeMax);                                                                        \
+                max_kv_tokens);                                                                   \
     }                                                                                             \
     else                                                                                          \
     {                                                                                             \
@@ -961,8 +1220,7 @@ void reshape_and_cache_flash(
                 block_size,                                                                       \
                 x,                                                                                \
                 num_tokens,                                                                       \
-                max_kv_tokens,                                                                    \
-                dtypeMax);                                                                        \
+                max_kv_tokens);                                                                   \
     }
 
 #define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(KV_T, CACHE_T, dequant_scale_t)               \
@@ -985,8 +1243,7 @@ void reshape_and_cache_flash(
                 block_size,                                                                   \
                 x,                                                                            \
                 num_tokens,                                                                   \
-                seq_len,                                                                      \
-                dtypeMax);                                                                    \
+                seq_len);                                                                     \
     }                                                                                         \
     else                                                                                      \
     {                                                                                         \
@@ -1007,8 +1264,56 @@ void reshape_and_cache_flash(
                 block_size,                                                                   \
                 x,                                                                            \
                 num_tokens,                                                                   \
-                seq_len,                                                                      \
-                dtypeMax);                                                                    \
+                seq_len);                                                                     \
+    }
+
+#define CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(KV_T, CACHE_T, dequant_scale_t)         \
+    if(asm_layout)                                                                                \
+    {                                                                                             \
+        vllm::reshape_and_cache_with_block_quant_kernel_for_asmpa<KV_T,                           \
+                                                                  CACHE_T,                        \
+                                                                  dequant_scale_t,                \
+                                                                  true>                           \
+            <<<grid, block, 0, stream>>>(                                                         \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                          \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                        \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                 \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                               \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                  \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                  \
+                slot_mapping.data_ptr<int64_t>(),                                                 \
+                key_stride,                                                                       \
+                value_stride,                                                                     \
+                num_heads,                                                                        \
+                num_blocks,                                                                       \
+                head_size,                                                                        \
+                block_size,                                                                       \
+                x,                                                                                \
+                num_tokens,                                                                       \
+                seq_len,                                                                          \
+                ori_block_size);                                                                  \
+    }                                                                                             \
+    else                                                                                          \
+    {                                                                                             \
+        vllm::reshape_and_cache_with_block_quant_kernel_for_asmpa<KV_T, CACHE_T, dequant_scale_t> \
+            <<<grid, block, 0, stream>>>(                                                         \
+                reinterpret_cast<KV_T*>(key.data_ptr()),                                          \
+                reinterpret_cast<KV_T*>(value.data_ptr()),                                        \
+                reinterpret_cast<CACHE_T*>(key_cache.data_ptr()),                                 \
+                reinterpret_cast<CACHE_T*>(value_cache.data_ptr()),                               \
+                reinterpret_cast<dequant_scale_t*>(k_dequant_scales.data_ptr()),                  \
+                reinterpret_cast<dequant_scale_t*>(v_dequant_scales.data_ptr()),                  \
+                slot_mapping.data_ptr<int64_t>(),                                                 \
+                key_stride,                                                                       \
+                value_stride,                                                                     \
+                num_heads,                                                                        \
+                num_blocks,                                                                       \
+                head_size,                                                                        \
+                block_size,                                                                       \
+                x,                                                                                \
+                num_tokens,                                                                       \
+                seq_len,                                                                          \
+                ori_block_size);                                                                  \
     }
 
 namespace aiter {
@@ -1043,18 +1348,19 @@ void reshape_and_cache_with_pertoken_quant(
     float dtypeMax;
     if(key_cache.dtype() == torch_fp8)
     {
-        dtypeMax = FP8_MAX;
         if(key.dtype() == at::ScalarType::Float)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, hip_fp8, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, ck_tile::fp8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::Half)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__half, hip_fp8, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(
+                ck_tile::fp16_t, ck_tile::fp8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::BFloat16)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__hip_bfloat16, hip_fp8, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(
+                ck_tile::bf16_t, ck_tile::fp8_t, dequant_scale_t);
         }
         else
         {
@@ -1063,18 +1369,17 @@ void reshape_and_cache_with_pertoken_quant(
     }
     else if(key_cache.dtype() == at::ScalarType::Char)
     {
-        dtypeMax = 127;
         if(key.dtype() == at::ScalarType::Float)
         {
             CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(float, int8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::Half)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__half, int8_t, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(ck_tile::fp16_t, int8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::BFloat16)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(__hip_bfloat16, int8_t, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_PERTOKEN_QUANT(ck_tile::bf16_t, int8_t, dequant_scale_t);
         }
         else
         {
@@ -1124,18 +1429,19 @@ void reshape_and_cache_with_block_quant(
     float dtypeMax;
     if(key_cache.dtype() == torch_fp8)
     {
-        dtypeMax = FP8_MAX;
         if(key.dtype() == at::ScalarType::Float)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, hip_fp8, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, ck_tile::fp8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::Half)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__half, hip_fp8, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
+                ck_tile::fp16_t, ck_tile::fp8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::BFloat16)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__hip_bfloat16, hip_fp8, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
+                ck_tile::bf16_t, ck_tile::fp8_t, dequant_scale_t);
         }
         else
         {
@@ -1144,18 +1450,109 @@ void reshape_and_cache_with_block_quant(
     }
     else if(key_cache.dtype() == at::ScalarType::Char)
     {
-        dtypeMax = 127;
         if(key.dtype() == at::ScalarType::Float)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, int8_t, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(float, ck_tile::int8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::Half)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__half, int8_t, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
+                ck_tile::fp16_t, ck_tile::int8_t, dequant_scale_t);
         }
         else if(key.dtype() == at::ScalarType::BFloat16)
         {
-            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(__hip_bfloat16, int8_t, dequant_scale_t);
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT(
+                ck_tile::bf16_t, ck_tile::int8_t, dequant_scale_t);
+        }
+        else
+        {
+            TORCH_CHECK(false,
+                        "Unsupported input type of kv: ",
+                        key.dtype(),
+                        " kv cache: ",
+                        key_cache.dtype());
+        }
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
+    }
+}
+
+void reshape_and_cache_with_block_quant_for_asmpa(
+    torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
+    torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]
+    torch::Tensor& value_cache,      // [num_blocks, num_heads, head_size, block_size:16]
+    torch::Tensor& k_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    torch::Tensor& v_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const bool asm_layout,
+    const int ori_block_size = 128)
+{
+    TORCH_CHECK(
+        key.dim() == 4 && value.dim() == 4,
+        "key/value must be a 4D tensor with shape [batch_size, seq_len, num_heads, head_size]");
+    TORCH_CHECK(ori_block_size == 128 || ori_block_size == 256,
+                "ori_block_size only support 128/256");
+
+    int batch_size   = key.size(0);
+    int seq_len      = key.size(1);
+    int num_heads    = key.size(2);
+    int head_size    = key.size(3);
+    int num_blocks   = key_cache.size(0);
+    int block_size   = key_cache.size(3);
+    int x            = key_cache.size(4);
+    int num_tokens   = batch_size * seq_len;
+    int key_stride   = key.stride(0) / seq_len;
+    int value_stride = value.stride(0) / seq_len;
+
+    int blockDimx = (ori_block_size + 255) / 256 * 256;
+    dim3 grid(batch_size, (seq_len + ori_block_size - 1) / ori_block_size + 1, num_heads);
+    dim3 block(blockDimx);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    using dequant_scale_t = float; // should align with k_dequant_scales/v_dequant_scales dtype
+
+    if(key_cache.dtype() == torch_fp8)
+    {
+        if(key.dtype() == at::ScalarType::Float)
+        {
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
+                float, ck_tile::fp8_t, dequant_scale_t);
+        }
+        else if(key.dtype() == at::ScalarType::Half)
+        {
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
+                ck_tile::fp16_t, ck_tile::fp8_t, dequant_scale_t);
+        }
+        else if(key.dtype() == at::ScalarType::BFloat16)
+        {
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
+                ck_tile::bf16_t, ck_tile::fp8_t, dequant_scale_t);
+        }
+        else
+        {
+            TORCH_CHECK(false, "Unsupported input type of kv: ", key.dtype());
+        }
+    }
+    else if(key_cache.dtype() == at::ScalarType::Char)
+    {
+        if(key.dtype() == at::ScalarType::Float)
+        {
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
+                float, ck_tile::int8_t, dequant_scale_t);
+        }
+        else if(key.dtype() == at::ScalarType::Half)
+        {
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
+                ck_tile::fp16_t, ck_tile::int8_t, dequant_scale_t);
+        }
+        else if(key.dtype() == at::ScalarType::BFloat16)
+        {
+            CALL_RESHAPE_AND_CACHE_WITH_BLOCK_QUANT_FOR_ASMPA(
+                ck_tile::bf16_t, ck_tile::int8_t, dequant_scale_t);
         }
         else
         {

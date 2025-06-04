@@ -150,55 +150,74 @@
           py::arg("kernelId") = 0,    \
           py::arg("splitK")   = 0);
 
-#define CACHE_PYBIND                                                           \
-    m.def("swap_blocks",                                                       \
-          &aiter::swap_blocks,                                                 \
-          "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()"); \
-    m.def("copy_blocks",                                                       \
-          &aiter::copy_blocks,                                                 \
-          "copy_blocks(Tensor(a!)[] key_caches, Tensor[](b!) value_caches, "   \
-          "Tensor block_mapping) -> ()");                                      \
-                                                                               \
-    m.def("reshape_and_cache",                                                 \
-          &aiter::reshape_and_cache,                                           \
-          "reshape_and_cache",                                                 \
-          py::arg("key"),                                                      \
-          py::arg("value"),                                                    \
-          py::arg("key_cache"),                                                \
-          py::arg("value_cache"),                                              \
-          py::arg("slot_mapping"),                                             \
-          py::arg("kv_cache_dtype"),                                           \
-          py::arg("k_scale")    = std::nullopt,                                \
-          py::arg("v_scale")    = std::nullopt,                                \
-          py::arg("asm_layout") = false);                                      \
-    m.def("reshape_and_cache_flash",                                           \
-          &aiter::reshape_and_cache_flash,                                     \
-          "reshape_and_cache_flash(Tensor key, Tensor value,"                  \
-          "                        Tensor! key_cache,"                         \
-          "                        Tensor! value_cache,"                       \
-          "                        Tensor slot_mapping,"                       \
-          "                        str kv_cache_dtype,"                        \
-          "                        float k_scale, float v_scale) -> ()");      \
-    m.def("reshape_and_cache_with_pertoken_quant",                             \
-          &aiter::reshape_and_cache_with_pertoken_quant,                       \
-          "reshape_and_cache_with_pertoken_quant(Tensor key, Tensor value,"    \
-          "                        Tensor! key_cache,"                         \
-          "                        Tensor! value_cache,"                       \
-          "                        Tensor! k_dequant_scales,"                  \
-          "                        Tensor! v_dequant_scales,"                  \
-          "                        Tensor slot_mapping) -> ()");               \
-    m.def("reshape_and_cache_with_block_quant",                                \
-          &aiter::reshape_and_cache_with_block_quant,                          \
-          "reshape_and_cache_with_block_quant(Tensor key, Tensor value,"       \
-          "                        Tensor! key_cache,"                         \
-          "                        Tensor! value_cache,"                       \
-          "                        Tensor! k_dequant_scales,"                  \
-          "                        Tensor! v_dequant_scales,"                  \
-          "                        Tensor slot_mapping,"                       \
-          "                        const bool asm_layout) -> ()");             \
-    m.def("convert_fp8",                                                       \
-          &aiter::convert_fp8,                                                 \
-          "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "     \
+#define CACHE_PYBIND                                                               \
+    m.def("swap_blocks",                                                           \
+          &aiter::swap_blocks,                                                     \
+          "swap_blocks(Tensor src, Tensor! dst, Tensor block_mapping) -> ()");     \
+    m.def("copy_blocks",                                                           \
+          &aiter::copy_blocks,                                                     \
+          "copy_blocks(Tensor(a!)[] key_caches, Tensor[](b!) value_caches, "       \
+          "Tensor block_mapping) -> ()");                                          \
+                                                                                   \
+    m.def("reshape_and_cache",                                                     \
+          &aiter::reshape_and_cache,                                               \
+          "reshape_and_cache",                                                     \
+          py::arg("key"),                                                          \
+          py::arg("value"),                                                        \
+          py::arg("key_cache"),                                                    \
+          py::arg("value_cache"),                                                  \
+          py::arg("slot_mapping"),                                                 \
+          py::arg("kv_cache_dtype"),                                               \
+          py::arg("k_scale")    = std::nullopt,                                    \
+          py::arg("v_scale")    = std::nullopt,                                    \
+          py::arg("asm_layout") = false);                                          \
+    m.def("reshape_and_cache_flash",                                               \
+          &aiter::reshape_and_cache_flash,                                         \
+          "reshape_and_cache_flash(Tensor key, Tensor value,"                      \
+          "                        Tensor! key_cache,"                             \
+          "                        Tensor! value_cache,"                           \
+          "                        Tensor slot_mapping,"                           \
+          "                        str kv_cache_dtype,"                            \
+          "                        float k_scale, float v_scale) -> ()");          \
+    m.def("reshape_and_cache_with_pertoken_quant",                                 \
+          &aiter::reshape_and_cache_with_pertoken_quant,                           \
+          "reshape_and_cache_with_pertoken_quant(Tensor key, Tensor value,"        \
+          "                        Tensor! key_cache,"                             \
+          "                        Tensor! value_cache,"                           \
+          "                        Tensor! k_dequant_scales,"                      \
+          "                        Tensor! v_dequant_scales,"                      \
+          "                        Tensor slot_mapping) -> ()");                   \
+    m.def("reshape_and_cache_with_block_quant",                                    \
+          &aiter::reshape_and_cache_with_block_quant,                              \
+          "reshape_and_cache_with_block_quant(Tensor key, Tensor value,"           \
+          "                        Tensor! key_cache,"                             \
+          "                        Tensor! value_cache,"                           \
+          "                        Tensor! k_dequant_scales,"                      \
+          "                        Tensor! v_dequant_scales,"                      \
+          "                        Tensor slot_mapping,"                           \
+          "                        const bool asm_layout) -> ()");                 \
+    m.def("reshape_and_cache_with_block_quant_for_asmpa",                          \
+          &aiter::reshape_and_cache_with_block_quant_for_asmpa,                    \
+          "reshape_and_cache_with_block_quant_for_asmpa(Tensor key, Tensor value," \
+          "                        Tensor! key_cache,"                             \
+          "                        Tensor! value_cache,"                           \
+          "                        Tensor! k_dequant_scales,"                      \
+          "                        Tensor! v_dequant_scales,"                      \
+          "                        Tensor slot_mapping,"                           \
+          "                        const bool asm_layout,"                         \
+          "                        const int ori_block_size) -> ()",               \
+          py::arg("key"),                                                          \
+          py::arg("value"),                                                        \
+          py::arg("key_cache"),                                                    \
+          py::arg("value_cache"),                                                  \
+          py::arg("k_dequant_scales"),                                             \
+          py::arg("v_dequant_scales"),                                             \
+          py::arg("slot_mapping"),                                                 \
+          py::arg("asm_layout"),                                                   \
+          py::arg("ori_block_size") = 128);                                        \
+    m.def("convert_fp8",                                                           \
+          &aiter::convert_fp8,                                                     \
+          "convert_fp8(Tensor! dst_cache, Tensor src_cache, float scale, "         \
           "str kv_cache_dtype) -> ()");
 
 #define CUSTOM_ALL_REDUCE_PYBIND                                                               \

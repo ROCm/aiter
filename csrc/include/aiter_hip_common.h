@@ -6,12 +6,6 @@
 #include "ck_tile/core.hpp"
 
 
-#if CK_TILE_USE_OCP_FP8
-constexpr auto FP8_MAX = 448.f;
-#else
-constexpr auto FP8_MAX = 240.f;
-#endif
-
 #define HIP_CALL(call)                                                                                                           \
     do                                                                                                                           \
     {                                                                                                                            \

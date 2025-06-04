@@ -54,6 +54,17 @@ void reshape_and_cache_with_block_quant(torch::Tensor& key,
                                         torch::Tensor& slot_mapping,
                                         const bool asm_layout);
 
+void reshape_and_cache_with_block_quant_for_asmpa(
+    torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
+    torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
+    torch::Tensor& key_cache,        // [num_blocks, num_heads, head_size/x, block_size:16, x]
+    torch::Tensor& value_cache,      // [num_blocks, num_heads, head_size, block_size:16]
+    torch::Tensor& k_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    torch::Tensor& v_dequant_scales, // [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    torch::Tensor& slot_mapping,     // [num_tokens]
+    const bool asm_layout,
+    const int ori_block_size = 128);
+
 // Just for unittest
 void convert_fp8(torch::Tensor& dst_cache,
                  torch::Tensor& src_cache,
