@@ -234,18 +234,6 @@ def gemm_a8w8(
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    """
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
-    GROUP_SIZE_M = 4
-    waves_per_eu = 2
-    kpack = 1 if get_arch() in ("gfx950") else 2
-    matrix_instr_nonkdim = 16
-    num_warps = 4
-    num_stages = 2
-    """
-
     if config is None:
         config = _get_config(M, N, K)
 
@@ -270,15 +258,6 @@ def gemm_a8w8(
         y.stride(1),
         bias is not None,
         **config,
-        # BLOCK_SIZE_M,
-        # BLOCK_SIZE_N,
-        # BLOCK_SIZE_K,
-        # GROUP_SIZE_M,
-        # waves_per_eu=waves_per_eu,
-        # kpack=kpack,
-        # matrix_instr_nonkdim=matrix_instr_nonkdim,
-        # num_warps=num_warps,
-        # num_stages=num_stages,
     )
 
     return y
