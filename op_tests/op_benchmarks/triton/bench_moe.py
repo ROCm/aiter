@@ -1,15 +1,14 @@
+import sys
+import argparse
 import triton
 import triton.language as tl
+from aiter.ops.triton.moe_op import fused_moe as triton_moe
+from utils.moe import generate_moe_alignment, generate_moe_input, get_optimal_moe_config
 from utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
-    torch_to_tl_dtype,
 )
-from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
-import torch
-import argparse
-from aiter.ops.triton.moe_op import fused_moe as triton_moe
-import sys
+from utils.common import str_to_torch_dtype, torch_to_tl_dtype
 
 
 def model_benchmark_configs(args):
@@ -37,132 +36,22 @@ def model_benchmark_configs(args):
     return moe_configs
 
 
-def fused_moe(
-    M,
-    N,
-    K,
-    top_k,
-    E,
-    routed_weight=False,
-    dtype=torch.float16,
-    int4_w4a16=False,
-    fp8_w8a8=False,
-    int8_w8a16=False,
-    group_size=128,
-    has_zp=True,
-):
-    if int4_w4a16:
-        (
-            a,
-            b,
-            triton_out,
-            _,
-            b_zp,
-            b_scale,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            config,
-        ) = input_helper_int4_w4a16(
-            M,
-            N,
-            K,
-            top_k,
-            E,
-            routed_weight=routed_weight,
-            dtype=dtype,
-            group_size=group_size,
-            has_zp=has_zp,
-        )
-
-        return lambda: triton_moe(  # noqa: E731
-            a,
-            b,
-            triton_out,
-            None,
-            b_scale,
-            b_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            routed_weight,
-            top_k,
-            config,
-            torch_to_tl_dtype[dtype],
-            use_fp8_w8a8=False,
-            use_int8_w8a16=False,
-            use_int4_w4a16=True,
-            block_shape=(0, group_size),
-        )
-    else:
-        (
-            a,
-            b,
-            triton_out,
-            _,
-            b_zp,
-            a_scale,
-            b_scale,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            config,
-        ) = input_helper(
-            M,
-            N,
-            K,
-            top_k,
-            E,
-            routed_weight=routed_weight,
-            dtype=dtype,
-            fp8_w8a8=fp8_w8a8,
-            int8_w8a16=int8_w8a16,
-        )
-
-        return lambda: triton_moe(
-            a,
-            b,
-            triton_out,
-            a_scale,
-            b_scale,
-            b_zp,
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            routed_weight,
-            top_k,
-            config,
-            torch_to_tl_dtype[dtype],
-            fp8_w8a8,
-            int8_w8a16,
-            use_int4_w4a16=False,
-        )
-
-
 def run_benchmark(args):
     routed_weight = args.routed_weight
-    int8_w8a16 = args.int8_w8a16
-    fp8_w8a8 = args.fp8_w8a8
-    int4_w4a16 = args.int4_w4a16
+    input_dtype = args.input_dtype
+    aux_dtype = args.aux_dtype
     group_size = args.group_size
     has_zp = args.has_zp
-    dtype = arg_to_torch_dtype[args.dtype]
-    fp8_type = arg_to_torch_dtype[args.fp8_type]
 
-    if int4_w4a16:
-        assert group_size != None, "set group_size with -group_size"
+    assert (
+        input_dtype != "int4_w4a16" or group_size is not None
+    ), "User has to set group_size explicitly for int4 weight"
 
-    kernel_name = "_fused_moe_kernel"
-    if (int8_w8a16 or int4_w4a16) and (group_size is not None) and group_size > 0:
-        kernel_name = "_fused_moe_kernel_gptq_awq"
+    kernel_name = "fused_moe_kernel"
+    if input_dtype in ["int8_w8a16", "int4_w4a16"] and group_size > 0:
+        kernel_name = "fused_moe_kernel_gptq_awq"
+    input_dtype_str = "" if input_dtype is None else input_dtype
+    kernel_name += input_dtype_str + "_" + aux_dtype
 
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
@@ -179,47 +68,52 @@ def run_benchmark(args):
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
         plot_name=f"{kernel_name}-benchmark",
-        args={},
+        args={"aux_dtype": aux_dtype, "input_dtype": input_dtype},
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_moe_gemm(M, N, K, E, top_k, metric, model=None):
+    def bench_moe_gemm(M, N, K, E, top_k, metric, input_dtype, aux_dtype, model=None):
 
+        a, b, triton_out, _, b_zp, a_scale, b_scale = generate_moe_input(
+            M, N, K, top_k, E, group_size, has_zp, input_dtype, aux_dtype
+        )
+        config = get_optimal_moe_config(input_dtype, aux_dtype, M)
+        topk_weights, topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            generate_moe_alignment(M, E, top_k, config["BLOCK_SIZE_M"])
+        )
+        aux_dtype = str_to_torch_dtype[aux_dtype]
         # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
         flops = 2.0 * M * top_k * K * N
         # The weight is applied on the gemm product which has the shape of (M, top_k, N)
         if routed_weight:
             flops += M * top_k * N
 
-        if fp8_w8a8:
-            a_bytes = b_bytes = torch.tensor([], dtype=fp8_type).element_size()
-            c_bytes = torch.tensor([], dtype=dtype).element_size()
-        elif int8_w8a16:
-            b_bytes = torch.tensor([], dtype=torch.int8).element_size()
-            a_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
-        else:
-            a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
-        # TODO add the int4 case
-
-        # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
-        mem_read = (M * K) * a_bytes + (E * N * K) * b_bytes
-
-        mem_write = (M * top_k * N) * c_bytes
+        # Variables to compute bandwidth
+        mem_read = a.numel() * a.element_size() + b.numel() * b.element_size()
+        mem_write = triton_out.numel() * triton_out.element_size()
         mem = mem_read + mem_write
 
-        fn = fused_moe(
-            M,
-            N,
-            K,
+        fp8_w8a8 = input_dtype == "fp8_w8a8"
+        int8_w8a16 = input_dtype == "int8_w8a16"
+        fn = lambda: triton_moe(  # noqa: E731
+            a,
+            b,
+            triton_out,
+            a_scale,
+            b_scale,
+            b_zp,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            routed_weight,
             top_k,
-            E,
-            routed_weight=routed_weight,
-            dtype=torch.float16,
-            int4_w4a16=int4_w4a16,
-            fp8_w8a8=fp8_w8a8,
-            int8_w8a16=int8_w8a16,
-            group_size=group_size,
-            has_zp=has_zp,
+            config,
+            torch_to_tl_dtype[aux_dtype],
+            fp8_w8a8,
+            int8_w8a16,
+            use_int4_w4a16=False,
         )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -257,29 +151,22 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="M dimension")
     parser.add_argument(
-        "-group_size", type=int, default=None, help="group_size for in4"
+        "--group-size", type=int, default=None, help="group_size for int4"
     )
-    parser.add_argument("-routed_weight", action="store_true", default=False)
-    parser.add_argument("-int8_w8a16", action="store_true", default=False)
-    parser.add_argument("-fp8_w8a8", action="store_true", default=False)
-    parser.add_argument("-int4_w4a16", action="store_true", default=False)
-    parser.add_argument("-has_zp", action="store_true", default=False)
-    parser.add_argument("-dtype", default="fp16")
-    parser.add_argument("-fp8_type", default="e5m2fnuz")
+    parser.add_argument("--routed-weight", action="store_true")
+    parser.add_argument(
+        "--input-dtype",
+        type=str,
+        choices=["int8_w8a16", "fp8_w8a8", "int4_w4a16", None],
+        default=None,
+    )
+    parser.add_argument("--aux-dtype", default="fp16")
+    parser.add_argument("--has-zp", action="store_true")
     args = parser.parse_args()
     return args
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-    "e5m2fnuz": torch.float8_e5m2fnuz,
-    "e4m3fnuz": torch.float8_e4m3fnuz,
-}
 
 
 def main():
