@@ -9,11 +9,11 @@
 #include "attention_common.cuh"
 
 #if defined(__HIPCC__) && \
-    (defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__))
-#define __HIP__MI300_MI250__
+    (defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || defined(__gfx950__))
+#define __HIP__MI3XX_MI250__
 #endif
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI3XX_MI250__) // TODO: Add NAVI support
 
 ///////////////////////////////////////
 // grid (num_seqs, num_partitions,num_kv_heads)
@@ -121,7 +121,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(query_loc, context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr);
 }
 
-#else // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else // !defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
 
 
 template <typename scalar_t,
@@ -189,7 +189,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     UNREACHABLE_CODE
 }
 
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
 
 #define LAUNCH_CUSTOM_ATTENTION_MFMA16(GQA_RATIO)           \
     paged_attention_ll4mi_QKV_mfma16_kernel<T,              \
