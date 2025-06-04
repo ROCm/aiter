@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
+import pytest
+import os
 import torch
 import triton
-import pytest
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4, gemm_afp4wfp4_preshuffled_scales
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
-import os
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
 )
 
 if TRITON_HIP_PRESHUFFLE_SCALES:
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffled_scales as gemm_afp4wfp4
+    from aiter.ops.triton.gemm_afp4wfp4 import (
+        gemm_afp4wfp4_preshuffled_scales as gemm_afp4wfp4,
+    )
 else:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as gemm_afp4wfp4
 

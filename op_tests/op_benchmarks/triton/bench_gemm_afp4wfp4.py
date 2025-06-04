@@ -5,14 +5,15 @@ import torch
 import triton
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
 from utils.benchmark_utils import get_model_configs, get_available_models
-import os
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
 )
 
 if TRITON_HIP_PRESHUFFLE_SCALES:
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffled_scales as gemm_afp4wfp4
+    from aiter.ops.triton.gemm_afp4wfp4 import (
+        gemm_afp4wfp4_preshuffled_scales as gemm_afp4wfp4,
+    )
 else:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as gemm_afp4wfp4
 
