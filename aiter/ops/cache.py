@@ -72,15 +72,15 @@ def reshape_and_cache_with_block_quant(
 
 @compile_ops("module_cache")
 def reshape_and_cache_with_block_quant_for_asm_pa(
-    key: Tensor, # [batch_size, seq_len, num_heads, head_size]
-    value: Tensor, # [batch_size, seq_len, num_heads, head_size]
-    key_cache: Tensor, # [num_blocks, num_heads, head_size/x, block_size:16, x]
-    value_cache: Tensor, # [num_blocks, num_heads, head_size, block_size:16] / [num_blocks, kvhead, block_size/x, head_size, x]
-    k_dequant_scales: Tensor, # [num_heads, num_blocks/(ori_block_size/block_size:16)]
-    v_dequant_scales: Tensor, # [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    key: Tensor,  # [batch_size, seq_len, num_heads, head_size]
+    value: Tensor,  # [batch_size, seq_len, num_heads, head_size]
+    key_cache: Tensor,  # [num_blocks, num_heads, head_size/x, block_size:16, x]
+    value_cache: Tensor,  # [num_blocks, num_heads, head_size, block_size:16] / [num_blocks, kvhead, block_size/x, head_size, x]
+    k_dequant_scales: Tensor,  # [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    v_dequant_scales: Tensor,  # [num_heads, num_blocks/(ori_block_size/block_size:16)]
     slot_mapping: Tensor,
     asm_layout: bool,
-    ori_block_size: int = 128 # [128/256]
+    ori_block_size: int = 128,  # [128/256]
 ): ...
 
 

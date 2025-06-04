@@ -154,7 +154,7 @@ def run_torch_for_asmpa(
     x,
     asm_layout,
     quantCfg={},
-    ori_block_size = 128
+    ori_block_size=128,
 ):
     block_split = ori_block_size // block_size
     num_batch, num_tokens, num_heads, head_size = key.shape
@@ -171,17 +171,41 @@ def run_torch_for_asmpa(
     if asm_layout:
         k_cache = k_cache.view(num_blocks, num_heads, -1).to(
             dtypes.fp32
-        ) * k_scale.view(ori_num_blocks, num_heads, 1).repeat(1, 1, block_split).permute(0, 2, 1).view(num_blocks, num_heads, 1)
+        ) * k_scale.view(ori_num_blocks, num_heads, 1).repeat(
+            1, 1, block_split
+        ).permute(
+            0, 2, 1
+        ).view(
+            num_blocks, num_heads, 1
+        )
         v_cache = v_cache.view(num_blocks, num_heads, -1).to(
             dtypes.fp32
-        ) * v_scale.view(ori_num_blocks, num_heads, 1).repeat(1, 1, block_split).permute(0, 2, 1).view(num_blocks, num_heads, 1)
+        ) * v_scale.view(ori_num_blocks, num_heads, 1).repeat(
+            1, 1, block_split
+        ).permute(
+            0, 2, 1
+        ).view(
+            num_blocks, num_heads, 1
+        )
     else:
         k_cache = k_cache.view(num_blocks, num_heads, -1).to(
             dtypes.fp32
-        ) * k_scale.t().view(ori_num_blocks, num_heads, 1).repeat(1, 1, block_split).permute(0, 2, 1).view(num_blocks, num_heads, 1)
+        ) * k_scale.t().view(ori_num_blocks, num_heads, 1).repeat(
+            1, 1, block_split
+        ).permute(
+            0, 2, 1
+        ).view(
+            num_blocks, num_heads, 1
+        )
         v_cache = v_cache.view(num_blocks, num_heads, -1).to(
             dtypes.fp32
-        ) * v_scale.t().view(ori_num_blocks, num_heads, 1).repeat(1, 1, block_split).permute(0, 2, 1).view(num_blocks, num_heads, 1)
+        ) * v_scale.t().view(ori_num_blocks, num_heads, 1).repeat(
+            1, 1, block_split
+        ).permute(
+            0, 2, 1
+        ).view(
+            num_blocks, num_heads, 1
+        )
 
     # [num_blocks, num_heads, head_size//x, block_size, x]
     k_cache = (
@@ -219,7 +243,11 @@ def run_torch_for_asmpa(
         scale_dtype=quantCfg["y_scale_dtype"],
         quant_dtype=quantCfg["quant_dtype"],
     )
-    k_cache = k_cache.view(ori_num_blocks, num_heads, block_split, block_size, -1).permute(0, 2, 1, 3, 4).contiguous()
+    k_cache = (
+        k_cache.view(ori_num_blocks, num_heads, block_split, block_size, -1)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
     k_cache = (
         k_cache.view(num_blocks, num_heads, block_size, head_size // x, x)
         .permute(0, 1, 3, 2, 4)
@@ -238,7 +266,14 @@ def run_torch_for_asmpa(
         scale_dtype=quantCfg["y_scale_dtype"],
         quant_dtype=quantCfg["quant_dtype"],
     )
-    v_cache = v_cache.view(ori_num_blocks, num_heads, block_split, block_size, -1).permute(0, 2, 1, 3, 4).contiguous().view(num_blocks, num_heads, block_split, block_size, -1).permute(0, 2, 1, 3, 4).contiguous()
+    v_cache = (
+        v_cache.view(ori_num_blocks, num_heads, block_split, block_size, -1)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+        .view(num_blocks, num_heads, block_split, block_size, -1)
+        .permute(0, 2, 1, 3, 4)
+        .contiguous()
+    )
     v_scale = v_scale.view(ori_num_blocks, num_heads)
 
     if asm_layout:
@@ -271,12 +306,21 @@ def run_aiter_for_asmpa(
     x,
     asm_layout,
     quantCfg={},
-    ori_block_size = 128
+    ori_block_size=128,
 ):
     aiter.reshape_and_cache_with_block_quant_for_asm_pa(
-        key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout, ori_block_size
+        key,
+        value,
+        k_cache,
+        v_cache,
+        k_scale,
+        v_scale,
+        slot_mapping,
+        asm_layout,
+        ori_block_size,
     )
     return k_cache, v_cache, k_scale, v_scale
+
 
 @benchmark()
 def test_reshape_and_cache(
@@ -288,12 +332,17 @@ def test_reshape_and_cache(
     DTyoe_KV: torch.dtype,
     DTyoe_KVCache: torch.dtype,
     quantCfg: dict = {},
-    ori_block_size = 0, # test for asm pa , only support 128 / 256, 0 mean off
+    ori_block_size=0,  # test for asm pa , only support 128 / 256, 0 mean off
 ):
     asm_layout = True
     qhead, kvhead = num_heads
     if ori_block_size:
-        num_blocks = (MAX_TOKEN_SUPPORTED + ori_block_size - 1) // ori_block_size * ori_block_size // block_size
+        num_blocks = (
+            (MAX_TOKEN_SUPPORTED + ori_block_size - 1)
+            // ori_block_size
+            * ori_block_size
+            // block_size
+        )
     else:
         num_blocks = (MAX_TOKEN_SUPPORTED + block_size - 1) // block_size
     # num_blocks = (ctx_lens+1+block_size-1)//block_size
@@ -303,14 +352,14 @@ def test_reshape_and_cache(
         k_cache_shape = (bs * num_blocks, kvhead, head_size // x, block_size, x)
         v_cache_shape = (bs * num_blocks, kvhead, block_size // x, head_size, x)
         if ori_block_size:
-            kv_scale_shape = (bs * num_blocks//(ori_block_size // block_size), kvhead)
+            kv_scale_shape = (bs * num_blocks // (ori_block_size // block_size), kvhead)
         else:
             kv_scale_shape = (bs * num_blocks, kvhead)
     else:
         k_cache_shape = (bs * num_blocks, kvhead, head_size // x, block_size, x)
         v_cache_shape = (bs * num_blocks, kvhead, head_size, block_size)
         if ori_block_size:
-            kv_scale_shape = (kvhead, bs * num_blocks//(ori_block_size // block_size))
+            kv_scale_shape = (kvhead, bs * num_blocks // (ori_block_size // block_size))
         else:
             kv_scale_shape = (kvhead, bs * num_blocks)
 
@@ -334,8 +383,16 @@ def test_reshape_and_cache(
         ]
     ).cuda()
 
-    torch_func = functools.partial(run_torch_for_asmpa, ori_block_size=ori_block_size) if ori_block_size else run_torch
-    aiter_func = functools.partial(run_aiter_for_asmpa, ori_block_size=ori_block_size) if ori_block_size else run_aiter
+    torch_func = (
+        functools.partial(run_torch_for_asmpa, ori_block_size=ori_block_size)
+        if ori_block_size
+        else run_torch
+    )
+    aiter_func = (
+        functools.partial(run_aiter_for_asmpa, ori_block_size=ori_block_size)
+        if ori_block_size
+        else run_aiter
+    )
 
     k_cache_ref = k_cache.clone()
     v_cache_ref = v_cache.clone()
@@ -661,4 +718,3 @@ test_reshape_and_cache(
     quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
     ori_block_size=256,
 )
-
