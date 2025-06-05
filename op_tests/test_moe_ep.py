@@ -376,7 +376,7 @@ print("\ng1u0 no quant")
 for dtype in [dtypes.fp16, dtypes.bf16]:
     for m in [7, 128, 256]:
         for dim in [4096, 8192]:
-            for hdim in [1024,1280]:
+            for hdim in [1024, 1280]:
                 for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=2, ep=ep
@@ -386,7 +386,7 @@ print("\ng1u1 no quant")
 for dtype in [dtypes.fp16, dtypes.bf16]:
     for m in [7, 128, 256]:
         for dim in [4096, 8192]:
-            for hdim in [1024,1280]:
+            for hdim in [1024, 1280]:
                 for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype,
