@@ -83,7 +83,7 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
       return it->second;
     }
     // Otherwise, use heuristics.
-    return a4w4_blockscale_256x128x512x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x2_intrawave_v3<CDataType>;
+    return a4w4_blockscale_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x2_intrawave_v3<CDataType>;
 }
 
 torch::Tensor gemm_a4w4_blockscale(
