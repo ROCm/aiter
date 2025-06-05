@@ -1,7 +1,7 @@
 #pragma once
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <unordered_map>
 #include <vector>
 #include "communication_asm.h"
+#include "hip_float8.h"
 
 #define CUDACHECK(cmd)                                              \
   do                                                                \
@@ -401,6 +402,181 @@ namespace vllm
     }
   }
 
+  template <template <typename> class functor, typename T, int size>
+  DINLINE T packReduce(array_t<T, size> pack)
+  {
+    auto op = functor<T>();
+    T ret_val = pack.data[0];
+#pragma unroll
+    for (int i = 1; i < size; ++i)
+    {
+      ret_val = op(ret_val, pack.data[i]);
+    }
+    return ret_val;
+  }
+
+  template <template<typename> class functor, typename T, int size>
+  DINLINE array_t<T, size> packOp(array_t<T, size> a, array_t<T, size> b)
+  {
+    auto op = functor<T>();
+    array_t<T, size> ret_pack;
+#pragma unroll
+    for (int i = 0; i < size; ++i)
+    {
+      ret_pack.data[i] = op(a.data[i], b.data[i]);
+    }
+    return ret_pack;
+  }
+
+  template <typename T>
+  struct AddFunctor
+  {
+    DINLINE T operator() (T a, T b)
+    {
+      return a + b;
+    }
+  };
+
+  template <>
+  struct AddFunctor<half>
+  {
+    DINLINE half operator() (half a, half b)
+    {
+      return downcast_s<half>(upcast_s(a) + upcast_s(b));
+    }
+  };
+
+  template <typename T>
+  struct MaxFunctor
+  {
+    DINLINE T operator() (T a, T b)
+    {
+      return max(a, b);
+    }
+  };
+
+  template <typename T>
+  struct AbsMaxFunctor
+  {
+    DINLINE T operator() (T a, T b)
+    {
+      a = a > static_cast<T>(0) ? a : static_cast<T>(0) - a;
+      b = b > static_cast<T>(0) ? b : static_cast<T>(0) - b;
+      return max(a, b);
+    }
+  };
+
+  template <template <typename> class functor, typename T, int reduce_range>
+  DINLINE T warpReduce(T val)
+  {
+    auto op = functor<T>();
+#pragma unroll
+    for (int stride = reduce_range / 2; stride > 0; stride >>= 1)
+    {
+      T tmp = __shfl_xor(val, stride, reduce_range);
+      val = op(val, tmp);
+    }
+    return val;
+  }
+
+  DINLINE hip_fp8 quantHalfToFp8(half input, half scale_functor)
+  {
+    return hip_fp8(static_cast<float>(input) / static_cast<float>(scale_functor));
+  }
+
+  DINLINE half dequantFp8ToHalf(hip_fp8 input, half scale_functor)
+  {
+    return static_cast<half>(float(input) * static_cast<float>(scale_functor));
+  }
+
+  template <typename input_type, typename output_type, int size>
+  DINLINE array_t<output_type, size> packQuant(array_t<input_type, size> inp_pack, input_type scale_functor)
+  {}
+
+  template <>
+  DINLINE array_t<hip_fp8, 8> packQuant<half, hip_fp8, 8>(array_t<half, 8> inp_pack, half scale_functor)
+  {
+    array_t<hip_fp8, 8> tmp;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+      tmp.data[i] = quantHalfToFp8(inp_pack.data[i], scale_functor);
+    }
+   return tmp;
+  }
+
+  template <typename input_type, typename output_type, int size>
+  DINLINE array_t<output_type, size> packDequant(array_t<input_type, size> inp_pack, output_type scale_functor)
+  {}
+
+  template <>
+  DINLINE array_t<half, 8> packDequant<hip_fp8, half, 8>(array_t<hip_fp8, 8> inp_pack, half scale_functor)
+  {
+    array_t<half, 8> tmp;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+      tmp.data[i] = dequantFp8ToHalf(inp_pack.data[i], scale_functor);
+    }
+    return tmp;
+  }
+
+  /*
+   * quant half to fp8 in allgather
+   * */
+  #define QUANT_SCALE 128
+  __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceFp8Naive(RankData* _dp, RankSignals sg, Signal* self_sg, half* __restrict__ result, int rank, int size)
+  {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int part_size = size / 8;
+    using half_vec8 = typename packed_t<half>::P;
+    using fp8_vec8 = array_t<hip_fp8, 8>;
+    const half_vec8* ptrs[8];
+    fp8_vec8* tmps[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+    {
+      ptrs[i] = (const half_vec8*)_dp->ptrs[i];
+      tmps[i] = get_tmp_buf<fp8_vec8>(sg.signals[i]);
+    }
+    start_sync<8>(sg, self_sg, rank);
+
+    // read HBM
+    half_vec8 half8_reg = ptrs[rank][rank * part_size / 8 + index];
+#pragma unroll
+    for (int i = 1; i < 8; ++i)
+    {
+      int device_id = (rank + i) % 8;
+      half8_reg = packOp<AddFunctor, half, 8>(half8_reg, ptrs[device_id][rank * part_size / 8 + index]);
+    }
+
+    // write HBM
+    *(reinterpret_cast<half_vec8*>(&result[rank * part_size]) + index) = half8_reg;
+
+    // quant
+    half thread_max = packReduce<AbsMaxFunctor, half, 8>(half8_reg);
+    thread_max = warpReduce<MaxFunctor, half, QUANT_SCALE / 8>(thread_max);
+    half scale_factor = static_cast<half>(static_cast<float>(thread_max) / 240.0f);
+
+    // save quant rslt
+    tmps[rank][index] = packQuant<half, hip_fp8, 8>(half8_reg, scale_factor);
+    *(reinterpret_cast<half*>(&tmps[rank][part_size / 8]) + index) = scale_factor;
+    end_sync<8>(sg, self_sg, rank);
+
+#pragma unroll
+    for (int i = 1; i < 8; ++i)
+    {
+      int device_id = (rank + i) % 8;
+
+      // load quant rslt
+      scale_factor = *(reinterpret_cast<half*>(&tmps[device_id][part_size / 8]) + index);
+      half8_reg = packDequant<hip_fp8, half, 8>(tmps[device_id][index], scale_factor);
+
+      // write HBM
+      *(reinterpret_cast<half_vec8*>(&result[device_id * part_size]) + index) = half8_reg;
+    }
+  }
+
   using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
   static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
   static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
@@ -602,6 +778,18 @@ namespace vllm
                            cudaMemcpyHostToDevice));
       d_rank_data_base_ += num_buffers;
       graph_unreg_buffers_.clear();
+    }
+
+    /*
+     * call all reduce fp8 kernel
+     * case size in single gpu: (128, 8192)
+     * */
+    void runFp8QuantKernel(cudaStream_t stream, half* input, half* output, int size)
+    {
+      RankData *ptrs = get_buffer_RD(stream, input);
+      dim3 block(512);
+      dim3 grid(size / (512 * 8 * 8));
+      allReduceFp8Naive<<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
     }
 
     /**

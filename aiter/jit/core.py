@@ -59,7 +59,7 @@ logger = logging.getLogger("aiter")
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 
 find_aiter = importlib.util.find_spec("aiter")
@@ -74,20 +74,20 @@ if find_aiter is not None:
     site_packages_dirs = site.getsitepackages()
     # develop mode
     if package_path not in site_packages_dirs:
-        AITER_ROOT_DIR = AITER_CORE_DIR
+        AITER_META_DIR = AITER_ROOT_DIR
     # install mode
     else:
-        AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
+        AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
 else:
-    AITER_ROOT_DIR = AITER_CORE_DIR
+    AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
 
-AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
-AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
-AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/"
+AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
+AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
-    "CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel"
+    "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
 
 
@@ -95,7 +95,7 @@ CK_3RDPARTY_DIR = os.environ.get(
 def get_asm_dir():
     gfx = get_gfx()
     global AITER_ASM_DIR
-    AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/{gfx}/"
+    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
     os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
     return AITER_ASM_DIR
 
@@ -249,6 +249,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
+    hipify=True,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -365,12 +366,13 @@ def build_module(
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                hipify=hipify,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
-                    f"{opbd_dir}/{target_name}", f"{AITER_CORE_DIR}/op_tests/cpp/mha"
+                    f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
@@ -444,6 +446,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
+                    # exclude
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
@@ -510,6 +513,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
+                hipify = d_args.get("hipify", True)
                 build_module(
                     md_name,
                     srcs,
@@ -522,6 +526,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_python_module,
                     is_standalone,
                     torch_exclude,
+                    hipify,
                 )
                 if is_python_module:
                     module = get_module(md_name)

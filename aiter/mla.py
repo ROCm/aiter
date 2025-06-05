@@ -9,7 +9,7 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
-from .jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -24,6 +24,9 @@ def _fwd_kernel_stage2_asm(
     stride_mid_os,
     stride_obs,
     stride_oh,
+    bs,
+    nheads,
+    max_seqlen_q,
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -171,6 +174,9 @@ def mla_decode_fwd(
         attn_lse.stride(1),
         o.stride(0),
         o.stride(1),
+        bs,
+        nhead,
+        max_seqlen_q,
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,

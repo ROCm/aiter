@@ -3,6 +3,7 @@
 #include "activation.h"
 #include "attention.h"
 #include "attention_ragged.h"
+#include "attention_v1.h"
 #include "attention_ck.h"
 #include "attention_asm.h"
 #include "attention_asm_mla.h"
@@ -75,6 +76,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
       QUANT_PYBIND;
       ATTENTION_ASM_PYBIND;
       ATTENTION_RAGGED_PYBIND;
+      ATTENTION_V1_PYBIND;
       MOE_OP_PYBIND;
       ROPE_GENERAL_FWD_PYBIND;
       ROPE_GENERAL_BWD_PYBIND;

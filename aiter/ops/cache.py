@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 from torch import Tensor
+from typing import Optional
 from ..jit.core import compile_ops
 
 MD_NAME = "module_cache"
@@ -17,16 +19,16 @@ def copy_blocks(key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor)
 
 @compile_ops("module_cache")
 def reshape_and_cache(
-    key: Tensor,
-    value: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-    slot_mapping: Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-    asm_layout: bool,
-): ...
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    asm_layout: bool = False,
+) -> None: ...
 
 
 @compile_ops("module_cache")

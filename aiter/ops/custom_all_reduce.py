@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from typing import List
@@ -22,7 +22,9 @@ def init_custom_ar(
 
 
 @compile_ops("module_custom_all_reduce")
-def all_reduce_reg(_fa: int, inp: torch.Tensor, out: torch.Tensor): ...
+def all_reduce_reg(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, open_fp8_quant: bool
+): ...
 
 
 @compile_ops("module_custom_all_reduce")

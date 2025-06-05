@@ -8,7 +8,7 @@ import functools
 import pandas as pd
 from ..jit.core import (
     compile_ops,
-    AITER_CORE_DIR,
+    AITER_ROOT_DIR,
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
@@ -82,7 +82,7 @@ def get_CKGEMM_config(
 ):
     if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
         ckgemm_dict = pd.read_csv(
-            f"{AITER_CORE_DIR}/aiter/configs/a8w8_tuned_gemm.csv"
+            f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv"
         ).drop_duplicates()
         get_CKGEMM_config.ckgemm_dict = ckgemm_dict.set_index(["M", "N", "K"]).to_dict(
             "index"
@@ -100,7 +100,7 @@ def get_CKGEMM_config(
 def get_ASMGEMM_config(M: int, N: int, K: int, bias: bool, dtype: torch.dtype):
     if not hasattr(get_ASMGEMM_config, "asmgemm_dict"):
         asmGemmDictDf = pd.read_csv(
-            f"{AITER_CORE_DIR}/aiter/configs/asm_a8w8_gemm.csv"
+            f"{AITER_ROOT_DIR}/aiter/configs/asm_a8w8_gemm.csv"
         ).drop_duplicates()
         asmGemmDictDf.bias = asmGemmDictDf.bias.apply(
             lambda s: True if s in ["True", 1, "true"] else False
