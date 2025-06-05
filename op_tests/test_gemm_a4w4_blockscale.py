@@ -7,6 +7,7 @@ import aiter
 from aiter import dtypes
 from aiter.utility import fp4_utils
 from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.ops.shuffle import shuffle_weight
 from einops import rearrange
 from einops import repeat as eirp
 import pandas as pd
@@ -49,27 +50,18 @@ def test_gemm(dtype, m, n, k):
 
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((m, k), dtype=dtype)
-    w = torch.ones((n, k), dtype=dtype)
+    w = torch.randn((n, k), dtype=dtype)
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
     x, x_scales_shuffle = quant_func(x, shuffle=True)
     w, w_scales_shuffle = quant_func(w, shuffle=True)
+    w_shuffle = shuffle_weight(w)
     out_ck = torch.empty((m + 255) // 256 * 256, n, dtype=dtype)
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
 
     a = run_torch(x, w, x_scales, w_scales, dtype)
-    b, avg_b = run_gemm_ck(x, w, x_scales_shuffle, w_scales_shuffle, out_ck)
-    print(x_scales.shape)
-    print(x_scales_shuffle.shape)
-    print(x.shape)
-    print(w.shape)
-    # print(a.shape)
-    # print(b.shape)
-    # print(a[0, 0:10])
-    # print(b[0, 0:10])
-    # print(b.shape)
-    # print(out_ck.shape)
+    b, avg_b = run_gemm_ck(x, w_shuffle, x_scales_shuffle, w_scales_shuffle, out_ck)
 
     err1 = checkAllclose(a, b[:m], msg="ck   ")
     tflops_b = m * n * k * 2 / avg_b / 1e6
