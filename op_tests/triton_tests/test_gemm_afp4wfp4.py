@@ -37,9 +37,13 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
         dtype = str_to_torch_dtype[dtype]
 
     # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
-    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
-    x = x_low | x_high << 4
+    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+    x = (
+        x_high << 4 | x_low
+    )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
+    x = x.to(device="cuda")
+
     w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w = w_low | w_high << 4
@@ -108,6 +112,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    x_vals += [(256, 3584, 2112)]
     return x_vals
 
 
