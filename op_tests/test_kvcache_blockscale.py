@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
-from aiter.test_common import checkAllclose, perftest, run_perftest, benchmark
+from aiter.test_common import checkAllclose, run_perftest, benchmark
 from typing import Tuple
 from aiter import dtypes
 import functools
@@ -26,8 +26,6 @@ def run_torch(
 ):
     num_batch, num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
-    dtype = k_cache.dtype
-    device = k_cache.device
     k_cache_shape = k_cache.shape
     v_cache_shape = v_cache.shape
 
