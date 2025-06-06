@@ -249,6 +249,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
+    hipify=True,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -311,9 +312,8 @@ def build_module(
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
-        for i in reversed(range(len(flags_hip))):
-            if not hip_flag_checker(flags_hip[i]):
-                del flags_hip[i]
+        flags_hip = list(set(flags_hip))  # remove same flags
+        flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
@@ -366,6 +366,7 @@ def build_module(
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                hipify=hipify,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -445,6 +446,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     # Cannot contain tune ops
                     if ops_name.endswith("tune"):
                         continue
+                    # exclude
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
@@ -511,6 +513,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
+                hipify = d_args.get("hipify", True)
                 build_module(
                     md_name,
                     srcs,
@@ -523,6 +526,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_python_module,
                     is_standalone,
                     torch_exclude,
+                    hipify,
                 )
                 if is_python_module:
                     module = get_module(md_name)

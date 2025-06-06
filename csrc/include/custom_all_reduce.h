@@ -19,11 +19,14 @@
 
 // all reduce
 using fptr_t = int64_t;
+
+namespace aiter {
+
 fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
                       const std::vector<std::string> &handles,
                       const std::vector<int64_t> &offsets, int64_t rank,
                       bool full_nvlink);
-void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out);
+void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant);
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
                       torch::Tensor &out);
 
@@ -40,3 +43,5 @@ void register_graph_buffers(fptr_t _fa, const std::vector<std::string> &handles,
 torch::Tensor allocate_meta_buffer(int64_t size);
 torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp);
 #endif
+
+} // namespace aiter

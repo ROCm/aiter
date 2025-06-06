@@ -94,6 +94,7 @@ void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& bl
 
 } // namespace aiter
 
+
 namespace vllm {
 
 // Grid: (num_layers, num_pairs)
@@ -129,6 +130,8 @@ __global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
 }
 
 } // namespace vllm
+
+namespace aiter {
 
 // Note: the key_caches and value_caches vectors are constant but
 // not the Tensors they contain. The vectors need to be const refs
@@ -183,6 +186,12 @@ void copy_blocks(std::vector<torch::Tensor> const& key_caches,
 }
 
 } // namespace aiter
+<<<<<<< HEAD
+=======
+
+namespace vllm
+{
+>>>>>>> main
 
 namespace vllm {
 
@@ -828,6 +837,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
                                      k_scale.data_ptr<float>(),                          \
                                      v_scale.data_ptr<float>());
 
+namespace aiter {
+
 void reshape_and_cache(
     torch::Tensor& key,          // [num_tokens, num_heads, head_size]
     torch::Tensor& value,        // [num_tokens, num_heads, head_size]
@@ -863,6 +874,8 @@ void reshape_and_cache(
     }
 }
 
+} // namespace aiter
+
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
 // KV_DTYPE is the real data type of kv-cache.
@@ -881,6 +894,8 @@ void reshape_and_cache(
                                      block_size,                                         \
                                      k_scale.data_ptr<float>(),                          \
                                      v_scale.data_ptr<float>());
+
+namespace aiter {
 
 void reshape_and_cache_flash(
     torch::Tensor& key,          // [num_tokens, num_heads, head_size]
@@ -909,6 +924,7 @@ void reshape_and_cache_flash(
 
     DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype, CALL_RESHAPE_AND_CACHE_FLASH);
 }
+} // namespace aiter
 
 // KV_T is the stored data type of kv-cache.
 // CACHE_T is the data type of key and value tensors.
@@ -1002,6 +1018,8 @@ void reshape_and_cache_flash(
                 seq_len,                                                                      \
                 dtypeMax);                                                                    \
     }
+
+namespace aiter {
 
 void reshape_and_cache_with_pertoken_quant(
     torch::Tensor& key,              // [num_tokens, num_heads, head_size]
@@ -1161,6 +1179,7 @@ void reshape_and_cache_with_block_quant(
         TORCH_CHECK(false, "Unsupported data type of kv cache: ", key_cache.dtype());
     }
 }
+} // namespace aiter
 
 namespace vllm {
 
@@ -1186,6 +1205,8 @@ __global__ void convert_fp8_kernel(const Tin* __restrict__ src_cache,
                                      reinterpret_cast<Tout*>(dst_cache.data_ptr()), \
                                      scale,                                         \
                                      block_stride);
+
+namespace aiter {
 
 // Only for testing.
 void convert_fp8(torch::Tensor& dst_cache,
@@ -1266,3 +1287,4 @@ void convert_fp8(torch::Tensor& dst_cache,
         TORCH_CHECK(false, "Unsupported data type: ", kv_cache_dtype);
     }
 }
+} // namespace aiter

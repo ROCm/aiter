@@ -332,7 +332,6 @@ def get_compiler_abi_compatibility_and_version(
                 versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
             )
             version = ["0", "0", "0"] if match is None else list(match.groups())
-
     except Exception:
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
@@ -1114,6 +1113,7 @@ def _jit_compile(
     is_standalone,
     keep_intermediates=True,
     torch_exclude=False,
+    hipify=True,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1160,7 +1160,7 @@ def _jit_compile(
                         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
                         torch_path = os.path.join(_TORCH_PATH, "*")
 
-                    if IS_HIP_EXTENSION and with_cuda:
+                    if IS_HIP_EXTENSION and with_cuda and hipify:
                         hipify_result = hipify_python.hipify(
                             project_directory=build_directory,
                             output_directory=build_directory,
@@ -1305,7 +1305,7 @@ def _write_ninja_file_and_build_library(
     _write_ninja_file_to_build_library(
         path=build_file_path,
         name=name,
-        sources=sources,
+        sources=list(set(sources)),
         extra_cflags=extra_cflags or [],
         extra_cuda_cflags=extra_cuda_cflags or [],
         extra_ldflags=extra_ldflags or [],

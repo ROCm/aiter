@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 torch::Tensor gemm_a4w4_asm(torch::Tensor &A,       // A:[M, K/2] f4x2
@@ -11,3 +11,4 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor &A,       // A:[M, K/2] f4x2
                             torch::Tensor &bias,    // bias:[M, N] f32
                             std::optional<float> alpha = 1.0,
                             std::optional<float> beta = 0.0);
+
