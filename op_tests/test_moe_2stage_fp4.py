@@ -22,9 +22,11 @@ from aiter import dtypes
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant
 from aiter import fp4_utils
+
 # from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 DEBUG_MODE = False
+
 
 def ck_moe_stage1(
     hidden_states,
@@ -73,6 +75,7 @@ def ck_moe_stage1(
 
     return out
 
+
 def ck_moe_stage2(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]
@@ -113,6 +116,7 @@ def ck_moe_stage2(
     )
     return out
 
+
 def torch_moe_stage1(
     a,
     b,
@@ -139,7 +143,7 @@ def torch_moe_stage1(
     # b_indexed = b[topk_ids]
 
     c = torch.zeros(
-        (M, top_k, N*2),
+        (M, top_k, N * 2),
         dtype=torch.float,
         device=a.device,
     )
@@ -162,6 +166,7 @@ def torch_moe_stage1(
         c = torch_act(c)
 
     return c.to(dtype)
+
 
 def torch_moe_stage2(
     a,
@@ -565,7 +570,6 @@ torch_to_tl_dtype = {
 )
 @pytest.mark.parametrize("routed_weight", [False, True])
 @pytest.mark.parametrize("swizzle_mx_scale", [False])  # TODO Add support for swizzle
-
 def test_fused_moe(
     tokens: int,
     model_dim: int,
@@ -586,9 +590,15 @@ def test_fused_moe(
     a_dtype = str_to_torch_dtype[a_dtype_str]
     c_dtype = torch.bfloat16 if is_a_mixed_input else a_dtype
     fp16_dtype = torch.float16 if a_dtype_str == "fp16" else torch.bfloat16
-    a_tri_ = alloc_rand((tokens, model_dim), dtype=c_dtype, device="cuda", requires_grad=False)
-    b1_tri_ = alloc_rand((E, inter_dim * 2, model_dim), dtype=c_dtype, device="cuda", requires_grad=False)
-    b2_tri_ = alloc_rand((E, model_dim, inter_dim), dtype=c_dtype, device="cuda", requires_grad=False)
+    a_tri_ = alloc_rand(
+        (tokens, model_dim), dtype=c_dtype, device="cuda", requires_grad=False
+    )
+    b1_tri_ = alloc_rand(
+        (E, inter_dim * 2, model_dim), dtype=c_dtype, device="cuda", requires_grad=False
+    )
+    b2_tri_ = alloc_rand(
+        (E, model_dim, inter_dim), dtype=c_dtype, device="cuda", requires_grad=False
+    )
 
     # a_tri = alloc_rand((1, 1), dtype=fp16_dtype, device="cuda", requires_grad=False)
     # a_tri = a_tri.repeat(tokens, inter_dim)
@@ -605,7 +615,13 @@ def test_fused_moe(
     a_scale = torch.tensor([1.00], dtype=torch.float32, device="cuda")
     b_scale = torch.tensor([1.00] * E, dtype=torch.float32, device="cuda")
     # Reference inputs
-    a_ref, b1_ref, b2_ref, c1_ref, c2_ref = a_tri_.clone(), b1_tri_.clone(), b2_tri_.clone(), c1_tri.clone(), c2_tri.clone()
+    a_ref, b1_ref, b2_ref, c1_ref, c2_ref = (
+        a_tri_.clone(),
+        b1_tri_.clone(),
+        b2_tri_.clone(),
+        c1_tri.clone(),
+        c2_tri.clone(),
+    )
 
     # Try fixed config for now
     config = {
@@ -624,8 +640,8 @@ def test_fused_moe(
     # softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = fused_topk(a_tri_, values, top_k, True)
 
-    sorted_token_ids, sorted_weights, expert_ids, num_tokens_post_padded, moe_buf = moe_sorting(
-        topk_ids, topk_weights, E, model_dim, a_tri_.dtype, block_size_m
+    sorted_token_ids, sorted_weights, expert_ids, num_tokens_post_padded, moe_buf = (
+        moe_sorting(topk_ids, topk_weights, E, model_dim, a_tri_.dtype, block_size_m)
     )
     # print(f"{topk_ids=}, {topk_weights=}, {E=}, {model_dim=}, {a_tri_.dtype=}, {block_size_m=}")
     # expert_ids = torch.zeros_like(expert_ids)
@@ -652,7 +668,7 @@ def test_fused_moe(
         # swizzle_axis = 1 if swizzle_mx_scale else None  # TODO Add Swizzle support
         b1_tri, b1_mx_scales = aiter_quant(b1_tri_.view(-1, model_dim), shuffle=False)
         b2_tri, b2_mx_scales = aiter_quant(b2_tri_.view(-1, inter_dim), shuffle=False)
-        
+
         b1_tri = b1_tri.view(E, inter_dim * 2, -1).cuda()
         b1_mx_scales = b1_mx_scales.view(E, inter_dim * 2, -1).cuda()
 
@@ -714,13 +730,18 @@ def test_fused_moe(
         dtype=fp16_dtype,
     )
 
-    a_mx_scales = moe_mxfp4_sort(a_mx_scales, sorted_ids=sorted_token_ids, num_valid_ids=num_tokens_post_padded, token_num=tokens, block_size=block_size_m)
+    a_mx_scales = moe_mxfp4_sort(
+        a_mx_scales,
+        sorted_ids=sorted_token_ids,
+        num_valid_ids=num_tokens_post_padded,
+        token_num=tokens,
+        block_size=block_size_m,
+    )
     # print(f"{sorted_token_ids=}, {num_tokens_post_padded=}, {tokens=}, {block_size_m=}")
     b1_tri, b1_mx_scales = aiter_quant(b1_tri_.view(-1, model_dim), shuffle=True)
- 
+
     b1_tri = b1_tri.view(E, inter_dim * 2, -1).cuda()
     b1_mx_scales = b1_mx_scales.view(E, inter_dim * 2, -1).cuda()
-
 
     out1_ck, us = run_perftest(
         ck_moe_stage1,
@@ -743,7 +764,6 @@ def test_fused_moe(
         out1_ck,
         msg=f"[perf]  ck_moe_stage1:{us:>8.2f} us, {(tokens * model_dim * inter_dim * 2 * top_k * 2 + tokens * model_dim * inter_dim * 2 * top_k * 2 / 32)/us/1000/1000:>8.2f} tflops......(quant)",
     )
-
 
     if is_a_mixed_input:
         # a_ref = a_tri
@@ -781,14 +801,19 @@ def test_fused_moe(
         dtype=fp16_dtype,
     )
 
-
-    a2_mx_scales = moe_mxfp4_sort(a2_mx_scales, sorted_ids=sorted_token_ids, num_valid_ids=num_tokens_post_padded, token_num=tokens, block_size=block_size_m)
+    a2_mx_scales = moe_mxfp4_sort(
+        a2_mx_scales,
+        sorted_ids=sorted_token_ids,
+        num_valid_ids=num_tokens_post_padded,
+        token_num=tokens,
+        block_size=block_size_m,
+    )
     # aiter_quant = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     b2_tri2, b2_mx_scales2 = aiter_quant(b2_tri_.view(-1, inter_dim), shuffle=True)
     b2_tri2 = b2_tri2.view(E, model_dim, -1)
     b2_mx_scales2 = b2_mx_scales2.view(E, model_dim, -1)
-    
-    out2_ck, us= run_perftest(
+
+    out2_ck, us = run_perftest(
         ck_moe_stage2,
         a2_tri,
         b2_tri2,
@@ -823,14 +848,13 @@ def test_fused_moe(
         activation=ActivationType.Silu,
         doweight_stage1=False,
     )
-    
+
     checkAllclose(
         c2_ref,
         out_ck,
         msg=f"ck_moe_2stages:{us:>8.2f} us, {(2 * tokens * model_dim * inter_dim * top_k * 3 + 2 * tokens * model_dim * inter_dim * top_k * 3 / 32)/us/1000/1000:>8.2f} tflops......(quant)",
         # rtol=5e-2, atol=5e-2
     )
-
 
 
 test_fused_moe(8192, 6144, 4096, 2, 8, "mxfp4_e2m1", "mxfp4_e2m1", False, False)

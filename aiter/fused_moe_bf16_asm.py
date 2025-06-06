@@ -15,6 +15,7 @@ from aiter.fused_moe import moe_sorting
 
 BLOCK_SIZE_M = 32
 
+
 def torch_dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even"
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -129,6 +130,7 @@ def torch_dynamic_mxfp4_quant(
     bs_e8m0 = bs_e8m0.reshape(bs_e8m0_shape)
 
     return x_mxfp4, bs_e8m0
+
 
 def moe_sorting_ck(
     topk_ids,
@@ -562,32 +564,34 @@ def ck_moe_2stages(
         q_dtype_a = torch.float8_e4m3fnuz
     # q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else torch.float8_e4m3fnuz
 
-    
-    
     if w1.dtype is torch.uint32:
         inter_dim = inter_dim * 8
 
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
-    
+
     _, topk = topk_ids.shape
-    M, _ = a1.shape 
+    M, _ = a1.shape
     dtype = a1.dtype
     device = topk_ids.device
     if block_size is None:
         block_size = get_block_size(M, topk, E)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
-        moe_sorting(
-            topk_ids, topk_weight, global_E, model_dim, dtype, block_size
-        )
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
+        topk_ids, topk_weight, global_E, model_dim, dtype, block_size
     )
     # print(f"{topk_ids=}, {topk_weight=}, {global_E=}, {model_dim=}, {dtype=}, {block_size=}")
     # print("block_size:", block_size, sorted_expert_ids)
     # a1, a1_scale = quant_func(a1, scale=a1_scale, shuffle=False)
     # return a1
     a1, a1_scale = dynamic_mxfp4_quant(a1)
-    a1_scale = moe_mxfp4_sort(a1_scale, sorted_ids=sorted_ids, num_valid_ids=num_valid_ids, token_num=M, block_size=block_size)
+    a1_scale = moe_mxfp4_sort(
+        a1_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=M,
+        block_size=block_size,
+    )
     # print(f"{sorted_ids=}, {num_valid_ids=}, {M=}, {block_size=}")
     a2 = torch.empty(
         (M, topk, inter_dim),
@@ -625,9 +629,14 @@ def ck_moe_2stages(
     a2 = a2.view(M, topk, -1)
     a2_scale = a2_scale.view(M, topk, -1)
 
-    a2_scale = moe_mxfp4_sort(a2_scale, sorted_ids=sorted_ids, num_valid_ids=num_valid_ids, token_num=M, block_size=block_size)
+    a2_scale = moe_mxfp4_sort(
+        a2_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=M,
+        block_size=block_size,
+    )
 
-    
     aiter.ck_moe_stage2(
         a2,
         w1,

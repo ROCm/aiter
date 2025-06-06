@@ -21,12 +21,16 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.view(*x.shape)
     return x_
 
+
 def shuffle_scale(scale: torch.Tensor) -> torch.Tensor:
     m, n = scale.shape
     block_size = 32
     n = n * block_size
     scale_padded = torch.empty(
-        (m + 255) // 256 * 256, (n // block_size + 7) // 8 * 8, dtype=torch.uint8, device=scale.device
+        (m + 255) // 256 * 256,
+        (n // block_size + 7) // 8 * 8,
+        dtype=torch.uint8,
+        device=scale.device,
     ).fill_(0x7F)
 
     scale_padded[:m, : n // block_size] = scale
