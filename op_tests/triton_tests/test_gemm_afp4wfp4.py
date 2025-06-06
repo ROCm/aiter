@@ -4,12 +4,16 @@ import pytest
 import os
 import torch
 import triton
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4, gemm_afp4wfp4_preshuffled_scales
+from aiter.ops.triton.gemm_afp4wfp4 import (
+    gemm_afp4wfp4,
+    gemm_afp4wfp4_preshuffled_scales,
+)
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
 )
+
 
 def shuffle_scales(scales: torch.Tensor):
     scales_shuffled = scales.clone()
@@ -71,7 +75,16 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     else:
         out_dtype = dtype
 
-    return x, w, x_scales[:M], w_scales, x_scales_shuffled, w_scales_shuffled, out_dtype, y
+    return (
+        x,
+        w,
+        x_scales[:M],
+        w_scales,
+        x_scales_shuffled,
+        w_scales_shuffled,
+        out_dtype,
+        y,
+    )
 
 
 def get_x_vals():
@@ -186,9 +199,13 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
 
     if TRITON_HIP_PRESHUFFLE_SCALES:
         if output:
-            triton_out = gemm_afp4wfp4_preshuffled_scales(x, w, x_scales_triton, w_scales_triton, dtype, y)
+            triton_out = gemm_afp4wfp4_preshuffled_scales(
+                x, w, x_scales_triton, w_scales_triton, dtype, y
+            )
         else:
-            triton_out = gemm_afp4wfp4_preshuffled_scales(x, w, x_scales_triton, w_scales_triton, dtype)
+            triton_out = gemm_afp4wfp4_preshuffled_scales(
+                x, w, x_scales_triton, w_scales_triton, dtype
+            )
     else:
         if output:
             triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype, y)
