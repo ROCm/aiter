@@ -173,7 +173,10 @@ def act_mul_and_mxfp4_quant(
     N_half = N // 2
     x_fp4 = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
     blockscale_e8m0 = torch.empty(
-        ((N_half + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, (M + 255) // 256 * 256),
+        (
+            (N_half + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE,
+            (M + 255) // 256 * 256,
+        ),
         dtype=torch.uint8,
         device=x.device,
     ).T
@@ -228,6 +231,7 @@ def act_mul_and_mxfp4_quant(
     )
 
     return x_fp4, blockscale_e8m0
+
 
 @triton.heuristics(
     {
@@ -312,7 +316,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel_shuffle_scales(
 
         bs_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
-        
+
         bs_offs_0 = bs_offs_m[:, None] // 32
         bs_offs_1 = bs_offs_m[:, None] % 32
         bs_offs_2 = bs_offs_1 % 16
@@ -330,11 +334,9 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel_shuffle_scales(
             + bs_offs_0 * 2 * 16 * scaleN
         )
         bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-        bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[
-            None, :
-        ]
+        bs_mask = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
         bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
-        
+
         if EVEN_M_N:
             tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
@@ -385,7 +387,7 @@ def act_mul_and_mxfp4_quant_shuffle_scales(
     scaleM = (M + 255) // 256 * 256
     scaleN_valid = (N_half + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
     scaleN = (scaleN_valid + 7) // 8 * 8
-    
+
     blockscale_e8m0 = torch.empty(
         (scaleM, scaleN),
         dtype=torch.uint8,

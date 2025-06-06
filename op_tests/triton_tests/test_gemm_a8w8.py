@@ -81,6 +81,7 @@ def get_x_vals():
     ]
     return x_vals
 
+
 @aiter_register_input_generator("gemm_a8w8")
 def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype, output=False):
 

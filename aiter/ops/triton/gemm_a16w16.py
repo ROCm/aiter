@@ -122,12 +122,13 @@ def _get_config(
 
 # Wrapper for gemm kernel.
 @aiter_register(module=sys.modules[__name__], kernels=["_gemm_a16_w16_kernel"])
-def gemm_a16w16(x, 
-                w, 
-                dtype: Optional[float] = torch.bfloat16,
-                y: Optional[torch.Tensor] = None,
-                config: Optional[dict] = None,
-                ):
+def gemm_a16w16(
+    x,
+    w,
+    dtype: Optional[float] = torch.bfloat16,
+    y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
+):
     """
     Computes the 16 bit matmul Y = X x W
 

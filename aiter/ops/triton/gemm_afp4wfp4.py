@@ -270,7 +270,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE) * 32) + tl.arange(
             0, BLOCK_SIZE_K // SCALE_GROUP_SIZE * 32
         )
-            # B scales are N x K even though B operand is K x N.
+        # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr
             + offs_asn[:, None] * stride_bsn
@@ -278,9 +278,9 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         )
 
         if BLOCK_SIZE_M < 32:
-            offs_ks_non_shufl = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-            )
+            offs_ks_non_shufl = (
+                pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)
+            ) + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
             a_scale_ptrs = (
                 a_scales_ptr
                 + offs_am[:, None] * stride_asm
@@ -586,8 +586,11 @@ def gemm_afp4wfp4(
 
     return y
 
+
 # Wrapper for gemm kernel.
-@aiter_register(module=sys.modules[__name__], kernels=["_gemm_afp4_wfp4_kernel_preshuffled_scales"])
+@aiter_register(
+    module=sys.modules[__name__], kernels=["_gemm_afp4_wfp4_kernel_preshuffled_scales"]
+)
 def gemm_afp4wfp4_preshuffled_scales(
     x,
     w,
@@ -616,7 +619,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     M, K = x.shape
     K, N = w.shape
-    
+
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 

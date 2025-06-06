@@ -3,7 +3,10 @@ import sys
 import os
 import torch
 import triton
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4, gemm_afp4wfp4_preshuffled_scales
+from aiter.ops.triton.gemm_afp4wfp4 import (
+    gemm_afp4wfp4,
+    gemm_afp4wfp4_preshuffled_scales,
+)
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
 from utils.benchmark_utils import get_model_configs, get_available_models
 import os
@@ -11,6 +14,7 @@ import os
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
 )
+
 
 def model_benchmark_shapes(args):
     config_file = args.model_configs
@@ -102,7 +106,9 @@ def run_benchmark(args):
 
         if TRITON_HIP_PRESHUFFLE_SCALES:
             ms = triton.testing.do_bench(
-                lambda: gemm_afp4wfp4_preshuffled_scales(x, w, x_scale, w_scale, c_dtype, out),
+                lambda: gemm_afp4wfp4_preshuffled_scales(
+                    x, w, x_scale, w_scale, c_dtype, out
+                ),
                 warmup=25,
                 rep=100,
             )
