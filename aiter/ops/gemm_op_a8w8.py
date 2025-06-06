@@ -197,7 +197,7 @@ def gemm_a8w8_bpreshuffle_CK(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    k = XQ.shape[-1]
+    # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
 
@@ -211,7 +211,7 @@ def gemm_a8w8_blockscale_CK(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    k = XQ.shape[-1]
+    # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, Y)
 
@@ -228,7 +228,7 @@ def flatmm_a8w8_blockscale_ASM(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    k = XQ.shape[-1]
+    # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
