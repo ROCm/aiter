@@ -9,3 +9,12 @@ torch::Tensor gemm_a4w4_blockscale(
     torch::Tensor &a_scale,
     torch::Tensor &b_scale,
     torch::Tensor &C);
+
+torch::Tensor gemm_a4w4_blockscale_tune(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int kernelId,
+    int splitK);

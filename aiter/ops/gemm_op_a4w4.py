@@ -60,3 +60,14 @@ def gemm_a4w4_blockscale(
     w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
 ): ...
+
+@compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
+def gemm_a4w4_blockscale_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK=0,
+): ...
