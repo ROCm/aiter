@@ -7,16 +7,16 @@
 #undef __HIP_NO_HALF_OPERATORS__
 #undef __HIP_NO_HALF_CONVERSIONS__
 
+#include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <numeric>
-#include <initializer_list>
-#include <cstdlib>
 
 #include <ATen/ATen.h>
-#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
 
 #include "ck/ck.hpp"
 #include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
@@ -24,12 +24,12 @@
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 #include "ck/tensor_operation/gpu/element/unary_element_wise_operation.hpp"
 
+#include "ck/library/reference_tensor_operation/cpu/reference_gemm.hpp"
+#include "ck/library/utility/check_err.hpp"
 #include "ck/library/utility/device_memory.hpp"
 #include "ck/library/utility/host_tensor.hpp"
 #include "ck/library/utility/host_tensor_generator.hpp"
 #include "ck/library/utility/literals.hpp"
-#include "ck/library/reference_tensor_operation/cpu/reference_gemm.hpp"
-#include "ck/library/utility/check_err.hpp"
 
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 
@@ -40,9 +40,9 @@ using F16  = ck::half_t;
 using BF16 = ck::bhalf_t;
 using FP8  = ck::f8_t;
 using F32  = float;
-using B16 = ck::bhalf_t;
-using Row = ck::tensor_layout::gemm::RowMajor;
-using Col = ck::tensor_layout::gemm::ColumnMajor;
+using B16  = ck::bhalf_t;
+using Row  = ck::tensor_layout::gemm::RowMajor;
+using Col  = ck::tensor_layout::gemm::ColumnMajor;
 
 using A0DataType       = FP8;
 using B0DataType       = FP8;
@@ -114,23 +114,30 @@ using AElementOp   = PassThrough;
 using BElementOp   = PassThrough;
 using CDEElementOp = MultiplyMultiply;
 
-
-template <typename AccDataType, typename EDataType,
+template <typename AccDataType,
+          typename EDataType,
           ck::index_t BlockSize,
-          ck::index_t MPerBlock, ck::index_t NPerBlock, ck::index_t KPerBlock,
-          ck::index_t AK1, ck::index_t BK1,
-          ck::index_t MPerXDL, ck::index_t NPerXDL,
-          ck::index_t MXdlPerWave, ck::index_t NXdlPerWave,
+          ck::index_t MPerBlock,
+          ck::index_t NPerBlock,
+          ck::index_t KPerBlock,
+          ck::index_t AK1,
+          ck::index_t BK1,
+          ck::index_t MPerXDL,
+          ck::index_t NPerXDL,
+          ck::index_t MXdlPerWave,
+          ck::index_t NXdlPerWave,
           typename ABlockTransferThreadClusterLengths_AK0_M_AK1,
           typename BBlockTransferThreadClusterLengths_BK0_N_BK1,
           ck::index_t CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
           ck::index_t CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
           typename CShuffleBlockTransferClusterLengths_MBlock_MPerBlock_NBlock_NPerBlock,
           typename CDEShuffleBlockTransferScalarPerVectors,
-          ck::BlockGemmPipelineScheduler BlkGemmPipeSched = ck::BlockGemmPipelineScheduler::Intrawave,
+          ck::BlockGemmPipelineScheduler BlkGemmPipeSched =
+              ck::BlockGemmPipelineScheduler::Intrawave,
           ck::BlockGemmPipelineVersion BlkGemmPipelineVer = ck::BlockGemmPipelineVersion::v3,
           auto GemmSpec = ck::tensor_operation::device::GemmSpecialization::Default>
-using DeviceGemmHelperF8Flatmm = ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle
+using DeviceGemmHelperF8Flatmm =
+    ck::tensor_operation::device::DeviceGemmMultiD_Xdl_CShuffle_V3_BPreshuffle
     // clang-format off
          <A0Layout, B0Layout, DsLayout, ELayout,
           A0DataType, B0DataType, DsDataType, EDataType, AccDataType, CShuffleDataType, 
