@@ -48,6 +48,7 @@ def run_gemm_skinny(
         out = out.to(bias) + bias
     return out.to(dtype)
 
+
 @benchmark()
 def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     dim = (m, n, k)
