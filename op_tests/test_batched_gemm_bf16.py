@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
+import argparse
+import itertools
 
 
 @perftest(num_iters=5)
@@ -38,36 +40,62 @@ def test_gemm(dtype, b, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 
-for dtype in [dtypes.bf16]:
-    # qkv_proj
-    for b, m, n, k in [
-        (16, 1, 1280, 8192),
-        (16, 32, 1280, 8192),
-        (16, 64, 1280, 8192),
-        (16, 128, 1280, 8192),
-        (16, 192, 1280, 8192),
-        (16, 256, 1280, 8192),
-        (16, 320, 1280, 8192),
-        (16, 512, 1280, 8192),
-        (16, 1024, 1280, 8192),
-        (16, 2048, 1280, 8192),
-        (16, 4096, 1280, 8192),
-        (16, 8192, 1280, 8192),
-    ]:
-        test_gemm(dtype, b, m, n, k)
-    # attn_out
-    for b, m, n, k in [
-        (16, 1, 8192, 1024),
-        (16, 32, 8192, 1024),
-        (16, 64, 8192, 1024),
-        (16, 128, 8192, 1024),
-        (16, 192, 8192, 1024),
-        (16, 256, 8192, 1024),
-        (16, 320, 8192, 1024),
-        (16, 512, 8192, 1024),
-        (16, 1024, 8192, 1024),
-        (16, 2048, 8192, 1024),
-        (16, 4096, 8192, 1024),
-        (16, 8192, 8192, 1024),
-    ]:
+l_dtype = ['bf16']
+l_b = [16]
+l_m = [1, 32, 64, 128, 192, 256, 320, 512, 1024, 2048, 4096, 8192]
+l_n = [1028, 8192]
+l_k = [8192, 1024]
+
+parser = argparse.ArgumentParser(description='config input of test')
+parser.add_argument('-d', '--dtype',
+                    type=str,
+                    choices=l_dtype,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='data type')
+parser.add_argument('-b', '--batch',
+                    type=int,
+                    choices=l_b,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='batch size')
+parser.add_argument('-m',
+                    type=int,
+                    choices=l_m,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='m: Represents the number of rows in the output matrix ( C ) and the first input matrix ( A ).')
+parser.add_argument('-n',
+                    type=int,
+                    choices=l_n,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='n: Represents the number of columns in the output matrix ( C ) and the second input matrix ( B ).')
+parser.add_argument('-k',
+                    type=int,
+                    choices=l_k,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='k: Represents the number of columns in the first input matrix ( A ) and the number of rows in the second input matrix ( B ).')
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.batch is not None:
+    l_b = [args.bitch]
+if args.m is not None:
+    l_m = [args.m]
+if args.n is not None:
+    l_n = [args.n]
+if args.k is not None:
+    l_k = [args.k]
+
+for dtype in l_dtype:
+    for b, m, n, k in itertools.product(l_b, l_m, l_n, l_k):
         test_gemm(dtype, b, m, n, k)
