@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
 import pytest
 from aiter.ops.triton.prefill_attention import context_attention_fwd as prefill_triton

@@ -248,15 +248,23 @@
     m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));              \
     m.def("get_meta_buffer_ipc_handle", &aiter::get_meta_buffer_ipc_handle, py::arg("inp"));
 
-#define CUSTOM_PYBIND                                                              \
-    m.def("wvSpltK",                                                               \
-          &wvSpltK,                                                                \
-          "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"             \
-          "        int CuCount) -> ()");                                           \
-    m.def("LLMM1",                                                                 \
-          &LLMM1,                                                                  \
-          "LLMM1(Tensor in_a, Tensor in_b, Tensor! out_c, int rows_per_block) -> " \
-          "()");
+#define CUSTOM_PYBIND                                                                           \
+    m.def("wvSpltK",                                                                            \
+          &wvSpltK,                                                                             \
+          "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"                          \
+          "        int CuCount) -> ()");                                                        \
+    m.def("wv_splitk_small_fp16_bf16",                                                          \
+          &wv_splitk_small_fp16_bf16_wrapper,                                                   \
+          "wv_splitk_small_fp16_bf16(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"        \
+          "        int CuCount) -> ()");                                                        \
+    m.def("LLMM1",                                                                              \
+          &LLMM1,                                                                               \
+          "LLMM1(Tensor in_a, Tensor in_b, Tensor! out_c, int rows_per_block) -> "              \
+          "()");                                                                                \
+    m.def("wvSplitKQ",                                                                          \
+          &wvSplitKQ,                                                                           \
+          "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
+          "int CuCount) -> ()");
 
 #define GEMM_A8W8_ASM_PYBIND                                            \
     m.def("gemm_a8w8_asm",                                              \

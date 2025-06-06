@@ -29,7 +29,7 @@
 #if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx940__) || \
                            defined(__gfx941__) || defined(__gfx942__) || \
                            defined(__gfx950__))
-  #define __HIP__MI300_MI250__
+  #define __HIP__MI3XX_MI250__
 #endif
 
 #if defined(NDEBUG)
@@ -45,7 +45,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
 
-#if defined(__HIP__MI300_MI250__)  // TODO: Add NAVI support
+#if defined(__HIP__MI3XX_MI250__)  // TODO: Add NAVI support
 
   #define GCN_MFMA_INSTR1 __builtin_amdgcn_mfma_f32_16x16x4f32
   #define GCN_MFMA_INSTR __builtin_amdgcn_mfma_f32_4x4x4f16
@@ -2097,7 +2097,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   }
 }
 
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
 
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, typename OUTT, int BLOCK_SIZE,
@@ -2169,7 +2169,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
     const int max_num_partitions,
     const float* __restrict__ fp8_out_scale_ptr){UNREACHABLE_CODE}
 
-#endif  // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif  // defined(__HIP__MI3XX_MI250__) TODO: Add NAVI support
 
 #define LAUNCH_CUSTOM_ATTENTION_MFMA16(GQA_RATIO)                                    \
   paged_attention_ll4mi_QKV_mfma16_kernel<T, KVT, KV_DTYPE, OUTT, BLOCK_SIZE,        \
