@@ -157,8 +157,6 @@ def run_torch_for_asmpa(
     block_split = ori_block_size // block_size
     num_batch, num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
-    dtype = k_cache.dtype
-    device = k_cache.device
     k_cache_shape = k_cache.shape
     v_cache_shape = v_cache.shape
     ori_num_blocks = num_blocks // block_split
