@@ -298,7 +298,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             a_scales = tl.load(a_scale_ptrs)
-            b_scales = tl.load(b_scale_ptrs)
+            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
             if BLOCK_SIZE_M >= 32:
                 a_scales = tl.reshape(
                     a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
@@ -345,7 +345,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+        tl.store(c_ptrs, c, mask=c_mask, cache_modifier=".wt")
 
 
 @triton.jit
@@ -437,15 +437,14 @@ def _get_config(
     N: int,
     K: int,
 ):
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
-        if not os.path.exists(fpath):
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4.json"
+    dev = arch_info.get_device()
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
+    if not os.path.exists(fpath):
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-AFP4WFP4.json"
 
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
+    with open(fpath, "r") as file:
+        config = json.load(file)
+    _get_config._config_dict = config
 
     if M < 32:
         return _get_config._config_dict["small"]
