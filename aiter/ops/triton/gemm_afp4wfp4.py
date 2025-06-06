@@ -12,8 +12,6 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_OPS_PATH, AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.tuning_util import aiter_register
-
 
 @triton.heuristics(
     {
@@ -467,7 +465,6 @@ def _get_config(
 
 
 # Wrapper for gemm kernel.
-@aiter_register(module=sys.modules[__name__], kernels=["_gemm_afp4_wfp4_kernel"])
 def gemm_afp4wfp4(
     x,
     w,
@@ -588,9 +585,6 @@ def gemm_afp4wfp4(
 
 
 # Wrapper for gemm kernel.
-@aiter_register(
-    module=sys.modules[__name__], kernels=["_gemm_afp4_wfp4_kernel_preshuffled_scales"]
-)
 def gemm_afp4wfp4_preshuffled_scales(
     x,
     w,

@@ -3,8 +3,6 @@ import triton
 import pytest
 import torch.nn.functional as F
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
-from aiter.ops.triton.utils.tuning_util import aiter_register_input_generator
-
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
     x = F.linear(x.to(torch.float32), weight.to(torch.float32))
@@ -82,7 +80,6 @@ def get_x_vals():
     return x_vals
 
 
-@aiter_register_input_generator("gemm_a8w8")
 def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype, output=False):
 
     x = torch.randn((M, K), dtype=torch.float32, device="cuda")

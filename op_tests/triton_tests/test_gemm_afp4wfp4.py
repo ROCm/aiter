@@ -5,7 +5,6 @@ from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_scales,
 )
-from aiter.ops.triton.utils.tuning_util import aiter_register_input_generator
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 import os
 
@@ -26,8 +25,6 @@ def shuffle_scales(scales: torch.Tensor):
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
-
-@aiter_register_input_generator("gemm_afp4wfp4")
 def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     torch.manual_seed(5)
     if isinstance(dtype, str):
