@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_bpreshuffle_common.cuh"
 #include "gemm_a8w8_bpreshuffle_manifest.h"
@@ -29,16 +29,9 @@ using RowwiseKernelMap = std::unordered_map<
     IntTupleHash>;
 
 template <typename DDataType, typename EDataType = DDataType>
-RowwiseKernel blockwise_heuristic_dispatch(int M, int N, int K)
+RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
-  // if(K <= 2048)
-  {
-    return a8w8_bpreshuffle_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<DDataType, EDataType>;
-  }
-  // else
-  // {
-  //   return a8w8_bpreshuffle_256x128x128x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8x8x1_1x2_intrawave_v3<DDataType, EDataType>;
-  // }
+  return a8w8_bpreshuffle_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<DDataType, EDataType>;
 }
 
 // Helper function to return the next largest power of 2
@@ -95,7 +88,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     return it->second;
   }
   // Otherwise, use heuristics.
-  return blockwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
+  return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
 
 torch::Tensor gemm_a8w8_bpreshuffle(
