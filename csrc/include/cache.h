@@ -65,10 +65,4 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     const bool asm_layout,
     const int ori_block_size = 128);
 
-// Just for unittest
-void convert_fp8(torch::Tensor& dst_cache,
-                 torch::Tensor& src_cache,
-                 const double scale,
-                 const std::string& kv_cache_dtype);
-
 } // namespace aiter

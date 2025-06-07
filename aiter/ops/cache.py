@@ -82,9 +82,3 @@ def reshape_and_cache_with_block_quant_for_asm_pa(
     asm_layout: bool,
     ori_block_size: int = 128,  # [128/256]
 ): ...
-
-
-@compile_ops("module_cache")
-def convert_fp8(
-    dst_cache: Tensor, src_cache: Tensor, scale: float, kv_cache_dtype: str
-): ...
