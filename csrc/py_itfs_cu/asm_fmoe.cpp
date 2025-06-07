@@ -84,9 +84,9 @@ public:
         this->sub_GU = sub_GU;
     };
 
-    void set_int4(bool is_int4_)
+    void set_4bit(bool is_4bit_)
     {
-        is_int4 = is_int4_;
+        is_int4 = is_4bit_;
     }
 
     template <typename T, typename T_O, bool switchGxy = false>
@@ -106,10 +106,10 @@ public:
     )
     {
         int token_cnt = out.size(0);
-        int dim = input.size(1);
+        int dim = w2.size(1);
         int sub_X_cnt = sorted_expert_ids.size(0);
         int eprt = w1.size(0);
-        int inter_dim = is_int4 ? w2.size(2) * 8 : w2.size(2);
+        int inter_dim = w2.size(2) * (w2.size(1) / w1.size(2));
         uint32_t sub_GU = this->sub_GU;
         uint32_t I_elemSize = sizeof(T);
         uint32_t O_elemSize = sizeof(T_O);
@@ -444,8 +444,16 @@ void fmoe_g1u1(torch::Tensor &out,                            // [token_cnt, dim
         {
             TORCH_CHECK(false, __func__, " Unsupported inter_dim " + std::to_string(inter_dim) + ", which should be divisible by 128, 256, or 512");
         }
-        impl_ptr->set_int4(true);
+        impl_ptr->set_4bit(true);
     }
+#if defined(__Float4_e2m1fn_x2)
+    else if (input.dtype() == gate.dtype() && (input.dtype() == torch::kFloat4_e2m1fn_x2 || input.dtype() == torch::kUInt8))
+    {
+        static FMoeKernel impl_fmoe_fp4_g1u1_novs_subGU_256_test("fmoe_fp4_g1u1_novs_subGU_256_test", "fmoe/silu/fmoe_fp4_g1u1_novs_subGU_256_test.co", 256);
+        impl_ptr = &impl_fmoe_fp4_g1u1_novs_subGU_256_test;
+        impl_ptr->set_4bit(true);
+    }
+#endif
     else if (input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte)
     {
         static std::unordered_map<int, FMoeKernelConfig> multix_kernel_int8_configs = {

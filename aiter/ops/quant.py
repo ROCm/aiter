@@ -74,6 +74,9 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     # dtypeMax = F4E2M1_MAX
     dtypeMax = 2.0**MAX_POW2
 
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
+
     m, n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
@@ -88,11 +91,14 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
 
     y = x.float() / scale_f32.view(-1, 1)
     y = fp4_utils.f32_to_mxfp4(y)
-    y = y.view(m, -1)
+    y = y.view(*shape_original[:-1], -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     if shuffle:
         scale_padded = torch.empty(
-            (m + 255) // 256 * 256, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
+            (m + 255) // 256 * 256,
+            (n // block_size + 7) // 8 * 8,
+            dtype=torch.uint8,
+            device=x.device,
         ).fill_(0x7F)
 
         scale_padded[:m, : n // block_size] = scale

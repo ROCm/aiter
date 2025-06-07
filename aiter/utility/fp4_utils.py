@@ -18,7 +18,7 @@ def f32_to_mxfp4(x):
 
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
-    x = x.repeat_interleave(2, dim=1)
+    x = x.repeat_interleave(2, dim=-1)
     x[:, ::2] = x[:, ::2] & 0xF
     x[:, 1::2] = x[:, 1::2] >> 4
     mxfp4_list = [
