@@ -102,9 +102,10 @@ namespace vllm
     }
     // Finally, since cache[0] contains the maximum for this thread block,
     // atomically write the max to the target location
+    float dtypeMax          = ck_tile::type_convert<float>(ck_tile::numeric<scalar_t>::max());
     if (threadIdx.x == 0)
     {
-      atomicMaxFloat(scale, cache[0] / FP8_MAX);
+      atomicMaxFloat(scale, cache[0] / dtypeMax);
     }
   }
 
