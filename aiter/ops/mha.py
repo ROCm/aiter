@@ -1647,3 +1647,123 @@ def mha_batch_prefill_func(
         result.append(S_dmask)
 
     return result[0] if len(result) == 1 else tuple(result)
+
+
+@compile_ops("module_mha_batch_decode", fc_name="mha_batch_decode")
+def mha_batch_decode(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    kv_indptr: Tensor,
+    kv_page_indices: Tensor,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    return_softmax_lse: bool,
+    out: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+): ...
+
+
+def _flashinfer_batch_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    softmax_scale: float,
+    logits_soft_cap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    zero_tensors: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    md_name = "mha_batch_decode"
+    filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
+    filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
+    if q.dtype == torch.float16:
+        md_name += "_fp16"
+        filter_fwd_splitkv1 += "fp16*"
+        filter_fwd_splitkv2 += "fp16*"
+    elif q.dtype == torch.bfloat16:
+        md_name += "_bf16"
+        filter_fwd_splitkv1 += "bf16*"
+        filter_fwd_splitkv2 += "bf16*"
+    if 0.0 < logits_soft_cap:
+        md_name += "_logits"
+        filter_fwd_splitkv2 += "_logits*"
+    else:
+        md_name += "_nlogits"
+        filter_fwd_splitkv2 += "_nlogits*"
+    if alibi_slopes is None:
+        md_name += "_nbias"
+        filter_fwd_splitkv2 += "_nbias*"
+    else:
+        md_name += "_alibi"
+        filter_fwd_splitkv2 += "_alibi*"
+    md_name += "_nmask"
+    filter_fwd_splitkv2 += "_nmask*"
+    filter_fwd_splitkv2 += "_pagedkv*"
+
+    filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_decode "
+        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+    ]
+
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    out, softmax_lse = mha_batch_decode(
+        q,
+        k,
+        v,
+        kv_indptr,
+        kv_page_indices,
+        softmax_scale,
+        logits_soft_cap,
+        zero_tensors,
+        return_lse,
+        None,
+        alibi_slopes,
+        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+    )
+    return out, softmax_lse
+
+
+def flashinfer_batch_decode_func(
+    q,
+    k,
+    v,
+    kv_indptr,
+    kv_page_indices,
+    softmax_scale=None,
+    logits_soft_cap=0.0,
+    alibi_slopes=None,
+    return_lse=False,
+):
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    head_size_q_og = q.size(2)
+    head_size_v_og = v.size(2)
+    if head_size_q_og % 8 != 0:
+        q = torch.nn.functional.pad(q, [0, 8 - head_size_q_og % 8])
+        k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
+    if head_size_v_og % 8 != 0:
+        v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
+    out_padded, softmax_lse = _flashinfer_batch_decode(
+        q,
+        k,
+        v,
+        kv_indptr,
+        kv_page_indices,
+        softmax_scale,
+        logits_soft_cap=logits_soft_cap,
+        alibi_slopes=alibi_slopes,
+        return_lse=return_lse,
+    )
+
+    out = out_padded[..., :head_size_v_og]
+
+    result = [out]
+    if return_lse:
+        result.append(softmax_lse)
+
+    return result[0] if len(result) == 1 else tuple(result)

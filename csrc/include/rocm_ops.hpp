@@ -553,6 +553,18 @@
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+#define MHA_BATCH_DECODE_PYBIND                       \
+      m.def("mha_batch_decode", &mha_batch_decode,    \
+            py::arg("q"), py::arg("k"), py::arg("v"), \
+            py::arg("kv_indptr"),                     \
+            py::arg("kv_page_indices"),               \
+            py::arg("softmax_scale"),                 \
+            py::arg("logits_soft_cap"),               \
+            py::arg("zero_tensors"),                  \
+            py::arg("return_softmax_lse"),            \
+            py::arg("out") = std::nullopt,            \
+            py::arg("alibi_slopes") = std::nullopt);
+
 #define MOE_CK_2STAGES_PYBIND                       \
     m.def("ck_moe_stage1",                          \
           &ck_moe_stage1,                           \
