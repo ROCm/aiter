@@ -1,10 +1,18 @@
 import argparse
 import sys
+import os
 import torch
 import triton
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+from aiter.ops.triton.gemm_afp4wfp4 import (
+    gemm_afp4wfp4,
+    gemm_afp4wfp4_preshuffled_scales,
+)
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
 from utils.benchmark_utils import get_model_configs, get_available_models
+
+TRITON_HIP_PRESHUFFLE_SCALES = (
+    os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
+)
 
 
 def model_benchmark_shapes(args):
@@ -80,7 +88,9 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4_blockscale(M, N, K, metric, provider):
         c_dtype = torch.bfloat16
-        x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs(M, N, K)
+        x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(
+            M, N, K, c_dtype
+        )
         # flops
         flops = 2.0 * M * N * K
         # memory transfer
@@ -93,11 +103,20 @@ def run_benchmark(args):
         mem = mem_read + mem_write
         out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=c_dtype)
 
-        ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4(x, w, out, x_scale, w_scale, c_dtype),
-            warmup=25,
-            rep=100,
-        )
+        if TRITON_HIP_PRESHUFFLE_SCALES:
+            ms = triton.testing.do_bench(
+                lambda: gemm_afp4wfp4_preshuffled_scales(
+                    x, w, x_scale, w_scale, c_dtype, out
+                ),
+                warmup=25,
+                rep=100,
+            )
+        else:
+            ms = triton.testing.do_bench(
+                lambda: gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, out),
+                warmup=25,
+                rep=100,
+            )
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":

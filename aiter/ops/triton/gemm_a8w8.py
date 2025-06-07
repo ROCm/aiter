@@ -4,15 +4,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
-
-
-# TODO Move this to a common folder. Will need to add future arch list
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(
@@ -178,6 +177,23 @@ def _gemm_a8w8_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-GEMM-A8W8.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    # TODO: Update this logic
+    return _get_config._config_dict["any"]
+
+
 def gemm_a8w8(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -186,6 +202,7 @@ def gemm_a8w8(
     bias: Optional[torch.Tensor] = None,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT, applies a conversion scale and optionally adds a bias
@@ -217,17 +234,12 @@ def gemm_a8w8(
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
-    GROUP_SIZE_M = 4
-    waves_per_eu = 2
-    kpack = 1 if get_arch() in ("gfx950") else 2
-    matrix_instr_nonkdim = 16
-    num_warps = 4
-    num_stages = 2
+    if config is None:
+        config = _get_config(M, N, K)
 
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    grid = (
+        triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+    )
     _gemm_a8w8_kernel[grid](
         x,
         w,
@@ -245,15 +257,7 @@ def gemm_a8w8(
         y.stride(0),
         y.stride(1),
         bias is not None,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        kpack=kpack,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **config,
     )
 
     return y
