@@ -48,8 +48,7 @@ __device__ constexpr T cross_wave_reduce(T local, F reduce_op, T* smem)
 
 // copied from https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
 template <typename T, typename F, int WarpSize=64, bool threadBroadcast=true>
-__device__ constexpr T wave_reduce(T local, F reduce_op)
-{
+__device__ constexpr T wave_reduce(T local, F reduce_op) {
   if constexpr(WarpSize > 1)
   {
       // quad_perm:[1,0,3,2] -> 10110001
@@ -99,7 +98,7 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
 }
 
 
-template <typename T, typename F, int BlockSize=256, bool waveBroadcast=true>
+template <typename T, typename F, int BlockSize, bool waveBroadcast>
 __device__ constexpr T block_reduce(T local, F reduce_op)
 {
   // static_assert(BlockSize <= 256, "BlockSize > 256 is not supported");
