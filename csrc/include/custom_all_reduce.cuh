@@ -481,12 +481,12 @@ namespace vllm
 
   DINLINE hip_fp8 quantHalfToFp8(half input, half scale_functor)
   {
-    return hip_fp8(static_cast<float>(input) / static_cast<float>(scale_functor));
+    return hip_fp8(__half2float(input) / __half2float(scale_functor));
   }
 
   DINLINE half dequantFp8ToHalf(hip_fp8 input, half scale_functor)
   {
-    return static_cast<half>(float(input) * static_cast<float>(scale_functor));
+    return __float2half(float(input) * __half2float(scale_functor));
   }
 
   template <typename input_type, typename output_type, int size>
@@ -556,7 +556,7 @@ namespace vllm
     // quant
     half thread_max = packReduce<AbsMaxFunctor, half, 8>(half8_reg);
     thread_max = warpReduce<MaxFunctor, half, QUANT_SCALE / 8>(thread_max);
-    half scale_factor = static_cast<half>(static_cast<float>(thread_max) / 240.0f);
+    half scale_factor = __float2half(__half2float(thread_max) / 240.0f);
 
     // save quant rslt
     tmps[rank][index] = packQuant<half, hip_fp8, 8>(half8_reg, scale_factor);
