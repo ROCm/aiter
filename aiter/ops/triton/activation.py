@@ -206,15 +206,19 @@ def act_mul_and_mxfp4_quant(
     if shuffle:
         scaleM = triton.cdiv(M, 256) * 256
         scaleN = triton.cdiv(scaleN_valid, 8) * 8
+        blockscale_e8m0 = torch.empty(
+            (scaleM, scaleN),
+            dtype=torch.uint8,
+            device=x.device,
+        )
     else:
         scaleM = M
         scaleN = scaleN_valid
-
-    blockscale_e8m0 = torch.empty(
-        (scaleM, scaleN),
-        dtype=torch.uint8,
-        device=x.device,
-    )
+        blockscale_e8m0 = torch.empty(
+            (scaleN, scaleM),
+            dtype=torch.uint8,
+            device=x.device,
+        ).T
 
     # for large N values
     if M <= 32:
