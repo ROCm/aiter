@@ -2,9 +2,22 @@ import torch
 import torch.nn.functional as F
 import pytest
 from .test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from .test_gemm_afp4wfp4 import shuffle_scales
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 
 DEBUG_MODE = False
+
+
+def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
+    M, N = tensor.shape
+
+    pad_rows = (mult_m - (M % mult_m)) % mult_m
+    pad_cols = (mult_n - (N % mult_n)) % mult_n
+    padded_tensor = torch.nn.functional.pad(
+        tensor, (0, pad_cols, 0, pad_rows), mode="constant", value=0
+    )
+
+    return padded_tensor
 
 
 def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch.Tensor:
@@ -43,25 +56,44 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch
         (128, 64),
         (128, 68),
         (256, 32),
+        (256, 512),
         (160, 40),
         (280, 20),
+        (32, 128),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
-def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str):
+@pytest.mark.parametrize(
+    "shuffle",
+    [
+        False,
+        True,
+    ],
+)
+def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle: bool):
+    # TODO: Change the pytorch code so that we dont have to have this restriction.
+    if shuffle and (M % 32 != 0 or N % 256 != 0):
+        pytest.skip(
+            "M needs to be multiple of 32 and N needs to be multiple of 256, skip this test for preshuffled scales tests"
+        )
     torch.manual_seed(20)
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 
     if DEBUG_MODE:
         print(f"x.shape={x.shape} x={x}")
 
-    triton_out, triton_scale = act_mul_and_mxfp4_quant(x, activation=activation)
+    triton_out, triton_scale = act_mul_and_mxfp4_quant(
+        x, activation=activation, shuffle=shuffle
+    )
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
         print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
 
     torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation)
+    if shuffle:
+        torch_scale = shuffle_scales(torch_scale)
+        triton_scale = triton_scale.reshape(M // 32, -1)
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")

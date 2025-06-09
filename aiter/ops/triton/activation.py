@@ -209,6 +209,7 @@ def act_mul_and_mxfp4_quant(
     else:
         scaleM = M
         scaleN = scaleN_valid
+
     blockscale_e8m0 = torch.empty(
         (scaleM, scaleN),
         dtype=torch.uint8,
