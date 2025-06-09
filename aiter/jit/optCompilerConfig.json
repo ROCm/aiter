@@ -210,6 +210,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "hip_clang_path": "'/work/llvm-project/build/bin'",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv'"
     },
     "module_gemm_a8w8_asm": {
@@ -434,6 +435,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "hip_clang_path": "'/work/llvm-project/build/bin'",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gen_instances.py --working_path {{}} --tune'"
     },
     "module_aiter_operator": {
