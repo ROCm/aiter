@@ -102,12 +102,14 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     weight, w_scale = aiter.per_tensor_quant(weight, quant_dtype=quantDtype)
     bias = None
 
-    if m <= 2:
-        a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    else:
-        a, avg_a = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
 
     b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
+
+    # if m <= 2:
+    #     b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
+    # else:
+    #     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
@@ -261,9 +263,9 @@ def test_normal_gemm_a8w8_pertoken_quant():
 
 
 def test_skinny_gemm_a8w8_pertoken_quant():
-    # seed = 8779
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed(seed)
+    seed = 8779
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     random.seed(137)
 
     aligned_k = 16
@@ -279,26 +281,35 @@ def test_skinny_gemm_a8w8_pertoken_quant():
     test_mnk_list = []
     test_mnk_list.extend(
         [
+            # [1, 1, 512],
+            # [1, 1, 1024],
+            # [1, 1, 2048],
+            # [2, 32, 512],
+            # [2, 32, 8192],
+            # [2, 32, 9216],
+            [4, 32, 8192],
+            # [4, 32, 9216],
+
             # [3, 1, 8192],
             # [4, 1, 8192],
             # [4, 32, 8192],
             # [4, 32, 9216],
-            [2, 320, 32768],
-            [2, 640, 32768],
-            [2, 1280, 32768],
-            [2, 320, 32768 + 1024],
-            [2, 320, 2 * 32768],
-            [1, 4, 1264],
-            [1, 12, 8720],
-            [1, 17, 6192],
-            [1, 40, 9024],
-            [2, 27, 4544],
-            [2, 28, 6544],
-            [2, 57, 1952],
-            [2, 60, 96],
+            # [2, 320, 32768],
+            # [2, 640, 32768],
+            # [2, 1280, 32768],
+            # [2, 320, 32768 + 1024],
+            # [2, 320, 2 * 32768],
+            # [1, 4, 1264],
+            # [1, 12, 8720],
+            # [1, 17, 6192],
+            # [1, 40, 9024],
+            # [2, 27, 4544],
+            # [2, 28, 6544],
+            # [2, 57, 1952],
+            # [2, 60, 96],
         ]
     )
-    test_mnk_list.extend(boundary_mnk_list)
+    # test_mnk_list.extend(boundary_mnk_list)
     # test_mnk_list.extend(mnk_list)
     print(f"cu_count={cu_count}")
     print(f"len(boundary_mnk_list)={len(boundary_mnk_list)}")
@@ -313,10 +324,11 @@ def test_skinny_gemm_a8w8_pertoken_quant():
         for mnk in test_mnk_list:
             m, n, k = mnk
             for quant_dtype in [dtypes.fp8]:
-                for dtype in [dtypes.fp16, dtypes.bf16]:
+                # for dtype in [dtypes.fp16, dtypes.bf16]:
+                for dtype in [dtypes.bf16, dtypes.fp16]:
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
 
-test_normal_gemm_a8w8_pertoken_quant()
+# test_normal_gemm_a8w8_pertoken_quant()
 test_skinny_gemm_a8w8_pertoken_quant()
