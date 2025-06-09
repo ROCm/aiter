@@ -92,4 +92,4 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
 
     torch.testing.assert_close(triton_out, torch_out)
-    torch.testing.assert_close(triton_scale.flatten(), torch_scale.flatten())
+    torch.testing.assert_close(triton_scale, torch_scale)
