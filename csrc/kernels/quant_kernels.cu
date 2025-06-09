@@ -38,7 +38,8 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                       float const* __restrict__ scale_ub,
                                                       const int32_t group_size,
                                                       int32_t ori_rows,
-                                                      int32_t ori_cols   = 1,
+                                                      int32_t ori_cols,
+                                                      int32_t ori_row_stride,
                                                       bool shuffle_scale = true)
 {
     auto fp4_scale_shuffle_id = [](int32_t scaleN_pad, int32_t x, int32_t y) {
@@ -74,7 +75,7 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             return;
     }
 
-    row_offset *= thread_data_size;
+    row_offset  = x * ori_row_stride + y * group_size;
     using vec_i = ck_tile::vec_t<DTYPE_I, thread_data_size>;
     static constexpr int32_t vec_size_o =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? thread_data_size / 2 : thread_data_size;
@@ -85,7 +86,7 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
 
     auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
-    vec_i thread_data      = input_vecs[threadIdx.x];
+    vec_i thread_data      = input_vecs[threadIdx.x % num_thread_per_group];
     float absMax           = 0.f;
     for(size_t j = 0; j < thread_data_size; j++)
     {
@@ -133,7 +134,7 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                          ? reinterpret_cast<vec_o*>(out + row_offset / 2)
                          : reinterpret_cast<vec_o*>(out + row_offset);
 
-    out_vecs[threadIdx.x] =
+    out_vecs[threadIdx.x % num_thread_per_group] =
         ck_tile::vec_convert<DTYPE_O, DTYPE_I, thread_data_size>(thread_data, inverted_scale);
 }
 
@@ -522,6 +523,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         group_size,
                         ori_rows,
                         ori_cols,
+                        ori_cols,
                         shuffle_scale);
                 });
         }
@@ -542,6 +544,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
                         group_size,
                         ori_rows,
+                        ori_cols,
                         ori_cols,
                         shuffle_scale);
                 });
@@ -567,6 +570,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,
                         group_size,
                         ori_rows,
+                        ori_cols,
                         ori_cols,
                         shuffle_scale);
                 });
@@ -605,4 +609,54 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
     }
 }
 
+void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
+                                        torch::Tensor const& input, // [..., d]
+                                        torch::Tensor& scales,
+                                        int group_size     = 32,
+                                        bool shuffle_scale = true)
+{
+    TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+                __func__,
+                " only support group_size [32, 64 , 128]");
+    TORCH_CHECK(out.is_contiguous());
+
+    int const cols       = input.size(-1);
+    int const rows       = input.numel() / cols;
+    int const row_stride = input.stride(-2);
+
+    TORCH_CHECK(cols % group_size == 0, __func__, " cols is not divisible by group_size");
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    int thread_data_size     = 32;
+    int num_thread_per_group = group_size / thread_data_size;
+    int num_group_per_tg     = groupQuantBlockSize / num_thread_per_group;
+
+    int scaleN    = cols / group_size;
+    int num_group = shuffle_scale ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
+    // int num_group = shuffle_scale ? ((rows + 255) / 256 * 256) * ((scaleN + 7) / 8 * 8) : rows *
+    // scaleN;
+    dim3 const grid((num_group + num_group_per_tg - 1) / num_group_per_tg);
+    dim3 const block(groupQuantBlockSize);
+
+#if defined(__Float4_e2m1fn_x2)
+    AITER_DISPATCH_FLOATING16_TYPES(
+        input.scalar_type(), "dynamic_per_group_scaled_quant_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::dynamic_per_group_scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                reinterpret_cast<ck_tile::fp4x2_t*>(out.data_ptr()),
+                reinterpret_cast<float*>(scales.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                nullptr,
+                group_size,
+                rows,
+                cols,
+                row_stride,
+                shuffle_scale);
+        });
+#else
+    TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
+#endif
+}
 } // namespace aiter
