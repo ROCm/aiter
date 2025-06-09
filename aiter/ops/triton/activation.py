@@ -153,9 +153,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
             bs_offs = (
                 bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
             )
-            bs_mask = (bs_offs_m < M)[:, None] & (
-                bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-            )[None, :]
+            bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
         if EVEN_M_N:
             tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
@@ -189,6 +187,8 @@ def act_mul_and_mxfp4_quant(
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
+        shuffle: Indicates whether to enable preshuffling of scales.
+            - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
@@ -198,19 +198,19 @@ def act_mul_and_mxfp4_quant(
     assert N % 4 == 0
 
     # This is fixed by spec for MXFP4. Do not tune this.
-    # For performance, perhaps, we should look at passing multiple of 32 column blocks
-    # that a triton program can process
     MXFP4_QUANT_BLOCK_SIZE = 32
     N_half = N // 2
     x_fp4 = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
-    scaleM = triton.cdiv(M, 32) * 32
     scaleN_valid = triton.cdiv(N_half, MXFP4_QUANT_BLOCK_SIZE)
-    scaleN = triton.cdiv(scaleN_valid, 8) * 8
+    # Setting scale M to be multiple of 256 and scale N to be multiple of 8
+    if shuffle:
+        scaleM = triton.cdiv(M, 256) * 256
+        scaleN = triton.cdiv(scaleN_valid, 8) * 8
+    else:
+        scaleM = M
+        scaleN = scaleN_valid
     blockscale_e8m0 = torch.empty(
-        (
-            triton.cdiv(M, 256) * 256,
-            scaleN,
-        ),
+        (scaleM, scaleN),
         dtype=torch.uint8,
         device=x.device,
     )
@@ -238,6 +238,11 @@ def act_mul_and_mxfp4_quant(
         # BLOCK_SIZE_N needs to be multiple of 32
         BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
         BLOCK_SIZE_M = min(8, triton.next_power_of_2(N_half))
+
+    # shuffle requires block sizes to be multiple of 32
+    if shuffle:
+        BLOCK_SIZE_M = triton.cdiv(BLOCK_SIZE_M, 32) * 32
+        BLOCK_SIZE_N = triton.cdiv(BLOCK_SIZE_N, 32) * 32
 
     grid = (
         triton.cdiv(M, BLOCK_SIZE_M),
