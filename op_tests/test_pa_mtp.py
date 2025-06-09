@@ -156,7 +156,7 @@ def torch_mha_extend(
         v = v_cache.view(torch.int8)[idx].view(kv_dtype).to(torch.float)
         if v_scale is not None:
             v *= v_scale[:, idx].t().unsqueeze(-1)
-        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=False)
+        o = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=True)
         os.append(o)
     o = torch.concat(os)
     return o
