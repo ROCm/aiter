@@ -1,0 +1,8 @@
+att: TARGET_CU=0
+SE_MASK=0xFF
+SIMD_SELECT=0xF
+BUFFER_SIZE=640
+ISA_CAPTURE_MODE=2
+
+# you can use filter the kernels you profile
+KERNEL=wv_splitk_small_fp16_bf16_kernel

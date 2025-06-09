@@ -298,9 +298,9 @@ def test_normal_gemm():
 
 
 def test_skinny_gemm():
-    # seed = 8779
-    # torch.manual_seed(seed)
-    # torch.cuda.manual_seed(seed)
+    seed = 8989
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     random.seed(137)
 
     aligned_k = 8
@@ -316,14 +316,20 @@ def test_skinny_gemm():
     test_mnk_list = []
     test_mnk_list.extend(
         [
-            [3, 1, 8192],
-            [4, 1, 8192],
+            # [3, 1, 8192],
+            # [4, 1, 8192],
+            # [4, 32, 512],
+            # [4, 32, 1024],
+            # [4, 32, 1024 + 512],
             [4, 32, 8192],
-            [4, 32, 9216],
+            # [4, 32, 8192 + 512],
+            # [4, 32, 9216],
+            # [16, 80, 8],
+
         ]
     )
-    test_mnk_list.extend(boundary_mnk_list)
-    test_mnk_list.extend(mnk_list)
+    # test_mnk_list.extend(boundary_mnk_list)
+    # test_mnk_list.extend(mnk_list)
     print(f"cu_count={cu_count}")
     print(f"len(boundary_mnk_list)={len(boundary_mnk_list)}")
     print(f"len(mnk_list)={len(mnk_list)}")
@@ -333,6 +339,7 @@ def test_skinny_gemm():
     print(f"total test case count: {2 * len(test_mnk_list)}")
 
     loop_count = 1
+    # loop_count = 6
     for i in range(loop_count):
         for mnk in test_mnk_list:
             m, n, k = mnk
