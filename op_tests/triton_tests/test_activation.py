@@ -7,14 +7,18 @@ from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 
 DEBUG_MODE = False
 
+
 def pad_tensor_2d(tensor, mult_m=256, mult_n=8):
     M, N = tensor.shape
 
     pad_rows = (mult_m - (M % mult_m)) % mult_m
     pad_cols = (mult_n - (N % mult_n)) % mult_n
-    padded_tensor = torch.nn.functional.pad(tensor, (0, pad_cols, 0, pad_rows), mode='constant', value=0)
+    padded_tensor = torch.nn.functional.pad(
+        tensor, (0, pad_cols, 0, pad_rows), mode="constant", value=0
+    )
 
     return padded_tensor
+
 
 def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch.Tensor:
     """
@@ -72,7 +76,9 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle
     if DEBUG_MODE:
         print(f"x.shape={x.shape} x={x}")
 
-    triton_out, triton_scale = act_mul_and_mxfp4_quant(x, activation=activation, shuffle=shuffle)
+    triton_out, triton_scale = act_mul_and_mxfp4_quant(
+        x, activation=activation, shuffle=shuffle
+    )
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
         print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
@@ -80,7 +86,7 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle
     torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation)
     if shuffle:
         torch_scale = shuffle_scales(torch_scale)
-        triton_scale = triton_scale.reshape(triton_scale.shape[0]//32, -1)
+        triton_scale = triton_scale.reshape(triton_scale.shape[0] // 32, -1)
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
         print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
