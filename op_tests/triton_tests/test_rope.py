@@ -52,6 +52,7 @@ def generate_rope_inputs(
     dtype: torch.dtype,
 ):
     torch.manual_seed(20)
+    random.seed(20)
 
     device = "cuda"
     if layout == "thd":  # T == S
@@ -192,18 +193,21 @@ def test_rope_fwd(
     inplace: bool,
     dtype: torch.dtype,
 ):
-
-    torch.manual_seed(20)
-
-    x = torch.randn((S, B, H, D), dtype=dtype, device="cuda")
-
-    freqs_D = D
-    if nope:
-        freqs_D = freqs_D // 2
-    if reuse_freqs_front_part:
-        freqs_D = freqs_D // 2
-
-    freqs = torch.randn((S, 1, 1, freqs_D), dtype=dtype, device="cuda")
+    x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        B,
+        S,
+        H,
+        1,
+        D,
+        cached=False,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=nope,
+        pos=False,
+        offs=False,
+        two_inputs=False,
+        layout="sbhd",
+        dtype=dtype,
+    )
 
     if DEBUG_MODE:
         print(f"x.shape={x.shape} x={x}")
@@ -267,18 +271,21 @@ def test_rope_fwd_thd(
     inplace: bool,
     dtype: torch.dtype,
 ):
-    torch.manual_seed(20)
-    random.seed(20)
-
-    x = torch.randn((T, H, D), dtype=dtype, device="cuda")
-
-    freqs_D = D
-    if nope:
-        freqs_D = freqs_D // 2
-    if reuse_freqs_front_part:
-        freqs_D = freqs_D // 2
-
-    freqs = torch.randn((T, 1, 1, freqs_D), dtype=dtype, device="cuda")
+    x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        1,
+        T,
+        H,
+        1,
+        D,
+        cached=False,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=nope,
+        pos=False,
+        offs=False,
+        two_inputs=False,
+        layout="thd",
+        dtype=dtype,
+    )
 
     if B > 1:
         seqlens = random.sample(range(1, T), k=B - 1)
@@ -338,11 +345,19 @@ def test_rope_fwd_thd(
     "nope, nope_first", [(False, False), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-# @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO bf16 results in accuracy issues
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
 @pytest.mark.parametrize("pos, offs", [(False, False), (True, False), (True, True)])
-# @pytest.mark.parametrize('pos, offs',[(True, True)])
+# # reproduce failures
+# @pytest.mark.parametrize("D", [128])
+# @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+# @pytest.mark.parametrize(
+#     "nope, nope_first", [(False, False)]
+# )
+# @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+# @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16])
+# @pytest.mark.parametrize("inplace", [True])
+# @pytest.mark.parametrize("pos, offs", [(True, False), (True, True)])
 def test_rope_fwd_cached(
     B: int,
     S: int,
@@ -357,48 +372,26 @@ def test_rope_fwd_cached(
     inplace: bool,
     dtype: torch.dtype,
 ):
-    torch.manual_seed(20)
-
-    x = torch.randn((S, B, H, D), dtype=dtype, device="cuda")
+    x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+        B,
+        S,
+        H,
+        1,
+        D,
+        cached=True,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope=nope,
+        pos=pos,
+        offs=offs,
+        two_inputs=False,
+        layout="sbhd",
+        dtype=dtype,
+    )
 
     # TODO: Fix this
-    if rotate_style == RotateStyle.NEOX and pos and D > 64:
-        pytest.skip("NEOX and pos=True with large B result in accuracy failures")
+    if rotate_style == RotateStyle.NEOX and pos and D > 64 and B >= 15:
+        pytest.skip("NEOX and pos=True with large B and D result in accuracy failures")
 
-    freqs_D = D
-    if nope:
-        freqs_D = freqs_D // 2
-    if reuse_freqs_front_part:
-        freqs_D = freqs_D // 2
-
-    freqs = torch.randn((S, 1, 1, freqs_D), dtype=torch.float32, device="cuda")
-
-    positions = (
-        torch.randint(
-            int(S * 0.25) if offs else 0,
-            int(S * 0.75) if offs else S,
-            (
-                S,
-                B,
-            ),
-            device="cuda",
-        )
-        if pos
-        else None
-    )
-    offsets = (
-        torch.randint(
-            int(S * -0.25),
-            int(S * 0.25),
-            (
-                S,
-                B,
-            ),
-            device="cuda",
-        )
-        if offs
-        else None
-    )
     ref_freqs = (
         freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
             -2
@@ -406,9 +399,6 @@ def test_rope_fwd_cached(
         if pos
         else freqs
     )
-
-    cos = torch.cos(freqs)
-    sin = torch.sin(freqs)
 
     if DEBUG_MODE:
         print(f"x.shape={x.shape} x={x}")
@@ -525,7 +515,6 @@ def test_rope_fwd_cached_thd_2c(
     offs: bool,
     inplace: bool,
 ):
-    torch.manual_seed(20)
     x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
@@ -640,7 +629,6 @@ def test_rope_fwd_cached_thd_2c_gqa(
     offs: bool,
     inplace: bool,
 ):
-    torch.manual_seed(20)
     x, y, freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
