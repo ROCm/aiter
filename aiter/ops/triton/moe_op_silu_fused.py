@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, List
 
+from aiter.ops.triton.activation import _silu_exp2
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
@@ -285,7 +286,8 @@ def _fused_moe_silu_kernel_gptq_awq(
     silu_acc, mul_acc = (
         accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
     )
-    silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
+    # silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
+    silu_acc = _silu_exp2(silu_acc)
     accumulator = (silu_acc * mul_acc).to(compute_type)
 
     # -----------------------------------------------------------

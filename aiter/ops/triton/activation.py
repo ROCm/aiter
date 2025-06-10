@@ -11,6 +11,11 @@ def _silu(x):
 
 
 @triton.jit
+def _silu_exp2(x):
+    return x / (1.0 + tl.exp2(-(x * 1.44269504089)))
+
+
+@triton.jit
 def _tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 

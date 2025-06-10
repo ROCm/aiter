@@ -7,6 +7,7 @@ import triton.language as tl
 from typing import Any, Dict, Optional, List
 
 from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.activation import _gelu_tanh
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 
@@ -40,17 +41,6 @@ def moe_set_quant_func(func):
     """
     global _MOE_A_QUANT_FUNC
     _MOE_A_QUANT_FUNC = func
-
-
-@triton.jit
-def tanh(x):
-    # Tanh is just a scaled sigmoid
-    return 2 * tl.sigmoid(2 * x) - 1
-
-
-@triton.jit
-def gelu(x):
-    return 0.5 * x * (1.0 + tanh(0.7978845608 * (x + 0.044715 * x * x * x)))
 
 
 @triton.heuristics(
@@ -255,7 +245,7 @@ def _fused_moe_kernel(
             accumulator = accumulator * a_scale * b_scale
 
     if not MUL_ROUTED_WEIGHT:
-        accumulator = gelu(accumulator)
+        accumulator = _gelu_tanh(accumulator)
 
     accumulator = accumulator.to(compute_type)
     # -----------------------------------------------------------
@@ -461,7 +451,7 @@ def _fused_moe_persistent_kernel(
                 accumulator = accumulator * a_scale * b_scale
 
         if not MUL_ROUTED_WEIGHT:
-            accumulator = gelu(accumulator)
+            accumulator = _gelu_tanh(accumulator)
 
         accumulator = accumulator.to(compute_type)
         # -----------------------------------------------------------

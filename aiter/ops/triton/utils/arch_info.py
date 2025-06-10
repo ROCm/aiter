@@ -16,14 +16,6 @@ def get_device():
     return _ARCH_TO_DEVICE[get_arch()]
 
 
-def arch_supports_fp4():
-    return get_arch() in ("gfx950")
-
-
-def arch_supports_fp8():
-    return get_arch() in ("gfx942", "gfx950")
-
-
 def is_fp4_avail():
     return get_arch() in ("gfx950")
 
