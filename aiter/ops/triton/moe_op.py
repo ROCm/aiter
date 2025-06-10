@@ -42,7 +42,6 @@ def moe_set_quant_func(func):
     _MOE_A_QUANT_FUNC = func
 
 
-
 @triton.heuristics(
     {
         "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
@@ -910,6 +909,7 @@ def _fused_moe_persistent_kernel(
 
         # advance tile_id
         tile_id += NUM_SMS
+
 
 def fused_moe(
     A: torch.Tensor,

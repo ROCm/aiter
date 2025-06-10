@@ -28,6 +28,7 @@ def get_cdna_version():
         return 4
     return -1
 
+
 def torch_dynamic_mxfp4_quant(
     x: torch.Tensor, scaling_mode: str = "even"
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -143,6 +144,7 @@ def torch_dynamic_mxfp4_quant(
 
     return x_mxfp4, bs_e8m0
 
+
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
@@ -190,11 +192,13 @@ def torch_mxfp4_to_fp32(x, x_scales):
 
     return x_f32
 
+
 def alloc_rand(shape, device, dtype, requires_grad=True):
     if dtype.itemsize == 1:
         tmp = 2 ** -(torch.randint(4, 8, shape, device=device, dtype=torch.float16))
         return tmp.to(dtype).requires_grad_(requires_grad)
     return torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
+
 
 # Note: Eventually all these combinations will be supported
 # Hardware native OCP
@@ -279,8 +283,8 @@ def test_fused_moe(
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = torch_moe_align_block_size_ref(
-        topk_ids, config["BLOCK_SIZE_M"], E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )
 
     # Downcast a tensor to mxfp4 and upcast back for reference

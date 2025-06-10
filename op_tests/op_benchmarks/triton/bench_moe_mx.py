@@ -2,10 +2,7 @@ import argparse
 import sys
 import torch
 import triton
-from aiter.ops.triton.utils.types import (
-    torch_to_triton_dtype,
-    str_to_torch_dtype
-)
+from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
 from op_tests.triton_tests.test_moe import torch_moe_align_block_size_ref
 from op_tests.triton_tests.test_moe_mx import (
@@ -97,8 +94,8 @@ def run_benchmark(args):
         softmax_vals = torch.softmax(values, dim=1)
         topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = torch_moe_align_block_size_ref(
-            topk_ids, config["BLOCK_SIZE_M"], E
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
         )
 
         if is_a_mixed_input:

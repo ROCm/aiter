@@ -7,17 +7,21 @@ import pytest
 from typing import Dict
 
 from aiter.ops.triton.moe_op import (
-        fused_moe as triton_moe,
-        moe_set_use_persistent_kernel as triton_moe_set_use_persistent_kernel)
+    fused_moe as triton_moe,
+    moe_set_use_persistent_kernel as triton_moe_set_use_persistent_kernel,
+)
 from aiter.ops.triton.moe_op_e2e import (
-    e2e_moe as triton_e2e_moe, 
-    moe_set_use_persistent_kernel as triton_e2e_moe_set_use_persistent_kernel)
-from aiter.ops.triton.moe_op_silu_fused import( 
+    e2e_moe as triton_e2e_moe,
+    moe_set_use_persistent_kernel as triton_e2e_moe_set_use_persistent_kernel,
+)
+from aiter.ops.triton.moe_op_silu_fused import (
     fused_moe_silu as triton_moe_silu,
-    moe_set_use_persistent_kernel as triton_moe_silu_set_use_persistent_kernel)
+    moe_set_use_persistent_kernel as triton_moe_silu_set_use_persistent_kernel,
+)
 from aiter.ops.triton.moe_op_gelu import (
     fused_moe_gelu as triton_moe_gelu,
-    moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel)
+    moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel,
+)
 
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
@@ -465,8 +469,8 @@ def input_helper(
 
     config = moe_config_func(M)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = torch_moe_align_block_size_ref(
-        topk_ids, config["BLOCK_SIZE_M"], E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )
 
     return (
@@ -538,8 +542,8 @@ def input_helper_int4_w4a16(
     moe_config_func = get_optimal_moe_config_func(dtype, use_int4_w4a16=True)
 
     config = moe_config_func(M)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = torch_moe_align_block_size_ref(
-        topk_ids, config["BLOCK_SIZE_M"], E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )
 
     return (
@@ -595,8 +599,8 @@ def input_helper_e2e(
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
     config = get_default_config_moe_e2e(persistent)
-    sorted_token_ids, expert_ids, num_tokens_post_padded = torch_moe_align_block_size_ref(
-        topk_ids, config["BLOCK_SIZE_M"], E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )
 
     return (
@@ -614,6 +618,7 @@ def input_helper_e2e(
         num_tokens_post_padded,
         config,
     )
+
 
 # Note: TODO These 2 result in accuracy issues (64, 14336, 4096, 2, 8), (1, 1024, 16384, 1, 2)
 @pytest.mark.parametrize(
@@ -655,9 +660,17 @@ def test_fused_moe(
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     if persistent:
-        triton_moe_silu_set_use_persistent_kernel(True) if silu_fused else triton_moe_set_use_persistent_kernel(True)
+        (
+            triton_moe_silu_set_use_persistent_kernel(True)
+            if silu_fused
+            else triton_moe_set_use_persistent_kernel(True)
+        )
     else:
-        triton_moe_silu_set_use_persistent_kernel(False) if silu_fused else triton_moe_set_use_persistent_kernel(False)
+        (
+            triton_moe_silu_set_use_persistent_kernel(False)
+            if silu_fused
+            else triton_moe_set_use_persistent_kernel(False)
+        )
 
     (
         a,
@@ -762,7 +775,7 @@ def test_fused_moe(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("has_zp", [False, True])
 @pytest.mark.parametrize("persistent", [False, True])
-@pytest.mark.parametrize("silu_fused", [False, True])  
+@pytest.mark.parametrize("silu_fused", [False, True])
 def test_fused_moe_int4_w4a16(
     M: int,
     N: int,
@@ -803,9 +816,17 @@ def test_fused_moe_int4_w4a16(
     )
 
     if persistent:
-        triton_moe_silu_set_use_persistent_kernel(True) if silu_fused else triton_moe_set_use_persistent_kernel(True)
+        (
+            triton_moe_silu_set_use_persistent_kernel(True)
+            if silu_fused
+            else triton_moe_set_use_persistent_kernel(True)
+        )
     else:
-        triton_moe_silu_set_use_persistent_kernel(False) if silu_fused else triton_moe_set_use_persistent_kernel(False)
+        (
+            triton_moe_silu_set_use_persistent_kernel(False)
+            if silu_fused
+            else triton_moe_set_use_persistent_kernel(False)
+        )
 
     _triton_moe = triton_moe_silu if silu_fused else triton_moe
     _triton_moe(

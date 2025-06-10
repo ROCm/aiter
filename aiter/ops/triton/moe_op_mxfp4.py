@@ -20,6 +20,7 @@ def get_scaled_dot_format_string(dtype: tl.dtype):
     }
     return mapping[dtype]
 
+
 @triton.heuristics(
     {
         "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
