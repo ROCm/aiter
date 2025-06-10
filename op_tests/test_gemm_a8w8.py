@@ -222,40 +222,11 @@ def calculate_total_valid_points(cu_count, aligned_k):
     return total
 
 
-def test_normal_gemm_a8w8_pertoken_quant():
+def test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk):
     df = []
-    for dtype in [dtypes.bf16, dtypes.fp16]:
-        for quantDtype in [dtypes.i8, dtypes.fp8]:
-            for m, n, k in [
-                # qkv_proj
-                (1, 1280, 8192),
-                (32, 1280, 8192),
-                (64, 1280, 8192),
-                (128, 1280, 8192),
-                (192, 1280, 8192),
-                (256, 1280, 8192),
-                (320, 1280, 8192),
-                (512, 1280, 8192),
-                (1024, 1280, 8192),
-                (2048, 1280, 8192),
-                (4096, 1280, 8192),
-                (8192, 1280, 8192),
-                (16384, 1280, 8192),
-                # attn_out
-                (1, 8192, 1024),
-                (32, 8192, 1024),
-                (64, 8192, 1024),
-                (128, 8192, 1024),
-                (192, 8192, 1024),
-                (256, 8192, 1024),
-                (320, 8192, 1024),
-                (512, 8192, 1024),
-                (1024, 8192, 1024),
-                (2048, 8192, 1024),
-                (4096, 8192, 1024),
-                (8192, 8192, 1024),
-                (16384, 8192, 1024),
-            ]:
+    for dtype in l_dtype:
+        for quantDtype in l_quantDtype:
+            for m, n, k in l_mnk:
                 ret = test_gemm(dtype, m, n, k, quantDtype)
                 df.append(ret)
     df = pd.DataFrame(df)
@@ -319,16 +290,9 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
-
-test_normal_gemm_a8w8_pertoken_quant()
-test_skinny_gemm_a8w8_pertoken_quant()
-    if c != None:
-        checkAllclose(a, c, msg="\033[1A\033[2K" + "a,c: " + msg, rtol=1e-2, atol=0.01)
-
-
 l_dtype = ['bf16', 'fp16']
 l_quantDtype = ['i8', 'fp8']
-l_mnk = [
+l_mnk_nm = [
     # qkv_proj
     (1, 1280, 8192),
     (32, 1280, 8192),
@@ -376,7 +340,7 @@ parser.add_argument('-q', '--quantDtype',
                     help='shape')
 parser.add_argument('-mnk',
                     type=dtypes.str2tuple,
-                    choices=l_mnk,
+                    choices=l_mnk_nm,
                     nargs='?',
                     const=None,
                     default=None,
@@ -392,11 +356,7 @@ if args.quantDtype is None:
 else:
     l_quantDtype = [dtypes.d_dtypes[args.quantDtype]]
 if args.mnk is not None:
-    l_mnk = [args.mnk]
+    l_mnk_nm = [args.mnk]
 
-
-
-for dtype in l_dtype:
-    for quantDtype in l_quantDtype:
-        for m, n, k in l_mnk:
-            test_gemm(dtype, m, n, k, quantDtype)
+test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+test_skinny_gemm_a8w8_pertoken_quant()
