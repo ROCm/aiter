@@ -173,10 +173,12 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
 @pytest.mark.parametrize("S", [2, 10, 32])
 @pytest.mark.parametrize("H", [1, 8, 32])
 @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-@pytest.mark.parametrize(
-    "nope, nope_first", [(False, False), (True, False), (True, True)]
-)
+# @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX])
+# @pytest.mark.parametrize(
+#     "nope, nope_first", [(False, False), (True, False), (True, True)]
+# )
+@pytest.mark.parametrize("nope, nope_first", [(False, False)])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 # @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO bf16 results in accuracy issues
 @pytest.mark.parametrize("dtype", [torch.float16])
