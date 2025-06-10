@@ -26,6 +26,16 @@ def gemm_a8w8(
 ) -> torch.Tensor: ...
 
 
+@compile_ops("module_gemm_a8w8_bpreshuffle", fc_name="gemm_a8w8_bpreshuffle")
+def gemm_a8w8_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+): ...
+
+
 @compile_ops("module_gemm_a8w8_asm", fc_name="gemm_a8w8_asm")
 def gemm_a8w8_asm(
     XQ: Tensor,  # A:[M, K] i8
@@ -178,6 +188,20 @@ def gemm_a8w8_CK(
     return gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
 
 
+def gemm_a8w8_bpreshuffle_CK(
+    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=torch.float16
+):
+    assert dtype in [
+        torch.bfloat16,
+        torch.float16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    # k = XQ.shape[-1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, Y)
+
+
 def gemm_a8w8_blockscale_CK(
     XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=dtypes.bf16
 ):
@@ -187,7 +211,7 @@ def gemm_a8w8_blockscale_CK(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    k = XQ.shape[-1]
+    # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_blockscale(XQ, WQ, x_scale, w_scale, Y)
 
@@ -204,7 +228,7 @@ def flatmm_a8w8_blockscale_ASM(
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     m = XQ.shape[0]
     n = WQ.shape[0]
-    k = XQ.shape[-1]
+    # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
@@ -223,6 +247,16 @@ def gemm_a8w8_tune(
 
 @compile_ops("module_gemm_a8w8_blockscale_tune", fc_name="gemm_a8w8_blockscale_tune")
 def gemm_a8w8_blockscale_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK=0,
+): ...
+@compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune")
+def gemm_a8w8_bpreshuffle_tune(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,

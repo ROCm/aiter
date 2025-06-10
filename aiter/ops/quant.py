@@ -214,7 +214,7 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2):
+def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     m, n = x.shape
     assert quant_dtype == dtypes.fp4x2
     assert n % 2 == 0
@@ -223,19 +223,19 @@ def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2):
         scale = (
             torch.empty(
                 (
-                    (m + 31) // 32 * 32,
+                    (m + 255) // 256 * 256,
                     (n // 32 + 7) // 8 * 8,
                 ),
                 dtype=torch.uint8,
                 device=device,
             )
-            .fill_(0x7F)
+            # .fill_(0x7F)
             .view(dtypes.fp8_e8m0)
         )
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
-    dynamic_per_token_scaled_quant(y, x.view(-1, 32), scale)
+    dynamic_per_token_scaled_quant(y, x.view(-1, 32), scale, shuffle_scale=shuffle)
     return y.view(torch.uint8), scale
 
 
@@ -306,5 +306,9 @@ def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
 
 @compile_ops("module_quant")
 def dynamic_per_token_scaled_quant(
-    out: Tensor, input: Tensor, scales: Tensor, scale_ub: Optional[Tensor] = None
+    out: Tensor,
+    input: Tensor,
+    scales: Tensor,
+    scale_ub: Optional[Tensor] = None,
+    shuffle_scale=True,
 ): ...
