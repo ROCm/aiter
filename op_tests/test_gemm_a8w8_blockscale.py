@@ -10,7 +10,6 @@ from einops import rearrange
 from einops import repeat as eirp
 import pandas as pd
 import argparse
-from aiter import dtypes
 
 block_shape = (128, 128)
 

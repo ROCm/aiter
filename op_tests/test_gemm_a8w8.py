@@ -9,10 +9,9 @@ from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import checkAllclose, perftest, benchmark
 import pandas as pd
+import argparse
 
 TEST_NUM_ITERS = 100
-import argparse
-from aiter import dtypes
 
 
 @perftest(num_iters=TEST_NUM_ITERS)

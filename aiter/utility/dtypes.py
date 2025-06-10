@@ -57,5 +57,5 @@ def str2tuple(v):
         parts = v.strip("()").split(",")
 
         return tuple(int(p.strip()) for p in parts)
-    except:
-        raise argparse.ArgumentTypeError(f"invalid format of input: {v}")
+    except Exception as e:
+        raise argparse.ArgumentTypeError(f"invalid format of input: {v}") from e

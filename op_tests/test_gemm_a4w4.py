@@ -9,7 +9,6 @@ from aiter.utility import fp4_utils
 import random
 import itertools
 import argparse
-from aiter import dtypes
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
