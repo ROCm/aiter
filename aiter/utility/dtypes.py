@@ -40,6 +40,7 @@ d_dtypes = {
     "i8": i8,
 }
 
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -49,12 +50,12 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError("Boolean value expected.")
-    
+
+
 def str2tuple(v):
     try:
-        parts = v.strip('()').split(',')
-        
+        parts = v.strip("()").split(",")
+
         return tuple(int(p.strip()) for p in parts)
     except:
         raise argparse.ArgumentTypeError(f"invalid format of input: {v}")
-
