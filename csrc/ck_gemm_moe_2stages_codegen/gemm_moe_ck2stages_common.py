@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 
+
 @dataclass
 class kernelInstanceGEMM1:
     BLOCK_SIZE: int
@@ -16,23 +17,34 @@ class kernelInstanceGEMM1:
     ActOP: bool = False
     CDEElementOp: str = "TypeCast"
     QuantType: str = "per_tensor"
-    stage:int = 1
+    stage: int = 1
 
     @property
     def name(self) -> str:
-        return ("_").join([
-            f"moe_ck2stages_gemm{self.stage}",
-            ("x").join(map(lambda x: str(x), [
-                self.BLOCK_SIZE, self.MPerBlock, self.NPerBlock, self.KPerBlock])),
-            ("x").join(map(lambda x: str(x), [
-                self.MWaves, self.NWaves])),
-            self.CDEElementOp,
-            f"v{self.GemmPipelineVersion}",
-            "Nswizzle" + str(int(self.Nswizzle)),
-            self.QuantType,
-            "MulRoutedWeight" + str(int( self.MulRoutedWeight)),
-            "silu" if  self.ActOP else "gelu",
-        ])
+        return ("_").join(
+            [
+                f"moe_ck2stages_gemm{self.stage}",
+                ("x").join(
+                    map(
+                        lambda x: str(x),
+                        [
+                            self.BLOCK_SIZE,
+                            self.MPerBlock,
+                            self.NPerBlock,
+                            self.KPerBlock,
+                        ],
+                    )
+                ),
+                ("x").join(map(lambda x: str(x), [self.MWaves, self.NWaves])),
+                self.CDEElementOp,
+                f"v{self.GemmPipelineVersion}",
+                "Nswizzle" + str(int(self.Nswizzle)),
+                self.QuantType,
+                "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
+                "silu" if self.ActOP else "gelu",
+            ]
+        )
+
 
 @dataclass
 class kernelInstanceGEMM2:
@@ -47,22 +59,33 @@ class kernelInstanceGEMM2:
     MulRoutedWeight: bool = True
     CDEElementOp: str = "TypeCast"
     QuantType: str = "per_tensor"
-    stage:int = 2
+    stage: int = 2
 
     @property
     def name(self) -> str:
-        return ("_").join([
-            f"moe_ck2stages_gemm{self.stage}",
-            ("x").join(map(lambda x: str(x), [
-                self.BLOCK_SIZE, self.MPerBlock, self.NPerBlock, self.KPerBlock])),
-            ("x").join(map(lambda x: str(x), [
-                self.MWaves, self.NWaves])),
-            self.CDEElementOp,
-            f"v{self.GemmPipelineVersion}",
-            "Nswizzle" + str(int(self.Nswizzle)),
-            self.QuantType,
-            "MulRoutedWeight" + str(int( self.MulRoutedWeight)),
-        ])
+        return ("_").join(
+            [
+                f"moe_ck2stages_gemm{self.stage}",
+                ("x").join(
+                    map(
+                        lambda x: str(x),
+                        [
+                            self.BLOCK_SIZE,
+                            self.MPerBlock,
+                            self.NPerBlock,
+                            self.KPerBlock,
+                        ],
+                    )
+                ),
+                ("x").join(map(lambda x: str(x), [self.MWaves, self.NWaves])),
+                self.CDEElementOp,
+                f"v{self.GemmPipelineVersion}",
+                "Nswizzle" + str(int(self.Nswizzle)),
+                self.QuantType,
+                "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
+            ]
+        )
+
 
 # gemm1 out&AB:bf16/fp16
 a16w16_gemm1_kernels_list= {
@@ -150,11 +173,24 @@ bit16_list = ["B16", "F16", "b16", "f16"]
 bit4_list = ["I4", "i4"]
 QuantType_list = ["per_128x128"]
 
-def get_gemm1_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, ActOP: bool, MulRoutedWeight: bool) -> list:
+
+def get_gemm1_kernels_list(
+    Adtype: str,
+    Bdtype: str,
+    Nswizzle: bool,
+    QuantType: str,
+    ActOP: bool,
+    MulRoutedWeight: bool,
+) -> list:
 
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         tag = "a16w16"
-    elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype and QuantType in QuantType_list:
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit8_list
+        and Adtype == Adtype
+        and QuantType in QuantType_list
+    ):
         tag = "a8w8blkscale"
     elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
         tag = "a8w8"
@@ -182,10 +218,17 @@ def get_gemm1_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: 
     return tag, kernels_list
 
 
-def get_gemm2_kernels_list(Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, MulRoutedWeight: bool) -> list:
+def get_gemm2_kernels_list(
+    Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, MulRoutedWeight: bool
+) -> list:
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         tag = "a16w16"
-    elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype and QuantType in QuantType_list:
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit8_list
+        and Adtype == Adtype
+        and QuantType in QuantType_list
+    ):
         tag = "a8w8blkscale"
     elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
         tag = "a8w8"
