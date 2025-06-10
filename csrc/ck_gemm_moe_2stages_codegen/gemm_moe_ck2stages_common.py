@@ -87,6 +87,7 @@ class kernelInstanceGEMM2:
         )
 
 
+# fmt: off
 # gemm1 out&AB:bf16/fp16
 a16w16_gemm1_kernels_list= {
 #   id: kernel:             BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| MWaves| NWaves|GemmPipelineVersion
@@ -160,6 +161,7 @@ a8w4_gemm2_kernels_list= {
     #3: kernelInstanceGEMM2(       256,       64,        256,       128,     1,       4,         3,),
 }
 
+# fmt: on
 gemm2_kernels_dict = {
     "a16w16": a16w16_gemm2_kernels_list,
     "a8w8": a8w8_gemm2_kernels_list,
