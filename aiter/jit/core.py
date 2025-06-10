@@ -69,11 +69,14 @@ if find_aiter is not None:
     elif find_aiter.origin:
         package_path = find_aiter.origin
     package_path = os.path.dirname(package_path)
+    package_parent_path = os.path.dirname(package_path)
     import site
 
     site_packages_dirs = site.getsitepackages()
     # develop mode
-    if package_path not in site_packages_dirs:
+    if (package_path not in site_packages_dirs) and (
+        package_parent_path not in site_packages_dirs
+    ):
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
     else:
