@@ -15,7 +15,7 @@
 #include <ATen/hip/HIPContext.h>
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "dispatch_utils.h"
-#include "py_itfs_common_hip.h"
+#include "py_itfs_common.h"
 #include <hipcub/util_type.hpp>
 #include <hipcub/hipcub.hpp>
 

@@ -7,13 +7,63 @@ import triton
 import triton.language as tl
 
 
-def fp32_to_fp4_e2m1fn_x2(x):
+def f32_to_mxfp4(x):
     FP4_EBITS, FP4_MBITS = 2, 1
     x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
     x = pack_uint4(x)
     # x = x.view(dtypes.fp4x2) # to(fp32) for this datatype gives all 0 for torch...
     x = x.view(torch.uint8)
     return x
+
+
+def mxfp4_to_f32(x):
+    # 2 because we pack fp4 in uint8.
+    x = x.repeat_interleave(2, dim=1)
+    x[:, ::2] = x[:, ::2] & 0xF
+    x[:, 1::2] = x[:, 1::2] >> 4
+    mxfp4_list = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device="cuda")
+    return mxfp4_in_f32[x.long()]
+
+
+def f32_to_e8m0(x):
+    u32 = x.view(torch.int32)
+    exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
+    nan_case = exponent == 0xFF
+    round_case = ((u32 & 0x400000) > 0) & (
+        ((u32 & 0x200000) > 0) | ((u32 & 0x1FFFFF) > 0) | (exponent > 0)
+    )
+    exponent[round_case] += 1
+    exponent[nan_case] = 0xFF
+    return exponent.view(dtypes.fp8_e8m0)
+
+
+def e8m0_to_f32(scale_e8m0_biased):
+    scale_e8m0_biased = scale_e8m0_biased.view(torch.uint8)
+    zero_case = scale_e8m0_biased == 0
+    nan_case = scale_e8m0_biased == 0b11111111
+    scale_f32 = scale_e8m0_biased.to(torch.int32) << 23
+    scale_f32[zero_case] = 0x00400000
+    scale_f32[nan_case] = 0x7F800001
+    scale_f32 = scale_f32.view(dtypes.fp32)
+    return scale_f32
 
 
 def down_size(size):
@@ -168,8 +218,8 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     stride_x_n,
     stride_x_fp4_m,
     stride_x_fp4_n,
-    # stride_bs_m,
-    # stride_bs_n,
+    stride_bs_m,
+    stride_bs_n,
     M: tl.constexpr,
     N: tl.constexpr,
     scaleN: tl.constexpr,
@@ -178,9 +228,15 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     BLOCK_SIZE: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     SCALING_MODE: tl.constexpr,
+    SHUFFLE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
+
+    stride_x_m = tl.cast(stride_x_m, tl.int64)
+    stride_x_n = tl.cast(stride_x_n, tl.int64)
+    stride_x_fp4_m = tl.cast(stride_x_fp4_m, tl.int64)
+    stride_x_fp4_n = tl.cast(stride_x_fp4_n, tl.int64)
 
     x_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE + tl.arange(0, MXFP4_QUANT_BLOCK_SIZE)
@@ -256,36 +312,35 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     bs_offs_n = pid_n
 
-    bs_offs_0 = bs_offs_m[:, None] // 32
-    bs_offs_1 = bs_offs_m[:, None] % 32
-    bs_offs_2 = bs_offs_1 % 16
-    bs_offs_1 = bs_offs_1 // 16
-    bs_offs_3 = bs_offs_n[None, :] // 8
-    bs_offs_4 = bs_offs_n[None, :] % 8
-    bs_offs_5 = bs_offs_4 % 4
-    bs_offs_4 = bs_offs_4 // 4
-    bs_offs_6 = bs_offs_5 % 1
-    bs_offs = (
-        bs_offs_6
-        + bs_offs_1
-        + bs_offs_4 * 2
-        + bs_offs_2 * 2 * 2
-        + bs_offs_5 * 2 * 2 * 16
-        + bs_offs_3 * 2 * 2 * 16 * 4
-        + bs_offs_0 * 2 * 16 * scaleN
-    )
-    bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-    bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
-    bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
-    tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
-
-    # bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-    # bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
-    # tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
+    if SHUFFLE:
+        bs_offs_0 = bs_offs_m[:, None] // 32
+        bs_offs_1 = bs_offs_m[:, None] % 32
+        bs_offs_2 = bs_offs_1 % 16
+        bs_offs_1 = bs_offs_1 // 16
+        bs_offs_3 = bs_offs_n[None, :] // 8
+        bs_offs_4 = bs_offs_n[None, :] % 8
+        bs_offs_5 = bs_offs_4 % 4
+        bs_offs_4 = bs_offs_4 // 4
+        bs_offs = (
+            bs_offs_1
+            + bs_offs_4 * 2
+            + bs_offs_2 * 2 * 2
+            + bs_offs_5 * 2 * 2 * 16
+            + bs_offs_3 * 2 * 2 * 16 * 4
+            + bs_offs_0 * 2 * 16 * scaleN
+        )
+        bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+        bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
+    else:
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -309,12 +364,12 @@ def dynamic_mxfp4_quant(
     MXFP4_QUANT_BLOCK_SIZE = 32
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    scaleM = (M + 31) // 32 * 32
+    scaleM = triton.cdiv(M, 32) * 32
     scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
     scaleN = triton.cdiv(scaleN_valid, 8) * 8
     blockscale_e8m0 = torch.empty(
         (
-            scaleM,
+            triton.cdiv(M, 256) * 256,
             scaleN,
         ),
         dtype=torch.uint8,
@@ -329,7 +384,7 @@ def dynamic_mxfp4_quant(
         blockscale_e8m0,
         *x.stride(),
         *x_fp4.stride(),
-        # *blockscale_e8m0.stride(),
+        *blockscale_e8m0.stride(),
         M=M,
         N=N,
         scaleN=scaleN_valid,
@@ -338,6 +393,154 @@ def dynamic_mxfp4_quant(
         BLOCK_SIZE=BLOCK_SIZE,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         SCALING_MODE=0,
+        SHUFFLE=shuffle,
     )
 
     return (x_fp4, blockscale_e8m0.view(dtypes.fp8_e8m0))
+
+
+@triton.jit
+def _moe_mxfp4_sort_kernel(
+    blockscale_e8m0_ptr,
+    sorted_ids_ptr,
+    num_valid_ids_ptr,
+    blockscale_e8m0_sorted_ptr,
+    stride_blockscale_e8m0_m: tl.constexpr,
+    stride_blockscale_e8m0_n: tl.constexpr,
+    stride_o3: tl.constexpr,
+    stride_o2: tl.constexpr,
+    stride_o1: tl.constexpr,
+    stride_o0: tl.constexpr,
+    token_num: tl.constexpr,
+    M_i: tl.constexpr,
+    N_i: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    pid_m = tl.program_id(0) * 2
+    pid_n = tl.program_id(1) * 2
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
+        return
+    stride_blockscale_e8m0_m = tl.cast(stride_blockscale_e8m0_m, tl.int64)
+    stride_blockscale_e8m0_n = tl.cast(stride_blockscale_e8m0_n, tl.int64)
+    stride_o0 = tl.cast(stride_o0, tl.int64)
+    stride_o1 = tl.cast(stride_o1, tl.int64)
+    stride_o2 = tl.cast(stride_o2, tl.int64)
+    stride_o3 = tl.cast(stride_o3, tl.int64)
+
+    out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
+    for i in range(0, 4):
+        m = i % 2 * BLOCK_SIZE_M
+        n = i // 2 * BLOCK_SIZE_N
+        sorted_ids_offs_m = pid_m * BLOCK_SIZE_M + m + tl.arange(0, BLOCK_SIZE_M)
+        sorted_ids_offs = sorted_ids_offs_m
+        sorted_ids_mask = sorted_ids_offs_m < num_valid_ids
+        sorted_ids = tl.load(
+            sorted_ids_ptr + sorted_ids_offs, mask=sorted_ids_mask, other=token_num
+        )
+        topk_ids = sorted_ids >> 24
+        sorted_ids = sorted_ids & 0xFFFFFF
+
+        # Sort the blockscale tensor based on the sorted ids
+        if TOPK == 1:
+            blockscale_e8m0_offs_m = sorted_ids
+        else:
+            blockscale_e8m0_offs_m = sorted_ids * TOPK + topk_ids
+        blockscale_e8m0_offs_n = pid_n * BLOCK_SIZE_N + n + tl.arange(0, BLOCK_SIZE_N)
+        blockscale_e8m0_offs = (
+            blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
+            + blockscale_e8m0_offs_n[None, :] * stride_blockscale_e8m0_n
+        )
+        blockscale_e8m0_mask = (sorted_ids < token_num)[:, None] & (
+            blockscale_e8m0_offs_n < N_i
+        )[None, :]
+        blockscale_e8m0_sub = tl.load(
+            blockscale_e8m0_ptr + blockscale_e8m0_offs,
+            mask=blockscale_e8m0_mask,
+        ).to(tl.uint8, bitcast=True)
+        out = out | (blockscale_e8m0_sub.to(tl.uint32) << (i * 8))
+
+    # Store the result
+    # 16x4 uint32 -> 32x2 uint8
+    offs_0 = tl.arange(0, BLOCK_SIZE_M)
+    offs_1 = tl.arange(0, BLOCK_SIZE_N)
+    offs_2 = pid_n // 2
+    offs_3 = pid_m // 2
+    offs = (
+        offs_0[:, None] * stride_o0
+        + offs_1[None, :] * stride_o1  # * BLOCK_SIZE_M
+        + offs_2 * stride_o2  # * BLOCK_SIZE_M * BLOCK_SIZE_N
+        + offs_3 * stride_o3  # * BLOCK_SIZE_M * BLOCK_SIZE_N * N_i // BLOCK_SIZE_N
+    )
+    # blockscale_e8m0_sorted_mask = (blockscale_e8m0_sorted_offs_m < M_o)[:, None] & (
+    #     blockscale_e8m0_sorted_offs_n < N_o
+    # )[None, :]
+    tl.store(
+        blockscale_e8m0_sorted_ptr + offs,
+        out,
+        # mask=blockscale_e8m0_sorted_mask,
+    )
+
+
+def moe_mxfp4_sort(
+    blockscale_e8m0: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """
+    Sort the blockscale_e8m0 tensor based on the sorted_ids tensor.
+
+    Args:
+        blockscale_e8m0: The input tensor to be sorted.
+        sorted_ids: The indices used for sorting.
+
+    Returns:
+        A sorted tensor.
+    """
+    # This is fixed by spec for MXFP4. Do not tune this.
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
+    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
+
+    # Assume blockscale_e8m0 is 2D-Tensor for now
+    topk = 1
+    if len(blockscale_e8m0.shape) == 3:
+        topk = blockscale_e8m0.shape[1]
+        blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
+    M_i, N_i = blockscale_e8m0.shape
+    M_o, N_o = sorted_ids.shape[0], N_i
+    assert (N_i // 2) % 2 == 0
+    assert block_size % BLOCK_SIZE_M == 0
+
+    blockscale_e8m0_sorted = torch.empty(
+        (
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_o, BLOCK_SIZE_N),
+            BLOCK_SIZE_N_u32,
+            BLOCK_SIZE_M_u32,
+        ),
+        dtype=torch.uint32,
+        device=blockscale_e8m0.device,
+    )  # .fill_(0)
+
+    grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
+    _moe_mxfp4_sort_kernel[grid](
+        blockscale_e8m0.view(torch.uint8),
+        sorted_ids,
+        num_valid_ids,
+        blockscale_e8m0_sorted,
+        *blockscale_e8m0.stride(),
+        *blockscale_e8m0_sorted.stride(),
+        token_num=token_num,
+        M_i=M_i,
+        N_i=N_i,
+        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
+        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
+        TOPK=topk,
+    )
+
+    # Reshape the output to the final shape
+    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)

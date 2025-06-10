@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # This file origins from pytorch:
 # https://github.com/pytorch/pytorch/blob/main/torch/utils/cpp_extension.py
@@ -285,7 +285,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 
 def get_compiler_abi_compatibility_and_version(
-    compiler, torch_exclude
+    compiler, torch_exclude=False
 ) -> Tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
@@ -327,13 +327,9 @@ def get_compiler_abi_compatibility_and_version(
             versionstr = subprocess.check_output(
                 [compiler, "-dumpfullversion", "-dumpversion"]
             )
-            version = versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip().split(".")
-        else:
-            minimum_required_version = MINIMUM_MSVC_VERSION
-            compiler_info = subprocess.check_output(compiler, stderr=subprocess.STDOUT)
             match = re.search(
                 r"(\d+)\.(\d+)\.(\d+)",
-                compiler_info.decode(*SUBPROCESS_DECODE_ARGS).strip(),
+                versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
             )
             version = ["0", "0", "0"] if match is None else list(match.groups())
     except Exception:
@@ -1117,6 +1113,7 @@ def _jit_compile(
     is_standalone,
     keep_intermediates=True,
     torch_exclude=False,
+    hipify=True,
 ) -> None:
     if is_python_module and is_standalone:
         raise ValueError(
@@ -1163,7 +1160,7 @@ def _jit_compile(
                         _TORCH_PATH = os.path.join(os.path.dirname(torch.__file__))
                         torch_path = os.path.join(_TORCH_PATH, "*")
 
-                    if IS_HIP_EXTENSION and with_cuda:
+                    if IS_HIP_EXTENSION and with_cuda and hipify:
                         hipify_result = hipify_python.hipify(
                             project_directory=build_directory,
                             output_directory=build_directory,
@@ -1308,7 +1305,7 @@ def _write_ninja_file_and_build_library(
     _write_ninja_file_to_build_library(
         path=build_file_path,
         name=name,
-        sources=sources,
+        sources=list(set(sources)),
         extra_cflags=extra_cflags or [],
         extra_cuda_cflags=extra_cuda_cflags or [],
         extra_ldflags=extra_ldflags or [],

@@ -59,7 +59,7 @@ logger = logging.getLogger("aiter")
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 
 find_aiter = importlib.util.find_spec("aiter")
@@ -74,20 +74,20 @@ if find_aiter is not None:
     site_packages_dirs = site.getsitepackages()
     # develop mode
     if package_path not in site_packages_dirs:
-        AITER_ROOT_DIR = AITER_CORE_DIR
+        AITER_META_DIR = AITER_ROOT_DIR
     # install mode
     else:
-        AITER_ROOT_DIR = os.path.abspath(f"{AITER_CORE_DIR}/aiter_meta/")
+        AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
 else:
-    AITER_ROOT_DIR = AITER_CORE_DIR
+    AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
 
-AITER_CSRC_DIR = f"{AITER_ROOT_DIR}/csrc"
-AITER_GRADLIB_DIR = f"{AITER_ROOT_DIR}/gradlib"
-AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/"
+AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
+AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
-    "CK_DIR", f"{AITER_ROOT_DIR}/3rdparty/composable_kernel"
+    "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
 
 
@@ -95,7 +95,7 @@ CK_3RDPARTY_DIR = os.environ.get(
 def get_asm_dir():
     gfx = get_gfx()
     global AITER_ASM_DIR
-    AITER_ASM_DIR = f"{AITER_ROOT_DIR}/hsa/{gfx}/"
+    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
     os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
     return AITER_ASM_DIR
 
@@ -127,7 +127,15 @@ CK_DIR = f"{bd_dir}/ck"
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx940",
+        "gfx941",
+        "gfx942",
+        "gfx1100",
+        "gfx950",
+    ]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -138,9 +146,7 @@ def validate_and_update_archs():
 
 @functools.lru_cache()
 def hip_flag_checker(flag_hip: str):
-    ret = os.system(
-        f"echo 'int main() {{ return 0; }}' | hipcc {flag_hip} -x hip -c -fsyntax-only -"
-    )
+    ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
         return [flag_hip]
     else:
@@ -243,6 +249,7 @@ def build_module(
     is_python_module,
     is_standalone,
     torch_exclude,
+    hipify=True,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -274,9 +281,8 @@ def build_module(
             "-D__HIP_PLATFORM_AMD__=1",
             "-U__HIP_NO_HALF_CONVERSIONS__",
             "-U__HIP_NO_HALF_OPERATORS__",
-            "-mllvm",
-            "--amdgpu-kernarg-preload-count=16",
-            # "-v", "--save-temps",
+            "-mllvm --amdgpu-kernarg-preload-count=16",
+            # "-v --save-temps",
             "-Wno-unused-result",
             "-Wno-switch-bool",
             "-Wno-vla-cxx-extension",
@@ -287,21 +293,27 @@ def build_module(
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        if hip_version > Version("5.5.00000"):
+            flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
-            flags_hip += hip_flag_checker("-fno-offload-uniform-block")
+            flags_hip += ["-fno-offload-uniform-block"]
         if hip_version > Version("6.1.40090"):
-            flags_hip += hip_flag_checker("-mllvm -enable-post-misched=0")
+            flags_hip += ["-mllvm -enable-post-misched=0"]
         if hip_version > Version("6.2.41132"):
-            flags_hip += hip_flag_checker(
-                "-mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false"
-            )
+            flags_hip += [
+                "-mllvm -amdgpu-early-inline-all=true",
+                "-mllvm -amdgpu-function-calls=false",
+            ]
         if hip_version > Version("6.2.41133"):
-            flags_hip += hip_flag_checker("-mllvm -amdgpu-coerce-illegal-types=1")
-
+            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+            flags_hip += ["-D__Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
         flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        flags_hip = list(set(flags_hip))  # remove same flags
+        flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
         def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
@@ -354,12 +366,13 @@ def build_module(
                 is_python_module=is_python_module,
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
+                hipify=hipify,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
             else:
                 shutil.copy(
-                    f"{opbd_dir}/{target_name}", f"{AITER_CORE_DIR}/op_tests/cpp/mha"
+                    f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
         except:
             tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
@@ -383,7 +396,7 @@ def build_module(
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
 
-def get_args_of_build(ops_name: str, exclue=[]):
+def get_args_of_build(ops_name: str, exclude=[]):
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -434,7 +447,7 @@ def get_args_of_build(ops_name: str, exclue=[]):
                     if ops_name.endswith("tune"):
                         continue
                     # exclude
-                    if ops_name in exclue:
+                    if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
                     for k in d_all_ops.keys():
@@ -500,6 +513,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 is_python_module = d_args["is_python_module"]
                 is_standalone = d_args["is_standalone"]
                 torch_exclude = d_args["torch_exclude"]
+                hipify = d_args.get("hipify", True)
                 build_module(
                     md_name,
                     srcs,
@@ -512,6 +526,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     is_python_module,
                     is_standalone,
                     torch_exclude,
+                    hipify,
                 )
                 if is_python_module:
                     module = get_module(md_name)
