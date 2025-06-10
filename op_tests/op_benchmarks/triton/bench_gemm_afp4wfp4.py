@@ -5,7 +5,10 @@ import torch
 import triton
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
 from utils.benchmark_utils import get_model_configs, get_available_models
+from pathlib import Path
 import os
+import triton.profiler as proton
+import json
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
@@ -126,6 +129,42 @@ def run_benchmark(args):
     bench_gemm_afp4wfp4_blockscale.run(save_path=".", print_data=True)
 
 
+def run_proton_benchmark(batch_range, N, K, name="skinny"):
+    c_dtype = torch.bfloat16
+    assert isinstance(batch_range, list)
+    for M in batch_range:
+        x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(
+            M, N, K, c_dtype
+        )
+        out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=c_dtype)
+        suffix = "preshuffle" if TRITON_HIP_PRESHUFFLE_SCALES else "noPreshuffle"
+        fpath = Path(f"logs/gemm_fp4/{name}/{M}-{N}-{K}-{suffix}.hatchet")
+        fpath.parent.mkdir(parents=True, exist_ok=True)
+        proton.start(str(fpath.with_suffix('')), hook="triton")
+        for _ in range(100):
+            gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, out)
+        proton.finalize()
+
+        # -- analyze --
+        with open(f"{fpath}") as fd:
+            data = json.load(fd)
+            # TODO: this will be broken if kernels use scopes themselves
+            # compute useful (a.k.a. matmul) bytes and flops
+            gemms = [
+                x for x in data[0]["children"] if "gemm" in x["frame"]["name"] and "metadata" not in x["frame"]["name"]
+            ]
+            bytes = sum([x["metrics"]["bytes"] for x in gemms])
+            # flops = {w: sum([x["metrics"].get(f"flops{w}", 0) for x in matmuls]) for w in [8, 16]}
+            # flops = sum([flops[w] for w in [8, 16]])
+            # compute total time (incl. "not useful" work)
+            # TODO: proton should really be recording that in the json instead of
+            # relying on the user to aggregate
+            time = sum(x["metrics"].get("time (ns)", 0) for x in data[0]["children"])
+            tbps = bytes / time * 1e-3
+        print(f"{M}-{N}-{K}-{suffix}: {tbps:.2f} TB/s")
+        # return tbps
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="Benchmark MXFP4 x MXFP4 GEMM",
@@ -165,13 +204,18 @@ def parse_args():
         default="throughput",
         help="metric to plot",
     )
+    parser.add_argument("--proton", action="store_true", help="Use proton for profiling")
     args = parser.parse_args()
     return args
 
 
 def main():
     args = parse_args()
-    run_benchmark(args)
+    if args.proton:
+        batch_range = [32, 64, 128]
+        run_proton_benchmark(batch_range, 106496, 16384, "skinny")
+    else:
+        run_benchmark(args)
 
 
 if __name__ == "__main__":
