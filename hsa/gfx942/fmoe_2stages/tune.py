@@ -21,9 +21,11 @@ from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.test_common import checkAllclose
-from aiter.int4_utils import *
+from aiter.int4_utils import (
+    rearrange_4bit_elements,
+    convert_int8_to_uint32_int4,
+)
 from aiter import dtypes
-from aiter import ActivationType
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
