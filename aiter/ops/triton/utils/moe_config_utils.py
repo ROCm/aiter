@@ -6,6 +6,8 @@ from typing import Any, Dict, Optional
 import os
 import json
 import functools
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 M_THRESHOLD_SMALL = 256
 M_THRESHOLD_MEDIUM = 1024
@@ -19,13 +21,13 @@ def get_config_dtype_str(
     use_int4_w4a16: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
-        return "fp8_w8a8"
+        return "FP8_W8A8"
     elif use_int8_w8a16:
-        return "int8_w8a16"
+        return "INT8_W8A16"
     elif use_int8_w8a8:
-        return "int8_w8a8"
+        return "INT8_W8A8"
     elif use_int4_w4a16:
-        return "int4_w4a16"
+        return "INT4_W4A16"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
@@ -53,9 +55,11 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     # directory
     json_file_name = get_config_file_name(dtype)
 
-    config_file_path = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "../moe_configs", json_file_name
+    dev = arch_info.get_device()
+    config_file_path = (
+        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{json_file_name}.json"
     )
+
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
             # If a configuration has been found, return it
