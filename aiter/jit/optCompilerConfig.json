@@ -68,7 +68,7 @@
 
     "module_attention_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_pa.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_pa.cu'",
             "f'{AITER_CSRC_DIR}/pybind/attention_asm_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -94,7 +94,7 @@
     },
     "module_mla_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mla.cu'",
             "f'{AITER_CSRC_DIR}/pybind/attention_asm_mla_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -122,7 +122,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/custom_all_reduce_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/custom_all_reduce.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_communication.cpp'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_communication.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -214,7 +214,7 @@
     "module_gemm_a8w8_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_asm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a8w8.cpp'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a8w8.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -226,7 +226,7 @@
     "module_gemm_a4w4_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a4w4_asm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w4.cpp'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w4.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -237,7 +237,7 @@
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_flatmm_a8w8_blockscale.cu'",
             "f'{AITER_CSRC_DIR}/pybind/flatmm_a8w8_blockscale_asm_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -253,8 +253,8 @@
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cpp'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cpp'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -315,7 +315,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/norm_kernels.cu'",
             "f'{AITER_CSRC_DIR}/pybind/norm_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cpp'"
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -504,7 +504,7 @@
     "module_fmha_v3_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_fwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_fwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -592,7 +592,7 @@
     "module_fmha_v3_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -612,7 +612,7 @@
     "module_fmha_v3_varlen_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cpp'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_bwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_bwd_asm_pybind.cu'"
         ],
         "flags_extra_cc": [],
