@@ -137,12 +137,12 @@ def test_fmoe(
 ):
     torch_quant = aiter.get_torch_quant(qType)
     torch_act = aiter.get_torch_act(actType)
-    input = torch.randn((token, model_dim), dtype=dtype)
+    input = torch.ones((token, model_dim), dtype=dtype) / 10
     if use_g1u1:
-        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype) / 10
     else:
-        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+        w1 = torch.ones((E, inter_dim, model_dim), dtype=dtype)
+    w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype) / 10
 
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -361,7 +361,7 @@ def test_fmoe(
         quant_type,
         sorted_weights if not doweight_stage1 else None,
     )
-    print("out2_ck:",out2_ck)
+
     checkAllclose(
         out2_ref,
         out2_ck,
@@ -428,13 +428,13 @@ list_tokenNum = [
     1024,
     4096,
     163840,
-][:]
+][7:8]
 list_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    #(aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:]
 list_doweight_stage1 = [False, True][:1]

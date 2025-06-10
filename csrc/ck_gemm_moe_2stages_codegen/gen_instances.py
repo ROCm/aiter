@@ -50,15 +50,15 @@ MoeKernel moe_stage1_heuristic_dispatch(int block_m)
 {{
     if (block_m == 32)
     {{
-        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
     }}
     else if (block_m == 64)
     {{
-        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
     }}
     else if (block_m == 128)
     {{
-        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 256, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
     }}
     else
     {{
@@ -70,6 +70,37 @@ MoeKernel moe_stage1_heuristic_dispatch(int block_m)
 }}
 
 """
+
+A8W4_gemm1_heuristic_dispatch = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+#include "gemm_moe_ck2stages.h"
+
+MoeKernel moe_stage1_heuristic_dispatch(int block_m)
+{{
+    if (block_m == 32)
+    {{
+        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+    }}
+    else if (block_m == 64)
+    {{
+        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+    }}
+    else if (block_m == 128)
+    {{
+        return ck_moe_stage1_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 64, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+    }}
+    else
+    {{
+        TORCH_CHECK(
+            false,
+            "Unsupported block_m value for moe heuristic dispatch: ",
+            block_m);
+    }}
+}}
+
+"""
+
 
 A8W8_blockscale_gemm1_heuristic_dispatch = """#pragma once
 // SPDX-License-Identifier: MIT
@@ -107,7 +138,33 @@ MoeKernel moe_stage2_heuristic_dispatch(int block_m)
     }}
     else if (block_m == 128)
     {{
-        return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V3, 256, 128, 256, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+        return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 128, 128/sizeof({A0DataType}), 2, 2, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+    }}
+    else
+    {{
+        TORCH_CHECK(
+            false,
+            "Unsupported block_m value for moe heuristic dispatch: ",
+            block_m);
+    }}
+}}
+
+"""
+
+A8W4_gemm2_heuristic_dispatch = """
+MoeKernel moe_stage2_heuristic_dispatch(int block_m)
+{{
+    if (block_m == 32)
+    {{
+        return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 32, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+    }}
+    else if (block_m == 64)
+    {{
+        return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 64, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
+    }}
+    else if (block_m == 128)
+    {{
+        return ck_moe_stage2_gemm<{A0DataType}, {B0DataType}, {AccDataType}, {EDataType}, {CDEElementOp}, V1, 256, 128, 128, 128/sizeof({A0DataType}), 1, 4, {Nswizzle}, {PerTensorQuant}, {MulRoutedWeight}, {ActOP}>;
     }}
     else
     {{
@@ -154,7 +211,10 @@ heuristic_dispatch_dict = {
         A16W16_A8W8_gemm1_heuristic_dispatch,
         A16W16_A8W8_gemm2_heuristic_dispatch,
     ],
-    "a8w4": [],
+    "a8w4": [
+        A8W4_gemm1_heuristic_dispatch,
+        A8W4_gemm2_heuristic_dispatch,
+    ],
 }
 
 
