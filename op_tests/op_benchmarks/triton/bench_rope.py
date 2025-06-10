@@ -3,19 +3,19 @@ import sys
 import torch
 import triton
 from triton.testing import runtime
-from op_tests.triton_tests.test_rope_triton import generate_rope_inputs
+from op_tests.triton_tests.test_rope import generate_rope_inputs
 from aiter.ops.triton.rope import RotateStyle
 from aiter.ops.triton.rope import (
     rope_fwd,
     rope_fwd_inplace,
     rope_fwd_thd,
     rope_fwd_thd_inplace,
-    # rope_cached_fwd,
-    # rope_cached_fwd_inplace,
-    # rope_cached_positions_fwd,
-    # rope_cached_positions_fwd_inplace,
-    # rope_cached_positions_offsets_fwd,
-    # rope_cached_positions_offsets_fwd_inplace,
+    rope_cached_fwd,
+    rope_cached_fwd_inplace,
+    rope_cached_positions_fwd,
+    rope_cached_positions_fwd_inplace,
+    rope_cached_positions_offsets_fwd,
+    rope_cached_positions_offsets_fwd_inplace,
     rope_cached_thd_positions_2c_fwd,
     rope_cached_thd_positions_2c_fwd_inplace,
     rope_cached_thd_positions_offsets_2c_fwd,
@@ -254,6 +254,7 @@ def run_benchmark(args):
 
         transpose_output = False
         fn = None
+
         if Q > 1 and two_inputs and cached and pos and layout == "thd":
             cos_sin_cache = torch.cat((cos, sin), dim=-1)
             cos, sin = cos_sin_cache.chunk(2, dim=-1)
@@ -364,26 +365,89 @@ def run_benchmark(args):
                         transpose_output,
                     )
 
-        # TODO enable these versions after passing tests in test_rope_trition.py
-        # if not two_inputs and cached and pos and offs and layout == "sbhd":
-        #     if inplace:
-        #         fn = lambda: rope_cached_positions_offsets_fwd_inplace(x, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
-        #     else:
-        #         fn = lambda: rope_cached_positions_offsets_fwd(x, cos, sin, positions, offsets, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+        if not two_inputs and cached and pos and offs:
+            if layout == "sbhd":
+                if inplace:
+                    fn = (
+                        lambda: rope_cached_positions_offsets_fwd_inplace(  # noqa: E731
+                            x,
+                            cos,
+                            sin,
+                            positions,
+                            offsets,
+                            rotate_style,
+                            reuse_freqs_front_part,
+                            nope_first,
+                            transpose_output,
+                        )
+                    )
+                else:
+                    fn = lambda: rope_cached_positions_offsets_fwd(  # noqa: E731
+                        x,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+            elif layout == "thd":
+                pass
 
-        # if not two_inputs and cached and pos and not offs and layout == "sbhd":
-        #     if inplace:
-        #         fn = lambda: rope_cached_positions_fwd_inplace(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
-        #     else:
-        #         fn = lambda: rope_cached_positions_fwd(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
+        if not two_inputs and cached and pos and not offs:
+            if layout == "sbhd":
+                if inplace:
+                    fn = lambda: rope_cached_positions_fwd_inplace(  # noqa: E731
+                        x,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_cached_positions_fwd(  # noqa: E731
+                        x,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+            else:
+                pass
 
-        # if not two_inputs and cached and not pos and not offs and layout == "sbhd":
-        #     if inplace:
-        #         fn = lambda : rope_cached_fwd_inplace(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
-        #     else:
-        #         fn = lambda : rope_cached_fwd(x, cos, sin, positions, rotate_style, reuse_freqs_front_part, nope_first, transpose_output)
-
-        # TODO enable rope_fwd_2d and rope_fwd_2d_inplace,
+        if not two_inputs and cached and not pos and not offs:
+            if layout == "sbhd":
+                if inplace:
+                    fn = lambda: rope_cached_fwd_inplace(  # noqa: E731
+                        x,
+                        cos,
+                        sin,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_cached_fwd(  # noqa: E731
+                        x,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+            else:
+                pass
 
         if not two_inputs and not cached and not pos and not offs:
             if layout == "sbhd":
@@ -391,7 +455,6 @@ def run_benchmark(args):
                     fn = lambda: rope_fwd_inplace(  # noqa: E731
                         x,
                         freqs,
-                        positions,
                         rotate_style,
                         reuse_freqs_front_part,
                         nope_first,
@@ -401,7 +464,6 @@ def run_benchmark(args):
                     fn = lambda: rope_fwd(  # noqa: E731
                         x,
                         freqs,
-                        positions,
                         rotate_style,
                         reuse_freqs_front_part,
                         nope_first,
@@ -415,7 +477,6 @@ def run_benchmark(args):
                         x,
                         cu_seqlens,
                         freqs,
-                        positions,
                         rotate_style,
                         reuse_freqs_front_part,
                         nope_first,
@@ -426,12 +487,13 @@ def run_benchmark(args):
                         x,
                         cu_seqlens,
                         freqs,
-                        positions,
                         rotate_style,
                         reuse_freqs_front_part,
                         nope_first,
                         transpose_output,
                     )
+
+        # TODO enable rope_fwd_2d and rope_fwd_2d_inplace
 
         if fn is None:
             raise NotImplementedError(
