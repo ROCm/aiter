@@ -8,6 +8,8 @@ from aiter import dtypes
 from aiter.utility import fp4_utils
 import random
 import itertools
+import argparse
+from aiter import dtypes
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -87,10 +89,9 @@ def test_gemm(dtype, M, N, K):
 
 import pandas as pd
 
-df = []
-for dtype in [dtypes.bf16]:
-    for m, n, k in [
-        # pure_compute
+l_dtype = ['bf16']
+l_mnk = [
+    # pure_compute
         (16384, 16384, 16384),
         (32768, 106496, 16384),
         (32768, 16384, 53248),
@@ -139,7 +140,35 @@ for dtype in [dtypes.bf16]:
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
-    ]:
+]
+
+parser = argparse.ArgumentParser(description='config input of test')
+parser.add_argument('-d', '--dtype',
+                    type=str,
+                    choices=l_dtype,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='data type')
+parser.add_argument('-s', '--shape',
+                    type=dtypes.str2tuple,
+                    choices=l_mnk,
+                    nargs='?',
+                    const=None,
+                    default=None,
+                    help='shape')
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.shape is not None:
+    l_mnk = [args.shape]
+
+df = []
+for dtype in l_dtype:
+    for m, n, k in l_mnk:
         ret = test_gemm(dtype, m, n, k)
         df.append(ret)
 df = pd.DataFrame(df)

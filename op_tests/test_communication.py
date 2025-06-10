@@ -340,7 +340,7 @@ if __name__ == "__main__":
     #         test_communication(8, shape, dtype, withGraph=True)
 
     print("start test test_communication\n")
-    for dtype in [dtypes.bf16]:
-        for shape in [(128, 8192)]:
+    for dtype in l_dtype:
+        for shape in l_shape:
             # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False)
             test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False, perTKQuant=True)
