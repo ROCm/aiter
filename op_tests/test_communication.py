@@ -304,24 +304,30 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype, withGraph=False, perTKQuant=F
     )
 
 
-l_dtype = ['bf16']
-l_shape = [(128,8192)]
+l_dtype = ["bf16"]
+l_shape = [(128, 8192)]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-s', '--shape',
-                    type=dtypes.str2tuple,
-                    choices=l_shape,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    choices=l_shape,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
 
 
 if __name__ == "__main__":

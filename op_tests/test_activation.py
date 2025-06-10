@@ -73,32 +73,40 @@ def test_silu_and_mul(m, n, dtype):
     checkAllclose(ref, out)
     return {"us_aiter": us_aiter}
 
+
 l_dtype = ["fp16", "bf16"]
 l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192]
 l_n = [1024, 4096, 8192]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-m',
-                    type=int,
-                    choices=l_m,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='m: matrix row count')
-parser.add_argument('-n',
-                    type=int,
-                    choices=l_n,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='n: matrix column count')
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    choices=l_m,
+    nargs="?",
+    const=None,
+    default=None,
+    help="m: matrix row count",
+)
+parser.add_argument(
+    "-n",
+    type=int,
+    choices=l_n,
+    nargs="?",
+    const=None,
+    default=None,
+    help="n: matrix column count",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -118,7 +126,6 @@ for dtype in l_dtype:
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"scaled_silu_and_mul summary:\n{df}")
-
 
 df = []
 for dtype in l_dtype:

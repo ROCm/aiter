@@ -272,28 +272,37 @@ def test_batch_prefill_with_paged_kv_cache(
 
 l_causal = [False, True]
 l_logits_soft_cap = [0.0, 30.0]
-l_dtype = ['fp16', 'bf16']
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-c', '--causal',
-                    type=dtypes.str2bool,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='causal mask mode')
-parser.add_argument('-l', '--logits_soft_cap',
-                    type=float,
-                    choices=l_logits_soft_cap,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='logits soft cap value')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
+l_dtype = ["fp16", "bf16"]
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-c",
+    "--causal",
+    type=dtypes.str2bool,
+    nargs="?",
+    const=None,
+    default=None,
+    help="causal mask mode",
+)
+parser.add_argument(
+    "-l",
+    "--logits_soft_cap",
+    type=float,
+    choices=l_logits_soft_cap,
+    nargs="?",
+    const=None,
+    default=None,
+    help="logits soft cap value",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
 
 if __name__ == "__main__":
     args = parser.parse_args()

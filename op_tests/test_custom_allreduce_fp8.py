@@ -123,24 +123,31 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         checkAllclose(c.cpu(), out.cpu(), msg=msg)
 
-l_dtype = ['fp16']
-l_shape = [(128,8192)]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-s', '--shape',
-                    type=dtypes.str2tuple,
-                    choices=l_shape,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
+l_dtype = ["fp16"]
+l_shape = [(128, 8192)]
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    choices=l_shape,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
 
 if __name__ == "__main__":
     freeze_support()

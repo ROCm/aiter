@@ -118,42 +118,43 @@ def test_gemm_asm(dtype, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 
-l_dtype = ['bf16']
-l_m =  [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
-l_nk =  [
-            (1536, 7168),
-            (3072, 1536),
-            (576, 7168),
-            (7168, 256),
-            (7168, 2048),
-            (4608, 7168),
-            (7168, 2304),
-            (512, 7168),
-            (4096, 512),
-        ]
+l_dtype = ["bf16"]
+l_m = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
+l_nk = [
+    (1536, 7168),
+    (3072, 1536),
+    (576, 7168),
+    (7168, 256),
+    (7168, 2048),
+    (4608, 7168),
+    (7168, 2304),
+    (512, 7168),
+    (4096, 512),
+]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-m',
-                    type=int,
-                    choices=l_m,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
-parser.add_argument('-nk',
-                    type=dtypes.str2tuple,
-                    choices=l_nk,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-m", type=int, choices=l_m, nargs="?", const=None, default=None, help="shape"
+)
+parser.add_argument(
+    "-nk",
+    type=dtypes.str2tuple,
+    choices=l_nk,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
 
 args = parser.parse_args()
 if args.dtype is None:

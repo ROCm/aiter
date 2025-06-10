@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
-import  argparse
+import argparse
 import itertools
 
 
@@ -43,48 +43,61 @@ def test_gemm(dtype, b, m, n, k):
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
-l_dtype = ['bf16']
+
+l_dtype = ["bf16"]
 l_b = [16]
 l_m = [1, 32, 64, 128, 192, 256, 320, 512, 1024, 2048, 4096, 8192]
 l_n = [1028, 8192]
 l_k = [8192, 1024]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-b', '--batch',
-                    type=int,
-                    choices=l_b,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='batch size')
-parser.add_argument('-m',
-                    type=int,
-                    choices=l_m,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='m: Represents the number of rows in the output matrix ( C ) and the first input matrix ( A ).')
-parser.add_argument('-n',
-                    type=int,
-                    choices=l_n,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='n: Represents the number of columns in the output matrix ( C ) and the second input matrix ( B ).')
-parser.add_argument('-k',
-                    type=int,
-                    choices=l_k,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='k: Represents the number of columns in the first input matrix ( A ) and the number of rows in the second input matrix ( B ).')
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-b",
+    "--batch",
+    type=int,
+    choices=l_b,
+    nargs="?",
+    const=None,
+    default=None,
+    help="batch size",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    choices=l_m,
+    nargs="?",
+    const=None,
+    default=None,
+    help="m: Represents the number of rows in the output matrix ( C ) and the first input matrix ( A ).",
+)
+parser.add_argument(
+    "-n",
+    type=int,
+    choices=l_n,
+    nargs="?",
+    const=None,
+    default=None,
+    help="n: Represents the number of columns in the output matrix ( C ) and the second input matrix ( B ).",
+)
+parser.add_argument(
+    "-k",
+    type=int,
+    choices=l_k,
+    nargs="?",
+    const=None,
+    default=None,
+    help="k: Represents the number of columns in the first input matrix ( A ) and the number of rows in the second input matrix ( B ).",
+)
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]

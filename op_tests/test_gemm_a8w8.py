@@ -290,8 +290,9 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
-l_dtype = ['bf16', 'fp16']
-l_quantDtype = ['i8', 'fp8']
+
+l_dtype = ["bf16", "fp16"]
+l_quantDtype = ["i8", "fp8"]
 l_mnk_nm = [
     # qkv_proj
     (1, 1280, 8192),
@@ -323,28 +324,36 @@ l_mnk_nm = [
     (16384, 8192, 1024),
 ]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-q', '--quantDtype',
-                    type=str,
-                    choices=l_quantDtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
-parser.add_argument('-mnk',
-                    type=dtypes.str2tuple,
-                    choices=l_mnk_nm,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-q",
+    "--quantDtype",
+    type=str,
+    choices=l_quantDtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
+parser.add_argument(
+    "-mnk",
+    type=dtypes.str2tuple,
+    choices=l_mnk_nm,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
 
 args = parser.parse_args()
 if args.dtype is None:

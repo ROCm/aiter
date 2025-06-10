@@ -103,26 +103,30 @@ def test_allreduce_custom(tp_size, pp_size, shape, dtype, withGraph=False):
         checkAllclose(ref, out.to(ref), msg=msg)
 
 
-l_dtype = ['fp16', 'bf16']
-l_shape = [(128,8192)]
+l_dtype = ["fp16", "bf16"]
+l_shape = [(128, 8192)]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-d', '--dtype',
-                    type=str,
-                    choices=l_dtype,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='data type')
-parser.add_argument('-s', '--shape',
-                    type=dtypes.str2tuple,
-                    choices=l_shape,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
-
-
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    choices=l_shape,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
 
 
 if __name__ == "__main__":

@@ -384,30 +384,40 @@ list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192]
 list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256]
 list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
 
-parser = argparse.ArgumentParser(description='config input of test')
-parser.add_argument('-c', '--ctxLen',
-                    type=int,
-                    choices=list_ctx_len,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='context length')
-parser.add_argument('-b', '--batchSize',
-                    type=int,
-                    choices=list_batch_size,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='batch size')
-parser.add_argument('-n', '--nhead',
-                    type=dtypes.str2tuple,
-                    choices=list_nhead,
-                    nargs='?',
-                    const=None,
-                    default=None,
-                    help='shape')
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-c",
+    "--ctxLen",
+    type=int,
+    choices=list_ctx_len,
+    nargs="?",
+    const=None,
+    default=None,
+    help="context length",
+)
+parser.add_argument(
+    "-b",
+    "--batchSize",
+    type=int,
+    choices=list_batch_size,
+    nargs="?",
+    const=None,
+    default=None,
+    help="batch size",
+)
+parser.add_argument(
+    "-n",
+    "--nhead",
+    type=dtypes.str2tuple,
+    choices=list_nhead,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
 
 import pandas as pd
+
 args = parser.parse_args()
 if args.ctxLen is not None:
     list_ctx_len = [args.ctxLen]
