@@ -517,60 +517,63 @@
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                          \
-      m.def("ck_moe_stage1", &ck_moe_stage1,           \
-            py::arg("hidden_states"),                  \
-            py::arg("w1"),                             \
-            py::arg("w2"),                             \
-            py::arg("sorted_token_ids"),               \
-            py::arg("sorted_expert_ids"),              \
-            py::arg("num_valid_ids"),                  \
-            py::arg("out"),                            \
-            py::arg("topk"),                           \
-            py::arg("kernelName"),                     \
-            py::arg("w1_scale") = std::nullopt,        \
-            py::arg("a1_scale") = std::nullopt,        \
-            py::arg("block_m") = 32,                   \
-            py::arg("sorted_weights") = std::nullopt); \
-                                                       \
-      m.def("ck_moe_stage2", &ck_moe_stage2,           \
-            py::arg("inter_states"),                   \
-            py::arg("w1"),                             \
-            py::arg("w2"),                             \
-            py::arg("sorted_token_ids"),               \
-            py::arg("sorted_expert_ids"),              \
-            py::arg("num_valid_ids"),                  \
-            py::arg("out"),                            \
-            py::arg("topk"),                           \
-            py::arg("kernelName"),                     \
-            py::arg("w2_scale") = std::nullopt,        \
-            py::arg("a2_scale") = std::nullopt,        \
-            py::arg("block_m") = 32,                   \
-            py::arg("sorted_weights") = std::nullopt); \
-#define MHA_VARLEN_FWD_PYBIND                     \
-    m.def("mha_varlen_fwd",                       \
-          &aiter::torch_itfs::mha_varlen_fwd,     \
-          py::arg("q"),                           \
-          py::arg("k"),                           \
-          py::arg("v"),                           \
-          py::arg("cu_seqlens_q"),                \
-          py::arg("cu_seqlens_k"),                \
-          py::arg("max_seqlen_q"),                \
-          py::arg("max_seqlen_k"),                \
-          py::arg("min_seqlen_q"),                \
-          py::arg("dropout_p"),                   \
-          py::arg("softmax_scale"),               \
-          py::arg("logits_soft_cap"),             \
-          py::arg("zero_tensors"),                \
-          py::arg("is_causal"),                   \
-          py::arg("window_size_left"),            \
-          py::arg("window_size_right"),           \
-          py::arg("return_softmax_lse"),          \
-          py::arg("return_dropout_randval"),      \
-          py::arg("out")          = std::nullopt, \
-          py::arg("block_table")  = std::nullopt, \
-          py::arg("bias")         = std::nullopt, \
-          py::arg("alibi_slopes") = std::nullopt, \
+#define MOE_CK_2STAGES_PYBIND                        \
+    m.def("ck_moe_stage1",                           \
+          &ck_moe_stage1,                            \
+          py::arg("hidden_states"),                  \
+          py::arg("w1"),                             \
+          py::arg("w2"),                             \
+          py::arg("sorted_token_ids"),               \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("num_valid_ids"),                  \
+          py::arg("out"),                            \
+          py::arg("topk"),                           \
+          py::arg("kernelName"),                     \
+          py::arg("w1_scale")       = std::nullopt,  \
+          py::arg("a1_scale")       = std::nullopt,  \
+          py::arg("block_m")        = 32,            \
+          py::arg("sorted_weights") = std::nullopt); \
+                                                     \
+    m.def("ck_moe_stage2",                           \
+          &ck_moe_stage2,                            \
+          py::arg("inter_states"),                   \
+          py::arg("w1"),                             \
+          py::arg("w2"),                             \
+          py::arg("sorted_token_ids"),               \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("num_valid_ids"),                  \
+          py::arg("out"),                            \
+          py::arg("topk"),                           \
+          py::arg("kernelName"),                     \
+          py::arg("w2_scale")       = std::nullopt,  \
+          py::arg("a2_scale")       = std::nullopt,  \
+          py::arg("block_m")        = 32,            \
+          py::arg("sorted_weights") = std::nullopt); \
+                                                  
+#define MHA_VARLEN_FWD_PYBIND                        \
+      m.def("mha_varlen_fwd",                        \
+          &aiter::torch_itfs::mha_varlen_fwd,        \
+          py::arg("q"),                              \
+          py::arg("k"),                              \
+          py::arg("v"),                              \
+          py::arg("cu_seqlens_q"),                   \
+          py::arg("cu_seqlens_k"),                   \
+          py::arg("max_seqlen_q"),                   \
+          py::arg("max_seqlen_k"),                   \
+          py::arg("min_seqlen_q"),                   \
+          py::arg("dropout_p"),                      \
+          py::arg("softmax_scale"),                  \
+          py::arg("logits_soft_cap"),                \
+          py::arg("zero_tensors"),                   \
+          py::arg("is_causal"),                      \
+          py::arg("window_size_left"),               \
+          py::arg("window_size_right"),              \
+          py::arg("return_softmax_lse"),             \
+          py::arg("return_dropout_randval"),         \
+          py::arg("out")          = std::nullopt,    \
+          py::arg("block_table")  = std::nullopt,    \
+          py::arg("bias")         = std::nullopt,    \
+          py::arg("alibi_slopes") = std::nullopt,    \
           py::arg("gen")          = std::nullopt);
 
 #define MHA_BATCH_PREFILL_PYBIND                  \
@@ -597,38 +600,6 @@
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
-
-#define MOE_CK_2STAGES_PYBIND                       \
-    m.def("ck_moe_stage1",                          \
-          &ck_moe_stage1,                           \
-          py::arg("hidden_states"),                 \
-          py::arg("w1"),                            \
-          py::arg("w2"),                            \
-          py::arg("sorted_token_ids"),              \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("num_valid_ids"),                 \
-          py::arg("out"),                           \
-          py::arg("topk"),                          \
-          py::arg("w1_scale")       = std::nullopt, \
-          py::arg("a1_scale")       = std::nullopt, \
-          py::arg("block_m")        = 32,           \
-          py::arg("sorted_weights") = std::nullopt, \
-          py::arg("act_op")         = 0);                   \
-                                                    \
-    m.def("ck_moe_stage2",                          \
-          &ck_moe_stage2,                           \
-          py::arg("inter_states"),                  \
-          py::arg("w1"),                            \
-          py::arg("w2"),                            \
-          py::arg("sorted_token_ids"),              \
-          py::arg("sorted_expert_ids"),             \
-          py::arg("num_valid_ids"),                 \
-          py::arg("out"),                           \
-          py::arg("topk"),                          \
-          py::arg("w2_scale")       = std::nullopt, \
-          py::arg("a2_scale")       = std::nullopt, \
-          py::arg("block_m")        = 32,           \
-          py::arg("sorted_weights") = std::nullopt);
 
 #define MOE_CK_PYBIND                            \
     m.def("ck_moe",                              \

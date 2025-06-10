@@ -137,12 +137,12 @@ def test_fmoe(
 ):
     torch_quant = aiter.get_torch_quant(qType)
     torch_act = aiter.get_torch_act(actType)
-    input = torch.ones((token, model_dim), dtype=dtype) / 10
+    input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
-        w1 = torch.ones((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) 
     else:
-        w1 = torch.ones((E, inter_dim, model_dim), dtype=dtype)
-    w2 = torch.ones((E, model_dim, inter_dim), dtype=dtype) / 10
+        w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) 
 
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
@@ -414,7 +414,7 @@ def test_fmoe(
         return {"us": us_fuse, "err": err}
 
 
-list_dtype = [dtypes.bf16, dtypes.fp16][:]
+list_dtype = [dtypes.bf16, dtypes.fp16][:1]
 list_dim = [(6144, 4096)]
 list_tokenNum = [
     1,
@@ -428,7 +428,7 @@ list_tokenNum = [
     1024,
     4096,
     163840,
-][7:8]
+][:]
 list_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
@@ -437,7 +437,7 @@ list_quant = [
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
 list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:]
-list_doweight_stage1 = [False, True][:1]
+list_doweight_stage1 = [False, True][:]
 expert, topk = 8, 2
 
 import pandas as pd
