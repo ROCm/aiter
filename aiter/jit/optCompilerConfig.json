@@ -196,6 +196,21 @@
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv'"
     },
+        "module_gemm_a8w8_bpreshuffle": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/include'",
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune_file {AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv'"
+    },
     "module_gemm_a8w8_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_asm_pybind.cu'",
@@ -406,6 +421,21 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gen_instances.py --working_path {{}} --tune'"
+    },
+        "module_gemm_a8w8_bpreshuffle_tune": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_tune_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.cu'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/include'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "is_python_module": "True",
+        "is_standalone": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gen_instances.py --working_path {{}} --tune'"
     },
     "module_aiter_operator": {
         "srcs": [

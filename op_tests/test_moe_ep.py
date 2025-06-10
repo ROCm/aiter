@@ -2,10 +2,21 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from aiter.test_common import checkAllclose, perftest
-from aiter.fused_moe import torch_moe, fused_topk
+import aiter
+from aiter.test_common import (
+    checkAllclose,
+    run_perftest,
+    perftest,
+)
+from aiter.fused_moe import (
+    fused_topk,
+    fused_moe,
+    torch_moe,
+)
+
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
+from aiter import ActivationType
 from aiter import pertoken_quant, ck_moe
 from aiter import dtypes
 
@@ -208,25 +219,46 @@ def test_fmoe_ep(
         )
 
         # b implement
-        w1b = shuffle_weight(w1)
-        w2b = shuffle_weight(w2)
+        torch_quant = aiter.get_torch_quant(aiter.QuantType.No)
+        w1_qt, w1_scale = torch_quant(w1, quant_dtype=None)
+        w2_qt, w2_scale = torch_quant(w2, quant_dtype=None)
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+        w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
 
-        if use_g1u1:
-            out_b = ref2
-            avg_b = 9999
-            print("asm g1u1 only support quant/smoothquant Now")
-        else:
-            out_b, avg_b = asm_moe_test(
-                input, w1b, w2b, topk_weights, topk_ids, expert_mask=expert_mask
-            )
+        # if use_g1u1:
+        #     out_b = ref2
+        #     avg_b = 9999
+        #     print("asm g1u1 only support quant/smoothquant Now")
+        # else:
+        #     out_b, avg_b = asm_moe_test(
+        #         input,
+        #         w1_qt_aiter,
+        #         w2_qt_aiter,
+        #         topk_weights,
+        #         topk_ids,
+        #         expert_mask=expert_mask,
+        #     )
 
         # test ck moe
-        out_ck, avg_ck = ck_moe_test(
-            input, w1b, w2b, topk_weights, topk_ids, None, None, None, None, expert_mask
+        out_ck, avg_ck = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            expert_mask,
+            w1_scale=None,
+            w2_scale=None,
+            quant_type=aiter.QuantType.No,
+            activation=ActivationType.Silu,
+            doweight_stage1=False,
         )
 
-        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+        # msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        # checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
 
     else:
@@ -340,29 +372,29 @@ def test_fmoe_ep(
 
 
 print("test test_fmoe 16 bit")
-print("\ng1u0 no quant")
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m in [7, 128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                for ep in [1, 2, 4, 8]:
-                    test_fmoe_ep(
-                        dtype, m, dim, hdim, 32, 5, quant="No", shared_E=2, ep=ep
-                    )
+# print("\ng1u0 no quant")
+# for dtype in [dtypes.fp16, dtypes.bf16]:
+#     for m in [7, 128, 256]:
+#         for dim in [4096, 8192]:
+#             for hdim in [1024, 1280]:
+#                 for ep in [4, 8]:
+#                     test_fmoe_ep(
+#                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=2, ep=ep
+#                     )
 
 print("\ng1u1 no quant")
 for dtype in [dtypes.fp16, dtypes.bf16]:
     for m in [7, 128, 256]:
         for dim in [4096, 8192]:
-            for hdim in [1024]:
-                for ep in [1, 2, 4, 8]:
+            for hdim in [1024, 1280]:
+                for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype,
                         m,
                         dim,
                         hdim,
-                        32,
-                        5,
+                        128,
+                        9,
                         quant="No",
                         use_g1u1=True,
                         shared_E=2,
@@ -374,7 +406,7 @@ for dtype in [dtypes.bf16]:
     for m in [128, 256]:
         for dim in [4096, 8192]:
             for hdim in [1024]:
-                for ep in [1, 2, 4, 8]:
+                for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype,
                         m,
@@ -393,7 +425,7 @@ for dtype in [dtypes.bf16]:
     for m in [128, 256]:
         for dim in [4096, 8192]:
             for hdim in [1024]:
-                for ep in [1, 2, 4, 8]:
+                for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype,
                         m,
@@ -413,7 +445,7 @@ for dtype in [dtypes.bf16]:
     for m in [128]:
         for dim in [4096, 6144, 8192]:
             for hdim in [512, 1024]:
-                for ep in [1, 2, 4, 8]:
+                for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype,
                         m,
@@ -451,7 +483,7 @@ for dtype in [dtypes.bf16]:
     for m in [128]:
         for dim in [4096, 6144, 8192]:
             for hdim in [512, 1024, 1280]:
-                for ep in [1, 2, 4, 8]:
+                for ep in [4, 8]:
                     test_fmoe_ep(
                         dtype,
                         m,

@@ -1,33 +1,90 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+import pytest
+import os
 import torch
 import triton
-import pytest
-from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+from aiter.ops.triton.gemm_afp4wfp4 import (
+    gemm_afp4wfp4,
+    gemm_afp4wfp4_preshuffled_scales,
+)
+from op_tests.triton_tests.utils.types import str_to_torch_dtype
+
+TRITON_HIP_PRESHUFFLE_SCALES = (
+    os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
+)
+
+
+def shuffle_scales(scales: torch.Tensor):
+    scales_shuffled = scales.clone()
+    sm, sn = scales_shuffled.shape
+    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
+    return scales_shuffled
+
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
 
-def generate_gemm_afp4wfp4_inputs(M, N, K):
+def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
     torch.manual_seed(5)
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
+
     # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
-    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
-    x = x_low | x_high << 4
+    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+    x = (
+        x_high << 4 | x_low
+    )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
+    x = x.to(device="cuda")
+
     w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w = w_low | w_high << 4
     w = w.T
     # Scale of 1.0 in e8m0, bias 127.
+    if M >= 32 and TRITON_HIP_PRESHUFFLE_SCALES:
+        M_pad = (M + 255) // 256 * 256
+    else:
+        M_pad = M
     x_scales = torch.randint(
-        124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device="cuda"
+        124, 128, (K // SCALE_GROUP_SIZE, M_pad), dtype=torch.uint8, device="cuda"
     )
     w_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
     )
     x_scales = x_scales.T
     w_scales = w_scales.T
+    if TRITON_HIP_PRESHUFFLE_SCALES:
+        if M >= 32:
+            x_scales_shuffled = shuffle_scales(x_scales)
+        else:
+            x_scales_shuffled = x_scales
+        w_scales_shuffled = shuffle_scales(w_scales)
+    else:
+        x_scales_shuffled = x_scales
+        w_scales_shuffled = w_scales
 
-    return x, w, x_scales, w_scales
+    y = None
+    if output:
+        y = torch.empty((M, N), dtype=dtype).cuda()
+        out_dtype = (None,)
+    else:
+        out_dtype = dtype
+
+    return (
+        x,
+        w,
+        x_scales[:M],
+        w_scales,
+        x_scales_shuffled,
+        w_scales_shuffled,
+        out_dtype,
+        y,
+    )
 
 
 def get_x_vals():
@@ -65,6 +122,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    x_vals += [(256, 3584, 2112)]
     return x_vals
 
 
@@ -118,15 +176,40 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype):
+@pytest.mark.parametrize("output", [True, False])
+def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(M, N, K)
-    out = torch.empty(x.shape[0], w.shape[1], device=x.device, dtype=dtype)
+    if TRITON_HIP_PRESHUFFLE_SCALES:
+        if N % 32 > 0:
+            pytest.skip(
+                f"N = {N} is not divisible by 32, skip this test for preshuffled scales tests"
+            )
+        elif K % 256 > 0:
+            pytest.skip(
+                f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
+            )
+
+    x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
+        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output)
+    )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
-    gemm_afp4wfp4(x, w, out, x_scales, w_scales, dtype)
+    if TRITON_HIP_PRESHUFFLE_SCALES:
+        if output:
+            triton_out = gemm_afp4wfp4_preshuffled_scales(
+                x, w, x_scales_triton, w_scales_triton, dtype, y
+            )
+        else:
+            triton_out = gemm_afp4wfp4_preshuffled_scales(
+                x, w, x_scales_triton, w_scales_triton, dtype
+            )
+    else:
+        if output:
+            triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype, y)
+        else:
+            triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype)
 
-    torch.testing.assert_close(torch_out, out)
+    torch.testing.assert_close(torch_out, triton_out)

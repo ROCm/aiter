@@ -1,8 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
 import triton
 import triton.language as tl
 
 from typing import Optional, Tuple
+
+# global parameters
+_USE_INT64_STRIDES = False
+
+
+def mha_set_use_int64_strides(value: bool):
+    global _USE_INT64_STRIDES
+    _USE_INT64_STRIDES = value
 
 
 @triton.jit
@@ -413,40 +424,40 @@ def _attn_fwd(
     s_dmask_ptr: torch.Tensor,
     dropout_mask_ptr: torch.Tensor,
     softmax_lse_ptr: torch.Tensor,
-    stride_qz,
-    stride_qh,
-    stride_qm,
-    stride_qk,
-    stride_kz,
-    stride_kh,
-    stride_kn,
-    stride_kk,
-    stride_vz,
-    stride_vh,
-    stride_vn,
-    stride_vk,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_oz,
-    stride_oh,
-    stride_om,
-    stride_on,
-    stride_alibi_z,
-    stride_alibi_h,
-    stride_sd_z,
-    stride_sd_h,
-    stride_sd_m,
-    stride_sd_n,
-    stride_lse_z,
-    stride_lse_h,
-    stride_lse_m,
+    stride_qz_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qk_in,
+    stride_kz_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kk_in,
+    stride_vz_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vk_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_oz_in,
+    stride_oh_in,
+    stride_om_in,
+    stride_on_in,
+    stride_alibi_z_in,
+    stride_alibi_h_in,
+    stride_sd_z_in,
+    stride_sd_h_in,
+    stride_sd_m_in,
+    stride_sd_n_in,
+    stride_lse_z_in,
+    stride_lse_h_in,
+    stride_lse_m_in,
     sm_scale,
     cu_seqlens_q,
     cu_seqlens_k,
     dropout_p,
     philox_seed,
-    philox_offset,
+    philox_offset_base_in,
     SEQLEN_Q: tl.constexpr,
     SEQLEN_K: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -463,6 +474,7 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
     # calculate offsets
     wid = tl.program_id(
@@ -483,6 +495,79 @@ def _attn_fwd(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    if USE_INT64_STRIDES:
+        stride_qz = tl.cast(stride_qz_in, tl.int64)
+        stride_qh = tl.cast(stride_qh_in, tl.int64)
+        stride_qm = tl.cast(stride_qm_in, tl.int64)
+        stride_qk = tl.cast(stride_qk_in, tl.int64)
+        stride_kz = tl.cast(stride_kz_in, tl.int64)
+        stride_kh = tl.cast(stride_kh_in, tl.int64)
+        stride_kn = tl.cast(stride_kn_in, tl.int64)
+        stride_kk = tl.cast(stride_kk_in, tl.int64)
+        stride_vz = tl.cast(stride_vz_in, tl.int64)
+        stride_vh = tl.cast(stride_vh_in, tl.int64)
+        stride_vn = tl.cast(stride_vn_in, tl.int64)
+        stride_vk = tl.cast(stride_vk_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+        stride_oz = tl.cast(stride_oz_in, tl.int64)
+        stride_oh = tl.cast(stride_oh_in, tl.int64)
+        stride_om = tl.cast(stride_om_in, tl.int64)
+        stride_on = tl.cast(stride_on_in, tl.int64)
+        stride_alibi_z = tl.cast(stride_alibi_z_in, tl.int64)
+        stride_alibi_h = tl.cast(stride_alibi_h_in, tl.int64)
+
+        # NOTE: philox offset is need in dropout pointer calculations
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_sd_z = tl.cast(stride_sd_z_in, tl.int64)
+        stride_sd_h = tl.cast(stride_sd_h_in, tl.int64)
+        stride_sd_m = tl.cast(stride_sd_m_in, tl.int64)
+        stride_sd_n = tl.cast(stride_sd_n_in, tl.int64)
+        stride_lse_z = tl.cast(stride_lse_z_in, tl.int64)
+        stride_lse_h = tl.cast(stride_lse_h_in, tl.int64)
+        stride_lse_m = tl.cast(stride_lse_m_in, tl.int64)
+    else:
+        stride_qz = stride_qz_in
+        stride_qm = stride_qm_in
+        stride_qk = stride_qk_in
+        stride_qh = stride_qh_in
+        stride_kz = stride_kz_in
+        stride_kh = stride_kh_in
+        stride_kn = stride_kn_in
+        stride_kk = stride_kk_in
+        stride_vz = stride_vz_in
+        stride_vh = stride_vh_in
+        stride_vn = stride_vn_in
+        stride_vk = stride_vk_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_oz = stride_oz_in
+        stride_oh = stride_oh_in
+        stride_om = stride_om_in
+        stride_on = stride_on_in
+        stride_alibi_z = stride_alibi_z_in
+        stride_alibi_h = stride_alibi_h_in
+        philox_offset_base = philox_offset_base_in
+        stride_sd_z = stride_sd_z_in
+        stride_sd_h = stride_sd_h_in
+        stride_sd_m = stride_sd_m_in
+        stride_sd_n = stride_sd_n_in
+        stride_lse_z = stride_lse_z_in
+        stride_lse_h = stride_lse_h_in
+        stride_lse_m = stride_lse_m_in
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -536,7 +621,7 @@ def _attn_fwd(
                 + offs_d[None, :] * stride_on
             )
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=out_ptr.type.element_ty)
-            out_mask = (offs_m[:, None] < seqlen_q) & (offs_d < BLOCK_DMODEL)
+            out_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
             tl.store(out_ptr + offs_out, acc, mask=out_mask)
 
             if softmax_lse_ptr is not None:
@@ -590,7 +675,7 @@ def _attn_fwd(
     # alibi slopes
     if alibi_slopes_ptr is not None:
         alibi_offs = off_z * stride_alibi_z + off_q_head * stride_alibi_h
-        alibi_slope = tl.load(alibi_slopes + alibi_offs)
+        alibi_slope = tl.load(alibi_slopes_ptr + alibi_offs)
     else:
         alibi_slope = None
 
@@ -616,7 +701,7 @@ def _attn_fwd(
         )
         dropout_mask_ptrs = dropout_mask_ptr + dropout_mask_offs
         philox_ptrs = (
-            philox_offset
+            philox_offset_base
             + off_z * stride_sd_z
             + off_q_head * stride_sd_h
             + offs_m[:, None] * stride_sd_m
@@ -1024,6 +1109,7 @@ def _flash_attn_forward(
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=8,
+        USE_INT64_STRIDES=_USE_INT64_STRIDES,
         **config,
     )
 
@@ -1432,37 +1518,37 @@ def _bwd_kernel_dkdv_causal(
     dv_ptr,
     m_ptr,
     delta_ptr,
-    stride_q_b,
-    stride_q_h,
-    stride_q_m,
-    stride_q_k,
-    stride_k_b,
-    stride_k_h,
-    stride_k_n,
-    stride_k_k,
-    stride_v_b,
-    stride_v_h,
-    stride_v_n,
-    stride_v_k,
-    stride_dk_b,
-    stride_dk_h,
-    stride_dk_n,
-    stride_dk_k,
-    stride_delta_b,
-    stride_delta_h,
-    stride_delta_m,
-    stride_do_b,
-    stride_do_h,
-    stride_do_m,
-    stride_do_k,
-    stride_dropout_b,
-    stride_dropout_h,
-    stride_dropout_m,
-    stride_dropout_n,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_descale_do_z,
+    stride_q_b_in,
+    stride_q_h_in,
+    stride_q_m_in,
+    stride_q_k_in,
+    stride_k_b_in,
+    stride_k_h_in,
+    stride_k_n_in,
+    stride_k_k_in,
+    stride_v_b_in,
+    stride_v_h_in,
+    stride_v_n_in,
+    stride_v_k_in,
+    stride_dk_b_in,
+    stride_dk_h_in,
+    stride_dk_n_in,
+    stride_dk_k_in,
+    stride_delta_b_in,
+    stride_delta_h_in,
+    stride_delta_m_in,
+    stride_do_b_in,
+    stride_do_h_in,
+    stride_do_m_in,
+    stride_do_k_in,
+    stride_dropout_b_in,
+    stride_dropout_h_in,
+    stride_dropout_m_in,
+    stride_dropout_n_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1470,7 +1556,7 @@ def _bwd_kernel_dkdv_causal(
     dropout_mask,
     dropout_p,
     philox_seed,
-    philox_offset_base,
+    philox_offset_base_in,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -1486,11 +1572,92 @@ def _bwd_kernel_dkdv_causal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
     # seq block, batch, head_k
     seq_k_blk_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
     head_k_idx = tl.program_id(2)
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    if USE_INT64_STRIDES:
+        stride_q_b = tl.cast(stride_q_b_in, tl.int64)
+        stride_q_h = tl.cast(stride_q_h_in, tl.int64)
+        stride_q_m = tl.cast(stride_q_m_in, tl.int64)
+        stride_q_k = tl.cast(stride_q_k_in, tl.int64)
+        stride_k_b = tl.cast(stride_k_b_in, tl.int64)
+        stride_k_h = tl.cast(stride_k_h_in, tl.int64)
+        stride_k_n = tl.cast(stride_k_n_in, tl.int64)
+        stride_k_k = tl.cast(stride_k_k_in, tl.int64)
+        stride_v_b = tl.cast(stride_v_b_in, tl.int64)
+        stride_v_h = tl.cast(stride_v_h_in, tl.int64)
+        stride_v_n = tl.cast(stride_v_n_in, tl.int64)
+        stride_v_k = tl.cast(stride_v_k_in, tl.int64)
+        stride_dk_b = tl.cast(stride_dk_b_in, tl.int64)
+        stride_dk_h = tl.cast(stride_dk_h_in, tl.int64)
+        stride_dk_n = tl.cast(stride_dk_n_in, tl.int64)
+        stride_dk_k = tl.cast(stride_dk_k_in, tl.int64)
+        stride_delta_b = tl.cast(stride_delta_b_in, tl.int64)
+        stride_delta_h = tl.cast(stride_delta_h_in, tl.int64)
+        stride_delta_m = tl.cast(stride_delta_m_in, tl.int64)
+        stride_do_b = tl.cast(stride_do_b_in, tl.int64)
+        stride_do_h = tl.cast(stride_do_h_in, tl.int64)
+        stride_do_m = tl.cast(stride_do_m_in, tl.int64)
+        stride_do_k = tl.cast(stride_do_k_in, tl.int64)
+
+        # NOTE: philox offset is need in dropout pointer calculations
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropout_b = tl.cast(stride_dropout_b_in, tl.int64)
+        stride_dropout_h = tl.cast(stride_dropout_h_in, tl.int64)
+        stride_dropout_m = tl.cast(stride_dropout_m_in, tl.int64)
+        stride_dropout_n = tl.cast(stride_dropout_n_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+    else:
+        # strides
+        stride_q_b = stride_q_b_in
+        stride_q_h = stride_q_h_in
+        stride_q_m = stride_q_m_in
+        stride_q_k = stride_q_k_in
+        stride_k_b = stride_k_b_in
+        stride_k_h = stride_k_h_in
+        stride_k_n = stride_k_n_in
+        stride_k_k = stride_k_k_in
+        stride_v_b = stride_v_b_in
+        stride_v_h = stride_v_h_in
+        stride_v_n = stride_v_n_in
+        stride_v_k = stride_v_k_in
+        stride_dk_b = stride_dk_b_in
+        stride_dk_h = stride_dk_h_in
+        stride_dk_n = stride_dk_n_in
+        stride_dk_k = stride_dk_k_in
+        stride_delta_b = stride_delta_b_in
+        stride_delta_h = stride_delta_h_in
+        stride_delta_m = stride_delta_m_in
+        stride_do_b = stride_do_b_in
+        stride_do_h = stride_do_h_in
+        stride_do_m = stride_do_m_in
+        stride_do_k = stride_do_k_in
+        philox_offset_base = philox_offset_base_in
+        stride_dropout_b = stride_dropout_b_in
+        stride_dropout_h = stride_dropout_h_in
+        stride_dropout_m = stride_dropout_m_in
+        stride_dropout_n = stride_dropout_n_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
 
     # Determine q and k start along with seqlen_q and seqlen_k
     q_start = 0
@@ -1740,37 +1907,37 @@ def _bwd_kernel_dq_causal(
     dq_ptr,
     m_ptr,
     delta_ptr,
-    stride_q_b,
-    stride_q_h,
-    stride_q_m,
-    stride_q_k,
-    stride_k_b,
-    stride_k_h,
-    stride_k_n,
-    stride_k_k,
-    stride_v_b,
-    stride_v_h,
-    stride_v_n,
-    stride_v_k,
-    stride_dq_b,
-    stride_dq_h,
-    stride_dq_m,
-    stride_dq_k,
-    stride_delta_b,
-    stride_delta_h,
-    stride_delta_m,
-    stride_do_b,
-    stride_do_h,
-    stride_do_m,
-    stride_do_k,
-    stride_dropout_b,
-    stride_dropout_h,
-    stride_dropout_m,
-    stride_dropout_n,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_descale_do_z,
+    stride_q_b_in,
+    stride_q_h_in,
+    stride_q_m_in,
+    stride_q_k_in,
+    stride_k_b_in,
+    stride_k_h_in,
+    stride_k_n_in,
+    stride_k_k_in,
+    stride_v_b_in,
+    stride_v_h_in,
+    stride_v_n_in,
+    stride_v_k_in,
+    stride_dq_b_in,
+    stride_dq_h_in,
+    stride_dq_m_in,
+    stride_dq_k_in,
+    stride_delta_b_in,
+    stride_delta_h_in,
+    stride_delta_m_in,
+    stride_do_b_in,
+    stride_do_h_in,
+    stride_do_m_in,
+    stride_do_k_in,
+    stride_dropout_b_in,
+    stride_dropout_h_in,
+    stride_dropout_m_in,
+    stride_dropout_n_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -1778,7 +1945,7 @@ def _bwd_kernel_dq_causal(
     dropout_mask,
     dropout_p,
     philox_seed,
-    philox_offset_base,
+    philox_offset_base_in,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -1794,10 +1961,92 @@ def _bwd_kernel_dq_causal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
+    # seq block, batch, head_k
     seq_q_blk_idx = tl.program_id(0)
     batch_idx = tl.program_id(1)
     head_k_idx = tl.program_id(2)
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    if USE_INT64_STRIDES:
+        stride_q_b = tl.cast(stride_q_b_in, tl.int64)
+        stride_q_h = tl.cast(stride_q_h_in, tl.int64)
+        stride_q_m = tl.cast(stride_q_m_in, tl.int64)
+        stride_q_k = tl.cast(stride_q_k_in, tl.int64)
+        stride_k_b = tl.cast(stride_k_b_in, tl.int64)
+        stride_k_h = tl.cast(stride_k_h_in, tl.int64)
+        stride_k_n = tl.cast(stride_k_n_in, tl.int64)
+        stride_k_k = tl.cast(stride_k_k_in, tl.int64)
+        stride_v_b = tl.cast(stride_v_b_in, tl.int64)
+        stride_v_h = tl.cast(stride_v_h_in, tl.int64)
+        stride_v_n = tl.cast(stride_v_n_in, tl.int64)
+        stride_v_k = tl.cast(stride_v_k_in, tl.int64)
+        stride_dq_b = tl.cast(stride_dq_b_in, tl.int64)
+        stride_dq_h = tl.cast(stride_dq_h_in, tl.int64)
+        stride_dq_m = tl.cast(stride_dq_m_in, tl.int64)
+        stride_dq_k = tl.cast(stride_dq_k_in, tl.int64)
+        stride_delta_b = tl.cast(stride_delta_b_in, tl.int64)
+        stride_delta_h = tl.cast(stride_delta_h_in, tl.int64)
+        stride_delta_m = tl.cast(stride_delta_m_in, tl.int64)
+        stride_do_b = tl.cast(stride_do_b_in, tl.int64)
+        stride_do_h = tl.cast(stride_do_h_in, tl.int64)
+        stride_do_m = tl.cast(stride_do_m_in, tl.int64)
+        stride_do_k = tl.cast(stride_do_k_in, tl.int64)
+
+        # NOTE: philox offset is need in dropout pointer calculations
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropout_b = tl.cast(stride_dropout_b_in, tl.int64)
+        stride_dropout_h = tl.cast(stride_dropout_h_in, tl.int64)
+        stride_dropout_m = tl.cast(stride_dropout_m_in, tl.int64)
+        stride_dropout_n = tl.cast(stride_dropout_n_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+    else:
+        stride_q_b = stride_q_b_in
+        stride_q_h = stride_q_h_in
+        stride_q_m = stride_q_m_in
+        stride_q_k = stride_q_k_in
+        stride_k_b = stride_k_b_in
+        stride_k_h = stride_k_h_in
+        stride_k_n = stride_k_n_in
+        stride_k_k = stride_k_k_in
+        stride_v_b = stride_v_b_in
+        stride_v_h = stride_v_h_in
+        stride_v_n = stride_v_n_in
+        stride_v_k = stride_v_k_in
+        stride_dq_b = stride_dq_b_in
+        stride_dq_h = stride_dq_h_in
+        stride_dq_m = stride_dq_m_in
+        stride_dq_k = stride_dq_k_in
+        stride_delta_b = stride_delta_b_in
+        stride_delta_h = stride_delta_h_in
+        stride_delta_m = stride_delta_m_in
+        stride_do_b = stride_do_b_in
+        stride_do_h = stride_do_h_in
+        stride_do_m = stride_do_m_in
+        stride_do_k = stride_do_k_in
+
+        philox_offset_base = philox_offset_base_in
+        stride_dropout_b = stride_dropout_b_in
+        stride_dropout_h = stride_dropout_h_in
+        stride_dropout_m = stride_dropout_m_in
+        stride_dropout_n = stride_dropout_n_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
 
     q_start = 0
     k_start = 0
@@ -2021,37 +2270,37 @@ def _bwd_kernel_dkdv_noncausal(
     DV,
     M,
     Delta,
-    stride_qb,
-    stride_qh,
-    stride_qm,
-    stride_qk,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_kk,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_vk,
-    stride_dkb,
-    stride_dkh,
-    stride_dkn,
-    stride_dkk,
-    stride_deltab,
-    stride_deltah,
-    stride_deltam,
-    stride_dob,
-    stride_doh,
-    stride_dom,
-    stride_dok,
-    stride_dropoutb,
-    stride_dropouth,
-    stride_dropoutm,
-    stride_dropoutn,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_descale_do_z,
+    stride_q_b_in,
+    stride_q_h_in,
+    stride_q_m_in,
+    stride_q_k_in,
+    stride_k_b_in,
+    stride_k_h_in,
+    stride_k_n_in,
+    stride_k_k_in,
+    stride_v_b_in,
+    stride_v_h_in,
+    stride_v_n_in,
+    stride_v_k_in,
+    stride_dk_b_in,
+    stride_dk_h_in,
+    stride_dk_n_in,
+    stride_dk_k_in,
+    stride_delta_b_in,
+    stride_delta_h_in,
+    stride_delta_m_in,
+    stride_do_b_in,
+    stride_do_h_in,
+    stride_do_m_in,
+    stride_do_k_in,
+    stride_dropout_b_in,
+    stride_dropout_h_in,
+    stride_dropout_m_in,
+    stride_dropout_n_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -2059,7 +2308,7 @@ def _bwd_kernel_dkdv_noncausal(
     dropout_mask,
     dropout_p,
     philox_seed,
-    philox_offset,
+    philox_offset_base_in,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -2075,10 +2324,91 @@ def _bwd_kernel_dkdv_noncausal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    bid = tl.program_id(1)
-    hkid = tl.program_id(2)
+    # seq block, batch, head_k
+    seq_k_blk_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1)
+    head_k_idx = tl.program_id(2)
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    if USE_INT64_STRIDES:
+        stride_q_b = tl.cast(stride_q_b_in, tl.int64)
+        stride_q_h = tl.cast(stride_q_h_in, tl.int64)
+        stride_q_m = tl.cast(stride_q_m_in, tl.int64)
+        stride_q_k = tl.cast(stride_q_k_in, tl.int64)
+        stride_k_b = tl.cast(stride_k_b_in, tl.int64)
+        stride_k_h = tl.cast(stride_k_h_in, tl.int64)
+        stride_k_n = tl.cast(stride_k_n_in, tl.int64)
+        stride_k_k = tl.cast(stride_k_k_in, tl.int64)
+        stride_v_b = tl.cast(stride_v_b_in, tl.int64)
+        stride_v_h = tl.cast(stride_v_h_in, tl.int64)
+        stride_v_n = tl.cast(stride_v_n_in, tl.int64)
+        stride_v_k = tl.cast(stride_v_k_in, tl.int64)
+        stride_dk_b = tl.cast(stride_dk_b_in, tl.int64)
+        stride_dk_h = tl.cast(stride_dk_h_in, tl.int64)
+        stride_dk_n = tl.cast(stride_dk_n_in, tl.int64)
+        stride_dk_k = tl.cast(stride_dk_k_in, tl.int64)
+        stride_delta_b = tl.cast(stride_delta_b_in, tl.int64)
+        stride_delta_h = tl.cast(stride_delta_h_in, tl.int64)
+        stride_delta_m = tl.cast(stride_delta_m_in, tl.int64)
+        stride_do_b = tl.cast(stride_do_b_in, tl.int64)
+        stride_do_h = tl.cast(stride_do_h_in, tl.int64)
+        stride_do_m = tl.cast(stride_do_m_in, tl.int64)
+        stride_do_k = tl.cast(stride_do_k_in, tl.int64)
+
+        # NOTE: philox offset is need in dropout pointer calculations
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropout_b = tl.cast(stride_dropout_b_in, tl.int64)
+        stride_dropout_h = tl.cast(stride_dropout_h_in, tl.int64)
+        stride_dropout_m = tl.cast(stride_dropout_m_in, tl.int64)
+        stride_dropout_n = tl.cast(stride_dropout_n_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+    else:
+        stride_q_b = stride_q_b_in
+        stride_q_h = stride_q_h_in
+        stride_q_m = stride_q_m_in
+        stride_q_k = stride_q_k_in
+        stride_k_b = stride_k_b_in
+        stride_k_h = stride_k_h_in
+        stride_k_n = stride_k_n_in
+        stride_k_k = stride_k_k_in
+        stride_v_b = stride_v_b_in
+        stride_v_h = stride_v_h_in
+        stride_v_n = stride_v_n_in
+        stride_v_k = stride_v_k_in
+        stride_dk_b = stride_dk_b_in
+        stride_dk_h = stride_dk_h_in
+        stride_dk_n = stride_dk_n_in
+        stride_dk_k = stride_dk_k_in
+        stride_delta_b = stride_delta_b_in
+        stride_delta_h = stride_delta_h_in
+        stride_delta_m = stride_delta_m_in
+        stride_do_b = stride_do_b_in
+        stride_do_h = stride_do_h_in
+        stride_do_m = stride_do_m_in
+        stride_do_k = stride_do_k_in
+        philox_offset_base = philox_offset_base_in
+        stride_dropout_b = stride_dropout_b_in
+        stride_dropout_h = stride_dropout_h_in
+        stride_dropout_m = stride_dropout_m_in
+        stride_dropout_n = stride_dropout_n_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
 
     q_start = 0
     k_start = 0
@@ -2086,17 +2416,17 @@ def _bwd_kernel_dkdv_noncausal(
     seqlen_k = max_seqlen_k
 
     if IS_VARLEN:
-        q_start = tl.load(cu_seqlens_q + bid)
-        q_end = tl.load(cu_seqlens_q + bid + 1)
-        k_start = tl.load(cu_seqlens_k + bid)
-        k_end = tl.load(cu_seqlens_k + bid + 1)
+        q_start = tl.load(cu_seqlens_q + batch_idx)
+        q_end = tl.load(cu_seqlens_q + batch_idx + 1)
+        k_start = tl.load(cu_seqlens_k + batch_idx)
+        k_end = tl.load(cu_seqlens_k + batch_idx + 1)
         seqlen_q = q_end - q_start
         seqlen_k = k_end - k_start
 
     dk = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D_MODEL_POW2], dtype=tl.float32)
 
-    start_n = pid * BLOCK_N
+    start_n = seq_k_blk_idx * BLOCK_N
 
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
     offs_n = start_n + tl.arange(0, BLOCK_N)
@@ -2107,29 +2437,33 @@ def _bwd_kernel_dkdv_noncausal(
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
     adj_k = (
-        bid * stride_kb
-        + hkid * stride_kh
-        + k_start * stride_kn
-        + offs_n[:, None] * stride_kn
-        + offs_k[None, :] * stride_kk
+        batch_idx * stride_k_b
+        + head_k_idx * stride_k_h
+        + k_start * stride_k_n
+        + offs_n[:, None] * stride_k_n
+        + offs_k[None, :] * stride_k_k
     )
     adj_v = (
-        bid * stride_vb
-        + hkid * stride_vh
-        + k_start * stride_vn
-        + offs_n[:, None] * stride_vn
-        + offs_k[None, :] * stride_vk
+        batch_idx * stride_v_b
+        + head_k_idx * stride_v_h
+        + k_start * stride_v_n
+        + offs_n[:, None] * stride_v_n
+        + offs_k[None, :] * stride_v_k
     )
 
     k = tl.load(K + adj_k, mask=mask_kv, other=0.0)
     v = tl.load(V + adj_v, mask=mask_kv, other=0.0)
 
-    for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
-        adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
+    for hqid in range(head_k_idx * GROUP_SIZE, head_k_idx * GROUP_SIZE + GROUP_SIZE):
+        adj_q = batch_idx * stride_q_b + hqid * stride_q_h + q_start * stride_q_m
         Q_ptr = Q + adj_q
-        adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
+        adj_do = batch_idx * stride_do_b + hqid * stride_do_h + q_start * stride_do_m
         DO_ptr = DO + adj_do
-        adj_delta = bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+        adj_delta = (
+            batch_idx * stride_delta_b
+            + hqid * stride_delta_h
+            + q_start * stride_delta_m
+        )
         M_ptr = M + adj_delta
         Delta_ptr = Delta + adj_delta
 
@@ -2138,17 +2472,25 @@ def _bwd_kernel_dkdv_noncausal(
         dropout_offset = 0
         if ENABLE_DROPOUT:
             batch_philox_offset = (
-                philox_offset + bid * stride_dropoutb + hqid * stride_dropouth
+                philox_offset_base
+                + batch_idx * stride_dropout_b
+                + hqid * stride_dropout_h
             )
             dropout_offset = (
-                dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+                dropout_mask + batch_idx * stride_dropout_b + hqid * stride_dropout_h
             )
 
         if IS_FP8:
-            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
-            descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
-            descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
-            descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
+            descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + hqid)
+            descale_k = tl.load(
+                descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx
+            )
+            descale_v = tl.load(
+                descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx
+            )
+            descale_do = tl.load(
+                descale_do_ptr + batch_idx * stride_descale_do_z + hqid
+            )
         else:
             descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -2164,13 +2506,13 @@ def _bwd_kernel_dkdv_noncausal(
             M_ptr,
             Delta_ptr,
             sm_scale,
-            stride_qm,
-            stride_qk,
-            stride_dom,
-            stride_dok,
-            stride_dropoutm,
-            stride_dropoutn,
-            stride_deltam,
+            stride_q_m,
+            stride_q_k,
+            stride_do_m,
+            stride_do_k,
+            stride_dropout_m,
+            stride_dropout_n,
+            stride_delta_m,
             dropout_p,
             philox_seed,
             batch_philox_offset,
@@ -2195,11 +2537,11 @@ def _bwd_kernel_dkdv_noncausal(
         )
 
     adj_dkdv = (
-        bid * stride_dkb
-        + hkid * stride_dkh
-        + k_start * stride_dkn
-        + offs_n[:, None] * stride_dkn
-        + offs_k[None, :] * stride_dkk
+        batch_idx * stride_dk_b
+        + head_k_idx * stride_dk_h
+        + k_start * stride_dk_n
+        + offs_n[:, None] * stride_dk_n
+        + offs_k[None, :] * stride_dk_k
     )
     tl.store(DV + adj_dkdv, dv, mask=mask_kv)
     dk *= sm_scale
@@ -2216,37 +2558,37 @@ def _bwd_kernel_dq_noncausal(
     DQ,
     M,
     delta,
-    stride_qb,
-    stride_qh,
-    stride_qm,
-    stride_qk,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_kk,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_vk,
-    stride_dqb,
-    stride_dqh,
-    stride_dqm,
-    stride_dqk,
-    stride_deltab,
-    stride_deltah,
-    stride_deltam,
-    stride_dob,
-    stride_doh,
-    stride_dom,
-    stride_dok,
-    stride_dropoutb,
-    stride_dropouth,
-    stride_dropoutm,
-    stride_dropoutn,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_descale_do_z,
+    stride_q_b_in,
+    stride_q_h_in,
+    stride_q_m_in,
+    stride_q_k_in,
+    stride_k_b_in,
+    stride_k_h_in,
+    stride_k_n_in,
+    stride_k_k_in,
+    stride_v_b_in,
+    stride_v_h_in,
+    stride_v_n_in,
+    stride_v_k_in,
+    stride_dq_b_in,
+    stride_dq_h_in,
+    stride_dq_m_in,
+    stride_dq_k_in,
+    stride_delta_b_in,
+    stride_delta_h_in,
+    stride_delta_m_in,
+    stride_do_b_in,
+    stride_do_h_in,
+    stride_do_m_in,
+    stride_do_k_in,
+    stride_dropout_b_in,
+    stride_dropout_h_in,
+    stride_dropout_m_in,
+    stride_dropout_n_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
     cu_seqlens_q,
     cu_seqlens_k,
     max_seqlen_q,
@@ -2254,7 +2596,7 @@ def _bwd_kernel_dq_noncausal(
     dropout_mask,
     dropout_p,
     philox_seed,
-    philox_offset_base,
+    philox_offset_base_in,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -2270,10 +2612,91 @@ def _bwd_kernel_dq_noncausal(
     IS_VARLEN: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
-    pid = tl.program_id(0)  # seqlen
-    bid = tl.program_id(1)  # batch
-    hkid = tl.program_id(2)  # head_k
+    seq_q_blk_idx = tl.program_id(0)  # seqlen
+    batch_idx = tl.program_id(1)  # batch
+    head_k_idx = tl.program_id(2)  # head_k
+
+    # NOTE:
+    # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
+    # computation is done in 32 bit and overflows resulting in segfaults
+    # If input strides are defined as int64, it disables vectorized loads which drops perf
+    # If we define new strides as stride_x = stride_x_in.to(tl.int64), that does not work
+    # because strides are tl.constexpr and cannot be upcasted
+    # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
+    # The permanent solution is to enable upcasting of tl.constexpr
+    # In the meantime, the following workaround provides correctness and does not drop perf
+    if USE_INT64_STRIDES:
+        stride_q_b = tl.cast(stride_q_b_in, tl.int64)
+        stride_q_h = tl.cast(stride_q_h_in, tl.int64)
+        stride_q_m = tl.cast(stride_q_m_in, tl.int64)
+        stride_q_k = tl.cast(stride_q_k_in, tl.int64)
+        stride_k_b = tl.cast(stride_k_b_in, tl.int64)
+        stride_k_h = tl.cast(stride_k_h_in, tl.int64)
+        stride_k_n = tl.cast(stride_k_n_in, tl.int64)
+        stride_k_k = tl.cast(stride_k_k_in, tl.int64)
+        stride_v_b = tl.cast(stride_v_b_in, tl.int64)
+        stride_v_h = tl.cast(stride_v_h_in, tl.int64)
+        stride_v_n = tl.cast(stride_v_n_in, tl.int64)
+        stride_v_k = tl.cast(stride_v_k_in, tl.int64)
+        stride_dq_b = tl.cast(stride_dq_b_in, tl.int64)
+        stride_dq_h = tl.cast(stride_dq_h_in, tl.int64)
+        stride_dq_m = tl.cast(stride_dq_m_in, tl.int64)
+        stride_dq_k = tl.cast(stride_dq_k_in, tl.int64)
+        stride_delta_b = tl.cast(stride_delta_b_in, tl.int64)
+        stride_delta_h = tl.cast(stride_delta_h_in, tl.int64)
+        stride_delta_m = tl.cast(stride_delta_m_in, tl.int64)
+        stride_do_b = tl.cast(stride_do_b_in, tl.int64)
+        stride_do_h = tl.cast(stride_do_h_in, tl.int64)
+        stride_do_m = tl.cast(stride_do_m_in, tl.int64)
+        stride_do_k = tl.cast(stride_do_k_in, tl.int64)
+
+        # NOTE: philox offset is need in dropout pointer calculations
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropout_b = tl.cast(stride_dropout_b_in, tl.int64)
+        stride_dropout_h = tl.cast(stride_dropout_h_in, tl.int64)
+        stride_dropout_m = tl.cast(stride_dropout_m_in, tl.int64)
+        stride_dropout_n = tl.cast(stride_dropout_n_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+    else:
+        stride_q_b = stride_q_b_in
+        stride_q_h = stride_q_h_in
+        stride_q_m = stride_q_m_in
+        stride_q_k = stride_q_k_in
+        stride_k_b = stride_k_b_in
+        stride_k_h = stride_k_h_in
+        stride_k_n = stride_k_n_in
+        stride_k_k = stride_k_k_in
+        stride_v_b = stride_v_b_in
+        stride_v_h = stride_v_h_in
+        stride_v_n = stride_v_n_in
+        stride_v_k = stride_v_k_in
+        stride_dq_b = stride_dq_b_in
+        stride_dq_h = stride_dq_h_in
+        stride_dq_m = stride_dq_m_in
+        stride_dq_k = stride_dq_k_in
+        stride_delta_b = stride_delta_b_in
+        stride_delta_h = stride_delta_h_in
+        stride_delta_m = stride_delta_m_in
+        stride_do_b = stride_do_b_in
+        stride_do_h = stride_do_h_in
+        stride_do_m = stride_do_m_in
+        stride_do_k = stride_do_k_in
+
+        philox_offset_base = philox_offset_base_in
+        stride_dropout_b = stride_dropout_b_in
+        stride_dropout_h = stride_dropout_h_in
+        stride_dropout_m = stride_dropout_m_in
+        stride_dropout_n = stride_dropout_n_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
 
     q_start = 0
     k_start = 0
@@ -2282,14 +2705,14 @@ def _bwd_kernel_dq_noncausal(
 
     if IS_VARLEN:
         # Compute actual sequence lengths
-        q_start = tl.load(cu_seqlens_q + bid)
-        q_end = tl.load(cu_seqlens_q + bid + 1)
-        k_start = tl.load(cu_seqlens_k + bid)
-        k_end = tl.load(cu_seqlens_k + bid + 1)
+        q_start = tl.load(cu_seqlens_q + batch_idx)
+        q_end = tl.load(cu_seqlens_q + batch_idx + 1)
+        k_start = tl.load(cu_seqlens_k + batch_idx)
+        k_end = tl.load(cu_seqlens_k + batch_idx + 1)
         seqlen_q = q_end - q_start
         seqlen_k = k_end - k_start
 
-    start_m = pid * BLOCK_M
+    start_m = seq_q_blk_idx * BLOCK_M
 
     offs_k = tl.arange(0, BLOCK_D_MODEL_POW2)
     offs_m = start_m + tl.arange(0, BLOCK_M)
@@ -2300,41 +2723,53 @@ def _bwd_kernel_dq_noncausal(
     if PADDED_HEAD:
         mask_k = offs_k < BLOCK_D_MODEL
         mask_q &= mask_k[None, :]
-    offs_q = offs_m[:, None] * stride_qm + offs_k[None, :] * stride_qk
-    offs_do = offs_m[:, None] * stride_dom + offs_k[None, :] * stride_dok
-    adj_k = bid * stride_kb + hkid * stride_kh + k_start * stride_kn
-    adj_v = bid * stride_vb + hkid * stride_vh + k_start * stride_vn
+    offs_q = offs_m[:, None] * stride_q_m + offs_k[None, :] * stride_q_k
+    offs_do = offs_m[:, None] * stride_do_m + offs_k[None, :] * stride_do_k
+    adj_k = batch_idx * stride_k_b + head_k_idx * stride_k_h + k_start * stride_k_n
+    adj_v = batch_idx * stride_v_b + head_k_idx * stride_v_h + k_start * stride_v_n
     K += adj_k
     V += adj_v
 
     GROUP_SIZE = NUM_Q_HEADS // NUM_K_HEADS
-    for hqid in range(hkid * GROUP_SIZE, hkid * GROUP_SIZE + GROUP_SIZE):
-        adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
-        adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
-        adj_delta = bid * stride_deltab + hqid * stride_deltah + q_start * stride_deltam
+    for hqid in range(head_k_idx * GROUP_SIZE, head_k_idx * GROUP_SIZE + GROUP_SIZE):
+        adj_q = batch_idx * stride_q_b + hqid * stride_q_h + q_start * stride_q_m
+        adj_do = batch_idx * stride_do_b + hqid * stride_do_h + q_start * stride_do_m
+        adj_delta = (
+            batch_idx * stride_delta_b
+            + hqid * stride_delta_h
+            + q_start * stride_delta_m
+        )
         delta_ptr = delta + adj_delta
 
         batch_philox_offset = 0
         dropout_offset = 0
         if ENABLE_DROPOUT:
             batch_philox_offset = (
-                philox_offset_base + bid * stride_dropoutb + hqid * stride_dropouth
+                philox_offset_base
+                + batch_idx * stride_dropout_b
+                + hqid * stride_dropout_h
             )
             dropout_offset = (
-                dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
+                dropout_mask + batch_idx * stride_dropout_b + hqid * stride_dropout_h
             )
 
         q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
         do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
-        m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
+        m = tl.load(M + adj_delta + offs_m * stride_delta_m, mask=offs_m < seqlen_q)
         m = m[:, None]
 
         # FP8
         if IS_FP8:
-            descale_q = tl.load(descale_q_ptr + bid * stride_descale_q_z + hqid)
-            descale_k = tl.load(descale_k_ptr + bid * stride_descale_k_z + hkid)
-            descale_v = tl.load(descale_v_ptr + bid * stride_descale_v_z + hkid)
-            descale_do = tl.load(descale_do_ptr + bid * stride_descale_do_z + hqid)
+            descale_q = tl.load(descale_q_ptr + batch_idx * stride_descale_q_z + hqid)
+            descale_k = tl.load(
+                descale_k_ptr + batch_idx * stride_descale_k_z + head_k_idx
+            )
+            descale_v = tl.load(
+                descale_v_ptr + batch_idx * stride_descale_v_z + head_k_idx
+            )
+            descale_do = tl.load(
+                descale_do_ptr + batch_idx * stride_descale_do_z + hqid
+            )
         else:
             descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
@@ -2351,15 +2786,15 @@ def _bwd_kernel_dq_noncausal(
             m,
             delta_ptr,
             sm_scale,
-            stride_qm,
-            stride_qk,
-            stride_kn,
-            stride_kk,
-            stride_vn,
-            stride_vk,
-            stride_dropoutm,
-            stride_dropoutn,
-            stride_deltam,
+            stride_q_m,
+            stride_q_k,
+            stride_k_n,
+            stride_k_k,
+            stride_v_n,
+            stride_v_k,
+            stride_dropout_m,
+            stride_dropout_n,
+            stride_delta_m,
             seqlen_q,
             seqlen_k,
             dropout_p,
@@ -2384,8 +2819,8 @@ def _bwd_kernel_dq_noncausal(
             FP8_MAX=FP8_MAX,
         )
 
-        adj_dq = bid * stride_dqb + hqid * stride_dqh + q_start * stride_dqm
-        offs_dq = offs_m[:, None] * stride_dqm + offs_k[None, :] * stride_dqk
+        adj_dq = batch_idx * stride_dq_b + hqid * stride_dq_h + q_start * stride_dq_m
+        offs_dq = offs_m[:, None] * stride_dq_m + offs_k[None, :] * stride_dq_k
         dq *= sm_scale
         tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
 
@@ -2575,6 +3010,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
@@ -2619,6 +3055,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
@@ -2665,6 +3102,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
@@ -2710,6 +3148,7 @@ def _flash_attn_backward(
             IS_VARLEN=IS_VARLEN,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            USE_INT64_STRIDES=_USE_INT64_STRIDES,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
             waves_per_eu=WAVES_PER_EU,
