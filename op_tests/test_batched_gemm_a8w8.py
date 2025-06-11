@@ -7,7 +7,6 @@ import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 import argparse
-import itertools
 
 
 @perftest(num_iters=5)
