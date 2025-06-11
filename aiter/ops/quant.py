@@ -220,18 +220,29 @@ def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True)
     assert n % 2 == 0
     device = x.device
     if scale is None:
-        scale = (
-            torch.empty(
-                (
-                    (m + 255) // 256 * 256,
-                    (n // 32 + 7) // 8 * 8,
-                ),
-                dtype=torch.uint8,
-                device=device,
+        if shuffle:
+            scale = (
+                torch.empty(
+                    (
+                        (m + 255) // 256 * 256,
+                        (n // 32 + 7) // 8 * 8,
+                    ),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                # .fill_(0x7F)
+                .view(dtypes.fp8_e8m0)
             )
-            # .fill_(0x7F)
-            .view(dtypes.fp8_e8m0)
-        )
+        else:
+            scale = (
+                torch.empty(
+                    (m, n // 32),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                # .fill_(0x7F)
+                .view(dtypes.fp8_e8m0)
+            )
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)

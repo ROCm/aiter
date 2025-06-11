@@ -828,7 +828,7 @@
           py::arg("out"),                                                \
           py::arg("input"),                                              \
           py::arg("scales"),                                             \
-          py::arg("scale_ub")      = 32,                                 \
+          py::arg("group_size")    = 32,                                 \
           py::arg("shuffle_scale") = true);
 
 #define RMSNORM_PYBIND                                                                             \
