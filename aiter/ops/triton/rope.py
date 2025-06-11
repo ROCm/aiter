@@ -91,22 +91,22 @@ def _rope_fwd_kernel_sbhd(
 
     if REUSE_FREQS_FRONT_PART:
         if IS_NEOX:
-            d_offs_freqs = tl.where(
+            d_freqs_offs = tl.where(
                 (d_offs >= BLOCK_D_HALF) & (d_offs < BLOCK_D),
                 d_offs - BLOCK_D_HALF,
                 d_offs,
             ).to(d_offs.dtype)
-            freqs_mask = s_mask & (d_offs_freqs < BLOCK_D)[None, :]
+            freqs_mask = s_mask & (d_freqs_offs < BLOCK_D)[None, :]
         else:
-            d_offs_freqs = d_offs // 2
-            freqs_mask = s_mask & (d_offs_freqs < BLOCK_D_HALF)[None, :]
+            d_freqs_offs = d_offs // 2
+            freqs_mask = s_mask & (d_freqs_offs < BLOCK_D_HALF)[None, :]
     else:
-        d_offs_freqs = d_offs
-        freqs_mask = s_mask & (d_offs_freqs < BLOCK_D)[None, :]
+        d_freqs_offs = d_offs
+        freqs_mask = s_mask & (d_freqs_offs < BLOCK_D)[None, :]
 
     # we don't need stride_freqs_b and stride_freqs_h here, as freqs_ptr has the shape of (S, 1, 1, D)
     freqs_offs = (
-        s_offs[:, None] * stride_freqs_s + d_offs_freqs[None, :] * stride_freqs_d
+        s_offs[:, None] * stride_freqs_s + d_freqs_offs[None, :] * stride_freqs_d
     )
 
     freqs = tl.load(freqs_ptr + freqs_offs, mask=freqs_mask)
@@ -167,7 +167,6 @@ def _rope_fwd_kernel_thd(
     BLOCK_D: tl.constexpr,
     BLOCK_D_HALF: tl.constexpr,
 ):
-    # Parallelize over batch and head. Handle 1 sequence per program
     b = tl.program_id(0)
     h = tl.program_id(1)
     pid_t = tl.program_id(2)
@@ -184,22 +183,22 @@ def _rope_fwd_kernel_thd(
 
     if REUSE_FREQS_FRONT_PART:
         if IS_NEOX:
-            d_offs_freqs = tl.where(
+            d_freqs_offs = tl.where(
                 (d_offs >= BLOCK_D_HALF) & (d_offs < BLOCK_D),
                 d_offs - BLOCK_D_HALF,
                 d_offs,
             ).to(d_offs.dtype)
-            freqs_mask = t_mask & (d_offs_freqs < BLOCK_D)[None, :]
+            freqs_mask = t_mask & (d_freqs_offs < BLOCK_D)[None, :]
         else:
-            d_offs_freqs = d_offs // 2
-            freqs_mask = t_mask & (d_offs_freqs < BLOCK_D_HALF)[None, :]
+            d_freqs_offs = d_offs // 2
+            freqs_mask = t_mask & (d_freqs_offs < BLOCK_D_HALF)[None, :]
     else:
-        d_offs_freqs = d_offs
-        freqs_mask = t_mask & (d_offs_freqs < BLOCK_D)[None, :]
+        d_freqs_offs = d_offs
+        freqs_mask = t_mask & (d_freqs_offs < BLOCK_D)[None, :]
 
     # we don't need stride_freqs_b and stride_freqs_h here, as freqs_ptr has the shape of (T, 1, 1, D)
     freqs_offs = (
-        t_offs[:, None] * stride_freqs_t + d_offs_freqs[None, :] * stride_freqs_d
+        t_offs[:, None] * stride_freqs_t + d_freqs_offs[None, :] * stride_freqs_d
     )
 
     freqs = tl.load(freqs_ptr + freqs_offs, mask=freqs_mask)
@@ -237,10 +236,12 @@ def _rope_fwd_kernel_thd(
 
 
 @triton.jit
-def _rope_fwd_kernel_neox_cached(
+def _rope_fwd_kernel_sbhd_cached(
     x_ptr: torch.Tensor,
     cos_ptr: torch.Tensor,
     sin_ptr: torch.Tensor,
+    pos_ptr: torch.Tensor,
+    off_ptr: torch.Tensor,
     out_ptr: torch.Tensor,
     stride_x_s,
     stride_x_b,
@@ -250,1075 +251,208 @@ def _rope_fwd_kernel_neox_cached(
     stride_cos_b,
     stride_cos_h,
     stride_cos_d,
+    stride_pos_s,
+    stride_pos_b,
     stride_out_s,
     stride_out_b,
     stride_out_h,
     stride_out_d,
-    rotate_style: tl.constexpr,
-    reuse_freqs_front_part: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
+    S,
+    REUSE_FREQS_FRONT_PART: tl.constexpr,
+    IS_NEOX: tl.constexpr,
+    HAVE_POS: tl.constexpr,
+    HAVE_OFFS: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
 ):
-    # Parallelize over batch and head. Handle 1 sequence per program
     b = tl.program_id(0)
     h = tl.program_id(1)
-    s = tl.program_id(2)
+    pid_s = tl.program_id(2)
 
-    # Load cos for this batch and head (s, 1, 1, d)
-    cos_base_offs = stride_cos_s * s + 0 * stride_cos_b + 0 * stride_cos_h
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    d_offs = tl.arange(0, BLOCK_D)
+    s_mask = (s_offs < S)[:, None]
 
-    if reuse_freqs_front_part:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_offs = tl.where(
-            (cos_offs >= D_MODEL_HALF) & (cos_offs < D_MODEL),
-            cos_offs - D_MODEL_HALF,
-            cos_offs,
-        ).to(cos_offs.dtype)
-        cos_mask = cos_offs < D_MODEL
-    else:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_mask = cos_offs < D_MODEL
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    x_mask = x_offs < D_MODEL
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load X rotated
-    # rotate_style: NEOX
-    x_offs_rotated = tl.where(
-        x_offs < D_MODEL_HALF, x_offs + D_MODEL_HALF, x_offs - D_MODEL_HALF
-    ).to(x_offs.dtype)
-    x_rotated = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask)
-    x_rotated = tl.where(x_offs < D_MODEL_HALF, -x_rotated, x_rotated)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_mask)
-
-
-@triton.jit
-def _rope_fwd_kernel_gptj_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    rotate_style: tl.constexpr,
-    reuse_freqs_front_part: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (s, 1, 1, d)
-    cos_base_offs = stride_cos_s * s + 0 * stride_cos_b + 0 * stride_cos_h
-    if reuse_freqs_front_part:
-        cos_offs = tl.arange(0, D_MODEL) // 2
-        cos_mask = cos_offs < D_MODEL_HALF
-    else:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_mask = cos_offs < D_MODEL
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X [D_MODEL]
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    x_mask = x_offs < D_MODEL
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load rotated.
-    # X1 = even idx of x, [D_MODEL/2]
-    # X2 = odd idx of x, [D_MODEL/2]
-    x_offs_rotated = tl.arange(0, D_MODEL_HALF) * 2
-    x_mask_rotated = x_offs_rotated < D_MODEL
-    x1 = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask_rotated)
-    x2 = tl.load(x_ptr + x_base_offs + (x_offs_rotated + 1), mask=x_mask_rotated)
-    x2 = -x2
-    x_rotated = tl.interleave(x2, x1)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_mask)
-
-
-@triton.jit
-def _rope_fwd_kernel_neox_nope_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    rotate_style: tl.constexpr,
-    reuse_freqs_front_part: tl.constexpr,
-    nope_first: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load freqs. Note: freqs is D_MODEL/2 or D_MODEL/4(nope+reuse_freqs_front_part),
-    # but freqs shape in here is D_MODEL which matches the shape of the final output.
-    # We use mask to load 0s in the bottom half or top half(nope_first)
-    cos_base_offs = stride_cos_s * s + 0 * stride_cos_b + 0 * stride_cos_h
-    if nope_first:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_offs = tl.where(
-                (cos_offs >= D_MODEL // 4) & (cos_offs < D_MODEL_HALF),
-                cos_offs - D_MODEL // 4,
-                cos_offs,
-            ).to(cos_offs.dtype)
-            cos_mask = (cos_offs >= 0) & (cos_offs <= D_MODEL // 4)
+    if HAVE_POS:
+        pos_offs = s_offs * stride_pos_s + b * stride_pos_b
+        pos = tl.load(pos_ptr + pos_offs, mask=(s_offs < S))
+        if HAVE_OFFS:
+            offset = tl.load(off_ptr + pos_offs, mask=(s_offs < S))
+            s_cos_offs = pos + offset
         else:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL_HALF)
+            s_cos_offs = pos
     else:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_offs = tl.where(
-                (cos_offs >= D_MODEL // 4) & (cos_offs < D_MODEL_HALF),
-                cos_offs - D_MODEL_HALF // 2,
-                cos_offs,
-            ).to(cos_offs.dtype)
-            cos_mask = cos_offs < D_MODEL_HALF // 2
+        s_cos_offs = s_offs
+
+    if REUSE_FREQS_FRONT_PART:
+        if IS_NEOX:
+            d_cos_offs = d_offs
+            d_cos_offs = tl.where(
+                (d_cos_offs >= BLOCK_D_HALF) & (d_cos_offs < BLOCK_D),
+                d_cos_offs - BLOCK_D_HALF,
+                d_cos_offs,
+            ).to(d_cos_offs.dtype)
+            cos_mask = s_mask & (d_cos_offs < BLOCK_D)[None, :]
         else:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_mask = cos_offs < D_MODEL_HALF
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    if nope_first:
-        x_mask = (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL)
+            d_cos_offs = d_offs // 2
+            cos_mask = s_mask & (d_cos_offs < BLOCK_D_HALF)[None, :]
     else:
-        x_mask = x_offs < D_MODEL_HALF
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
+        d_cos_offs = d_offs
+        cos_mask = s_mask & (d_cos_offs < BLOCK_D)[None, :]
 
-    # Load X rotated
-    # rotate_style: NEOX
-    if nope_first:
-        x1_offs = tl.where(
-            (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL_HALF + D_MODEL_HALF / 2),
-            x_offs + D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x2_offs = tl.where(
-            (x_offs >= D_MODEL_HALF + D_MODEL_HALF / 2) & (x_offs < D_MODEL),
-            x_offs - D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x_rotated_offs = x1_offs + x2_offs
-        x_rotated_mask = (x_rotated_offs >= D_MODEL_HALF) & (x_rotated_offs < D_MODEL)
-    else:
-        x1_offs = tl.where(x_offs < D_MODEL_HALF / 2, x_offs + D_MODEL_HALF / 2, 0).to(
-            x_offs.dtype
+    cos_offs = s_cos_offs[:, None] * stride_cos_s + d_cos_offs[None, :] * stride_cos_d
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+
+    x_offs = (
+        b * stride_x_b
+        + s_offs[:, None] * stride_x_s
+        + h * stride_x_h
+        + d_offs[None, :] * stride_x_d
+    )
+    x_mask = s_mask & (d_offs < BLOCK_D)[None, :]
+    x = tl.load(x_ptr + x_offs, mask=x_mask)
+
+    if IS_NEOX:
+        x_rotated_mask = (d_offs < BLOCK_D_HALF)[None, :]
+        x_rotated = _get_neox_rotated_x(
+            x, x_rotated_mask, BLOCK_S, BLOCK_D, BLOCK_D_HALF
         )
-        x2_offs = tl.where(
-            (x_offs >= D_MODEL_HALF / 2) & (x_offs < D_MODEL_HALF),
-            x_offs - D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x_rotated_offs = x1_offs + x2_offs
-        x_rotated_mask = x_rotated_offs < D_MODEL_HALF
-    x_rotated = tl.load(x_ptr + x_base_offs + x_rotated_offs, mask=x_rotated_mask)
-    if nope_first:
-        x_rotated = tl.where(
-            (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL_HALF + D_MODEL_HALF / 2),
-            -x_rotated,
+    else:
+        x_rotated_mask = (d_offs % 2 == 0)[None, :]
+        x_rotated = _get_gptj_rotated_x(
+            x, x_rotated_mask, BLOCK_S, BLOCK_D, BLOCK_D_HALF
+        )
+
+    out_x = x * cos + x_rotated * sin
+    out_x = out_x.to(x_ptr.dtype.element_ty)
+    x_out_offs = (
+        b * stride_out_b
+        + s_offs[:, None] * stride_out_s
+        + h * stride_out_h
+        + d_offs[None, :] * stride_out_d
+    )
+
+    tl.store(out_ptr + x_out_offs, out_x, mask=x_mask)
+
+
+@triton.jit
+def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c(
+    x_ptr: torch.Tensor,
+    y_ptr: torch.Tensor,
+    cos_ptr: torch.Tensor,
+    sin_ptr: torch.Tensor,
+    pos_ptr: torch.Tensor,
+    off_ptr: torch.Tensor,
+    out_x_ptr: torch.Tensor,
+    out_y_ptr: torch.Tensor,
+    stride_x_t,
+    stride_x_h,
+    stride_x_d,
+    stride_cos_t,
+    stride_cos_d,
+    stride_pos_t,
+    stride_out_t,
+    stride_out_h,
+    stride_out_d,
+    T,
+    reuse_freqs_front_part: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    SPLIT_H_SIZE: tl.constexpr,
+    D_MODEL: tl.constexpr,
+    D_MODEL_HALF: tl.constexpr,
+    HAVE_OFFS: tl.constexpr,
+    num_stages: tl.constexpr,
+):
+    h_s = tl.program_id(0)
+    s = tl.program_id(1)
+
+    tl.assume(stride_x_t > 0)
+    tl.assume(stride_x_h > 0)
+    tl.assume(stride_x_d > 0)
+    tl.assume(stride_cos_t > 0)
+    tl.assume(stride_cos_d > 0)
+    tl.assume(stride_pos_t > 0)
+    tl.assume(stride_out_t > 0)
+    tl.assume(stride_out_h > 0)
+    tl.assume(stride_out_d > 0)
+
+    pos_offs = s * BLOCK_T + tl.arange(0, BLOCK_T)
+    pos_mask = pos_offs < T
+    pos = tl.load(pos_ptr + pos_offs, mask=pos_mask)
+    if HAVE_OFFS:
+        offset = tl.load(off_ptr + pos_offs, mask=pos_mask)
+        cos_offs_t = pos + offset
+    else:
+        cos_offs_t = pos
+
+    if reuse_freqs_front_part:
+        cos_offs_d = tl.arange(0, D_MODEL)
+        cos_offs_d = tl.where(
+            (cos_offs_d < D_MODEL_HALF),
+            cos_offs_d,
+            cos_offs_d - D_MODEL_HALF,
+        ).to(cos_offs_d.dtype)
+        cos_mask_d = cos_offs_d < D_MODEL_HALF
+    else:
+        cos_offs_d = tl.arange(0, D_MODEL)
+        cos_mask_d = cos_offs_d < D_MODEL
+
+    cos_mask = (pos_mask)[:, None] & (cos_mask_d)[None, :]
+    cos_offs = cos_offs_t[:, None] * stride_cos_t + cos_offs_d[None, :] * stride_cos_d
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+
+    h_start_idx = h_s * SPLIT_H_SIZE
+
+    x_offs_t = pos_offs
+    x_offs_d = tl.arange(0, D_MODEL)
+    x_mask = (x_offs_t < T)[:, None] & (x_offs_d < D_MODEL)[None, :]
+    x_offs_base = x_offs_t[:, None] * stride_x_t + x_offs_d[None, :] * stride_x_d
+
+    x_rotated_mask = (x_offs_d < D_MODEL_HALF)[None, :]
+
+    for h in tl.range(0, SPLIT_H_SIZE, 1, num_stages=num_stages):
+        x_offs = x_offs_base + (h_start_idx + h) * stride_x_h
+
+        x = tl.load(x_ptr + x_offs, mask=x_mask)
+        y = tl.load(y_ptr + x_offs, mask=x_mask)
+
+        x_rotated = tl.where(x_rotated_mask, x, -x)
+        y_rotated = tl.where(x_rotated_mask, y, -y)
+
+        x_rotated = tl.reshape(x_rotated, (BLOCK_T, 2, D_MODEL_HALF))
+        y_rotated = tl.reshape(y_rotated, (BLOCK_T, 2, D_MODEL_HALF))
+
+        x_rotated = tl.flip(x_rotated, 2)
+        y_rotated = tl.flip(y_rotated, 2)
+
+        x_rotated = tl.reshape(
             x_rotated,
+            (
+                BLOCK_T,
+                D_MODEL,
+            ),
         )
-    else:
-        x_rotated = tl.where(x_offs < D_MODEL_HALF / 2, -x_rotated, x_rotated)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    # Load nope
-    if nope_first:
-        x_nope_mask = tl.where(x_offs < D_MODEL_HALF, 1, 0).to(x_rotated_mask.dtype)
-    else:
-        x_nope_mask = tl.where(x_offs >= D_MODEL_HALF, 1, 0).to(x_rotated_mask.dtype)
-    x_nope = tl.load(x_ptr + x_base_offs + x_offs, mask=x_nope_mask)
-
-    out = out + x_nope
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_offs < D_MODEL)
-
-
-@triton.jit
-def _rope_fwd_kernel_gptj_nope_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    rotate_style: tl.constexpr,
-    reuse_freqs_front_part: tl.constexpr,
-    nope_first: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (1, 1, 1, d)
-    cos_base_offs = stride_cos_s * s + 0 * stride_cos_b + 0 * stride_cos_h
-    if nope_first:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_offs = cos_offs // 2
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL // 4)
-        else:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL_HALF)
-    else:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) // 2
-            cos_mask = cos_offs < D_MODEL // 4
-        else:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_mask = cos_offs < D_MODEL_HALF
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X [D_MODEL]
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    if nope_first:
-        x_mask = (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL)
-    else:
-        x_mask = x_offs < D_MODEL_HALF
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load rotated.
-    # rotate_style:GPTJ
-    # X1 = even idx of x, [D_MODEL/2]
-    # X2 = odd idx of x, [D_MODEL/2]
-    x_offs_rotated = tl.arange(0, D_MODEL_HALF) * 2
-    if nope_first:
-        x_mask_rotated = x_offs_rotated >= D_MODEL_HALF
-    else:
-        x_mask_rotated = x_offs_rotated < D_MODEL_HALF
-
-    x1 = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask_rotated)
-    x2 = tl.load(x_ptr + x_base_offs + (x_offs_rotated + 1), mask=x_mask_rotated)
-    x2 = -x2
-    x_rotated = tl.interleave(x2, x1)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    # Load nope
-    if nope_first:
-        x_nope_mask = tl.where(x_offs < D_MODEL_HALF, 1, 0).to(x_mask_rotated.dtype)
-    else:
-        x_nope_mask = tl.where(x_offs >= D_MODEL_HALF, 1, 0).to(x_mask_rotated.dtype)
-    x_nope = tl.load(x_ptr + x_base_offs + x_offs, mask=x_nope_mask)
-
-    out = out + x_nope
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (1, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out)
-
-
-@triton.jit
-def _rope_fwd_kernel_neox_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (s, 1, 1, d)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    cos_base_offs = stride_cos_s * pos + 0 * stride_cos_b + 0 * stride_cos_h
-
-    if reuse_freqs_front_part:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_offs = tl.where(
-            (cos_offs >= D_MODEL_HALF) & (cos_offs < D_MODEL),
-            cos_offs - D_MODEL_HALF,
-            cos_offs,
-        ).to(cos_offs.dtype)
-        cos_mask = cos_offs < D_MODEL
-    else:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_mask = cos_offs < D_MODEL
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    x_mask = x_offs < D_MODEL
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load X rotated
-    # rotate_style: NEOX
-    x_offs_rotated = tl.where(
-        x_offs < D_MODEL_HALF, x_offs + D_MODEL_HALF, x_offs - D_MODEL_HALF
-    ).to(x_offs.dtype)
-    x_rotated = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask)
-    x_rotated = tl.where(x_offs < D_MODEL_HALF, -x_rotated, x_rotated)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_mask)
-
-
-@triton.jit
-def _rope_fwd_kernel_gptj_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (s, 1, 1, d)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    cos_base_offs = pos * stride_cos_s + 0 * stride_cos_b + 0 * stride_cos_h
-    if reuse_freqs_front_part:
-        cos_offs = tl.arange(0, D_MODEL) // 2
-        cos_mask = cos_offs < D_MODEL_HALF
-    else:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_mask = cos_offs < D_MODEL
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X [D_MODEL]
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    x_mask = x_offs < D_MODEL
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load rotated.
-    # X1 = even idx of x, [D_MODEL/2]
-    # X2 = odd idx of x, [D_MODEL/2]
-    x_offs_rotated = tl.arange(0, D_MODEL_HALF) * 2
-    x_mask_rotated = x_offs_rotated < D_MODEL
-    x1 = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask_rotated)
-    x2 = tl.load(x_ptr + x_base_offs + (x_offs_rotated + 1), mask=x_mask_rotated)
-    x2 = -x2
-    x_rotated = tl.interleave(x2, x1)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_mask)
-
-
-@triton.jit
-def _rope_fwd_kernel_neox_nope_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    nope_first: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load freqs. Note: freqs is D_MODEL/2 or D_MODEL/4(nope+reuse_freqs_front_part),
-    # but freqs shape in here is D_MODEL which matches the shape of the final output.
-    # We use mask to load 0s in the bottom half or top half(nope_first)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    cos_base_offs = stride_cos_s * pos + 0 * stride_cos_b + 0 * stride_cos_h
-
-    if nope_first:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_offs = tl.where(
-                (cos_offs >= D_MODEL // 4) & (cos_offs < D_MODEL_HALF),
-                cos_offs - D_MODEL // 4,
-                cos_offs,
-            ).to(cos_offs.dtype)
-            cos_mask = (cos_offs >= 0) & (cos_offs <= D_MODEL // 4)
-        else:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL_HALF)
-    else:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_offs = tl.where(
-                (cos_offs >= D_MODEL // 4) & (cos_offs < D_MODEL_HALF),
-                cos_offs - D_MODEL_HALF // 2,
-                cos_offs,
-            ).to(cos_offs.dtype)
-            cos_mask = cos_offs < D_MODEL_HALF // 2
-        else:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_mask = cos_offs < D_MODEL_HALF
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    if nope_first:
-        x_mask = (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL)
-    else:
-        x_mask = x_offs < D_MODEL_HALF
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load X rotated
-    # rotate_style: NEOX
-    if nope_first:
-        x1_offs = tl.where(
-            (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL_HALF + D_MODEL_HALF / 2),
-            x_offs + D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x2_offs = tl.where(
-            (x_offs >= D_MODEL_HALF + D_MODEL_HALF / 2) & (x_offs < D_MODEL),
-            x_offs - D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x_rotated_offs = x1_offs + x2_offs
-        x_rotated_mask = (x_rotated_offs >= D_MODEL_HALF) & (x_rotated_offs < D_MODEL)
-    else:
-        x1_offs = tl.where(x_offs < D_MODEL_HALF / 2, x_offs + D_MODEL_HALF / 2, 0).to(
-            x_offs.dtype
+        y_rotated = tl.reshape(
+            y_rotated,
+            (
+                BLOCK_T,
+                D_MODEL,
+            ),
         )
-        x2_offs = tl.where(
-            (x_offs >= D_MODEL_HALF / 2) & (x_offs < D_MODEL_HALF),
-            x_offs - D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x_rotated_offs = x1_offs + x2_offs
-        x_rotated_mask = x_rotated_offs < D_MODEL_HALF
-    x_rotated = tl.load(x_ptr + x_base_offs + x_rotated_offs, mask=x_rotated_mask)
-    if nope_first:
-        x_rotated = tl.where(
-            (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL_HALF + D_MODEL_HALF / 2),
-            -x_rotated,
-            x_rotated,
-        )
-    else:
-        x_rotated = tl.where(x_offs < D_MODEL_HALF / 2, -x_rotated, x_rotated)
 
-    # compute output
-    out = x * cos + x_rotated * sin
+        x_rotated = tl.flip(x_rotated, 1)
+        y_rotated = tl.flip(y_rotated, 1)
 
-    # Load nope
-    if nope_first:
-        x_nope_mask = tl.where(x_offs < D_MODEL_HALF, 1, 0).to(x_rotated_mask.dtype)
-    else:
-        x_nope_mask = tl.where(x_offs >= D_MODEL_HALF, 1, 0).to(x_rotated_mask.dtype)
-    x_nope = tl.load(x_ptr + x_base_offs + x_offs, mask=x_nope_mask)
+        out_x = x * cos + x_rotated * sin
+        out_x = out_x.to(x_ptr.dtype.element_ty)
+        out_y = y * cos + y_rotated * sin
+        out_y = out_y.to(y_ptr.dtype.element_ty)
 
-    out = out + x_nope
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_offs < D_MODEL)
-
-
-@triton.jit
-def _rope_fwd_kernel_gptj_nope_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    nope_first: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (1, 1, 1, d)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    cos_base_offs = pos * stride_cos_s + 0 * stride_cos_b + 0 * stride_cos_h
-    if nope_first:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_offs = cos_offs // 2
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL // 4)
-        else:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL_HALF)
-    else:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) // 2
-            cos_mask = cos_offs < D_MODEL // 4
-        else:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_mask = cos_offs < D_MODEL_HALF
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X [D_MODEL]
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    if nope_first:
-        x_mask = (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL)
-    else:
-        x_mask = x_offs < D_MODEL_HALF
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load rotated.
-    # rotate_style:GPTJ
-    # X1 = even idx of x, [D_MODEL/2]
-    # X2 = odd idx of x, [D_MODEL/2]
-    x_offs_rotated = tl.arange(0, D_MODEL_HALF) * 2
-    if nope_first:
-        x_mask_rotated = x_offs_rotated >= D_MODEL_HALF
-    else:
-        x_mask_rotated = x_offs_rotated < D_MODEL_HALF
-
-    x1 = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask_rotated)
-    x2 = tl.load(x_ptr + x_base_offs + (x_offs_rotated + 1), mask=x_mask_rotated)
-    x2 = -x2
-    x_rotated = tl.interleave(x2, x1)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    # Load nope
-    if nope_first:
-        x_nope_mask = tl.where(x_offs < D_MODEL_HALF, 1, 0).to(x_mask_rotated.dtype)
-    else:
-        x_nope_mask = tl.where(x_offs >= D_MODEL_HALF, 1, 0).to(x_mask_rotated.dtype)
-    x_nope = tl.load(x_ptr + x_base_offs + x_offs, mask=x_nope_mask)
-
-    out = out + x_nope
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (1, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out)
-
-
-@triton.jit
-def _rope_fwd_kernel_neox_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (s, 1, 1, d)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    offset = tl.load(off_ptr + pos_offs)
-    cos_base_offs = (pos + offset) * stride_cos_s + 0 * stride_cos_b + 0 * stride_cos_h
-
-    if reuse_freqs_front_part:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_offs = tl.where(
-            (cos_offs >= D_MODEL_HALF) & (cos_offs < D_MODEL),
-            cos_offs - D_MODEL_HALF,
-            cos_offs,
-        ).to(cos_offs.dtype)
-        cos_mask = cos_offs < D_MODEL
-    else:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_mask = cos_offs < D_MODEL
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    x_mask = x_offs < D_MODEL
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load X rotated
-    # rotate_style: NEOX
-    x_offs_rotated = tl.where(
-        x_offs < D_MODEL_HALF, x_offs + D_MODEL_HALF, x_offs - D_MODEL_HALF
-    ).to(x_offs.dtype)
-    x_rotated = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask)
-    x_rotated = tl.where(x_offs < D_MODEL_HALF, -x_rotated, x_rotated)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_mask)
-
-
-@triton.jit
-def _rope_fwd_kernel_gptj_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (s, 1, 1, d)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    offset = tl.load(off_ptr + pos_offs)
-    cos_base_offs = (pos + offset) * stride_cos_s + 0 * stride_cos_b + 0 * stride_cos_h
-
-    if reuse_freqs_front_part:
-        cos_offs = tl.arange(0, D_MODEL) // 2
-        cos_mask = cos_offs < D_MODEL_HALF
-    else:
-        cos_offs = tl.arange(0, D_MODEL)
-        cos_mask = cos_offs < D_MODEL
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X [D_MODEL]
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    x_mask = x_offs < D_MODEL
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load rotated.
-    # X1 = even idx of x, [D_MODEL/2]
-    # X2 = odd idx of x, [D_MODEL/2]
-    x_offs_rotated = tl.arange(0, D_MODEL_HALF) * 2
-    x_mask_rotated = x_offs_rotated < D_MODEL
-    x1 = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask_rotated)
-    x2 = tl.load(x_ptr + x_base_offs + (x_offs_rotated + 1), mask=x_mask_rotated)
-    x2 = -x2
-    x_rotated = tl.interleave(x2, x1)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_mask)
-
-
-@triton.jit
-def _rope_fwd_kernel_neox_nope_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    nope_first: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load freqs. Note: freqs is D_MODEL/2 or D_MODEL/4(nope+reuse_freqs_front_part),
-    # but freqs shape in here is D_MODEL which matches the shape of the final output.
-    # We use mask to load 0s in the bottom half or top half(nope_first)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    offset = tl.load(off_ptr + pos_offs)
-    cos_base_offs = (pos + offset) * stride_cos_s + 0 * stride_cos_b + 0 * stride_cos_h
-
-    if nope_first:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_offs = tl.where(
-                (cos_offs >= D_MODEL // 4) & (cos_offs < D_MODEL_HALF),
-                cos_offs - D_MODEL // 4,
-                cos_offs,
-            ).to(cos_offs.dtype)
-            cos_mask = (cos_offs >= 0) & (cos_offs <= D_MODEL // 4)
-        else:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL_HALF)
-    else:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_offs = tl.where(
-                (cos_offs >= D_MODEL // 4) & (cos_offs < D_MODEL_HALF),
-                cos_offs - D_MODEL_HALF // 2,
-                cos_offs,
-            ).to(cos_offs.dtype)
-            cos_mask = cos_offs < D_MODEL_HALF // 2
-        else:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_mask = cos_offs < D_MODEL_HALF
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    if nope_first:
-        x_mask = (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL)
-    else:
-        x_mask = x_offs < D_MODEL_HALF
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load X rotated
-    # rotate_style: NEOX
-    if nope_first:
-        x1_offs = tl.where(
-            (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL_HALF + D_MODEL_HALF / 2),
-            x_offs + D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x2_offs = tl.where(
-            (x_offs >= D_MODEL_HALF + D_MODEL_HALF / 2) & (x_offs < D_MODEL),
-            x_offs - D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x_rotated_offs = x1_offs + x2_offs
-        x_rotated_mask = (x_rotated_offs >= D_MODEL_HALF) & (x_rotated_offs < D_MODEL)
-    else:
-        x1_offs = tl.where(x_offs < D_MODEL_HALF / 2, x_offs + D_MODEL_HALF / 2, 0).to(
-            x_offs.dtype
-        )
-        x2_offs = tl.where(
-            (x_offs >= D_MODEL_HALF / 2) & (x_offs < D_MODEL_HALF),
-            x_offs - D_MODEL_HALF / 2,
-            0,
-        ).to(x_offs.dtype)
-        x_rotated_offs = x1_offs + x2_offs
-        x_rotated_mask = x_rotated_offs < D_MODEL_HALF
-    x_rotated = tl.load(x_ptr + x_base_offs + x_rotated_offs, mask=x_rotated_mask)
-    if nope_first:
-        x_rotated = tl.where(
-            (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL_HALF + D_MODEL_HALF / 2),
-            -x_rotated,
-            x_rotated,
-        )
-    else:
-        x_rotated = tl.where(x_offs < D_MODEL_HALF / 2, -x_rotated, x_rotated)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    # Load nope
-    if nope_first:
-        x_nope_mask = tl.where(x_offs < D_MODEL_HALF, 1, 0).to(x_rotated_mask.dtype)
-    else:
-        x_nope_mask = tl.where(x_offs >= D_MODEL_HALF, 1, 0).to(x_rotated_mask.dtype)
-    x_nope = tl.load(x_ptr + x_base_offs + x_offs, mask=x_nope_mask)
-
-    out = out + x_nope
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (s, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out, mask=x_offs < D_MODEL)
-
-
-@triton.jit
-def _rope_fwd_kernel_gptj_nope_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    stride_x_s,
-    stride_x_b,
-    stride_x_h,
-    stride_x_d,
-    stride_cos_s,
-    stride_cos_b,
-    stride_cos_h,
-    stride_cos_d,
-    stride_pos_s,
-    stride_pos_b,
-    stride_out_s,
-    stride_out_b,
-    stride_out_h,
-    stride_out_d,
-    reuse_freqs_front_part: tl.constexpr,
-    nope_first: tl.constexpr,
-    SEQ_LEN: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
-):
-    # Parallelize over batch and head. Handle 1 sequence per program
-    b = tl.program_id(0)
-    h = tl.program_id(1)
-    s = tl.program_id(2)
-
-    # Load cos for this batch and head (1, 1, 1, d)
-    pos_offs = s * stride_pos_s + b * stride_pos_b
-    pos = tl.load(pos_ptr + pos_offs)
-    offset = tl.load(off_ptr + pos_offs)
-    cos_base_offs = (pos + offset) * stride_cos_s + 0 * stride_cos_b + 0 * stride_cos_h
-
-    if nope_first:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_offs = cos_offs // 2
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL // 4)
-        else:
-            cos_offs = tl.arange(0, D_MODEL) - D_MODEL_HALF
-            cos_mask = (cos_offs >= 0) & (cos_offs < D_MODEL_HALF)
-    else:
-        if reuse_freqs_front_part:
-            cos_offs = tl.arange(0, D_MODEL) // 2
-            cos_mask = cos_offs < D_MODEL // 4
-        else:
-            cos_offs = tl.arange(0, D_MODEL)
-            cos_mask = cos_offs < D_MODEL_HALF
-    cos = tl.load(cos_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-    sin = tl.load(sin_ptr + cos_base_offs + cos_offs, mask=cos_mask)
-
-    # Load X [D_MODEL]
-    x_base_offs = b * stride_x_b + s * stride_x_s + h * stride_x_h
-    x_offs = tl.arange(0, D_MODEL)
-    if nope_first:
-        x_mask = (x_offs >= D_MODEL_HALF) & (x_offs < D_MODEL)
-    else:
-        x_mask = x_offs < D_MODEL_HALF
-    x = tl.load(x_ptr + x_base_offs + x_offs, mask=x_mask)
-
-    # Load rotated.
-    # rotate_style:GPTJ
-    # X1 = even idx of x, [D_MODEL/2]
-    # X2 = odd idx of x, [D_MODEL/2]
-    x_offs_rotated = tl.arange(0, D_MODEL_HALF) * 2
-    if nope_first:
-        x_mask_rotated = x_offs_rotated >= D_MODEL_HALF
-    else:
-        x_mask_rotated = x_offs_rotated < D_MODEL_HALF
-
-    x1 = tl.load(x_ptr + x_base_offs + x_offs_rotated, mask=x_mask_rotated)
-    x2 = tl.load(x_ptr + x_base_offs + (x_offs_rotated + 1), mask=x_mask_rotated)
-    x2 = -x2
-    x_rotated = tl.interleave(x2, x1)
-
-    # compute output
-    out = x * cos + x_rotated * sin
-
-    # Load nope
-    if nope_first:
-        x_nope_mask = tl.where(x_offs < D_MODEL_HALF, 1, 0).to(x_mask_rotated.dtype)
-    else:
-        x_nope_mask = tl.where(x_offs >= D_MODEL_HALF, 1, 0).to(x_mask_rotated.dtype)
-    x_nope = tl.load(x_ptr + x_base_offs + x_offs, mask=x_nope_mask)
-
-    out = out + x_nope
-    out = out.to(x_ptr.dtype.element_ty)
-
-    # store output for this batch and head (1, 1, 1, d)
-    tl.store(out_ptr + x_base_offs + x_offs, out)
+        tl.store(out_x_ptr + x_offs, out_x, mask=x_mask)
+        tl.store(out_y_ptr + x_offs, out_y, mask=x_mask)
 
 
 @triton.jit
@@ -2217,7 +1351,7 @@ def _rope_fwd(
         *x_.stride(),
         *freqs.stride(),
         *out_.stride(),
-        S=s,
+        s,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=(rotate_style == RotateStyle.NEOX),
         BLOCK_S=BLOCK_S,
@@ -2407,9 +1541,12 @@ def _rope_cached_fwd(
     out: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    pos: torch.Tensor,
+    offs: torch.Tensor,
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
+    inplace: bool,
     transpose_output: bool = False,
 ) -> torch.Tensor:
     s, b, h, d = x.shape
@@ -2424,71 +1561,54 @@ def _rope_cached_fwd(
     else:
         have_nope = False
 
-    grid = (b, h, s)
-    if rotate_style == RotateStyle.NEOX:
-        if have_nope:
-            _rope_fwd_kernel_neox_nope_cached[grid](
-                x,
-                cos,
-                sin,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *out.stride(),
-                rotate_style,
-                reuse_freqs_front_part,
-                nope_first,
-                s,
-                d,
-                d // 2,
-            )
-        else:
-            _rope_fwd_kernel_neox_cached[grid](
-                x,
-                cos,
-                sin,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *out.stride(),
-                rotate_style,
-                reuse_freqs_front_part,
-                s,
-                d,
-                d // 2,
-            )
+    if have_nope:
+        BLOCK_D = d // 2
+        BLOCK_D_HALF = d // 4
+        if nope_first:
+            x_ = x[..., BLOCK_D:]
+            out_ = out[..., BLOCK_D:]
+            if not inplace:
+                out[..., :BLOCK_D] = x[..., :BLOCK_D]
+        elif have_nope:
+            x_ = x[..., :BLOCK_D]
+            out_ = out[..., :BLOCK_D]
+            if not inplace:
+                out[..., BLOCK_D:] = x[..., BLOCK_D:]
     else:
-        if have_nope:
-            _rope_fwd_kernel_gptj_nope_cached[grid](
-                x,
-                cos,
-                sin,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *out.stride(),
-                rotate_style,
-                reuse_freqs_front_part,
-                nope_first,
-                s,
-                d,
-                d // 2,
-            )
-        else:
-            _rope_fwd_kernel_gptj_cached[grid](
-                x,
-                cos,
-                sin,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *out.stride(),
-                rotate_style,
-                reuse_freqs_front_part,
-                s,
-                d,
-                d // 2,
-            )
+        BLOCK_D = d
+        BLOCK_D_HALF = d // 2
+        x_ = x
+        out_ = out
+
+    # TODO: performance optimization
+    BLOCK_S = 32
+    num_warps = 4
+    waves_per_eu = 0
+    grid = (b, h, triton.cdiv(s, BLOCK_S))
+
+    pos_stride = pos.stride() if pos is not None else (1, 1)
+    _rope_fwd_kernel_sbhd_cached[grid](
+        x_,
+        cos,
+        sin,
+        pos,
+        offs,
+        out_,
+        *x_.stride(),
+        *cos.stride(),
+        *pos_stride,
+        *out_.stride(),
+        s,
+        REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
+        IS_NEOX=(rotate_style == RotateStyle.NEOX),
+        HAVE_POS=(pos is not None),
+        HAVE_OFFS=(offs is not None),
+        BLOCK_S=BLOCK_S,
+        BLOCK_D=BLOCK_D,
+        BLOCK_D_HALF=BLOCK_D_HALF,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+    )
 
     return out
 
@@ -2510,9 +1630,12 @@ def rope_cached_fwd(
         out,
         cos,
         sin,
+        None,
+        None,
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        False,
         transpose_output,
     )
 
@@ -2529,111 +1652,20 @@ def rope_cached_fwd_inplace(
     transpose_output: bool = False,
 ):
     out = x
+
     _rope_cached_fwd(
         x,
         out,
         cos,
         sin,
+        None,
+        None,
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
         transpose_output,
     )
-
-    return out
-
-
-def _rope_cached_positions_fwd(
-    x: torch.Tensor,
-    out: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    positions: torch.Tensor,
-    rotate_style: int,
-    reuse_freqs_front_part: bool,
-    nope_first: bool,
-    transpose_output: bool = False,
-) -> torch.Tensor:
-    s, b, h, d = x.shape
-    if cos.shape[-1] == d // 2:
-        if reuse_freqs_front_part:
-            have_nope = False
-        else:
-            have_nope = True
-    elif cos.shape[-1] == d // 4:
-        have_nope = True
-    else:
-        have_nope = False
-
-    grid = (b, h, s)
-    if rotate_style == RotateStyle.NEOX:
-        if have_nope:
-            _rope_fwd_kernel_neox_nope_cached_position[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                nope_first,
-                s,
-                d,
-                d // 2,
-            )
-        else:
-            _rope_fwd_kernel_neox_cached_position[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                s,
-                d,
-                d // 2,
-            )
-    else:
-        if have_nope:
-            _rope_fwd_kernel_gptj_nope_cached_position[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                nope_first,
-                s,
-                d,
-                d // 2,
-            )
-        else:
-            _rope_fwd_kernel_gptj_cached_position[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                s,
-                d,
-                d // 2,
-            )
 
     return out
 
@@ -2651,15 +1683,17 @@ def rope_cached_positions_fwd(
     s, b, h, d = x.shape
     out = torch.empty((s, b, h, d), dtype=x.dtype, device=x.device, requires_grad=False)
 
-    _rope_cached_positions_fwd(
+    _rope_cached_fwd(
         x,
         out,
         cos,
         sin,
         positions,
+        None,
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        False,
         transpose_output,
     )
 
@@ -2678,117 +1712,19 @@ def rope_cached_positions_fwd_inplace(
 ) -> torch.Tensor:
     out = x
 
-    _rope_cached_positions_fwd(
+    _rope_cached_fwd(
         x,
         out,
         cos,
         sin,
         positions,
+        None,
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
         transpose_output,
     )
-
-    return out
-
-
-def _rope_cached_positions_offsets_fwd(
-    x: torch.Tensor,
-    out: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    positions: torch.Tensor,
-    offsets: torch.Tensor,
-    rotate_style: int,
-    reuse_freqs_front_part: bool,
-    nope_first: bool,
-    transpose_output: bool = False,
-) -> torch.Tensor:
-    s, b, h, d = x.shape
-    if cos.shape[-1] == d // 2:
-        if reuse_freqs_front_part:
-            have_nope = False
-        else:
-            have_nope = True
-    elif cos.shape[-1] == d // 4:
-        have_nope = True
-    else:
-        have_nope = False
-
-    grid = (b, h, s)
-    if rotate_style == RotateStyle.NEOX:
-        if have_nope:
-            _rope_fwd_kernel_neox_nope_cached_position_off[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                offsets,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                nope_first,
-                s,
-                d,
-                d // 2,
-            )
-        else:
-            _rope_fwd_kernel_neox_cached_position_off[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                offsets,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                s,
-                d,
-                d // 2,
-            )
-    else:
-        if have_nope:
-            _rope_fwd_kernel_gptj_nope_cached_position_off[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                offsets,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                nope_first,
-                s,
-                d,
-                d // 2,
-            )
-        else:
-            _rope_fwd_kernel_gptj_cached_position_off[grid](
-                x,
-                cos,
-                sin,
-                positions,
-                offsets,
-                out,
-                *x.stride(),
-                *cos.stride(),
-                *positions.stride(),
-                *out.stride(),
-                reuse_freqs_front_part,
-                s,
-                d,
-                d // 2,
-            )
 
     return out
 
@@ -2807,7 +1743,7 @@ def rope_cached_positions_offsets_fwd(
     s, b, h, d = x.shape
     out = torch.empty((s, b, h, d), dtype=x.dtype, device=x.device, requires_grad=False)
 
-    _rope_cached_positions_offsets_fwd(
+    _rope_cached_fwd(
         x,
         out,
         cos,
@@ -2817,6 +1753,7 @@ def rope_cached_positions_offsets_fwd(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        False,
         transpose_output,
     )
 
@@ -2836,7 +1773,7 @@ def rope_cached_positions_offsets_fwd_inplace(
 ) -> torch.Tensor:
     out = x
 
-    _rope_cached_positions_offsets_fwd(
+    _rope_cached_fwd(
         x,
         out,
         cos,
@@ -2846,6 +1783,7 @@ def rope_cached_positions_offsets_fwd_inplace(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
         transpose_output,
     )
 
