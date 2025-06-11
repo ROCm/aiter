@@ -46,9 +46,32 @@ def test_gemm(dtype, b, m, n, k):
 
 l_dtype = ["bf16"]
 l_b = [16]
-l_m = [1, 32, 64, 128, 192, 256, 320, 512, 1024, 2048, 4096, 8192]
-l_n = [1028, 8192]
-l_k = [8192, 1024]
+l_mnk = [
+    (1, 1280, 8192),
+    (32, 1280, 8192),
+    (64, 1280, 8192),
+    (128, 1280, 8192),
+    (192, 1280, 8192),
+    (256, 1280, 8192),
+    (320, 1280, 8192),
+    (512, 1280, 8192),
+    (1024, 1280, 8192),
+    (2048, 1280, 8192),
+    (4096, 1280, 8192),
+    (8192, 1280, 8192),
+    (1, 8192, 1024),
+    (32, 8192, 1024),
+    (64, 8192, 1024),
+    (128, 8192, 1024),
+    (192, 8192, 1024),
+    (256, 8192, 1024),
+    (320, 8192, 1024),
+    (512, 8192, 1024),
+    (1024, 8192, 1024),
+    (2048, 8192, 1024),
+    (4096, 8192, 1024),
+    (8192, 8192, 1024),
+]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
@@ -72,32 +95,15 @@ parser.add_argument(
     help="batch size",
 )
 parser.add_argument(
-    "-m",
-    type=int,
-    choices=l_m,
+    "-mnk",
+    type=dtypes.str2tuple,
+    choices=l_mnk,
     nargs="?",
     const=None,
     default=None,
-    help="m: Represents the number of rows in the output matrix ( C ) and the first input matrix ( A ).",
+    help="shape of mnk",
 )
-parser.add_argument(
-    "-n",
-    type=int,
-    choices=l_n,
-    nargs="?",
-    const=None,
-    default=None,
-    help="n: Represents the number of columns in the output matrix ( C ) and the second input matrix ( B ).",
-)
-parser.add_argument(
-    "-k",
-    type=int,
-    choices=l_k,
-    nargs="?",
-    const=None,
-    default=None,
-    help="k: Represents the number of columns in the first input matrix ( A ) and the number of rows in the second input matrix ( B ).",
-)
+
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -105,13 +111,11 @@ else:
     l_dtype = [dtypes.d_dtypes[args.dtype]]
 if args.batch is not None:
     l_b = [args.bitch]
-if args.m is not None:
-    l_m = [args.m]
-if args.n is not None:
-    l_n = [args.n]
-if args.k is not None:
-    l_k = [args.k]
+if args.mnk is not None:
+    l_mnk = [args.m]
+
 
 for dtype in l_dtype:
-    for b, m, n, k in itertools.product(l_b, l_m, l_n, l_k):
-        test_gemm(dtype, b, m, n, k)
+    for b in l_b:
+        for m, n, k in l_mnk:
+            test_gemm(dtype, b, m, n, k)
