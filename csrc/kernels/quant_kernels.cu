@@ -279,7 +279,7 @@ __device__ void scaled_quant_impl(DTYPE_O* __restrict__ out,
 
     using vec_i       = ck_tile::vec_t<DTYPE_I, vec_size_i>;
     using vec_o       = ck_tile::vec_t<DTYPE_O, vec_size_o>;
-    using DTYPE_STORE = ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
 
     const int64_t row_offset        = blockIdx.x * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
@@ -352,7 +352,7 @@ __device__ void scaled_quant_vgpr_impl(DTYPE_O* __restrict__ out,
 
     using vec_i       = ck_tile::vec_t<DTYPE_I, vec_size_i>;
     using vec_o       = ck_tile::vec_t<DTYPE_O, vec_size_o>;
-    using DTYPE_STORE = ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
 
     const int64_t row_offset        = blockIdx.x * cols;
     auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input);

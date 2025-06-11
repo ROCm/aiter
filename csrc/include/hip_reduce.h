@@ -44,6 +44,15 @@ __device__ constexpr T cross_wave_reduce(T local, F reduce_op, T* smem)
     return v_local;
 }
 
+// template <typename T, typename F>
+// __device__ constexpr T block_reduce(T val, F reduce_f)
+// {
+//     __shared__ T smem[256];
+//     T wave_local = wave_reduce(val, reduce_f);
+//     T v_local    = cross_wave_reduce(wave_local, reduce_f, smem);
+//     return v_local;
+// }
+
 // copied from
 // https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
 template <typename T, typename F, int WarpSize = 64, bool threadBroadcast = true>
@@ -97,14 +106,14 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     return local;
 }
 
-template <typename T, typename F, int BlockSize = 256, bool waveBroadcast = true>
+template <typename T, typename F, int BlockSize, bool waveBroadcast = true>
 __device__ constexpr T block_reduce(T local, F reduce_op)
 {
     // static_assert(BlockSize <= 256, "BlockSize > 256 is not supported");
-    const int waves     = BlockSize / WARP_SIZE;
-    const int wave_size = WARP_SIZE;
-    int wave_id         = threadIdx.x / wave_size;
-    int lane_id         = threadIdx.x % wave_size;
+    static constexpr int waves = BlockSize / WARP_SIZE;
+    const int wave_size        = WARP_SIZE;
+    int wave_id                = threadIdx.x / wave_size;
+    int lane_id                = threadIdx.x % wave_size;
     __shared__ float smem[waves];
 
     local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);

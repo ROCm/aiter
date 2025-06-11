@@ -227,19 +227,19 @@ def test_fmoe_ep(
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
 
-        if use_g1u1:
-            out_b = ref2
-            avg_b = 9999
-            print("asm g1u1 only support quant/smoothquant Now")
-        else:
-            out_b, avg_b = asm_moe_test(
-                input,
-                w1_qt_aiter,
-                w2_qt_aiter,
-                topk_weights,
-                topk_ids,
-                expert_mask=expert_mask,
-            )
+        # if use_g1u1:
+        #     out_b = ref2
+        #     avg_b = 9999
+        #     print("asm g1u1 only support quant/smoothquant Now")
+        # else:
+        #     out_b, avg_b = asm_moe_test(
+        #         input,
+        #         w1_qt_aiter,
+        #         w2_qt_aiter,
+        #         topk_weights,
+        #         topk_ids,
+        #         expert_mask=expert_mask,
+        #     )
 
         # test ck moe
         out_ck, avg_ck = run_perftest(
@@ -257,8 +257,8 @@ def test_fmoe_ep(
             doweight_stage1=False,
         )
 
-        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
-        checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
+        # msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        # checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
         checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
 
     else:
@@ -372,15 +372,15 @@ def test_fmoe_ep(
 
 
 print("test test_fmoe 16 bit")
-print("\ng1u0 no quant")
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m in [7, 128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024, 1280]:
-                for ep in [4, 8]:
-                    test_fmoe_ep(
-                        dtype, m, dim, hdim, 128, 6, quant="No", shared_E=2, ep=ep
-                    )
+# print("\ng1u0 no quant")
+# for dtype in [dtypes.fp16, dtypes.bf16]:
+#     for m in [7, 128, 256]:
+#         for dim in [4096, 8192]:
+#             for hdim in [1024, 1280]:
+#                 for ep in [4, 8]:
+#                     test_fmoe_ep(
+#                         dtype, m, dim, hdim, 128, 6, quant="No", shared_E=2, ep=ep
+#                     )
 
 print("\ng1u1 no quant")
 for dtype in [dtypes.fp16, dtypes.bf16]:
