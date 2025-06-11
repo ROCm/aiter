@@ -338,6 +338,10 @@ def test_rope_fwd_thd(
 @pytest.mark.parametrize("S", [4, 10, 32])
 @pytest.mark.parametrize("H", [1, 8, 32])
 @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
+# @pytest.mark.parametrize("B", [32])
+# @pytest.mark.parametrize("S", [32])
+# @pytest.mark.parametrize("H", [32])
+# @pytest.mark.parametrize("D", [128])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize(
     "nope, nope_first", [(False, False), (True, False), (True, True)]
@@ -387,8 +391,8 @@ def test_rope_fwd_cached(
     )
 
     # TODO: Fix this
-    if rotate_style == RotateStyle.NEOX and pos and D > 64 and B >= 15:
-        pytest.skip("NEOX and pos=True with large B and D result in accuracy failures")
+    # if rotate_style == RotateStyle.NEOX and pos and D > 64 and B >= 15:
+    #     pytest.skip("NEOX and pos=True with large B and D result in accuracy failures")
 
     ref_freqs = (
         freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
