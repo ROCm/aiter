@@ -255,8 +255,7 @@ def test_rope_fwd(
     "nope, nope_first", [(False, False), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("reuse_freqs_front_part", [True, False])
-# @pytest.mark.parametrize('dtype', [torch.float16, torch.bfloat16]) #TODO bf16 results in accuracy issues
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
 def test_rope_fwd_thd(
     B: int,
