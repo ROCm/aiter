@@ -22,6 +22,10 @@ bool static isGPUArch(const std::vector<std::string> &archs)
     }
     return false;
 }
+<<<<<<< HEAD
+
+=======
+>>>>>>> origin/main
 #ifdef __HIP_DEVICE_COMPILE__
 #if CK_TILE_USE_OCP_FP8
 const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fn;

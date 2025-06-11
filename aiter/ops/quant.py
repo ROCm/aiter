@@ -73,6 +73,12 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
     # dtypeMax = F4E2M1_MAX
     dtypeMax = 2.0**MAX_POW2
+<<<<<<< HEAD
+
+    shape_original = x.shape
+    x = x.view(-1, shape_original[-1])
+=======
+>>>>>>> origin/main
 
     m, n = x.shape
     x = x.view(-1, block_size)
@@ -88,11 +94,22 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
 
     y = x.float() / scale_f32.view(-1, 1)
     y = fp4_utils.f32_to_mxfp4(y)
+<<<<<<< HEAD
+    y = y.view(*shape_original[:-1], -1)
+    scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
+    if shuffle:
+        scale_padded = torch.empty(
+            (m + 255) // 256 * 256,
+            (n // block_size + 7) // 8 * 8,
+            dtype=torch.uint8,
+            device=x.device,
+=======
     y = y.view(m, -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     if shuffle:
         scale_padded = torch.empty(
             (m + 255) // 256 * 256, (n // block_size + 7) // 8 * 8, dtype=torch.uint8
+>>>>>>> origin/main
         ).fill_(0x7F)
 
         scale_padded[:m, : n // block_size] = scale
@@ -214,7 +231,11 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
+<<<<<<< HEAD
+def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2):
+=======
 def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
+>>>>>>> origin/main
     m, n = x.shape
     assert quant_dtype == dtypes.fp4x2
     assert n % 2 == 0
@@ -223,19 +244,31 @@ def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True)
         scale = (
             torch.empty(
                 (
+<<<<<<< HEAD
+                    (m + 31) // 32 * 32,
+=======
                     (m + 255) // 256 * 256,
+>>>>>>> origin/main
                     (n // 32 + 7) // 8 * 8,
                 ),
                 dtype=torch.uint8,
                 device=device,
             )
+<<<<<<< HEAD
+            .fill_(0x7F)
+=======
             # .fill_(0x7F)
+>>>>>>> origin/main
             .view(dtypes.fp8_e8m0)
         )
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
+<<<<<<< HEAD
+    dynamic_per_token_scaled_quant(y, x.view(-1, 32), scale)
+=======
     dynamic_per_token_scaled_quant(y, x.view(-1, 32), scale, shuffle_scale=shuffle)
+>>>>>>> origin/main
     return y.view(torch.uint8), scale
 
 

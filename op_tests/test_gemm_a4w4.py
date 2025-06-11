@@ -38,7 +38,11 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 def run_triton(x, w, x_scales, w_scales, out, dtype=dtypes.bf16):
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
 
+<<<<<<< HEAD
+    gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
+=======
     gemm_afp4wfp4(x, w, out, x_scales, w_scales, dtype)
+>>>>>>> origin/main
     return out
 
 

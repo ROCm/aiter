@@ -84,6 +84,20 @@
           py::arg("quant_algo"),       \
           py::arg("out_") = std::nullopt);
 
+<<<<<<< HEAD
+#define ATTENTION_PYBIND                                            \
+      m.def("paged_attention_rocm", &paged_attention,               \
+            "paged_attention_rocm(Tensor! out, Tensor exp_sums,"    \
+            "                Tensor max_logits, Tensor tmp_out,"    \
+            "                Tensor query, Tensor key_cache,"       \
+            "                Tensor value_cache, int num_kv_heads," \
+            "                float scale, Tensor block_tables,"     \
+            "                Tensor context_lens, int block_size,"  \
+            "                int max_context_len,"                  \
+            "                Tensor? alibi_slopes,"                 \
+            "                str kv_cache_dtype,"                   \
+            "                Tensor k_scale, Tensor v_scale) -> ()");
+=======
 #define ATTENTION_PYBIND                                          \
     m.def("paged_attention_rocm",                                 \
           &paged_attention,                                       \
@@ -97,6 +111,7 @@
           "                Tensor? alibi_slopes,"                 \
           "                str kv_cache_dtype,"                   \
           "                float k_scale, float v_scale) -> ()");
+>>>>>>> origin/main
 
 #define ATTENTION_RAGGED_PYBIND                                   \
     m.def("paged_attention_ragged",                               \
@@ -281,6 +296,19 @@
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
+<<<<<<< HEAD
+#define GEMM_A4W4_ASM_PYBIND                        \
+      m.def("gemm_a4w4_asm", &gemm_a4w4_asm,        \
+            "Asm gemm a4w4",                        \
+            py::arg("A"), py::arg("B"),             \
+            py::arg("A_scale"), py::arg("B_scale"), \
+            py::arg("out"), py::arg("bias"),        \
+            py::arg("alpha") = 1.0, py::arg("beta") = 0.0);
+
+#define GEMM_A8W8_BLOCKSCALE_PYBIND                                                                             \
+      m.def("gemm_a8w8_blockscale", &gemm_a8w8_blockscale, "fp8 blockscale gemm", py::arg("XQ"), py::arg("WQ"), \
+            py::arg("x_scale"), py::arg("w_scale"), py::arg("Out"));
+=======
 #define GEMM_A8W8_ASM_PYBIND                                            \
     m.def("gemm_a8w8_asm",                                              \
           &gemm_a8w8_asm,                                               \
@@ -297,6 +325,7 @@
           py::arg("pad_b")  = 0,                                        \
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
+>>>>>>> origin/main
 
 #define GEMM_A4W4_ASM_PYBIND      \
     m.def("gemm_a4w4_asm",        \
@@ -490,6 +519,61 @@
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+<<<<<<< HEAD
+#define MHA_BATCH_PREFILL_PYBIND                                        \
+      m.def("mha_batch_prefill", &aiter::torch_itfs::mha_batch_prefill, \
+            py::arg("q"), py::arg("k"), py::arg("v"),                   \
+            py::arg("cu_seqlens_q"),                                    \
+            py::arg("kv_indptr"),                                       \
+            py::arg("kv_page_indices"),                                 \
+            py::arg("max_seqlen_q"),                                    \
+            py::arg("max_seqlen_k"),                                    \
+            py::arg("dropout_p"),                                       \
+            py::arg("softmax_scale"),                                   \
+            py::arg("logits_soft_cap"),                                 \
+            py::arg("zero_tensors"),                                    \
+            py::arg("is_causal"),                                       \
+            py::arg("window_size_left"),                                \
+            py::arg("window_size_right"),                               \
+            py::arg("return_softmax_lse"),                              \
+            py::arg("return_dropout_randval"),                          \
+            py::arg("out") = std::nullopt,                              \
+            py::arg("bias") = std::nullopt,                             \
+            py::arg("alibi_slopes") = std::nullopt,                     \
+            py::arg("gen") = std::nullopt);
+
+#define MOE_CK_2STAGES_PYBIND                          \
+      m.def("ck_moe_stage1", &ck_moe_stage1,           \
+            py::arg("hidden_states"),                  \
+            py::arg("w1"),                             \
+            py::arg("w2"),                             \
+            py::arg("sorted_token_ids"),               \
+            py::arg("sorted_expert_ids"),              \
+            py::arg("num_valid_ids"),                  \
+            py::arg("out"),                            \
+            py::arg("topk"),                           \
+            py::arg("w1_scale") = std::nullopt,        \
+            py::arg("a1_scale") = std::nullopt,        \
+            py::arg("block_m") = 32,                   \
+            py::arg("sorted_weights") = std::nullopt,  \
+            py::arg("act_op") = 0,                     \
+            py::arg("pipe_ver") = 1);                  \
+                                                       \
+      m.def("ck_moe_stage2", &ck_moe_stage2,           \
+            py::arg("inter_states"),                   \
+            py::arg("w1"),                             \
+            py::arg("w2"),                             \
+            py::arg("sorted_token_ids"),               \
+            py::arg("sorted_expert_ids"),              \
+            py::arg("num_valid_ids"),                  \
+            py::arg("out"),                            \
+            py::arg("topk"),                           \
+            py::arg("w2_scale") = std::nullopt,        \
+            py::arg("a2_scale") = std::nullopt,        \
+            py::arg("block_m") = 32,                   \
+            py::arg("sorted_weights") = std::nullopt,  \
+            py::arg("pipe_ver") = 1);                  \
+=======
 #define MHA_VARLEN_BWD_PYBIND                     \
     m.def("mha_varlen_bwd",                       \
           &aiter::torch_itfs::mha_varlen_bwd,     \
@@ -542,6 +626,7 @@
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
+>>>>>>> origin/main
 
 #define MHA_BATCH_PREFILL_PYBIND                  \
     m.def("mha_batch_prefill",                    \
@@ -746,6 +831,14 @@
           py::arg("unit_size"),         \
           py::arg("local_expert_mask") = std::nullopt);
 
+<<<<<<< HEAD
+#define QUANT_PYBIND                                                           \
+      m.def("static_per_tensor_quant", &static_per_tensor_quant);              \
+      m.def("dynamic_per_tensor_quant", &dynamic_per_tensor_quant);            \
+      m.def("dynamic_per_token_scaled_quant", &dynamic_per_token_scaled_quant, \
+            py::arg("out"), py::arg("input"),                                  \
+            py::arg("scales"), py::arg("scale_ub") = std::nullopt);
+=======
 #define NORM_PYBIND                                               \
     m.def("layernorm2d_fwd",                                      \
           &layernorm2d,                                           \
@@ -808,6 +901,7 @@
           py::arg("x_bias") = std::nullopt);                      \
     m.def("layernorm2d_with_add_asm", &layernorm2d_with_add_asm); \
     m.def("layernorm2d_with_add_smoothquant_asm", &layernorm2d_with_add_smoothquant_asm);
+>>>>>>> origin/main
 
 #define POS_ENCODING_PYBIND                                               \
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
@@ -873,6 +967,22 @@
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
 
+<<<<<<< HEAD
+#define AITER_ENUM_PYBIND                                  \
+      pybind11::enum_<QuantType>(m, "QuantType")           \
+          .value("No", QuantType::No)                      \
+          .value("per_Tensor", QuantType::per_Tensor)      \
+          .value("per_Token", QuantType::per_Token)        \
+          .value("per_1x32", QuantType::per_1x32)          \
+          .value("per_1x128", QuantType::per_1x128)        \
+          .value("per_128x128", QuantType::per_128x128)    \
+          .export_values();                                \
+      pybind11::enum_<ActivationType>(m, "ActivationType") \
+          .value("No", ActivationType::No)                 \
+          .value("Silu", ActivationType::Silu)             \
+          .value("Gelu", ActivationType::Gelu)             \
+          .export_values();
+=======
 #define HIPBSOLGEMM_PYBIND                                                         \
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
     m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension"); \
@@ -919,3 +1029,4 @@
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
         .export_values();
+>>>>>>> origin/main

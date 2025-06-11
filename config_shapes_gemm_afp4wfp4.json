@@ -1,0 +1,40 @@
+{
+    "configs": {
+        "small": {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 6,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": ".cg",
+            "NUM_KSPLIT": 4
+        },
+        "medium_M32": {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+            "waves_per_eu": 4,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": ".cg",
+            "NUM_KSPLIT": 4
+        }
+    },
+    "shapes_params": [
+        {"M":1024, 
+        "N": 1024, 
+        "K": 1024,
+        "dtype":"bfloat16"},
+        {"M":32, 
+        "N": 32, 
+        "K": 32,
+        "dtype":"bfloat16"}
+    ]
+}

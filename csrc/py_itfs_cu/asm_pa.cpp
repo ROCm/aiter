@@ -142,25 +142,38 @@ torch::Tensor pa_fwd(torch::Tensor &Q,            //   [num_seqs, num_heads, hea
             }
             else if (K.dtype() == torch_fp8)
             {
-                if (high_precision.value() == 0)
+                if (gqa_ratio == 16)
                 {
-                    static AiterAsmKernel impl_a16w8_b16_f8("_ZN5aiter32pa_bf16_pertokenFp8_a16w8_2tg_g8E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8.co");
+                    static AiterAsmKernel impl_a16w8_b16_f8("_ZN5aiter39pa_bf16_pertokenFp8_a16w8_2tg_g8_f8_Q16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_f8_Q16.co");
                     impl_ptr = &impl_a16w8_b16_f8;
                 }
-                else if (high_precision.value() == 1)
+                else if (gqa_ratio <= 8)
                 {
-                    static AiterAsmKernel impl_a16w8_b16_f8_tail_bf16("_ZN5aiter42pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16.co");
-                    impl_ptr = &impl_a16w8_b16_f8_tail_bf16;
-                }
-                else if (high_precision.value() == 2)
-                {
-                    static AiterAsmKernel impl_a16w8_b16_f8_gemm1_bf16("_ZN5aiter43pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16.co");
-                    impl_ptr = &impl_a16w8_b16_f8_gemm1_bf16;
+                    if (high_precision.value() == 0)
+                    {
+                        static AiterAsmKernel impl_a16w8_b16_f8("_ZN5aiter32pa_bf16_pertokenFp8_a16w8_2tg_g8E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8.co");
+                        impl_ptr = &impl_a16w8_b16_f8;
+                    }
+                    else if (high_precision.value() == 1)
+                    {
+                        static AiterAsmKernel impl_a16w8_b16_f8_tail_bf16("_ZN5aiter42pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16.co");
+                        impl_ptr = &impl_a16w8_b16_f8_tail_bf16;
+                    }
+                    else if (high_precision.value() == 2)
+                    {
+                        static AiterAsmKernel impl_a16w8_b16_f8_gemm1_bf16("_ZN5aiter43pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16E", "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16.co");
+                        impl_ptr = &impl_a16w8_b16_f8_gemm1_bf16;
+                    }
+                    else
+                    {
+                        TORCH_CHECK(false,
+                                    __func__, ": high_precision value only support (0, 1, 2) grades on bf16 asm pa for fp8 kv cache !!!");
+                    }
                 }
                 else
                 {
                     TORCH_CHECK(false,
-                                __func__, ": high_precision value only support (0, 1, 2) grades on bf16 asm pa for fp8 kv cache !!!");
+                                __func__, ": gqa_ratio only support 8 or 16 for bf16 asm pa for fp8 kv cache !!!");
                 }
             }
         }

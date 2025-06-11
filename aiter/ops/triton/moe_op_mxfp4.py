@@ -8,7 +8,7 @@ from typing import Any, Dict
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 
 
-@tl.constexpr_function
+# @tl.constexpr_function
 def get_scaled_dot_format_string(dtype: tl.dtype):
     mapping = {
         tl.float16: "fp16",

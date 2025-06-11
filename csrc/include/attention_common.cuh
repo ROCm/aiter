@@ -11,6 +11,13 @@
 #include <ck_tile/ops/fmha/block/block_masking.hpp>
 #include <ck_tile/ops/fmha/block/variants.hpp>
 
+<<<<<<< HEAD
+#if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__))
+#define __HIP__MI300_MI250__
+#endif
+
+=======
+>>>>>>> origin/main
 #if defined(NDEBUG)
 #undef NDEBUG
 #include <assert.h>
@@ -45,9 +52,12 @@ typedef struct _B16x8
     _B16x4 xy[2];
 } _B16x8;
 
+<<<<<<< HEAD
+=======
 using bit16x8 = __attribute__((__vector_size__(8 * sizeof(uint16_t)))) uint16_t;
 typedef bit16x8 _B16x8_2;
 
+>>>>>>> origin/main
 using _B8x8  = uint2;
 using _B8x4  = int32_t; // used in builtins
 using bit8_t = uint8_t;
@@ -95,6 +105,8 @@ __device__ __forceinline__ floatx4 gcn_mfma4x4x4_instr(const _B16x4& inpA,
     }
 }
 
+<<<<<<< HEAD
+=======
 #if defined(__gfx950__)
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const _B16x8& inpA,
@@ -118,6 +130,7 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const _B16x8& inpA,
     }
 }
 #else
+>>>>>>> origin/main
 template <typename T, int absz, int cbid, int blgp>
 __device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
                                                           const _B16x4& inpB,
@@ -136,7 +149,10 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
         static_assert(false, "unsupported 16b dtype");
     }
 }
+<<<<<<< HEAD
+=======
 #endif
+>>>>>>> origin/main
 
 template <typename T>
 __device__ __forceinline__ float to_float(const T& inp)
@@ -714,12 +730,15 @@ __device__ void _paged_attention_kernel(
             {
                 for(int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++)
                 {
+<<<<<<< HEAD
+=======
 #if defined(__gfx950__)
                     dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
                         Klocal[token_depth][qkhe_depth],
                         Qlocal[qkhe_depth][qkratio],
                         dout[token_depth]);
 #else
+>>>>>>> origin/main
                     for(int i = 0; i < 2; i++)
                     {
                         dout[token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
@@ -727,7 +746,10 @@ __device__ void _paged_attention_kernel(
                             Qlocal[qkhe_depth][qkratio].xy[i],
                             dout[token_depth]);
                     }
+<<<<<<< HEAD
+=======
 #endif
+>>>>>>> origin/main
                 }
             }
             else
@@ -738,18 +760,24 @@ __device__ void _paged_attention_kernel(
                 {
                     _B8x8 Ktmp8x8    = Ktmp8x16.xy[qkratio];
                     _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
+<<<<<<< HEAD
+=======
 #if defined(__gfx950__)
                     dout[token_depth] = gcn_mfma16x16x32_instr<scalar_t, 0, 0, 0>(
                         Klocaltmp,
                         Qlocal[qkhe_depth][qkratio],
                         dout[token_depth]);
 #else
+>>>>>>> origin/main
                     for(int i = 0; i < 2; i++)
                     {
                         dout[token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
                             Klocaltmp.xy[i], Qlocal[qkhe_depth][qkratio].xy[i], dout[token_depth]);
                     }
+<<<<<<< HEAD
+=======
 #endif
+>>>>>>> origin/main
                 }
             }
         }
@@ -934,6 +962,9 @@ __device__ void _paged_attention_kernel(
                         Vlocal[vtoken_depth][vhe_depth][vfetch_depth] =
                             *reinterpret_cast<const _B16x8*>(elems);
                     }
+<<<<<<< HEAD
+
+=======
 #if defined(__gfx950__)
 		    assert(ELEMS8_ELEMS4_RATIO == 2);
                     _B16x8 tmp_in;
@@ -952,6 +983,7 @@ __device__ void _paged_attention_kernel(
                         tmp_in,
                         tmp_out);
 #else
+>>>>>>> origin/main
                     for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                     {
                         const int offset = rowid * VTLANELOOP * ELEMS8_ELEMS4_RATIO +
@@ -965,7 +997,10 @@ __device__ void _paged_attention_kernel(
                             shared_logits[vtoken_depth][offset2][lane16id][offset1],
                             tmp_out);
                     }
+<<<<<<< HEAD
+=======
 #endif
+>>>>>>> origin/main
                 }
                 // KV cache fp8
             }
@@ -980,6 +1015,8 @@ __device__ void _paged_attention_kernel(
                     {
                         _B8x8 Vtmp8x8    = Vtmp8x16.xy[j];
                         _B16x8 Vlocaltmp = convert_b8x8_custom<scalar_t>(Vtmp8x8);
+<<<<<<< HEAD
+=======
 #if defined(__gfx950__)
                         assert(ELEMS8_ELEMS4_RATIO == 2);
                         _B16x8 tmp_in;
@@ -998,6 +1035,7 @@ __device__ void _paged_attention_kernel(
                             tmp_in,
                             tmp_out);
 #else
+>>>>>>> origin/main
                         for(int i = 0; i < ELEMS8_ELEMS4_RATIO; i++)
                         {
                             const int offset = rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
@@ -1011,7 +1049,10 @@ __device__ void _paged_attention_kernel(
                                 shared_logits[vtoken_depth][offset2][lane16id][offset1],
                                 tmp_out);
                         }
+<<<<<<< HEAD
+=======
 #endif
+>>>>>>> origin/main
                     }
                 }
             }
@@ -1290,4 +1331,8 @@ __device__ void _paged_attention_ll4mi_reduce_kernel(
     {
         out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
     }
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> origin/main

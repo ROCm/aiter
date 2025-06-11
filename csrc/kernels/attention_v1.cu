@@ -243,7 +243,11 @@ void paged_attention_custom_launcher(torch::Tensor& out,
                                      float logits_soft_cap,
                                      torch::Tensor& k_scale,
                                      torch::Tensor& v_scale,
+<<<<<<< HEAD
+                                     const c10::optional<torch::Tensor>& fp8_out_scale)
+=======
                                      const std::optional<torch::Tensor>& fp8_out_scale)
+>>>>>>> origin/main
 {
     const int num_kv_heads = kv_cache_layout=="HND" ? key_cache.size(1) : key_cache.size(2);
     int num_seqs        = context_lens.size(0);
@@ -509,4 +513,8 @@ void paged_attention_v1(
 #undef WARP_SIZE
 #undef MAX
 #undef MIN
+<<<<<<< HEAD
 #undef DIVIDE_ROUND_UP
+=======
+#undef DIVIDE_ROUND_UP
+>>>>>>> origin/main

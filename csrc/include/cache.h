@@ -23,8 +23,13 @@ void reshape_and_cache(torch::Tensor& key,
                        torch::Tensor& value_cache,
                        torch::Tensor& slot_mapping,
                        const std::string& kv_cache_dtype,
+<<<<<<< HEAD
+                       torch::Tensor& k_scale,
+                       torch::Tensor& v_scale,
+=======
                        std::optional<torch::Tensor> k_scale,
                        std::optional<torch::Tensor> v_scale,
+>>>>>>> origin/main
                        const bool asm_layout);
 
 void reshape_and_cache_flash(torch::Tensor& key,
@@ -54,6 +59,13 @@ void reshape_and_cache_with_block_quant(torch::Tensor& key,
                                         torch::Tensor& slot_mapping,
                                         const bool asm_layout);
 
+<<<<<<< HEAD
+// Just for unittest
+void convert_fp8(torch::Tensor& dst_cache,
+                 torch::Tensor& src_cache,
+                 const double scale,
+                 const std::string& kv_cache_dtype);
+=======
 void reshape_and_cache_with_block_quant_for_asm_pa(
     torch::Tensor& key,              // [batch_size, seq_len, num_heads, head_size]
     torch::Tensor& value,            // [batch_size, seq_len, num_heads, head_size]
@@ -64,5 +76,6 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     torch::Tensor& slot_mapping,     // [num_tokens]
     const bool asm_layout,
     const int ori_block_size = 128);
+>>>>>>> origin/main
 
 } // namespace aiter

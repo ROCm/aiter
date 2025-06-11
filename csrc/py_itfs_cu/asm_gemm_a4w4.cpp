@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MIT
+<<<<<<< HEAD
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+=======
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+>>>>>>> origin/main
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>

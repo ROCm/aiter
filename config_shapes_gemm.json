@@ -1,0 +1,32 @@
+{
+    "configs": {
+        "1": {
+            "BLOCK_SIZE_M": 128, 
+            "BLOCK_SIZE_N": 256, 
+            "BLOCK_SIZE_K": 16, 
+            "GROUP_SIZE_M": 1, 
+            "waves_per_eu": 2,
+            "num_warps":    4, 
+            "num_stages":   2
+        },
+        "2": {
+            "BLOCK_SIZE_M": 128, 
+            "BLOCK_SIZE_N": 256, 
+            "BLOCK_SIZE_K": 16, 
+            "GROUP_SIZE_M": 1, 
+            "waves_per_eu": 2,
+            "num_warps":    4, 
+            "num_stages":   2
+        }
+    },
+    "shapes_params": [
+        {"M":1024, 
+        "N": 1024, 
+        "K": 1024,
+        "dtype":"bfloat16"},
+        {"M":32, 
+        "N": 32, 
+        "K": 32,
+        "dtype":"bfloat16"}
+    ]
+}
