@@ -118,9 +118,9 @@ template torch::Tensor
         # TODO: dFP8_eFP8
 
         if self.istune:
-            # Path(
-            #     os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")
-            # ).write_text(INSTANCE_dFP32_eBF16)
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
             Path(
                 os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
             ).write_text(INSTANCE_dFP32_eFP16)
