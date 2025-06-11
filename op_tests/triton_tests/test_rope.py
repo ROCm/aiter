@@ -180,7 +180,7 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
-def test_rope_fwd(
+def test_rope_fwd_sbhd(
     B: int,
     S: int,
     H: int,
