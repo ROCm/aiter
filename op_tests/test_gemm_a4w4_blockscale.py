@@ -2,15 +2,13 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import torch.nn.functional as F
 import aiter
+from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import dtypes
 from aiter.utility import fp4_utils
-from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.ops.shuffle import shuffle_weight
-from einops import rearrange
-from einops import repeat as eirp
 import pandas as pd
+import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -73,41 +71,77 @@ def test_gemm(dtype, m, n, k):
         "ck TB/s": tbs_b,
     }
 
+l_dtype = ["bf16"]
+l_mnk = [
+    #decode
+    (1, 16384, 16384),
+    (1, 106496, 16384),
+    (1, 16384, 53248),
+    (1, 18432, 16384),
+    (4, 16384, 16384),
+    (4, 106496, 16384),
+    (4, 16384, 53248),
+    (4, 18432, 16384),
+    (8, 16384, 16384),
+    (8, 106496, 16384),
+    (8, 16384, 53248),
+    (8, 18432, 16384),
+    (16, 16384, 16384),
+    (16, 106496, 16384),
+    (16, 16384, 53248),
+    (16, 18432, 16384),
+    (32, 16384, 16384),
+    (32, 106496, 16384),
+    (32, 16384, 53248),
+    (32, 18432, 16384),
+    (64, 16384, 16384),
+    (64, 106496, 16384),
+    (64, 16384, 53248),
+    (64, 18432, 16384),
+    (128, 16384, 16384),
+    (128, 106496, 16384),
+    (128, 16384, 53248),
+    (128, 18432, 16384),
+    (256, 16384, 16384),
+    (256, 106496, 16384),
+    (256, 16384, 53248),
+    (256, 18432, 16384),
+]
+
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    choices=l_mnk,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.shape is not None:
+    l_mnk = [args.shape]
 
 df = []
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m, n, k in [
-        # qkv_proj
-        (1, 1280, 8192),
-        (64, 1280, 8192),
-        (127, 1280, 8192),
-        (129, 1280, 8192),
-        (65, 1280, 8192),
-        (32, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        # attn_out
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]:
+for dtype in l_dtype:
+    for m, n, k in l_mnk:
         ret = test_gemm(dtype, m, n, k)
         df.append(ret)
 df = pd.DataFrame(df)
