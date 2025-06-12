@@ -42,7 +42,7 @@ if IS_ROCM:
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
     if PREBUILD_KERNELS == 1:
-        exclude_ops = ["libmha_fwd", "libmha_bwd"]
+        exclude_ops = ["libmha_fwd", "libmha_bwd", "module_moe_ck2stages"]
         all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
