@@ -4,14 +4,12 @@ import os
 import aiter
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from aiter import dtypes
 from aiter.utility import fp4_utils
-from aiter.test_common import checkAllclose, perftest
+from aiter.test_common import perftest
 from aiter.ops.shuffle import shuffle_weight
 from gemm_a4w4_blockscale_common import kernels_list
 import argparse
-from einops import rearrange
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
