@@ -74,9 +74,10 @@ if find_aiter is not None:
 
     site_packages_dirs = site.getsitepackages()
     # develop mode
-    if (package_path not in site_packages_dirs) and (
+    isDevelopMode = (package_path not in site_packages_dirs) and (
         package_parent_path not in site_packages_dirs
-    ):
+    )
+    if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
     else:
