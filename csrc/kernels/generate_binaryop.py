@@ -3,13 +3,8 @@
 # generate kernel instances to speed up compilation
 
 import argparse
-from enum import IntEnum
 from pathlib import Path
-import sys
-from typing import List, Optional, Any
-import functools
-import itertools
-import copy
+from typing import List, Any
 from dataclasses import dataclass
 
 def get_if_str(idx, total, last_else=True):
