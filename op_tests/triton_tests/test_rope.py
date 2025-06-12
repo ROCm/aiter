@@ -116,6 +116,9 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
     positions: torch.Tensor,
     offsets: torch.Tensor,
     rotate_style: RotateStyle,
+    reuse_freqs_front_part: bool,
+    nope: bool,
+    nope_first: bool,
 ) -> torch.Tensor:
     """
     Args:
@@ -134,12 +137,16 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
 
-    if rotate_style == RotateStyle.GPTJ:
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-    elif rotate_style == RotateStyle.NEOX:
-        x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
+    if reuse_freqs_front_part:
+        if rotate_style == RotateStyle.GPTJ:
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+        elif rotate_style == RotateStyle.NEOX:
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+    else:
+        x1 = x
+        x2 = x
 
     # Compute out_x
     ox1 = x1 * cos - x2 * sin
@@ -150,12 +157,13 @@ def ref_rope_cached_thd_positions_offsets_2c_fwd(
     elif rotate_style == RotateStyle.NEOX:
         ox = torch.cat((ox1, ox2), dim=-1)
 
-    if rotate_style == RotateStyle.GPTJ:
-        y1 = y[..., ::2]
-        y2 = y[..., 1::2]
-    elif rotate_style == RotateStyle.NEOX:
-        y1 = y[..., : y.shape[-1] // 2]
-        y2 = y[..., y.shape[-1] // 2 :]
+    if reuse_freqs_front_part:
+        if rotate_style == RotateStyle.GPTJ:
+            y1 = y[..., ::2]
+            y2 = y[..., 1::2]
+        elif rotate_style == RotateStyle.NEOX:
+            y1 = y[..., : y.shape[-1] // 2]
+            y2 = y[..., y.shape[-1] // 2 :]
 
     # Compute out_x
     oy1 = y1 * cos - y2 * sin
@@ -482,7 +490,9 @@ def test_rope_fwd_cached(
 @pytest.mark.parametrize("H", [1, 8, 32, 128])
 @pytest.mark.parametrize("D", [4, 64, 128])  # For now, D is power of 2.
 @pytest.mark.parametrize("rotate_style", [RotateStyle.NEOX, RotateStyle.GPTJ])
-# @pytest.mark.parametrize('nope, nope_first', [(False, False)])
+@pytest.mark.parametrize(
+    "nope, nope_first", [(False, False)]
+)  # TODO add support nope and nope_first
 # @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -494,6 +504,8 @@ def test_rope_fwd_cached_thd_2c(
     D: int,
     rotate_style: RotateStyle,
     reuse_freqs_front_part: bool,
+    nope: bool,
+    nope_first: bool,
     dtype: torch.dtype,
     pos: bool,
     offs: bool,
@@ -521,7 +533,16 @@ def test_rope_fwd_cached_thd_2c(
         )
 
     torch_out_x, torch_out_y = ref_rope_cached_thd_positions_offsets_2c_fwd(
-        x, y, cos, sin, positions, offsets, rotate_style
+        x,
+        y,
+        cos,
+        sin,
+        positions,
+        offsets,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope,
+        nope_first,
     )
     if DEBUG_MODE:
         print(f"torch_out_x={torch_out_x}")
