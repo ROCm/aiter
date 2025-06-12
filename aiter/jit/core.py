@@ -518,7 +518,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 hip_clang_path = d_args.get("hip_clang_path", None)
                 prev_hip_clang_path = None
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
-                    prev_hip_clang_path = os.environ.get('HIP_CLANG_PATH', None)
+                    prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
                     os.environ["HIP_CLANG_PATH"] = hip_clang_path
 
                 build_module(
@@ -540,7 +540,7 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     if prev_hip_clang_path is not None:
                         os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
                     else:
-                        os.environ.pop('HIP_CLANG_PATH', None)
+                        os.environ.pop("HIP_CLANG_PATH", None)
 
                 if is_python_module:
                     module = get_module(md_name)

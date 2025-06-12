@@ -60,7 +60,7 @@ class kernelInstance:
             ]
         )
 
-# TODO - more kernel
+
 kernels_list = {
     # clang-format off
     ##############| Block|  MPer|  NPer|  KPer| AK1| BK1|MPer| NPer| MXdl| NXdl|  ABlockTransfer|  BBlockTransfer|    CShuffle|    CShuffle|     CBlockTransferClusterLengths|  CBlockTransfer|  Block-wiseGemm|     Block-wiseGemm|

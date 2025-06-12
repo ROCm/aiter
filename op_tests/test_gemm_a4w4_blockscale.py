@@ -16,6 +16,7 @@ torch.random.manual_seed(0)
 SCALE_GROUP_SIZE = 32
 block_shape = (128, 128)
 
+
 def run_torch(x, w, x_scales, w_scales, dtype):
     m, k = x.shape
     n, k = w.shape
@@ -71,9 +72,10 @@ def test_gemm(dtype, m, n, k):
         "ck TB/s": tbs_b,
     }
 
+
 l_dtype = ["bf16"]
 l_mnk = [
-    #decode
+    # decode
     (1, 16384, 16384),
     (1, 106496, 16384),
     (1, 16384, 53248),
