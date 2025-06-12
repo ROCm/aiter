@@ -64,20 +64,7 @@ def _pick_block(m: int, k: int) -> int:
 def one_stage_topk(
     x: torch.Tensor,
     k: int,
-    *,
-    largest: bool = True,
-    sorted: bool = True,
-    dim: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if not largest:
-        raise NotImplementedError("only largest=True supported")
-    if not sorted:
-        raise ValueError("sorted=False not supported")
-    if x.ndim != 2:
-        raise ValueError("input tensor must be 2-D (batch, M)")
-    if dim not in (-1, x.ndim - 1):
-        raise ValueError("only last-dim Top-K supported")
-
     B, M = x.shape
     BLOCK = _pick_block(M, k)
     if M > BLOCK or BLOCK > 1024:
@@ -264,7 +251,6 @@ def topk_stage2_kernel(
     index_ptr,
     chunk_x,
     chunk_index,
-    sort_dim: tl.constexpr,
     k: tl.constexpr,
     N: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -300,14 +286,7 @@ def topk_stage2_kernel(
     tl.store(index_ptr + cols, sorted_chunk_index, mask=cols < k)
 
 
-def two_stage_topk(x, k, dim=-1, largest=True, sorted=True):
-    # If dim equals to last dim, we set it to -1.
-    if dim < 0:
-        dim = dim + x.ndim
-
-    assert dim == x.ndim - 1, "Currently only support topk in last dimension"
-    assert sorted, "Currently only support sorted == True"
-
+def two_stage_topk(x, k, dim=-1, largest=True):
     descending = True
     if not largest:
         descending = False
@@ -354,7 +333,6 @@ def two_stage_topk(x, k, dim=-1, largest=True, sorted=True):
         stage2_out_idx,
         stage1_out,
         stage1_out_idx,
-        dim,
         k,
         stage2_elem_cnt,
         BLOCK_SIZE,
@@ -379,22 +357,20 @@ def topk(
 ):
     if dim < 0:
         dim += x.ndim
+    if not largest:
+        raise ValueError("only largest=True supported")
+    if not sorted:
+        raise ValueError("sorted=False not supported")
+    if x.ndim != 2:
+        raise ValueError("input tensor must be 2-D (batch, M)")
     if dim != x.ndim - 1:
         raise ValueError("only last-dim Top-K is implemented")
-    if not x.is_cuda:
-        raise ValueError("input must be a CUDA tensor")
-
     if not x.is_contiguous():
         x = x.contiguous()
 
     row_len = x.shape[-1]
     if row_len <= tiny_row_thresh:
         # if (row_len <= tiny_row_thresh) and (k <= 8):
-        return one_stage_topk(
-            x.view(-1, row_len),
-            k,
-            largest=largest,
-            sorted=sorted,
-            dim=-1,
-        )
-    return two_stage_topk(x, k, dim=dim, largest=largest, sorted=sorted)
+        return one_stage_topk(x.view(-1, row_len), k)
+    else:
+        return two_stage_topk(x, k, dim=dim, largest=True)
