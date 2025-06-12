@@ -342,8 +342,38 @@ def two_stage_topk(x, k, dim=-1, largest=True):
     return (stage2_out, stage2_out_idx)
 
 
-# dispatcher
+# For dispatcher
 MAX_TINY_ROW = 1024
+
+"""
+Triton Top-K operator
+=========================================
+
+Selects the "k" largest elements (and their indices) along the "last"
+dimension of a 2-D input tensor.  A fast path and a hierarchical path are
+chosen automatically based on the row length "M".
+
+Algorithm selection
+-------------------
+- 1-stage kernel - used when M ≤ 1024 ("tiny" rows).  
+  Each row is processed by one Triton launch.
+- 2-stage kernel - used when M > 1024 ("large" rows).  
+  The row is first tiled, each tile computes a local Top-K, and the partial
+  results are merged in a second stage.
+
+Interface & constraints
+-----------------------
+1. Only the last dimension can be reduced.
+2. Input must be a 2-D tensor of shape (B, M).
+3. Exactly k largest elements are returned.
+4. Returned values are **sorted in descending order.
+
+Returns
+-------
+(values, indices) - both tensors have shape (B, k) and reside on the
+same device as the input.
+
+"""
 
 
 def topk(
@@ -357,14 +387,15 @@ def topk(
 ):
     if dim < 0:
         dim += x.ndim
+    if dim != x.ndim - 1:
+        raise ValueError("only last-dim Top-K is implemented")
+    if x.ndim != 2:
+        raise ValueError("input tensor must be 2-D (batch, M)")
     if not largest:
         raise ValueError("only largest=True supported")
     if not sorted:
         raise ValueError("sorted=False not supported")
-    if x.ndim != 2:
-        raise ValueError("input tensor must be 2-D (batch, M)")
-    if dim != x.ndim - 1:
-        raise ValueError("only last-dim Top-K is implemented")
+
     if not x.is_contiguous():
         x = x.contiguous()
 
