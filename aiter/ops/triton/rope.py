@@ -18,17 +18,17 @@ def _get_neox_rotated_x(
     x,
     x_rotated_mask,
     BLOCK_T: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
 ):
     x_rotated = tl.where(x_rotated_mask, x, -x)
-    x_rotated = tl.reshape(x_rotated, (BLOCK_T, 2, D_MODEL_HALF))
+    x_rotated = tl.reshape(x_rotated, (BLOCK_T, 2, BLOCK_D_HALF))
     x_rotated = tl.flip(x_rotated, 2)
     x_rotated = tl.reshape(
         x_rotated,
         (
             BLOCK_T,
-            D_MODEL,
+            BLOCK_D,
         ),
     )
     x_rotated = tl.flip(x_rotated, 1)
@@ -40,17 +40,17 @@ def _get_gptj_rotated_x(
     x,
     x_rotated_mask,
     BLOCK_T: tl.constexpr,
-    D_MODEL: tl.constexpr,
-    D_MODEL_HALF: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
 ):
     x_rotated = tl.where(x_rotated_mask, x, -x)
-    x_rotated = tl.reshape(x_rotated, (BLOCK_T, D_MODEL_HALF, 2))
+    x_rotated = tl.reshape(x_rotated, (BLOCK_T, BLOCK_D_HALF, 2))
     x_rotated = tl.flip(x_rotated, 2)
     x_rotated = tl.reshape(
         x_rotated,
         (
             BLOCK_T,
-            D_MODEL,
+            BLOCK_D,
         ),
     )
     return x_rotated
