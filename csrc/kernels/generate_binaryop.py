@@ -9,39 +9,35 @@ from dataclasses import dataclass
 
 def get_if_str(idx, total, last_else=True):
     if idx == 0:
-        return 'if'
+        return "if"
     else:
-        return 'else if'
-    # elif idx < total - 1:
-    #     return 'else if'
-    # else:
-    #     return 'else' if last_else else 'else if'
+        return "else if"
 
 DATA_TYPE_MAP = {
-    'float32': 'float',
-    'float64': 'double',
-    'int32': 'int',
-    'int64': 'long long',
-    'bool': 'bool',
-    'float16': 'torch::Half',
-    'bfloat16': 'torch::BFloat16'
+    "float32": "float",
+    "float64": "double",
+    "int32": "int",
+    "int64": "long long",
+    "bool": "bool",
+    "float16": "torch::Half",
+    "bfloat16": "torch::BFloat16"
 }
 
 TORCH_TYPE_MAP = {
-    'float32': 'torch::kFloat32',
-    'float64': 'torch::kFloat64',
-    'int32': 'torch::kInt32',
-    'int64': 'torch::kInt64',
-    'bool': 'torch::kBool',
-    'float16': 'torch::kHalf',
-    'bfloat16': 'torch::kBFloat16'
+    "float32": "torch::kFloat32",
+    "float64": "torch::kFloat64",
+    "int32": "torch::kInt32",
+    "int64": "torch::kInt64",
+    "bool": "torch::kBool",
+    "float16": "torch::kHalf",
+    "bfloat16": "torch::kBFloat16"
 }
 
 OPERATOR_MAP = {
-    'add': 'aiter::AddOp',
-    'sub': 'aiter::SubOp',
-    'mul': 'aiter::MulOp',
-    'div': 'aiter::DivOp'
+    "add": "aiter::AddOp",
+    "sub": "aiter::SubOp",
+    "mul": "aiter::MulOp",
+    "div": "aiter::DivOp"
 }
 
 class BinaryOpCodegen:
@@ -318,12 +314,12 @@ void binary_op_dispatch(const std::string& op_type,
 
         @property
         def name(self) -> str:
-            in0, in1 = self.F_dtype_pair.split(',')
+            in0, in1 = self.F_dtype_pair.split(",")
             return f"binary_op_{self.F_op_type}_{in0}_{in1}"
 
         @property
         def content(self) -> str:
-            instance_defs = '\n'.join(ins.def_name for ins in self.instance_list)
+            instance_defs = "\n".join(ins.def_name for ins in self.instance_list)
             return BinaryOpCodegen.INSTANCE_BASE.format(F_instance_def=instance_defs)
 
     def content_api(self) -> str:
@@ -336,39 +332,36 @@ void binary_op_dispatch(const std::string& op_type,
             if blob.F_dtype_pair not in op_dict[blob.F_op_type]:
                 op_dict[blob.F_op_type][blob.F_dtype_pair] = blob
 
-        dispatch_str = ''
+        dispatch_str = ""
         for i_op, (op_type, dtype_blobs) in enumerate(op_dict.items()):
-            dtype_str = ''
+            dtype_str = ""
             for i_dtype, (dtype_key, blob) in enumerate(dtype_blobs.items()):
-                in0, in1 = dtype_key.split(',')
+                in0, in1 = dtype_key.split(",")
                 dtype_str += self.API_PER_DTYPE.format(
                     F_if=get_if_str(i_dtype, len(dtype_blobs)),
                     F_in0_type=TORCH_TYPE_MAP[in0],
                     F_in1_type=TORCH_TYPE_MAP[in1],
                     F_op_cpp=OPERATOR_MAP[op_type],
                     F_in0_cpp=DATA_TYPE_MAP[in0],
-                    F_in1_cpp=DATA_TYPE_MAP[in1]
+                    F_in1_cpp=DATA_TYPE_MAP[in1],
                 )
 
             dispatch_str += self.API_PER_OPERATOR.format(
                 F_if=get_if_str(i_op, len(op_dict)),
                 F_op_type=op_type,
-                F_per_dtype=dtype_str
+                F_per_dtype=dtype_str,
             )
 
-        return self.API_BASE.format(
-            F_traits_define="",
-            F_dispatch=dispatch_str
-        )
+        return self.API_BASE.format(F_traits_define="", F_dispatch=dispatch_str)
 
     def get_blobs(self):
-        operators = ['add', 'sub', 'mul', 'div']
+        operators = ["add", "sub", "mul", "div"]
         dtype_combinations = [
-            ('float32', 'float32'),
-            ('float16', 'float16'), 
-            ('bfloat16', 'bfloat16'),
-            ('float32', 'float16'),
-            ('float16', 'float32')
+            ("float32", "float32"),
+            ("float16", "float16"), 
+            ("bfloat16", "bfloat16"),
+            ("float32", "float16"),
+            ("float16", "float32")
         ]
 
         blobs = []
@@ -394,14 +387,13 @@ void binary_op_dispatch(const std::string& op_type,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        prog="generate",
-        description="Generate binary operation kernels"
+        prog="generate", description="Generate binary operation kernels"
     )
     parser.add_argument(
         "-w",
         "--working_path",
         default="./generated",
-        help="Output directory for generated files"
+        help="Output directory for generated files",
     )
     args = parser.parse_args()
 
