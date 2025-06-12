@@ -7,11 +7,13 @@ from pathlib import Path
 from typing import List, Any
 from dataclasses import dataclass
 
+
 def get_if_str(idx, total, last_else=True):
     if idx == 0:
         return "if"
     else:
         return "else if"
+
 
 DATA_TYPE_MAP = {
     "float32": "float",
@@ -20,7 +22,7 @@ DATA_TYPE_MAP = {
     "int64": "long long",
     "bool": "bool",
     "float16": "torch::Half",
-    "bfloat16": "torch::BFloat16"
+    "bfloat16": "torch::BFloat16",
 }
 
 TORCH_TYPE_MAP = {
@@ -30,15 +32,16 @@ TORCH_TYPE_MAP = {
     "int64": "torch::kInt64",
     "bool": "torch::kBool",
     "float16": "torch::kHalf",
-    "bfloat16": "torch::kBFloat16"
+    "bfloat16": "torch::kBFloat16",
 }
 
 OPERATOR_MAP = {
     "add": "aiter::AddOp",
     "sub": "aiter::SubOp",
     "mul": "aiter::MulOp",
-    "div": "aiter::DivOp"
+    "div": "aiter::DivOp",
 }
+
 
 class BinaryOpCodegen:
     API_COMMON_HEADER = """
@@ -358,10 +361,10 @@ void binary_op_dispatch(const std::string& op_type,
         operators = ["add", "sub", "mul", "div"]
         dtype_combinations = [
             ("float32", "float32"),
-            ("float16", "float16"), 
+            ("float16", "float16"),
             ("bfloat16", "bfloat16"),
             ("float32", "float16"),
-            ("float16", "float32")
+            ("float16", "float32"),
         ]
 
         blobs = []
@@ -384,6 +387,7 @@ void binary_op_dispatch(const std::string& op_type,
         blobs = self.get_blobs()
         for b in blobs:
             (w_p / f"{b.name}.cpp").write_text(b.content)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
