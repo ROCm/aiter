@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 import random
 import itertools
+import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -378,10 +379,51 @@ qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
 list_dtype = [(dtypes.bf16, dtypes.bf16)]
-list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]
-list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)][:]
+list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192]
+list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256]
+list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-c",
+    "--ctxLen",
+    type=int,
+    choices=list_ctx_len,
+    nargs="?",
+    const=None,
+    default=None,
+    help="context length",
+)
+parser.add_argument(
+    "-b",
+    "--batchSize",
+    type=int,
+    choices=list_batch_size,
+    nargs="?",
+    const=None,
+    default=None,
+    help="batch size",
+)
+parser.add_argument(
+    "-n",
+    "--nhead",
+    type=dtypes.str2tuple,
+    choices=list_nhead,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
+
 import pandas as pd
+
+args = parser.parse_args()
+if args.ctxLen is not None:
+    list_ctx_len = [args.ctxLen]
+if args.batchSize is not None:
+    list_batch_size = [args.batchSize]
+if args.nhead is not None:
+    list_nhead = [args.nhead]
 
 for nhead, mtp in list_nhead:
     df = []

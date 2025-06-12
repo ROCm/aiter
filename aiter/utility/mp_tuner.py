@@ -7,7 +7,9 @@ from aiter.test_common import checkAllclose
 from aiter import dtypes
 
 
-def worker(gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2):
+def worker(
+    gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2, printLog=False
+):
     from aiter.test_common import run_perftest
 
     pid = mp.current_process().pid
@@ -44,12 +46,19 @@ def worker(gpuIDMap, tag, func, args, kwargs, ref=None, rtol=1e-2, atol=1e-2):
                         ref[i] = ref[i].to(dtypes.fp32)
                         res[i] = res[i].to(dtypes.fp32)
                     err_ratio = checkAllclose(
-                        ref[i], res[i], atol=atol, rtol=rtol, printLog=False
+                        ref[i],
+                        res[i],
+                        atol=atol,
+                        rtol=rtol,
+                        printLog=printLog,
+                        msg=f"tag:{tag} res[{i}] ",
                     )
                     max_err_ratio = max(max_err_ratio, err_ratio)
 
     except Exception as e:
-        print(f"Error in process {pid}: {e}")
+        print(f"Error in process:{pid} tag:{tag}: {e}")
+        if res is None and ref is not None:
+            print("The output is None, can't match with reference")
         us = float("inf")
         max_err_ratio = 1.0
 

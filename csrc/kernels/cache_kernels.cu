@@ -20,15 +20,6 @@
 
 #include <hip/hip_bf16.h>
 
-template <typename T, typename F>
-__device__ constexpr T block_reduce(T val, F reduce_f)
-{
-    __shared__ T smem[256];
-    T wave_local = wave_reduce(val, reduce_f);
-    T v_local    = cross_wave_reduce(wave_local, reduce_f, smem);
-    return v_local;
-}
-
 namespace aiter {
 
 void swap_blocks(torch::Tensor& src, torch::Tensor& dst, const torch::Tensor& block_mapping)
@@ -563,7 +554,6 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
     }
     auto sum               = [](float a, float b) { return a + b; };
     int numtokens_in_block = block_reduce<int, decltype(sum), wg_size, true>(tokens_in_block, sum);
-    // int numtokens_in_block = blockReduce(tokens_in_block, sum);
 
     auto f_absmax_f32 = [](float v_0_, float v_1_) {
         return __builtin_fmaxf(impl::abs(v_0_), impl::abs(v_1_));
@@ -590,8 +580,6 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
 
     k_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(k_max_val, f_max_f32);
     v_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(v_max_val, f_max_f32);
-    // k_max_val = blockReduce(k_max_val, f_max_f32);
-    // v_max_val = blockReduce(v_max_val, f_max_f32);
 
     float k_block_scale = k_max_val / dtypeMax;
     float v_block_scale = v_max_val / dtypeMax;
@@ -811,7 +799,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
         tokens_in_block = slot_mapping[first_token_idx + threadIdx.x] / ori_block_size;
         tokens_in_block = tokens_in_block == block_idx ? 1 : 0;
     }
-    int numtokens_in_block = block_reduce(tokens_in_block, [](float a, float b) { return a + b; });
+    auto sum = [](float a, float b) { return a + b; };
+    int numtokens_in_block =
+        block_reduce<float, decltype(sum), wg_size, true>(tokens_in_block, sum);
 
     auto f_absmax_f32 = [](float v_0_, float v_1_) {
         return __builtin_fmaxf(impl::abs(v_0_), impl::abs(v_1_));
@@ -836,8 +826,8 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
         }
     }
 
-    k_max_val = block_reduce(k_max_val, f_max_f32);
-    v_max_val = block_reduce(v_max_val, f_max_f32);
+    k_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(k_max_val, f_max_f32);
+    v_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(v_max_val, f_max_f32);
 
     float k_block_scale = k_max_val / dtypeMax;
     float v_block_scale = v_max_val / dtypeMax;
@@ -1498,4 +1488,3 @@ void reshape_and_cache_with_block_quant_for_asm_pa(
     }
 }
 } // namespace aiter
-

@@ -13,6 +13,7 @@ import sys
 import traceback
 import logging
 import multiprocessing as mp
+import argparse
 
 logger = logging.getLogger("aiter")
 
@@ -303,7 +304,41 @@ def test_all_reduce_rmsnorm(tp_size, shape, dtype, withGraph=False, perTKQuant=F
     )
 
 
+l_dtype = ["bf16"]
+l_shape = [(128, 8192)]
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-s",
+    "--shape",
+    type=dtypes.str2tuple,
+    choices=l_shape,
+    nargs="?",
+    const=None,
+    default=None,
+    help="shape",
+)
+
+
 if __name__ == "__main__":
+    args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    if args.shape is not None:
+        l_shape = [args.shape]
+
     mp.freeze_support()
     # for dtype in [dtypes.bf16]:
     #     for shape in [(128, 8192)]:
@@ -311,7 +346,7 @@ if __name__ == "__main__":
     #         test_communication(8, shape, dtype, withGraph=True)
 
     print("start test test_communication\n")
-    for dtype in [dtypes.bf16]:
-        for shape in [(128, 8192)]:
+    for dtype in l_dtype:
+        for shape in l_shape:
             # test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False)
             test_all_reduce_rmsnorm(8, shape, dtype, withGraph=False, perTKQuant=True)

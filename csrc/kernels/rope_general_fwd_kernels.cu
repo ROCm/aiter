@@ -32,6 +32,7 @@ void rope_fwd_impl(
     const int32_t stride_o_h = output.stride(2);
     const int32_t stride_o_d = output.stride(3);
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         freqs.scalar_type(),
@@ -85,6 +86,7 @@ void rope_2c_fwd_impl(
     const int32_t stride_oy_h = output_y.stride(2);
     const int32_t stride_oy_d = output_y.stride(3);
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input_x));
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
         freqs.scalar_type(),
@@ -132,6 +134,7 @@ void rope_cached_fwd_impl(
     const int32_t stride_o_h = output.stride(2);
     const int32_t stride_o_d = output.stride(3);
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         cos.scalar_type(),
@@ -187,6 +190,7 @@ void rope_cached_2c_fwd_impl(
     const int32_t stride_oy_h = output_y.stride(2);
     const int32_t stride_oy_d = output_y.stride(3);
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input_x));
     DISPATCH_ROPE_TYPES_PARAMS(
         input_x.scalar_type(),
         cos.scalar_type(),
@@ -233,6 +237,7 @@ void rope_thd_fwd_impl(
     const int32_t stride_o_h = output.stride(1);
     const int32_t stride_o_d = output.stride(2);
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         freqs.scalar_type(),
@@ -282,6 +287,7 @@ void rope_2d_fwd_impl(
 
     TORCH_CHECK(size_s == img_height * img_width, "rope_2d_fwd_impl - input tensor shape doesn't match image size.");
 
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     DISPATCH_ROPE_TYPES_PARAMS(
         input.scalar_type(),
         cos_h.scalar_type(),
