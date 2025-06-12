@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 import triton
 import triton.language as tl
 import torch
@@ -163,6 +166,79 @@ def dynamic_per_token_fp8_quant(
     return qx, scale_out
 
 
+@triton.jit
+def _mxfp4_quant_op(
+    x,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_M,
+    MXFP4_QUANT_BLOCK_SIZE,
+):
+    """
+    Converts given x (in fp32) to mxfp4 format.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
+
+    """
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+
+    # blockscale_e8m0
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
+
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+
+    # Compute quantized x
+    qx = x * quant_scale
+
+    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
+    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
+    #   Zeros: S000 -> +/-0
+    #   Denormal Numbers: S001 -> +/- 0.5
+    #   Normal Numbers:
+    #           S010 -> +/- 1.0
+    #           S011 -> +/- 1.5
+    #           S100 -> +/- 2.0
+    #           S101 -> +/- 3.0
+    #           S110 -> +/- 4.0
+    #           S111 -> +/- 6.0
+    qx = qx.to(tl.uint32, bitcast=True)
+
+    # Extract sign, exponents and mantissa fields from FP32
+    s = qx & 0x80000000
+    e = (qx >> 23) & 0xFF
+    m = qx & 0x7FFFFF
+    E8_BIAS: tl.constexpr = 127
+    E2_BIAS: tl.constexpr = 1
+
+    # Denormal numbers
+    # If exponent is less than 127, then it's a denormal number
+    # See above, for denormal number mantissa is always 1 and we set bit 1 of mantissa
+    adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
+    m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
+    # For normal numbers, bias is changed from 127 to 1, and for subnormals, we keep exponent as 0.
+    # Note: E8_BIAS - E2_BIAS = 126, so for normals we subtract that.
+    e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+
+    # Combine sign, exponent, and mantissa, while saturating
+    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
+    e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
+    e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
+    e2m1_value = tl.reshape(
+        e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
+    )
+    evens, odds = tl.split(e2m1_value)
+    x_fp4 = evens | (odds << 4)
+    x_fp4 = x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
+
+    return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+
+
 @triton.heuristics(
     {
         "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
@@ -200,6 +276,8 @@ def _dynamic_mxfp4_quant_kernel(
     stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
     stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
 
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+
     for pid_n in tl.range(start_n, min(start_n + NUM_ITER, N), num_stages=NUM_STAGES):
         x_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -213,63 +291,9 @@ def _dynamic_mxfp4_quant_kernel(
                 tl.float32
             )
 
-        NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-        x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
-        # Calculate scale
-        amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-        amax = amax.to(tl.int32, bitcast=True)
-        amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-        amax = amax.to(tl.float32, bitcast=True)
-        scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-        scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-
-        # blockscale_e8m0
-        bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
-
-        quant_scale = tl.exp2(-scale_e8m0_unbiased)
-
-        # Compute quantized x
-        qx = x * quant_scale
-
-        # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-        # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-        #   Zeros: S000 -> +/-0
-        #   Denormal Numbers: S001 -> +/- 0.5
-        #   Normal Numbers:
-        #           S010 -> +/- 1.0
-        #           S011 -> +/- 1.5
-        #           S100 -> +/- 2.0
-        #           S101 -> +/- 3.0
-        #           S110 -> +/- 4.0
-        #           S111 -> +/- 6.0
-        qx = qx.to(tl.uint32, bitcast=True)
-
-        # Extract sign, exponents and mantissa fields from FP32
-        s = qx & 0x80000000
-        e = (qx >> 23) & 0xFF
-        m = qx & 0x7FFFFF
-        E8_BIAS: tl.constexpr = 127
-        E2_BIAS: tl.constexpr = 1
-
-        # Denormal numbers
-        # If exponent is less than 127, then it's a denormal number
-        # See above, for denormal number mantissa is always 1 and we set bit 1 of mantissa
-        adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
-        m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
-        # For normal numbers, bias is changed from 127 to 1, and for subnormals, we keep exponent as 0.
-        # Note: E8_BIAS - E2_BIAS = 126, so for normals we subtract that.
-        e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
-
-        # Combine sign, exponent, and mantissa, while saturating
-        # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
-        e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
-        e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
-        e2m1_value = tl.reshape(
-            e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
+        out_tensor, bs_e8m0 = _mxfp4_quant_op(
+            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
-        evens, odds = tl.split(e2m1_value)
-        out_tensor = evens | (odds << 4)
-        out_tensor = out_tensor.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
@@ -287,14 +311,14 @@ def _dynamic_mxfp4_quant_kernel(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            tl.store(bs_ptr + bs_offs, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS))
+            tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
             bs_mask = (bs_offs_m < M)[:, None] & (
                 bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
             )[None, :]
             tl.store(
                 bs_ptr + bs_offs,
-                bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+                bs_e8m0,
                 mask=bs_mask,
             )
 

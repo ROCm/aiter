@@ -1,7 +1,7 @@
 #pragma once
 /*
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
                       const std::vector<std::string> &handles,
                       const std::vector<int64_t> &offsets, int64_t rank,
                       bool full_nvlink);
-void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out);
+void all_reduce_reg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out, bool open_fp8_quant);
 void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
                       torch::Tensor &out);
 

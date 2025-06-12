@@ -3,6 +3,7 @@ import sys
 import torch
 import triton
 from triton.testing import runtime
+from op_tests.triton_tests.test_rope_triton import generate_rope_inputs
 from aiter.ops.triton.rope import RotateStyle
 from aiter.ops.triton.rope import (
     rope_fwd,
@@ -19,73 +20,13 @@ from aiter.ops.triton.rope import (
     rope_cached_thd_positions_2c_fwd_inplace,
     rope_cached_thd_positions_offsets_2c_fwd,
     rope_cached_thd_positions_offsets_2c_fwd_inplace,
+    rope_cached_thd_positions_2c_gqa_fwd,
+    rope_cached_thd_positions_2c_gqa_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_gqa_fwd,
+    rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace,
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
 )
-
-
-# TODO: move to aiter/op_tests/triton_tests/test_rope_triton.py
-def generate_rope_inputs(
-    B: int,
-    S: int,
-    H: int,
-    D: int,
-    cached: bool,
-    reuse_freqs_front_part: bool,
-    nope: bool,
-    pos: bool,
-    offs: bool,
-    two_inputs: bool,
-    layout: str,
-    dtype: torch.dtype,
-):
-    torch.manual_seed(20)
-
-    device = "cuda"
-    if layout == "thd":  # T == S
-        assert B == 1, "B should always be 1 in THD layout"
-        input_shape = (S, H, D)
-        pos_offs_shape = (S,)
-    elif layout == "sbhd":
-        input_shape = (S, B, H, D)
-        pos_offs_shape = (S, B)
-    else:
-        raise NotImplementedError(f"layout '{layout}' not supported")
-
-    x = torch.randn(input_shape, dtype=dtype, device="cuda")
-    y = torch.randn(input_shape, dtype=dtype, device="cuda") if two_inputs else None
-
-    freqs_D = D
-    if nope:
-        freqs_D = freqs_D // 2
-    if reuse_freqs_front_part:
-        freqs_D = freqs_D // 2
-
-    freqs = torch.randn((S, 1, 1, freqs_D), dtype=dtype, device="cuda")
-    positions = (
-        torch.randint(
-            int(S * 0.25) if offs else 0,
-            int(S * 0.75) if offs else S,
-            pos_offs_shape,
-            device=device,
-        )
-        if pos
-        else None
-    )
-    offsets = (
-        torch.randint(int(S * -0.25), int(S * 0.25), pos_offs_shape, device=device)
-        if offs
-        else None
-    )
-
-    cos = torch.cos(freqs) if cached else None
-    sin = torch.sin(freqs) if cached else None
-
-    if cached and layout == "thd":
-        cos = cos.reshape(S, freqs_D)
-        sin = sin.reshape(S, freqs_D)
-
-    return x, y, freqs, positions, offsets, cos, sin
 
 
 def str_to_bool(v, vstr):
@@ -148,6 +89,7 @@ def run_benchmark(args):
         B,
         S,
         H,
+        Q,
         D,
         cached,
         rotate_style,
@@ -164,6 +106,7 @@ def run_benchmark(args):
         args.B,
         args.S,
         args.H,
+        args.Q,
         args.D,
         args.cached,
         args.rotate_style,
@@ -189,6 +132,9 @@ def run_benchmark(args):
     two_inputs = str_to_bool(two_inputs, "two_inputs")
     inplace = str_to_bool(inplace, "inplace")
 
+    Q = Q if two_inputs == True else 1  # noqa: E712
+    is_mha = True if Q == 1 else False
+
     rep = args.repeat
 
     if dtype == "fp16":
@@ -204,7 +150,8 @@ def run_benchmark(args):
     x_names = [
         "B",
         "S",
-        "H",
+        "HK",
+        "HQ_per_HK",
         "D",
         "cached",
         "rotate_style",
@@ -223,6 +170,7 @@ def run_benchmark(args):
             B,
             S,
             H,
+            Q,
             D,
             cached,
             rotate_style,
@@ -244,6 +192,7 @@ def run_benchmark(args):
         B: int,
         S: int,
         H: int,
+        Q: int,
         D: int,
         cached: bool,
         rotate_style: int,
@@ -263,6 +212,7 @@ def run_benchmark(args):
             B,
             S,
             H,
+            Q,
             D,
             cached,
             reuse_freqs_front_part,
@@ -278,7 +228,7 @@ def run_benchmark(args):
         elif rotate_style == "neox":
             rotate_style = RotateStyle.NEOX
         # flops
-        flops = B * S * H * (D / 2.0) * 3.0 * 2.0 * (2.0 if two_inputs else 1.0)
+        flops = B * S * H * (D / 2.0) * 3.0 * 2.0 * ((Q + 1) if two_inputs else 1.0)
 
         # memory transfer (B = 1, T = S for thd layout, positions and offsets are always int)
 
@@ -287,20 +237,80 @@ def run_benchmark(args):
             * S
             * H
             * D
-            * ((2.0 * x.element_size()) if two_inputs else (1.0 * x.element_size()))
+            * (((Q + 1) * x.element_size()) if two_inputs else (1.0 * x.element_size()))
             + S
             * D
-            * ((2.0 * freqs.element_size()) if cached else (1.0 * freqs.element_size()))
+            * (
+                ((Q + 1) * freqs.element_size())
+                if cached
+                else (1.0 * freqs.element_size())
+            )
             + B * S * ((1.0 * positions.element_size()) if pos else 0.0)
             + B * S * ((1.0 * offsets.element_size()) if offs else 0.0)
         )
 
-        mem_write = B * S * H * D * (2.0 if two_inputs else 1.0) * x.element_size()
+        mem_write = B * S * H * D * ((Q + 1) if two_inputs else 1.0) * x.element_size()
         mem = mem_read + mem_write
 
         transpose_output = False
         fn = None
-        if two_inputs and cached and pos and layout == "thd":
+        if Q > 1 and two_inputs and cached and pos and layout == "thd":
+            cos_sin_cache = torch.cat((cos, sin), dim=-1)
+            cos, sin = cos_sin_cache.chunk(2, dim=-1)
+            if offs:
+                if inplace:
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_gqa_fwd_inplace(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_cached_thd_positions_offsets_2c_gqa_fwd(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        offsets,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+            else:
+                if inplace:
+                    fn = lambda: rope_cached_thd_positions_2c_gqa_fwd_inplace(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+                else:
+                    fn = lambda: rope_cached_thd_positions_2c_gqa_fwd(  # noqa: E731
+                        x,
+                        y,
+                        cos,
+                        sin,
+                        positions,
+                        rotate_style,
+                        reuse_freqs_front_part,
+                        nope_first,
+                        transpose_output,
+                    )
+
+        if Q == 1 and two_inputs and cached and pos and layout == "thd":
             if offs:
                 if inplace:
                     fn = lambda: rope_cached_thd_positions_offsets_2c_fwd_inplace(  # noqa: E731
@@ -425,7 +435,7 @@ def run_benchmark(args):
 
         if fn is None:
             raise NotImplementedError(
-                f"No API with option: [layout='{layout}', cached={cached}, two_inputs={two_inputs}, pos={pos}, offs={offs}, inplace={inplace}]."
+                f"No API with option: [layout='{layout}', cached={cached}, two_inputs={two_inputs}, pos={pos}, offs={offs}, inplace={inplace}, (HQ_per_HK > 1)={is_mha}]."
             )
 
         di = runtime.driver.active.get_device_interface()
@@ -456,7 +466,7 @@ def run_benchmark(args):
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="Benchmark RoPE",
-        description="This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime (the DurationNs column) in results.csv or results.stats.csv. For instance, try \"rocprof --stats python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
+        description="This script will not print out runtime as short running kernels cannot be measured accuratly throught triton.testing.do_bench function, please use rocprof to measure accurate runtime. For instance, try \"rocprofv2 --kernel-trace python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
         allow_abbrev=False,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -476,7 +486,13 @@ def parse_args():
         help="the sequence length, S, or the number of tokens, T",
         default=4096,
     )
-    parser.add_argument("-H", type=int, help="the number of heads, H", default=128)
+    parser.add_argument("-H", type=int, help="the number of K heads, H", default=128)
+    parser.add_argument(
+        "-Q",
+        type=int,
+        help="the number of Q heads per K heads, Q (default is 1, MHA implementation, this argument will be ignored if --two_inputs=false)",
+        default=1,
+    )
     parser.add_argument("-D", type=int, help="the head dimension, D", default=64)
     parser.add_argument("--cached", type=str, help="cached sin/cos", default="true")
     parser.add_argument("--rotate_style", type=str, help="gptj or neox", default="gptj")

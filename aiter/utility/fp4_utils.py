@@ -218,8 +218,8 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     stride_x_n,
     stride_x_fp4_m,
     stride_x_fp4_n,
-    # stride_bs_m,
-    # stride_bs_n,
+    stride_bs_m,
+    stride_bs_n,
     M: tl.constexpr,
     N: tl.constexpr,
     scaleN: tl.constexpr,
@@ -228,6 +228,7 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     BLOCK_SIZE: tl.constexpr,
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     SCALING_MODE: tl.constexpr,
+    SHUFFLE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -311,34 +312,35 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
     bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     bs_offs_n = pid_n
 
-    bs_offs_0 = bs_offs_m[:, None] // 32
-    bs_offs_1 = bs_offs_m[:, None] % 32
-    bs_offs_2 = bs_offs_1 % 16
-    bs_offs_1 = bs_offs_1 // 16
-    bs_offs_3 = bs_offs_n[None, :] // 8
-    bs_offs_4 = bs_offs_n[None, :] % 8
-    bs_offs_5 = bs_offs_4 % 4
-    bs_offs_4 = bs_offs_4 // 4
-    bs_offs = (
-        bs_offs_1
-        + bs_offs_4 * 2
-        + bs_offs_2 * 2 * 2
-        + bs_offs_5 * 2 * 2 * 16
-        + bs_offs_3 * 2 * 2 * 16 * 4
-        + bs_offs_0 * 2 * 16 * scaleN
-    )
-    bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
-    bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
-    bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
-    tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
-
-    # bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
-    # bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
-    # tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
+    if SHUFFLE:
+        bs_offs_0 = bs_offs_m[:, None] // 32
+        bs_offs_1 = bs_offs_m[:, None] % 32
+        bs_offs_2 = bs_offs_1 % 16
+        bs_offs_1 = bs_offs_1 // 16
+        bs_offs_3 = bs_offs_n[None, :] // 8
+        bs_offs_4 = bs_offs_n[None, :] % 8
+        bs_offs_5 = bs_offs_4 % 4
+        bs_offs_4 = bs_offs_4 // 4
+        bs_offs = (
+            bs_offs_1
+            + bs_offs_4 * 2
+            + bs_offs_2 * 2 * 2
+            + bs_offs_5 * 2 * 2 * 16
+            + bs_offs_3 * 2 * 2 * 16 * 4
+            + bs_offs_0 * 2 * 16 * scaleN
+        )
+        bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+        bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
+    else:
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.
@@ -362,12 +364,12 @@ def dynamic_mxfp4_quant(
     MXFP4_QUANT_BLOCK_SIZE = 32
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    scaleM = (M + 31) // 32 * 32
+    scaleM = triton.cdiv(M, 32) * 32
     scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
     scaleN = triton.cdiv(scaleN_valid, 8) * 8
     blockscale_e8m0 = torch.empty(
         (
-            scaleM,
+            triton.cdiv(M, 256) * 256,
             scaleN,
         ),
         dtype=torch.uint8,
@@ -382,7 +384,7 @@ def dynamic_mxfp4_quant(
         blockscale_e8m0,
         *x.stride(),
         *x_fp4.stride(),
-        # *blockscale_e8m0.stride(),
+        *blockscale_e8m0.stride(),
         M=M,
         N=N,
         scaleN=scaleN_valid,
@@ -391,6 +393,7 @@ def dynamic_mxfp4_quant(
         BLOCK_SIZE=BLOCK_SIZE,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
         SCALING_MODE=0,
+        SHUFFLE=shuffle,
     )
 
     return (x_fp4, blockscale_e8m0.view(dtypes.fp8_e8m0))

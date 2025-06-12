@@ -9,7 +9,7 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
-from .jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -24,6 +24,9 @@ def _fwd_kernel_stage2_asm(
     stride_mid_os,
     stride_obs,
     stride_oh,
+    bs,
+    nheads,
+    max_seqlen_q,
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
@@ -80,14 +83,31 @@ def _fwd_kernel_stage2_asm(
 
 
 @functools.lru_cache()
-def get_meta_param(num_kv_splits, device, bs, nhead):
+def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q):
     if num_kv_splits is None:
         cu_num = get_cu_num()
-        num_kv_splits = min(16, max(1, cu_num // bs))
+        avg_kv = total_kv / bs
+        overhead = 84.1
+        tmp = [
+            (
+                bs
+                * i
+                / ((bs * i + cu_num - 1) // cu_num * cu_num)
+                * avg_kv
+                / (avg_kv + overhead * i),
+                i,
+            )
+            for i in range(1, 17)
+        ]
+        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        # num_kv_splits = min(16, max(1, cu_num // bs))
 
-    get_mgc = {16: 64, 128: 16}
+    get_mgc = {16: 16, 128: 16}
+
     assert nhead in get_mgc, f"{nhead=} not supported"
     mgc = get_mgc[nhead]
+    if max_seqlen_q == 1 and nhead == 16:
+        mgc = 64
     return num_kv_splits, mgc
 
 
@@ -112,19 +132,20 @@ def mla_decode_fwd(
 
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
+    total_kv = kv_indices.shape[0]
 
-    num_kv_splits, mgc = get_meta_param(num_kv_splits, device, bs, nhead)
+    num_kv_splits, mgc = get_meta_param(
+        num_kv_splits, bs, total_kv, nhead, max_seqlen_q
+    )
 
-    if nhead == 16:
+    if nhead == 16 and max_seqlen_q == 1:
+        # special case for 16 heads and max_seqlen_q == 1
         logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
         )
-        assert (
-            max_seqlen_q == 1
-        ), f"Assertion: max_seqlen_q should be 1 when n_head=16, but got {max_seqlen_q}"
-    elif nhead == 128:
+    elif nhead in [16, 128]:
         logits = (
             o.view((total_s, num_kv_splits, nhead, v_head_dim))
             if num_kv_splits == 1
@@ -154,7 +175,7 @@ def mla_decode_fwd(
         attn_lse,
     )
 
-    if num_kv_splits == 1 and nhead == 128:
+    if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
         return logits.view(total_s, nhead, v_head_dim), attn_lse
     Lv = v_head_dim
     BLOCK_DV = triton.next_power_of_2(Lv)
@@ -171,6 +192,9 @@ def mla_decode_fwd(
         attn_lse.stride(1),
         o.stride(0),
         o.stride(1),
+        bs,
+        nhead,
+        max_seqlen_q,
         NUM_KV_SPLITS=num_kv_splits,
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,

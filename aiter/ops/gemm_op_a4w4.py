@@ -8,7 +8,7 @@ import functools
 import pandas as pd
 from ..jit.core import (
     compile_ops,
-    AITER_CORE_DIR,
+    AITER_ROOT_DIR,
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
