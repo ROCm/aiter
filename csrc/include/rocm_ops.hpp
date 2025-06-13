@@ -823,6 +823,13 @@
           py::arg("input"),                                              \
           py::arg("scales"),                                             \
           py::arg("scale_ub")      = std::nullopt,                       \
+          py::arg("shuffle_scale") = true);                              \
+    m.def("dynamic_per_group_scaled_quant_fp4",                          \
+          &aiter::dynamic_per_group_scaled_quant_fp4,                    \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("group_size")    = 32,                                 \
           py::arg("shuffle_scale") = true);
 
 #define RMSNORM_PYBIND                                                                             \
