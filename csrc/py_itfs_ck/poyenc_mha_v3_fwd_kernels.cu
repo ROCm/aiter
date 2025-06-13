@@ -589,21 +589,22 @@ struct BlockFmhaPipelineQRKSVS
             __builtin_amdgcn_sched_barrier(0);
             // (3) load & store V =============================================
             const auto v_prefetch = load_tile(v_dram_window);
-            __builtin_amdgcn_sched_barrier(0);
 
             if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
             {
                 auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(
                     Policy::template MakeShuffledVRegBlockDescriptor<Problem>());
                 shuffle_tile(v_shuffle_tmp, v_prefetch);
-                __builtin_amdgcn_sched_barrier(0);
                 store_tile(
                     v_lds_window,
                     tile_elementwise_in(v_element_func, v_shuffle_tmp)); // store the prefetch
+
+                __builtin_amdgcn_sched_group_barrier(0x020, 4, 0); // VMEM read
+                __builtin_amdgcn_sched_group_barrier(0x002, 8, 4); // VALU
+                __builtin_amdgcn_sched_group_barrier(0x200, 4, 0); // DS Write
             }
             else
             {
-                __builtin_amdgcn_sched_barrier(0);
                 store_tile(v_lds_window,
                            tile_elementwise_in(v_element_func, v_prefetch)); // store the prefetch
             }
