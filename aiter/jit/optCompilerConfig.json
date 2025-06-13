@@ -309,7 +309,7 @@
         "md_name": "'module_moe_ck2stages'",
         "flags_extra_cc": ["f'-DMOE_STAGE2_ASM_DIR=\\\\\"{CK_DIR}/example/65_gemm_multiply_multiply/hsa/{get_gfx()}/\\\\\"'"],
         "flags_extra_hip": [
-            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"  
+            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -451,7 +451,10 @@
             "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/include'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm --amdgpu-use-amdgpu-trackers=1'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
