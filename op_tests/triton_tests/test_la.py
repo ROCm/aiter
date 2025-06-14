@@ -45,8 +45,8 @@ from aiter.ops.triton.lean_atten import persistent_lean_attention
             True,
             1,
             64,
-            16384,
-            [16384],
+            8192,
+            [8192],
             64,
             304,
             torch.float16,
@@ -55,7 +55,7 @@ from aiter.ops.triton.lean_atten import persistent_lean_attention
             1,
             4,
         ),  # Causal=1,
-        (True, 1, 96, 4096, [4096], 64, 304, torch.float16, 64, 64, 1, 4),
+        (True, 2, 64, 2048, [2048, 2048], 64, 304, torch.float16, 64, 64, 1, 4),
     ],
 )
 def test_persistent_lean_attention(
@@ -81,7 +81,6 @@ def test_persistent_lean_attention(
         d = 16
 
     assert batch == len(n_ctx)
-
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
@@ -106,59 +105,22 @@ def test_persistent_lean_attention(
     sm_scale = 0.5
 
     # Allocate Tensors
-    q = torch.empty((h, n_ctx_q * batch, d), dtype=init_dtype, device="cuda").normal_(
+    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    k = torch.empty((h, sum_n_ctx, d), dtype=init_dtype, device="cuda").normal_(
+    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    v = torch.empty((h, sum_n_ctx, d), dtype=init_dtype, device="cuda").normal_(
+    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
 
-    print(f"Q shape={q.shape}")
-    print(f"K shape={k.shape}")
-    print(f"V shape={v.shape}")
-    torch.set_printoptions(threshold=10000)
     # LeanAttention Specific Parameters
     Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
     Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
     Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
-
-    # Calculate Pytorch refence output
-    start = 0
-    start_q = 0
-    ref_out = torch.empty_like(q, dtype=v.dtype)
-    # qb = torch.empty((h, n_ctx_q*batch, d), dtype=init_dtype)
-    for h in range(h):
-        for b in n_ctx:
-            # print(f"h={h}")
-            # print(f"n_ctx_q={N_CTX_Q}")
-            # print(f"M shape: {M.shape}")
-            qb = q[h, start_q : (start_q + int(n_ctx_q)), :]
-            # print(f"qb shape: {qb.shape}")
-            kb = k[h, start : (start + int(b)), :]
-            # print(f"kb shape: {kb.shape}")
-            vb = v[h, start : (start + int(b)), :]
-            # print(f"vb shape: {vb.shape}")
-            p = torch.matmul(qb, kb.transpose(0, 1)) * sm_scale
-            # print(f"p shape: {p.shape}")
-            if causal:
-                M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
-                mask = M == 0
-                p[mask] = float("-inf")
-            # print(f"p shape: {p.shape}")
-            p = torch.softmax(p.float(), dim=-1).to(q.dtype)
-            refb = torch.matmul(p, vb)
-            ref_out[h, start_q : (start_q + int(n_ctx_q)), :] = refb
-            # print(f"refb={refb}")
-            # print(f"refb shape: {refb.shape}")
-            start += b
-            start_q += n_ctx_q
-        start = 0
-        start_q = 0
 
     # Triton LeanAttention output
     la_out = persistent_lean_attention(
@@ -179,6 +141,31 @@ def test_persistent_lean_attention(
         num_warps,
         waves_per_eu,
     )
+
+    # Calculate Pytorch refence output
+    ref_out = torch.empty_like(q, dtype=v.dtype)
+    start = 0
+    start_q = 0
+
+    for b in n_ctx:
+        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
+        qb_reshaped = qb.transpose(0, 1)
+        kb = k[start : (start + int(b)), :, :]
+        kb_reshaped = kb.transpose(0, 1)
+        vb = v[start : (start + int(b)), :, :]
+        vb_reshaped = vb.transpose(0, 1)
+        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
+        if causal:
+            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
+            mask = M == 0
+            p[:, mask] = float("-inf")
+        # print(f"p shape: {p.shape}")
+        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
+        refb = torch.matmul(p, vb_reshaped)
+        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+        start += b
+        start_q += n_ctx_q
+
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
@@ -186,15 +173,15 @@ def test_persistent_lean_attention(
 
 
 def main():
-    batch = 1
-    causal = False
-    h = 64
-    n_ctx_q = 16
-    n_ctx = [4096]
+    batch = 2
+    causal = True
+    h = 4
+    n_ctx_q = 1024
+    n_ctx = [1024, 1024]
     d = 64
     total_programs = 32
     init_dtype = torch.float16
-    BLOCK_M = 16
+    BLOCK_M = 64
     BLOCK_N = 64
     waves_per_eu = 1
     num_warps = 4
@@ -205,12 +192,12 @@ def main():
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
 
+    print(f"causal={causal}, batch={batch}")
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
     # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
     # Third, convert list to a tensor "batch_num_block_n"
     for s in n_ctx:
-        # print(f"s={s}")
         list_num_block_n = [
             (int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx
         ]
@@ -224,19 +211,16 @@ def main():
     sm_scale = 0.5
 
     # Allocate Tensors
-    q = torch.empty((h, n_ctx_q * batch, d), dtype=init_dtype, device="cuda").normal_(
+    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    k = torch.empty((h, sum_n_ctx, d), dtype=init_dtype, device="cuda").normal_(
+    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
-    v = torch.empty((h, sum_n_ctx, d), dtype=init_dtype, device="cuda").normal_(
+    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
         mean=0.0, std=0.5
     )
 
-    print(f"Q shape={q.shape}")
-    print(f"K shape={k.shape}")
-    print(f"V shape={v.shape}")
     # LeanAttention Specific Parameters
     Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
     Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
@@ -264,11 +248,36 @@ def main():
         waves_per_eu,
     )
 
-    print(f"la_out[0,0,:10]={la_out[0,0,:10]}")
+    # Calculate Pytorch refence output
+    ref_out = torch.empty_like(q, dtype=v.dtype)
+    start = 0
+    start_q = 0
+
+    for b in n_ctx:
+        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
+        print(f"qb shape: {qb.shape}")
+        qb_reshaped = qb.transpose(0, 1)
+        print(f"qb reshaped shape: {qb_reshaped.shape}")
+        kb = k[start : (start + int(b)), :, :]
+        kb_reshaped = kb.transpose(0, 1)
+        vb = v[start : (start + int(b)), :, :]
+        vb_reshaped = vb.transpose(0, 1)
+        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
+        if causal:
+            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
+            mask = M == 0
+            p[:, mask] = float("-inf")
+        # print(f"p shape: {p.shape}")
+        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
+        refb = torch.matmul(p, vb_reshaped)
+        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+        start += b
+        start_q += n_ctx_q
+
     # Compare result
-    # atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
-    # rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
+    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
+    torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
