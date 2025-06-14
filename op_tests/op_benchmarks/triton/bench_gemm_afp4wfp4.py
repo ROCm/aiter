@@ -8,7 +8,7 @@ from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffled_scales,
 )
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
-from utils.benchmark_utils import get_model_configs, get_available_models
+from utils.benchmark_utils import get_model_configs, get_available_models, print_vgpr
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
@@ -172,12 +172,24 @@ def parse_args():
         default="throughput",
         help="metric to plot",
     )
+
+    parser.add_argument(
+        "--print_vgpr",
+        action="store_true",
+        help="Print VGPR usage for Triton kernels.",
+    )
+
     args = parser.parse_args()
     return args
 
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, "GEMM")
+        return 0
     run_benchmark(args)
 
 
