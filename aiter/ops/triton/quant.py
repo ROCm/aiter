@@ -8,9 +8,9 @@ import torch
 
 @triton.jit
 def _static_per_tensor_fp8_quant_kernel(
-    qx_ptr: torch.Tensor,
-    x_in_ptr: torch.Tensor,
-    scale_in_ptr: torch.Tensor,
+    qx_ptr,
+    x_in_ptr,
+    scale_in_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
@@ -35,9 +35,7 @@ def _static_per_tensor_fp8_quant_kernel(
     tl.store(qx_ptr + offs, qx, mask=mask)
 
 
-def static_per_tensor_fp8_quant(
-    qx: torch.Tensor, x_in: torch.Tensor, scale_in: torch.Tensor
-):
+def static_per_tensor_fp8_quant(qx, x_in, scale_in):
     """
     #TODO: Add Doc
     """
@@ -55,8 +53,8 @@ def static_per_tensor_fp8_quant(
 
 @triton.jit
 def _dynamic_per_tensor_fp8_quant_kernel(
-    x_in_ptr: torch.Tensor,
-    scale_out_ptr: torch.Tensor,
+    x_in_ptr,
+    scale_out_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
@@ -78,9 +76,7 @@ def _dynamic_per_tensor_fp8_quant_kernel(
     tl.atomic_max(scale_out_ptr, m / FP8_MAX, sem="relaxed")
 
 
-def dynamic_per_tensor_fp8_quant(
-    qx: torch.Tensor, x_in: torch.Tensor, scale_out: torch.Tensor
-):
+def dynamic_per_tensor_fp8_quant(qx, x_in, scale_out):
     """
     #TODO: Add Doc
     """
@@ -106,9 +102,9 @@ def dynamic_per_tensor_fp8_quant(
 
 @triton.jit
 def _dynamic_per_token_fp8_quant_kernel(
-    qx_ptr: torch.Tensor,
-    scale_out_ptr: torch.Tensor,
-    x_in_ptr: torch.Tensor,
+    qx_ptr,
+    scale_out_ptr,
+    x_in_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
@@ -140,11 +136,11 @@ def _dynamic_per_token_fp8_quant_kernel(
 
 
 def dynamic_per_token_fp8_quant(
-    qx: torch.Tensor,
-    x_in: torch.Tensor,
-    scale_out: torch.Tensor,
+    qx,
+    x_in,
+    scale_out,
     quant_dtype=torch.float8_e4m3fnuz,
-    dtypeMax: torch.Tensor = torch.finfo(torch.float8_e4m3fnuz).max,
+    dtypeMax=torch.finfo(torch.float8_e4m3fnuz).max,
 ):
     """
     #TODO: Add doc
@@ -323,9 +319,7 @@ def _dynamic_mxfp4_quant_kernel(
             )
 
 
-def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
-) -> tuple[torch.Tensor, torch.Tensor]:
+def dynamic_mxfp4_quant(x, scaling_mode: str = "even"):
     """
     Quantize a tensor to MX FP4 format.
 
