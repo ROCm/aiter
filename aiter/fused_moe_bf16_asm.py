@@ -140,8 +140,8 @@ def asm_moe(
             128,
         ), "asm_moe for block_scale only support (128, 128)"
         assert (
-            w1.dtype == torch.float8_e4m3fnuz
-        ), "asm_moe for block_scale only support float8_e4m3fnuz weight"
+            w1.dtype == dtypes.fp8
+        ), "asm_moe for block_scale only support float8_e4m3fnuz weight on gfx942 and float8_e4m3fn on gfx950"
         assert (
             w2.shape[2] * 2 == w1.shape[1]
         ), "aiter moe for block_scale only support g1u1"
@@ -150,7 +150,7 @@ def asm_moe(
 
         a1_q, a1_scale = pertoken_quant(
             hidden_states.view(-1, model_dim // scale_blk_k, scale_blk_k),
-            quant_dtype=torch.float8_e4m3fnuz,
+            quant_dtype=dtypes.fp8,
         )
         a1_q = a1_q.view(-1, model_dim)
         a1_scale = a1_scale.squeeze(-1).t().contiguous()
@@ -429,7 +429,7 @@ def ck_moe_2stages(
 ):
 
     quant_func = get_hip_quant(quant_type)
-    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else torch.float8_e4m3fnuz
+    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
 
     # quant_func = get_torch_quant(quant_type)
     E, model_dim, inter_dim = w2.shape
