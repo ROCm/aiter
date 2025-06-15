@@ -1,16 +1,16 @@
+import sys
+import random
+import torch
+import argparse
 import triton
 import triton.language as tl
+from aiter.ops.triton.pa_decode import paged_attention_decode
 from utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     get_dtype_bytes,
-    torch_to_tl_dtype,
 )
-import torch
-import argparse
-from aiter.ops.triton.pa_decode import paged_attention_decode
-import sys
-import random
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 
 def input_helper(
@@ -178,7 +178,7 @@ def paged_attn_decode(
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
-    compute_type = torch_to_tl_dtype[arg_to_torch_dtype[args.compute_type]]
+    compute_type = torch_to_triton_dtype[arg_to_torch_dtype[args.compute_type]]
     output_type = arg_to_torch_dtype[args.output_type]
 
     x_vals_list = model_benchmark_configs(args)

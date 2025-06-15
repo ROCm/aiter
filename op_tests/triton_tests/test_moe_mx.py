@@ -7,40 +7,10 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
+from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
+from op_tests.triton_tests.test_moe import torch_moe_ref, torch_moe_align_block_size_ref
 
 DEBUG_MODE = False
-
-
-def torch_moe(
-    a,
-    b,
-    c,
-    a_scale,
-    b_scale,
-    b_zp,
-    group_size,
-    topk_ids,
-    topk_weights,
-    routed_weight,
-    sorted_token_ids,
-    expert_ids,
-    num_tokens_post_padded,
-    dtype,
-):
-    M, top_k, N = c.shape
-    _, K = a.shape
-
-    # Repeat a -> (M, top_k, K)
-    a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
-    # (M, top_k, N, K)
-    b_indexed = b[topk_ids]
-
-    c = torch.einsum("mek,menk->men", a_expanded.to(dtype), b_indexed.to(dtype))
-
-    if routed_weight:
-        c *= topk_weights.unsqueeze(-1)
-
-    return c
 
 
 def get_cdna_version():
@@ -57,120 +27,6 @@ def get_cdna_version():
     if target.arch == "gfx950":
         return 4
     return -1
-
-
-def _moe_align_block_size(
-    topk_ids: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    block_size: int,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    num_tokens_post_pad: torch.Tensor,
-) -> None:
-    M, top_k = topk_ids.shape
-
-    expert_to_tokens = [[] for _ in range(num_experts)]
-    # For each token, for each selected expert, we append (token_id, expert)
-    for token_id in range(M):
-        for j in range(top_k):
-            e_id = topk_ids[token_id, j].item()
-            expert_to_tokens[e_id].append(token_id * top_k + j)
-
-    # Reorder tokens block by block, padding if needed
-    reordered_token_ids = []
-    reordered_expert_ids = []
-
-    for e_id in range(num_experts):
-        tokens_for_expert = expert_to_tokens[e_id]
-        num_tokens = len(tokens_for_expert)
-
-        n_blocks = (num_tokens + block_size - 1) // block_size
-        # If not a multiple of block_size, pad up to the next multiple
-        padded_size = n_blocks * block_size
-
-        # Reorder all actual tokens for expert e_id
-        reordered_token_ids.extend(tokens_for_expert)
-        # reordered_expert_ids.extend([e_id]*num_tokens)
-        reordered_expert_ids.extend([e_id] * n_blocks)
-
-        # Pad with dummy token_id = topk_ids.numel()
-        if padded_size > num_tokens:
-            pad_count = padded_size - num_tokens
-            reordered_token_ids.extend([topk_ids.numel()] * pad_count)
-
-    token_length = len(reordered_token_ids)
-    expert_length = len(reordered_expert_ids)
-
-    sorted_token_ids[:token_length] = torch.tensor(
-        reordered_token_ids,
-        dtype=sorted_token_ids.dtype,
-        device=sorted_token_ids.device,
-    )
-    expert_ids[:expert_length] = torch.tensor(
-        reordered_expert_ids, dtype=expert_ids.dtype, device=expert_ids.device
-    )
-
-    # Fill remainder with topk_ids.numel() if these arrays are bigger than total_length
-    if token_length < sorted_token_ids.numel():
-        sorted_token_ids[token_length:] = topk_ids.numel()
-    if expert_length < expert_ids.numel():
-        expert_ids[expert_length:] = topk_ids.numel()
-
-    num_tokens_post_pad.fill_(token_length)
-
-
-def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Aligns the token distribution across experts to be compatible with block size for matrix multiplication.
-
-    Parameters:
-    - topk_ids: A tensor of shape [total_tokens, top_k] representing the top-k expert indices for each token.
-    - block_size: The block size used in block matrix multiplication.
-    - num_experts: The total number of experts.
-
-    Returns:
-    - sorted_token_ids: A tensor containing the sorted token indices according to their allocated expert.
-    - expert_ids: A tensor indicating the assigned expert index for each block.
-    - num_tokens_post_padded: The total number of tokens after padding, ensuring divisibility by block_size.
-
-    This function pads the number of tokens that each expert needs to process so that it is divisible by block_size.
-    Padding ensures that during block matrix multiplication, the dimensions align correctly.
-
-    Example:
-    Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]], block_size = 4, and num_experts = 4:
-    - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts, with each expert needing to process 3 tokens.
-    - As block_size is 4, we pad 1 token for each expert.
-    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
-    - Then append padding tokens [12, 12, 12, 12] for each block.
-    - After sorting by expert index, we obtain token_ids [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
-        Tokens 12 are non-existent (padding) and are ignored in the subsequent matrix multiplication.
-    - The padding ensures that the total number of tokens is now divisible by block_size for proper block matrix operations.
-    """
-    top_k = topk_ids.shape[1]
-    sorted_ids = torch.empty(
-        (topk_ids.numel() + num_experts * (block_size - 1),),
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
-    expert_ids = torch.empty(
-        (topk_ids.numel() + num_experts,), dtype=torch.int32, device=topk_ids.device
-    )
-    sorted_ids.fill_(topk_ids.numel())
-    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
-    _moe_align_block_size(
-        topk_ids,
-        num_experts,
-        top_k,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-    )
-
-    return sorted_ids, expert_ids, num_tokens_post_pad
 
 
 def torch_dynamic_mxfp4_quant(
@@ -344,30 +200,6 @@ def alloc_rand(shape, device, dtype, requires_grad=True):
     return torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
 
 
-# OCP mixed-format fp4 (mxfp4) has two elements packed in one uint8
-str_to_torch_dtype = {
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp8_e4m3": (
-        torch.float8_e4m3fn if get_cdna_version() == 4 else torch.float8_e4m3fnuz
-    ),
-    "fp8_e5m2": torch.float8_e5m2 if get_cdna_version() == 4 else torch.float8_e5m2fnuz,
-    "mxfp4_e2m1": torch.uint8,
-}
-
-torch_to_tl_dtype = {
-    torch.float32: tl.float32,
-    torch.bfloat16: tl.bfloat16,
-    torch.float16: tl.float16,
-    torch.float8_e4m3fn: tl.float8e4nv,
-    torch.float8_e4m3fnuz: tl.float8e4b8,
-    torch.float8_e5m2: tl.float8e5,
-    torch.float8_e5m2fnuz: tl.float8e5b16,
-    torch.uint8: tl.uint8,
-}
-
-
 # Note: Eventually all these combinations will be supported
 # Hardware native OCP
 # ("fp8_e5m2", "mxfp4_e2m1"),
@@ -451,8 +283,8 @@ def test_fused_moe(
     softmax_vals = torch.softmax(values, dim=1)
     topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config["BLOCK_SIZE_M"], E
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
     )
 
     # Downcast a tensor to mxfp4 and upcast back for reference
@@ -505,14 +337,14 @@ def test_fused_moe(
         swizzle_mx_scale,
         swizzle_mx_scale,
         config,
-        torch_to_tl_dtype[c_tri.dtype],
+        torch_to_triton_dtype[c_tri.dtype],
     )
 
     # Torch
     b_zp = None
     group_size = 0
     # a_scale and b_scale not used actually
-    c_ref = torch_moe(
+    c_ref = torch_moe_ref(
         a_ref,
         b_ref,
         c_ref,
@@ -527,6 +359,9 @@ def test_fused_moe(
         expert_ids,
         num_tokens_post_padded,
         dtype=fp16_dtype,
+        fp8_w8a8=False,
+        int8_w8a16=False,
+        int4_w4a16=False,
     )
 
     torch.testing.assert_close(c_tri.to(fp16_dtype), c_ref.to(fp16_dtype))
