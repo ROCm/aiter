@@ -5,7 +5,7 @@ import math
 
 
 MD_NAME = "pa_ragged"
-warpSize = 64
+
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
@@ -25,7 +25,12 @@ def compile(
     return compile_template_op(
         src_template,
         MD_NAME,
-        ["../utils.h", "pa.cuh", "../../include"],
+        [
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_ragged.cuh",
+            f"{AITER_CORE_DIR}/csrc/include",
+            f"{AITER_CORE_DIR}/csrc/include/ck_tile/",
+        ],
         [],
         gqa_ratio=gqa_ratio,
         head_size=head_size,
@@ -63,13 +68,14 @@ def paged_attention_ragged(
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
+    warpSize = torch.cuda.get_device_properties(out.device).warp_size
     if kv_cache_dtype == "auto":
         if query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
             kv_dtype = "__hip_bfloat16"
         elif query.dtype == torch.float16:
-            dtype = "__half"
-            kv_dtype = "__half"
+            dtype = "_Float16"
+            kv_dtype = "_Float16"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
     elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
@@ -77,7 +83,7 @@ def paged_attention_ragged(
             dtype = "__hip_bfloat16"
             kv_dtype = "uint8_t"
         elif query.dtype == torch.float16:
-            dtype = "__half"
+            dtype = "_Float16"
             kv_dtype = "uint8_t"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
@@ -87,7 +93,7 @@ def paged_attention_ragged(
     if out.dtype == torch.bfloat16:
         out_dtype = "__hip_bfloat16"
     elif out.dtype == torch.float16:
-        out_dtype = "__half"
+        out_dtype = "_Float16"
     else:
         raise ValueError(f"Unsupported data type: {out.dtype}")
 

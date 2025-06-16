@@ -6,6 +6,8 @@ from typing import Optional
 from ..jit.core import (
     compile_ops,
 )
+from csrc.cpp_itfs.pa.pa import paged_attention_rocm as paged_attention_rocm_core
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 MD_NAME = "module_attention"
 
@@ -52,7 +54,6 @@ def pa_fwd_asm(
 ) -> torch.Tensor: ...
 
 
-@compile_ops("module_pa")
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sums: torch.Tensor,
@@ -73,7 +74,38 @@ def paged_attention_rocm(
     v_scale: float,
     fp8_out_scale: Optional[torch.Tensor],
     partition_size: int,
-): ...
+    mtp: int = 1,
+) -> torch.Tensor:
+    paged_attention_rocm_core(
+        out,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        context_lens,
+        block_size,
+        max_context_len,
+        alibi_slopes,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        fp8_out_scale,
+        partition_size,
+        mtp,
+    )
+    return out
+
+
+direct_register_custom_op(
+    "paged_attention_rocm",
+    paged_attention_rocm,
+    ["out", "exp_sums", "max_logits", "tmp_out"],
+)
 
 
 @compile_ops("module_pa_v1")
