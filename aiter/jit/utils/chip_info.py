@@ -4,15 +4,16 @@ import os
 import functools
 import subprocess
 
+from aiter.jit.utils.cpp_extension import executable_path
+
 
 @functools.lru_cache(maxsize=1)
 def get_gfx():
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
-            result = subprocess.run(
-                ["rocminfo"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            rocminfo = executable_path("rocminfo")
+            result = subprocess.run([rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             output = result.stdout
             for line in output.split("\n"):
                 if "gfx" in line.lower():
