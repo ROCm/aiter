@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import pytest
 import torch
-import torch.nn.functional as F
 import triton
 from aiter.ops.triton.rmsnorm import (
     rms_norm,
