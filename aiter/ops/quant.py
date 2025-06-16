@@ -252,7 +252,7 @@ def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True)
 
 def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
-    if quant_dtype == dtypes.fp8:
+    if quant_dtype in [dtypes.fp8, dtypes.i8]:
         if scale is None:
             scale = torch.empty(1, dtype=dtypes.fp32, device=x.device)
             dynamic_per_tensor_quant(y, x, scale)
