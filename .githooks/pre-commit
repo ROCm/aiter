@@ -74,6 +74,8 @@ if command -v black >/dev/null; then
        if [[ -e $file ]] && echo $file | grep -Eq '\.py$'; then
             echo "black $file"
             black "$file"
+            echo "ruff check --fix $file"
+            ruff check --fix "$file"
             git add -u "$file"
         fi
     done

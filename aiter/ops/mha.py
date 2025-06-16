@@ -3,7 +3,8 @@
 
 from torch import Tensor, Generator
 from typing import Optional, Tuple
-from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR
+from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
+from ..jit.utils.chip_info import get_gfx
 from ..utility import dtypes
 import torch
 
@@ -55,6 +56,7 @@ def mha_varlen_fwd(
     cu_seqlens_k: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    min_seqlen_q: int,
     dropout_p: float,
     softmax_scale: float,
     logits_soft_cap: float,
@@ -332,6 +334,10 @@ def _flash_attn_backward(
     is_v3_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
+    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
+        logger.warning(
+            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
+        )
     md_name = "mha_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
     filter2 = "*"  # get_bwd_convert_dq_blobs()
@@ -816,6 +822,7 @@ def _flash_attn_varlen_forward(
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
+    min_seqlen_q: int,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -876,6 +883,12 @@ def _flash_attn_varlen_forward(
         else:
             md_name += "_dropout"
             filter_fwd += "_dropout*"
+        if min_seqlen_q == 0:
+            md_name += "_nskip"
+            filter_fwd += "_nskip*"
+        else:
+            md_name += "_skip"
+            filter_fwd += "_skip*"
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -951,6 +964,7 @@ def _flash_attn_varlen_forward(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        min_seqlen_q,
         dropout_p,
         softmax_scale,
         logits_soft_cap,
@@ -1199,6 +1213,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        min_seqlen_q,
         dropout_p,
         softmax_scale,
         logits_soft_cap,
@@ -1233,6 +1248,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
+            min_seqlen_q,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -1335,6 +1351,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             dbias,
             None,
             None,
@@ -1354,6 +1371,7 @@ def flash_attn_varlen_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    min_seqlen_q=0,
     dropout_p=0.0,
     softmax_scale=None,
     logits_soft_cap=0.0,
@@ -1399,6 +1417,7 @@ def flash_attn_varlen_func(
            of the sequences in the batch, used to index into kv.
         max_seqlen_q: int. Maximum query sequence length in the batch.
         max_seqlen_k: int. Maximum key sequence length in the batch.
+        min_seqlen_q: int. Minimum query sequence length for chunked prefill.
         dropout_p: float. Dropout probability.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim_q).
@@ -1430,6 +1449,7 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        min_seqlen_q,
         dropout_p,
         softmax_scale,
         logits_soft_cap,

@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 from torch import Tensor
+from typing import Optional
 from ..jit.core import compile_ops
 
 MD_NAME = "module_cache"
@@ -17,16 +19,16 @@ def copy_blocks(key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor)
 
 @compile_ops("module_cache")
 def reshape_and_cache(
-    key: Tensor,
-    value: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-    slot_mapping: Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-    asm_layout: bool,
-): ...
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
+    asm_layout: bool = False,
+) -> None: ...
 
 
 @compile_ops("module_cache")
@@ -69,6 +71,14 @@ def reshape_and_cache_with_block_quant(
 
 
 @compile_ops("module_cache")
-def convert_fp8(
-    dst_cache: Tensor, src_cache: Tensor, scale: float, kv_cache_dtype: str
+def reshape_and_cache_with_block_quant_for_asm_pa(
+    key: Tensor,  # [batch_size, seq_len, num_heads, head_size]
+    value: Tensor,  # [batch_size, seq_len, num_heads, head_size]
+    key_cache: Tensor,  # [num_blocks, num_heads, head_size/x, block_size:16, x]
+    value_cache: Tensor,  # [num_blocks, num_heads, head_size, block_size:16] / [num_blocks, kvhead, block_size/x, head_size, x]
+    k_dequant_scales: Tensor,  # [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    v_dequant_scales: Tensor,  # [num_heads, num_blocks/(ori_block_size/block_size:16)]
+    slot_mapping: Tensor,
+    asm_layout: bool,
+    ori_block_size: int = 128,  # [128/256]
 ): ...

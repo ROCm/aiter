@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -7,23 +7,31 @@ import pandas as pd
 import argparse
 import time
 import os
+import sys
 from aiter import QuantType
-from aiter.jit.core import get_asm_dir
+from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
     asm_stage1,
-    ck_stage1,
     torch_moe_stage1,
+    torch_moe_stage2,
 )
+from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.test_common import checkAllclose
-from aiter.int4_utils import *
+from aiter.int4_utils import (
+    rearrange_4bit_elements,
+    convert_int8_to_uint32_int4,
+)
 from aiter import dtypes
 
+sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
+from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
+
 torch.set_default_device("cuda")
-torch.int4 = torch.uint32
+torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
 def weight_quant(
@@ -71,6 +79,50 @@ def weight_quant(
     return weight_qt, weight_scale
 
 
+def ck_moe_stage2_fwd_out(
+    a2_qt,
+    w1_qt_shffle_ck,
+    w2_qt_shffle_ck,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    topk,
+    dtype,
+    kernelName,
+    w2_scale,
+    a2_scale,
+    blockM,
+    sorted_weights,
+    q_type,
+    act_type,
+):
+    model_dim = w2_qt_shffle_ck.shape[1]
+    token_num = a2_qt.shape[0]
+
+    out = torch.zeros(
+        (token_num, model_dim),
+        dtype=dtype,
+        device=a2_qt.device,
+    )
+    return ck_moe_stage2_fwd(
+        a2_qt,
+        w1_qt_shffle_ck,
+        w2_qt_shffle_ck,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        w2_scale,
+        a2_scale,
+        blockM,
+        sorted_weights,
+        q_type,
+        act_type,
+    )
+
+
 def go(
     untunedf,
     tunedf,
@@ -116,15 +168,15 @@ def go(
         q_dtype_w = eval(q_dtype_w)
         q_type = eval(q_type)
         print("\nStart tuning", line)
-        # if q_dtype_a == dtypes.i8 and q_type == QuantType.per_Tensor:
-        #     print(f'no moe solution for ', line)
-        #     continue
+        if not use_g1u1:
+            print("no moe solution(g1u0) can tune for ", line)
+            continue
         act_type = eval(act_type)
-        input = torch.randn((token, model_dim), dtype=dtype)
+        input = torch.randn((token, model_dim), dtype=dtype) / 10
         if use_g1u1:
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
         else:
-            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype)
+            w1 = torch.randn((expert, inter_dim, model_dim), dtype=dtype) / 10
         w2 = torch.randn((expert, model_dim, inter_dim), dtype=dtype)
         w1_qt, w1_scale = weight_quant(w1, q_type, quant_dtype=q_dtype_w)
         w2_qt, w2_scale = weight_quant(w2, q_type, quant_dtype=q_dtype_w)
@@ -143,7 +195,7 @@ def go(
             a1_qt, a1_scale = torch_quant(input, quant_dtype=q_dtype_a)
         del input, w1, w2, score
 
-        ref = torch_moe_stage1(
+        ref1 = torch_moe_stage1(
             a1_qt,
             w1_qt,
             w2_qt,
@@ -156,12 +208,33 @@ def go(
             w1_scale=w1_scale,
             doweight=doweight_stage1,
         )
+
+        if q_type == QuantType.per_Token:
+            ref1 = ref1.view(token, -1)
         if q_type == QuantType.per_128x128:
-            ref, ref_scale = aiter.pertoken_quant(
-                ref.view(ref.shape[0], -1, 128), quant_dtype=q_dtype_a
+            ref1, ref_scale = aiter.pertoken_quant(
+                ref1.view(ref1.shape[0], -1, 128), quant_dtype=q_dtype_a
             )
-            ref = ref.view(ref.shape[0], topk, -1)
+            ref1 = ref1.view(ref1.shape[0], topk, -1)
             ref_scale = ref_scale.view(token, -1)
+            a2_qt = ref1
+            a2_scale = ref_scale
+        else:
+            torch_quant = aiter.get_torch_quant(q_type)
+            a2_qt, a2_scale = torch_quant(ref1, quant_dtype=q_dtype_a)
+        a2_qt = a2_qt.view(token, topk, -1)
+        ref2 = torch_moe_stage2(
+            a2_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            quant_type=q_type,
+            dtype=dtype,
+            a2_scale=a2_scale,
+            w2_scale=w2_scale,
+            doweight=not doweight_stage1,
+        )
 
         tasks = []
         tasks_ck = []
@@ -193,18 +266,38 @@ def go(
             kernels_list_csv.format(quantDtype=quantDtype, extraInfo=extraInfo)
         )
 
+        _, ck_stage1_kernels = get_gemm1_kernels_list(
+            dtype2str_dict[q_dtype_a],
+            dtype2str_dict[q_dtype_w],
+            False,
+            str(q_type).split(".")[-1].lower(),
+            str(act_type).split(".")[-1].lower(),
+            doweight_stage1,
+        )
+        _, ck_stage2_kernels = get_gemm2_kernels_list(
+            dtype2str_dict[q_dtype_a],
+            dtype2str_dict[q_dtype_w],
+            False,
+            str(q_type).split(".")[-1].lower(),
+            not doweight_stage1,
+        )
+
+        w1_qt_shffle = shuffle_weight(w1_qt, (16, 16))
+        w2_qt_shffle = shuffle_weight(w2_qt, (16, 16))
+
         for blockM in blockMs:
             sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
                 moe_sorting(topk_ids, topk_weights, expert, model_dim, dtype, blockM)
             )
+            del moe_buf
             if q_type != QuantType.per_128x128:
-                out = torch.empty(
+                out1 = torch.empty(
                     (token, topk, inter_dim),
                     dtype=dtype,
                 )
             else:
                 ratio = a1_scale.element_size() // a1_qt.element_size()
-                out = torch.empty(
+                out1 = torch.empty(
                     (token + (token * ratio + 127) // 128, topk, inter_dim),
                     dtype=q_dtype_a,
                 )
@@ -213,16 +306,17 @@ def go(
                 for el in asm_kernels.get(blockM, []):
                     tasks.append(
                         (
-                            (el, blockM),  # tag
+                            ("stage1", el, blockM),  # tag
                             asm_stage1,  # func
                             (
                                 a1_qt,
-                                shuffle_weight(w1_qt, (16, 16)),
-                                shuffle_weight(w2_qt, (16, 16)),
+                                w1_qt_shffle,
+                                w2_qt_shffle,
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                out,
+                                out1.view(dtypes.bf16),
+                                topk,
                                 blockM,
                                 el,
                                 0,
@@ -237,53 +331,105 @@ def go(
                                 sorted_weights if doweight_stage1 else None,
                             ),
                             {},
-                            (ref),
+                            (ref1),
+                            0.01,
+                            0.01,
+                            True,
                         )
                     )
 
             if blockM in [32, 64, 128] and q_type != QuantType.per_128x128:
                 if q_dtype_w == torch.int4:
-                    w1_qt_shffle = rearrange_4bit_elements(
+                    w1_qt_shffle_ck = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(
-                            shuffle_weight(w1_qt, (32, 32), use_int4=True)
+                            shuffle_weight(w1_qt, (16, 16), use_int4=True)
+                        )
+                    )
+                    w2_qt_shffle_ck = rearrange_4bit_elements(
+                        convert_int8_to_uint32_int4(
+                            shuffle_weight(w2_qt, (16, 16), use_int4=True)
                         )
                     )
                 else:
-                    w1_qt_shffle = shuffle_weight(w1_qt, layout=(16, 16))
+                    w1_qt_shffle_ck = w1_qt_shffle
+                    w2_qt_shffle_ck = w2_qt_shffle
 
-                tasks_ck.append(
-                    (
-                        (f"ck_{blockM}", blockM),  # tag
-                        ck_stage1,  # func
+                for kernel in ck_stage1_kernels.values():
+                    if kernel.MPerBlock != blockM:
+                        continue
+                    tasks_ck.append(
                         (
-                            a1_qt,
-                            w1_qt_shffle,
-                            w2_qt,
-                            sorted_ids,
-                            sorted_expert_ids,
-                            num_valid_ids,
-                            out,
-                            blockM,
-                            act_type,
-                            a1_scale,
-                            w1_scale,
-                            sorted_weights if doweight_stage1 else None,
-                        ),
-                        {},
-                        (ref),
+                            ("stage1", kernel.name, blockM),  # tag
+                            ck_moe_stage1_fwd,  # func
+                            (
+                                a1_qt,
+                                w1_qt_shffle_ck,
+                                w2_qt_shffle_ck,
+                                sorted_ids,
+                                sorted_expert_ids,
+                                num_valid_ids,
+                                out1,
+                                topk,
+                                kernel.name,
+                                w1_scale,
+                                a1_scale,
+                                blockM,
+                                sorted_weights if doweight_stage1 else None,
+                                q_type,
+                                act_type,
+                            ),
+                            {},
+                            (ref1),
+                            0.01,
+                            0.01,
+                            True,
+                        )
                     )
-                )
+
+                for kernel in ck_stage2_kernels.values():
+                    if kernel.MPerBlock != blockM:
+                        continue
+                    tasks_ck.append(
+                        (
+                            ("stage2", kernel.name, blockM),  # tag
+                            ck_moe_stage2_fwd_out,  # func
+                            (
+                                a2_qt,
+                                w1_qt_shffle_ck,
+                                w2_qt_shffle_ck,
+                                sorted_ids,
+                                sorted_expert_ids,
+                                num_valid_ids,
+                                topk,
+                                dtype,
+                                kernel.name,
+                                w2_scale,
+                                a2_scale,
+                                blockM,
+                                sorted_weights if not doweight_stage1 else None,
+                                q_type,
+                                act_type,
+                            ),
+                            {},
+                            (ref2),
+                            0.01,
+                            0.01,
+                            True,
+                        )
+                    )
+
         if tasks is None and tasks_ck is None:
-            print("no moe solution for ", line)
+            print("no moe solution can tune for ", line)
             continue
         rets = mp_tuner(tasks + tasks_ck)
 
         profileDF = []
-        for (tag, block_m), us, err in rets:
+        for (stage, kernelName, block_m), us, err in rets:
             if us == float("inf"):
                 continue
             profileDF.append(
                 [
+                    stage,
                     token,
                     model_dim,
                     inter_dim,
@@ -299,15 +445,55 @@ def go(
                     block_m,
                     0,
                     us,
-                    tag,
+                    kernelName,
                     f"{err:.1%}",
                 ]
             )
         profileDF = pd.DataFrame(
-            profileDF, columns=args + ["block_m", "ksplit", "us", "tag", "err"]
+            profileDF,
+            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
         )
-        best_one = profileDF.loc[profileDF["us"].idxmin()]
         prorfiles.append(profileDF)
+        profileDF = profileDF.sort_values("us").drop_duplicates(
+            ["stage", "block_m"], keep="first"
+        )
+        stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
+            columns=["stage"], axis=1
+        )
+        stage1_profileDF = stage1_profileDF.rename(
+            columns={"kernelName": "kernelName1", "err": "err1", "us": "us1"}
+        )
+        stage2_profileDF = profileDF[profileDF["stage"] == "stage2"].drop(
+            columns=["stage", "ksplit"], axis=1
+        )
+        stage2_profileDF = stage2_profileDF.rename(
+            columns={"kernelName": "kernelName2", "err": "err2", "us": "us2"}
+        )
+        profileDF = pd.merge(
+            stage1_profileDF,
+            stage2_profileDF,
+            on=[
+                "token",
+                "model_dim",
+                "inter_dim",
+                "expert",
+                "topk",
+                "act_type",
+                "dtype",
+                "q_dtype_a",
+                "q_dtype_w",
+                "q_type",
+                "use_g1u1",
+                "doweight_stage1",
+                "block_m",
+            ],
+            how="inner",
+        )
+        if profileDF.shape[0] == 0:
+            print("no moe solution can pass for ", line)
+            continue
+        profileDF["total_us"] = profileDF["us1"] + profileDF["us2"]
+        best_one = profileDF.loc[profileDF["total_us"].idxmin()]
         bests.append(best_one)
     print(f"finish tuning, cost {time.perf_counter()-startTS:.8f}s")
     if len(prorfiles) > 0:

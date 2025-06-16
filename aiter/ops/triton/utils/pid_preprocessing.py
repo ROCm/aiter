@@ -1,17 +1,30 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 import triton
 import triton.language as tl
 
 
 @triton.jit
-def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+def remap_xcd(pid, total_pid, NUM_XCDS: tl.constexpr = 8):
+    """
+    Parameters:
+        last_k: the last index of the set, i.e. len(set) - 1
+        k: the index to be remapped
+        NUM_XCD: number of XCDs in the GPU, e.g. 8 for MI300x and MI350
+    Function maps indices pid = 0, ..., total_pid - 1 so that [multiples of NUM_XCD] come first (those present in the set),
+    then [multiples of NUM_XCD] + 1, ..., until [multiples of NUM_XCD] + NUM_XCD - 1
+    As indices are distributed to the XCDs in a round robin fashion, this remaps the indices at the XCDs back to consecutive indices.
+    """
+
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
-    pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS
+    pids_per_xcd = (total_pid + NUM_XCDS - 1) // NUM_XCDS
     # When GRID_MN cannot divide NUM_XCDS, some xcds will have
     # pids_per_xcd pids, the other will have pids_per_xcd - 1 pids.
     # We calculate the number of xcds that have pids_per_xcd pids as
-    # tall_xcds
-    tall_xcds = GRID_MN % NUM_XCDS
+    # tall_xcds: how many xcd has more pids than others
+    tall_xcds = total_pid % NUM_XCDS
     tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
     # Compute current XCD and local pid within the XCD
     xcd = pid % NUM_XCDS

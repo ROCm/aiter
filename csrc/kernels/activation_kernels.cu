@@ -1,6 +1,6 @@
 /*
  * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -132,6 +132,8 @@ namespace vllm
         });
 #endif
 
+namespace aiter {
+
 void silu_and_mul(torch::Tensor &out,   // [..., d]
                   torch::Tensor &input) // [..., 2 * d]
 {
@@ -156,6 +158,8 @@ void gelu_tanh_and_mul(torch::Tensor &out,   // [..., d]
 {
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::gelu_tanh_kernel);
 }
+
+} // namespace aiter
 
 namespace vllm
 {
@@ -211,6 +215,8 @@ namespace vllm
 
 } // namespace vllm
 
+namespace aiter {
+
 void gelu_new(torch::Tensor &out,   // [..., d]
               torch::Tensor &input) // [..., d]
 {
@@ -222,3 +228,5 @@ void gelu_fast(torch::Tensor &out,   // [..., d]
 {
   LAUNCH_ACTIVATION_KERNEL(vllm::gelu_fast_kernel);
 }
+
+} // namespace aiter
