@@ -192,7 +192,7 @@ def test_flash_mla(dtype, b, s_q, mean_sk, h_q, h_kv, d, dv, page_block_size, ca
             torch.finfo(q.dtype).bits // 8
         )
         print(
-            f"{t:.4f} ms, {FLOPS / 10 ** 6 / t:.4f} TFLOPS, {bytes / 10 ** 3 / t:.4f} GB/s"
+            f"{t:.4f} us, {FLOPS / 10 ** 6 / t:.4f} TFLOPS, {bytes / 10 ** 3 / t:.4f} GB/s"
         )
 
     print("====================================")
