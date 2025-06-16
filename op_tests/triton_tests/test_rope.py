@@ -392,13 +392,6 @@ def test_rope_fwd_cached(
         else freqs
     )
 
-    if DEBUG_MODE:
-        print(f"x.shape={x.shape} x={x}")
-        if pos:
-            print(f"positions.shape={positions.shape} positions={positions}")
-        if offs:
-            print(f"offsets.shape={offsets.shape} offsets={offsets}")
-        print(f"freqs.shape={freqs.shape} freqs.strides={freqs.stride()} freqs={freqs}")
     torch_out = ref_rope_sbhd_fwd(
         x,
         ref_freqs,
@@ -493,8 +486,9 @@ def test_rope_fwd_cached(
 @pytest.mark.parametrize(
     "nope, nope_first", [(False, False)]
 )  # TODO add support nope and nope_first
-# @pytest.mark.parametrize('reuse_freqs_front_part', [True, False]) #TODO add support for False
-@pytest.mark.parametrize("reuse_freqs_front_part", [True])
+@pytest.mark.parametrize(
+    "reuse_freqs_front_part", [True, False]
+)  # TODO add support for False
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("inplace", [True, False])
 @pytest.mark.parametrize("pos, offs", [(True, False), (True, True)])
@@ -527,23 +521,29 @@ def test_rope_fwd_cached_thd_2c(
         dtype=dtype,
     )
 
-    if pos is False:
-        pytest.skip(
-            "there is no version of RoPE with 2 inputs without positions for now"
+    ref_freqs = (
+        freqs[positions if offsets is None else torch.add(positions, offsets)].squeeze(
+            -2
         )
-
-    torch_out_x, torch_out_y = ref_rope_cached_thd_positions_offsets_2c_fwd(
-        x,
-        y,
-        cos,
-        sin,
-        positions,
-        offsets,
-        rotate_style,
-        reuse_freqs_front_part,
-        nope,
-        nope_first,
+        if pos
+        else freqs
     )
+
+    torch_out_x = ref_rope_sbhd_fwd(
+        x.unsqueeze(0),
+        ref_freqs,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope_first=nope_first,
+    ).squeeze(0)
+    torch_out_y = ref_rope_sbhd_fwd(
+        y.unsqueeze(0),
+        ref_freqs,
+        rotate_style=rotate_style,
+        reuse_freqs_front_part=reuse_freqs_front_part,
+        nope_first=nope_first,
+    ).squeeze(0)
+
     if DEBUG_MODE:
         print(f"torch_out_x={torch_out_x}")
         print(f"torch_out_y={torch_out_y}")

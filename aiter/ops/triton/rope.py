@@ -74,6 +74,9 @@ def _rope_fwd_kernel_sbhd(
     stride_out_h,
     stride_out_d,
     S,
+    HAVE_NOPE: tl.constexpr,
+    NOPE_FIRST: tl.constexpr,
+    INPLACE: tl.constexpr,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -113,11 +116,15 @@ def _rope_fwd_kernel_sbhd(
     cos = tl.cos(freqs.to(tl.float32))
     sin = tl.sin(freqs.to(tl.float32))
 
+    nope_offs = 0
+    if HAVE_NOPE and NOPE_FIRST:
+        nope_offs = BLOCK_D
+
     x_offs = (
         b * stride_x_b
         + s_offs[:, None] * stride_x_s
         + h * stride_x_h
-        + d_offs[None, :] * stride_x_d
+        + (d_offs + nope_offs)[None, :] * stride_x_d
     )
     x_mask = s_mask[:, None] & (d_offs < BLOCK_D)[None, :]
     x = tl.load(x_ptr + x_offs, mask=x_mask)
@@ -139,10 +146,18 @@ def _rope_fwd_kernel_sbhd(
         b * stride_out_b
         + s_offs[:, None] * stride_out_s
         + h * stride_out_h
-        + d_offs[None, :] * stride_out_d
+        + (d_offs + nope_offs)[None, :] * stride_out_d
     )
 
     tl.store(out_ptr + x_out_offs, out_x, mask=x_mask)
+
+    if HAVE_NOPE and not INPLACE:
+        if NOPE_FIRST:
+            x = tl.load(x_ptr + x_offs - BLOCK_D * stride_x_d, mask=x_mask)
+            tl.store(out_ptr + x_out_offs - BLOCK_D * stride_out_d, x, mask=x_mask)
+        else:
+            x = tl.load(x_ptr + x_offs + BLOCK_D * stride_x_d, mask=x_mask)
+            tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
 @triton.jit
@@ -161,6 +176,9 @@ def _rope_fwd_kernel_thd(
     stride_out_t,
     stride_out_h,
     stride_out_d,
+    HAVE_NOPE: tl.constexpr,
+    NOPE_FIRST: tl.constexpr,
+    INPLACE: tl.constexpr,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -204,10 +222,14 @@ def _rope_fwd_kernel_thd(
     cos = tl.cos(freqs.to(tl.float32))
     sin = tl.sin(freqs.to(tl.float32))
 
+    nope_offs = 0
+    if HAVE_NOPE and NOPE_FIRST:
+        nope_offs = BLOCK_D
+
     x_offs = (
         (t_start + t_offs)[:, None] * stride_x_t
         + h * stride_x_h
-        + d_offs[None, :] * stride_x_d
+        + (d_offs + nope_offs)[None, :] * stride_x_d
     )
     x_mask = t_mask[:, None] & (d_offs < BLOCK_D)[None, :]
     x = tl.load(x_ptr + x_offs, mask=x_mask)
@@ -228,10 +250,18 @@ def _rope_fwd_kernel_thd(
     x_out_offs = (
         (t_start + t_offs)[:, None] * stride_out_t
         + h * stride_out_h
-        + d_offs[None, :] * stride_out_d
+        + (d_offs + nope_offs)[None, :] * stride_out_d
     )
 
     tl.store(out_ptr + x_out_offs, out_x, mask=x_mask)
+
+    if HAVE_NOPE and not INPLACE:
+        if NOPE_FIRST:
+            x = tl.load(x_ptr + x_offs - BLOCK_D * stride_x_d, mask=x_mask)
+            tl.store(out_ptr + x_out_offs - BLOCK_D * stride_out_d, x, mask=x_mask)
+        else:
+            x = tl.load(x_ptr + x_offs + BLOCK_D * stride_x_d, mask=x_mask)
+            tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
 @triton.jit
@@ -257,6 +287,9 @@ def _rope_fwd_kernel_sbhd_cached(
     stride_out_h,
     stride_out_d,
     S,
+    HAVE_NOPE: tl.constexpr,
+    NOPE_FIRST: tl.constexpr,
+    INPLACE: tl.constexpr,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     HAVE_POS: tl.constexpr,
@@ -305,11 +338,15 @@ def _rope_fwd_kernel_sbhd_cached(
     cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
     sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
+    nope_offs = 0
+    if HAVE_NOPE and NOPE_FIRST:
+        nope_offs = BLOCK_D
+
     x_offs = (
         b * stride_x_b
         + s_offs[:, None] * stride_x_s
         + h * stride_x_h
-        + d_offs[None, :] * stride_x_d
+        + (d_offs + nope_offs)[None, :] * stride_x_d
     )
     x_mask = s_mask[:, None] & (d_offs < BLOCK_D)[None, :]
     x = tl.load(x_ptr + x_offs, mask=x_mask)
@@ -331,10 +368,18 @@ def _rope_fwd_kernel_sbhd_cached(
         b * stride_out_b
         + s_offs[:, None] * stride_out_s
         + h * stride_out_h
-        + d_offs[None, :] * stride_out_d
+        + (d_offs + nope_offs)[None, :] * stride_out_d
     )
 
     tl.store(out_ptr + x_out_offs, out_x, mask=x_mask)
+
+    if HAVE_NOPE and not INPLACE:
+        if NOPE_FIRST:
+            x = tl.load(x_ptr + x_offs - BLOCK_D * stride_x_d, mask=x_mask)
+            tl.store(out_ptr + x_out_offs - BLOCK_D * stride_out_d, x, mask=x_mask)
+        else:
+            x = tl.load(x_ptr + x_offs + BLOCK_D * stride_x_d, mask=x_mask)
+            tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
 @triton.jit
@@ -357,6 +402,9 @@ def _rope_2c_fwd_kernel_thd_cached(
     stride_out_h,
     stride_out_d,
     T,
+    HAVE_NOPE: tl.constexpr,
+    NOPE_FIRST: tl.constexpr,
+    INPLACE: tl.constexpr,
     REUSE_FREQS_FRONT_PART: tl.constexpr,
     IS_NEOX: tl.constexpr,
     HAVE_POS: tl.constexpr,
@@ -416,10 +464,14 @@ def _rope_2c_fwd_kernel_thd_cached(
     cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
     sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
 
+    nope_offs = 0
+    if HAVE_NOPE and NOPE_FIRST:
+        nope_offs = BLOCK_D
+
     h_start_idx = h_s * SPLIT_H_SIZE
 
     x_mask = t_mask[:, None] & (d_offs < BLOCK_D)[None, :]
-    x_offs_base = t_offs[:, None] * stride_x_t + d_offs[None, :] * stride_x_d
+    x_offs_base = t_offs[:, None] * stride_x_t + (d_offs + nope_offs)[None, :] * stride_x_d
 
     if IS_NEOX:
         x_rotated_mask = (d_offs < BLOCK_D_HALF)[None, :]
@@ -1095,21 +1147,9 @@ def _rope_fwd(
     if have_nope:
         BLOCK_D = d // 2
         BLOCK_D_HALF = d // 4
-        if nope_first:
-            x_ = x[..., BLOCK_D:]
-            out_ = out[..., BLOCK_D:]
-            if not inplace:
-                out[..., :BLOCK_D] = x[..., :BLOCK_D]
-        else:
-            x_ = x[..., :BLOCK_D]
-            out_ = out[..., :BLOCK_D]
-            if not inplace:
-                out[..., BLOCK_D:] = x[..., BLOCK_D:]
     else:
         BLOCK_D = d
         BLOCK_D_HALF = d // 2
-        x_ = x
-        out_ = out
 
     # TODO: performance optimization
     BLOCK_S = 32
@@ -1118,13 +1158,16 @@ def _rope_fwd(
     grid = (b, h, triton.cdiv(s, BLOCK_S))
 
     _rope_fwd_kernel_sbhd[grid](
-        x_,
+        x,
         freqs,
-        out_,
-        *x_.stride(),
+        out,
+        *x.stride(),
         *freqs.stride(),
-        *out_.stride(),
+        *out.stride(),
         s,
+        HAVE_NOPE=have_nope,
+        NOPE_FIRST=nope_first,
+        INPLACE=inplace,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=(rotate_style == RotateStyle.NEOX),
         BLOCK_S=BLOCK_S,
@@ -1213,21 +1256,9 @@ def _rope_fwd_thd(
     if have_nope:
         BLOCK_D = d // 2
         BLOCK_D_HALF = d // 4
-        if nope_first:
-            x_ = x[..., BLOCK_D:]
-            out_ = out[..., BLOCK_D:]
-            if not inplace:
-                out[..., :BLOCK_D] = x[..., :BLOCK_D]
-        else:
-            x_ = x[..., :BLOCK_D]
-            out_ = out[..., :BLOCK_D]
-            if not inplace:
-                out[..., BLOCK_D:] = x[..., BLOCK_D:]
     else:
         BLOCK_D = d
         BLOCK_D_HALF = d // 2
-        x_ = x
-        out_ = out
 
     # TODO: performance optimization
     BLOCK_T = 32
@@ -1236,13 +1267,16 @@ def _rope_fwd_thd(
     grid = (b, h, triton.cdiv(t, BLOCK_T))
 
     _rope_fwd_kernel_thd[grid](
-        x_,
+        x,
         cu_seqlens,
         freqs,
-        out_,
-        *x_.stride(),
+        out,
+        *x.stride(),
         *freqs.stride(),
-        *out_.stride(),
+        *out.stride(),
+        HAVE_NOPE=have_nope,
+        NOPE_FIRST=nope_first,
+        INPLACE=inplace,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=(rotate_style == RotateStyle.NEOX),
         BLOCK_T=BLOCK_T,
@@ -1337,21 +1371,9 @@ def _rope_cached_fwd(
     if have_nope:
         BLOCK_D = d // 2
         BLOCK_D_HALF = d // 4
-        if nope_first:
-            x_ = x[..., BLOCK_D:]
-            out_ = out[..., BLOCK_D:]
-            if not inplace:
-                out[..., :BLOCK_D] = x[..., :BLOCK_D]
-        else:
-            x_ = x[..., :BLOCK_D]
-            out_ = out[..., :BLOCK_D]
-            if not inplace:
-                out[..., BLOCK_D:] = x[..., BLOCK_D:]
     else:
         BLOCK_D = d
         BLOCK_D_HALF = d // 2
-        x_ = x
-        out_ = out
 
     # TODO: performance optimization
     BLOCK_S = 32
@@ -1361,17 +1383,20 @@ def _rope_cached_fwd(
 
     pos_stride = positions.stride() if positions is not None else (1, 1)
     _rope_fwd_kernel_sbhd_cached[grid](
-        x_,
+        x,
         cos,
         sin,
         positions,
         offsets,
-        out_,
-        *x_.stride(),
+        out,
+        *x.stride(),
         *cos.stride(),
         *pos_stride,
-        *out_.stride(),
+        *out.stride(),
         s,
+        HAVE_NOPE=have_nope,
+        NOPE_FIRST=nope_first,
+        INPLACE=inplace,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=(rotate_style == RotateStyle.NEOX),
         HAVE_POS=(positions is not None),
@@ -1575,6 +1600,7 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
+    inplace: bool,
     transpose_output: bool = False,
 ):
     if nope_first:
@@ -1594,8 +1620,12 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
     else:
         have_nope = False
 
-    BLOCK_D = d
-    BLOCK_D_HALF = d // 2
+    if have_nope:
+        BLOCK_D = d // 2
+        BLOCK_D_HALF = d // 4
+    else:
+        BLOCK_D = d
+        BLOCK_D_HALF = d // 2
 
     BLOCK_T = 32
     SPLIT_T = (triton.next_power_of_2(t) + BLOCK_T - 1) // BLOCK_T
@@ -1638,6 +1668,9 @@ def _rope_cached_thd_positions_offsets_2c_fwd(
         *positions.stride(),
         *out_x.stride(),
         t,
+        HAVE_NOPE=have_nope,
+        NOPE_FIRST=nope_first,
+        INPLACE=inplace,
         REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
         IS_NEOX=(rotate_style == RotateStyle.NEOX),
         HAVE_POS=(positions is not None),
@@ -1681,6 +1714,7 @@ def rope_cached_thd_positions_2c_fwd(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        False,
         transpose_output,
     )
 
@@ -1713,6 +1747,7 @@ def rope_cached_thd_positions_2c_fwd_inplace(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
         transpose_output,
     )
 
@@ -1747,6 +1782,7 @@ def rope_cached_thd_positions_offsets_2c_fwd(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        False,
         transpose_output,
     )
 
@@ -1780,6 +1816,7 @@ def rope_cached_thd_positions_offsets_2c_fwd_inplace(
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
         transpose_output,
     )
 
