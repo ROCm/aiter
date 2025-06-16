@@ -44,17 +44,22 @@ def run_mori(rankID, world_size, E, tokens, topk_weights, topk_ids):
     )
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
 
-    dispatch_output, dispatch_weights, dispatch_ids = mori_op.dispatch(
+    dispatch_output, dispatch_weights, dispatch_ids, dispatch_recv_token_num = mori_op.dispatch(
         tokens, topk_weights, topk_ids
     )
     torch.cuda.synchronize()
-    src_token_pos = mori_op.get_dispatch_src_token_pos()
+
+    src_token_pos = mori_op.get_dispatch_src_token_pos().cpu()
+    # Copy dispatch output to cpu before run combine since they share the same buffer
+    dispatch_output_cpu = dispatch_output[: src_token_pos.shape[0]].cpu()
+    dispatch_ids_cpu = dispatch_ids[: src_token_pos.shape[0]].cpu()
 
     combine_output = mori_op.combine(dispatch_output, topk_weights, topk_ids)
+
     # destroy dist
     aiter.destroy_dist_env()
-    # return dispatch_ids[:10].cpu(), 1
-    return dispatch_ids[: src_token_pos.shape[0]+1].cpu(), 1
+
+    return dispatch_output_cpu, dispatch_ids_cpu, src_token_pos, 1
 
 
 def test_dispatch_combine(world_size, shape, dtype, E, topk):
@@ -68,9 +73,9 @@ def test_dispatch_combine(world_size, shape, dtype, E, topk):
     topk_weights, topk_ids = fused_topk(tokens, score, topk, True)
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
-    tokens_dp = tokens.split(world_size)
-    topk_weights_dp = topk_weights.split(world_size)
-    topk_ids_dp = topk_ids.to(torch.uint32).split(world_size)
+    tokens_dp = tokens.chunk(world_size)
+    topk_weights_dp = topk_weights.chunk(world_size)
+    topk_ids_dp = topk_ids.to(torch.uint32).chunk(world_size)
     for i in range(world_size):
         x = torch.randn(shape, dtype=dtype)
         ref += x
@@ -91,16 +96,20 @@ def test_dispatch_combine(world_size, shape, dtype, E, topk):
     pool.join()
     rets = [el.get() for el in rets]
     print(f"{topk_ids=}")
-    for i, (out, us) in enumerate(rets):
+    for i, (out, dispatch_ids, src_token_pos, us) in enumerate(rets):
         mask = (topk_ids >= i * E // world_size) & (
             topk_ids < (i + 1) * E // world_size
         )
         ref = topk_ids[mask.any(1)]
         print(f"{mask=}")
         print(f"{ref=}")
-        print(f"{out=}")
-        print(f"{ref.shape=}, {out.shape=}")
-        checkAllclose(topk_ids[mask.any(1)], out.to(topk_ids))
+        print(f"{dispatch_ids=}")
+        print(f"{ref.shape=}, {dispatch_ids.shape=}")
+
+        # Mori dispatch / combine does not guarantee ordering, use this tensor to recover original order
+        src_token_order = torch.sort(src_token_pos)[1]
+        checkAllclose(tokens[mask.any(1)], out[src_token_order].to(tokens))
+        checkAllclose(topk_ids[mask.any(1)], dispatch_ids.to(torch.int)[src_token_order].to(topk_ids))
 
 
 l_dtype = ["bf16"]
