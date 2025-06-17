@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
 import functools
+import os
 import subprocess
 
-from aiter.jit.utils.cpp_extension import executable_path
+from cpp_extension import executable_path
 
 
 @functools.lru_cache(maxsize=1)
@@ -13,7 +13,9 @@ def get_gfx():
     if gfx == "native":
         try:
             rocminfo = executable_path("rocminfo")
-            result = subprocess.run([rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            result = subprocess.run(
+                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
             output = result.stdout
             for line in output.split("\n"):
                 if "gfx" in line.lower():
