@@ -4,7 +4,6 @@
 import torch
 import triton
 import pytest
-import numpy as np
 from enum import Enum
 from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
 
