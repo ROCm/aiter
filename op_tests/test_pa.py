@@ -15,6 +15,7 @@ from aiter.test_common import (
     benchmark,
 )
 from aiter import pertoken_quant
+import argparse
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -802,9 +803,58 @@ def test_paged_attention(
     )
 
 
-for num_heads in [(4, 1), (8, 1), (32, 8)]:
-    for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097]:
-        for dtype in [dtypes.fp16, dtypes.bf16]:
+l_num_heads = [(4, 1), (8, 1), (32, 8)]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
+l_dtype = ["fp16", "bf16"]
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+
+parser.add_argument(
+    "-n",
+    "--num_heads",
+    type=dtypes.str2tuple,
+    choices=l_num_heads,
+    nargs="?",
+    const=None,
+    default=None,
+    help="number of heads (num_query_heads, num_kv_heads)",
+)
+
+parser.add_argument(
+    "-c",
+    "--ctx_len",
+    type=int,
+    choices=l_ctx_len,
+    nargs="?",
+    const=None,
+    default=None,
+    help="context length",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.num_heads is not None:
+    l_num_heads = [args.num_heads]
+if args.ctx_len is not None:
+    l_ctx_len = [args.ctx_len]
+
+
+for num_heads in l_num_heads:
+    for ctx_len in l_ctx_len:
+        for dtype in l_dtype:
             test_paged_attention(
                 ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )
