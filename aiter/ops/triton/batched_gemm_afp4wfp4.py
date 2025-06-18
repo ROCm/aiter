@@ -313,6 +313,7 @@ def _get_config(
  
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
+
     return config
 
 
@@ -341,6 +342,8 @@ def batched_gemm_afp4wfp4(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+
+    assert (arch_info.is_fp4_avail()), f"MXFP4 is not available on your device"
 
     Bx, M, K = x.shape
     Bw, K, N = w.shape

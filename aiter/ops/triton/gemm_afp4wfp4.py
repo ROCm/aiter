@@ -600,6 +600,8 @@ def gemm_afp4wfp4_preshuffled_scales(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+    
+    assert (arch_info.is_fp4_avail()), f"MXFP4 is not available on your device"
 
     M, K = x.shape
     K, N = w.shape

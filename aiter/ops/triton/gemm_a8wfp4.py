@@ -347,9 +347,11 @@ def gemm_a8wfp4(
     - Every 32 consecutive elements in the K dimension of W share one e8m0 scale
     - X uses per-row scaling (not per-group scaling)
     """
-
     M, K = x.shape
     K_packed, N = w.shape
+
+    assert (arch_info.is_fp4_avail()), f"MXFP4 is not available on your device"
+
     assert (
         K_packed == K // 2
     ), f"Inconsistent shapes: x has K={K} but w has K_packed={K_packed}, expected {K//2}"

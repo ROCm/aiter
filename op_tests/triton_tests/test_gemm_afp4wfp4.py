@@ -8,6 +8,7 @@ from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_scales,
 )
+import aiter.ops.triton.utils.arch_info as arch_info
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
@@ -178,7 +179,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
-    if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
+    if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
     if TRITON_HIP_PRESHUFFLE_SCALES:
