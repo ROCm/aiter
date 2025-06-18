@@ -8,9 +8,9 @@ import torch
 
 @triton.jit
 def _static_per_tensor_fp8_quant_kernel(
-    qx_ptr: torch.Tensor,
-    x_in_ptr: torch.Tensor,
-    scale_in_ptr: torch.Tensor,
+    qx_ptr,
+    x_in_ptr,
+    scale_in_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
@@ -55,8 +55,8 @@ def static_per_tensor_fp8_quant(
 
 @triton.jit
 def _dynamic_per_tensor_fp8_quant_kernel(
-    x_in_ptr: torch.Tensor,
-    scale_out_ptr: torch.Tensor,
+    x_in_ptr,
+    scale_out_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
@@ -106,9 +106,9 @@ def dynamic_per_tensor_fp8_quant(
 
 @triton.jit
 def _dynamic_per_token_fp8_quant_kernel(
-    qx_ptr: torch.Tensor,
-    scale_out_ptr: torch.Tensor,
-    x_in_ptr: torch.Tensor,
+    qx_ptr,
+    scale_out_ptr,
+    x_in_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
