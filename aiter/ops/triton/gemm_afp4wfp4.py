@@ -462,7 +462,6 @@ def _get_config(
         return _get_config._config_dict["xlarge"]
 
 
-# Wrapper for gemm kernel.
 def gemm_afp4wfp4(
     x,
     w,
@@ -497,7 +496,7 @@ def gemm_afp4wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    # print(f"AFP4WFP4_config={config}")
+    
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
