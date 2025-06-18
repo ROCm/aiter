@@ -2,13 +2,22 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
+import functools
+import json
 import os
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
-DEBUG = False
+global _USE_GEMM_SPLITK_BF16
+_USE_GEMM_SPLITK_BF16 = False
+
+def set_use_gemm_splitk_bf16(value: bool):
+    global _USE_GEMM_SPLITK_BF16
+    _USE_GEMM_SPLITK_BF16 = value 
 
 
 @triton.heuristics(
@@ -239,9 +248,6 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
     while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
-        # print(K, SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT)
-        # print(K % (SPLITK_BLOCK_SIZE // 2) == 0, SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0, K % (BLOCK_SIZE_K // 2) == 0)
-
         if (
             K % (SPLITK_BLOCK_SIZE // 2) == 0
             and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
@@ -264,10 +270,48 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
             triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
         )
 
-    # print(K, SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2, NUM_KSPLIT)
-    # print(K % (SPLITK_BLOCK_SIZE // 2) == 0, SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0, K % (BLOCK_SIZE_K // 2) == 0)
     return SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT
 
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8WFP4.json"
+
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    if M < 32:
+        config = _get_config._config_dict["M_LT_32"]
+    elif M == 32:
+        config = _get_config._config_dict["M_EQ_32"]
+    elif M <= 64:
+        config = _get_config._config_dict["M_33_64"]
+    elif M <= 128:
+        config = _get_config._config_dict["M_65_128"]
+    elif M <= 256:
+        config = _get_config._config_dict["M_129_256"]
+    else:
+        config = _get_config._config_dict["default"]
+
+    if M <= 128:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE 
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT 
+ 
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    return config
 
 def gemm_a8wfp4(
     x,
@@ -276,6 +320,7 @@ def gemm_a8wfp4(
     x_scales,
     w_scales,
     dtype: Optional[float] = torch.bfloat16,
+    config: Optional[dict] = None,
 ):
     """
     Computes the matmul Y = X @ W.T (where W.T is the logical transpose of unpacked W)
@@ -313,126 +358,34 @@ def gemm_a8wfp4(
         K // 32,
     ), f"Scale shapes incorrect: x_scales should be ({M}, 1), got {x_scales.shape}; w_scales should be ({N}, {K//32}), got {w_scales.shape}"
 
-    if M < 32:
-        BLOCK_SIZE_M = 16
-        BLOCK_SIZE_N = 64
-        BLOCK_SIZE_K = 256
-        GROUP_SIZE_M = 1
-        waves_per_eu = 6
-        kpack = 1
-        num_warps = 4
-        num_stages = 2
-        matrix_instr_nonkdim = 16
-        cache_modifier = ".cg"
+    if config is None:
+        config = _get_config(M, N, K)
 
-        NUM_KSPLIT = 4
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, BLOCK_SIZE_K, NUM_KSPLIT
-        )
-
-        if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
-            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
+    if M <= 128:
+        if _USE_GEMM_SPLITK_BF16:
+            y_pp = torch.empty((config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device)
         else:
-            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
-    elif M <= 128:
-        BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 128
-        BLOCK_SIZE_K = 256
-        GROUP_SIZE_M = 1
-        waves_per_eu = 4
-        kpack = 1
-        num_warps = 4
-        num_stages = 2
-        matrix_instr_nonkdim = 16
-        cache_modifier = ".cg"
-
-        NUM_KSPLIT = 4
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, BLOCK_SIZE_K, NUM_KSPLIT
-        )
-
-        if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
-            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=y.dtype, device=y.device)
-        else:
-            y_pp = torch.empty((NUM_KSPLIT, M, N), dtype=torch.float32, device=y.device)
-    elif M <= 256:
-        BLOCK_SIZE_M = 128
-        BLOCK_SIZE_N = 128
-        BLOCK_SIZE_K = 256
-        GROUP_SIZE_M = 2
-        waves_per_eu = 4
-        kpack = 1
-        num_warps = 4
-        num_stages = 2
-        matrix_instr_nonkdim = 16
-        cache_modifier = ".cg"
-
-        NUM_KSPLIT = 1
-        SPLITK_BLOCK_SIZE = 2 * K
-        y_pp = None
+            y_pp = torch.empty((config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device)
     else:
-        BLOCK_SIZE_M = 256
-        BLOCK_SIZE_N = 256
-        BLOCK_SIZE_K = 256
-        GROUP_SIZE_M = 32
-        waves_per_eu = 1
-        kpack = 1
-        num_warps = 8
-        num_stages = 2
-        matrix_instr_nonkdim = 32
-        cache_modifier = None
-
-        NUM_KSPLIT = 1
         SPLITK_BLOCK_SIZE = 2 * K
         y_pp = None
 
     grid = lambda META: (  # noqa: E731
         (
-            NUM_KSPLIT
+            config["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
 
-    y_final = y if NUM_KSPLIT == 1 else y_pp
+    y_final = y if config["NUM_KSPLIT"] == 1 else y_pp
     stride_am, stride_ak = x.stride()
     stride_bk, stride_bn = w.stride()
     stride_ck, stride_cm, stride_cn = (
-        (0, y.stride(0), y.stride(1)) if NUM_KSPLIT == 1 else y_pp.stride()
+        (0, y.stride(0), y.stride(1)) if config["NUM_KSPLIT"] == 1 else y_pp.stride()
     )
     stride_asm, stride_ask = x_scales.stride()
     stride_bsn, stride_bsk = w_scales.stride()
-
-    if DEBUG:
-        print(
-            "grid:", grid({"BLOCK_SIZE_M": BLOCK_SIZE_M, "BLOCK_SIZE_N": BLOCK_SIZE_N})
-        )
-        print("x:", x)
-        print("w:", w)
-        print("y_final:", y_final)
-        print("x_scales", x_scales)
-        print("w_scales:", w_scales)
-        print("M:", M)
-        print("N:", N)
-        print("K:", K)
-        print("stride_am:", stride_am)
-        print("stride_ak:", stride_ak)
-        print("stride_bk:", stride_bk)
-        print("stride_bn:", stride_bn)
-        print("stride_ck:", stride_ck)
-        print("stride_cm:", stride_cm)
-        print("stride_cn:", stride_cn)
-        print("stride_asm:", stride_asm)
-        print("stride_ask:", stride_ask)
-        print("stride_bsn:", stride_bsn)
-        print("stride_bsk:", stride_bsk)
-        print("BLOCK_SIZE_M:", BLOCK_SIZE_M)
-        print("BLOCK_SIZE_N:", BLOCK_SIZE_N)
-        print("BLOCK_SIZE_K:", BLOCK_SIZE_K)
-        print("GROUP_SIZE_M:", GROUP_SIZE_M)
-        print("NUM_KSPLIT:", NUM_KSPLIT)
-        print("SPLITK_BLOCK_SIZE:", SPLITK_BLOCK_SIZE)
-        print("cache_modifier:", cache_modifier)
 
     _gemm_a8wfp4_kernel[grid](
         x,
@@ -454,30 +407,19 @@ def gemm_a8wfp4(
         stride_ask,
         stride_bsn,
         stride_bsk,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        NUM_KSPLIT,
-        SPLITK_BLOCK_SIZE,
         RAW_MASKED_LOADS=True,
-        cache_modifier=cache_modifier,
-        waves_per_eu=waves_per_eu,
-        kpack=kpack,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
+        **config
     )
 
-    if NUM_KSPLIT > 1:
+    if config["NUM_KSPLIT"] > 1:
         REDUCE_BLOCK_SIZE_M = 16
         # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = (
-            128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 64
+            128 if _USE_GEMM_SPLITK_BF16 else 64
         )
-        ACTUAL_KSPLIT = triton.cdiv(K, (SPLITK_BLOCK_SIZE))
+        ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"]))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
@@ -496,5 +438,5 @@ def gemm_a8wfp4(
             REDUCE_BLOCK_SIZE_M,
             REDUCE_BLOCK_SIZE_N,
             ACTUAL_KSPLIT,
-            NUM_KSPLIT,
+            config["NUM_KSPLIT"],
         )

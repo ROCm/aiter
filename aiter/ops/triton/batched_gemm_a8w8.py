@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
 from typing import Optional
+import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
@@ -178,6 +182,25 @@ def _batched_gemm_a8w8_kernel(
 
     tl.store(c_ptrs, c, mask=c_mask)
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8.json"
+        print(f"fpath={fpath}")
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    if M + N >= 4096:
+        return _get_config._config_dict["large"]
+    else:
+        return _get_config._config_dict["small"]
+
 
 def batched_gemm_a8w8(
     XQ: torch.Tensor,
@@ -188,6 +211,7 @@ def batched_gemm_a8w8(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     splitK: Optional[int] = None,
     YQ: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
     """
     Computes the matmul YQ[i] = XQ[i] x WQ[i]T and applies a conversion scale for every i in a given batch.
@@ -233,25 +257,12 @@ def batched_gemm_a8w8(
     if YQ is None:
         YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
 
-    if (M + N) >= 4096:
-        BLOCK_SIZE_M = 256
-        BLOCK_SIZE_N = 256
-        BLOCK_SIZE_K = 64
-        GROUP_SIZE_M = 4
-    else:
-        BLOCK_SIZE_M = 128
-        BLOCK_SIZE_N = 128
-        BLOCK_SIZE_K = 32
-        GROUP_SIZE_M = 1
+    if config is None:
+        config = _get_config(M, N, K)
 
-    waves_per_eu = 2
-    matrix_instr_nonkdim = 16
-    num_warps = 8
-    num_stages = 2
-
-    grid = (
+    grid = lambda META: ( # noqa: E731
         B,
-        triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
     _batched_gemm_a8w8_kernel[grid](
@@ -277,13 +288,7 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **config
     )
+
     return YQ

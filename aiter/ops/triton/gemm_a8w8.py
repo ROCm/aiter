@@ -187,7 +187,6 @@ def _get_config(
             config = json.load(file)
         _get_config._config_dict = config
 
-    # TODO: Update this logic
     return _get_config._config_dict["any"]
 
 
