@@ -243,15 +243,18 @@ def gemm_a8w8_blockscale(
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
-        config = _get_config(M, N, K) 
+        config = _get_config(M, N, K)
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
 
-    grid = lambda META: ( # noqa: E731
-        (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
+    grid = lambda META: (  # noqa: E731
+        (
+            triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+        )
     )
     _gemm_a8w8_blockscale_kernel[grid](
         x,

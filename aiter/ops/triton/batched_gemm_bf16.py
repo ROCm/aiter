@@ -231,7 +231,7 @@ def batched_gemm_bf16(
     if config is None:
         config = _get_config(M, N, K)
 
-    grid = lambda META: ( # noqa: E731
+    grid = lambda META: (  # noqa: E731
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -255,7 +255,7 @@ def batched_gemm_bf16(
         YQ.stride(2),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        **config
+        **config,
     )
 
     return YQ

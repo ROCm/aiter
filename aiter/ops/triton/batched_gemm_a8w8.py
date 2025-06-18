@@ -182,6 +182,7 @@ def _batched_gemm_a8w8_kernel(
 
     tl.store(c_ptrs, c, mask=c_mask)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
@@ -260,7 +261,7 @@ def batched_gemm_a8w8(
     if config is None:
         config = _get_config(M, N, K)
 
-    grid = lambda META: ( # noqa: E731
+    grid = lambda META: (  # noqa: E731
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
@@ -288,7 +289,7 @@ def batched_gemm_a8w8(
         w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        **config
+        **config,
     )
 
     return YQ

@@ -126,7 +126,7 @@ def _gemm_afp4_wfp4_kernel(
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
-            
+
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -490,7 +490,7 @@ def gemm_afp4wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -600,8 +600,8 @@ def gemm_afp4wfp4_preshuffled_scales(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
-    
-    assert (arch_info.is_fp4_avail()), f"MXFP4 is not available on your device"
+
+    assert arch_info.is_fp4_avail(), f"MXFP4 is not available on your device"
 
     M, K = x.shape
     K, N = w.shape
@@ -611,7 +611,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     if config is None:
         config = _get_config(M, N, K)
-    
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
