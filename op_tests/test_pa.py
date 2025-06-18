@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
 from typing import List, Optional, Tuple, Union
@@ -15,6 +15,7 @@ from aiter.test_common import (
     benchmark,
 )
 from aiter import pertoken_quant
+import pandas as pd
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -396,10 +397,11 @@ def run_aiter_asm(
         block_tables,
         seq_lens,
         max_num_blocks,
-        k_scale,
-        v_scale,
-        None,
-        high_precision,
+        max_qlen=1,
+        K_QScale=k_scale,
+        V_QScale=v_scale,
+        out_=None,
+        high_precision=high_precision,
     )
 
 
@@ -563,7 +565,8 @@ def test_paged_attention(
     )
     # tensor_dump(out_aiter, 'out_aiter')
 
-    if num_kv_heads == 1:
+    time_aiter_asm = None
+    if dtype == dtypes.bf16:
         out_aiter_asm, time_aiter_asm = run_aiter_asm(
             query.contiguous(),  # this kernel need contiguous buffer
             k_cache,
@@ -800,11 +803,16 @@ def test_paged_attention(
     print(
         f"finish~ {ctx_lens=}, {num_seqs=}, {num_heads=}, {head_size=}, {use_alibi=}, {block_size=}, {dtype=}, {kv_cache_dtype=}\n"
     )
+    return {"aiter_shomy": time_aiter, "aiter_asm": time_aiter_asm}
 
 
+df = []
 for num_heads in [(4, 1), (8, 1), (32, 8)]:
     for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097]:
-        for dtype in [dtypes.fp16, dtypes.bf16]:
-            test_paged_attention(
+        for dtype in [dtypes.bf16]:
+            ret = test_paged_attention(
                 ctx_len, 128, num_heads, 128, False, 16, dtype, "auto", 0, "cuda:0"
             )
+            df.append(ret)
+df = pd.DataFrame(df)
+aiter.logger.info(f"summary:\n{df}")

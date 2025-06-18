@@ -9,9 +9,10 @@ import aiter
 from aiter import logger
 from aiter import ActivationType, QuantType, dtypes
 
-# from aiter import get_hip_quant as get_quant
+from aiter import get_hip_quant as get_quant
+
 # from aiter import get_torch_quant as get_quant
-from aiter import get_triton_quant as get_quant
+# from aiter import get_triton_quant as get_quant
 from aiter.jit.core import AITER_ROOT_DIR, PY, get_asm_dir, bd_dir, mp_lock
 from aiter.jit.utils.chip_info import get_cu_num
 
@@ -103,7 +104,7 @@ def fused_moe(
 
     if block_size_M is None:
         _, _, block_size_M, *_ = get_2stage_cfgs(
-            M,
+            min(1024, M),  # consider token_num > 1024 as prefill
             model_dim,
             inter_dim,
             E,
@@ -443,7 +444,7 @@ def fused_moe_2stages(
     device = hidden_states.device
 
     stage1, stage2, block_m, ksplit = get_2stage_cfgs(
-        token_num,
+        min(1024, token_num),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,

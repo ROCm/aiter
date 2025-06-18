@@ -21,6 +21,8 @@
 #include <cuda_runtime.h>
 #include "py_itfs_common.h"
 
+namespace aiter {
+
 // declare templates for front (cpp) and back (cuda) sides of function:
 // template <typename T>
 
@@ -239,3 +241,4 @@ void MMCustomGPU(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c)
                 matO_sizes[1],
                 at::cuda::getCurrentCUDAStream());
 }
+} // namespace aiter
