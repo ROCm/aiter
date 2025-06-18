@@ -628,11 +628,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         stride_dropouth = stride_dropouth_in
         stride_dropoutm = stride_dropoutm_in
         stride_dropoutn = stride_dropoutn_in
-        if IS_FP8:
-            stride_descale_q_z = stride_descale_q_z_in
-            stride_descale_k_z = stride_descale_k_z_in
-            stride_descale_v_z = stride_descale_v_z_in
-            stride_descale_do_z = stride_descale_do_z_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
         stride_az = stride_az_in
         stride_ah = stride_ah_in
 
@@ -1257,11 +1256,10 @@ def bwd_kernel_noncausal(
         stride_dropouth = stride_dropouth_in
         stride_dropoutm = stride_dropoutm_in
         stride_dropoutn = stride_dropoutn_in
-        if IS_FP8:
-            stride_descale_q_z = stride_descale_q_z_in
-            stride_descale_k_z = stride_descale_k_z_in
-            stride_descale_v_z = stride_descale_v_z_in
-            stride_descale_do_z = stride_descale_do_z_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
         stride_az = stride_az_in
         stride_ah = stride_ah_in
 
@@ -1829,10 +1827,7 @@ def flash_attn_onekernel_backward(
             *delta_strides,
             *do_strides,
             *dropout_strides,
-            stride_descale_q_z,
-            stride_descale_k_z,
-            stride_descale_v_z,
-            stride_descale_do_z,
+            *descale_strides,
             stride_az,
             stride_ah,
             num_q_heads,
@@ -1885,10 +1880,7 @@ def flash_attn_onekernel_backward(
             *delta_strides,
             *do_strides,
             *dropout_strides,
-            stride_descale_q_z,
-            stride_descale_k_z,
-            stride_descale_v_z,
-            stride_descale_do_z,
+            *descale_strides,
             stride_az,
             stride_ah,
             num_q_heads,

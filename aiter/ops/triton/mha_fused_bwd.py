@@ -819,10 +819,11 @@ def _bwd_kernel_dkdvdq_noncausal(
         stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
         stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
         stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
-        stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
-        stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
-        stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
-        stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
     else:
         stride_qb = stride_qb_in
         stride_qh = stride_qh_in
