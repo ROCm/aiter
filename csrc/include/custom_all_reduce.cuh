@@ -32,6 +32,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <vector>
 #include "communication_asm.h"
 #include "hip_float8.h"
+#include "ck_tile/core.hpp"
 
 #define CUDACHECK(cmd)                                              \
   do                                                                \
@@ -434,49 +435,6 @@ namespace vllm
 #define BF16_FILTER \
   typename std::enable_if<Bf16Filter<T>::value, void>::type* = nullptr
 
-  // safe dtype convert will be used in fp8 quant calculation
-  template <typename T>
-  DINLINE float convertToFp32(T inp)
-  {
-    return static_cast<float>(inp);
-  }
-
-  template <>
-  DINLINE float convertToFp32<half>(half inp)
-  {
-    return __half2float(inp);
-  }
-
-  template <>
-  DINLINE float convertToFp32<__hip_bfloat16>(__hip_bfloat16 inp)
-  {
-    return __bfloat162float(inp);
-  }
-
-  template <typename T>
-  DINLINE T convertFromFp32(float inp)
-  {
-    return static_cast<T>(inp);
-  }
-
-  template <>
-  DINLINE half convertFromFp32<half>(float inp)
-  {
-    return __float2half(inp);
-  }
-
-  template <>
-  DINLINE __hip_bfloat16 convertFromFp32<__hip_bfloat16>(float inp)
-  {
-    return __float2bfloat16(inp);
-  }
-
-  template <>
-  DINLINE hip_fp8 convertFromFp32<hip_fp8>(float inp)
-  {
-    return hip_fp8(inp);
-  }
-
   template <template <typename> class functor, typename T, int size>
   DINLINE T packReduce(array_t<T, size> pack)
   {
@@ -517,9 +475,9 @@ namespace vllm
   {
     DINLINE half operator() (half a, half b)
     {
-      float a_fp32 = convertToFp32<half>(a);
-      float b_fp32 = convertToFp32<half>(b);
-      return convertFromFp32<half>(a_fp32 + b_fp32);
+      float a_fp32 = ck_tile::type_convert<float>(a);
+      float b_fp32 = ck_tile::type_convert<float>(b);
+      return ck_tile::type_convert<half>(a_fp32 + b_fp32);
     }
   };
 
@@ -528,9 +486,9 @@ namespace vllm
   {
     DINLINE __hip_bfloat16 operator() (__hip_bfloat16 a, __hip_bfloat16 b)
     {
-      float a_fp32 = convertToFp32<__hip_bfloat16>(a);
-      float b_fp32 = convertToFp32<__hip_bfloat16>(b);
-      return convertFromFp32<__hip_bfloat16>(a_fp32 + b_fp32);
+      float a_fp32 = ck_tile::type_convert<float>(a);
+      float b_fp32 = ck_tile::type_convert<float>(b);
+      return ck_tile::type_convert<__hip_bfloat16>(a_fp32 + b_fp32);
     }
   };
 
@@ -555,7 +513,7 @@ namespace vllm
   {
     DINLINE T operator() (T a, T b)
     {
-      T zero_t = convertFromFp32<T>(0.0f);
+      T zero_t = ck_tile::type_convert<T>(0.0f);
       a = a > zero_t ? a : zero_t - a;
       b = b > zero_t ? b : zero_t - b;
       return max(a, b);
@@ -579,13 +537,13 @@ namespace vllm
   template <typename T>
   DINLINE hip_fp8 elementQuant(T input, T scale_functor)
   {
-    return hip_fp8(convertToFp32<T>(input) / convertToFp32<T>(scale_functor));
+    return hip_fp8(ck_tile::type_convert<float>(input) / ck_tile::type_convert<float>(scale_functor));
   }
 
   template <typename T>
   DINLINE T elementDequant(hip_fp8 input, T scale_functor)
   {
-    return convertFromFp32<T>(float(input) * convertToFp32<T>(scale_functor));
+    return ck_tile::type_convert<T>(float(input) * ck_tile::type_convert<float>(scale_functor));
   }
 
   template <typename T, int pack_size>
@@ -620,7 +578,7 @@ namespace vllm
 #pragma unroll
     for (int i = 0; i < pack_size; ++i)
     {
-      ret_val.data[i] = convertToFp32<T>(inp.data[i]);
+      ret_val.data[i] = ck_tile::type_convert<float>(inp.data[i]);
     }
     return ret_val;
   }
@@ -632,7 +590,7 @@ namespace vllm
 #pragma unroll
     for (int i = 0; i < pack_size; ++i)
     {
-      ret_val.data[i] = convertFromFp32<T>(inp.data[i]);
+      ret_val.data[i] = ck_tile::type_convert<T>(inp.data[i]);
     }
     return ret_val;
   }
@@ -654,15 +612,13 @@ namespace vllm
     return packDowncast<T, pack_size>(ret_val);
   }
 
-  // #ifdef(__gfx942__) no use
-#define FP8_UPBOUND 240.0f
   // bf16 quant fp8 kernel function
   // too slow need to be optimized
   // fp16
+#define FP8_UPBOUND 240.0f
   template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
   __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
   {
-    // constexpr int ngpus = 8;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
     using inp_pack = array_t<T, pack_size>;
@@ -692,7 +648,7 @@ namespace vllm
       // quant
       T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg);
       thread_max = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max);
-      T scale_factor = convertFromFp32<T>(convertToFp32<T>(thread_max) / FP8_UPBOUND);
+      T scale_factor = ck_tile::type_convert<T>(ck_tile::type_convert<float>(thread_max) / FP8_UPBOUND);
       tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);
       if (threadIdx.x % (quant_scale / pack_size) == 0)
       {
