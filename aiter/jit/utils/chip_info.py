@@ -19,6 +19,8 @@ def get_gfx():
                     return line.split(":")[-1].strip()
         except Exception as e:
             raise RuntimeError(f"Get GPU arch from rcominfo failed {str(e)}")
+    elif ";" in gfx:
+        gfx = gfx.split(";")[-1]
     return gfx
 
 

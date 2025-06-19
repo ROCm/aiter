@@ -75,7 +75,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     void *num_valid_ids_ptr = num_valid_ids.data_ptr();
     void *sorted_weights_ptr = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
     void *out_ptr = out.data_ptr();
-    void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().transpose(0, 1).data_ptr() : nullptr;
+    void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
     void *a1_scale_ptr = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
     if (!hidden_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
     {
