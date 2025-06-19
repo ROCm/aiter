@@ -1832,9 +1832,9 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr bool ENABLE_PACK_QK_RATIO = true;
+    constexpr bool kEnablePackQkRatio = true;
     //                                        dqk  dv   m0  n0  n1  #warp
-    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4, ENABLE_PACK_QK_RATIO>;
+    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4, kEnablePackQkRatio>;
     constexpr bool kForceOutAcc = false;
     using acc_t                 = float;
 
