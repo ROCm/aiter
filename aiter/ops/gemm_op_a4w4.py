@@ -8,7 +8,7 @@ import functools
 import pandas as pd
 from ..jit.core import (
     compile_ops,
-    AITER_CORE_DIR,
+    AITER_ROOT_DIR,
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
@@ -49,4 +49,27 @@ def gemm_a4w4_asm(
     bias: Tensor,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
+    bpreshuffle: Optional[bool] = True,
 ) -> torch.Tensor: ...
+
+
+@compile_ops("module_gemm_a4w4_blockscale")
+def gemm_a4w4_blockscale(
+    XQ: Tensor,  # XQ:[M, K/2] f4x2
+    WQ: Tensor,  # WQ:[N, K/2] f4x2
+    x_scale: Tensor,  # x_scale:[M, K/32] e8m0 paded
+    w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
+    out: Tensor,  # Out:[M, N] bf16
+): ...
+
+
+@compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
+def gemm_a4w4_blockscale_tune(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    kernelId: int,
+    splitK=0,
+): ...

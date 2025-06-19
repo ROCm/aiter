@@ -6,12 +6,6 @@
 #include "ck_tile/core.hpp"
 
 
-#if CK_TILE_USE_OCP_FP8
-constexpr auto FP8_MAX = 448.f;
-#else
-constexpr auto FP8_MAX = 240.f;
-#endif
-
 #define HIP_CALL(call)                                                                                                           \
     do                                                                                                                           \
     {                                                                                                                            \
@@ -69,6 +63,38 @@ public:
     };
 
     ~AiterAsmKernel()
+    {
+        HIP_CALL(hipModuleUnload(module));
+    }
+
+    void launch_kernel(const AiterAsmKernelArgs &kargs)
+    {
+        void *config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER, kargs.args_ptr,
+                          HIP_LAUNCH_PARAM_BUFFER_SIZE, kargs.arg_size_ptr,
+                          HIP_LAUNCH_PARAM_END};
+
+        HIP_CALL(hipModuleLaunchKernel(kernel_func,
+                                       kargs.gdx, kargs.gdy, kargs.gdz,
+                                       kargs.bdx, kargs.bdy, kargs.bdz,
+                                       0, kargs.stream, nullptr, (void **)&config));
+    };
+};
+
+class AiterAsmKernelFast
+{
+private:
+    hipModule_t module;
+    hipFunction_t kernel_func;
+
+public:
+    AiterAsmKernelFast(const char *name, void *hsaco)
+    {
+        HIP_CALL(hipModuleLoadData(&module, hsaco));
+        HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
+        std::cout << " Success" << std::endl;
+    };
+
+    ~AiterAsmKernelFast()
     {
         HIP_CALL(hipModuleUnload(module));
     }

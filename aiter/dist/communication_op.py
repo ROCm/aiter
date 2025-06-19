@@ -1,6 +1,6 @@
 '''
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,9 +23,9 @@ import torch.distributed
 from .parallel_state import get_tp_group
 
 
-def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+def tensor_model_parallel_all_reduce(input_: torch.Tensor, open_fp8_quant: bool = False) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    return get_tp_group().all_reduce(input_, open_fp8_quant)
 
 
 def tensor_model_parallel_all_gather(input_: torch.Tensor,

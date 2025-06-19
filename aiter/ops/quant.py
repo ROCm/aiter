@@ -220,34 +220,45 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2):
+def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     m, n = x.shape
     assert quant_dtype == dtypes.fp4x2
     assert n % 2 == 0
     device = x.device
     if scale is None:
-        scale = (
-            torch.empty(
-                (
-                    (m + 31) // 32 * 32,
-                    (n // 32 + 7) // 8 * 8,
-                ),
-                dtype=torch.uint8,
-                device=device,
+        if shuffle:
+            scale = (
+                torch.empty(
+                    (
+                        (m + 255) // 256 * 256,
+                        (n // 32 + 7) // 8 * 8,
+                    ),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                # .fill_(0x7F)
+                .view(dtypes.fp8_e8m0)
             )
-            .fill_(0x7F)
-            .view(dtypes.fp8_e8m0)
-        )
+        else:
+            scale = (
+                torch.empty(
+                    (m, n // 32),
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                # .fill_(0x7F)
+                .view(dtypes.fp8_e8m0)
+            )
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
-    dynamic_per_token_scaled_quant(y, x.view(-1, 32), scale)
+    dynamic_per_group_scaled_quant_fp4(y, x, scale, 32, shuffle_scale=shuffle)
     return y.view(torch.uint8), scale
 
 
 def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
-    if quant_dtype == dtypes.fp8:
+    if quant_dtype in [dtypes.fp8, dtypes.i8]:
         if scale is None:
             scale = torch.empty(1, dtype=dtypes.fp32, device=x.device)
             dynamic_per_tensor_quant(y, x, scale)
@@ -312,5 +323,23 @@ def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
 
 @compile_ops("module_quant")
 def dynamic_per_token_scaled_quant(
-    out: Tensor, input: Tensor, scales: Tensor, scale_ub: Optional[Tensor] = None
+    out: Tensor,
+    input: Tensor,
+    scales: Tensor,
+    scale_ub: Optional[Tensor] = None,
+    shuffle_scale=True,
 ): ...
+
+
+@compile_ops("module_quant")
+def dynamic_per_group_scaled_quant_fp4(
+    out: Tensor,
+    input: Tensor,
+    scales: Tensor,
+    group_size: Optional[int] = 32,
+    shuffle_scale=True,
+):
+    """
+    Only support group_size in [32, 64, 128]
+    """
+    ...

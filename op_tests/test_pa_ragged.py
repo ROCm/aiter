@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
 from typing import List, Optional, Tuple, Union
@@ -459,6 +459,7 @@ def run_aiter_asm(
         block_tables,
         seq_lens,
         max_num_blocks,
+        max_seq_len,
         k_scale,
         v_scale,
     )
@@ -538,8 +539,8 @@ DUMP_OUTPUT = False  # whether to dump output
 
 
 @pytest.mark.parametrize("ctx_lens", [1, 26, 128, 4097])
-@pytest.mark.parametrize("num_seqs", [128])
-@pytest.mark.parametrize("num_heads", [(8, 1), (4, 2)])
+@pytest.mark.parametrize("num_seqs", [1, 3, 31, 128])
+@pytest.mark.parametrize("num_heads", [(8, 1), (4, 2), (32, 4)])
 @pytest.mark.parametrize("head_size", [64, 128])
 @pytest.mark.parametrize("use_alibi", [False, True])
 @pytest.mark.parametrize("block_size", [1, 16, 32])

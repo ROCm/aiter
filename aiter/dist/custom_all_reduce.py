@@ -1,6 +1,6 @@
 '''
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
+ * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+ * Copyright (C) 2024-2025, The vLLM team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -206,7 +206,7 @@ class CustomAllreduce:
     @contextmanager
     def capture(self):
         """
-        The main responsibility of this context manager is the 
+        The main responsibility of this context manager is the
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
@@ -289,10 +289,10 @@ class CustomAllreduce:
 
     # all reduce, assuming inp tensor is IPC registered with register_buffer,
     # or, in the context of cuda graphs, register_graph_buffers
-    def all_reduce_reg(self, inp: torch.Tensor, out: torch.Tensor = None):
+    def all_reduce_reg(self, inp: torch.Tensor, out: torch.Tensor = None, open_fp8_quant: bool = False):
         if out is None:
             out = torch.empty_like(inp)
-        ops.all_reduce_reg(self._ptr, inp, out)
+        ops.all_reduce_reg(self._ptr, inp, out, open_fp8_quant)
         return out
 
     # all reduce, assuming inp tensor is NOT IPC registered
@@ -302,13 +302,13 @@ class CustomAllreduce:
         ops.all_reduce_unreg(self._ptr, inp, self.buffer, out)
         return out
 
-    def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
+    def custom_all_reduce(self, input: torch.Tensor, open_fp8_quant: bool) -> Optional[torch.Tensor]:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce_reg(input)
+                return self.all_reduce_reg(input, open_fp8_quant = open_fp8_quant)
             else:
                 # if warm up, mimic the allocation pattern
                 # since custom allreduce is out-of-place

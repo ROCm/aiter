@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
 import torch
 import pytest
 import logging
@@ -7,6 +10,8 @@ from aiter.ops.triton.mha import (
     flash_attn_fp8_func,
     flash_attn_varlen_func,
     flash_attn_varlen_fp8_func,
+    mha_set_use_fused_bwd_kernel,
+    mha_set_use_int64_strides,
 )
 from aiter.test_mha_common import (
     attention_ref,
@@ -165,7 +170,8 @@ def test_mha(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
 
-    triton_out = triton_out[0]
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = triton_out[0]
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
@@ -179,7 +185,112 @@ def test_mha(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    if FP8:
+        fp8_assert_close(
+            triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
+        )
+    else:
+        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+# LLaMA 3 405B config
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(1, 1)],
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("CAUSAL", [True])
+@pytest.mark.parametrize("DROPOUT", [0.0])
+def test_mha_int64_strides(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    DROPOUT: float,
+    dtype=torch.float16,
+    device="cuda",
+    test_backward=True,
+):
+    """
+    In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
+    """
+    torch.manual_seed(20)
+    pytest.skip("Fails due to compilation error")
+    # use int64 strides.
+    mha_set_use_int64_strides(
+        True
+    )  # NOTE: if you set this to false this test case will segfault
+
+    # generate inputs with large strides
+    def _generate_input(
+        batch: int, seqlen: int, nheads: int, dim_size: int, large_stride: bool = False
+    ) -> torch.Tensor:
+        seqlens = torch.full((batch,), seqlen)
+        cu_seqlens = torch.cat(
+            [
+                torch.tensor([0], dtype=torch.int32),
+                seqlens.cumsum(dim=0, dtype=torch.int32),
+            ]
+        ).to(device="cuda")
+        total_seqlen = cu_seqlens[-1].item()
+
+        if large_stride:
+            x_dummy = torch.randn(
+                (total_seqlen, nheads, 1024 * 1024 * 64), dtype=dtype, device="cuda"
+            ).requires_grad_(True)
+            x = x_dummy[:seqlen, :nheads, :dim_size]
+        else:
+            x = torch.randn(
+                (total_seqlen, nheads, dim_size), dtype=dtype, device="cuda"
+            ).requires_grad_(True)
+        return x, cu_seqlens, seqlen
+
+    # inputs
+    q, cu_seqlens_q, max_seqlens_q = _generate_input(
+        BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ, large_stride=True
+    )
+    k, cu_seqlens_k, max_seqlens_k = _generate_input(
+        BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ
+    )
+    v, _, _ = _generate_input(BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ)
+    do = torch.randn_like(q)
+
+    if DEBUG_MODE:
+        print()
+        print("q:", q.shape, q.stride())
+        print("k:", k.shape, k.stride())
+        print("v:", v.shape, v.stride())
+        print("cu_seqlens_q:", cu_seqlens_q.shape, cu_seqlens_q.stride())
+        print("cu_seqlens_k:", cu_seqlens_k.shape, cu_seqlens_k.stride())
+
+    triton_out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlens_q,
+        max_seqlens_k,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=True,
+    )
+    if test_backward:
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+            triton_out, (q, k, v), do.clone()
+        )
+
+    # NOTE: use fwd output to wait not exit program before kernel finishes
+    print("triton_out:", triton_out)
+    if test_backward:
+        print("triton_dq:", triton_dq.shape, triton_dq.stride())
+        print("triton_dk:", triton_dk.shape, triton_dk.stride())
+        print("triton_dv:", triton_dv.shape, triton_dv.stride())
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -315,8 +426,10 @@ def test_mha_varlen(
             print(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
-
-    triton_out = output_pad_fn(triton_out[0])
+    if RETURN_SOFTMAX or RETURN_LSE:
+        triton_out = output_pad_fn(triton_out[0])
+    else:
+        triton_out = output_pad_fn(triton_out)
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
@@ -360,6 +473,7 @@ def test_mha_varlen(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize("FUSED", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward(
     BATCH: int,
@@ -371,9 +485,13 @@ def test_mha_backward(
     DROPOUT: float,
     CAUSAL: bool,
     FP8: bool,
+    FUSED: bool,
     dtype=torch.float16,
 ):
+    torch.cuda.empty_cache()
     torch.manual_seed(20)
+
+    mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -427,6 +545,7 @@ def test_mha_backward(
     if DEBUG_MODE:
         print(f"triton_out={triton_out}")
         print(f"triton_lse={lse}")
+        print(f"sd_mask={sd_mask}")
         print(f"triton_dq.shape={triton_dq.shape} triton_dq={triton_dq}")
         print(f"triton_dk.shape={triton_dk.shape} triton_dk={triton_dk}")
         print(f"triton_dv.shape={triton_dv.shape} triton_dv={triton_dv}")
@@ -491,6 +610,7 @@ def test_mha_backward(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
+@pytest.mark.parametrize("FUSED", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward_varlen(
     BATCH: int,
@@ -502,9 +622,12 @@ def test_mha_backward_varlen(
     DROPOUT: float,
     CAUSAL: bool,
     FP8: bool,
+    FUSED: bool,
     dtype=torch.float16,
 ):
+    torch.cuda.empty_cache()
     torch.manual_seed(20)
+    mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
