@@ -54,7 +54,8 @@ template <int32_t kSizeD_,
           int32_t kBlockM_,
           int32_t kBlockN0_,
           int32_t kBlockN1_,
-          int32_t kNumWarps_>
+          int32_t kNumWarps_,
+          bool    kEnableXQA_>
 struct FlashMlaPrefillKernelTrait
 {
     static constexpr int32_t kSizeD                     = kSizeD_;    // hidden dimension size of query and key
@@ -79,6 +80,7 @@ struct FlashMlaPrefillKernelTrait
     static constexpr bool    kPadHeadDimV               = false;
     static constexpr bool    kPadSeqLenQ                = true;
     static constexpr bool    kPadSeqLenK                = true;
+    static constexpr bool    kEnableXQA                 = kEnableXQA_;
 
     static constexpr int32_t kNumPrefetchK  = 1;
     static constexpr int32_t kNumPrefetchV  = 1;
@@ -1425,7 +1427,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     const int32_t mid = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
 
     // Define causal mask
-    using Mask = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, true>;
+    using Mask = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, Traits::kEnableXQA>;
     const int32_t seqlen_k = params.p_seqlens_k[bid];
     Mask mask = kIsCausal ?
                 Mask{params.size_s, seqlen_k - params.size_s / params.mask_y_ratio + 1, params.size_s, seqlen_k, params.mask_y_ratio} :
@@ -1827,9 +1829,9 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    bool ENABLE_PACK_QK_RATIO = true;
+    constexpr bool ENABLE_PACK_QK_RATIO = false;
     //                                        dqk  dv   m0  n0  n1  #warp
-    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4>;
+    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4, ENABLE_PACK_QK_RATIO>;
     constexpr bool kForceOutAcc = false;
     using acc_t = float;
 
@@ -1858,7 +1860,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const int32_t hq_hk_ratio = num_heads_q / num_heads_k;
     int32_t mask_y_ratio      = 1;
 
-    if(ENABLE_PACK_QK_RATIO)
+    if constexpr(Traits::kEnableXQA)
     {
         seqlen_q     = seqlen_q_ori * hq_hk_ratio;
         num_heads_q  = num_heads_k;
@@ -1952,7 +1954,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     // using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>;
     // dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, true>(params);
 
-    if(ENABLE_PACK_QK_RATIO)
+    if constexpr(Traits::kEnableXQA)
     {
         // post process for out and softmax_lse
         if(num_heads_k == 1)
