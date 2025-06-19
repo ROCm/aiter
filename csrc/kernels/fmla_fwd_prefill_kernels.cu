@@ -1427,11 +1427,14 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     const int32_t mid = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
 
     // Define causal mask
-    using Mask = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, Traits::kEnableXQA>;
+    using Mask             = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, Traits::kEnableXQA>;
     const int32_t seqlen_k = params.p_seqlens_k[bid];
-    Mask mask = kIsCausal ?
-                Mask{params.size_s, seqlen_k - params.size_s / params.mask_y_ratio + 1, params.size_s, seqlen_k, params.mask_y_ratio} :
-                Mask{params.size_s, seqlen_k};
+    Mask mask              = kIsCausal ? Mask{params.size_s,
+                                 seqlen_k - params.size_s / params.mask_y_ratio + 1,
+                                 params.size_s,
+                                 seqlen_k,
+                                 params.mask_y_ratio}
+                                       : Mask{params.size_s, seqlen_k};
 
     auto q_dram_window_lengths =
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockK0>{});
@@ -1833,7 +1836,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     //                                        dqk  dv   m0  n0  n1  #warp
     using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4, ENABLE_PACK_QK_RATIO>;
     constexpr bool kForceOutAcc = false;
-    using acc_t = float;
+    using acc_t                 = float;
 
     torch::Tensor vcache = value_cache.data_ptr() ? value_cache : key_cache;
 
