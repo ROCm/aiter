@@ -62,7 +62,9 @@
           py::arg("K_QScale")       = std::nullopt, \
           py::arg("V_QScale")       = std::nullopt, \
           py::arg("out_")           = std::nullopt, \
-          py::arg("high_precision") = 1);
+          py::arg("kernelName")     = "",           \
+          py::arg("high_precision") = 1,            \
+          py::arg("max_seqlen_q")   = 1);
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -265,19 +267,19 @@
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \
-          &aiter::wvSpltK,                                                                             \
+          &aiter::wvSpltK,                                                                      \
           "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"                          \
           "        int CuCount) -> ()");                                                        \
     m.def("wv_splitk_small_fp16_bf16",                                                          \
-          &aiter::wv_splitk_small_fp16_bf16_wrapper,                                                   \
+          &aiter::wv_splitk_small_fp16_bf16_wrapper,                                            \
           "wv_splitk_small_fp16_bf16(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"        \
           "        int CuCount) -> ()");                                                        \
     m.def("LLMM1",                                                                              \
-          &aiter::LLMM1,                                                                               \
+          &aiter::LLMM1,                                                                        \
           "LLMM1(Tensor in_a, Tensor in_b, Tensor! out_c, int rows_per_block) -> "              \
           "()");                                                                                \
     m.def("wvSplitKQ",                                                                          \
-          &aiter::wvSplitKQ,                                                                           \
+          &aiter::wvSplitKQ,                                                                    \
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
@@ -570,32 +572,32 @@
           py::arg("w2_scale")       = std::nullopt,  \
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt); \
+          py::arg("sorted_weights") = std::nullopt);
 
-#define MHA_VARLEN_FWD_PYBIND                        \
-      m.def("mha_varlen_fwd",                        \
-          &aiter::torch_itfs::mha_varlen_fwd,        \
-          py::arg("q"),                              \
-          py::arg("k"),                              \
-          py::arg("v"),                              \
-          py::arg("cu_seqlens_q"),                   \
-          py::arg("cu_seqlens_k"),                   \
-          py::arg("max_seqlen_q"),                   \
-          py::arg("max_seqlen_k"),                   \
-          py::arg("min_seqlen_q"),                   \
-          py::arg("dropout_p"),                      \
-          py::arg("softmax_scale"),                  \
-          py::arg("logits_soft_cap"),                \
-          py::arg("zero_tensors"),                   \
-          py::arg("is_causal"),                      \
-          py::arg("window_size_left"),               \
-          py::arg("window_size_right"),              \
-          py::arg("return_softmax_lse"),             \
-          py::arg("return_dropout_randval"),         \
-          py::arg("out")          = std::nullopt,    \
-          py::arg("block_table")  = std::nullopt,    \
-          py::arg("bias")         = std::nullopt,    \
-          py::arg("alibi_slopes") = std::nullopt,    \
+#define MHA_VARLEN_FWD_PYBIND                     \
+    m.def("mha_varlen_fwd",                       \
+          &aiter::torch_itfs::mha_varlen_fwd,     \
+          py::arg("q"),                           \
+          py::arg("k"),                           \
+          py::arg("v"),                           \
+          py::arg("cu_seqlens_q"),                \
+          py::arg("cu_seqlens_k"),                \
+          py::arg("max_seqlen_q"),                \
+          py::arg("max_seqlen_k"),                \
+          py::arg("min_seqlen_q"),                \
+          py::arg("dropout_p"),                   \
+          py::arg("softmax_scale"),               \
+          py::arg("logits_soft_cap"),             \
+          py::arg("zero_tensors"),                \
+          py::arg("is_causal"),                   \
+          py::arg("window_size_left"),            \
+          py::arg("window_size_right"),           \
+          py::arg("return_softmax_lse"),          \
+          py::arg("return_dropout_randval"),      \
+          py::arg("out")          = std::nullopt, \
+          py::arg("block_table")  = std::nullopt, \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MHA_BATCH_PREFILL_PYBIND                  \

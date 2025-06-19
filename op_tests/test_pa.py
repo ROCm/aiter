@@ -400,7 +400,7 @@ def run_aiter_asm(
         k_scale,
         v_scale,
         None,
-        high_precision,
+        high_precision=high_precision,
     )
 
 
@@ -674,7 +674,6 @@ def test_paged_attention(
         # )
         # checkAllclose(out_aiter_asm, out_aiter_naive,
         #             msg=f'golden vs ck_naive(quant:{ck_naive_quant_algo[quant_algo_]}, kvcache:{cache_type_}):{time_aiter_naive:>8.2f} us......')
-
         if quant_algo_ != 0:
             out_aiter_asm, time_aiter_asm = run_aiter_asm(
                 query,

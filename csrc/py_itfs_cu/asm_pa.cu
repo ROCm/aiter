@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "asm_pa_configs.hpp"
 #include "py_itfs_common.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -42,6 +43,35 @@ struct __attribute__((packed)) KernelArgs
     p3 _p18;
 };
 
+std::string get_heuristic_kernel(
+    std::string q_type, std::string kv_type, int gqa, int mtp, int msk, int hp, CFG* cfgs)
+{
+    for(const auto& el : *cfgs)
+    {
+        const auto& cfg = el.second;
+        if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa && cfg.mtp == mtp &&
+           cfg.msk == msk && cfg.hp == hp)
+        {
+            return el.first;
+        }
+    }
+    TORCH_CHECK(false,
+                __func__,
+                ": cannot get heuristic kernel!"
+                " q_type:",
+                q_type,
+                " kv_type:",
+                kv_type,
+                " gqa:",
+                gqa,
+                " mtp:",
+                mtp,
+                " msk:",
+                msk,
+                " hp:",
+                hp);
+    return "";
+}
 const float f_log2E = log2f(expf(1));
 
 torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
@@ -53,7 +83,9 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      std::optional<torch::Tensor>& K_QScale,
                      std::optional<torch::Tensor>& V_QScale,
                      std::optional<torch::Tensor>& out_,
-                     std::optional<int> high_precision = 1)
+                     std::string kernelName            = "",
+                     std::optional<int> high_precision = 1,
+                     std::optional<int> max_seqlen_q   = 1)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
@@ -99,123 +131,86 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     args.KVs       = stride_KV_head;
     args.GQA       = gqa_ratio;
     // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << " kv_nheads:" <<
-    // args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs << std::endl;
+    // args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs <<
+    // std::endl;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    AiterAsmKernel* impl_ptr = nullptr;
-    if(K.dtype() != at::ScalarType::BFloat16 && K.dtype() != at::ScalarType::Half)
+    std::string q_type;
+    std::string kv_type;
+    int gqa;
+    int mtp;
+    int msk;
+    int hp;
+    // 1. "q_type"
+    if(Q.dtype() == at::ScalarType::Half)
+        q_type = "fp16";
+    else if(Q.dtype() == at::ScalarType::BFloat16)
+        q_type = "bf16";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport Q dtype:", Q.scalar_type());
+
+    // 2. "kv_type"
+    if(K.dtype() == at::ScalarType::Half)
+        kv_type = "fp16";
+    else if(K.dtype() == at::ScalarType::BFloat16)
+        kv_type = "bf16";
+    else if(K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char) //?
+        kv_type = "int8";
+    else if(K.dtype() == torch_fp8)
+        kv_type = "fp8";
+    else
+        TORCH_CHECK(false, __func__, ": unsupport K dtype:", K.scalar_type());
+
+    // 3. "gqa_ratio"
+    gqa = (gqa_ratio <= 8) ? 8 : 16;
+
+    // 4. "mtp" , 5. "mask"
+    if(max_seqlen_q > 1)
     {
-        if(Q.dtype() == at::ScalarType::Half)
-        {
-            if(K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
-            {
-                static AiterAsmKernel impl_a16w8_f16_i8("pa_a16w8_2tg_g8_i8",
-                                                        "pa_a16w8_f16_2tg_g8_i8.co");
-                impl_ptr = &impl_a16w8_f16_i8;
-            }
-            else if(K.dtype() == torch_fp8)
-            {
-                if(high_precision.value() == 0)
-                {
-                    static AiterAsmKernel impl_a16w8_f16_f8(
-                        "_ZN5aiter32pa_fp16_pertokenFp8_a16w8_2tg_g8E",
-                        "/pa/pa_fp16_pertokenFp8_a16w8_2tg_g8.co");
-                    impl_ptr = &impl_a16w8_f16_f8;
-                }
-                else if(high_precision.value() == 1)
-                {
-                    static AiterAsmKernel impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16(
-                        "_ZN5aiter45pa_bf16_pertokenFp8_a16w8_g8_q_fp16_tail_bf16E",
-                        "/pa/pa_bf16_pertokenFp8_a16w8_g8_q_fp16_tail_bf16.co");
-                    impl_ptr = &impl_a16w8_2tg_g8_f8_q_fp16_tail_bf16;
-                }
-                else
-                {
-                    TORCH_CHECK(false,
-                                __func__,
-                                ": high_precision value only support (0, 1) grades on fp16 asm pa "
-                                "for fp8 kv cache !!!");
-                }
-            }
-        }
-        else if(Q.dtype() == at::ScalarType::BFloat16)
-        {
-            if(K.dtype() == at::ScalarType::Byte || K.dtype() == at::ScalarType::Char)
-            {
-                static AiterAsmKernel impl_a16w8_b16_i8(
-                    "_ZN5aiter33pa_bf16_pertokenInt8_a16w8_2tg_g8E",
-                    "/pa/pa_bf16_pertokenInt8_a16w8_2tg_g8.co");
-                impl_ptr = &impl_a16w8_b16_i8;
-            }
-            else if(K.dtype() == torch_fp8)
-            {
-                if(gqa_ratio == 16)
-                {
-                    static AiterAsmKernel impl_a16w8_b16_f8(
-                        "_ZN5aiter39pa_bf16_pertokenFp8_a16w8_2tg_g8_f8_Q16E",
-                        "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_f8_Q16.co");
-                    impl_ptr = &impl_a16w8_b16_f8;
-                }
-                else if(gqa_ratio <= 8)
-                {
-                    if(high_precision.value() == 0)
-                    {
-                        static AiterAsmKernel impl_a16w8_b16_f8(
-                            "_ZN5aiter32pa_bf16_pertokenFp8_a16w8_2tg_g8E",
-                            "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8.co");
-                        impl_ptr = &impl_a16w8_b16_f8;
-                    }
-                    else if(high_precision.value() == 1)
-                    {
-                        static AiterAsmKernel impl_a16w8_b16_f8_tail_bf16(
-                            "_ZN5aiter42pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16E",
-                            "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_tail_bf16.co");
-                        impl_ptr = &impl_a16w8_b16_f8_tail_bf16;
-                    }
-                    else if(high_precision.value() == 2)
-                    {
-                        static AiterAsmKernel impl_a16w8_b16_f8_gemm1_bf16(
-                            "_ZN5aiter43pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16E",
-                            "/pa/pa_bf16_pertokenFp8_a16w8_2tg_g8_gemm1_bf16.co");
-                        impl_ptr = &impl_a16w8_b16_f8_gemm1_bf16;
-                    }
-                    else
-                    {
-                        TORCH_CHECK(false,
-                                    __func__,
-                                    ": high_precision value only support (0, 1, 2) grades on bf16 "
-                                    "asm pa for fp8 kv cache !!!");
-                    }
-                }
-                else
-                {
-                    TORCH_CHECK(
-                        false,
-                        __func__,
-                        ": gqa_ratio only support 8 or 16 for bf16 asm pa for fp8 kv cache !!!");
-                }
-            }
-        }
+        mtp = 1;
+        msk = 1;
     }
     else
     {
-        TORCH_CHECK(Q.is_contiguous(), __func__, ":a16w16 only support Q.is_contiguous() for now");
-        TORCH_CHECK(num_kv_heads == 1, __func__, ":a16w16 only support num_kv_heads==1, for now");
-        if(Q.dtype() == at::ScalarType::Half)
-        {
-            static AiterAsmKernel impl_a16w16_f16("pa_kernel_func", "pa_a16w16_f16.co");
-            impl_ptr = &impl_a16w16_f16;
-        }
-        else if(Q.dtype() == at::ScalarType::BFloat16)
-        {
-            static AiterAsmKernel impl_a16w16_b16("_ZN5aiter22pa_bf16_noquant_a16w16E",
-                                                  "/pa/pa_bf16_noquant_a16w16.co");
-            impl_ptr = &impl_a16w16_b16;
-        }
+        mtp = 0;
+        msk = 0;
     }
-    TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
+    // 6. "high_precision" , 7. "ultra_precision"
+    switch(high_precision.value())
+    {
+    case 1: hp = 1; break;
+    case 2: hp = 2; break;
+    default: hp = 0; break;
+    };
+
+    CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
+    static std::unordered_map<std::string, std::unique_ptr<AiterAsmKernel>> impl_ptr_map;
+
+    kernelName = get_heuristic_kernel(q_type, kv_type, gqa, mtp, msk, hp, config_map);
+    if(kernelName.empty())
+    {
+        TORCH_CHECK(false, __func__, "not supported this kernel now! ");
+    }
+
+    AiterAsmKernel* impl_ptr = nullptr;
+
+    auto it = config_map->find(kernelName);
+    if(it != config_map->end())
+    {
+        const auto& cfg     = it->second;
+        const char* name    = cfg.name.c_str();
+        const char* co_name = cfg.co_name.c_str();
+        auto result         = impl_ptr_map.emplace(name, nullptr);
+        if(result.second)
+        {
+            result.first->second = std::make_unique<AiterAsmKernel>(name, co_name);
+        }
+        impl_ptr = result.first->second.get();
+    }
+    else
+        TORCH_CHECK(false, __func__, " not find kernel " + kernelName);
 
     impl_ptr->launch_kernel({&args,
                              &arg_size,
