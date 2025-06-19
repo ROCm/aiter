@@ -9,7 +9,7 @@ from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffled_scales,
 )
 import aiter.ops.triton.utils.arch_info as arch_info
-from op_tests.triton_tests.utils.types import str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"

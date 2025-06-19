@@ -352,7 +352,7 @@ def gemm_a8wfp4(
     M, K = x.shape
     K_packed, N = w.shape
 
-    assert arch_info.is_fp4_avail(), f"MXFP4 is not available on your device"
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     assert (
         K_packed == K // 2
