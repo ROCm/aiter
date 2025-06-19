@@ -175,16 +175,16 @@ def test_persistent_lean_attention(
 def main():
     batch = 2
     causal = True
-    h = 4
-    n_ctx_q = 1024
-    n_ctx = [1024, 1024]
+    h = 64
+    n_ctx_q = 512
+    n_ctx = [512, 512]
     d = 64
-    total_programs = 32
+    total_programs = 304
     init_dtype = torch.float16
     BLOCK_M = 64
     BLOCK_N = 64
     waves_per_eu = 1
-    num_warps = 4
+    num_warps = 1
     assert batch == len(n_ctx)
 
     try:

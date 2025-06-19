@@ -89,7 +89,7 @@ def persistent_lean_attention(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
-    la_persistent[grid](
+    la_kernel = la_persistent[grid](
         q,
         k,
         v,
@@ -130,6 +130,8 @@ def persistent_lean_attention(
         waves_per_eu=waves_per_eu,
         num_warps=waves_per_eu,
     )
+
+    print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
 
     return o
 
