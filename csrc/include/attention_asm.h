@@ -15,4 +15,4 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      std::optional<torch::Tensor> qo_indptr = std::nullopt,
                      std::string kernelName                 = "",
                      std::optional<int> high_precision      = 1,
-                     std::optional<int> max_seqlen_q        = 1)
+                     std::optional<int> max_seqlen_q        = 1);
