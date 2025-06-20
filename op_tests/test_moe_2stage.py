@@ -5,7 +5,7 @@ import torch
 import itertools
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, benchmark, run_perftest, tensor_load
+from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.int4_utils import *
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
