@@ -244,7 +244,7 @@ def run_aiter_asm(
         k_scale,
         v_scale,
         None,
-        qo_indptr,
+        qo_indptr=qo_indptr,
         max_seqlen_q=max_qlen,
     )
 
