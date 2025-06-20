@@ -17,27 +17,46 @@ CK_MOE_STAGE1_GEMM_DEFINE(32, 256/sizeof(A0DataType), 1, 4, V1, true, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(32, 128/sizeof(A0DataType), 1, 4, V1, true, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 256/sizeof(A0DataType), 1, 4, V1, true, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 128/sizeof(A0DataType), 1, 4, V1, true, 1)
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V1, true, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V1, true, 1)
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V1, true, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(256, 128/sizeof(A0DataType), 1, 4, V1, true, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(32, 256/sizeof(A0DataType), 1, 4, V1, true, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(32, 128/sizeof(A0DataType), 1, 4, V1, true, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 256/sizeof(A0DataType), 1, 4, V1, true, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 128/sizeof(A0DataType), 1, 4, V1, true, 0)
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V1, true, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V1, true, 0)
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V1, true, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(256, 128/sizeof(A0DataType), 1, 4, V1, true, 0)
 
 CK_MOE_STAGE1_GEMM_DEFINE(32, 256/sizeof(A0DataType), 1, 4, V1, false, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(32, 128/sizeof(A0DataType), 1, 4, V1, false, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 256/sizeof(A0DataType), 1, 4, V1, false, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 128/sizeof(A0DataType), 1, 4, V1, false, 1)
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V1, false, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V1, false, 1)
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V1, false, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(256, 128/sizeof(A0DataType), 1, 4, V1, false, 1)
 CK_MOE_STAGE1_GEMM_DEFINE(32, 256/sizeof(A0DataType), 1, 4, V1, false, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(32, 128/sizeof(A0DataType), 1, 4, V1, false, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 256/sizeof(A0DataType), 1, 4, V1, false, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(64, 128/sizeof(A0DataType), 1, 4, V1, false, 0)
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V1, false, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V1, false, 0)
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V1, false, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(256, 128/sizeof(A0DataType), 1, 4, V1, false, 0)
+
+
+
+
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V3, true, 1)
+
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V3, true, 0)
+
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V3, false, 1)
+
+CK_MOE_STAGE1_GEMM_DEFINE(96, 128/sizeof(A0DataType), 1, 4, V3, false, 0)
 
 
 
@@ -48,6 +67,16 @@ CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V3, true, 0)
 CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V3, false, 1)
 
 CK_MOE_STAGE1_GEMM_DEFINE(128, 128/sizeof(A0DataType), 1, 4, V3, false, 0)
+
+
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V3, true, 1)
+
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V3, true, 0)
+
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V3, false, 1)
+
+CK_MOE_STAGE1_GEMM_DEFINE(192, 128/sizeof(A0DataType), 1, 4, V3, false, 0)
+
 
 CK_MOE_STAGE1_GEMM_DEFINE(256, 128/sizeof(A0DataType), 1, 4, V3, true, 1)
 
