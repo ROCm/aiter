@@ -460,7 +460,7 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
         AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
             using input_dtype = typename t2ck<scalar_t>::type;
             aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
                 reinterpret_cast<input_dtype*>(input.data_ptr()),
                 scale.data_ptr<float>(),
                 cols);

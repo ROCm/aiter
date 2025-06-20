@@ -15,9 +15,9 @@ class RotateStyle(IntEnum):
 
 @triton.jit
 def _rope_fwd_kernel_neox_nope(
-    x_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -142,9 +142,9 @@ def _rope_fwd_kernel_neox_nope(
 
 @triton.jit
 def _rope_fwd_kernel_neox(
-    x_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -215,9 +215,9 @@ def _rope_fwd_kernel_neox(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_nope(
-    x_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -310,9 +310,9 @@ def _rope_fwd_kernel_gptj_nope(
 
 @triton.jit
 def _rope_fwd_kernel_gptj(
-    x_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -378,10 +378,10 @@ def _rope_fwd_kernel_gptj(
 
 @triton.jit
 def _rope_fwd_kernel_neox_thd(
-    x_ptr: torch.Tensor,
-    cu_seqlens_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cu_seqlens_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -470,10 +470,10 @@ def _rope_fwd_kernel_neox_thd(
 
 @triton.jit
 def _rope_fwd_kernel_neox_nope_thd(
-    x_ptr: torch.Tensor,
-    cu_seqlens_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cu_seqlens_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -616,10 +616,10 @@ def _rope_fwd_kernel_neox_nope_thd(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_nope_thd(
-    x_ptr: torch.Tensor,
-    cu_seqlens_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cu_seqlens_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -735,10 +735,10 @@ def _rope_fwd_kernel_gptj_nope_thd(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_thd(
-    x_ptr: torch.Tensor,
-    cu_seqlens_ptr: torch.Tensor,
-    freqs_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cu_seqlens_ptr,
+    freqs_ptr,
+    out_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -821,10 +821,10 @@ def _rope_fwd_kernel_gptj_thd(
 
 @triton.jit
 def _rope_fwd_kernel_neox_nope_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -944,10 +944,10 @@ def _rope_fwd_kernel_neox_nope_cached(
 
 @triton.jit
 def _rope_fwd_kernel_neox_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1013,10 +1013,10 @@ def _rope_fwd_kernel_neox_cached(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_nope_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1104,10 +1104,10 @@ def _rope_fwd_kernel_gptj_nope_cached(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_cached(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1168,11 +1168,11 @@ def _rope_fwd_kernel_gptj_cached(
 
 @triton.jit
 def _rope_fwd_kernel_neox_nope_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1296,11 +1296,11 @@ def _rope_fwd_kernel_neox_nope_cached_position(
 
 @triton.jit
 def _rope_fwd_kernel_neox_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1369,11 +1369,11 @@ def _rope_fwd_kernel_neox_cached_position(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_nope_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1464,11 +1464,11 @@ def _rope_fwd_kernel_gptj_nope_cached_position(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_cached_position(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1532,12 +1532,12 @@ def _rope_fwd_kernel_gptj_cached_position(
 
 @triton.jit
 def _rope_fwd_kernel_neox_nope_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1662,12 +1662,12 @@ def _rope_fwd_kernel_neox_nope_cached_position_off(
 
 @triton.jit
 def _rope_fwd_kernel_neox_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1737,12 +1737,12 @@ def _rope_fwd_kernel_neox_cached_position_off(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_nope_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1835,12 +1835,12 @@ def _rope_fwd_kernel_gptj_nope_cached_position_off(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_cached_position_off(
-    x_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_ptr,
     stride_x_s,
     stride_x_b,
     stride_x_h,
@@ -1906,14 +1906,14 @@ def _rope_fwd_kernel_gptj_cached_position_off(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
+    x_ptr,
+    y_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_x_ptr,
+    out_y_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -2016,14 +2016,14 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c(
 
 @triton.jit
 def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
+    x_ptr,
+    y_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_x_ptr,
+    out_y_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -2134,14 +2134,14 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
+    x_ptr,
+    y_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_x_ptr,
+    out_y_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -2254,14 +2254,14 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa(
 
 @triton.jit
 def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
+    x_ptr,
+    y_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_x_ptr,
+    out_y_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -2381,14 +2381,14 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa(
 
 @triton.jit
 def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa_one_head(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
+    x_ptr,
+    y_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_x_ptr,
+    out_y_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -2498,14 +2498,14 @@ def _rope_fwd_kernel_gptj_cached_thd_position_offsets_2c_gqa_one_head(
 
 @triton.jit
 def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa_one_head(
-    x_ptr: torch.Tensor,
-    y_ptr: torch.Tensor,
-    cos_ptr: torch.Tensor,
-    sin_ptr: torch.Tensor,
-    pos_ptr: torch.Tensor,
-    off_ptr: torch.Tensor,
-    out_x_ptr: torch.Tensor,
-    out_y_ptr: torch.Tensor,
+    x_ptr,
+    y_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    off_ptr,
+    out_x_ptr,
+    out_y_ptr,
     stride_x_t,
     stride_x_h,
     stride_x_d,
@@ -2640,7 +2640,7 @@ def _rope_fwd_kernel_neox_cached_thd_position_offsets_2c_gqa_one_head(
 
 @triton.jit
 def _rope_fwd_2d_kernel_neox(
-    x_ptr: torch.Tensor,
+    x_ptr,
     cos_h_ptr,
     sin_h_ptr,
     cos_w_ptr,

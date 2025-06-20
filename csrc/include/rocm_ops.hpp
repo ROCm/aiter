@@ -62,6 +62,7 @@
           py::arg("K_QScale")       = std::nullopt, \
           py::arg("V_QScale")       = std::nullopt, \
           py::arg("out_")           = std::nullopt, \
+          py::arg("qo_indptr")      = std::nullopt, \
           py::arg("kernelName")     = "",           \
           py::arg("high_precision") = 1,            \
           py::arg("max_seqlen_q")   = 1);
@@ -300,18 +301,19 @@
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
 
-#define GEMM_A4W4_ASM_PYBIND      \
-    m.def("gemm_a4w4_asm",        \
-          &gemm_a4w4_asm,         \
-          "Asm gemm a4w4",        \
-          py::arg("A"),           \
-          py::arg("B"),           \
-          py::arg("A_scale"),     \
-          py::arg("B_scale"),     \
-          py::arg("out"),         \
-          py::arg("bias"),        \
-          py::arg("alpha") = 1.0, \
-          py::arg("beta")  = 0.0);
+#define GEMM_A4W4_ASM_PYBIND            \
+    m.def("gemm_a4w4_asm",              \
+          &gemm_a4w4_asm,               \
+          "Asm gemm a4w4",              \
+          py::arg("A"),                 \
+          py::arg("B"),                 \
+          py::arg("A_scale"),           \
+          py::arg("B_scale"),           \
+          py::arg("out"),               \
+          py::arg("bias"),              \
+          py::arg("alpha")       = 1.0, \
+          py::arg("beta")        = 0.0, \
+          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -862,8 +864,15 @@
           "Apply Root Mean Square (RMS) Normalization to the input tensor.");                      \
     m.def(                                                                                         \
         "fused_add_rms_norm_cu", &fused_add_rms_norm, "In-place fused Add and RMS Normalization"); \
-    m.def("rmsnorm2d_fwd", &rmsnorm2d);                                                            \
-    m.def("rmsnorm2d_fwd_with_add", &rmsnorm2d_with_add);                                          \
+    m.def("rmsnorm2d_fwd", &rmsnorm2d, py::arg("input"), py::arg("weight"), py::arg("epsilon"));   \
+    m.def("rmsnorm2d_fwd_with_add",                                                                \
+          &rmsnorm2d_with_add,                                                                     \
+          py::arg("out"),                                                                          \
+          py::arg("input"),                                                                        \
+          py::arg("residual_in"),                                                                  \
+          py::arg("residual_out"),                                                                 \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"));                                                                     \
     m.def("rmsnorm2d_fwd_with_smoothquant", &rmsnorm2d_with_smoothquant);                          \
     m.def("rmsnorm2d_fwd_with_add_smoothquant",                                                    \
           &rmsnorm2d_with_add_smoothquant,                                                         \

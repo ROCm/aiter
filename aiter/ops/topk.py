@@ -13,15 +13,15 @@ from ..utility import dtypes
 
 @compile_ops("module_moe_asm")
 def biased_grouped_topk(
-    gating_output: Tensor,
-    correction_bias: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
-    topk_group: int,
+    topk_grp: int,
     need_renorm: bool,
-    routed_scaling_factor: float = 1.0,  # mul to topk_weights
-): ...
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")

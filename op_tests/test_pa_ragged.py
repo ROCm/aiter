@@ -461,6 +461,7 @@ def run_aiter_asm(
         max_num_blocks,
         k_scale,
         v_scale,
+        max_seqlen_q=max_seq_len,
     )
 
 

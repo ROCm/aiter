@@ -41,6 +41,8 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     unsigned int GQA;
     p3 _p18;
+    void* ptr_QTP;
+    p2 _p19;
 };
 
 std::string get_heuristic_kernel(
@@ -80,12 +82,13 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor& context_lens, //   [num_seqs]
                      int max_num_blocks,
-                     std::optional<torch::Tensor>& K_QScale,
-                     std::optional<torch::Tensor>& V_QScale,
-                     std::optional<torch::Tensor>& out_,
-                     std::string kernelName            = "",
-                     std::optional<int> high_precision = 1,
-                     std::optional<int> max_seqlen_q   = 1)
+                     std::optional<torch::Tensor> K_QScale  = std::nullopt,
+                     std::optional<torch::Tensor> V_QScale  = std::nullopt,
+                     std::optional<torch::Tensor> out_      = std::nullopt,
+                     std::optional<torch::Tensor> qo_indptr = std::nullopt,
+                     std::string kernelName                 = "",
+                     std::optional<int> high_precision      = 1,
+                     std::optional<int> max_seqlen_q        = 1)
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
@@ -130,9 +133,10 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     args.Bs        = stride_KV_blk;
     args.KVs       = stride_KV_head;
     args.GQA       = gqa_ratio;
-    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << " kv_nheads:" <<
-    // args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs << " KVs:" << args.KVs <<
-    // std::endl;
+    args.ptr_QTP   = qo_indptr ? qo_indptr.value().data_ptr() : nullptr;
+    // std::cout << "sclg2e: " << args.sclg2e << " mblk:" << args.mblk << "
+    // kv_nheads:" << args.kv_nheads << " Qs:" << args.Qs << " Bs:" << args.Bs <<
+    // " KVs:" << args.KVs << std::endl;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -167,7 +171,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     gqa = (gqa_ratio <= 8) ? 8 : 16;
 
     // 4. "mtp" , 5. "mask"
-    if(max_seqlen_q > 1)
+    if(qo_indptr && max_seqlen_q > 1)
     {
         mtp = 1;
         msk = 1;

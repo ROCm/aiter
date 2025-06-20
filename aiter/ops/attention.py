@@ -47,6 +47,7 @@ def pa_fwd_asm(
     V_QScale: Optional[torch.Tensor],
     kernelName: str = "",
     out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
     high_precision: Optional[
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache

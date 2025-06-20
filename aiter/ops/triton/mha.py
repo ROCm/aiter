@@ -1173,6 +1173,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1196,6 +1197,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -1412,6 +1414,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1439,6 +1442,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
         # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
@@ -1683,6 +1687,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1706,6 +1711,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -1880,6 +1886,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1907,6 +1914,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k_fp8.shape[-1]]
