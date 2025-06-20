@@ -65,7 +65,7 @@ def pertoken_quant(
     return y, y_scale
 
 
-def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
+def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     assert quant_dtype == dtypes.fp4x2
     block_size = 32
     F8E8M0_EXP_BIAS = 127
@@ -94,27 +94,7 @@ def per_1x32_f4_quant(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
     y = y.view(*shape_original[:-1], -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
     if shuffle:
-        scale_padded = torch.empty(
-            (m + 255) // 256 * 256,
-            (n // block_size + 7) // 8 * 8,
-            dtype=torch.uint8,
-            device=x.device,
-        ).fill_(0x7F)
-
-        scale_padded[:m, : n // block_size] = scale
-        scale = scale_padded
-        sm, sn = scale.shape
-
-    if shuffle == 2:
-        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-        scale = scale.permute(0, 3, 4, 1, 5, 2).contiguous()
-        scale = scale.view(-1, 4, 64)
-        scale = scale.permute(0, 2, 1).contiguous()
-        scale = scale.view(sm, sn)
-    elif shuffle:
-        scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
-        scale = scale.view(sm, sn)
+        scale = fp4_utils.e8m0_shuffle(scale)
     return y, scale.view(dtypes.fp8_e8m0)
 
 
@@ -220,7 +200,7 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=True):
+def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
     m, n = x.shape
     assert quant_dtype == dtypes.fp4x2
     assert n % 2 == 0

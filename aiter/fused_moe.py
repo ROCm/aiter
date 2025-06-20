@@ -8,6 +8,7 @@ import functools
 import aiter
 from aiter import logger
 from aiter import ActivationType, QuantType, dtypes
+from aiter.utility import fp4_utils
 
 from aiter import get_hip_quant as get_quant
 
@@ -218,6 +219,20 @@ def fused_moe_1stage(
         )
         quant_func = get_quant(quant_type)
         a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+
+        token_num = hidden_states.shape[0]
+        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        if quant_type == QuantType.per_1x32:
+            a1_scale = fp4_utils.moe_mxfp4_sort(
+                a1_scale,
+                sorted_ids,
+                num_valid_ids,
+                token_num,
+                block_size_M,
+            )
+            w1_scale = w1_scale.view(E, -1)
+            w2_scale = w2_scale.view(E, -1)
+
         if quant_type == QuantType.per_1x128:
             a1 = a1.view_as(hidden_states)
             a1_scale = a1_scale.view(hidden_states.shape[0], -1).t().contiguous()
