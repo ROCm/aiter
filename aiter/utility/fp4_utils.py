@@ -67,6 +67,8 @@ def e8m0_to_f32(scale_e8m0_biased):
 
 
 def e8m0_shuffle(scale):
+    if scale is None:
+        return scale
     if scale.dtype == torch.float32:
         return scale
     assert scale.ndim == 2, "scale must be a 2D tensor"
