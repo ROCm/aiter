@@ -25,6 +25,7 @@ u32 = torch.uint32
 i32 = torch.int32
 i16 = torch.int16
 i8 = torch.int8
+# u8 = torch.uint8
 
 d_dtypes = {
     "fp8": fp8,

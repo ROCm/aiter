@@ -83,6 +83,11 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         return;
     }
 
+    if (hidden_states.dtype() == at::ScalarType::Byte && w1.dtype() == at::ScalarType::Byte)
+    {
+        K *= 2;
+    }
+
     auto kernel = moe_dispatch<1>(kernelName, MPerBlock);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
@@ -129,7 +134,10 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-
+    if (inter_states.dtype() == at::ScalarType::Byte && w2.dtype() == at::ScalarType::Byte)
+    {
+        K *= 2;
+    }
     auto kernel = moe_dispatch<2>(kernelName, MPerBlock);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
