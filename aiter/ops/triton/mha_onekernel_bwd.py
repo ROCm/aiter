@@ -6,8 +6,8 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from typing import Optional
 from aiter.ops.triton.utils.mha_kernel_utils import (
-    compute_fp8_scaling_factors,
-    is_fp8,
+    _compute_fp8_scaling_factors,
+    _is_fp8,
 )
 
 
@@ -245,7 +245,7 @@ def _bwd_dkdv_inner(
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
             if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
+                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(
                     pT_dropout, FP8_MAX
                 )
                 dv += (
@@ -257,7 +257,7 @@ def _bwd_dkdv_inner(
                 dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
-                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
+                scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
                 dv += (
                     tl.dot((pT * scale_pT).to(do.type.element_ty), do)
                     * descale_pT
@@ -281,7 +281,7 @@ def _bwd_dkdv_inner(
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
         if IS_FP8:
-            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
+            scale_dsT, descale_dsT = _compute_fp8_scaling_factors(dsT, FP8_MAX)
             dk += (
                 tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
                 * descale_dsT
@@ -441,7 +441,7 @@ def _bwd_dq_inner(
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
+            scale_ds, descale_ds = _compute_fp8_scaling_factors(ds, FP8_MAX)
             dq += (
                 tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT))
                 * descale_ds
@@ -456,11 +456,6 @@ def _bwd_dq_inner(
     return dq
 
 
-# @triton.autotune(
-#     configs=causal_autotune_configs,
-#     key=causal_autotune_keys,
-#     use_cuda_graph=True,
-# )
 @triton.jit
 def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
     Q,
@@ -1084,11 +1079,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             # end of GQA/MQA of dq
 
 
-# @triton.autotune(
-#     configs=noncausal_autotune_configs,
-#     key=noncausal_autotune_keys,
-#     use_cuda_graph=True,
-# )
 @triton.jit
 def bwd_kernel_noncausal(
     Q,
@@ -1564,106 +1554,12 @@ def flash_attn_onekernel_backward(
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    # IS_VARLEN = True if cu_seqlens_q is not None else False
 
-    # IS_FP8 = is_fp8(q)
-    # if IS_FP8:
-    #     FP8_MAX = torch.finfo(q.dtype).max
-    #     # assert that the main inputs are fp8
-
-    #     stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
-    #     stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
-    #     stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
-    #     stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
-    # else:
-    #     FP8_MAX = None
-    #     stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-    #         stride_descale_o_z
-    #     ) = stride_descale_do_z = None
-    # if IS_VARLEN:
-    #     layout = "thd"
-    # elif q.shape[2] == max_seqlen_q:
-    #     layout = "bhsd"
-    # elif q.shape[1] == max_seqlen_q:
-    #     layout = "bshd"
-    # else:
-    #     raise ValueError("invalid layout")
-
-    # # get strides and shape
-    # batch, nheads_q, nheads_k, head_size, max_seqlen_q_final, max_seqlen_k_final = (
-    #     get_shapes_from_layout(
-    #         q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
-    #     )
-    # )
-    # q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(
-    #     q, k, v, o, layout
-    # )
-    # stride_qb, stride_qh, stride_qm, stride_qd = q_strides
-    # stride_kb, stride_kh, stride_kn, stride_kd = k_strides
-    # stride_vb, stride_vh, stride_vn, stride_vd = v_strides
-    # stride_ob, stride_oh, stride_om, stride_od = o_strides
-    # dq_strides, dk_strides, dv_strides, do_strides = get_strides_from_layout(
-    #     dq, dk, dv, do, layout
-    # )
-    # stride_dqb, stride_dqh, stride_dqm, stride_dqd = dq_strides
-    # stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
-    # stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
-    # stride_dob, stride_doh, stride_dom, stride_dod = do_strides
-    # use_dropout = dropout_p > 0.0
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
 
-    # # get closest power of 2 over or equal to 32.
-    # padded_d_model = 1 << (head_size - 1).bit_length()
-    # padded_d_model = max(padded_d_model, 32)
-    # HEAD_DIM = padded_d_model
-    # ACTUAL_HEAD_DIM = head_size
-
-    # # init delta
-    # delta = torch.zeros_like(softmax_lse)
-    # if IS_VARLEN:
-    #     stride_deltab = 0
-    #     stride_deltam, stride_deltah = delta.stride()
-    # else:
-    #     stride_deltab, stride_deltah, stride_deltam = delta.stride()
-    # PRE_BLOCK = 128
-    # pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
-
-    # _bwd_preprocess[pre_grid](
-    #     o,
-    #     do,
-    #     delta,
-    #     stride_ob,
-    #     stride_oh,
-    #     stride_om,
-    #     stride_od,
-    #     stride_deltab,
-    #     stride_deltah,
-    #     stride_deltam,
-    #     stride_descale_do_z,
-    #     cu_seqlens_q,
-    #     max_seqlen_q,
-    #     descale_do,
-    #     BLOCK_M=PRE_BLOCK,
-    #     BLOCK_D_MODEL=HEAD_DIM,
-    #     BLOCK_D_MODEL_POW2=ACTUAL_HEAD_DIM,
-    #     IS_VARLEN=IS_VARLEN,
-    #     IS_FP8=IS_FP8,
-    # )
-
-    # # dropout mask tensor for debugging. We dump the dropout mask created in
-    # #   the kernel for testing
-    # dropout_mask = None
-    # stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = (0, 0, 0, 0)
-    # if use_dropout:
-    #     dropout_mask = torch.zeros(
-    #         (batch, nheads_q, max_seqlen_q_final, max_seqlen_k_final),
-    #         device=q.device,
-    #         dtype=torch.float32,
-    #     )
-
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = _is_fp8(q)
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
         descale_strides = (
@@ -1724,15 +1620,6 @@ def flash_attn_onekernel_backward(
     BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
 
     # Configs
-    # PRE_BLOCK, BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2
-    # BLK_SLICE_FACTOR
-    # NUM_WARPS, NUM_STAGES = 4, 1
-    # WAVES_PER_EU = 1
-    # PRE_BLOCK = 128
-    # # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
-    # BLK_SLICE_FACTOR = 2
-
     NUM_WARPS, NUM_STAGES = 4, 1
     WAVES_PER_EU = 1
     PRE_BLOCK = 128

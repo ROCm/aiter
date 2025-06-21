@@ -33,3 +33,12 @@ def get_fp8_dtypes():
         e4m3_dtype = torch.float8_e4m3fnuz
 
     return e5m2_dtype, e4m3_dtype
+
+
+def get_fp8_e4m3_dtype():
+    if get_arch() in ("gfx950"):
+        e4m3_dtype = torch.float8_e4m3fn
+    else:
+        e4m3_dtype = torch.float8_e4m3fnuz
+
+    return e4m3_dtype
