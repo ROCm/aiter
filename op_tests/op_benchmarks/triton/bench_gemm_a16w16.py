@@ -87,7 +87,9 @@ def run_benchmark(args):
     def bench_gemm_a16w16(M, N, K, layout, metric, provider):
         # NOTE: Assume bias and output has the same dtype
         c_dtype = torch.bfloat16
-        x, w, y = generate_gemm_a16w16_inputs(M, N, K, c_dtype, layout, output=True)
+        x, w, out_dtype, y = generate_gemm_a16w16_inputs(
+            M, N, K, c_dtype, layout, output=True
+        )
         # flops
         flops = 2.0 * M * N * K
         # memory transfer

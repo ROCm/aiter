@@ -1,7 +1,4 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
-
-# SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
@@ -190,7 +187,6 @@ def _get_config(
             config = json.load(file)
         _get_config._config_dict = config
 
-    # TODO: Update this logic
     return _get_config._config_dict["any"]
 
 

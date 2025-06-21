@@ -6,6 +6,8 @@ import triton
 import pytest
 import torch.nn.functional as F
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
@@ -21,22 +23,7 @@ def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=N
     return gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
-def is_cdna4():
-    return triton.runtime.driver.active.get_current_target().arch == "gfx950"
-
-
-e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
-e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
-
-name_to_torch_types = {
-    "int8": torch.int8,
-    "int32": torch.int32,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp8e5": e5m2_type,
-    "fp8e4": e4m3_type,
-}
+e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 dtype_max = {
@@ -111,15 +98,15 @@ def generate_gemm_a8w8_inputs(M, N, K, in_dtype, out_dtype, output=False):
     "in_dtype, out_dtype, m, n, k, output",
     [
         (in_dtype, out_dtype, *shape, output)
-        for in_dtype in ["fp8e4", "fp8e5", "int8"]
+        for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16"]
         for shape in get_x_vals()
         for output in [True, False]
     ],
 )
 def test_gemm(in_dtype, out_dtype, m, n, k, output):
-    in_dtype = name_to_torch_types[in_dtype]
-    out_dtype = name_to_torch_types[out_dtype]
+    in_dtype = str_to_torch_dtype[in_dtype]
+    out_dtype = str_to_torch_dtype[out_dtype]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
         m, n, k, in_dtype, out_dtype, output
     )
