@@ -429,8 +429,10 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
     };
 
     FMoeKernel* impl_ptr = nullptr;
+    int model_dim        = down.size(1);
     int inter_dim        = down.size(2);
-    int sub_X_cnt        = sorted_expert_ids.size(0);
+    inter_dim *= model_dim / gate.size(2);
+    int sub_X_cnt = sorted_expert_ids.size(0);
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
     if(gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
