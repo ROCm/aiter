@@ -241,11 +241,11 @@ def run_aiter_asm(
         block_tables,
         seq_lens,
         max_num_blocks,
+        max_qlen,
         k_scale,
         v_scale,
         None,
-        qo_indptr=qo_indptr,
-        max_seqlen_q=max_qlen,
+        qo_indptr,
     )
 
 

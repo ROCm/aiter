@@ -51,11 +51,11 @@ std::string get_heuristic_kernel(
     for(const auto& el : *cfgs)
     {
         const auto& cfg = el.second;
+        // hp is just distinct from uhp
         if(cfg.q_type == q_type && cfg.kv_type == kv_type && cfg.gqa == gqa && cfg.mtp == mtp &&
-           cfg.msk == msk && cfg.hp == hp)
-        {
+           cfg.msk == msk && (cfg.hp == hp || hp == 1))
+
             return el.first;
-        }
     }
     TORCH_CHECK(false,
                 __func__,
@@ -82,13 +82,13 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor& context_lens, //   [num_seqs]
                      int max_num_blocks,
+                     int max_qlen                           = 1,
                      std::optional<torch::Tensor> K_QScale  = std::nullopt,
                      std::optional<torch::Tensor> V_QScale  = std::nullopt,
                      std::optional<torch::Tensor> out_      = std::nullopt,
                      std::optional<torch::Tensor> qo_indptr = std::nullopt,
-                     std::string kernelName                 = "",
                      std::optional<int> high_precision      = 1,
-                     std::optional<int> max_seqlen_q        = 1)
+                     std::string kernelName                 = "")
 {
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
@@ -171,7 +171,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
     gqa = (gqa_ratio <= 8) ? 8 : 16;
 
     // 4. "mtp" , 5. "mask"
-    if(qo_indptr && max_seqlen_q > 1)
+    if(qo_indptr && max_qlen > 1)
     {
         mtp = 1;
         msk = 1;

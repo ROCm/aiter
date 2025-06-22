@@ -459,9 +459,9 @@ def run_aiter_asm(
         block_tables,
         seq_lens,
         max_num_blocks,
+        max_seq_len,
         k_scale,
         v_scale,
-        max_seqlen_q=max_seq_len,
     )
 
 
