@@ -789,6 +789,21 @@ def test_fused_moe_int4_w4a16(
     persistent: bool,
     silu_fused: bool,
 ):
+
+    if (
+        M == 1
+        and N == 64
+        and K == 128
+        and top_k == 1
+        and E == 2
+        and group_size == 8
+        and routed_weight
+        and not persistent
+        and has_zp
+        and not silu_fused
+    ):
+        pytest.skip("Results in accuracy failure because of Triton compiler change")
+
     torch.manual_seed(20)
     (
         a,
