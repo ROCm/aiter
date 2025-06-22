@@ -64,9 +64,31 @@ __all__ = [
 ]
 
 
+def executable_path(executable: str) -> str:
+    """
+    Return the path to the executable.
+
+    Args:
+        executable (str): The name of the executable.
+
+    Returns:
+        The path to the executable.
+    """
+    path = shutil.which(executable)
+    if not path:
+        home = _find_rocm_home()
+        if home:
+            path = shutil.which(os.path.join(home, "bin", executable))
+        assert (
+            path is not None
+        ), f"Could not find {executable} in PATH or ROCM_HOME({home})"
+    return os.path.realpath(path)
+
+
 def get_hip_version():
     try:
-        output = subprocess.check_output(["hipconfig", "--version"], text=True)
+        hipconfig = executable_path("hipconfig")
+        output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
     except Exception:
         raise RuntimeError("ROCm version file not found")
