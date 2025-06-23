@@ -431,29 +431,41 @@ def _get_config(
     N: int,
     K: int,
 ):
-    dev = arch_info.get_device()
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
-    if not os.path.exists(fpath):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict["default"] = config
 
-    with open(fpath, "r") as file:
-        config = json.load(file)
-    _get_config._config_dict = config
+    key = f"{N}_{K}"
+    if key not in _get_config._config_dict.keys():
+        dev = arch_info.get_device()
+        fpath = (
+            f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
+        )
+        if os.path.exists(fpath):
+            with open(fpath, "r") as file:
+                config = json.load(file)
+                _get_config._config_dict[key] = config
+        else:
+            key = "default"  # fall back to default config
 
     if M < 32:
-        return _get_config._config_dict["small"]
+        return _get_config._config_dict[key]["small"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
-            return _get_config._config_dict["medium_M32"]
+            return _get_config._config_dict[key]["medium_M32"]
         elif BLK_M == 64:
-            return _get_config._config_dict["medium_M64"]
+            return _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128:
-            return _get_config._config_dict["medium_M128"]
+            return _get_config._config_dict[key]["medium_M128"]
     elif M <= 256:
-        return _get_config._config_dict["large"]
+        return _get_config._config_dict[key]["large"]
     else:
-        return _get_config._config_dict["xlarge"]
+        return _get_config._config_dict[key]["xlarge"]
 
 
 def gemm_afp4wfp4(
