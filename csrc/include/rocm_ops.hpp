@@ -49,20 +49,23 @@
           py::arg("splitData"),         \
           py::arg("splitLse"));
 
-#define ATTENTION_ASM_PYBIND                     \
-      m.def("pa_fwd_asm", &pa_fwd, "pa_fwd",     \
-            py::arg("Q"),                        \
-            py::arg("K"),                        \
-            py::arg("V"),                        \
-            py::arg("block_tables"),             \
-            py::arg("context_lens"),             \
-            py::arg("max_num_blocks"),           \
-            py::arg("max_qlen") = 1,             \
-            py::arg("K_QScale") = std::nullopt,  \
-            py::arg("V_QScale") = std::nullopt,  \
-            py::arg("out_") = std::nullopt,      \
-            py::arg("qo_indptr") = std::nullopt, \
-            py::arg("high_precision") = 1);
+#define ATTENTION_ASM_PYBIND                        \
+    m.def("pa_fwd_asm",                             \
+          &pa_fwd,                                  \
+          "pa_fwd",                                 \
+          py::arg("Q"),                             \
+          py::arg("K"),                             \
+          py::arg("V"),                             \
+          py::arg("block_tables"),                  \
+          py::arg("context_lens"),                  \
+          py::arg("max_num_blocks"),                \
+          py::arg("max_qlen")       = 1,            \
+          py::arg("K_QScale")       = std::nullopt, \
+          py::arg("V_QScale")       = std::nullopt, \
+          py::arg("out_")           = std::nullopt, \
+          py::arg("qo_indptr")      = std::nullopt, \
+          py::arg("high_precision") = 1,            \
+          py::arg("kernelName")     = "");
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -298,19 +301,19 @@
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
 
-#define GEMM_A4W4_ASM_PYBIND      \
-    m.def("gemm_a4w4_asm",        \
-          &gemm_a4w4_asm,         \
-          "Asm gemm a4w4",        \
-          py::arg("A"),           \
-          py::arg("B"),           \
-          py::arg("A_scale"),     \
-          py::arg("B_scale"),     \
-          py::arg("out"),         \
-          py::arg("bias"),        \
-          py::arg("alpha") = 1.0, \
-          py::arg("beta") = 0.0, \
-          py::arg("bpreshuffle")  = true);
+#define GEMM_A4W4_ASM_PYBIND            \
+    m.def("gemm_a4w4_asm",              \
+          &gemm_a4w4_asm,               \
+          "Asm gemm a4w4",              \
+          py::arg("A"),                 \
+          py::arg("B"),                 \
+          py::arg("A_scale"),           \
+          py::arg("B_scale"),           \
+          py::arg("out"),               \
+          py::arg("bias"),              \
+          py::arg("alpha")       = 1.0, \
+          py::arg("beta")        = 0.0, \
+          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
