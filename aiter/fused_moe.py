@@ -28,7 +28,7 @@ def moe_sorting(
     moebuf_dtype,
     block_size=BLOCK_SIZE_M,
     expert_mask=None,
-    num_local_tokens=None
+    num_local_tokens=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -55,7 +55,7 @@ def moe_sorting(
         num_experts,
         block_size,
         expert_mask,
-        num_local_tokens
+        num_local_tokens,
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
@@ -87,7 +87,7 @@ def fused_moe(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
-    num_local_tokens=None
+    num_local_tokens=None,
 ):
     """user API"""
     M, topk = topk_ids.shape
@@ -127,7 +127,14 @@ def fused_moe(
     block_size_M = 32 if run_1stage else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids, topk_weight, global_E, model_dim, dtype, block_size_M, expert_mask, num_local_tokens
+        topk_ids,
+        topk_weight,
+        global_E,
+        model_dim,
+        dtype,
+        block_size_M,
+        expert_mask,
+        num_local_tokens,
     )
 
     if run_1stage:
