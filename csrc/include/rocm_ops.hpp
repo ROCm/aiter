@@ -733,19 +733,20 @@
           py::arg("sorted_weights") = std::nullopt);                                          \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
-#define MOE_SORTING_PYBIND              \
-    m.def("moe_sorting_fwd",            \
-          &moe_sorting_fwd,             \
-          py::arg("topk_ids"),          \
-          py::arg("topk_weights"),      \
-          py::arg("sorted_token_ids"),  \
-          py::arg("sorted_weights"),    \
-          py::arg("sorted_expert_ids"), \
-          py::arg("num_valid_ids"),     \
-          py::arg("moe_buf"),           \
-          py::arg("num_experts"),       \
-          py::arg("unit_size"),         \
-          py::arg("local_expert_mask") = std::nullopt);
+#define MOE_SORTING_PYBIND                             \
+    m.def("moe_sorting_fwd",                           \
+          &moe_sorting_fwd,                            \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("num_experts"),                      \
+          py::arg("unit_size"),                        \
+          py::arg("local_expert_mask") = std::nullopt, \
+          py::arg("num_local_tokens")  = std::nullopt);
 
 #define NORM_PYBIND                                               \
     m.def("layernorm2d_fwd",                                      \
