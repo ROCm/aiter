@@ -2,21 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-
 import torch
-import torch.distributed as dist
 import argparse
 import aiter
 from aiter import dtypes
-from aiter.fused_moe import torch_moe, fused_topk, fused_moe
-from aiter.dist.parallel_state import get_world_group
+from aiter.fused_moe import fused_topk, fused_moe
 from aiter.ops.shuffle import shuffle_weight
 import mori
 import multiprocessing as mp
 from aiter.test_common import (
     checkAllclose,
-    perftest,
-    benchmark,
 )
 
 
@@ -33,7 +28,7 @@ def run_ref(
     quant_type,
 ):
     ref = torch.zeros(tokens.shape, dtype=dtypes.bf16, device=tokens.device)
-    out_list = []
+    # out_list = []
     for i in range(world_size):
         mask = (topk_ids >= i * E // world_size) & (
             topk_ids < (i + 1) * E // world_size
@@ -235,7 +230,7 @@ def test_dispatch_combine(
         w2_scale_ep,
         quant_type,
     )
-    checkAllclose(ref, ref_noep.to(ref), msg=f"EP ref vs no EP ref")
+    checkAllclose(ref, ref_noep.to(ref), msg="EP ref vs no EP ref")
     ref_dp = ref.chunk(world_size)
 
     rets = []
@@ -263,7 +258,7 @@ def test_dispatch_combine(
     rets = [el.get() for el in rets]
 
     ret_out = torch.cat(rets, dim=0)
-    checkAllclose(ref, ret_out.to(ref), msg=f"total tokens:")
+    checkAllclose(ref, ret_out.to(ref), msg="total tokens:")
 
     for i in range(world_size):
         checkAllclose(ref_dp[i], rets[i].to(ref_dp[i]), msg=f"rank:{i}")
