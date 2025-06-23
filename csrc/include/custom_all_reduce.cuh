@@ -615,10 +615,10 @@ namespace vllm
   // bf16 quant fp8 kernel function
   // too slow need to be optimized
   // fp16
-#define FP8_UPBOUND 240.0f
   template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
   __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
   {
+    float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
     using inp_pack = array_t<T, pack_size>;
