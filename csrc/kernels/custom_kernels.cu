@@ -37,6 +37,8 @@
 #define UNREACHABLE_CODE assert(false);
 #endif
 
+namespace aiter {
+
 template <typename T>
 struct scalar
 {
@@ -2473,3 +2475,4 @@ void MMGPUKernel(float* in_a,
     if(cudaSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
+} // namespace aiter

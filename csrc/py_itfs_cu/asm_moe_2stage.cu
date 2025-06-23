@@ -96,7 +96,7 @@ static CFG *get_cfg(torch::Tensor &inp, torch::Tensor &out, torch::Tensor &w1, Q
     }
     else
     {
-        TORCH_CHECK(false, __func__, "Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
+        TORCH_CHECK(false, __func__, " Unsupported input_type:", inp.scalar_type(), ", weight_type:", w1.scalar_type(),
                     ", out_type:", out.scalar_type(), ", quant_type:", static_cast<int>(quant_type), ", do_weight:", do_weight);
     }
 };

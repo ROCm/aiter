@@ -17,6 +17,7 @@
 #include "custom.h"
 #include "custom_all_reduce.h"
 #include "gemm_a8w8.h"
+#include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
 #include "hipbsolgemm.cuh"
@@ -73,7 +74,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     NORM_PYBIND;
     POS_ENCODING_PYBIND;
     ATTENTION_PYBIND;
-    MOE_CK_2STAGES_PYBIND;
+    // MOE_CK_2STAGES_PYBIND;
     QUANT_PYBIND;
     ATTENTION_ASM_PYBIND;
     ATTENTION_RAGGED_PYBIND;
@@ -83,6 +84,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     ROPE_GENERAL_BWD_PYBIND;
     ROPE_POS_FWD_PYBIND;
     // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
+    GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
     AITER_OPERATOR_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
