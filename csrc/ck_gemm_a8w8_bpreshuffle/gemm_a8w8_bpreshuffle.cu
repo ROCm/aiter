@@ -26,7 +26,7 @@ using RowwiseKernelMap = std::unordered_map<std::tuple<int, int, int>, RowwiseKe
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
-    return a8w8_bpreshuffle_256x128x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8x8x1_2x1_intrawave_v3<
+    return a8w8_bpreshuffle_128x16x32x128_16x16_16x16_8x16x1_8x16x1_1x16x1x8_4x4x1_1x1_intrawave_v1<
         DDataType,
         EDataType>;
 }
