@@ -8,8 +8,8 @@ import triton.language as tl
 from typing import Optional
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.mha_kernel_utils import (
-    compute_fp8_scaling_factors,
-    is_fp8,
+    _compute_fp8_scaling_factors,
+    _is_fp8,
 )
 
 
@@ -244,7 +244,7 @@ def _bwd_dkdvdq_inner(
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
             if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
+                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(
                     pT_dropout, FP8_MAX
                 )
                 dv += (
@@ -256,7 +256,7 @@ def _bwd_dkdvdq_inner(
                 dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
-                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
+                scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
                 dv += (
                     tl.dot((pT * scale_pT).to(do.type.element_ty), do)
                     * descale_pT
@@ -282,7 +282,7 @@ def _bwd_dkdvdq_inner(
 
         # compute dk
         if IS_FP8:
-            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
+            scale_dsT, descale_dsT = _compute_fp8_scaling_factors(dsT, FP8_MAX)
             dk += (
                 tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
                 * descale_dsT
@@ -1035,7 +1035,7 @@ def flash_attn_fused_backward(
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
 
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = _is_fp8(q)
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
         descale_strides = (

@@ -33,14 +33,14 @@
 #include "smoothquant.h"
 #include <torch/extension.h>
 
-#include "torch/mha_batch_prefill.h"
-#include "torch/mha_bwd.h"
-#include "torch/mha_fwd.h"
-#include "torch/mha_v3_bwd.h"
-#include "torch/mha_v3_fwd.h"
-#include "torch/mha_v3_varlen_bwd.h"
-#include "torch/mha_varlen_bwd.h"
-#include "torch/mha_varlen_fwd.h"
+// #include "torch/mha_batch_prefill.h"
+// #include "torch/mha_bwd.h"
+// #include "torch/mha_fwd.h"
+// #include "torch/mha_v3_bwd.h"
+// #include "torch/mha_v3_fwd.h"
+// #include "torch/mha_v3_varlen_bwd.h"
+// #include "torch/mha_varlen_bwd.h"
+// #include "torch/mha_varlen_fwd.h"
 
 #include "rocm_ops.hpp"
 
@@ -51,14 +51,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // GEMM_A8W8_TUNE_PYBIND;
     AITER_ENUM_PYBIND;
     RMSNORM_PYBIND;
-    MHA_VARLEN_FWD_PYBIND;
-    MHA_VARLEN_BWD_PYBIND;
-    MHA_FWD_PYBIND;
-    MHA_BWD_PYBIND;
-    MHA_BATCH_PREFILL_PYBIND;
-    MHA_FWD_ASM_PYBIND
-    MHA_BWD_ASM_PYBIND;
-    MHA_VARLEN_BWD_ASM_PYBIND;
+    // MHA_VARLEN_FWD_PYBIND;
+    // MHA_VARLEN_BWD_PYBIND;
+    // MHA_FWD_PYBIND;
+    // MHA_BWD_PYBIND;
+    // MHA_BATCH_PREFILL_PYBIND;
+    // MHA_FWD_ASM_PYBIND
+    // MHA_BWD_ASM_PYBIND;
+    // MHA_VARLEN_BWD_ASM_PYBIND;
     GEMM_A8W8_PYBIND;
     CUSTOM_PYBIND;
     SMOOTHQUANT_PYBIND;

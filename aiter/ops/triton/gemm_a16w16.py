@@ -118,7 +118,6 @@ def _get_config(
     return _get_config._config_dict["any"]
 
 
-# Wrapper for gemm kernel.
 def gemm_a16w16(
     x,
     w,

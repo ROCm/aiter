@@ -51,6 +51,7 @@ def pa_fwd_asm(
     high_precision: Optional[
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str = "",
 ) -> torch.Tensor: ...
 
 

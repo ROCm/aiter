@@ -126,8 +126,7 @@ def _gemm_afp4_wfp4_kernel(
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             a_scales = tl.load(a_scale_ptrs)
             b_scales = tl.load(b_scale_ptrs)
-            # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
-            # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
+
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -307,8 +306,6 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
                 b_scales, (BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
             )
 
-            # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
-            # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -403,9 +400,6 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
     while NUM_KSPLIT > 1 and BLOCK_SIZE_K > 16:
-        # print(K, SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT)
-        # print(K % (SPLITK_BLOCK_SIZE // 2) == 0, SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0, K % (BLOCK_SIZE_K // 2) == 0)
-
         if (
             K % (SPLITK_BLOCK_SIZE // 2) == 0
             and SPLITK_BLOCK_SIZE % BLOCK_SIZE_K == 0
@@ -437,32 +431,43 @@ def _get_config(
     N: int,
     K: int,
 ):
-    dev = arch_info.get_device()
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
-    if not os.path.exists(fpath):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict["default"] = config
 
-    with open(fpath, "r") as file:
-        config = json.load(file)
-    _get_config._config_dict = config
+    key = f"{N}_{K}"
+    if key not in _get_config._config_dict.keys():
+        dev = arch_info.get_device()
+        fpath = (
+            f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-AFP4WFP4-N={N}-K={2*K}.json"
+        )
+        if os.path.exists(fpath):
+            with open(fpath, "r") as file:
+                config = json.load(file)
+                _get_config._config_dict[key] = config
+        else:
+            key = "default"  # fall back to default config
 
     if M < 32:
-        return _get_config._config_dict["small"]
+        return _get_config._config_dict[key]["small"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
-            return _get_config._config_dict["medium_M32"]
+            return _get_config._config_dict[key]["medium_M32"]
         elif BLK_M == 64:
-            return _get_config._config_dict["medium_M64"]
+            return _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128:
-            return _get_config._config_dict["medium_M128"]
+            return _get_config._config_dict[key]["medium_M128"]
     elif M <= 256:
-        return _get_config._config_dict["large"]
+        return _get_config._config_dict[key]["large"]
     else:
-        return _get_config._config_dict["xlarge"]
+        return _get_config._config_dict[key]["xlarge"]
 
 
-# Wrapper for gemm kernel.
 def gemm_afp4wfp4(
     x,
     w,
@@ -497,7 +502,7 @@ def gemm_afp4wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    # print(f"AFP4WFP4_config={config}")
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
@@ -582,7 +587,6 @@ def gemm_afp4wfp4(
     return y
 
 
-# Wrapper for gemm kernel.
 def gemm_afp4wfp4_preshuffled_scales(
     x,
     w,
@@ -609,6 +613,8 @@ def gemm_afp4wfp4_preshuffled_scales(
     - Y: The output matrix with shape (M, N).
     """
 
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
     M, K = x.shape
     K, N = w.shape
 
@@ -617,7 +623,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     if config is None:
         config = _get_config(M, N, K)
-    # print(f"AFP4WFP4_config={config}")
+
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
