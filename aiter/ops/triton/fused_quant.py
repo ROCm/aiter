@@ -1,83 +1,85 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.quant import _mxfp4_quant_op
+
+# from aiter.ops.triton.quant import _mxfp4_quant_op
 from typing import Optional
 
-# @triton.jit
-# def _mxfp4_quant_op(
-#     x,
-#     BLOCK_SIZE_N,
-#     MXFP4_QUANT_BLOCK_SIZE,
-# ):
-#     """
-#     Converts given x (in fp32) to mxfp4 format.
-#     x: [BLOCK_SIZE_N], fp32
 
-#     """
-#     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-#     x = x.reshape(NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
-#     # Calculate scale
-#     amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-#     amax = amax.to(tl.int32, bitcast=True)
-#     amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-#     amax = amax.to(tl.float32, bitcast=True)
-#     scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-#     scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+@triton.jit
+def _mxfp4_quant_op(
+    x,
+    BLOCK_SIZE_N,
+    MXFP4_QUANT_BLOCK_SIZE,
+):
+    """
+    Converts given x (in fp32) to mxfp4 format.
+    x: [BLOCK_SIZE_N], fp32
 
-#     # blockscale_e8m0
-#     bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
+    """
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x = x.reshape(NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
 
-#     quant_scale = tl.exp2(-scale_e8m0_unbiased)
+    # blockscale_e8m0
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
 
-#     # Compute quantized x
-#     qx = x * quant_scale
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
 
-#     # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-#     # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-#     #   Zeros: S000 -> +/-0
-#     #   Denormal Numbers: S001 -> +/- 0.5
-#     #   Normal Numbers:
-#     #           S010 -> +/- 1.0
-#     #           S011 -> +/- 1.5
-#     #           S100 -> +/- 2.0
-#     #           S101 -> +/- 3.0
-#     #           S110 -> +/- 4.0
-#     #           S111 -> +/- 6.0
-#     qx = qx.to(tl.uint32, bitcast=True)
+    # Compute quantized x
+    qx = x * quant_scale
 
-#     # Extract sign, exponents and mantissa fields from FP32
-#     s = qx & 0x80000000
-#     e = (qx >> 23) & 0xFF
-#     m = qx & 0x7FFFFF
-#     E8_BIAS: tl.constexpr = 127
-#     E2_BIAS: tl.constexpr = 1
+    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
+    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
+    #   Zeros: S000 -> +/-0
+    #   Denormal Numbers: S001 -> +/- 0.5
+    #   Normal Numbers:
+    #           S010 -> +/- 1.0
+    #           S011 -> +/- 1.5
+    #           S100 -> +/- 2.0
+    #           S101 -> +/- 3.0
+    #           S110 -> +/- 4.0
+    #           S111 -> +/- 6.0
+    qx = qx.to(tl.uint32, bitcast=True)
 
-#     # Denormal numbers
-#     # If exponent is less than 127, then it's a denormal number
-#     # See above, for denormal number mantissa is always 1 and we set bit 1 of mantissa
-#     adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
-#     m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
-#     # For normal numbers, bias is changed from 127 to 1, and for subnormals, we keep exponent as 0.
-#     # Note: E8_BIAS - E2_BIAS = 126, so for normals we subtract that.
-#     e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+    # Extract sign, exponents and mantissa fields from FP32
+    s = qx & 0x80000000
+    e = (qx >> 23) & 0xFF
+    m = qx & 0x7FFFFF
+    E8_BIAS: tl.constexpr = 127
+    E2_BIAS: tl.constexpr = 1
 
-#     # Combine sign, exponent, and mantissa, while saturating
-#     # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
-#     e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
-#     e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
-#     e2m1_value = tl.reshape(
-#         e2m1_value, [NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
-#     )
-#     evens, odds = tl.split(e2m1_value)
-#     x_fp4 = evens | (odds << 4)
-#     x_fp4 = x_fp4.reshape(
-#         BLOCK_SIZE_N // 2,
-#     )
+    # Denormal numbers
+    # If exponent is less than 127, then it's a denormal number
+    # See above, for denormal number mantissa is always 1 and we set bit 1 of mantissa
+    adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
+    m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
+    # For normal numbers, bias is changed from 127 to 1, and for subnormals, we keep exponent as 0.
+    # Note: E8_BIAS - E2_BIAS = 126, so for normals we subtract that.
+    e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
 
-#     return x_fp4, bs_e8m0.reshape(
-#         NUM_QUANT_BLOCKS,
-#     )
+    # Combine sign, exponent, and mantissa, while saturating
+    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
+    e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
+    e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
+    e2m1_value = tl.reshape(
+        e2m1_value, [NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
+    )
+    evens, odds = tl.split(e2m1_value)
+    x_fp4 = evens | (odds << 4)
+    x_fp4 = x_fp4.reshape(
+        BLOCK_SIZE_N // 2,
+    )
+
+    return x_fp4, bs_e8m0.reshape(
+        NUM_QUANT_BLOCKS,
+    )
 
 
 @triton.jit
@@ -91,7 +93,7 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
 
 
 @triton.jit
-def _rms_rms_mxfpx4_quant_kernel(
+def _fused_rms_mxfp4_quant_kernel(
     inp1_ptr,
     weight1_ptr,
     inp2_ptr,
@@ -144,7 +146,7 @@ def _rms_rms_mxfpx4_quant_kernel(
 
     norm1 = _rmsmorm_op(inp1, w1, inp1_n_cols, eps1)
     out1_fp4, out1_block_scales = _mxfp4_quant_op(
-        norm1, BLOCK_SIZE, 1, MXFP4_QUANT_BLOCK_SIZE
+        norm1, BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE
     )
 
     # store the results
@@ -174,10 +176,19 @@ def _rms_rms_mxfpx4_quant_kernel(
         tl.store(out2_ptr + pid * out2_row_stride + block_inds, norm2, mask=mask2)
     if FIRST_INPUT_RES:
         inp1 = inp1.to(out_res1_ptr.dtype.element_ty)
-        tl.store(out_res1_ptr + pid * out_res1_row_stride + block_inds, inp1, mask=mask1)
+        tl.store(
+            out_res1_ptr + pid * out_res1_row_stride + block_inds, inp1, mask=mask1
+        )
 
-def rms_rms_mxfpx4_quant(
-    inp1, inp1_weight, inp1_epsilon, inp2, inp2_weight, inp2_epsilon, res1 = None,
+
+def fused_rms_mxfp4_quant(
+    inp1,
+    inp1_weight,
+    inp1_epsilon,
+    inp2,
+    inp2_weight,
+    inp2_epsilon,
+    res1=None,
 ):
     """
     Apply rms norm to both inp1 and inp2, then quantize the result of inp1
@@ -194,7 +205,7 @@ def rms_rms_mxfpx4_quant(
         N2 = 0
     # as we merge 2 fp4s to 1 uint8
     assert N1 % 2 == 0
-    
+
     BLOCK_SIZE = max(BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE)
     out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=inp1.device)
     out1_bs = torch.empty(
@@ -219,7 +230,7 @@ def rms_rms_mxfpx4_quant(
         inp2_row_stride = inp2.stride(0)
         out2_row_stride = out2.stride(0)
 
-    _rms_rms_mxfpx4_quant_kernel[(M,)](
+    _fused_rms_mxfp4_quant_kernel[(M,)](
         inp1,
         inp1_weight,
         inp2,
@@ -256,10 +267,10 @@ def rms_rms_mxfpx4_quant(
             return (out1_fp4, out1_bs)
         else:
             return (out1_fp4, out1_bs), out2
-    
+
 
 @triton.jit
-def _fused_flatten_quant(
+def _fused_flatten_mxfp4_quant(
     x_ptr,
     out_ptr,
     out_scales_ptr,
@@ -280,31 +291,33 @@ def _fused_flatten_quant(
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N2 // MXFP4_QUANT_BLOCK_SIZE
     n2_offs = tl.arange(0, BLOCK_SIZE_N2)
     x_offs = m * x_stride_m + n1 * x_stride_n1 + n2_offs * x_stride_n2
-    x = tl.load(x_ptr + x_offs, mask = n2_offs < N2)
+    x = tl.load(x_ptr + x_offs, mask=n2_offs < N2)
 
-    out, out_block_scales = _mxfp4_quant_op(
-        x, BLOCK_SIZE_N2, 1, MXFP4_QUANT_BLOCK_SIZE
-    )
+    out, out_block_scales = _mxfp4_quant_op(x, BLOCK_SIZE_N2, MXFP4_QUANT_BLOCK_SIZE)
 
     half_block_offs = tl.arange(0, BLOCK_SIZE_N2 // 2)
     tl.store(
-        out_ptr + m * out_stride_m + (n1 * (BLOCK_SIZE_N2 // 2) + half_block_offs) * out_stide_n,
+        out_ptr
+        + m * out_stride_m
+        + (n1 * (BLOCK_SIZE_N2 // 2) + half_block_offs) * out_stide_n,
         out,
-        mask = half_block_offs < (N2 // 2),
+        mask=half_block_offs < (N2 // 2),
     )
     block_scale_offs = tl.arange(0, NUM_QUANT_BLOCKS)
     tl.store(
-        out_scales_ptr + m * out_scales_stride_m + (n1 * NUM_QUANT_BLOCKS + block_scale_offs) * out_scales_stride_n,
+        out_scales_ptr
+        + m * out_scales_stride_m
+        + (n1 * NUM_QUANT_BLOCKS + block_scale_offs) * out_scales_stride_n,
         out_block_scales,
         mask=block_scale_offs < tl.cdiv(N2, MXFP4_QUANT_BLOCK_SIZE),
     )
-    
 
-def fused_flatten_quant(
+
+def fused_flatten_mxfp4_quant(
     x: torch.Tensor,
 ):
     M, N1, N2 = x.shape
-    
+
     MXFP4_QUANT_BLOCK_SIZE = 32
     BLOCK_SIZE_N2 = max(triton.next_power_of_2(N2), MXFP4_QUANT_BLOCK_SIZE)
     N = N1 * N2
@@ -314,9 +327,12 @@ def fused_flatten_quant(
         dtype=torch.uint8,
         device=x.device,
     ).T
-    
-    grid = (M, N1, )
-    _fused_flatten_quant[grid](
+
+    grid = (
+        M,
+        N1,
+    )
+    _fused_flatten_mxfp4_quant[grid](
         x,
         out,
         out_block_scales,
