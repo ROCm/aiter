@@ -1,5 +1,4 @@
 import torch
-import triton
 import pytest
 from aiter.ops.triton.fused_concat import fused_qk_cat, fused_qk_rope_cat
 from ..test_rope import ref_rope_sbhd_fwd, RotateStyle
