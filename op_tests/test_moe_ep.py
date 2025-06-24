@@ -17,7 +17,7 @@ from aiter.fused_moe import (
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
 from aiter import ActivationType
-from aiter import pertoken_quant, ck_moe
+from aiter import pertoken_quant
 from aiter import dtypes
 
 BLOCK_SIZE_M = 32
@@ -79,34 +79,6 @@ def asm_moe_test(
         fc1_smooth_scale,
         fc2_smooth_scale,
         a16,
-        expert_mask=expert_mask,
-    )
-
-
-@perftest()
-def ck_moe_test(
-    hidden_states,
-    w1,
-    w2,
-    topk_weight,
-    topk_ids,
-    # following for int8 quant
-    fc1_scale=None,  # [expert, inter_dim, 1]
-    fc2_scale=None,  # [expert, model_dim, 1]
-    fc1_smooth_scale=None,  # [expert, 1, model_dim]
-    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-    expert_mask=None,
-):
-    return ck_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        fc1_scale,
-        fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
         expert_mask=expert_mask,
     )
 
@@ -360,11 +332,6 @@ def test_fmoe_ep(
             )
             msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
             checkAllclose(out_b, out_b2, atol=10, msg=msg)
-
-        # # test ck moe, not support now
-        # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-        #                              fc1_scale, fc2_scale,
-        #                              fc1_smooth_scale, fc2_smooth_scale)
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
