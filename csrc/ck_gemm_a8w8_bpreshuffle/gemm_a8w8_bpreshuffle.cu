@@ -26,9 +26,18 @@ using RowwiseKernelMap = std::unordered_map<std::tuple<int, int, int>, RowwiseKe
 template <typename DDataType, typename EDataType = DDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
-    return a8w8_bpreshuffle_128x16x32x128_16x16_16x16_8x16x1_8x16x1_1x16x1x8_4x4x1_1x1_intrawave_v1<
-        DDataType,
-        EDataType>;
+    if(K == 256)
+    {
+        return a8w8_bpreshuffle_128x32x256x64_16x16_16x16_4x32x1_4x32x1_1x8x1x16_8x8x1_1x4_intrawave_v1<
+            DDataType,
+            EDataType>;
+    }
+    else
+    {
+        return a8w8_bpreshuffle_128x16x32x128_16x16_16x16_8x16x1_8x16x1_1x16x1x8_4x4x1_1x1_intrawave_v1<
+            DDataType,
+            EDataType>;
+    }
 }
 
 // Helper function to return the next largest power of 2
