@@ -152,8 +152,10 @@ def _get_config(
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
-    print(_get_config._config_dict[key]["any"])
-    return _get_config._config_dict[key]["any"]
+    if M <= 128 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
+    else:
+        return _get_config._config_dict[key]["any"]
 
 
 def gemm_a16w16_atomic(
