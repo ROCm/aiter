@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.quant import _mxfp4_quant_op
-from typing import Optional
+
 
 @triton.jit
 def _rmsmorm_op(row, weight, n_cols, epsilon):
@@ -87,7 +87,7 @@ def _fused_rms_mxfp4_quant_kernel(
         out1_block_scales,
         mask=bs_inds < num_bs_cols,
     )
-    if SKIP_SECOND_INPUT == False:
+    if not SKIP_SECOND_INPUT:
         mask2 = block_inds < inp2_n_cols
         inp2 = tl.load(
             inp2_ptr + pid * inp2_row_stride + block_inds,
