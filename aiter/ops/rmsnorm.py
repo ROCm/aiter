@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
+import torch
 from torch import Tensor
 from typing import Optional
 from ..jit.core import compile_ops
@@ -48,12 +49,8 @@ def rms_norm(
 
 @compile_ops("module_rmsnorm")
 def rmsnorm2d_fwd(
-    input: Tensor,
-    # normalized_shape: List[int],
-    weight: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    eps: float = 1e-5,
-) -> Tensor: ...
+    input: torch.Tensor, weight: torch.Tensor, epsilon: float
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_rmsnorm")

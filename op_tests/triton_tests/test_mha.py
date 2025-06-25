@@ -124,6 +124,7 @@ def test_mha(
     FP8: bool,
     dtype=torch.float16,
 ):
+    torch.cuda.empty_cache()
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -219,8 +220,8 @@ def test_mha_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
+    torch.cuda.empty_cache()
     torch.manual_seed(20)
-
     # use int64 strides.
     mha_set_use_int64_strides(
         True
@@ -322,6 +323,7 @@ def test_mha_varlen(
     dtype=torch.float16,
 ):
     torch.set_printoptions(threshold=10000)
+    torch.cuda.empty_cache()
     torch.manual_seed(20)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)

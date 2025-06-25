@@ -6,9 +6,14 @@ import triton
 import triton.language as tl
 
 from typing import Optional, Tuple
+import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.mha_fused_bwd import flash_attn_fused_backward
+from aiter.ops.triton.utils.mha_kernel_utils import (
+    _compute_fp8_scaling_factors,
+    _is_fp8,
+)
 
 global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
@@ -19,7 +24,6 @@ def mha_set_use_fused_bwd_kernel(value: bool):
     _USE_FUSED_BWD_KERNEL = value
 
 
-# global parameters
 _USE_INT64_STRIDES = False
 
 
@@ -28,37 +32,7 @@ def mha_set_use_int64_strides(value: bool):
     _USE_INT64_STRIDES = value
 
 
-@triton.jit
-def cdiv_fn(x, y):
-    return (x + y - 1) // y
-
-
-@triton.jit
-def compute_fp8_scaling_factors(x, fp8_max: tl.constexpr):
-    # compute fp8 scaling and descaling factor for a block
-    x_amax = tl.max(tl.abs(x))  # NOTE: abs deals with negative values
-    x_amax = tl.where(x_amax <= 1e-9, 1e-9, x_amax)
-    scale_x = fp8_max / x_amax
-    descale_x = x_amax / fp8_max
-    return scale_x, descale_x
-
-
-def is_fp8(x):
-    if x.dtype in {
-        torch.float8_e4m3fnuz,
-        torch.float8_e4m3fn,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-    }:
-        if arch_supports_fp8():
-            return True
-        else:
-            raise RuntimeError("This device does not support fp8")
-    else:
-        return False
-
-
-def cast_to_fp8(
+def _cast_to_fp8(
     x: torch.Tensor,
     fp8_dtype,
     layout,
@@ -90,7 +64,7 @@ def cast_to_fp8(
     return x_fp8, descale_factor
 
 
-def cast_varlen_to_fp8(
+def _cast_varlen_to_fp8(
     x: torch.Tensor,
     fp8_dtype: torch.dtype,
     cu_seqlens,
@@ -139,21 +113,13 @@ def cast_varlen_to_fp8(
     return x_fp8, descale_factors
 
 
-# TODO Move this to a common folder. Will need to add future arch list
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-def arch_supports_fp8():
-    return is_hip() and get_arch() in ("gfx942", "gfx950")
+@triton.jit
+def _cdiv_fn(x, y):
+    return (x + y - 1) // y
 
 
 @triton.jit
-def load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
+def _load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & (
             offset_second[None, :] < boundary_second
@@ -171,7 +137,7 @@ def load_fn(ptrs, offset_first, offset_second, boundary_first, boundary_second):
 
 
 @triton.jit
-def compute_alibi_block(
+def _compute_alibi_block(
     alibi_slope, seqlen_q, seqlen_k, offs_m, offs_n, transpose=False
 ):
     # when seqlen_k and seqlen_q are different we want the diagonal to stick to the bottom right of the attention matrix
@@ -260,7 +226,7 @@ def _attn_fwd_inner(
         else:
             k_offs_n = None
         k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL_POW2)
-        k = load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
+        k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -307,7 +273,7 @@ def _attn_fwd_inner(
             # Compute the global position of each token within the sequence
             global_m_positions = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             global_n_positions = start_n + tl.arange(0, BLOCK_N)
-            alibi_block = compute_alibi_block(
+            alibi_block = _compute_alibi_block(
                 alibi_slope, seqlen_q, seqlen_k, global_m_positions, global_n_positions
             )
             qk += alibi_block / SM_SCALE
@@ -346,14 +312,14 @@ def _attn_fwd_inner(
         m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
         alpha = tl.math.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
-        v = load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
 
         if IS_FP8:
-            scale_p, descale_p = compute_fp8_scaling_factors(p, FP8_MAX)
+            scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
             acc += (
                 tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v
             )
@@ -545,7 +511,7 @@ def _attn_fwd(
         seqlen_q = SEQLEN_Q
         seqlen_k = SEQLEN_K
 
-    n_blocks = cdiv_fn(seqlen_k, BLOCK_N)
+    n_blocks = _cdiv_fn(seqlen_k, BLOCK_N)
 
     # Now we compute whether we need to exit early due to causal masking.
     # This is because for seqlen_q > seqlen_k, M rows of the attn scores
@@ -560,7 +526,7 @@ def _attn_fwd(
         # the top edge (seqlen_q < seqlen_k) or left edge.
 
         # This captures the decrease in n_blocks if we have a rectangular attn matrix
-        n_blocks_seqlen = cdiv_fn(
+        n_blocks_seqlen = _cdiv_fn(
             (start_m + 1) * BLOCK_M + seqlen_k - seqlen_q, BLOCK_N
         )
 
@@ -915,7 +881,7 @@ def _flash_attn_forward(
         raise ValueError("Sliding Window is not supported yet in the Triton Backend")
 
     # FP8
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = _is_fp8(q)
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
     is_varlen = True if cu_seqlens_q is not None else False
 
@@ -1072,7 +1038,7 @@ def _flash_attn_forward(
     return o, softmax_lse, s_dmask, philox_seed, philox_offset
 
 
-class FlashAttnFunc(torch.autograd.Function):
+class _FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -1173,6 +1139,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1196,6 +1163,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -1268,7 +1236,7 @@ def flash_attn_func(
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
 
-    return FlashAttnFunc.apply(
+    return _FlashAttnFunc.apply(
         q,
         k,
         v,
@@ -1285,7 +1253,7 @@ def flash_attn_func(
     )
 
 
-class FlashAttnFP8Func(torch.autograd.Function):
+class _FlashAttnFP8Func(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -1312,10 +1280,10 @@ class FlashAttnFP8Func(torch.autograd.Function):
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
 
         # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz
-        q_fp8, descale_q = cast_to_fp8(q, fp8_dtype, "bshd")
-        k_fp8, descale_k = cast_to_fp8(k, fp8_dtype, "bshd")
-        v_fp8, descale_v = cast_to_fp8(v, fp8_dtype, "bshd")
+        fp8_dtype = arch_info.get_fp8_e4m3_dtype()
+        q_fp8, descale_q = _cast_to_fp8(q, fp8_dtype, "bshd")
+        k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd")
+        v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd")
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
@@ -1384,8 +1352,8 @@ class FlashAttnFP8Func(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        fp8_dtype = torch.float8_e4m3fnuz
-        do_padded_fp8, descale_do = cast_to_fp8(do_padded, fp8_dtype, "bshd")
+        fp8_dtype = arch_info.get_fp8_e4m3_dtype()
+        do_padded_fp8, descale_do = _cast_to_fp8(do_padded, fp8_dtype, "bshd")
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
                 do_padded_fp8,
@@ -1412,6 +1380,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1439,6 +1408,7 @@ class FlashAttnFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
         # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
@@ -1460,7 +1430,7 @@ def flash_attn_fp8_func(
     return_lse=False,
     return_attn_probs=False,
 ):
-    return FlashAttnFP8Func.apply(
+    return _FlashAttnFP8Func.apply(
         q,
         k,
         v,
@@ -1476,105 +1446,7 @@ def flash_attn_fp8_func(
     )
 
 
-def flash_attn_varlen_func(
-    q,
-    k,
-    v,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    bias=None,
-    alibi_slopes=None,
-    deterministic=False,
-    return_lse=False,
-    return_attn_probs=False,
-    block_table=None,
-    out=None,
-):
-    """dropout_p should be set to 0.0 during evaluation
-    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
-    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
-    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
-    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
-
-    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
-    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
-        1 1 1 1 0
-        1 1 1 1 1
-    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
-        0 0
-        0 0
-        0 0
-        1 0
-        1 1
-    If the row of the mask is all zero, the output will be zero.
-
-    If window_size != (-1, -1), implements sliding window local attention. Query at position i
-    will only attend to keys between
-    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
-
-    Arguments:
-        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
-        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
-        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into q.
-        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-           of the sequences in the batch, used to index into kv.
-        max_seqlen_q: int. Maximum query sequence length in the batch.
-        max_seqlen_k: int. Maximum key sequence length in the batch.
-        dropout_p: float. Dropout probability.
-        softmax_scale: float. The scaling of QK^T before applying softmax.
-            Default to 1 / sqrt(headdim).
-        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
-        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        bias: (seqlen_q, seqlen_k)
-        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
-            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
-            is added to the attention score of query i and key j.
-        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
-            which is slightly slower and uses more memory. The forward pass is always deterministic.
-        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
-           testing only. The returned probabilities are not guaranteed to be correct
-           (they might not have the right scaling).
-    Return:
-        out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
-            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
-            normalization factor).
-        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
-            The output of softmax (possibly with different scaling). It also encodes the dropout
-            pattern (negative means that location was dropped, nonnegative means it was kept).
-    """
-    return FlashAttnVarlenFunc.apply(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        bias,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-        block_table,
-        out,
-        torch.is_grad_enabled(),
-    )
-
-
-class FlashAttnVarlenFunc(torch.autograd.Function):
+class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -1683,6 +1555,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1706,6 +1579,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
@@ -1734,7 +1608,105 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
 
 
-class FlashAttnVarlenFP8Func(torch.autograd.Function):
+def flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+    return_attn_probs=False,
+    block_table=None,
+    out=None,
+):
+    """dropout_p should be set to 0.0 during evaluation
+    Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
+    than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
+    For example, if Q has 6 heads and K, V have 2 heads, head 0, 1, 2 of Q will attention to head
+    0 of K, V, and head 3, 4, 5 of Q will attention to head 1 of K, V.
+
+    If causal=True, the causal mask is aligned to the bottom right corner of the attention matrix.
+    For example, if seqlen_q = 2 and seqlen_k = 5, the causal mask (1 = keep, 0 = masked out) is:
+        1 1 1 1 0
+        1 1 1 1 1
+    If seqlen_q = 5 and seqlen_k = 2, the causal mask is:
+        0 0
+        0 0
+        0 0
+        1 0
+        1 1
+    If the row of the mask is all zero, the output will be zero.
+
+    If window_size != (-1, -1), implements sliding window local attention. Query at position i
+    will only attend to keys between
+    [i + seqlen_k - seqlen_q - window_size[0], i + seqlen_k - seqlen_q + window_size[1]] inclusive.
+
+    Arguments:
+        q: (total_q, nheads, headdim), where total_q = total number of query tokens in the batch.
+        k: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        v: (total_k, nheads_k, headdim), where total_k = total number of key tokens in the batch.
+        cu_seqlens_q: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into q.
+        cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
+           of the sequences in the batch, used to index into kv.
+        max_seqlen_q: int. Maximum query sequence length in the batch.
+        max_seqlen_k: int. Maximum key sequence length in the batch.
+        dropout_p: float. Dropout probability.
+        softmax_scale: float. The scaling of QK^T before applying softmax.
+            Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
+        window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        bias: (seqlen_q, seqlen_k)
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
+            (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
+            is added to the attention score of query i and key j.
+        deterministic: bool. Whether to use the deterministic implementation of the backward pass,
+            which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_attn_probs: bool. Whether to return the attention probabilities. This option is for
+           testing only. The returned probabilities are not guaranteed to be correct
+           (they might not have the right scaling).
+    Return:
+        out: (total, nheads, headdim).
+        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
+        S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
+            The output of softmax (possibly with different scaling). It also encodes the dropout
+            pattern (negative means that location was dropped, nonnegative means it was kept).
+    """
+    return _FlashAttnVarlenFunc.apply(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        bias,
+        alibi_slopes,
+        deterministic,
+        return_lse,
+        return_attn_probs,
+        block_table,
+        out,
+        torch.is_grad_enabled(),
+    )
+
+
+class _FlashAttnVarlenFP8Func(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
@@ -1766,10 +1738,10 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
 
         # cast input to fp8
-        fp8_dtype = torch.float8_e4m3fnuz
-        q_fp8, descale_q = cast_varlen_to_fp8(q, fp8_dtype, cu_seqlens=cu_seqlens_q)
-        k_fp8, descale_k = cast_varlen_to_fp8(k, fp8_dtype, cu_seqlens=cu_seqlens_k)
-        v_fp8, descale_v = cast_varlen_to_fp8(v, fp8_dtype, cu_seqlens=cu_seqlens_k)
+        fp8_dtype = arch_info.get_fp8_e4m3_dtype()
+        q_fp8, descale_q = _cast_varlen_to_fp8(q, fp8_dtype, cu_seqlens=cu_seqlens_q)
+        k_fp8, descale_k = _cast_varlen_to_fp8(k, fp8_dtype, cu_seqlens=cu_seqlens_k)
+        v_fp8, descale_v = _cast_varlen_to_fp8(v, fp8_dtype, cu_seqlens=cu_seqlens_k)
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
@@ -1850,8 +1822,8 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        fp8_dtype = torch.float8_e4m3fnuz
-        do_padded_fp8, descale_do = cast_varlen_to_fp8(
+        fp8_dtype = arch_info.get_fp8_e4m3_dtype()
+        do_padded_fp8, descale_do = _cast_varlen_to_fp8(
             do_padded, fp8_dtype, "thd", cu_seqlens_q
         )
         if _USE_FUSED_BWD_KERNEL:
@@ -1880,6 +1852,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
@@ -1907,6 +1880,7 @@ class FlashAttnVarlenFP8Func(torch.autograd.Function):
                 descale_k=descale_k,
                 descale_v=descale_v,
                 descale_do=descale_do,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k_fp8.shape[-1]]
@@ -1932,7 +1906,7 @@ def flash_attn_varlen_fp8_func(
     return_attn_probs=False,
     block_table=None,
 ):
-    return FlashAttnVarlenFP8Func.apply(
+    return _FlashAttnVarlenFP8Func.apply(
         q,
         k,
         v,

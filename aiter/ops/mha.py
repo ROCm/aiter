@@ -49,11 +49,11 @@ def fmha_v3_fwd(
 
 @compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
 def mha_varlen_fwd(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -66,12 +66,12 @@ def mha_varlen_fwd(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> list[Tensor]: ...
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> list[torch.Tensor]: ...
 
 
 @compile_ops("module_mha_bwd", fc_name="mha_bwd")

@@ -6,8 +6,8 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from typing import Optional
 from aiter.ops.triton.utils.mha_kernel_utils import (
-    compute_fp8_scaling_factors,
-    is_fp8,
+    _compute_fp8_scaling_factors,
+    _is_fp8,
 )
 
 
@@ -245,7 +245,7 @@ def _bwd_dkdv_inner(
         if ENABLE_DROPOUT:
             pT_dropout = tl.where(dropout_mask, pT, 0.0) * dropout_scale
             if IS_FP8:
-                scale_p_dropout, descale_p_dropout = compute_fp8_scaling_factors(
+                scale_p_dropout, descale_p_dropout = _compute_fp8_scaling_factors(
                     pT_dropout, FP8_MAX
                 )
                 dv += (
@@ -257,7 +257,7 @@ def _bwd_dkdv_inner(
                 dv += tl.dot(pT_dropout.to(do.type.element_ty), do)
         else:
             if IS_FP8:
-                scale_pT, descale_pT = compute_fp8_scaling_factors(pT, FP8_MAX)
+                scale_pT, descale_pT = _compute_fp8_scaling_factors(pT, FP8_MAX)
                 dv += (
                     tl.dot((pT * scale_pT).to(do.type.element_ty), do)
                     * descale_pT
@@ -281,7 +281,7 @@ def _bwd_dkdv_inner(
         delta_i = Di[None, :]
         dsT = pT * (dpT - delta_i)
         if IS_FP8:
-            scale_dsT, descale_dsT = compute_fp8_scaling_factors(dsT, FP8_MAX)
+            scale_dsT, descale_dsT = _compute_fp8_scaling_factors(dsT, FP8_MAX)
             dk += (
                 tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT))
                 * descale_dsT
@@ -441,7 +441,7 @@ def _bwd_dq_inner(
         # Compute dQ.
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         if IS_FP8:
-            scale_ds, descale_ds = compute_fp8_scaling_factors(ds, FP8_MAX)
+            scale_ds, descale_ds = _compute_fp8_scaling_factors(ds, FP8_MAX)
             dq += (
                 tl.dot((ds * scale_ds).to(kT.type.element_ty), tl.trans(kT))
                 * descale_ds
@@ -456,11 +456,6 @@ def _bwd_dq_inner(
     return dq
 
 
-# @triton.autotune(
-#     configs=causal_autotune_configs,
-#     key=causal_autotune_keys,
-#     use_cuda_graph=True,
-# )
 @triton.jit
 def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nheads_q)
     Q,
@@ -473,47 +468,47 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     DV,
     M,
     Delta,
-    stride_qb,
-    stride_qh,
-    stride_qm,
-    stride_qd,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_kd,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_vd,
-    stride_dqb,
-    stride_dqh,
-    stride_dqm,
-    stride_dqd,
-    stride_dkb,
-    stride_dkh,
-    stride_dkn,
-    stride_dkd,
-    stride_dvb,
-    stride_dvh,
-    stride_dvn,
-    stride_dvd,
-    stride_deltab,
-    stride_deltah,
-    stride_deltam,
-    stride_dob,
-    stride_doh,
-    stride_dom,
-    stride_dod,
-    stride_dropoutb,
-    stride_dropouth,
-    stride_dropoutm,
-    stride_dropoutn,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_descale_do_z,
-    stride_az,
-    stride_ah,
+    stride_qb_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qd_in,
+    stride_kb_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kd_in,
+    stride_vb_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vd_in,
+    stride_dqb_in,
+    stride_dqh_in,
+    stride_dqm_in,
+    stride_dqd_in,
+    stride_dkb_in,
+    stride_dkh_in,
+    stride_dkn_in,
+    stride_dkd_in,
+    stride_dvb_in,
+    stride_dvh_in,
+    stride_dvn_in,
+    stride_dvd_in,
+    stride_deltab_in,
+    stride_deltah_in,
+    stride_deltam_in,
+    stride_dob_in,
+    stride_doh_in,
+    stride_dom_in,
+    stride_dod_in,
+    stride_dropoutb_in,
+    stride_dropouth_in,
+    stride_dropoutm_in,
+    stride_dropoutn_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
+    stride_az_in,
+    stride_ah_in,
     HQ,
     HK,
     cu_seqlens_q,
@@ -523,7 +518,7 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     Dropout_mask,
     dropout_p,
     philox_seed,
-    philox_offset_base,
+    philox_offset_base_in,
     Alibi_slopes,
     Descale_q,
     Descale_k,
@@ -545,7 +540,96 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
+    if USE_INT64_STRIDES:
+        stride_qb = tl.cast(stride_qb_in, tl.int64)
+        stride_qh = tl.cast(stride_qh_in, tl.int64)
+        stride_qm = tl.cast(stride_qm_in, tl.int64)
+        stride_qd = tl.cast(stride_qd_in, tl.int64)
+        stride_kb = tl.cast(stride_kb_in, tl.int64)
+        stride_kh = tl.cast(stride_kh_in, tl.int64)
+        stride_kn = tl.cast(stride_kn_in, tl.int64)
+        stride_kd = tl.cast(stride_kd_in, tl.int64)
+        stride_vb = tl.cast(stride_vb_in, tl.int64)
+        stride_vh = tl.cast(stride_vh_in, tl.int64)
+        stride_vn = tl.cast(stride_vn_in, tl.int64)
+        stride_vd = tl.cast(stride_vd_in, tl.int64)
+        stride_dqb = tl.cast(stride_dqb_in, tl.int64)
+        stride_dqh = tl.cast(stride_dqh_in, tl.int64)
+        stride_dqm = tl.cast(stride_dqm_in, tl.int64)
+        stride_dqd = tl.cast(stride_dqd_in, tl.int64)
+        stride_dkb = tl.cast(stride_dkb_in, tl.int64)
+        stride_dkh = tl.cast(stride_dkh_in, tl.int64)
+        stride_dkn = tl.cast(stride_dkn_in, tl.int64)
+        stride_dkd = tl.cast(stride_dkd_in, tl.int64)
+        stride_dvb = tl.cast(stride_dvb_in, tl.int64)
+        stride_dvh = tl.cast(stride_dvh_in, tl.int64)
+        stride_dvn = tl.cast(stride_dvn_in, tl.int64)
+        stride_dvd = tl.cast(stride_dvd_in, tl.int64)
+        stride_deltab = tl.cast(stride_deltab_in, tl.int64)
+        stride_deltah = tl.cast(stride_deltah_in, tl.int64)
+        stride_deltam = tl.cast(stride_deltam_in, tl.int64)
+        stride_dob = tl.cast(stride_dob_in, tl.int64)
+        stride_doh = tl.cast(stride_doh_in, tl.int64)
+        stride_dom = tl.cast(stride_dom_in, tl.int64)
+        stride_dod = tl.cast(stride_dod_in, tl.int64)
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropoutb = tl.cast(stride_dropoutb_in, tl.int64)
+        stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
+        stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
+        stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+        stride_az = tl.cast(stride_az_in, tl.int64)
+        stride_ah = tl.cast(stride_ah_in, tl.int64)
+    else:
+        stride_qb = stride_qb_in
+        stride_qh = stride_qh_in
+        stride_qm = stride_qm_in
+        stride_qd = stride_qd_in
+        stride_kb = stride_kb_in
+        stride_kh = stride_kh_in
+        stride_kn = stride_kn_in
+        stride_kd = stride_kd_in
+        stride_vb = stride_vb_in
+        stride_vh = stride_vh_in
+        stride_vn = stride_vn_in
+        stride_vd = stride_vd_in
+        stride_dqb = stride_dqb_in
+        stride_dqh = stride_dqh_in
+        stride_dqm = stride_dqm_in
+        stride_dqd = stride_dqd_in
+        stride_dkb = stride_dkb_in
+        stride_dkh = stride_dkh_in
+        stride_dkn = stride_dkn_in
+        stride_dkd = stride_dkd_in
+        stride_dvb = stride_dvb_in
+        stride_dvh = stride_dvh_in
+        stride_dvn = stride_dvn_in
+        stride_dvd = stride_dvd_in
+        stride_deltab = stride_deltab_in
+        stride_deltah = stride_deltah_in
+        stride_deltam = stride_deltam_in
+        stride_dob = stride_dob_in
+        stride_doh = stride_doh_in
+        stride_dom = stride_dom_in
+        stride_dod = stride_dod_in
+        philox_offset_base = philox_offset_base_in
+        stride_dropoutb = stride_dropoutb_in
+        stride_dropouth = stride_dropouth_in
+        stride_dropoutm = stride_dropoutm_in
+        stride_dropoutn = stride_dropoutn_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
+        stride_az = stride_az_in
+        stride_ah = stride_ah_in
+
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
@@ -995,11 +1079,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             # end of GQA/MQA of dq
 
 
-# @triton.autotune(
-#     configs=noncausal_autotune_configs,
-#     key=noncausal_autotune_keys,
-#     use_cuda_graph=True,
-# )
 @triton.jit
 def bwd_kernel_noncausal(
     Q,
@@ -1012,47 +1091,47 @@ def bwd_kernel_noncausal(
     DV,
     M,
     Delta,
-    stride_qb,
-    stride_qh,
-    stride_qm,
-    stride_qd,
-    stride_kb,
-    stride_kh,
-    stride_kn,
-    stride_kd,
-    stride_vb,
-    stride_vh,
-    stride_vn,
-    stride_vd,
-    stride_dqb,
-    stride_dqh,
-    stride_dqm,
-    stride_dqd,
-    stride_dkb,
-    stride_dkh,
-    stride_dkn,
-    stride_dkd,
-    stride_dvb,
-    stride_dvh,
-    stride_dvn,
-    stride_dvd,
-    stride_deltab,
-    stride_deltah,
-    stride_deltam,
-    stride_dob,
-    stride_doh,
-    stride_dom,
-    stride_dod,
-    stride_dropoutb,
-    stride_dropouth,
-    stride_dropoutm,
-    stride_dropoutn,
-    stride_descale_q_z,
-    stride_descale_k_z,
-    stride_descale_v_z,
-    stride_descale_do_z,
-    stride_az,
-    stride_ah,
+    stride_qb_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qd_in,
+    stride_kb_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kd_in,
+    stride_vb_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vd_in,
+    stride_dqb_in,
+    stride_dqh_in,
+    stride_dqm_in,
+    stride_dqd_in,
+    stride_dkb_in,
+    stride_dkh_in,
+    stride_dkn_in,
+    stride_dkd_in,
+    stride_dvb_in,
+    stride_dvh_in,
+    stride_dvn_in,
+    stride_dvd_in,
+    stride_deltab_in,
+    stride_deltah_in,
+    stride_deltam_in,
+    stride_dob_in,
+    stride_doh_in,
+    stride_dom_in,
+    stride_dod_in,
+    stride_dropoutb_in,
+    stride_dropouth_in,
+    stride_dropoutm_in,
+    stride_dropoutn_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_descale_do_z_in,
+    stride_az_in,
+    stride_ah_in,
     HQ,
     HK,
     cu_seqlens_q,
@@ -1062,7 +1141,7 @@ def bwd_kernel_noncausal(
     Dropout_mask,
     dropout_p,
     philox_seed,
-    philox_offset_base,
+    philox_offset_base_in,
     Alibi_slopes,
     Descale_q,
     Descale_k,
@@ -1084,7 +1163,96 @@ def bwd_kernel_noncausal(
     FP8_OUTPUT: tl.constexpr,
     DEBUG_TRITON: tl.constexpr,
     DEBUG_TRITON_DETAIL: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
 ):
+    if USE_INT64_STRIDES:
+        stride_qb = tl.cast(stride_qb_in, tl.int64)
+        stride_qh = tl.cast(stride_qh_in, tl.int64)
+        stride_qm = tl.cast(stride_qm_in, tl.int64)
+        stride_qd = tl.cast(stride_qd_in, tl.int64)
+        stride_kb = tl.cast(stride_kb_in, tl.int64)
+        stride_kh = tl.cast(stride_kh_in, tl.int64)
+        stride_kn = tl.cast(stride_kn_in, tl.int64)
+        stride_kd = tl.cast(stride_kd_in, tl.int64)
+        stride_vb = tl.cast(stride_vb_in, tl.int64)
+        stride_vh = tl.cast(stride_vh_in, tl.int64)
+        stride_vn = tl.cast(stride_vn_in, tl.int64)
+        stride_vd = tl.cast(stride_vd_in, tl.int64)
+        stride_dqb = tl.cast(stride_dqb_in, tl.int64)
+        stride_dqh = tl.cast(stride_dqh_in, tl.int64)
+        stride_dqm = tl.cast(stride_dqm_in, tl.int64)
+        stride_dqd = tl.cast(stride_dqd_in, tl.int64)
+        stride_dkb = tl.cast(stride_dkb_in, tl.int64)
+        stride_dkh = tl.cast(stride_dkh_in, tl.int64)
+        stride_dkn = tl.cast(stride_dkn_in, tl.int64)
+        stride_dkd = tl.cast(stride_dkd_in, tl.int64)
+        stride_dvb = tl.cast(stride_dvb_in, tl.int64)
+        stride_dvh = tl.cast(stride_dvh_in, tl.int64)
+        stride_dvn = tl.cast(stride_dvn_in, tl.int64)
+        stride_dvd = tl.cast(stride_dvd_in, tl.int64)
+        stride_deltab = tl.cast(stride_deltab_in, tl.int64)
+        stride_deltah = tl.cast(stride_deltah_in, tl.int64)
+        stride_deltam = tl.cast(stride_deltam_in, tl.int64)
+        stride_dob = tl.cast(stride_dob_in, tl.int64)
+        stride_doh = tl.cast(stride_doh_in, tl.int64)
+        stride_dom = tl.cast(stride_dom_in, tl.int64)
+        stride_dod = tl.cast(stride_dod_in, tl.int64)
+        philox_offset_base = tl.cast(philox_offset_base_in, tl.int64)
+        stride_dropoutb = tl.cast(stride_dropoutb_in, tl.int64)
+        stride_dropouth = tl.cast(stride_dropouth_in, tl.int64)
+        stride_dropoutm = tl.cast(stride_dropoutm_in, tl.int64)
+        stride_dropoutn = tl.cast(stride_dropoutn_in, tl.int64)
+        if IS_FP8:
+            stride_descale_q_z = tl.cast(stride_descale_q_z_in, tl.int64)
+            stride_descale_k_z = tl.cast(stride_descale_k_z_in, tl.int64)
+            stride_descale_v_z = tl.cast(stride_descale_v_z_in, tl.int64)
+            stride_descale_do_z = tl.cast(stride_descale_do_z_in, tl.int64)
+        stride_az = tl.cast(stride_az_in, tl.int64)
+        stride_ah = tl.cast(stride_ah_in, tl.int64)
+    else:
+        stride_qb = stride_qb_in
+        stride_qh = stride_qh_in
+        stride_qm = stride_qm_in
+        stride_qd = stride_qd_in
+        stride_kb = stride_kb_in
+        stride_kh = stride_kh_in
+        stride_kn = stride_kn_in
+        stride_kd = stride_kd_in
+        stride_vb = stride_vb_in
+        stride_vh = stride_vh_in
+        stride_vn = stride_vn_in
+        stride_vd = stride_vd_in
+        stride_dqb = stride_dqb_in
+        stride_dqh = stride_dqh_in
+        stride_dqm = stride_dqm_in
+        stride_dqd = stride_dqd_in
+        stride_dkb = stride_dkb_in
+        stride_dkh = stride_dkh_in
+        stride_dkn = stride_dkn_in
+        stride_dkd = stride_dkd_in
+        stride_dvb = stride_dvb_in
+        stride_dvh = stride_dvh_in
+        stride_dvn = stride_dvn_in
+        stride_dvd = stride_dvd_in
+        stride_deltab = stride_deltab_in
+        stride_deltah = stride_deltah_in
+        stride_deltam = stride_deltam_in
+        stride_dob = stride_dob_in
+        stride_doh = stride_doh_in
+        stride_dom = stride_dom_in
+        stride_dod = stride_dod_in
+        philox_offset_base = philox_offset_base_in
+        stride_dropoutb = stride_dropoutb_in
+        stride_dropouth = stride_dropouth_in
+        stride_dropoutm = stride_dropoutm_in
+        stride_dropoutn = stride_dropoutn_in
+        stride_descale_q_z = stride_descale_q_z_in
+        stride_descale_k_z = stride_descale_k_z_in
+        stride_descale_v_z = stride_descale_v_z_in
+        stride_descale_do_z = stride_descale_do_z_in
+        stride_az = stride_az_in
+        stride_ah = stride_ah_in
+
     # program ids
     hkid = tl.program_id(0)
     pid = tl.program_id(1)
@@ -1382,109 +1550,16 @@ def flash_attn_onekernel_backward(
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
+    USE_INT64_STRIDES: Optional[bool] = False,
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    # IS_VARLEN = True if cu_seqlens_q is not None else False
 
-    # IS_FP8 = is_fp8(q)
-    # if IS_FP8:
-    #     FP8_MAX = torch.finfo(q.dtype).max
-    #     # assert that the main inputs are fp8
-
-    #     stride_descale_q_z = descale_q.stride(0) if descale_q is not None else None
-    #     stride_descale_k_z = descale_k.stride(0) if descale_k is not None else None
-    #     stride_descale_v_z = descale_v.stride(0) if descale_v is not None else None
-    #     stride_descale_do_z = descale_do.stride(0) if descale_do is not None else None
-    # else:
-    #     FP8_MAX = None
-    #     stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-    #         stride_descale_o_z
-    #     ) = stride_descale_do_z = None
-    # if IS_VARLEN:
-    #     layout = "thd"
-    # elif q.shape[2] == max_seqlen_q:
-    #     layout = "bhsd"
-    # elif q.shape[1] == max_seqlen_q:
-    #     layout = "bshd"
-    # else:
-    #     raise ValueError("invalid layout")
-
-    # # get strides and shape
-    # batch, nheads_q, nheads_k, head_size, max_seqlen_q_final, max_seqlen_k_final = (
-    #     get_shapes_from_layout(
-    #         q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
-    #     )
-    # )
-    # q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(
-    #     q, k, v, o, layout
-    # )
-    # stride_qb, stride_qh, stride_qm, stride_qd = q_strides
-    # stride_kb, stride_kh, stride_kn, stride_kd = k_strides
-    # stride_vb, stride_vh, stride_vn, stride_vd = v_strides
-    # stride_ob, stride_oh, stride_om, stride_od = o_strides
-    # dq_strides, dk_strides, dv_strides, do_strides = get_strides_from_layout(
-    #     dq, dk, dv, do, layout
-    # )
-    # stride_dqb, stride_dqh, stride_dqm, stride_dqd = dq_strides
-    # stride_dkb, stride_dkh, stride_dkn, stride_dkd = dk_strides
-    # stride_dvb, stride_dvh, stride_dvn, stride_dvd = dv_strides
-    # stride_dob, stride_doh, stride_dom, stride_dod = do_strides
-    # use_dropout = dropout_p > 0.0
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
 
-    # # get closest power of 2 over or equal to 32.
-    # padded_d_model = 1 << (head_size - 1).bit_length()
-    # padded_d_model = max(padded_d_model, 32)
-    # HEAD_DIM = padded_d_model
-    # ACTUAL_HEAD_DIM = head_size
-
-    # # init delta
-    # delta = torch.zeros_like(softmax_lse)
-    # if IS_VARLEN:
-    #     stride_deltab = 0
-    #     stride_deltam, stride_deltah = delta.stride()
-    # else:
-    #     stride_deltab, stride_deltah, stride_deltam = delta.stride()
-    # PRE_BLOCK = 128
-    # pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, nheads_q)
-
-    # _bwd_preprocess[pre_grid](
-    #     o,
-    #     do,
-    #     delta,
-    #     stride_ob,
-    #     stride_oh,
-    #     stride_om,
-    #     stride_od,
-    #     stride_deltab,
-    #     stride_deltah,
-    #     stride_deltam,
-    #     stride_descale_do_z,
-    #     cu_seqlens_q,
-    #     max_seqlen_q,
-    #     descale_do,
-    #     BLOCK_M=PRE_BLOCK,
-    #     BLOCK_D_MODEL=HEAD_DIM,
-    #     BLOCK_D_MODEL_POW2=ACTUAL_HEAD_DIM,
-    #     IS_VARLEN=IS_VARLEN,
-    #     IS_FP8=IS_FP8,
-    # )
-
-    # # dropout mask tensor for debugging. We dump the dropout mask created in
-    # #   the kernel for testing
-    # dropout_mask = None
-    # stride_dropoutb, stride_dropouth, stride_dropoutm, stride_dropoutn = (0, 0, 0, 0)
-    # if use_dropout:
-    #     dropout_mask = torch.zeros(
-    #         (batch, nheads_q, max_seqlen_q_final, max_seqlen_k_final),
-    #         device=q.device,
-    #         dtype=torch.float32,
-    #     )
-
-    IS_FP8 = is_fp8(q)
+    IS_FP8 = _is_fp8(q)
     if IS_FP8:
         FP8_MAX = torch.finfo(q.dtype).max
         descale_strides = (
@@ -1545,15 +1620,6 @@ def flash_attn_onekernel_backward(
     BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
 
     # Configs
-    # PRE_BLOCK, BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2
-    # BLK_SLICE_FACTOR
-    # NUM_WARPS, NUM_STAGES = 4, 1
-    # WAVES_PER_EU = 1
-    # PRE_BLOCK = 128
-    # # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    # BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 16, 64, 64, 16
-    # BLK_SLICE_FACTOR = 2
-
     NUM_WARPS, NUM_STAGES = 4, 1
     WAVES_PER_EU = 1
     PRE_BLOCK = 128
@@ -1648,10 +1714,7 @@ def flash_attn_onekernel_backward(
             *delta_strides,
             *do_strides,
             *dropout_strides,
-            stride_descale_q_z,
-            stride_descale_k_z,
-            stride_descale_v_z,
-            stride_descale_do_z,
+            *descale_strides,
             stride_az,
             stride_ah,
             num_q_heads,
@@ -1680,6 +1743,7 @@ def flash_attn_onekernel_backward(
             FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
+            USE_INT64_STRIDES=USE_INT64_STRIDES,
             **onekernel_config,
         )
     else:
@@ -1703,10 +1767,7 @@ def flash_attn_onekernel_backward(
             *delta_strides,
             *do_strides,
             *dropout_strides,
-            stride_descale_q_z,
-            stride_descale_k_z,
-            stride_descale_v_z,
-            stride_descale_do_z,
+            *descale_strides,
             stride_az,
             stride_ah,
             num_q_heads,
@@ -1735,6 +1796,7 @@ def flash_attn_onekernel_backward(
             FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
+            USE_INT64_STRIDES=USE_INT64_STRIDES,
             **onekernel_config,
         )
 

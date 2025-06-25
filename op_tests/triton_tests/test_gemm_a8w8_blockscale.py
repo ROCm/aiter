@@ -5,6 +5,8 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 
 
@@ -34,22 +36,7 @@ def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
     return gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y)
 
 
-def is_cdna4():
-    return triton.runtime.driver.active.get_current_target().arch == "gfx950"
-
-
-e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
-e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
-
-name_to_torch_types = {
-    "int8": torch.int8,
-    "int32": torch.int32,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp8e5": e5m2_type,
-    "fp8e4": e4m3_type,
-}
+e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
@@ -121,7 +108,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 def test_gemm(dtype, M, N, K, output):
     block_shape_n, block_shape_k = block_shape
 
-    dtype = name_to_torch_types[dtype]
+    dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
         M,
         N,

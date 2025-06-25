@@ -69,11 +69,15 @@ if find_aiter is not None:
     elif find_aiter.origin:
         package_path = find_aiter.origin
     package_path = os.path.dirname(package_path)
+    package_parent_path = os.path.dirname(package_path)
     import site
 
     site_packages_dirs = site.getsitepackages()
     # develop mode
-    if package_path not in site_packages_dirs:
+    isDevelopMode = (package_path not in site_packages_dirs) and (
+        package_parent_path not in site_packages_dirs
+    )
+    if isDevelopMode:
         AITER_META_DIR = AITER_ROOT_DIR
     # install mode
     else:
@@ -84,7 +88,8 @@ else:
 
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
-AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
+gfx = get_gfx()
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
 os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
@@ -93,10 +98,6 @@ CK_3RDPARTY_DIR = os.environ.get(
 
 @functools.lru_cache(maxsize=1)
 def get_asm_dir():
-    gfx = get_gfx()
-    global AITER_ASM_DIR
-    AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/{gfx}/"
-    os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
     return AITER_ASM_DIR
 
 

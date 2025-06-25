@@ -455,14 +455,32 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
     dim3 block(BlockSize);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-        using input_dtype = typename t2ck<scalar_t>::type;
-        aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
-            reinterpret_cast<input_dtype*>(input.data_ptr()),
-            scale.data_ptr<float>(),
-            cols);
-    });
+    if(out.dtype() == torch_fp8)
+    {
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                scale.data_ptr<float>(),
+                cols);
+        });
+    }
+    else if(out.dtype() == torch::kInt8)
+    {
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                scale.data_ptr<float>(),
+                cols);
+        });
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+    }
 }
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA)      \
@@ -504,17 +522,40 @@ void dynamic_per_tensor_quant(torch::Tensor& out,         // [..., d]
     dim3 block(BlockSize);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
-        using input_dtype = typename t2ck<scalar_t>::type;
-        vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(scale.data_ptr<float>(), 1, 0.0f);
-        aiter::data_to_scale_kernel<input_dtype, FP8_TYPE><<<grid, block, 0, stream>>>(
-            scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
-        aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
-            reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
-            reinterpret_cast<input_dtype*>(input.data_ptr()),
-            scale.data_ptr<float>(),
-            cols);
-    });
+    if(out.dtype() == torch_fp8)
+    {
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
+                scale.data_ptr<float>(), 1, 0.0f);
+            aiter::data_to_scale_kernel<input_dtype, FP8_TYPE><<<grid, block, 0, stream>>>(
+                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                reinterpret_cast<FP8_TYPE*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                scale.data_ptr<float>(),
+                cols);
+        });
+    }
+    else if(out.dtype() == torch::kInt8)
+    {
+        AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "scaled_quant_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            vllm::initializeScale<<<dim3(1), dim3(64), 0, stream>>>(
+                scale.data_ptr<float>(), 1, 0.0f);
+            aiter::data_to_scale_kernel<input_dtype, ck_tile::int8_t><<<grid, block, 0, stream>>>(
+                scale.data_ptr<float>(), reinterpret_cast<input_dtype*>(input.data_ptr()), cols);
+            aiter::scaled_quant_kernel<<<grid, block, 0, stream>>>(
+                reinterpret_cast<ck_tile::int8_t*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                scale.data_ptr<float>(),
+                cols);
+        });
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+    }
 }
 
 void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]

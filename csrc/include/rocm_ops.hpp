@@ -59,10 +59,13 @@
           py::arg("block_tables"),                  \
           py::arg("context_lens"),                  \
           py::arg("max_num_blocks"),                \
+          py::arg("max_qlen")       = 1,            \
           py::arg("K_QScale")       = std::nullopt, \
           py::arg("V_QScale")       = std::nullopt, \
           py::arg("out_")           = std::nullopt, \
-          py::arg("high_precision") = 1);
+          py::arg("qo_indptr")      = std::nullopt, \
+          py::arg("high_precision") = 1,            \
+          py::arg("kernelName")     = "");
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -265,19 +268,19 @@
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \
-          &aiter::wvSpltK,                                                                             \
+          &aiter::wvSpltK,                                                                      \
           "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"                          \
           "        int CuCount) -> ()");                                                        \
     m.def("wv_splitk_small_fp16_bf16",                                                          \
-          &aiter::wv_splitk_small_fp16_bf16_wrapper,                                                   \
+          &aiter::wv_splitk_small_fp16_bf16_wrapper,                                            \
           "wv_splitk_small_fp16_bf16(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"        \
           "        int CuCount) -> ()");                                                        \
     m.def("LLMM1",                                                                              \
-          &aiter::LLMM1,                                                                               \
+          &aiter::LLMM1,                                                                        \
           "LLMM1(Tensor in_a, Tensor in_b, Tensor! out_c, int rows_per_block) -> "              \
           "()");                                                                                \
     m.def("wvSplitKQ",                                                                          \
-          &aiter::wvSplitKQ,                                                                           \
+          &aiter::wvSplitKQ,                                                                    \
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
           "int CuCount) -> ()");
 
@@ -298,18 +301,19 @@
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
 
-#define GEMM_A4W4_ASM_PYBIND      \
-    m.def("gemm_a4w4_asm",        \
-          &gemm_a4w4_asm,         \
-          "Asm gemm a4w4",        \
-          py::arg("A"),           \
-          py::arg("B"),           \
-          py::arg("A_scale"),     \
-          py::arg("B_scale"),     \
-          py::arg("out"),         \
-          py::arg("bias"),        \
-          py::arg("alpha") = 1.0, \
-          py::arg("beta")  = 0.0);
+#define GEMM_A4W4_ASM_PYBIND            \
+    m.def("gemm_a4w4_asm",              \
+          &gemm_a4w4_asm,               \
+          "Asm gemm a4w4",              \
+          py::arg("A"),                 \
+          py::arg("B"),                 \
+          py::arg("A_scale"),           \
+          py::arg("B_scale"),           \
+          py::arg("out"),               \
+          py::arg("bias"),              \
+          py::arg("alpha")       = 1.0, \
+          py::arg("beta")        = 0.0, \
+          py::arg("bpreshuffle") = true);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -570,32 +574,32 @@
           py::arg("w2_scale")       = std::nullopt,  \
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt); \
+          py::arg("sorted_weights") = std::nullopt);
 
-#define MHA_VARLEN_FWD_PYBIND                        \
-      m.def("mha_varlen_fwd",                        \
-          &aiter::torch_itfs::mha_varlen_fwd,        \
-          py::arg("q"),                              \
-          py::arg("k"),                              \
-          py::arg("v"),                              \
-          py::arg("cu_seqlens_q"),                   \
-          py::arg("cu_seqlens_k"),                   \
-          py::arg("max_seqlen_q"),                   \
-          py::arg("max_seqlen_k"),                   \
-          py::arg("min_seqlen_q"),                   \
-          py::arg("dropout_p"),                      \
-          py::arg("softmax_scale"),                  \
-          py::arg("logits_soft_cap"),                \
-          py::arg("zero_tensors"),                   \
-          py::arg("is_causal"),                      \
-          py::arg("window_size_left"),               \
-          py::arg("window_size_right"),              \
-          py::arg("return_softmax_lse"),             \
-          py::arg("return_dropout_randval"),         \
-          py::arg("out")          = std::nullopt,    \
-          py::arg("block_table")  = std::nullopt,    \
-          py::arg("bias")         = std::nullopt,    \
-          py::arg("alibi_slopes") = std::nullopt,    \
+#define MHA_VARLEN_FWD_PYBIND                     \
+    m.def("mha_varlen_fwd",                       \
+          &aiter::torch_itfs::mha_varlen_fwd,     \
+          py::arg("q"),                           \
+          py::arg("k"),                           \
+          py::arg("v"),                           \
+          py::arg("cu_seqlens_q"),                \
+          py::arg("cu_seqlens_k"),                \
+          py::arg("max_seqlen_q"),                \
+          py::arg("max_seqlen_k"),                \
+          py::arg("min_seqlen_q"),                \
+          py::arg("dropout_p"),                   \
+          py::arg("softmax_scale"),               \
+          py::arg("logits_soft_cap"),             \
+          py::arg("zero_tensors"),                \
+          py::arg("is_causal"),                   \
+          py::arg("window_size_left"),            \
+          py::arg("window_size_right"),           \
+          py::arg("return_softmax_lse"),          \
+          py::arg("return_dropout_randval"),      \
+          py::arg("out")          = std::nullopt, \
+          py::arg("block_table")  = std::nullopt, \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
 #define MHA_BATCH_PREFILL_PYBIND                  \
@@ -860,8 +864,15 @@
           "Apply Root Mean Square (RMS) Normalization to the input tensor.");                      \
     m.def(                                                                                         \
         "fused_add_rms_norm_cu", &fused_add_rms_norm, "In-place fused Add and RMS Normalization"); \
-    m.def("rmsnorm2d_fwd", &rmsnorm2d);                                                            \
-    m.def("rmsnorm2d_fwd_with_add", &rmsnorm2d_with_add);                                          \
+    m.def("rmsnorm2d_fwd", &rmsnorm2d, py::arg("input"), py::arg("weight"), py::arg("epsilon"));   \
+    m.def("rmsnorm2d_fwd_with_add",                                                                \
+          &rmsnorm2d_with_add,                                                                     \
+          py::arg("out"),                                                                          \
+          py::arg("input"),                                                                        \
+          py::arg("residual_in"),                                                                  \
+          py::arg("residual_out"),                                                                 \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"));                                                                     \
     m.def("rmsnorm2d_fwd_with_smoothquant", &rmsnorm2d_with_smoothquant);                          \
     m.def("rmsnorm2d_fwd_with_add_smoothquant",                                                    \
           &rmsnorm2d_with_add_smoothquant,                                                         \

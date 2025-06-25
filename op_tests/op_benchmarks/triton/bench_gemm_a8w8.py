@@ -3,9 +3,9 @@ import sys
 import torch
 import triton
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.triton_tests.test_gemm_a8w8 import (
     generate_gemm_a8w8_inputs,
-    name_to_torch_types,
 )
 from utils.benchmark_utils import get_model_configs, get_available_models
 
@@ -83,9 +83,9 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(M, N, K, metric, provider):
         # NOTE: Assume bias and output has the same dtype
-        c_dtype = name_to_torch_types["bf16"]
+        c_dtype = str_to_torch_dtype["bf16"]
         x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
-            M, N, K, name_to_torch_types["fp8e4"], c_dtype, output=True
+            M, N, K, str_to_torch_dtype["fp8e4m3"], c_dtype, output=True
         )
         # flops
         flops = 2.0 * M * N * K
