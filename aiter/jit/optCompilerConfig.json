@@ -490,8 +490,9 @@
     "module_aiter_operator": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_operator_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/include/aiter_operator.h'",
+            "f'{AITER_CSRC_DIR}/include/binary_operator.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'",
+            "f'{AITER_CSRC_DIR}/../aiter/jit/build/module_aiter_operator/build/src/binary_op_api.cpp'",
             "f'{AITER_CSRC_DIR}/kernels/unary_operator.cu'"
         ],
         "flags_extra_cc": [],
@@ -499,7 +500,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/generate_binaryop.py --working_path {{}}'"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/generate_binaryop.py --working_path {{}} --dtypes'"
     },
     "module_quant": {
         "srcs": [

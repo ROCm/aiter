@@ -250,7 +250,6 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
   return ;
   }
 }
-
 """
 
     API_BASE = """
@@ -259,9 +258,8 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 
 #include "binary_op_api_common.hpp"
 
-template <typename Op, typename T0, typename T1>
-void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output);
-
+// template <typename Op, typename T0, typename T1>
+// void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output);
 void binary_op_dispatch(const std::string& op_type, 
                        torch::Tensor &input, 
                        torch::Tensor &other, 
@@ -292,8 +290,12 @@ void binary_op_dispatch(const std::string& op_type,
 {F_instance_def}
 """
 
-    def __init__(self, working_path):
+    def __init__(self, working_path, dtypes, optype):
         self.working_path = working_path
+        self.input_dtype = dtypes.split("_")[0].split(".")[1]
+        self.other_dtype = dtypes.split("_")[1].split(".")[1]
+        self.op_type = optype
+        print("@@@@@", self.input_dtype, self.other_dtype, self.op_type)
 
     @dataclass
     class h_traits:
@@ -304,6 +306,9 @@ void binary_op_dispatch(const std::string& op_type,
         @property
         def trait_name(self) -> str:
             return f"{OPERATOR_MAP[self.F_op_type]}, {DATA_TYPE_MAP[self.F_in0_type]}, {DATA_TYPE_MAP[self.F_in1_type]}"
+        @property
+        def call_name(self) -> str:
+          return f'binary_op_impl<{self.trait_name}>'
 
         @property
         def def_name(self) -> str:
@@ -358,14 +363,16 @@ void binary_op_dispatch(const std::string& op_type,
         return self.API_BASE.format(F_traits_define="", F_dispatch=dispatch_str)
 
     def get_blobs(self):
-        operators = ["add", "sub", "mul", "div"]
-        dtype_combinations = [
-            ("float32", "float32"),
-            ("float16", "float16"),
-            ("bfloat16", "bfloat16"),
-            ("float32", "float16"),
-            ("float16", "float32"),
-        ]
+        # operators = ["add", "sub", "mul", "div"]
+        # dtype_combinations = [
+        #     ("float32", "float32"),
+        #     ("float16", "float16"),
+        #     ("bfloat16", "bfloat16"),
+        #     ("float32", "float16"),
+        #     ("float16", "float32"),
+        # ]
+        operators = [self.op_type]
+        dtype_combinations = [(str(self.input_dtype), str(self.other_dtype))]
 
         blobs = []
         for op in operators:
@@ -390,6 +397,7 @@ void binary_op_dispatch(const std::string& op_type,
 
 
 if __name__ == "__main__":
+    print('==================================')
     parser = argparse.ArgumentParser(
         prog="generate", description="Generate binary operation kernels"
     )
@@ -399,10 +407,26 @@ if __name__ == "__main__":
         default="./generated",
         help="Output directory for generated files",
     )
+
+    parser.add_argument(
+      "-o",
+      "--optype",
+      default="add",
+      help="binary operator optype"
+    )
+
+    parser.add_argument(
+      "-t",
+      "--dtypes",
+      default="torch.float32_torch.float32",
+      help="input tensor, other tensor dtype",
+    )
+
     args = parser.parse_args()
+    print(args.working_path)
 
     p = Path(args.working_path)
     if not p.exists():
         p.mkdir()
 
-    BinaryOpCodegen(args.working_path).gen_blobs()
+    BinaryOpCodegen(args.working_path, args.dtypes, args.optype).gen_blobs()

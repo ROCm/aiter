@@ -10,7 +10,7 @@
     m.def("gelu_tanh_and_mul", &aiter::gelu_tanh_and_mul, "Activation function used in GELU tanh.");
 
 #define AITER_OPERATOR_PYBIND                                                   \
-    m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
+    m.def("_add", &aiter_add, "apply for add with transpose and broadcast.");    \
     m.def("mul", &aiter_mul, "apply for mul with transpose and broadcast.");    \
     m.def("sub", &aiter_sub, "apply for sub with transpose and broadcast.");    \
     m.def("div", &aiter_div, "apply for div with transpose and broadcast.");    \
