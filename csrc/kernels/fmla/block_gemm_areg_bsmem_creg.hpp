@@ -79,8 +79,12 @@ struct BlockGemmARegBSmemCReg
         constexpr int32_t NIterPerWarp = NPerBlock / (NWarp * WG::kN);
         constexpr int32_t KIterPerWarp = KPerBlock / WG::kK;
 
-        constexpr int32_t NPerBlockPerIter = NPerBlock / NIterPerWarp;
-        constexpr int32_t KPerBlockPerIter = KPerBlock / KIterPerWarp;
+        // wave-4: qk: <1, 8, 2, 64, 64, 32, 4, 1, 16, 16, 16>, kv: <1, 16, 1, 64, 256, 16, 4, 1, 16, 16, 16>
+        // wave-8: qk: <1, 4, 2, 64, 64, 32, 4, 2, 16, 16, 16>, kv: <1,  8, 1, 64, 256, 16, 4, 2, 16, 16, 16>
+        // ck_tile::sequence<MIterPerWarp, NIterPerWarp, KIterPerWarp, MPerBlock, NPerBlock, KPerBlock, MWarp, NWarp, WG::kM, WG::kN, WG::kK>::aaa();
+
+        constexpr int32_t NPerBlockPerIter = NPerBlock / NIterPerWarp; // wave-8: qk: 64 / 4 = 16
+        constexpr int32_t KPerBlockPerIter = KPerBlock / KIterPerWarp; // wave-8: qk: 32 / 2 = 16
 
         const int32_t iNWarp = ck_tile::get_warp_id() % NWarp;
 
@@ -98,7 +102,7 @@ struct BlockGemmARegBSmemCReg
         auto b_warp_window_tmp = ck_tile::make_tile_window(
             b_block_window_tmp.get_bottom_tensor_view(),
             ck_tile::make_tuple(ck_tile::number<WG::kN>{}, ck_tile::number<WG::kK>{}),
-            b_block_window_tmp.get_window_origin() + ck_tile::multi_index<2>{iNWarp * WG::kN, 0},
+            b_block_window_tmp.get_window_origin() + ck_tile::multi_index<2>{iNWarp * (NPerBlock / NWarp), 0},
             ck_tile::make_static_tile_distribution(typename WG::BWarpDstrEncoding{}));
 
 #if 0 // FIXME: using array will cause register spill
@@ -150,11 +154,36 @@ struct BlockGemmARegBSmemCReg
         constexpr auto a_warp_y_index_zeros = ck_tile::uniform_sequence_gen_t<AWarpDstr::NDimY, 0>{};
         constexpr auto c_warp_y_index_zeros = ck_tile::uniform_sequence_gen_t<CWarpDstr::NDimY, 0>{};
 
+        // wave-4: qk: <1, 4, 2>, kv: <1, 16, 1>
+        // wave-8: qk: <1, 2, 2>, kv: <1,  8, 1>
+        // ck_tile::sequence<MIterPerWarp, NIterPerWarp, KIterPerWarp>::aaa();
+
         // hot loop:
         ck_tile::static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
             ck_tile::static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
                 // read B warp tensor from B Block window
-                const auto b_warp_tensor = load_tile(b_warp_windows(nIter)(kIter));
+                // const auto b_warp_tensor = ck_tile::load_tile(b_warp_windows(nIter)(kIter));
+                using B = ck_tile::remove_cvref_t<decltype(ck_tile::load_tile(b_warp_windows(nIter)(kIter)))>;
+                B b_warp_tensor;
+                ck_tile::clear_tile(b_warp_tensor);
+                const auto bspan = ck_tile::remove_cvref_t<decltype(b_warp_tensor)>::get_distributed_spans();
+                // ck_tile::tuple<ck_tile::tile_distributed_span<>, ck_tile::tile_distributed_span<4>>
+                // decltype(bspan)::aaa();
+                // ck_tile::sweep_tile_span(bspan[ck_tile::number<0>{}], [&](auto idx0) {
+                    ck_tile::sweep_tile_span(bspan[ck_tile::number<1>{}], [&](auto idx1) {
+                        const auto idx0 = ck_tile::tile_distributed_index<0>{};
+                        const auto i_j_idx = ck_tile::make_tuple(idx0, idx1);
+                        const auto tile_idx = ck_tile::get_x_indices_from_distributed_indices(
+                            b_warp_tensor.get_tile_distribution(), i_j_idx);
+                        auto row_id = tile_idx.at(ck_tile::number<0>{});
+                        auto col_id = tile_idx.at(ck_tile::number<1>{});
+                        printf("[%d, %d, %d, %d, nIter: %d, kIter: %d] b_warp_tensor [%d, %d]: %f\n",
+                            threadIdx.x, blockIdx.x, blockIdx.y, blockIdx.z,
+                            nIter.value, kIter.value, 
+                            row_id, col_id,
+                            ck_tile::type_convert<float>(b_warp_tensor[i_j_idx]));
+                    });
+                // });
 
                 ck_tile::static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
                     // read A warp tensor from A block tensor
@@ -225,8 +254,8 @@ struct BlockGemmARegBSmemCReg
         constexpr int32_t MWarp = config.template at<1>();
         constexpr int32_t NWarp = config.template at<2>();
 
-        constexpr int32_t MVector = WG::WarpGemmAttribute::Impl::kCM0PerLane;
-        constexpr int32_t NVector = WG::WarpGemmAttribute::Impl::kCM1PerLane;
+        constexpr int32_t MVector = WG::WarpGemmAttribute::Impl::kCM1PerLane;
+        constexpr int32_t NVector = WG::WarpGemmAttribute::Impl::kCM0PerLane;
 
         constexpr int32_t MthrPerWarp = WG::WarpGemmAttribute::Impl::kCMLane;
         constexpr int32_t NThrPerWarp = WG::WarpGemmAttribute::Impl::kCNLane;

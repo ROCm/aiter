@@ -202,18 +202,19 @@ if __name__ == "__main__":
     h_kv = 1
     d, dv = 576, 512
 
-    for (dtype, b, s, h_q, s_q, page_block_size, varlen, causal) in itertools.product(
-        (torch.float16, torch.bfloat16)[1:],
-        [1, 3, 5, 16, 32, 64, 128, 256][3:4],
-        [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
-        (16, 64, 128)[:],
-        # (1, 2), # s_q for decode
-        (64,),  # s_q for prefill
-        (1, 16, 64)[:],
-        (False, True)[:],
-        (False, True)[:]
-    ):
-        test_flash_mla(dtype, b, s_q, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, True, False)
+    # for (dtype, b, s, h_q, s_q, page_block_size, varlen, causal) in itertools.product(
+    #     (torch.float16, torch.bfloat16)[1:],
+    #     [1, 3, 5, 16, 32, 64, 128, 256][3:4],
+    #     [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
+    #     (16, 64, 128)[:],
+    #     # (1, 2), # s_q for decode
+    #     (64,),  # s_q for prefill
+    #     (1, 16, 64)[:],
+    #     (False, True)[:],
+    #     (False, True)[:]
+    # ):
+    #     test_flash_mla(dtype, b, s_q, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, True, False)
+    test_flash_mla(torch.bfloat16, 16, 64, 21, 16, 1, 576, 512, 1, True, False, True, False)
 
     # for (dtype, b, s, h_q, page_block_size, varlen, causal) in itertools.product(
     #     (torch.float16, torch.bfloat16)[1:],
@@ -225,3 +226,15 @@ if __name__ == "__main__":
     #     (False, True)[1:]
     # ):
     #     test_flash_mla(dtype, b, s, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, False, True)
+
+    # test_flash_mla(torch.bfloat16, 32, 48, 6001, 1, 1, d, dv, 64, True, False, True, True)
+    # test_flash_mla(torch.bfloat16, 32, 3, 6001, 16, 1, d, dv, 64, True, False, True, True)
+
+    # for seqlenk in [234, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 18432, 24576, 32768]:
+    #     test_flash_mla(torch.bfloat16, 32, 3, seqlenk, 16, 1, 576, 512, 16, False, False, False, True)
+ 
+    # for seqlenk in [234, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 18432, 24576, 32768]:
+    #     test_flash_mla(torch.bfloat16, 32, 3, seqlenk, 16, 1, 576, 512, 16, True, False, False, True)
+ 
+    # for seqlenk in [234, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 18432, 24576, 32768]:
+    #     test_flash_mla(torch.bfloat16, 96, 1, seqlenk, 16, 1, 576, 512, 16, False, False, False, True)

@@ -64,7 +64,7 @@ struct FlashMlaPrefillKernelTrait
     static constexpr int32_t kSizeDV                    = kSizeDV_;   // hidden dimension size of value
     static constexpr int32_t kNumWarps                  = kNumWarps_;
     static constexpr int32_t kNumThreads                = kNumWarps * ck_tile::get_warp_size();
-    static constexpr int32_t kWaveOccupancy             = 2;
+    static constexpr int32_t kWaveOccupancy             = 1;
     static constexpr int32_t kNumWarpsSoftmax           = 4;
     static constexpr int32_t kNumThreadsSoftmax         = kNumWarpsSoftmax * ck_tile::get_warp_size();
     static constexpr int32_t kNumWarpsCombine           = 4;
@@ -965,9 +965,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
     constexpr auto gemm_1 = Policy::GetKVBlockGemm();
 
     // Reduction funtions for softmax
-    const auto f_max = [](auto e0, auto e1) { return ck_tile::max(e0, e1); };
-    const auto f_sum = [](auto e0, auto e1) { return e0 + e1; };
-    // Block reduce 2d for softmax
     using BlockShape           = ck_tile::remove_cvref_t<decltype(gemm_0.GetCBlockShape())>;
     using BlockReduce2dProblem = ck_tile::BlockReduce2dProblem<acc_t, acc_t, BlockShape>;
     auto block_reduce_2d       = ck_tile::BlockReduce2d<BlockReduce2dProblem>();              // In-thread
@@ -1169,6 +1166,26 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
         ck_tile::block_sync_lds();
         gemm_0(s_acc, q_regs[(k0_loops - 1) % 2], k_lds_window);
+
+        __syncthreads();
+        // if (IsDebugThreadBlock()) {
+        //     const auto debug_span = ck_tile::remove_cvref_t< decltype(s_acc)>::get_distributed_spans();
+        //     ck_tile::sweep_tile_span(debug_span[ck_tile::number<0>{}], [&](auto idx0) {
+        //         ck_tile::sweep_tile_span(debug_span[ck_tile::number<1>{}], [&](auto idx1) {
+        //             const auto i_j_idx = ck_tile::make_tuple(idx0, idx1);
+        //             const auto tile_idx = ck_tile::get_x_indices_from_distributed_indices(
+        //                 s_acc.get_tile_distribution(), i_j_idx);
+        //             auto row_id = tile_idx.at(ck_tile::number<0>{});
+        //             auto col_id = tile_idx.at(ck_tile::number<1>{});
+        //             printf("[%d, %d, %d, %d, loop: %d] s_acc [%d, %d]: %f\n",
+        //                 threadIdx.x, blockIdx.x, blockIdx.y, blockIdx.z,
+        //                 loop_idx,
+        //                 row_id, col_id,
+        //                 ck_tile::type_convert<float>(s_acc[i_j_idx]));
+        //         });
+        //     });
+        // }
+        return;
 
         ck_tile::tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, s_acc);
 
@@ -1380,15 +1397,16 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
     // Execute the loop
     main_loop.template operator()<true>(0);
-    for (int32_t loop_idx = 1; (loop_idx + 1) < num_total_loop; (loop_idx += 2))
-    {
-        main_loop.template operator()<false>(loop_idx);
-        main_loop.template operator()<true>(loop_idx + 1);
-    }
-    if ((num_total_loop % 2) == 0)
-    {
-        main_loop.template operator()<false>(num_total_loop - 1);
-    }
+    return;
+    // for (int32_t loop_idx = 1; (loop_idx + 1) < num_total_loop; (loop_idx += 2))
+    // {
+    //     main_loop.template operator()<false>(loop_idx);
+    //     main_loop.template operator()<true>(loop_idx + 1);
+    // }
+    // if ((num_total_loop % 2) == 0)
+    // {
+    //     main_loop.template operator()<false>(num_total_loop - 1);
+    // }
 
 
     // 7. Store LSE
@@ -1440,8 +1458,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         {
             ck_tile::move_tile_window(out_dram_window_, {0, Traits::kBlockN1});
         }
-    }
-    );
+    });
 }
 
 // =====================================================================================================================
@@ -1869,9 +1886,9 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr bool kEnablePackQkRatio = true;
-    //                                        dqk  dv   m0  n0  n1  #warp
-    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4, kEnablePackQkRatio>;
+    constexpr bool kEnablePackQkRatio = false;
+    //                                        dqk  dv   m0  n0   n1   #warp
+    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64,  256, 8, kEnablePackQkRatio>;
     constexpr bool kForceOutAcc = false;
     using acc_t                 = float;
 
@@ -1980,19 +1997,19 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
         params.stride_sp_lseacc   = softmax_lseaccum.stride(1);
     }
 
-    DISPATCH_FMLA_TYPES(
-        query.scalar_type(),
-        is_causal,
-        "fmla_fwd",
-        [&](){
-            dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, Is_causal>(params);
-        }();
-    );
-    // assert(is_causal == true);
-    // assert(query.scalar_type() == at::ScalarType::BFloat16);
-    // using scalar_t = ck_tile::bf16_t;
-    // using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>;
-    // dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, true>(params);
+    // DISPATCH_FMLA_TYPES(
+    //     query.scalar_type(),
+    //     is_causal,
+    //     "fmla_fwd",
+    //     [&](){
+    //         dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, Is_causal>(params);
+    //     }();
+    // );
+    assert(is_causal == true);
+    assert(query.scalar_type() == at::ScalarType::BFloat16);
+    using scalar_t = ck_tile::bf16_t;
+    using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>;
+    dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, true>(params);
 
     if constexpr(Traits::kEnableXQA)
     {
