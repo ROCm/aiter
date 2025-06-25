@@ -12,6 +12,14 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
+global _USE_GEMM_SPLITK_BF16
+_USE_GEMM_SPLITK_BF16 = False
+
+
+def set_use_gemm_splitk_bf16(value: bool):
+    global _USE_GEMM_SPLITK_BF16
+    _USE_GEMM_SPLITK_BF16 = value
+
 
 @triton.heuristics(
     {
@@ -512,7 +520,7 @@ def gemm_afp4wfp4(
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
 
-        if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
+        if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
             )
@@ -559,9 +567,7 @@ def gemm_afp4wfp4(
         # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
-        REDUCE_BLOCK_SIZE_N = (
-            128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 64
-        )
+        REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
         ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (
@@ -633,7 +639,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
 
-        if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1":
+        if _USE_GEMM_SPLITK_BF16:
             y_pp = torch.empty(
                 (config["NUM_KSPLIT"], M, N), dtype=y.dtype, device=y.device
             )
@@ -681,9 +687,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         # TODO: Need to debug - REDUCE_BLOCK_SIZE_N=128 with fp32 partials fails
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
-        REDUCE_BLOCK_SIZE_N = (
-            128 if os.getenv("VLLM_TRITON_FP4_GEMM_SPLITK_USE_BF16") == "1" else 64
-        )
+        REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
         ACTUAL_KSPLIT = triton.cdiv(K, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (

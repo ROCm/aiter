@@ -8,6 +8,7 @@
     "num_stages": 2,
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 32,
+    "cache_modifier": null,
     "kpack": 1
   }
 }
