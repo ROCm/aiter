@@ -109,14 +109,16 @@ def fused_rms_mxfp4_quant(
     inp1,
     inp1_weight,
     inp1_epsilon,
-    inp2,
-    inp2_weight,
-    inp2_epsilon,
+    inp2=None,
+    inp2_weight=None,
+    inp2_epsilon=0.0,
     res1=None,
 ):
     """
-    Apply rms norm to both inp1 and inp2, then quantize the result of inp1
-    Skip the second rms norm if inp2 is None
+    Apply rms norm to both inp1 and inp2, then quantize the result of inp1.
+    Skip the second rms norm if inp2 is None.
+
+    If res1 is provided, it is added to inp1 before rms norm calculation.
     """
 
     MXFP4_QUANT_BLOCK_SIZE = 32
