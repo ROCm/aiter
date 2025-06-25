@@ -10,6 +10,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
 #include <unordered_map> 
 
 #define ADD_CFG(q_type, kv_type, gqa, mtp, msk, hp, path, name, co)         \\
