@@ -10,6 +10,7 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+import os
 
 
 @triton.heuristics(
@@ -133,15 +134,26 @@ def _get_config(
     N: int,
     K: int,
 ):
-    # TODO: the configs need to be updated to include the k-split with atomic add options.
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16.json"
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-ATOMIC.json"
         with open(fpath, "r") as file:
             config = json.load(file)
-        _get_config._config_dict = config
+        _get_config._config_dict["default"] = config
 
-    return _get_config._config_dict["any"]
+    key = f"{N}_{K}"
+    if key not in _get_config._config_dict.keys():
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-ATOMIC-N={N}-K={K}.json"
+        if os.path.exists(fpath):
+            with open(fpath, "r") as file:
+                config = json.load(file)
+                _get_config._config_dict[key] = config
+        else:
+            key = "default"  # fall back to default config
+    print(_get_config._config_dict[key]["any"])
+    return _get_config._config_dict[key]["any"]
 
 
 def gemm_a16w16_atomic(

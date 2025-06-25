@@ -1,0 +1,15 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 256,
+    "GROUP_SIZE_M": 1,
+    "NUM_KSPLIT": 28,
+    "cache_modifier": ".cg",
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 16,
+    "kpack": 1
+  }
+}
