@@ -10,7 +10,7 @@ import types
 import importlib
 import functools
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Callable, Any
 import logging
 import json
 import multiprocessing
@@ -477,7 +477,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
-def compile_ops(_md_name: str, fc_name: Optional[str] = None):
+def compile_ops(_md_name: str, fc_name: Optional[str] = None, gen_func: Optional[Callable[..., dict[str, Any]]] = None):
     def decorator(func):
         func.arg_checked = False
 
@@ -500,6 +500,9 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     module = get_module(md)
             except ModuleNotFoundError:
                 d_args = get_args_of_build(md_name)
+                if gen_func is not None:
+                    gen_build_args = gen_func(*args, **kwargs)
+                    custom_build_args.update(gen_build_args)
                 d_args.update(custom_build_args)
 
                 # update module if we have coustom build
