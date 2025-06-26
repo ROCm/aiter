@@ -859,6 +859,116 @@ namespace aiter
   }
 
   template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastN11_unroll_vec_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < (m * n * k); index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+        // uint64_t other_offset = (index + block_offset) / (n * k);
+#pragma unroll
+        for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+        {
+          uint64_t input_offset = index + block_offset + vec_index;
+          uint64_t other_offset = input_offset / (n * k);
+          if (types_match)
+          {
+            _T t0 = static_cast<_T>(a_ptr[input_offset]);
+            _T t1 = static_cast<_T>(b_ptr[other_offset]);
+            *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+          }
+          else
+          {
+            float t0 = static_cast<float>(a_ptr[input_offset]);
+            float t1 = static_cast<float>(b_ptr[other_offset]);
+            float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+            *(c_ptr + input_offset) = static_cast<_T>(t2);
+          }
+        }
+      }
+    }
+  }
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastN11_unroll_vec_pad(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, const int padded_size, bool types_match)
+  {
+    constexpr uint32_t element_size = sizeof(_T);
+    constexpr uint32_t vec_size = 16 / element_size;
+    uint64_t idx = (uint64_t)(blockIdx.x * blockDim.x * _rows + threadIdx.x) * vec_size;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index + (uint64_t)((_rows - 1) * blockDim.x * vec_size) < padded_size; index += gridDim.x * blockDim.x * _rows * vec_size)
+    {
+#pragma unroll
+      for (int unroll_index = 0; unroll_index < _rows; ++unroll_index)
+      {
+        uint64_t block_offset = (uint64_t)blockDim.x * vec_size * unroll_index;
+        // uint64_t other_offset = (index + block_offset) / (n * k);
+        if (index + block_offset < (m * n * k))
+        {
+#pragma unroll
+          for (int vec_index = 0; vec_index < vec_size; ++vec_index)
+          {
+            uint64_t input_offset = index + block_offset + vec_index;
+            uint64_t other_offset = input_offset / (n * k);
+            if (types_match)
+            {
+              _T t0 = static_cast<_T>(a_ptr[input_offset]);
+              _T t1 = static_cast<_T>(b_ptr[other_offset]);
+              *(c_ptr + input_offset) = performOperation<_T, Operation, order_flag>(t0, t1);
+            }
+            else
+            {
+              float t0 = static_cast<float>(a_ptr[input_offset]);
+              float t1 = static_cast<float>(b_ptr[other_offset]);
+              float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+              *(c_ptr + input_offset) = static_cast<_T>(t2);
+            }
+          }
+        }
+      }
+    }
+  }
+
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
+  __global__ void operator_bcastN11_naive(const void *__restrict a, const void *__restrict b, void *__restrict c,
+                                             const int m, const int n, const int k, bool types_match)
+  {
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const _T0* a_ptr = reinterpret_cast<const _T0*>(a);
+    const _T1* b_ptr = reinterpret_cast<const _T1*>(b);
+    _T* c_ptr = reinterpret_cast<_T*>(c);
+    for (uint64_t index = idx; index < m * n * k; index += blockDim.x * gridDim.x)
+    {
+      if (types_match)
+      {
+        _T t0 = static_cast<_T>(a_ptr[index]);
+        _T t1 = static_cast<_T>(b_ptr[index / (n * k)]);
+        *(c_ptr + index) = performOperation<_T, Operation, order_flag>(t0, t1);
+      }
+      else
+      {
+        float t0 = static_cast<float>(a_ptr[index]);
+        float t1 = static_cast<float>(b_ptr[index / (n * k)]);
+        float t2 = performOperation<float, Operation, order_flag>(t0, t1);
+        *(c_ptr + index) = static_cast<_T>(t2);
+      }
+    }
+  }
+
+  template <class _T, int _rows, typename Operation, bool order_flag, class _T0, class _T1>
   __global__ void operator_contiguous_kernel_naive(const void* __restrict a, const void* __restrict b, void* __restrict c,
                                                    const int n, bool types_match)
   {
@@ -1556,6 +1666,158 @@ struct BinaryOperationPattern<6, Operation, _T0, _T1>
   }
 };
 
+// PATTERN_BROADCAST_4
+// broadcast last 2 dim, (m, n, k) (m, 1, 1)
+template <typename Operation, class _T0, class _T1>
+struct BinaryOperationPattern<7, Operation, _T0, _T1>
+{
+  static void apply(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output, bool order_flag)
+  {
+    int dim = output.dim();
+    auto shape = output.sizes().vec();
+    void *buf_a = reinterpret_cast<void *>(input.data_ptr());
+    void *buf_b = reinterpret_cast<void *>(other.data_ptr());
+    void *buf_c = reinterpret_cast<void *>(output.data_ptr());
+
+    int m = output.size(0);
+    int n = output.size(1);
+    int k = output.size(2);
+
+    int num_elements = output.numel();
+    int vec_size = 16 / output.element_size();
+    constexpr uint32_t row = 8;
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    bool types_match = typeid(_T0) == typeid(_T1);
+
+    // optimize kernel
+    // if (k % vec_size == 0 && num_elements % (256 * vec_size * row) == 0)
+    if (num_elements % vec_size == 0)
+    {
+      hipDevice_t dev;
+      hipDeviceProp_t dev_prop;
+      hipGetDevice(&dev);
+      hipGetDeviceProperties(&dev_prop, dev);
+      uint32_t num_cu = dev_prop.multiProcessorCount;
+
+      constexpr uint32_t wg = 256;
+      int tmp_row;// = row;
+      int grid_x = (num_elements / (row * vec_size) + wg - 1) / wg;
+      int occupancy;
+      bool need_pad = true;
+      int padded_size = num_elements;
+
+      auto ifNeedPad = [=] (int tmp_row)
+      {
+        return num_elements % (wg * tmp_row * vec_size) != 0;
+      };
+
+      auto getPaddedSize = [=] (int tmp_row)
+      {
+        int elem_num_per_block = wg * vec_size * tmp_row;
+        return ((num_elements + elem_num_per_block - 1) / elem_num_per_block) * elem_num_per_block;
+      };
+
+#define GET_PATTERN(_row)                                                                                       \
+  do                                                                                                            \
+  {                                                                                                             \
+    tmp_row = _row;                                                                                             \
+    grid_x = (num_elements / (tmp_row * vec_size) + wg - 1) / wg;                                               \
+    auto kernel_ptr = aiter::operator_bcast1N1_unroll_vec_naive<_T0, _row, Operation, true, _T0, _T1>;          \
+    hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, reinterpret_cast<const void*>(kernel_ptr), wg, 0); \
+    need_pad = ifNeedPad(tmp_row);                                                                              \
+    if (need_pad)                                                                                               \
+    {                                                                                                           \
+      padded_size = getPaddedSize(tmp_row);                                                                     \
+    }                                                                                                           \
+  } while(0)
+
+      if (grid_x > 512 && num_elements % (8 * vec_size) == 0) // row = 8
+      {
+        GET_PATTERN(8);
+      }
+      else if (grid_x > 256 && num_elements % (4 * vec_size) == 0) // row = 4
+      {
+        GET_PATTERN(4);
+      }
+      else if (grid_x > 128 && num_elements % (2 * vec_size) == 0) // row = 2
+      {
+        GET_PATTERN(2);
+      }
+      else // row = 1
+      {
+        GET_PATTERN(1);
+      }
+      grid_x = grid_x < num_cu * occupancy ? grid_x : num_cu * occupancy;
+
+#define BCAST_CASE(case_row, normal_tensor, bcast_tensor)                                                                          \
+  do                                                                                                                               \
+  {                                                                                                                                \
+    case case_row:                                                                                                                 \
+    {                                                                                                                              \
+      if (!need_pad)                                                                                                               \
+      {                                                                                                                            \
+        VLLM_DISPATCH_FLOATING_TYPES(                                                                                              \
+            output.scalar_type(), "operator_bcastN11_unroll_vec_naive", [&]                                                        \
+            { aiter::operator_bcastN11_unroll_vec_naive<scalar_t, case_row, Operation, true, _T0, _T1>                             \
+                  <<<grid_dim, block_dim, 0, stream>>>(normal_tensor, bcast_tensor, buf_c, m, n, k, types_match); });              \
+      }                                                                                                                            \
+      else                                                                                                                         \
+      {                                                                                                                            \
+        VLLM_DISPATCH_FLOATING_TYPES(                                                                                              \
+            output.scalar_type(), "operator_bcastN11_unroll_vec_pad", [&]                                                          \
+            { aiter::operator_bcastN11_unroll_vec_pad<scalar_t, case_row, Operation, true, _T0, _T1>                               \
+                  <<<grid_dim, block_dim, 0, stream>>>(normal_tensor, bcast_tensor, buf_c, m, n, k, padded_size, types_match); }); \
+      }                                                                                                                            \
+      return;                                                                                                                      \
+    }                                                                                                                              \
+  } while(0)
+
+      const dim3 grid_dim(grid_x);
+      const dim3 block_dim(wg);
+      if (order_flag)
+      {
+        switch (tmp_row)
+        {
+          BCAST_CASE(8, buf_a, buf_b);
+          BCAST_CASE(4, buf_a, buf_b);
+          BCAST_CASE(2, buf_a, buf_b);
+          BCAST_CASE(1, buf_a, buf_b);
+        }
+      }
+      else
+      {
+        switch(tmp_row)
+        {
+          BCAST_CASE(8, buf_b, buf_a);
+          BCAST_CASE(4, buf_b, buf_a);
+          BCAST_CASE(2, buf_b, buf_a);
+          BCAST_CASE(1, buf_b, buf_a);
+        }
+      }
+    }
+    // fallback
+    else
+    {
+      const dim3 block_dim(256, 1, 1);
+      const dim3 grid_dim((num_elements + 256 - 1) / 256, 1, 1);
+      if (order_flag)
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastN11_naive", [&]
+            { aiter::operator_bcastN11_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_a, buf_b, buf_c, m, n, k, types_match); });
+      }
+      else
+      {
+        VLLM_DISPATCH_FLOATING_TYPES(
+            output.scalar_type(), "operator_bcastN11_naive", [&]
+            { aiter::operator_bcastN11_naive<scalar_t, row, Operation, true, _T0, _T1>
+                  <<<grid_dim, block_dim, 0, stream>>>(buf_b, buf_a, buf_c, m, n, k, types_match); });
+      }
+    }
+  }
+};
+
 // PATTERN_CONTIGUOUS
 template <typename Operation, class _T0, class _T1>
 struct BinaryOperationPattern<4, Operation, _T0, _T1>
@@ -1666,7 +1928,4 @@ void binary_operation_process(torch::Tensor &input, torch::Tensor &other, torch:
   BinaryOperationPattern<pattern, Operation, _T0, _T1>::apply(input, other, output, order_flag);
 }
 
-void binary_op_dispatch(const std::string& op_type, 
-                       torch::Tensor &input, 
-                       torch::Tensor &other, 
-                       torch::Tensor &output);
+void binary_op_dispatch(const std::string& op_type, torch::Tensor &input, torch::Tensor &other, torch::Tensor &output);

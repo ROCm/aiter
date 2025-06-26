@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import List, Any
 from dataclasses import dataclass
 
-
 def get_if_str(idx, total, last_else=True):
     if idx == 0:
         return "if"
@@ -66,6 +65,7 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
   constexpr uint32_t PATTERN_CONTIGUOUS = 4;
   constexpr uint32_t PATTERN_BROADCAST_2 = 5;   // (m, n, k), (m, n, 1)
   constexpr uint32_t PATTERN_BROADCAST_3 = 6;   // (m, n, k), (   n, 1)
+  constexpr uint32_t PATTERN_BROADCAST_4 = 7;   // (m, n, k), (m, 1, 1)
 
   // contiguous case
   if (!is_support)
@@ -131,6 +131,17 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
         broadcast_3d_case(1);
         // (m, n, k), (m, n, 1) or (m, n, 1), (m, n, k)
         broadcast_3d_case(2);
+
+        // broadcast in last 2 dim
+        bool first_dim_eq = input.size(0) == other.size(0);
+        bool input_bcast_last2dim = input.size(1) == 1 && input.size(2) == 1;
+        bool other_bcast_last2dim = other.size(1) == 1 && other.size(2) == 1;
+        if (first_dim_eq && (input_bcast_last2dim || other_bcast_last2dim))
+        {
+          is_support = true;
+          order_flag = other_bcast_last2dim ? true : false;
+          pattern = PATTERN_BROADCAST_4;
+        }
       }
       // (m, n, k), (n, 1) or (n, 1), (m, n, k)
       else if (input.dim() == 2 || other.dim() == 2)
@@ -213,14 +224,6 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 
   if (is_support)
   {
-    auto in0_dtype = input.dtype();
-    auto in1_dtype = other.dtype();
-    torch::ScalarType out_dtype = torch::promote_types(input.scalar_type(), other.scalar_type());
-    std::vector<int64_t> out_shape = broadcastShapes(input, other);
-    auto device = input.device();
-    auto options = torch::TensorOptions().dtype(out_dtype).device(input.device());
-
-
     switch (pattern)
     {
       case PATTERN_TRANSPOSE:
@@ -241,12 +244,17 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
       case PATTERN_BROADCAST_3:
         binary_operation_process<6, Op, T0, T1>(input, other, output, order_flag);
         break;
+      case PATTERN_BROADCAST_4:
+        binary_operation_process<7, Op, T0, T1>(input, other, output, order_flag);
+        break;
       default:
         return ;
     }
+    return ;
   }
   else
   {
+  output = aiter::aten_compute<Op>(input, other);
   return ;
   }
 }
@@ -257,16 +265,13 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 // Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "binary_op_api_common.hpp"
-
-// template <typename Op, typename T0, typename T1>
-// void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output);
 void binary_op_dispatch(const std::string& op_type, 
                        torch::Tensor &input, 
                        torch::Tensor &other, 
                        torch::Tensor &output) {{
     // Dispatch based on operator and input types
 {F_dispatch}
-    AT_ERROR("Unsupported operator or dtype combination");
+    //AT_ERROR("Unsupported operator or dtype combination");
 }}
 """
 
@@ -292,8 +297,8 @@ void binary_op_dispatch(const std::string& op_type,
 
     def __init__(self, working_path, dtypes, optype):
         self.working_path = working_path
-        self.input_dtype = dtypes.split("_")[0].split(".")[1]
-        self.other_dtype = dtypes.split("_")[1].split(".")[1]
+        self.input_dtype = dtypes.split("_")[0]
+        self.other_dtype = dtypes.split("_")[1]
         self.op_type = optype
         print("@@@@@", self.input_dtype, self.other_dtype, self.op_type)
 
@@ -363,14 +368,6 @@ void binary_op_dispatch(const std::string& op_type,
         return self.API_BASE.format(F_traits_define="", F_dispatch=dispatch_str)
 
     def get_blobs(self):
-        # operators = ["add", "sub", "mul", "div"]
-        # dtype_combinations = [
-        #     ("float32", "float32"),
-        #     ("float16", "float16"),
-        #     ("bfloat16", "bfloat16"),
-        #     ("float32", "float16"),
-        #     ("float16", "float32"),
-        # ]
         operators = [self.op_type]
         dtype_combinations = [(str(self.input_dtype), str(self.other_dtype))]
 

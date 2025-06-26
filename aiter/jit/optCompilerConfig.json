@@ -492,7 +492,6 @@
             "f'{AITER_CSRC_DIR}/pybind/aiter_operator_pybind.cu'",
             "f'{AITER_CSRC_DIR}/include/binary_operator.cuh'",
             "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'",
-            "f'{AITER_CSRC_DIR}/../aiter/jit/build/module_aiter_operator/build/src/binary_op_api.cpp'",
             "f'{AITER_CSRC_DIR}/kernels/unary_operator.cu'"
         ],
         "flags_extra_cc": [],
