@@ -476,7 +476,7 @@ def fused_moe_2stages(
 
     a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
     if quant_type != QuantType.per_128x128:
-        a2 = torch.empty(
+        a2 = torch.zeros(
             (token_num, topk, inter_dim),
             dtype=dtype,
             device=device,
@@ -508,6 +508,7 @@ def fused_moe_2stages(
         if quant_type == QuantType.per_Token:
             a2 = a2.view(token_num, -1)
         a2, a2_scale = quant_func(a2, scale=a2_scale, quant_dtype=q_dtype_a)
+
         a2 = a2.view(token_num, topk, inter_dim)
     else:
         a2_v = a2[:token_num, :, :]
@@ -521,7 +522,6 @@ def fused_moe_2stages(
 
     if quant_type == aiter.QuantType.No:
         a2_scale = get1tensor(device)
-
     stage2(
         a2,
         w1,
@@ -640,6 +640,7 @@ def torch_moe(
         topk_ids = local_expert_hash[topk_ids]
 
     hidden_states = hidden_states.view(B, -1, D).repeat(1, topk, 1)
+
     out = torch.zeros(
         (B, topk, D),
         dtype=computeType,
@@ -663,7 +664,9 @@ def torch_moe(
     for E_id in range(w1.shape[0]):
         mask = topk_ids == E_id
         if mask.sum():
+
             sub_tokens = hidden_states[mask]
+
             if fc1_smooth_scale is not None:
                 sub_tokens = sub_tokens * (fc1_smooth_scale[E_id])
 

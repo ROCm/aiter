@@ -8,6 +8,8 @@ from aiter.test_common import (
     run_perftest,
     perftest,
 )
+from aiter.int4_utils import *
+from aiter.utility import fp4_utils
 from aiter.fused_moe import (
     fused_topk,
     fused_moe,
@@ -180,7 +182,6 @@ def test_fmoe_ep(
         / 10
     )
     score = torch.randn((token, E), device="cuda", dtype=dtype)
-
     # if shared_E > 0:
     shared_E_score = 0.1
     # init total_topk_ids, inference time you just need to fill ns_topk_ids in total_topk_ids
@@ -262,6 +263,17 @@ def test_fmoe_ep(
         checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg="ck check")
 
     else:
+        # for ck weight
+        torch_quant = aiter.get_torch_quant(aiter.QuantType.per_Token)
+        w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp8)
+        w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.fp8)
+
+        w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt_aiter = w2_qt.view(w2.shape)
+        w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
+        w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
+
+        # for asm weight
         w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype)
         w2, fc2_scale = pertoken_quant(w2, quant_dtype=quant_dtype)
 
@@ -361,14 +373,28 @@ def test_fmoe_ep(
             msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
             checkAllclose(out_b, out_b2, atol=10, msg=msg)
 
-        # # test ck moe, not support now
-        # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-        #                              fc1_scale, fc2_scale,
-        #                              fc1_smooth_scale, fc2_smooth_scale)
-
-        msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
+        msg = f"[perf asm] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=10, msg=msg)
-        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
+        # test ck moe per-token quant
+        if quant == "fp8quant":
+            out_ck, avg_ck = run_perftest(
+                fused_moe,
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                expert_mask,
+                w1_scale=fp4_utils.e8m0_shuffle(
+                    w1_scale
+                ),  # e8m0_shuffle will do nothing if it's a fp32
+                w2_scale=fp4_utils.e8m0_shuffle(w2_scale),
+                quant_type=aiter.QuantType.per_Token,
+                activation=ActivationType.Silu,
+            )
+
+            msg = f"[perf ck] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, {ep=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, ck_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_ck-1:.1%}"
+            checkAllclose(ref2, out_ck, rtol=0.01, atol=10, msg=msg)
 
 
 print("test test_fmoe 16 bit")
