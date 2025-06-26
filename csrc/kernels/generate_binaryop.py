@@ -265,9 +265,9 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 // Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "binary_op_api_common.hpp"
-void binary_op_dispatch(const std::string& op_type, 
-                       torch::Tensor &input, 
-                       torch::Tensor &other, 
+void binary_op_dispatch(const std::string& op_type,
+                       torch::Tensor &input,
+                       torch::Tensor &other,
                        torch::Tensor &output) {{
     // Dispatch based on operator and input types
 {F_dispatch}
@@ -300,7 +300,6 @@ void binary_op_dispatch(const std::string& op_type,
         self.input_dtype = dtypes.split("_")[0]
         self.other_dtype = dtypes.split("_")[1]
         self.op_type = optype
-        print("@@@@@", self.input_dtype, self.other_dtype, self.op_type)
 
     @dataclass
     class h_traits:
@@ -394,7 +393,6 @@ void binary_op_dispatch(const std::string& op_type,
 
 
 if __name__ == "__main__":
-    print('==================================')
     parser = argparse.ArgumentParser(
         prog="generate", description="Generate binary operation kernels"
     )
@@ -405,22 +403,16 @@ if __name__ == "__main__":
         help="Output directory for generated files",
     )
 
-    parser.add_argument(
-      "-o",
-      "--optype",
-      default="add",
-      help="binary operator optype"
-    )
+    parser.add_argument("-o", "--optype", default="add", help="binary operator optype")
 
     parser.add_argument(
-      "-t",
-      "--dtypes",
-      default="torch.float32_torch.float32",
-      help="input tensor, other tensor dtype",
+        "-t",
+        "--dtypes",
+        default="float32_float32",
+        help="input tensor, other tensor dtype",
     )
 
     args = parser.parse_args()
-    print(args.working_path)
 
     p = Path(args.working_path)
     if not p.exists():
