@@ -642,14 +642,16 @@ struct FlashMlaPrefillFwdParams
 
     int32_t size_b;         // batch count
     int32_t size_s;         // seqlen of q
+    int32_t size_s_ori;     // seqlen of q without XQA
     int32_t size_h;         // head count of q
+    int32_t size_h_ori;     // head count of q without XQA
     int32_t hq_hk_ratio;    // head count of q / head count of kv
     int32_t num_splits;
     int64_t block_table_batch_stride;
     int32_t num_page_blocks;
     int32_t page_block_size;
     float   scale_softmax;
-    int32_t mask_y_ratio;
+    ck_tile::mdiv mask_y_ratio_mdiv;
 
     // Use int64_t if there is int32 overflow case. For now, just use int32 to save sgpr and prevent using
     // spill table.
@@ -667,6 +669,7 @@ struct FlashMlaPrefillFwdParams
     index_t stride_b_o;         // stride in batch of output
     index_t stride_s_o;         //    ... in sequence ...
     index_t stride_h_o;         //    ... in head ...
+    index_t stride_h_lse;
     index_t stride_b_lseacc;
     index_t stride_h_lseacc;
     index_t stride_sp_lseacc;   //    ... in split ...
@@ -726,19 +729,41 @@ CK_TILE_DEVICE static auto GetSeqlenRange(
 }
 
 template <typename Policy, typename scalar_t = typename Policy::InOutType>
-CK_TILE_DEVICE static auto MakeQDram(
-    const scalar_t* p_data,
-    const int32_t   height,
-    const int32_t   stride_s)
+CK_TILE_DEVICE static auto MakeQDram(const scalar_t* p_data,
+                                     const int32_t size_s_ori,
+                                     const int32_t stride_s,
+                                     const int32_t hq_hk_ratio,
+                                     const int32_t stride_h)
 {
     using Traits = typename Policy::Traits;
 
-    const auto q_dram_naive = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
-        p_data,
-        ck_tile::make_tuple(height, Traits::kSizeD),
-        ck_tile::make_tuple(stride_s, 1),
-        ck_tile::number<Policy::GetAlignmentQ()>{},
-        ck_tile::number<1>{});
+    const auto q_dram_naive = [&] {
+        if constexpr(Traits::kEnableXQA)
+        {
+            const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori, hq_hk_ratio, Traits::kSizeD),
+                ck_tile::make_tuple(stride_s, stride_h, 1),
+                ck_tile::number<Policy::GetAlignmentQ()>{},
+                ck_tile::number<1>{});
+            return ck_tile::transform_tensor_view(
+                view,
+                ck_tile::make_tuple(
+                    ck_tile::make_merge_transform(ck_tile::make_tuple(size_s_ori, hq_hk_ratio)),
+                    ck_tile::make_pass_through_transform(Traits::kSizeD)),
+                ck_tile::make_tuple(ck_tile::sequence<0, 1>{}, ck_tile::sequence<2>{}),
+                ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
+        }
+        else
+        {
+            return ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori, Traits::kSizeD),
+                ck_tile::make_tuple(stride_s, 1),
+                ck_tile::number<Policy::GetAlignmentQ()>{},
+                ck_tile::number<1>{});
+        }
+    }();
 
     return ck_tile::pad_tensor_view(
         q_dram_naive,
@@ -798,19 +823,41 @@ CK_TILE_DEVICE static auto MakeVDram(
 }
 
 template <typename Policy, typename Lengths, typename scalar_t>
-CK_TILE_DEVICE static auto MakeLseAccDram(
-    scalar_t* p_data,
-    const Lengths&  window_lengths,
-    const int32_t   size_s)
+CK_TILE_DEVICE static auto MakeLseAccDram(scalar_t* p_data,
+                                          const Lengths& window_lengths,
+                                          const int32_t size_s_ori,
+                                          const int32_t hq_hk_ratio,
+                                          const int32_t stride_h)
 {
     using Traits = typename Policy::Traits;
 
-    const auto lse_acc_dram_naive = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
-        p_data,
-        ck_tile::make_tuple(size_s),
-        ck_tile::make_tuple(1),
-        ck_tile::number<1>{},
-        ck_tile::number<1>{});
+    const auto lse_acc_dram_naive = [&] {
+        if constexpr(Traits::kEnableXQA)
+        {
+            // transpose + merge: (hq_hk_ratio, seqlen_q) -> (seqlenq * hq_hk_ratio)
+            const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(hq_hk_ratio, size_s_ori),
+                ck_tile::make_tuple(stride_h, 1),
+                ck_tile::number<1>{},
+                ck_tile::number<1>{});
+            return ck_tile::transform_tensor_view(
+                view,
+                ck_tile::make_tuple(
+                    ck_tile::make_merge_transform(ck_tile::make_tuple(size_s_ori, hq_hk_ratio))),
+                ck_tile::make_tuple(ck_tile::sequence<1, 0>{}),
+                ck_tile::make_tuple(ck_tile::sequence<0>{}));
+        }
+        else
+        {
+            return ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori),
+                ck_tile::make_tuple(1),
+                ck_tile::number<1>{},
+                ck_tile::number<1>{});
+        }
+    }();
 
     return ck_tile::pad_tensor_view(
         lse_acc_dram_naive,
@@ -819,19 +866,42 @@ CK_TILE_DEVICE static auto MakeLseAccDram(
 }
 
 template <typename Policy, typename scalar_t>
-CK_TILE_DEVICE static auto MakeOutAccDram(
-    scalar_t* p_data,
-    const int32_t   size_s,
-    const int32_t   stride_s)
+CK_TILE_DEVICE static auto MakeOutAccDram(scalar_t* p_data,
+                                          const int32_t size_s_ori,
+                                          const int32_t stride_s,
+                                          const int32_t hq_hk_ratio,
+                                          const int32_t stride_h)
 {
     using Traits = typename Policy::Traits;
 
-    const auto o_acc_dram_naive = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
-        p_data,
-        ck_tile::make_tuple(size_s, Traits::kSizeDV),
-        ck_tile::make_tuple(stride_s, 1),
-        ck_tile::number<Policy::GetAlignmentOacc()>{},
-        ck_tile::number<1>{});
+    const auto o_acc_dram_naive = [&] {
+        if constexpr(Traits::kEnableXQA)
+        {
+            // merge: (seqlen_q, hq_hk_ratio, headdim) -> (seqlen_q*hq_hk_ratio, headdim)
+            const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori, hq_hk_ratio, Traits::kSizeDV),
+                ck_tile::make_tuple(stride_s, stride_h, 1),
+                ck_tile::number<Policy::GetAlignmentOacc()>{},
+                ck_tile::number<1>{});
+            return ck_tile::transform_tensor_view(
+                view,
+                ck_tile::make_tuple(
+                    ck_tile::make_merge_transform(ck_tile::make_tuple(size_s_ori, hq_hk_ratio)),
+                    ck_tile::make_pass_through_transform(Traits::kSizeDV)),
+                ck_tile::make_tuple(ck_tile::sequence<0, 1>{}, ck_tile::sequence<2>{}),
+                ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
+        }
+        else
+        {
+            return ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori, Traits::kSizeDV),
+                ck_tile::make_tuple(stride_s, 1),
+                ck_tile::number<Policy::GetAlignmentOacc()>{},
+                ck_tile::number<1>{});
+        }
+    }();
 
     return ck_tile::pad_tensor_view(
         o_acc_dram_naive,
@@ -840,38 +910,84 @@ CK_TILE_DEVICE static auto MakeOutAccDram(
 }
 
 template <typename Policy, typename Lengths, typename scalar_t>
-CK_TILE_DEVICE static auto MakeLseDram(
-    scalar_t* p_data,
-    const Lengths&  window_lenghts,
-    const int32_t   size_s)
+CK_TILE_DEVICE static auto MakeLseDram(scalar_t* p_data,
+                                       const Lengths& window_lenghts,
+                                       const int32_t size_s_ori,
+                                       const int32_t hq_hk_ratio,
+                                       const int32_t stride_h)
 {
     using Traits = typename Policy::Traits;
 
-    const auto lse_dram_naive = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
-        p_data,
-        ck_tile::make_tuple(size_s),
-        ck_tile::make_tuple(1),
-        ck_tile::number<Policy::GetAlignmentLse()>{},
-        ck_tile::number<1>{});
+    const auto lse_dram_naive = [&] {
+        if constexpr(Traits::kEnableXQA)
+        {
+            // transpose + merge: (hq_hk_ratio, seqlen_q) -> (seqlenq * hq_hk_ratio)
+            const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(hq_hk_ratio, size_s_ori),
+                ck_tile::make_tuple(stride_h, 1),
+                ck_tile::number<Policy::GetAlignmentLse()>{},
+                ck_tile::number<1>{});
+            return ck_tile::transform_tensor_view(
+                view,
+                ck_tile::make_tuple(
+                    ck_tile::make_merge_transform(ck_tile::make_tuple(size_s_ori, hq_hk_ratio))),
+                ck_tile::make_tuple(ck_tile::sequence<1, 0>{}),
+                ck_tile::make_tuple(ck_tile::sequence<0>{}));
+        }
+        else
+        {
+
+            return ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori),
+                ck_tile::make_tuple(1),
+                ck_tile::number<Policy::GetAlignmentLse()>{},
+                ck_tile::number<1>{});
+        }
+    }();
 
     return ck_tile::pad_tensor_view(
         lse_dram_naive, window_lenghts, ck_tile::sequence<Traits::kPadSeqLenQ>{});
 }
 
 template <typename Policy, typename scalar_t>
-CK_TILE_DEVICE static auto MakeOutDram(
-    scalar_t* p_data,
-    const int32_t   size_s,
-    const int32_t   stride_s)
+CK_TILE_DEVICE static auto MakeOutDram(scalar_t* p_data,
+                                       const int32_t size_s_ori,
+                                       const int32_t stride_s,
+                                       const int32_t hq_hk_ratio,
+                                       const int32_t stride_h)
 {
     using Traits = typename Policy::Traits;
 
-    const auto o_dram_naive = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
-        p_data,
-        ck_tile::make_tuple(size_s, Traits::kSizeDV),
-        ck_tile::make_tuple(stride_s, 1),
-        ck_tile::number<Policy::GetAlignmentO()>{},
-        ck_tile::number<1>{});
+    const auto o_dram_naive = [&] {
+        if constexpr(Traits::kEnableXQA)
+        {
+            // merge: (seqlen_q, hq_hk_ratio, headdim) -> (seqlen_q * hq_hk_ratio, headdim)
+            const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori, hq_hk_ratio, Traits::kSizeDV),
+                ck_tile::make_tuple(stride_s, stride_h, 1),
+                ck_tile::number<Policy::GetAlignmentO()>{},
+                ck_tile::number<1>{});
+            return ck_tile::transform_tensor_view(
+                view,
+                ck_tile::make_tuple(
+                    ck_tile::make_merge_transform(ck_tile::make_tuple(size_s_ori, hq_hk_ratio)),
+                    ck_tile::make_pass_through_transform(Traits::kSizeDV)),
+                ck_tile::make_tuple(ck_tile::sequence<0, 1>{}, ck_tile::sequence<2>{}),
+                ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
+        }
+        else
+        {
+            return ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
+                p_data,
+                ck_tile::make_tuple(size_s_ori, Traits::kSizeDV),
+                ck_tile::make_tuple(stride_s, 1),
+                ck_tile::number<Policy::GetAlignmentO()>{},
+                ck_tile::number<1>{});
+        }
+    }();
 
     return ck_tile::pad_tensor_view(
         o_dram_naive,
@@ -1511,17 +1627,18 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
     const auto [tile_m_id, split_id, hqid, bid] =
         kDoSplit ? GetTileIndex<Traits>(params.num_splits) : GetTileIndex<Traits>(1);
-    const auto hkid = hqid / params.hq_hk_ratio;
-    const int32_t mid = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
+    const auto hqid_xqa = Traits::kEnableXQA ? hqid * params.hq_hk_ratio : hqid;
+    const auto hkid     = hqid_xqa / params.hq_hk_ratio;
+    const int32_t mid   = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
 
     // Define causal mask
     using Mask             = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, Traits::kEnableXQA>;
     const int32_t seqlen_k = params.p_seqlens_k[bid];
     Mask mask              = kIsCausal ? Mask{params.size_s,
-                                 seqlen_k - params.size_s / params.mask_y_ratio + 1,
+                                 seqlen_k - params.size_s_ori + 1,
                                  params.size_s,
                                  seqlen_k,
-                                 params.mask_y_ratio}
+                                 params.mask_y_ratio_mdiv}
                                        : Mask{params.size_s, seqlen_k};
 
     auto q_dram_window_lengths =
@@ -1532,7 +1649,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockN1>{}, ck_tile::number<Traits::kBlockK1>{});
 
     const scalar_t* p_query = reinterpret_cast<const scalar_t*>(params.p_query) +
-                              int64_t(hqid) * params.stride_h_q +   // head offset
+                              int64_t(hqid_xqa) * params.stride_h_q +   // head offset
                               int64_t(bid) * params.stride_b_q;     // batch offset
     const scalar_t* p_key   = reinterpret_cast<const scalar_t*>(params.p_key) +
                               int64_t(hkid) * params.stride_h_k;    // head offset
@@ -1543,7 +1660,8 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
     const int32_t kv_cache_width = params.num_page_blocks * params.page_block_size;
 
-    const auto q_dram = MakeQDram<Policy>(p_query, params.size_s,  params.stride_s_q);
+    const auto q_dram = MakeQDram<Policy>(
+        p_query, params.size_s_ori, params.stride_s_q, params.hq_hk_ratio, params.stride_h_q);
     const auto k_dram = MakeKDram<Policy>(p_key,   kv_cache_width, params.stride_s_k);
     const auto v_dram = MakeVDram<Policy>(p_value, kv_cache_width, params.stride_s_v);    
 
@@ -1554,11 +1672,11 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     if constexpr (kDoSplit)
     {
         acc_t* p_lse_acc = reinterpret_cast<acc_t*>(params.p_softmax_lseaccum) +
-                           int64_t(hqid) * params.stride_h_lseacc +     // head offset
+                           int64_t(hqid_xqa) * params.stride_h_lseacc +     // head offset
                            int64_t(bid) * params.stride_b_lseacc +      // batch offset
                            int64_t(split_id) * params.stride_sp_lseacc; // split offset
         out_t* p_out_acc = reinterpret_cast<out_t*>(params.p_output_accum) +
-                           int64_t(hqid) * params.stride_h_oacc +      // head offset
+                           int64_t(hqid_xqa) * params.stride_h_oacc +      // head offset
                            int64_t(bid) * params.stride_b_oacc +       // batch offset
                            int64_t(split_id) * params.stride_sp_oacc;  // split offset
 
@@ -1567,8 +1685,16 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         auto out_acc_dram_window_lengths =
             ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockN1>{});
 
-        const auto lse_acc_dram = MakeLseAccDram<Policy>(p_lse_acc, lse_acc_dram_window_lengths, params.size_s);
-        const auto out_acc_dram = MakeOutAccDram<Policy>(p_out_acc, params.size_s, params.stride_s_oacc);
+        const auto lse_acc_dram = MakeLseAccDram<Policy>(p_lse_acc,
+                                                         lse_acc_dram_window_lengths,
+                                                         params.size_s_ori,
+                                                         params.hq_hk_ratio,
+                                                         params.stride_h_lseacc);
+        const auto out_acc_dram = MakeOutAccDram<Policy>(p_out_acc,
+                                                         params.size_s_ori,
+                                                         params.stride_s_oacc,
+                                                         params.hq_hk_ratio,
+                                                         params.stride_h_oacc);
 
         auto lse_acc_dram_window =
             ck_tile::make_tile_window(lse_acc_dram, lse_acc_dram_window_lengths, {mid});
@@ -1595,19 +1721,25 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     else
     {
         // Assuming lse is in shape [b, h, s] and is contiguous
-        acc_t* p_lse = reinterpret_cast<acc_t*>(params.p_softmax_lse) +
-                       (int64_t(bid) * params.size_h + hqid) * params.size_s; // batch+head offset
+        acc_t* p_lse =
+            reinterpret_cast<acc_t*>(params.p_softmax_lse) +
+            (int64_t(bid) * params.size_h_ori + hqid_xqa) * params.size_s_ori; // batch+head offset
         out_t* p_out = reinterpret_cast<out_t*>(params.p_output) +
-                       int64_t(hqid) * params.stride_h_o +   // head offset
-                       int64_t(bid) * params.stride_b_o;     // batch offset
+                       int64_t(hqid_xqa) * params.stride_h_o + // head offset
+                       int64_t(bid) * params.stride_b_o;       // batch offset
 
         auto lse_dram_window_lengths =
             ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{});
         auto out_dram_window_lengths =
             ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockN1>{});
-        
-        const auto lse_dram = MakeLseDram<Policy>(p_lse, lse_dram_window_lengths, params.size_s);
-        const auto out_dram = MakeOutDram<Policy>(p_out, params.size_s, params.stride_s_o);
+
+        const auto lse_dram = MakeLseDram<Policy>(p_lse,
+                                                  lse_dram_window_lengths,
+                                                  params.size_s_ori,
+                                                  params.hq_hk_ratio,
+                                                  params.stride_h_lse);
+        const auto out_dram = MakeOutDram<Policy>(
+            p_out, params.size_s_ori, params.stride_s_o, params.hq_hk_ratio, params.stride_h_o);
 
         auto lse_dram_window =
             ck_tile::make_tile_window(lse_dram, lse_dram_window_lengths, {mid});
@@ -1630,7 +1762,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
             mask,
             params.scale_softmax,
             p_smem);
-    }    
+    }
 }
 
 template <typename Traits, int32_t kMaxSplits, typename out_t, typename in_t>
@@ -1651,9 +1783,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
     const int32_t lane_id          = ck_tile::get_lane_id();
     const int32_t hidx             = blockIdx.y;
     const int32_t sidx             = blockIdx.x;
-    const int32_t hsidx            = hidx * params.size_s + sidx;
-    const int32_t shidx            = hidx + sidx * params.size_h;
-    const int32_t size_hs          = params.size_h * params.size_s;
+    const int32_t hsidx            = hidx * params.size_s_ori + sidx;
+    const int32_t shidx            = hidx + sidx * params.size_h_ori;
+    const int32_t size_hs          = params.size_h_ori * params.size_s_ori;
     const index_t offset_lse_accum = split_offset * size_hs + hsidx; // offset to split 0
     const index_t offset_lse       = bidx * size_hs + hsidx;
 
@@ -1767,7 +1899,7 @@ void dispatch_fmla_fwd_splictkv_prefill(
 
     const int32_t num_blk   = ck_tile::integer_divide_ceil(params.size_s,  Traits::kBlockM) * params.num_splits;
     const dim3    grid_attn = dim3(num_blk, params.size_h, params.size_b);
-    const dim3    grid_comb = dim3(params.size_s, params.size_h, params.size_b);
+    const dim3    grid_comb = dim3(params.size_s_ori, params.size_h_ori, params.size_b);  // TODO: not enable XQA
 
     if (params.num_splits > 1)
     {
@@ -1948,7 +2080,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     TORCH_CHECK(num_heads_q % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
 
-    const int32_t hq_hk_ratio = num_heads_q / num_heads_k;
+    int32_t hq_hk_ratio = num_heads_q_ori / num_heads_k;
     int32_t mask_y_ratio      = 1;
 
     if constexpr(Traits::kEnableXQA)
@@ -1956,16 +2088,16 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
         seqlen_q     = seqlen_q_ori * hq_hk_ratio;
         num_heads_q  = num_heads_k;
         mask_y_ratio = hq_hk_ratio;
-        if(num_heads_k == 1)
-        {
-            query = query.reshape({batch_size, seqlen_q, num_heads_q, head_size});
-        }
-        else
-        {
-            query = query.view({batch_size, seqlen_q_ori, num_heads_q, hq_hk_ratio, head_size})
-                        .transpose(2, 3)
-                        .reshape({batch_size, seqlen_q, num_heads_q, head_size});
-        }
+        // if(num_heads_k == 1)
+        // {
+        //     query = query.reshape({batch_size, seqlen_q, num_heads_q, head_size});
+        // }
+        // else
+        // {
+        //     query = query.view({batch_size, seqlen_q_ori, num_heads_q, hq_hk_ratio, head_size})
+        //                 .transpose(2, 3)
+        //                 .reshape({batch_size, seqlen_q, num_heads_q, head_size});
+        // }
     }
 
     const int32_t num_splits = calculate_num_splits<Traits>(batch_size, num_heads_q, seqlen_q);
@@ -1973,9 +2105,9 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 
     // Combine shader, which only exists when num_splits > 1, will conduct type convert by default and force.
     // Thus, kForceOutAcc doesn't work in this case.
-    auto output = torch::empty({batch_size, seqlen_q, num_heads_q, head_size_v},
+    auto output = torch::empty({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v},
                                (kForceOutAcc && !do_splits) ? opts_acc : opts);
-    auto softmax_lse = torch::empty({batch_size, num_heads_q, seqlen_q}, opts_acc);
+    auto softmax_lse = torch::empty({batch_size, num_heads_q_ori, seqlen_q_ori}, opts_acc);
 
     FlashMlaPrefillFwdParams params = {};
 
@@ -1991,14 +2123,16 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 
     params.size_b                   = batch_size;
     params.size_s                   = seqlen_q;
+    params.size_s_ori               = seqlen_q_ori;
     params.size_h                   = num_heads_q;
-    params.hq_hk_ratio              = num_heads_q / num_heads_k;
+    params.size_h_ori               = num_heads_q_ori;
+    params.hq_hk_ratio              = hq_hk_ratio;
     params.block_table_batch_stride = block_table.stride(0);
     params.num_page_blocks          = num_blocks;
     params.page_block_size          = page_block_size;
     params.scale_softmax            = softmax_scale;
 
-    params.mask_y_ratio = mask_y_ratio;
+    params.mask_y_ratio_mdiv = ck_tile::mdiv{static_cast<uint32_t>(mask_y_ratio)};
 
     params.stride_b_q = query.stride(0);
     params.stride_s_q = query.stride(1);
@@ -2012,13 +2146,14 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.stride_b_o = output.stride(0);
     params.stride_s_o = output.stride(1);
     params.stride_h_o = output.stride(2);
+    params.stride_h_lse = softmax_lse.stride(1);
 
     if(num_splits > 1)
     {
         auto output_accum =
-            torch::empty({batch_size, num_splits, seqlen_q, num_heads_q, head_size_v}, opts_acc);
+            torch::empty({batch_size, num_splits, seqlen_q_ori, num_heads_q_ori, head_size_v}, opts_acc);
         auto softmax_lseaccum =
-            torch::empty({batch_size, num_splits, num_heads_q, seqlen_q}, opts_acc);
+            torch::empty({batch_size, num_splits, num_heads_q_ori, seqlen_q_ori}, opts_acc);
 
         params.p_softmax_lseaccum = softmax_lseaccum.data_ptr();
         params.p_output_accum     = output_accum.data_ptr();
@@ -2045,23 +2180,23 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     // using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>;
     // dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, false>(params);
 
-    if constexpr(Traits::kEnableXQA)
-    {
-        // post process for out and softmax_lse
-        if(num_heads_k == 1)
-        {
-            output = output.reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
-        }
-        else
-        {
-            output = output.view({batch_size, seqlen_q_ori, hq_hk_ratio, num_heads_q, head_size_v})
-                         .transpose(2, 3)
-                         .reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
-        }
-        softmax_lse = softmax_lse.view({batch_size, num_heads_q, seqlen_q_ori, hq_hk_ratio})
-                          .transpose(2, 3)
-                          .reshape({batch_size, num_heads_q_ori, seqlen_q_ori});
-    }
+    // if constexpr(Traits::kEnableXQA)
+    // {
+    //     // post process for out and softmax_lse
+    //     if(num_heads_k == 1)
+    //     {
+    //         output = output.reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
+    //     }
+    //     else
+    //     {
+    //         output = output.view({batch_size, seqlen_q_ori, hq_hk_ratio, num_heads_q, head_size_v})
+    //                      .transpose(2, 3)
+    //                      .reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
+    //     }
+    //     softmax_lse = softmax_lse.view({batch_size, num_heads_q, seqlen_q_ori, hq_hk_ratio})
+    //                       .transpose(2, 3)
+    //                       .reshape({batch_size, num_heads_q_ori, seqlen_q_ori});
+    // }
 
     return {output.to(opts), softmax_lse};
 }
