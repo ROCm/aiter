@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Any
 from dataclasses import dataclass
 
+
 def get_if_str(idx, total, last_else=True):
     if idx == 0:
         return "if"
@@ -310,9 +311,10 @@ void binary_op_dispatch(const std::string& op_type,
         @property
         def trait_name(self) -> str:
             return f"{OPERATOR_MAP[self.F_op_type]}, {DATA_TYPE_MAP[self.F_in0_type]}, {DATA_TYPE_MAP[self.F_in1_type]}"
+
         @property
         def call_name(self) -> str:
-          return f'binary_op_impl<{self.trait_name}>'
+            return f'binary_op_impl<{self.trait_name}>'
 
         @property
         def def_name(self) -> str:
