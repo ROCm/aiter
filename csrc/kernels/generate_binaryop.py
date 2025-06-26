@@ -314,7 +314,7 @@ void binary_op_dispatch(const std::string& op_type,
 
         @property
         def call_name(self) -> str:
-            return f'binary_op_impl<{self.trait_name}>'
+            return f"binary_op_impl<{self.trait_name}>"
 
         @property
         def def_name(self) -> str:

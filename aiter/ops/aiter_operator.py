@@ -20,7 +20,7 @@ def add(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_add_"+dtype_str,
+            "md_name": "module_aiter_add_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -40,7 +40,7 @@ def sub(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_sub_"+dtype_str,
+            "md_name": "module_aiter_sub_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -60,7 +60,7 @@ def mul(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_mul_"+dtype_str,
+            "md_name": "module_aiter_mul_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -80,7 +80,7 @@ def div(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_div_"+dtype_str,
+            "md_name": "module_aiter_div_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -100,7 +100,7 @@ def add_(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_add_"+dtype_str,
+            "md_name": "module_aiter_add_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -120,7 +120,7 @@ def sub_(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_sub_"+dtype_str,
+            "md_name": "module_aiter_sub_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -140,7 +140,7 @@ def mul_(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_mul_"+dtype_str,
+            "md_name": "module_aiter_mul_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
@@ -160,7 +160,7 @@ def div_(input: Tensor, other: Tensor) -> Tensor:
         input,
         other,
         custom_build_args={
-            "md_name": "module_aiter_div_"+dtype_str,
+            "md_name": "module_aiter_div_" + dtype_str,
             "blob_gen_cmd": blob_gen_cmd,
         },
     )
