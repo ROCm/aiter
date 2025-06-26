@@ -131,14 +131,14 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
-    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K)
+    x, w, _, w_scales = generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K)
 
     if output:
-        out = torch.zeros((M, N), device=x.device, dtype=dtype)
-        gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype, out)
+        out = torch.zeros((M, N), device=x.device, dtype=torch.float32)
+        out = gemm_afp4wfp4_pre_quant(x, w, None, w_scales, torch.float32, out).to(dtype)
     else:
-        out = gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype)
+        out = gemm_afp4wfp4_pre_quant(x, w, None, w_scales, torch.float32).to(dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype)
+    torch_out = run_torch(x, w, None, w_scales, dtype).to(dtype)
 
     torch.testing.assert_close(torch_out, out)

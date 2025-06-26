@@ -257,8 +257,16 @@ def gemm_afp4wfp4_pre_quant(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["NUM_KSPLIT"] = 1  # there should be no splik whatsoever
-    config["SPLITK_BLOCK_SIZE"] = 2 * K
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (  # noqa: E731
         (
