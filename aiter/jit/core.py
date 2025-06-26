@@ -548,10 +548,25 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 if md_name not in __mds:
                     __mds[md_name] = module
 
+
             if isinstance(module, types.ModuleType):
-                op = getattr(module, loadName)
+                try:
+                    op = getattr(module, loadName)
+                except AttributeError:
+                    def dummy_op(*args, **kwargs):
+                        if AITER_LOG_MORE:
+                            print(f"[WARN] `{loadName}` not available in `{md_name}`, fallback dummy used.")
+                        return None
+                    return dummy_op
             else:
-                return None
+                def dummy_op(*args, **kwargs):
+                    if AITER_LOG_MORE:
+                        print(f"[WARN] Module `{md_name}` is not a ModuleType, fallback dummy used.")
+                    return None
+                return dummy_op
+
+
+
 
             def check_args():
                 get_asm_dir()
@@ -618,6 +633,16 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                 from ..test_common import log_args
 
                 log_args(func, *args, **kwargs)
+
+
+            if AITER_LOG_MORE == 3:
+                from ..test_common import perftest
+                if callable(op):
+                    def wrapped_op(*args_inner, **kwargs_inner):
+                        return op(*args_inner, **kwargs_inner)
+
+                    wrapped_op.__name__ = loadName
+                    perftest(2, 0)(wrapped_op)(*args, **kwargs)
 
             return op(*args, **kwargs)
 
