@@ -8,6 +8,7 @@ from typing import Any
 
 MD_NAME = "module_aiter_operator"
 
+
 def cmdGenFunc(op_name: str, input: Tensor, other: Tensor) -> dict[str, Any]:
     dtype_str = str(input.dtype).split(".")[1] + "_" + str(other.dtype).split(".")[1]
     blob_gen_cmd = [

@@ -477,7 +477,11 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
-def compile_ops(_md_name: str, fc_name: Optional[str] = None, gen_func: Optional[Callable[..., dict[str, Any]]] = None):
+def compile_ops(
+    _md_name: str,
+    fc_name: Optional[str] = None,
+    gen_func: Optional[Callable[..., dict[str, Any]]] = None,
+):
     def decorator(func):
         func.arg_checked = False
 
