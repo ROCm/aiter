@@ -71,7 +71,7 @@ def get_x_vals():
     ]
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(32, 512, 7168)]
+    x_vals += [(2**v, 512, 7168) for v in range(10)]
     return x_vals
 
 
