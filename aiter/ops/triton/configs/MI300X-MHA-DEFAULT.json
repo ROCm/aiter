@@ -1,0 +1,20 @@
+{
+  "fwd": {
+    "dropout_or_fp32": {
+      "BLOCK_M": 32,
+      "BLOCK_N": 32,
+      "waves_per_eu": 1,
+      "num_warps": 2,
+      "num_ctas": 1,
+      "num_stages": 1
+    },
+    "default": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 4,
+      "num_ctas": 1,
+      "num_stages": 1
+    }
+  }
+}
