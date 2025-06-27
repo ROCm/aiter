@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from typing import Any, Dict, Optional
 
-from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 # Source:
@@ -14,7 +14,7 @@ from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 _PADDING_SIZE = 0
 
-_MOE_A_QUANT_FUNC = dynamic_per_tensor_fp8_quant
+_MOE_A_QUANT_FUNC = dynamic_per_tensor_quant_fp8_i8
 
 _USE_MOE_PERSISTENT_KERNEL = False
 
