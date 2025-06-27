@@ -17,7 +17,8 @@
     m.def("add_", &aiter_add_, "apply for add_ with transpose and broadcast."); \
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
-    m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast."); \
+    m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
+#define AITER_UNARY_PYBIND                                                      \
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid.");                     \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
