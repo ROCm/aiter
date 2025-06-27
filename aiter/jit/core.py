@@ -500,13 +500,13 @@ def compile_ops(
                     rebuilded_list.append(md_name)
                     raise ModuleNotFoundError("")
                 if module is None:
+                    if gen_func is not None:
+                        gen_build_args = gen_func(*args, **kwargs)
+                        custom_build_args.update(gen_build_args)
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
             except ModuleNotFoundError:
                 d_args = get_args_of_build(md_name)
-                if gen_func is not None:
-                    gen_build_args = gen_func(*args, **kwargs)
-                    custom_build_args.update(gen_build_args)
                 d_args.update(custom_build_args)
 
                 # update module if we have coustom build

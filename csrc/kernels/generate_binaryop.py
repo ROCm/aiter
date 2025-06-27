@@ -123,7 +123,7 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
             is_support &= input.size(bcast_dim) == 1 ? other.size(bcast_dim) != 1 : true;
             pattern = is_support ? bcast_pattern[bcast_dim] : 0;
             order_flag = input.size(bcast_dim) != 1 ? true : false;
-            if (bcast_dim == 1) order_flag = !order_flag;
+            // if (bcast_dim == 1) order_flag = !order_flag;
           }
         };
         // (m, n, k), (1, n, k) or (1, n, k), (m, n, k)
@@ -133,11 +133,11 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
         // (m, n, k), (m, n, 1) or (m, n, 1), (m, n, k)
         broadcast_3d_case(2);
 
-        // broadcast in last 2 dim
+
         bool first_dim_eq = input.size(0) == other.size(0);
         bool input_bcast_last2dim = input.size(1) == 1 && input.size(2) == 1;
         bool other_bcast_last2dim = other.size(1) == 1 && other.size(2) == 1;
-        if (first_dim_eq && (input_bcast_last2dim || other_bcast_last2dim))
+        if (first_dim_eq && (input_bcast_last2dim || other_bcast_last2dim)) // broadcast in last 2 dim
         {
           is_support = true;
           order_flag = other_bcast_last2dim ? true : false;
