@@ -1214,7 +1214,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -1463,7 +1463,7 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         # dk = dk[..., : k_fp8.shape[-1]]
         # dv = dv[..., : v_fp8.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_fp8_func(
@@ -1658,6 +1658,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None, 
             None
         )
 
@@ -1944,7 +1945,7 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
         dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k_fp8.shape[-1]]
         dv = dv[..., : v_fp8.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_fp8_func(
