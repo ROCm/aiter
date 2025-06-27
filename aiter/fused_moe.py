@@ -76,18 +76,18 @@ def fused_moe(
     w2,  # [expert(local_expert:EP), dim, inter_dim]
     topk_weight,
     topk_ids,
-    expert_mask=None,  # EP
+    expert_mask: Optional[torch.tensor] = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
     # following for quant
-    w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
-    num_local_tokens=None,
+    num_local_tokens: Optional[torch.tensor] = None,
     dtype=None,
 ):
     """user API"""
