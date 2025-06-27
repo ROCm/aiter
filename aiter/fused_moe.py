@@ -88,6 +88,7 @@ def fused_moe(
     # following for tuning
     block_size_M=None,
     num_local_tokens=None,
+    dtype=None,
 ):
     """user API"""
     M, topk = topk_ids.shape
@@ -102,7 +103,11 @@ def fused_moe(
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
-    dtype = hidden_states.dtype
+    dtype = hidden_states.dtype if dtype is None else dtype
+    assert dtype in [
+        dtypes.fp16,
+        dtypes.bf16,
+    ], f"Fused_moe unsupported out dtype: {dtype}"
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
@@ -228,7 +233,15 @@ def fused_moe_1stage(
             QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
         )
         quant_func = get_quant(quant_type)
-        a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+        if hidden_states.dtype != q_dtype_a:
+            a1, a1_scale = quant_func(
+                hidden_states, scale=a1_scale, quant_dtype=q_dtype_a
+            )
+        else:
+            assert (
+                a1_scale is not None or quant_type == QuantType.No
+            ), "a1_scale must be provided for quantized input for fused_moe"
+            a1 = hidden_states
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -466,7 +479,7 @@ def fused_moe_2stages(
 
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    dtype = hidden_states.dtype
+    dtype = moe_out.dtype
     device = hidden_states.device
 
     stage1, stage2, block_m, ksplit = get_2stage_cfgs(
@@ -484,7 +497,13 @@ def fused_moe_2stages(
         doweight_stage1,
     )
 
-    a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+    if hidden_states.dtype != q_dtype_a:
+        a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+    else:
+        assert (
+            a1_scale is not None or quant_type == QuantType.No
+        ), "a1_scale must be provided for quantized input for fused_moe"
+        a1 = hidden_states
     if quant_type != QuantType.per_128x128:
         a2 = torch.empty(
             (token_num, topk, inter_dim),

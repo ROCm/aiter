@@ -10,6 +10,7 @@ from aiter.fused_moe import fused_topk, fused_moe
 from aiter.ops.shuffle import shuffle_weight
 import mori
 import multiprocessing as mp
+from aiter import get_hip_quant
 from aiter.test_common import (
     checkAllclose,
 )
@@ -27,7 +28,7 @@ def run_ref(
     w2_scale_ep,
     quant_type,
 ):
-    ref = torch.zeros(tokens.shape, dtype=dtypes.bf16, device=tokens.device)
+    ref = torch.zeros(tokens.shape, dtype=tokens.dtype, device=tokens.device)
     # out_list = []
     for i in range(world_size):
         mask = (topk_ids >= i * E // world_size) & (
@@ -43,8 +44,14 @@ def run_ref(
         num_local_tokens = torch.tensor(
             [tokens_ep.shape[0]], dtype=dtypes.i32, device=tokens_ep.device
         )
+        quant_func = get_hip_quant(
+            quant_type
+            if quant_type != aiter.QuantType.per_128x128
+            else aiter.QuantType.per_1x128
+        )
+        tokens_ep_qt, scale = quant_func(tokens_ep, quant_dtype=dtypes.fp8)
         out = fused_moe(
-            tokens_ep,
+            tokens_ep_qt,
             w1_ep[i],
             w2_ep[i],
             topk_weights_ep,
@@ -54,6 +61,8 @@ def run_ref(
             w1_scale=w1_scale_ep[i],
             w2_scale=w2_scale_ep[i],
             quant_type=quant_type,
+            a1_scale=scale,
+            dtype=dtypes.bf16,
         )
         # out_list.append(out)
         # return out_list
@@ -89,27 +98,40 @@ def run_mori(
     w2 = w2.to(device)
     w1_scale = w1_scale.to(device) if w1_scale is not None else None
     w2_scale = w2_scale.to(device) if w2_scale is not None else None
+    quant_func = get_hip_quant(
+        quant_type
+        if quant_type != aiter.QuantType.per_128x128
+        else aiter.QuantType.per_1x128
+    )
+    tokens_qt, scale = quant_func(tokens, quant_dtype=dtypes.fp8)
 
+    # print(f"before init mori {scale.shape=} {tokens_qt.dtype=}")
     # init dist
     world_group = torch.distributed.group.WORLD
     assert world_group is not None
     torch._C._distributed_c10d._register_process_group("default", world_group)
     mori.shmem.shmem_torch_process_group_init("default")
     mori_config = mori.ops.EpDispatchCombineConfig(
-        data_type=dtype,
+        data_type=tokens_qt.dtype,
         rank=rankID,
         world_size=world_size,
         hidden_dim=hdim,
+        scale_dim=scale.shape[-1] if scale is not None else 0,
+        scale_type_size=scale.dtype.itemsize if scale is not None else 0,
         max_num_inp_token_per_rank=128,
         num_experts_per_rank=E // world_size,
         num_experts_per_token=topk,
     )
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
 
-    dispatch_output, dispatch_weights, dispatch_ids, dispatch_recv_token_num = (
-        mori_op.dispatch(tokens, topk_weights, topk_ids)
-    )
-    torch.cuda.synchronize()
+    (
+        dispatch_output,
+        dispatch_weights,
+        dispatch_scale,
+        dispatch_ids,
+        dispatch_recv_token_num,
+    ) = mori_op.dispatch(tokens_qt, topk_weights, scale, topk_ids)
+    # torch.cuda.synchronize()
     # src_token_pos = mori_op.get_dispatch_src_token_pos().cpu()
     # src_token_num = src_token_pos.shape[0]
     # src_token_order = torch.sort(src_token_pos)[1].cpu()
@@ -119,6 +141,7 @@ def run_mori(
     # dispatch_ids = dispatch_ids[: src_token_num].to(dtypes.i32)[src_token_order]
     # dispatch_output = dispatch_output[: src_token_num][src_token_order]
     # dispatch_weights = dispatch_weights[: src_token_num][src_token_order]
+    # dispatch_scale = dispatch_scale[: src_token_num][src_token_order]
 
     expert_mask = torch.zeros((E,), dtype=dtypes.i32, device=device)
     expert_mask[E // world_size * rankID : E // world_size * (rankID + 1)] = 1
@@ -127,18 +150,21 @@ def run_mori(
         w1,
         w2,
         dispatch_weights,
-        dispatch_ids.to(dtypes.i32),
+        dispatch_ids,
         expert_mask,
-        num_local_tokens=dispatch_recv_token_num.to(dtypes.i32),
+        num_local_tokens=dispatch_recv_token_num,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
+        a1_scale=dispatch_scale,
         quant_type=quant_type,
+        dtype=dtype,
     )
 
     # aiter.destroy_dist_env()
     # return out[:src_token_num].cpu()
 
     combine_output = mori_op.combine(out, topk_weights, topk_ids)
+    print(f"{rankID=} {combine_output.shape=} {combine_output.dtype=} {out.dtype=}")
     aiter.destroy_dist_env()
     return combine_output[:token_num].cpu()
 
@@ -199,7 +225,7 @@ def test_dispatch_combine(
 
     tokens_dp = tokens.chunk(world_size)
     topk_weights_dp = topk_weights.chunk(world_size)
-    topk_ids_dp = topk_ids.to(torch.uint32).chunk(world_size)
+    topk_ids_dp = topk_ids.chunk(world_size)
     w1_ep = w1_qt.chunk(world_size)
     w2_ep = w2_qt.chunk(world_size)
     w1_scale_ep = (
@@ -268,8 +294,8 @@ l_dtype = ["bf16"]
 l_shape = [(128, 6144, 1024)]
 quant_types = [
     aiter.QuantType.No,
-    aiter.QuantType.per_Token,
-    aiter.QuantType.per_128x128,
+    # aiter.QuantType.per_Token,
+    # aiter.QuantType.per_128x128,
 ][-1:]
 
 parser = argparse.ArgumentParser(description="config input of test")
