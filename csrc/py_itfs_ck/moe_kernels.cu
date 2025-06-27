@@ -102,6 +102,7 @@ torch::Tensor ck_moe(torch::Tensor &hidden_states,          // [m, k], input tok
                         w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr,
                         a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr,
                         expert_mask.has_value() ? expert_mask.value().data_ptr() : nullptr,
+                        nullptr, // TODO: update fused_moe parameter lists
                         out.data_ptr(),
                         ws_ptr,
 

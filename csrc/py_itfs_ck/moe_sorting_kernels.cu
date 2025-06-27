@@ -46,6 +46,7 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                 {topk_ids.data_ptr(),     // p_topk_ids
                  topk_weights.data_ptr(), // p_weights
                  local_expert_mask.has_value() ? local_expert_mask.value().data_ptr() : nullptr,
+                 nullptr,                      // p_local_tokens
                  sorted_token_ids.data_ptr(),  // p_sorted_token_ids
                  sorted_weights.data_ptr(),    // p_sorted_weights
                  sorted_expert_ids.data_ptr(), // p_sorted_expert_ids
