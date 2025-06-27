@@ -9,6 +9,8 @@ from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter.int4_utils import *
 from aiter.utility import fp4_utils
 from aiter.jit.utils.chip_info import get_gfx
+import argparse
+import pandas as pd
 
 from aiter.fused_moe import (
     fused_topk,
@@ -407,9 +409,9 @@ def test_fmoe(
         return {"us": us_fuse, "err": err}
 
 
-list_dtype = [dtypes.bf16, dtypes.fp16][:1]
-list_dim = [(6144, 4096)]
-list_tokenNum = [
+l_dtype = ["bf16", "fp16"]
+l_dim = [(6144, 4096)]
+l_tokenNum = [
     1,
     3,
     5,
@@ -421,8 +423,8 @@ list_tokenNum = [
     1024,
     4096,
     163840,
-][:]
-list_quant = [
+]
+l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
     (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
@@ -430,11 +432,100 @@ list_quant = [
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
-list_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
-list_doweight_stage1 = [False, True][:1]
-expert, topk = 8, 2
+l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu]
+l_doweight_stage1 = [False, True]
 
-import pandas as pd
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+
+parser.add_argument(
+    "-dim",
+    type=dtypes.str2tuple,
+    nargs="?",
+    const=None,
+    default=None,
+)
+
+parser.add_argument(
+    "-t",
+    "--tokenNum",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="number of tokens",
+)
+
+parser.add_argument(
+    "--quant",
+    type=int,
+    choices=range(len(l_quant)),
+    help="select quantization type",
+)
+
+parser.add_argument(
+    "-a",
+    "--act",
+    type=str,
+    choices=["silu", "gelu"],
+    default=None,
+    help="select activation type",
+)
+
+parser.add_argument(
+    "-s",
+    "--doweight_stage1",
+    type=dtypes.str2bool,
+    nargs="?",
+    const=None,
+    default=None,
+    help="whether to do weight in stage 1",
+)
+
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    default=8,
+    help="number of experts",
+)
+
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    default=2,
+    help="number of top experts",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+
+if args.dim is not None:
+    l_dim = [args.dim]
+
+if args.tokenNum is not None:
+    l_tokenNum = [args.tokenNum]
+
+l_quant = [l_quant[args.quant]] if args.quant is not None else l_quant
+
+if args.act is not None:
+    l_act = [getattr(aiter.ActivationType, args.act.capitalize())]
+
+if args.doweight_stage1 is not None:
+    l_doweight_stage1 = [args.doweight_stage1]
 
 for (
     dtype,
@@ -442,18 +533,16 @@ for (
     (quant_type, aq_dtype, wq_dtype),
     (model_dim, inter_dim),
     doweight_stage1,
-) in itertools.product(
-    list_dtype, list_act, list_quant, list_dim, list_doweight_stage1
-):
+) in itertools.product(l_dtype, l_act, l_quant, l_dim, l_doweight_stage1):
     df = []
-    for m in list_tokenNum:
+    for m in l_tokenNum:
         ret = test_fmoe(
             dtype,
             m,
             model_dim,
             inter_dim,
-            expert,
-            topk,
+            args.expert,
+            args.topk,
             act_type,
             quant_type,
             aq_dtype,

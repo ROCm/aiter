@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
+import argparse
 
 
 @perftest()
@@ -88,8 +89,47 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_rmsnorm2d(dtype, m, n)
 
+l_dtype = ["fp16", "bf16"]
+l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+l_n = [4096, 8192, 16384, 32768, 65536]
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-m",
+    "--m",
+    type=int,
+    nargs="?",
+    default=None,
+)
+parser.add_argument(
+    "-n",
+    "--n",
+    type=int,
+    nargs="?",
+    default=None,
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.m is not None:
+    l_m = [args.m]
+if args.n is not None:
+    l_n = [args.n]
+
 print("\nstart fuse add test")
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-        for n in [4096, 8192, 16384, 32768, 65536]:
+for dtype in l_dtype:
+    for m in l_m:
+        for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)

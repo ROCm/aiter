@@ -11,6 +11,7 @@ from aiter.test_common import (
 )
 from aiter import dtypes
 import pandas as pd
+import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -176,17 +177,71 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
+l_dtype = ["bf16", "fp16"]
+l_expert = [64, 256]
+l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
+l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
+
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    choices=l_expert,
+    nargs="?",
+    const=None,
+    default=None,
+    help="number of experts",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    default=None,
+)
+parser.add_argument(
+    "-t",
+    "--token",
+    type=int,
+    choices=l_token,
+    nargs="?",
+    const=None,
+    default=None,
+    help="number of tokens",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.expert is not None:
+    l_expert = [args.expert]
+if args.m is not None:
+    l_m = [args.m]
+if args.token is not None:
+    l_token = [args.token]
+
 df = []
-for dtype in [dtypes.fp16, dtypes.bf16][:1]:
-    for e in [64, 256][:]:
-        for m in [1, 8, 16, 32, 64, 128, 256, 65536, 163840][:]:
+for dtype in l_dtype:
+    for e in l_expert:
+        for m in l_m:
             ret = test_topk_softmax(dtype, m, e, 5)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
 
 df = []
-for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384][:]:
+for token in l_token:
     # DeepSeek-R1
     topk = 8
     group = 8
@@ -202,7 +257,7 @@ df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
 
 df = []
-for token in [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000]:
+for token in l_token:
     for scoring_func in ["softmax", "sigmoid"]:
         # DeepSeek-R1
         topk = 8

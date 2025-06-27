@@ -1134,6 +1134,38 @@ if __name__ == "__main__":
         action="store_true",
         help="Check correctness when compare with legacy implementation. Default: False",
     )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        type=int,
+        default=(1, 2, 4),
+        nargs="*",
+        help="Batch sizes to test. Default: (1, 2, 4).",
+    )
+    parser.add_argument(
+        "-s",
+        "--seq_size",
+        type=int,
+        default=(1024, 2048, 4096),
+        nargs="*",
+        help="Sequence sizes to test. Default: (1024, 2048, 4096).",
+    )
+    parser.add_argument(
+        "--head_size",
+        type=int,
+        default=(32, 64),
+        nargs="*",
+        help="Head sizes to test. Default: (32, 64).",
+    )
+    parser.add_argument(
+        "-d",
+        "--hidden_dim",
+        type=int,
+        default=(128, 256),
+        nargs="*",
+        help="Hidden dimensions to test. Default: (128, 256).",
+    )
+
     args = parser.parse_args()
 
     # dtype_ = (dtypes.fp32, dtypes.fp16, dtypes.bf16)
@@ -1175,10 +1207,10 @@ if __name__ == "__main__":
             transpose_output_,
             rotate_style_,
             rotary_percent_and_reuse_,
-            batch_size_[-1:],
-            seq_size_[1:2],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.batch_size,
+            args.seq_size,
+            args.head_size,
+            args.hidden_dim,
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -1242,11 +1274,11 @@ if __name__ == "__main__":
             rotate_style_,
             rotary_percent_and_reuse_,
             (False, True),
-            batch_size_[-1:],
-            seq_size_[1:2],
-            head_size_[-1:],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.batch_size,
+            args.seq_size,
+            args.head_size,
+            args.head_size,
+            args.hidden_dim,
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -1332,11 +1364,11 @@ if __name__ == "__main__":
             rotate_style_,
             rotary_percent_and_reuse_compare_,
             (False, True),
-            batch_size_[-1:],
-            seq_size_[1:2],
-            head_size_[-1:],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.batch_size,
+            args.seq_size,
+            args.head_size,
+            args.head_size,
+            args.hidden_dim,
         ):
             color, endc = "\033[95m", "\033[0m"
             print(
@@ -1421,8 +1453,8 @@ if __name__ == "__main__":
             dtype_,
             rotate_style_,
             rotary_percent_and_reuse_,
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.head_size,
+            args.hidden_dim,
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -1452,9 +1484,9 @@ if __name__ == "__main__":
         for dtype, fdtype, b, h, d, height, width, margin in itertools.product(
             dtype_,
             dtype_,
-            batch_size_[-1:],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.batch_size,
+            args.head_size,
+            args.hidden_dim,
             height_[-1:],
             width_[-1:],
             margin_,

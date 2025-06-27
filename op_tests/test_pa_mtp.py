@@ -7,6 +7,8 @@ import aiter
 from aiter.test_common import checkAllclose, benchmark, perftest
 import random
 import pandas as pd
+import argparse
+from aiter import dtypes
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -391,13 +393,76 @@ def test_pa_mtp(
 
 head_dim = 128
 block_size = 16
+l_dtype = ["bf16"]
+l_num_heads = [(5, 1), (8, 1), (16, 1)]
+l_qlen = [1, 2, 3, 4]
+l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
+l_batch_size = [128]
 
-for dtype in [torch.bfloat16]:
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-n",
+    "--num_heads",
+    type=dtypes.str2tuple,
+    choices=l_num_heads,
+    default=None,
+    help="number of heads, e.g. 8,1",
+)
+parser.add_argument(
+    "-q",
+    "--qlen",
+    type=int,
+    choices=l_qlen,
+    default=None,
+    help="query length, e.g. 1, 2, 3, 4",
+)
+parser.add_argument(
+    "-c",
+    "--ctx_len",
+    type=int,
+    choices=l_ctx_len,
+    default=None,
+    help="context length, e.g. 7, 26, 57, 66, 109, 128, 257, 282, 4097",
+)
+parser.add_argument(
+    "-b",
+    "--batch_size",
+    type=int,
+    choices=l_batch_size,
+    default=None,
+    help="batch size, e.g. 128",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.num_heads is not None:
+    l_num_heads = [args.num_heads]
+if args.qlen is not None:
+    l_qlen = [args.qlen]
+if args.ctx_len is not None:
+    l_ctx_len = [args.ctx_len]
+if args.batch_size is not None:
+    l_batch_size = [args.batch_size]
+
+for dtype in l_dtype:
     df = []
-    for num_heads in [(5, 1), (8, 1), (16, 1)][:-1]:
-        for qlen in [1, 2, 3, 4][1:]:
-            for ctx_len in [7, 26, 57, 66, 109, 128, 257, 282, 4097][:]:
-                for batch_size in [128][:]:
+    for num_heads in l_num_heads:
+        for qlen in l_qlen:
+            for ctx_len in l_ctx_len:
+                for batch_size in l_batch_size:
                     ret = test_pa_mtp(
                         ctx_len,
                         batch_size,
