@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import pytest
@@ -260,7 +260,7 @@ def test_rms_norm_dynamic_per_token_fp8_quant(
     x_scale_fused = torch.empty(x.shape[0], 1, dtype=torch.float32, device="cuda")
 
     x_normed = rmsnorm2d_fwd_with_dynamicquant(
-        xq_fused_triton, x, x_scale_fused, w, dump_rms_norm=True
+        xq_fused_triton, x, x_scale_fused, w, EPS, dump_rms_norm=True
     )
 
     ref_x_normed = torch_rmsnorm(x, w, dtype, EPS)

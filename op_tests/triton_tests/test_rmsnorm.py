@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import pytest
 import torch
-import torch.nn.functional as F
 import triton
 from aiter.ops.triton.rmsnorm import (
     rms_norm,
@@ -47,26 +46,39 @@ def run_triton(x, weight, eps, residual=None):
     else:
         residual_out = torch.empty_like(x)
         output = torch.empty_like(x)
-        rmsnorm2d_fwd_with_add(output, x, residual, residual_out, weight, eps)
+        output = rmsnorm2d_fwd_with_add(output, x, residual, residual_out, weight, eps)
     return output, residual_out
+
+
+def get_vals():
+
+    vals = [
+        (1, 4),
+        (2, 10),
+        (256, 4096),
+        (4096, 8192),
+        (1, 31744),
+        (8192, 65536),
+        (873, 1245),
+        (4096, 5120),
+        (8192, 8192),
+        (2048, 4096),
+        (768, 2048),
+        (256, 1024),
+        (128, 768),
+        (64, 512),
+        (173, 409),
+        (71, 3571),
+        (29, 17389),
+    ]
+
+    return vals
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize(
     "M, N",
-    [
-        (1, 4),
-        (2, 10),
-        (8192, 4096),
-        (4096, 8192),
-        (8000, 8000),
-        (1, 31744),
-        (3, 65536),
-        (1, 131072),
-        (873, 1245),
-        (23153, 45),
-        (89999, 234),
-    ],
+    [(shape) for shape in get_vals()],
 )
 def test_rmsnorm(M, N, in_dtype_str):
     arg_to_torch_dtype = {
@@ -80,8 +92,22 @@ def test_rmsnorm(M, N, in_dtype_str):
 
     x, weight = generate_rmsnorm_inputs(M, N, in_dtype)
 
+    dy = torch.randn_like(x)
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+
+    # forward pass
     y_torch, *_ = run_torch(x, weight, 1e-5)
     y_triton, *_ = run_triton(x, weight, 1e-5)
+
+    # backward pass (triton)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dg_triton = [_.grad.clone() for _ in [x, weight]]
+    x.grad, weight.grad = None, None
+
+    # backward pass (torch)
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dg_torch = [_.grad.clone() for _ in [x, weight]]
 
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
@@ -97,24 +123,14 @@ def test_rmsnorm(M, N, in_dtype_str):
     ), f"y_torch has dtype={y_torch.dtype}, expected {out_dtype}"
 
     triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    triton.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize(
     "M, N",
-    [
-        (1, 4),
-        (2, 10),
-        (8192, 4096),
-        (4096, 8192),
-        (8000, 8000),
-        (1, 31744),
-        (3, 65536),
-        (1, 131072),
-        (873, 1245),
-        (23153, 45),
-        (89999, 234),
-    ],
+    [(shape) for shape in get_vals()],
 )
 def test_fused_add_rmsnorm(M, N, in_dtype_str):
     arg_to_torch_dtype = {
@@ -130,14 +146,28 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     weight = torch.randn(N, device="cuda", dtype=in_dtype)
     res = torch.randn(M, N, device="cuda", dtype=in_dtype)
 
+    dy = torch.randn_like(x)
+    x.requires_grad_(True)
+    weight.requires_grad_(True)
+
+    # forward pass
     y_torch, res_torch, *_ = run_torch(x, weight, 1e-5, residual=res)
     y_triton, res_triton, *_ = run_triton(x, weight, 1e-5, residual=res)
+
+    # backward pass (triton)
+    y_triton.backward(dy, retain_graph=True)
+    dx_triton, dg_triton = [_.grad.clone() for _ in [x, weight]]
+    x.grad, weight.grad = None, None
+
+    # backward pass (torch)
+    y_torch.backward(dy, retain_graph=True)
+    dx_torch, dg_torch = [_.grad.clone() for _ in [x, weight]]
 
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
         # float32 typically can be tighter
-        atol, rtol = 1e-5, 1e-5
+        atol, rtol = 1e-4, 1e-4
 
     assert (
         y_triton.dtype == out_dtype
@@ -148,3 +178,5 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
 
     triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
     triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
+    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    triton.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)

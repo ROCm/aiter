@@ -40,3 +40,10 @@ torch_to_triton_dtype = {
     torch.int8: tl.int8,
     torch.uint8: tl.uint8,
 }
+
+
+def get_dtype_max(dtype):
+    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).max
+    else:
+        return torch.iinfo(dtype).max
