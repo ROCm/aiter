@@ -930,5 +930,5 @@
 
 #define FLASH_MLA_FWD_PYBIND                                                        \
       m.def("get_mla_metadata", &get_mla_metadata);                                 \
-      m.def("flash_mla_fwd_with_kvcache_impl", &flash_mla_fwd_with_kvcache_impl); \
+      m.def("flash_mla_fwd_with_kvcache_impl", &flash_mla_fwd_with_kvcache_impl);   \
       m.def("flash_mla_fwd_prefill_with_kvcache_impl", &flash_mla_fwd_prefill_with_kvcache_impl);
