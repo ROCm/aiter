@@ -16,7 +16,8 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                      torch::Tensor &moe_buf,           // [max_num_tokens_padded]
                      int num_experts,
                      int unit_size,
-                     std::optional<torch::Tensor> local_expert_mask = std::nullopt)
+                     std::optional<torch::Tensor> local_expert_mask = std::nullopt,
+                     std::optional<torch::Tensor> num_local_tokens = std::nullopt)
 {
     // Ensure that the incoming top‑k weights tensor is FP32
     TORCH_CHECK(topk_weights.scalar_type() == at::ScalarType::Float,
@@ -46,6 +47,7 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,          // [m, topk]
                 {topk_ids.data_ptr(),     // p_topk_ids
                  topk_weights.data_ptr(), // p_weights
                  local_expert_mask.has_value() ? local_expert_mask.value().data_ptr() : nullptr,
+                 num_local_tokens.has_value() ? num_local_tokens.value().data_ptr() : nullptr,
                  sorted_token_ids.data_ptr(),  // p_sorted_token_ids
                  sorted_weights.data_ptr(),    // p_sorted_weights
                  sorted_expert_ids.data_ptr(), // p_sorted_expert_ids

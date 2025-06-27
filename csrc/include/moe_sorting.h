@@ -12,4 +12,5 @@ void moe_sorting_fwd(torch::Tensor &topk_ids,              // [m, topk]
                      torch::Tensor &moe_buf,               // [max_num_tokens_padded]
                      int num_experts,
                      int unit_size,
-                     std::optional<torch::Tensor> local_expert_mask = std::nullopt);
+                     std::optional<torch::Tensor> local_expert_mask = std::nullopt,
+                     std::optional<torch::Tensor> num_local_tokens = std::nullopt);

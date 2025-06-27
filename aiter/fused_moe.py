@@ -28,6 +28,7 @@ def moe_sorting(
     moebuf_dtype,
     block_size=BLOCK_SIZE_M,
     expert_mask=None,
+    num_local_tokens=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -54,6 +55,7 @@ def moe_sorting(
         num_experts,
         block_size,
         expert_mask,
+        num_local_tokens,
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
@@ -74,17 +76,19 @@ def fused_moe(
     w2,  # [expert(local_expert:EP), dim, inter_dim]
     topk_weight,
     topk_ids,
-    expert_mask=None,  # EP
+    expert_mask: Optional[torch.tensor] = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
     # following for quant
-    w1_scale=None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
+    num_local_tokens: Optional[torch.tensor] = None,
+    dtype=None,
 ):
     """user API"""
     M, topk = topk_ids.shape
@@ -99,7 +103,11 @@ def fused_moe(
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
-    dtype = hidden_states.dtype
+    dtype = hidden_states.dtype if dtype is None else dtype
+    assert dtype in [
+        dtypes.fp16,
+        dtypes.bf16,
+    ], f"Fused_moe unsupported out dtype: {dtype}"
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
@@ -124,7 +132,14 @@ def fused_moe(
     block_size_M = 32 if run_1stage else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids, topk_weight, global_E, model_dim, dtype, block_size_M, expert_mask
+        topk_ids,
+        topk_weight,
+        global_E,
+        model_dim,
+        dtype,
+        block_size_M,
+        expert_mask,
+        num_local_tokens,
     )
 
     if run_1stage:
@@ -218,7 +233,15 @@ def fused_moe_1stage(
             QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
         )
         quant_func = get_quant(quant_type)
-        a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+        if hidden_states.dtype != q_dtype_a:
+            a1, a1_scale = quant_func(
+                hidden_states, scale=a1_scale, quant_dtype=q_dtype_a
+            )
+        else:
+            assert (
+                a1_scale is not None or quant_type == QuantType.No
+            ), "a1_scale must be provided for quantized input for fused_moe"
+            a1 = hidden_states
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -456,7 +479,7 @@ def fused_moe_2stages(
 
     token_num, _ = hidden_states.shape
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
-    dtype = hidden_states.dtype
+    dtype = moe_out.dtype
     device = hidden_states.device
 
     stage1, stage2, block_m, ksplit = get_2stage_cfgs(
@@ -474,7 +497,13 @@ def fused_moe_2stages(
         doweight_stage1,
     )
 
-    a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+    if hidden_states.dtype != q_dtype_a:
+        a1, a1_scale = quant_func(hidden_states, scale=a1_scale, quant_dtype=q_dtype_a)
+    else:
+        assert (
+            a1_scale is not None or quant_type == QuantType.No
+        ), "a1_scale must be provided for quantized input for fused_moe"
+        a1 = hidden_states
     if quant_type != QuantType.per_128x128:
         a2 = torch.empty(
             (token_num, topk, inter_dim),
@@ -505,8 +534,6 @@ def fused_moe_2stages(
     )
 
     if quant_type != QuantType.per_128x128:
-        if quant_type == QuantType.per_Token:
-            a2 = a2.view(token_num, -1)
         a2, a2_scale = quant_func(a2, scale=a2_scale, quant_dtype=q_dtype_a)
         a2 = a2.view(token_num, topk, inter_dim)
     else:
