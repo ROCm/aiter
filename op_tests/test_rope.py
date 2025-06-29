@@ -1118,6 +1118,7 @@ dim_freqs: {str(freqs_h.shape):<20}
 
 
 if __name__ == "__main__":
+    l_dtype = ("fp16", "bf16")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--no_check",
@@ -1133,6 +1134,24 @@ if __name__ == "__main__":
         "--compare_check",
         action="store_true",
         help="Check correctness when compare with legacy implementation. Default: False",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="data type",
+    )
+    parser.add_argument(
+        "-t",
+        "--transpose_output",
+        default=(False, True),
+        nargs="*",
+        type=dtypes.str2bool,
+        help="Transpose output. Default: (False, True).",
     )
     parser.add_argument(
         "-b",
@@ -1151,6 +1170,7 @@ if __name__ == "__main__":
         help="Sequence sizes to test. Default: (1024, 2048, 4096).",
     )
     parser.add_argument(
+        "-hs",
         "--head_size",
         type=int,
         default=(32, 64),
@@ -1158,7 +1178,7 @@ if __name__ == "__main__":
         help="Head sizes to test. Default: (32, 64).",
     )
     parser.add_argument(
-        "-d",
+        "-hd",
         "--hidden_dim",
         type=int,
         default=(128, 256),
@@ -1167,14 +1187,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
 
-    # dtype_ = (dtypes.fp32, dtypes.fp16, dtypes.bf16)
-    dtype_ = (dtypes.fp16, dtypes.bf16)
-    transpose_output_ = (False, True)
-    batch_size_ = (1, 2, 4)
-    seq_size_ = (1024, 2048, 4096)
-    head_size_ = (32, 64)
-    hidden_dim_ = (128, 256)
     # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
     rotary_percent_and_reuse_ = (
         (1.0, True, False),
@@ -1202,9 +1219,9 @@ if __name__ == "__main__":
             h,
             d,
         ) in itertools.product(
-            dtype_,
-            dtype_,
-            transpose_output_,
+            l_dtype,
+            l_dtype,
+            args.transpose_output,
             rotate_style_,
             rotary_percent_and_reuse_,
             args.batch_size,
@@ -1268,9 +1285,9 @@ if __name__ == "__main__":
             h_y,
             d,
         ) in itertools.product(
-            dtype_,
-            dtype_,
-            transpose_output_,
+            l_dtype,
+            l_dtype,
+            args.transpose_output,
             rotate_style_,
             rotary_percent_and_reuse_,
             (False, True),
@@ -1360,7 +1377,7 @@ if __name__ == "__main__":
             h_y,
             d,
         ) in itertools.product(
-            dtype_,  # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
+            l_dtype,  # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
             rotate_style_,
             rotary_percent_and_reuse_compare_,
             (False, True),
@@ -1449,8 +1466,8 @@ if __name__ == "__main__":
             h,
             d,
         ) in itertools.product(
-            dtype_,
-            dtype_,
+            l_dtype,
+            l_dtype,
             rotate_style_,
             rotary_percent_and_reuse_,
             args.head_size,
@@ -1482,8 +1499,8 @@ if __name__ == "__main__":
     # Test 2d image format for cached
     if not args.no_check:
         for dtype, fdtype, b, h, d, height, width, margin in itertools.product(
-            dtype_,
-            dtype_,
+            l_dtype,
+            l_dtype,
             args.batch_size,
             args.head_size,
             args.hidden_dim,
