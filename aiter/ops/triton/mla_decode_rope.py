@@ -26,7 +26,6 @@ It supports page size = 1.
 from typing import Optional
 import functools
 import json
-import os
 import triton
 import triton.language as tl
 import torch
@@ -319,7 +318,7 @@ def _decode_grouped_att_m_fwd_rope(
     logit_cap,
     use_rope,
     is_neox_style,
-    config
+    config,
 ):
     if use_rope:
         assert (
@@ -339,7 +338,6 @@ def _decode_grouped_att_m_fwd_rope(
         triton.cdiv(head_num, min(config["BLOCK_H"], kv_group_num)),
         config["NUM_KV_SPLITS"],
     )
-
 
     _fwd_grouped_kernel_stage1_rope[grid](
         q,
@@ -474,6 +472,7 @@ def _get_config():
 
     return _get_config._config_dict
 
+
 def decode_attention_fwd_grouped_rope(
     q: torch.Tensor,
     k_buffer: torch.Tensor,
@@ -540,13 +539,14 @@ def decode_attention_fwd_grouped_rope(
         logit_cap,
         use_rope,
         is_neox_style,
-        config["fwd_grouped_kernel_stage1_rope"]
+        config["fwd_grouped_kernel_stage1_rope"],
     )
-    _decode_softmax_reducev_fwd(attn_logits, 
-        q, 
-        o, 
-        v_buffer, 
-        kv_indptr, 
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        q,
+        o,
+        v_buffer,
+        kv_indptr,
         num_kv_splits,
-        config["fwd_kernel_stage2"]
-        )
+        config["fwd_kernel_stage2"],
+    )
