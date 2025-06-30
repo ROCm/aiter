@@ -83,7 +83,7 @@ def get_invalid_mask(N: int, max_attn_len: int, causal: bool):
     seq_n = torch.unsqueeze(seq, 0)
     offs_m_minus_n = seq_m - seq_n
     invalid_mask = seq_m >= seq_n
-    # if max_attn_len is not None:
+    # if max_attn_len > 0:
     #     invalid_mask = invalid_mask and (offs_m_minus_n <= max_attn_len)
 
     return invalid_mask
@@ -129,8 +129,6 @@ def torch_hstu_attention_fwd(
 
         qk = torch.bmm(in_q, in_k.permute(0, 2, 1))
         silu = qk / (torch.exp(-qk) + 1.0) / N
-        print(f"silu.shape = {silu.shape}")
-        print(f"mask.shape = {mask.shape}")
         silu = silu * mask
         qkv = torch.bmm(silu, in_v)
         out[ss : se] = qkv.permute(1, 0, 2)
