@@ -1,6 +1,5 @@
 import argparse
 import sys
-import torch
 import triton
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils.types import str_to_torch_dtype

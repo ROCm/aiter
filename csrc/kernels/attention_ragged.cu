@@ -21,7 +21,6 @@
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
-          typename OUTT,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -48,7 +47,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                                     // max_num_partitions]
     scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
                                     // head_size]
-    OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* k_scale_ptr,
@@ -79,7 +77,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     }
     const int64_t query_loc = static_cast<int64_t>(seq_idx);
     const int* block_table_seq = kv_page_indices + kv_indptr[seq_idx];
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, OUTT, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, AttentionVariant>(block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, final_out, logits_soft_cap, logits_soft_cap_rcp, k_scale_ptr, v_scale_ptr, variant);
+    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, AttentionVariant>(block_table_seq, query_loc, context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, k_scale_ptr, v_scale_ptr, variant);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -127,7 +125,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
-          typename OUTT,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -154,7 +151,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                                     // max_num_partitions]
     scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
                                     // head_size]
-    OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* k_scale_ptr,
@@ -195,7 +191,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     paged_attention_ll4mi_QKV_mfma16_kernel<T,              \
                                             KVT,            \
                                             KV_DTYPE,       \
-                                            OUTT,           \
                                             BLOCK_SIZE,     \
                                             HEAD_SIZE,      \
                                             NTHR,           \
@@ -216,7 +211,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
                                      exp_sums_ptr,          \
                                      max_logits_ptr,        \
                                      tmp_out_ptr,           \
-                                     out_ptr,               \
                                      logits_soft_cap,       \
                                      logits_soft_cap_rcp,   \
                                      k_scale_ptr,           \

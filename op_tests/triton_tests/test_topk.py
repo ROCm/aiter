@@ -18,7 +18,7 @@ K = [2, 8]
 
 
 def _to_cpu(res: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """Move `res` to CPU so it matches `ref`’s device."""
+    """Move `res` to CPU so it matches `ref`'s device."""
     if res.device.type != "cpu":
         res = res.cpu()
     return res
@@ -55,7 +55,7 @@ def TEST_assert_equal(*a, **kw):
     return _assert_equal(*a, **kw)
 
 
-# ─────────────────────────────── tests ──────────────────────────────────────
+# ------------------------------- tests --------------------------------------
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("hiddensize", DIM2)
 @pytest.mark.parametrize("topk", K)

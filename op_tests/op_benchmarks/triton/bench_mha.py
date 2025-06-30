@@ -1,5 +1,4 @@
 import triton
-import triton.language as tl
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
@@ -589,7 +588,7 @@ def main():
     if args.model:
         if args.causal is None:  # User didn't specify -causal
             args.causal = True
-        if args.layout is None:  # User didn’t specify -layout
+        if args.layout is None:  # User didn't specify -layout
             args.layout = "thd"
         print(
             f"Note: using -model config defaults: causal={True}, layout={'thd'}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
@@ -598,7 +597,7 @@ def main():
         # the defaults for causal and varlen when not using the -model
         if args.causal is None:  # User didn't specify -causal
             args.causal = False
-        if args.layout is None:  # User didn’t specify -layout
+        if args.layout is None:  # User didn't specify -layout
             args.layout = "bshd"
 
     custom_config = False

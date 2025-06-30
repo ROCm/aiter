@@ -3,7 +3,6 @@ import random
 import torch
 import argparse
 import triton
-import triton.language as tl
 from aiter.ops.triton.pa_decode import paged_attention_decode
 from utils.benchmark_utils import (
     get_model_configs,

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a4w4_blockscale_common.cuh"
 #include "gemm_a4w4_blockscale_manifest.h"

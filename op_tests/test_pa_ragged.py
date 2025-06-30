@@ -68,7 +68,6 @@ def kv_cache_factory(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
-    scale = head_size**-0.5
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     key_caches: List[torch.Tensor] = []
@@ -348,7 +347,6 @@ def run_aiter(
 
     num_seqs, num_heads, head_size = query.shape
     block_size = key_cache.shape[2 if kv_cache_layout == "HND" else 1]
-    gqa_ratio = num_heads // num_kv_heads
 
     output = torch.empty_like(query)
     max_num_partitions = (
@@ -372,7 +370,7 @@ def run_aiter(
     if fp8_out_scale is not None:
         output = torch.empty_like(output, dtype=dtypes.fp8)
         cpa_fp8_out = True
-    aiter.paged_attention_ragged(
+    torch.ops.aiter.paged_attention_ragged(
         output,
         workspace_buffer,
         query,
@@ -639,14 +637,15 @@ def test_paged_attention(
         # prepare flashinfer format-compatible parameters
         # TODO: pass list of context_length instead
         def convert_to_kv_indptr_last_page_lens(fixed_context_length):
-            get_num_blocks = lambda context_length: (
-                context_length + block_size - 1
-            ) // (block_size)
-            get_last_page_len = lambda context_length: (
-                context_length % block_size
-                if context_length % block_size > 0
-                else block_size
-            )
+            def get_num_blocks(context_length):
+                return (context_length + block_size - 1) // (block_size)
+
+            def get_last_page_len(context_length):
+                return (
+                    context_length % block_size
+                    if context_length % block_size > 0
+                    else block_size
+                )
 
             context_lengths = [fixed_context_length] * num_seqs
             num_blocks_list = [

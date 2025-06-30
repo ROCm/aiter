@@ -5,7 +5,6 @@ import random
 from typing import List, Optional, Tuple, Union
 import itertools
 import torch
-import aiter
 import pytest
 from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from aiter import pertoken_quant
@@ -307,7 +306,7 @@ def run_aiter(
     if fp8_out_scale is not None:
         output = torch.empty_like(output, dtype=dtypes.fp8)
         cpa_fp8_out = True
-    aiter.paged_attention_v1(
+    torch.ops.aiter.paged_attention_v1(
         output,
         workspace_buffer,
         query,

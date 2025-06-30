@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
 
 
@@ -110,11 +110,11 @@ kernels_list = {
     45: kernelInstance(       256,       128,        64,       128,          32,          32,          2,          1,      [8, 32, 1],      [8, 32, 1],   [1, 32, 1, 8],  [8, 8, 1],           1,           1,  "Intrawave",    3),
     46: kernelInstance(       256,        64,       128,       128,          32,          32,          1,          2,      [8, 32, 1],      [8, 32, 1],   [1, 32, 1, 8],  [8, 8, 1],           1,           1,  "Intrawave",    3),
     47: kernelInstance(       256,        64,        64,       128,          32,          32,          1,          1,      [8, 32, 1],      [8, 32, 1],   [1, 32, 1, 8],  [8, 8, 1],           1,           1,  "Intrawave",    3),
-# mem(Intrawave): Latency friendly 
+# mem(Intrawave): Latency friendly
     48: kernelInstance(       128,        32,        16,       128,          16,          16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [2, 2, 1],           1,           1,  "Intrawave",    1),
     49: kernelInstance(        64,        16,        16,       128,          16,          16,          1,          1,      [8,  8, 1],      [8,  8, 1],   [1, 16, 1, 4],  [4, 4, 1],           1,           1,  "Intrawave",    1),
     50: kernelInstance(       128,        16,        32,       128,          16,          16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [4, 4, 1],           1,           1,  "Intrawave",    1),
-# mem(Intrawave): Memory friendly, Col    
+# mem(Intrawave): Memory friendly, Col
     51: kernelInstance(       256,       256,        32,       128,          32,          32,          2,          1,      [8, 32, 1],      [8, 32, 1],   [1, 32, 1, 8],  [4, 4, 1],           1,           1,  "Intrawave",    2),
     52: kernelInstance(       256,       256,        16,       128,          16,          16,          4,          1,      [8, 32, 1],      [8, 16, 1],   [1, 32, 1, 8],  [2, 2, 1],           1,           1,  "Intrawave",    2),
     53: kernelInstance(       128,       128,        32,       128,          32,          32,          2,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [4, 4, 1],           1,           1,  "Intrawave",    2),
@@ -131,11 +131,11 @@ kernels_list = {
     64: kernelInstance(       128,        32,       128,       128,          32,          32,          1,          2,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [8, 8, 1],           1,           1,  "Interwave",    2),
     65: kernelInstance(       256,        16,       256,       128,          16,          16,          1,          4,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 16], [4, 4, 1],           1,           1,  "Interwave",    2),
     66: kernelInstance(       256,        32,       256,       128,          32,          32,          1,          2,      [8, 32, 1],      [8, 32, 1],   [1, 16, 1, 16], [8, 8, 1],           1,           1,  "Intrawave",    2),
-# mem(Interwave): Latency friendly 
+# mem(Interwave): Latency friendly
     67: kernelInstance(       128,        32,        16,       128,          16,          16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [2, 2, 1],           1,           1,  "Interwave",    1),
     68: kernelInstance(        64,        16,        16,       128,          16,          16,          1,          1,      [8,  8, 1],      [8,  8, 1],   [1, 16, 1, 4],  [4, 4, 1],           1,           1,  "Interwave",    1),
     69: kernelInstance(       128,        16,        32,       128,          16,          16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [4, 4, 1],           1,           1,  "Interwave",    1),
-# mem(Interwave): Memory friendly, Col    
+# mem(Interwave): Memory friendly, Col
     70: kernelInstance(       256,       256,        32,       128,          32,          32,          2,          1,      [8, 32, 1],      [8, 32, 1],   [1, 32, 1, 8],  [4, 4, 1],           1,           1,  "Interwave",    2),
     71: kernelInstance(       256,       256,        16,       128,          16,          16,          4,          1,      [8, 32, 1],      [8, 16, 1],   [1, 32, 1, 8],  [2, 2, 1],           1,           1,  "Interwave",    2),
     72: kernelInstance(       128,       128,        32,       128,          32,          32,          2,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [4, 4, 1],           1,           1,  "Interwave",    2),
@@ -156,7 +156,7 @@ kernels_list = {
 
 
 default_kernels_dict = {
-#   (    M,     N,     K): kernel:        BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_MAP_M| WAVE_MAP_N| ABLOCK_TRANSFER| BBLOCK_TRANSFER| CBLOCK_TRANSFER| CBLOCK_SPV| CSHUFFLE_MX| CSHUFFLE_NX|  LOOP_SCHED|PIPELINE_VERSION          
+#   (    M,     N,     K): kernel:        BLOCK_SIZE| MPerBLOCK| NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_MAP_M| WAVE_MAP_N| ABLOCK_TRANSFER| BBLOCK_TRANSFER| CBLOCK_TRANSFER| CBLOCK_SPV| CSHUFFLE_MX| CSHUFFLE_NX|  LOOP_SCHED|PIPELINE_VERSION
     (-1):                  kernelInstance(        64,        16,        16,       128,           16,         16,          1,          1,      [8, 8,  1],      [8, 8,  1],   [1, 16, 1, 4],  [4, 4, 1],           1,           1, "Interwave",  2),
     (-3):                  kernelInstance(       128,        32,        16,       128,           16,         16,          1,          1,      [8, 16, 1],      [8, 16, 1],   [1, 16, 1, 8],  [2, 2, 1],           1,           1, "Interwave",  2),
     (-4):                  kernelInstance(        64,        16,        16,       256,           16,         16,          1,          1,      [16, 4, 1],      [16, 4, 1],   [1, 16, 1, 4],  [4, 4, 1],           1,           1, "Intrawave",  1),
