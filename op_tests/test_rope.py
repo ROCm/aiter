@@ -1118,6 +1118,7 @@ dim_freqs: {str(freqs_h.shape):<20}
 
 
 if __name__ == "__main__":
+    l_dtype = ("fp16", "bf16")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--no_check",
@@ -1134,28 +1135,116 @@ if __name__ == "__main__":
         action="store_true",
         help="Check correctness when compare with legacy implementation. Default: False",
     )
-    args = parser.parse_args()
-
-    # dtype_ = (dtypes.fp32, dtypes.fp16, dtypes.bf16)
-    dtype_ = (dtypes.fp16, dtypes.bf16)
-    transpose_output_ = (False, True)
-    batch_size_ = (1, 2, 4)
-    seq_size_ = (1024, 2048, 4096)
-    head_size_ = (32, 64)
-    hidden_dim_ = (128, 256)
-    # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
-    rotary_percent_and_reuse_ = (
-        (1.0, True, False),
-        (1.0, False, False),
-        (0.5, False, False),
-        (0.5, True, False),
-        (0.5, True, True),
-        (0.5, False, True),
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="data type",
     )
-    height_ = (32, 64)
-    width_ = (32, 64)
-    margin_ = (0, 3)
-    rotate_style_ = (RotateStyle.NEOX, RotateStyle.GPTJ)
+    parser.add_argument(
+        "-t",
+        "--transpose_output",
+        default=(False, True),
+        nargs="*",
+        type=dtypes.str2bool,
+        help="Transpose output. Default: (False, True).",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        type=int,
+        default=[4],
+        nargs="*",
+        help="Batch sizes for testing. The default is 4, but you can choose from: 1, 2, 4.",
+    )
+    parser.add_argument(
+        "-s",
+        "--seq_size",
+        type=int,
+        default=[2048],
+        nargs="*",
+        help="Sequence sizes to test. Default: 2048, but you can choose from: 1024, 2048, 4096.",
+    )
+    parser.add_argument(
+        "-hs",
+        "--head_size",
+        type=int,
+        default=[64],
+        nargs="*",
+        help="Head sizes to test. Default is 64, but you can choose from: 32, 64.",
+    )
+    parser.add_argument(
+        "-hd",
+        "--hidden_dim",
+        type=int,
+        default=[256],
+        nargs="*",
+        help="Hidden dimensions to test. Default is 256, bui you can choose from: 128, 256.",
+    )
+    parser.add_argument(
+        "-ht",
+        "--height",
+        default=[64],
+        nargs="*",
+        type=int,
+        help="Height sizes to test. Default is 64, but you can choose from: 32, 64.",
+    )
+    parser.add_argument(
+        "-wd",
+        "--width",
+        default=[64],
+        nargs="*",
+        type=int,
+        help="Width sizes to test. Default is 64, but you can choose from: 32, 64.",
+    )
+    parser.add_argument(
+        "-m",
+        "--margin",
+        default=[0, 3],
+        nargs="*",
+        type=int,
+        help="Margin sizes to test. Default is 0, 3.",
+    )
+    d_rs = {"neox": RotateStyle.NEOX, "gptj": RotateStyle.GPTJ}
+    parser.add_argument(
+        "-rs",
+        "--rotate_style",
+        default=list(d_rs.keys()),
+        type=str,
+        choices=list(d_rs.keys()),
+        nargs="*",
+    )
+    d_rr = {
+        # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
+        0: (1.0, True, False),
+        1: (1.0, False, False),
+        2: (0.5, False, False),
+        3: (0.5, True, False),
+        4: (0.5, True, True),
+        5: (0.5, False, True),
+    }
+    parser.add_argument(
+        "-rr",
+        "--rotary_percent_and_reuse",
+        default=list(d_rr.keys()),
+        type=int,
+        nargs="*",
+        choices=list(d_rr.keys()),
+        help="Rotary percentage and reuse front part. Default is all combinations of (1.0, True, False), (1.0, False, False), (0.5, False, False), (0.5, True, False), (0.5, True, True), (0.5, False, True).",
+    )
+
+    args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+
+    args.rotate_style = [d_rs[rs] for rs in args.rotate_style]
+    args.rotary_percent_and_reuse = [d_rr[rr] for rr in args.rotary_percent_and_reuse]
 
     # Test sbhd format for both cached and uncached
     if not args.no_check:
@@ -1170,15 +1259,15 @@ if __name__ == "__main__":
             h,
             d,
         ) in itertools.product(
-            dtype_,
-            dtype_,
-            transpose_output_,
-            rotate_style_,
-            rotary_percent_and_reuse_,
-            batch_size_[-1:],
-            seq_size_[1:2],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            l_dtype,
+            l_dtype,
+            args.transpose_output,
+            args.rotate_style,
+            args.rotary_percent_and_reuse,
+            args.batch_size,
+            args.seq_size,
+            args.head_size,
+            args.hidden_dim,
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -1236,17 +1325,17 @@ if __name__ == "__main__":
             h_y,
             d,
         ) in itertools.product(
-            dtype_,
-            dtype_,
-            transpose_output_,
-            rotate_style_,
-            rotary_percent_and_reuse_,
+            l_dtype,
+            l_dtype,
+            args.transpose_output,
+            args.rotate_style,
+            args.rotary_percent_and_reuse,
             (False, True),
-            batch_size_[-1:],
-            seq_size_[1:2],
-            head_size_[-1:],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.batch_size,
+            args.seq_size,
+            args.head_size,
+            args.head_size,
+            args.hidden_dim,
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -1328,15 +1417,15 @@ if __name__ == "__main__":
             h_y,
             d,
         ) in itertools.product(
-            dtype_,  # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
-            rotate_style_,
+            l_dtype,  # legacy implementation doesn't support different scalar type between input/output and freqs/sin/cos
+            args.rotate_style,
             rotary_percent_and_reuse_compare_,
             (False, True),
-            batch_size_[-1:],
-            seq_size_[1:2],
-            head_size_[-1:],
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            args.batch_size,
+            args.seq_size,
+            args.head_size,
+            args.head_size,
+            args.hidden_dim,
         ):
             color, endc = "\033[95m", "\033[0m"
             print(
@@ -1417,12 +1506,12 @@ if __name__ == "__main__":
             h,
             d,
         ) in itertools.product(
-            dtype_,
-            dtype_,
-            rotate_style_,
-            rotary_percent_and_reuse_,
-            head_size_[-1:],
-            hidden_dim_[-1:],
+            l_dtype,
+            l_dtype,
+            args.rotate_style,
+            args.rotary_percent_and_reuse,
+            args.head_size,
+            args.hidden_dim,
         ):
             rotary_percent = rotary_percent_and_reuse[0]
             reuse_freqs_front_part = rotary_percent_and_reuse[1]
@@ -1450,14 +1539,14 @@ if __name__ == "__main__":
     # Test 2d image format for cached
     if not args.no_check:
         for dtype, fdtype, b, h, d, height, width, margin in itertools.product(
-            dtype_,
-            dtype_,
-            batch_size_[-1:],
-            head_size_[-1:],
-            hidden_dim_[-1:],
-            height_[-1:],
-            width_[-1:],
-            margin_,
+            l_dtype,
+            l_dtype,
+            args.batch_size,
+            args.head_size,
+            args.hidden_dim,
+            args.height[-1:],
+            args.width[-1:],
+            args.margin,
         ):
             input = torch.randn(
                 (b, height * width, h, d),

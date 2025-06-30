@@ -11,6 +11,7 @@ from aiter.test_mha_common import (
     convert_flash_attn_S_to_softmax,
 )
 import pytest
+import argparse
 
 
 def run_torch(
@@ -300,32 +301,35 @@ def test_flash_attn_output(
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument("-b", "--batch_size", type=int, default=2)
+parser.add_argument("-n", "--nheads", type=int, default=5)
+parser.add_argument("-q", "--seqlen_q", type=int, default=512)
+parser.add_argument("-k", "--seqlen_k", type=int, default=512)
+parser.add_argument("-d", "--d", type=int, default=128)
+parser.add_argument("-v", "--d_v", type=int, default=128)
+parser.add_argument("-p", "--dropout_p", type=float, default=0.0)
+parser.add_argument("-c", "--causal", action="store_true")
+parser.add_argument("-l", "--local", action="store_true")
+parser.add_argument("-bt", "--bias_type", type=str, default="no")
+parser.add_argument("-det", "--deterministic", action="store_true")
+parser.add_argument("-m", "--mha_type", type=str, default="mha")
+parser.add_argument("-dtype", "--dtype", type=str, default="bf16")
 if __name__ == "__main__":
-    batch_size = 2
-    nheads = 5
-    (seqlen_q, seqlen_k) = (512, 512)
-    d = 128
-    d_v = 128
-    dropout_p = 0.0
-    causal = False
-    local = False
-    bias_type = "no"
-    deterministic = False
-    mha_type = "mha"
-    dtype = dtypes.bf16
-
+    args = parser.parse_args()
+    dtype = dtypes.d_dtypes[args.dtype]
     test_flash_attn_output(
-        batch_size,
-        nheads,
-        seqlen_q,
-        seqlen_k,
-        d,
-        d_v,
-        dropout_p,
-        causal,
-        local,
-        bias_type,
-        deterministic,
-        mha_type,
+        args.batch_size,
+        args.nheads,
+        args.seqlen_q,
+        args.seqlen_k,
+        args.d,
+        args.d_v,
+        args.dropout_p,
+        args.causal,
+        args.local,
+        args.bias_type,
+        args.deterministic,
+        args.mha_type,
         dtype,
     )
