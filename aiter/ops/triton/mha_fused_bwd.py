@@ -1008,6 +1008,7 @@ def _bwd_kernel_dkdvdq_noncausal(
     dk *= sm_scale
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config():
     if not hasattr(_get_config, "_config_dict"):
@@ -1019,6 +1020,7 @@ def _get_config():
         _get_config._config_dict = config
 
     return _get_config._config_dict["bkwd_fused"]
+
 
 def flash_attn_fused_backward(
     do: torch.Tensor,
@@ -1046,7 +1048,7 @@ def flash_attn_fused_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
-    config: Optional[Dict[str, any]] = None
+    config: Optional[Dict[str, any]] = None,
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -1123,8 +1125,11 @@ def flash_attn_fused_backward(
     if config is None:
         config = _get_config()
 
-    pre_grid = (triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]), batch, num_q_heads)
-
+    pre_grid = (
+        triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]),
+        batch,
+        num_q_heads,
+    )
 
     _bwd_preprocess[pre_grid](
         o,
@@ -1161,7 +1166,9 @@ def flash_attn_fused_backward(
     else:
         config_dkdvdq = config["dkdvdq_kernel_N128"]
 
-    num_k_pids = (max_seqlen_k + config_dkdvdq["BLOCK_N"] - 1) // config_dkdvdq["BLOCK_N"]
+    num_k_pids = (max_seqlen_k + config_dkdvdq["BLOCK_N"] - 1) // config_dkdvdq[
+        "BLOCK_N"
+    ]
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
