@@ -29,13 +29,6 @@ import torch
 from typing import Optional
 
 
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-is_hip_ = is_hip()
-
-
 @triton.jit
 def tanh(x):
     # Tanh is just a scaled sigmoid
@@ -342,10 +335,6 @@ def _decode_grouped_att_m_fwd_rope(
 
     BLOCK = 32
 
-    # # [TODO] work around shmem limit on MI3xx
-    # if is_hip_ and kv_lora_rank >= 576:
-    #     BLOCK = 16
-
     qk_rope_head_dim = k_buffer.shape[-1] - kv_lora_rank
     batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
@@ -363,11 +352,10 @@ def _decode_grouped_att_m_fwd_rope(
 
     extra_kargs = {}
     num_stages = 2
-    if is_hip_:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+    # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+    # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+    extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    num_stages = 1
 
     _fwd_grouped_kernel_stage1_rope[grid](
         q,
@@ -490,10 +478,9 @@ def _decode_softmax_reducev_fwd(
     NUM_KV_SPLITS = num_kv_splits
 
     extra_kargs = {}
-    if is_hip_:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+    # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+    # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+    extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
