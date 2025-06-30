@@ -27,12 +27,7 @@ import triton
 import triton.language as tl
 import torch
 from typing import Optional
-
-
-@triton.jit
-def tanh(x):
-    # Tanh is just a scaled sigmoid
-    return 2 * tl.sigmoid(2 * x) - 1
+from aiter.ops.triton.activation import _tanh
 
 
 @triton.jit
@@ -246,7 +241,7 @@ def _fwd_grouped_kernel_stage1_rope(
             qk *= sm_scale
 
             if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+                qk = logit_cap * _tanh(qk / logit_cap)
 
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
