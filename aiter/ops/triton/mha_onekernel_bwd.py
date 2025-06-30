@@ -1541,6 +1541,7 @@ def _get_config():
 
     return _get_config._config_dict["bkwd_onekernel"]
 
+
 def flash_attn_onekernel_backward(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -1567,7 +1568,7 @@ def flash_attn_onekernel_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
-    config: Optional[Dict[str, any]] = None
+    config: Optional[Dict[str, any]] = None,
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -1651,7 +1652,11 @@ def flash_attn_onekernel_backward(
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
-    pre_grid = (triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]), batch, num_q_heads)
+    pre_grid = (
+        triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]),
+        batch,
+        num_q_heads,
+    )
     _bwd_preprocess[pre_grid](
         o,
         do,
