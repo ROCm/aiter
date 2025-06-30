@@ -5,7 +5,7 @@ from functools import partial
 
 import pytest
 import torch
-from aiter.ops.triton.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1 
+from aiter.ops.triton.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
 
 
 def torch_routing_sigmoid_top1(
@@ -36,6 +36,7 @@ def torch_routing_sigmoid_top1(
         )
 
     return topk_ids, topk_weights
+
 
 @pytest.mark.parametrize("M", [128, 1024, 2048, 4096, 8192])
 @pytest.mark.parametrize("N", [16, 128])

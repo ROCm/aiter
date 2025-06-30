@@ -4,7 +4,6 @@
 from typing import Optional
 import functools
 import json
-import os
 import torch
 import triton
 import triton.language as tl
@@ -174,6 +173,7 @@ def _routing_sigmoid_top1_kernel(
     tl.store(topk_ids_ptrs, topk_ids_buffer)
     tl.store(topk_weights_ptrs, topk_weights_buffer)
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(M, N, K):
     if not hasattr(_get_config, "_config_dict"):
@@ -184,7 +184,7 @@ def _get_config(M, N, K):
             config = json.load(file)
         _get_config._config_dict = config
 
-    n_key = "N16" if N <=16 else "N128"
+    n_key = "N16" if N <= 16 else "N128"
     m_key = (
         "xlarge"
         if M >= 8192
@@ -192,12 +192,10 @@ def _get_config(M, N, K):
     )
     return _get_config._config_dict[n_key][m_key]
 
-def routing_sigmoid_top1(x, 
-    w, 
-    topk, 
-    fused_shared_experts=False,
-    config: Optional[dict[str, any]] = None
-    ):
+
+def routing_sigmoid_top1(
+    x, w, topk, fused_shared_experts=False, config: Optional[dict[str, any]] = None
+):
     x = x.view(-1, x.shape[-1])
 
     assert topk == 1
@@ -237,7 +235,7 @@ def routing_sigmoid_top1(x,
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
-        BLOCK_N=N,  # Set BLOCK_N to N 
+        BLOCK_N=N,  # Set BLOCK_N to N
         TOPK=topk,
         FUSED_SHARED_EXPERTS=fused_shared_experts,
         **config,
