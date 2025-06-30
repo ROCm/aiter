@@ -60,7 +60,6 @@ def apply_SL(
     alpha: float,
     max_seq_len: int,
 ) -> torch.Tensor:
-    print(f"alpha = {alpha}")
     threshold = int(max_seq_len ** (alpha / 2.0))
     no_sample_prob = (max_seq_len**alpha) / torch.pow(lengths, 2)
     users_to_sample = torch.logical_and(
@@ -204,7 +203,7 @@ def test_hstu_attention(
     time_bucket_incr = 60
     time_bucket_div = 1.0
     relative_bias_type = "ALL"
-    alpha = 1.0 / attn_dim
+    alpha = 1.0 / attn_dim * 1000000
 
     # generate inputs
     torch.manual_seed(1001)  # for reproducibility
@@ -214,7 +213,6 @@ def test_hstu_attention(
         sparsity=sparsity,
         device=torch.device("cuda"),
     )
-    print(f"alpha1 = {sl_alpha}")
     lengths = apply_SL(lengths, sl_alpha, max_seq_len=max_seq_len)
     num_targets = torch.randint(
         1,
@@ -267,19 +265,21 @@ def test_hstu_attention(
         max_attn_len=None,
         contextual_seq_len=0,
     )
-    # fn = lambda: _AttentionFunction.apply(
-    #     max_seq_len,
-    #     alpha,
-    #     q,
-    #     k,
-    #     v,
-    #     seq_offsets,
-    #     causal,
-    #     num_targets,
-    #     0,  # max_attn_len,
-    #     0,  # contextual_seq_len
-    #     True,  # sort_by_length,
-    # )
+
+    fn = lambda: _AttentionFunction.apply(
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        causal,
+        num_targets,
+        0,  # max_attn_len,
+        0,  # contextual_seq_len
+        True,  # sort_by_length,
+    )
+
     fn_ref = lambda: torch_hstu_attention_fwd(
         max_seq_len,
         alpha,
@@ -289,12 +289,13 @@ def test_hstu_attention(
         seq_offsets,
         causal,
         num_targets,
-        None,
+        0,
         0,
         True,
     )
 
-    # out = fn() * max_seq_len
+    out = fn() * max_seq_len
     out_ref = fn_ref() * max_seq_len
+    print(f"out = {out}")
     print(f"out_ref = {out_ref}")
-    # torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=0)
+    torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=0)
