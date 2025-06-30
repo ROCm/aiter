@@ -7,7 +7,7 @@ import pytest
 from aiter.ops.triton.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
-    _get_config
+    _get_config,
 )
 from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,
@@ -257,7 +257,7 @@ def test_op_fwd_rope(
         logit_cap,
         use_rope,
         is_neox_style=True,
-        config=_get_config()["fwd_grouped_kernel_stage1_rope"]
+        config=_get_config()["fwd_grouped_kernel_stage1_rope"],
     )
 
     tri_logits = attn_logits
@@ -358,7 +358,7 @@ def test_op_fwd_rope_neox(
         logit_cap,
         use_rope,
         is_neox_style=is_neox_style,
-        config=_get_config()["fwd_grouped_kernel_stage1_rope"]
+        config=_get_config()["fwd_grouped_kernel_stage1_rope"],
     )
 
     tri_logits = attn_logits
