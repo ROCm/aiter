@@ -10,13 +10,15 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+#pragma once
+#include <unordered_map> 
 
 #define ADD_CFG(q_type, kv_type, gqa, mtp, msk, hp, path, name, co)         \\
     {                                         \\
         name, { name, path co, q_type, kv_type, gqa, mtp, msk, hp }         \\
     }
 
-struct FMoe2StageConfig
+struct AsmPaConfig
 {
     std::string name;
     std::string co_name;
@@ -28,7 +30,7 @@ struct FMoe2StageConfig
     int hp;
 };
 
-using CFG = std::unordered_map<std::string, FMoe2StageConfig>;
+using CFG = std::unordered_map<std::string, AsmPaConfig>;
 
 """
 

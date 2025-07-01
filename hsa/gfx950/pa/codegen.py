@@ -11,28 +11,33 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include <unordered_map> 
+#include <unordered_map>
 
-#define ADD_CFG(M, N, path, name, co)         \\
+#define ADD_CFG(q_type, kv_type, gqa, mtp, msk, hp, path, name, co)         \\
     {                                         \\
-        name, { name, path co, M, N }         \\
+        name, { name, path co, q_type, kv_type, gqa, mtp, msk, hp }         \\
     }
 
-struct FMoe2StageConfig
+struct AsmPaConfig
 {
     std::string name;
     std::string co_name;
-    int tile_M;
-    int tile_N;
+    std::string q_type;
+    std::string kv_type;
+    int gqa;
+    int mtp;
+    int msk;
+    int hp;
 };
 
-using CFG = std::unordered_map<std::string, FMoe2StageConfig>;
+using CFG = std::unordered_map<std::string, AsmPaConfig>;
 
 """
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
-        description="gen API for CK fmha kernel",
+        description="gen API for asm PA kernel",
     )
     parser.add_argument(
         "-o",
@@ -47,8 +52,8 @@ if __name__ == "__main__":
     for el in glob.glob(f"{this_dir}/*.csv"):
         df = pd.read_csv(el)
         cfg = [
-            f'ADD_CFG({tileM:>4}, {tileN:>4}, "fmoe_2stages/", "{name}", "{co}"),'
-            for tileM, tileN, name, co in df.values
+            f'ADD_CFG("{qType}", "{kvType}",{Gqa:>4}, {Mtp:>2}, {Msk:>2},{Hp:>2},"pa/", "{Name}", "{Co}"),'
+            for qType, kvType, Gqa, Mtp, Msk, Hp, Name, Co in df.values
         ]
         filename = os.path.basename(el)
         cfgname = filename.split(".")[0]
@@ -58,5 +63,5 @@ if __name__ == "__main__":
             {cfg_txt}}};"""
         cfgs.append(txt)
     txt_all = template + "\n".join(cfgs)
-    with open(f"{args.output_dir}/asm_moe_2stage_configs.hpp", "w") as f:
+    with open(f"{args.output_dir}/asm_pa_configs.hpp", "w") as f:
         f.write(txt_all)

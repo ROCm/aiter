@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Any, Dict, Optional, List
-from aiter.ops.triton.quant import dynamic_per_tensor_fp8_quant
+from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 
@@ -15,7 +15,7 @@ from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 
 _PADDING_SIZE = 0
 
-_MOE_A_QUANT_FUNC = dynamic_per_tensor_fp8_quant
+_MOE_A_QUANT_FUNC = dynamic_per_tensor_quant_fp8_i8
 
 _USE_MOE_PERSISTENT_KERNEL = False
 
