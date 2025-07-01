@@ -2,6 +2,7 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
+import aiter.ops.triton.utils.arch_info as arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -74,6 +75,13 @@ def get_x_vals():
     for i, (m, n, k) in enumerate(x_vals):
         b = batch_sizes[i % num_batch_sizes]
         x_vals_with_batch.append((b, m, n, k))
+
+    x_vals_with_batch += [
+        (b, 2**m, n, k)
+        for b in range(1, 17)
+        for m in range(0, 9)
+        for (n, k) in [(512, 128), (128, 512)]
+    ]
     return x_vals_with_batch
 
 
@@ -128,7 +136,7 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype):
-    if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
+    if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
     x, w, x_scales, w_scales = generate_batched_gemm_afp4wfp4_inputs(B, M, N, K)
@@ -136,6 +144,6 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype):
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
-    batched_gemm_afp4wfp4(x, w, out, x_scales, w_scales, dtype)
+    batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)

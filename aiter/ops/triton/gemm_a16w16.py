@@ -4,6 +4,7 @@
 from typing import Optional
 import functools
 import json
+import os
 import torch
 import triton
 import triton.language as tl
@@ -40,6 +41,7 @@ def _gemm_a16_w16_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    cache_modifier: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -81,10 +83,15 @@ def _gemm_a16_w16_kernel(
         # If it is out of bounds, set it to 0.
         if EVEN_K:
             a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+            b = tl.load(b_ptrs, cache_modifier=cache_modifier)
         else:
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                other=0.0,
+                cache_modifier=cache_modifier,
+            )
 
         accumulator += tl.dot(a, b, input_precision="ieee")
 
@@ -110,15 +117,29 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
+        _get_config._config_dict = {}
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16.json"
         with open(fpath, "r") as file:
             config = json.load(file)
-        _get_config._config_dict = config
+        _get_config._config_dict["default"] = config
 
-    return _get_config._config_dict["any"]
+    key = f"{N}_{K}"
+    if key not in _get_config._config_dict.keys():
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-N={N}-K={2*K}.json"
+        if os.path.exists(fpath):
+            with open(fpath, "r") as file:
+                config = json.load(file)
+                _get_config._config_dict[key] = config
+        else:
+            key = "default"  # fall back to default config
+
+    if M < 128 and "small" in _get_config._config_dict[key]:
+        return _get_config._config_dict[key]["small"]
+    else:
+        return _get_config._config_dict[key]["any"]
 
 
-# Wrapper for gemm kernel.
 def gemm_a16w16(
     x,
     w,

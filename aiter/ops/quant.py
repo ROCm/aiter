@@ -252,17 +252,10 @@ def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
 def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     shape = x.shape
     device = x.device
-    dtypeMax = get_dtype_max(quant_dtype)
     y = torch.empty(shape, dtype=quant_dtype, device=device)
     if scale is None:
         scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=device)
-        triton.quant.dynamic_per_token_fp8_quant(
-            y,
-            x.view(-1, x.shape[-1]),
-            scale,
-            quant_dtype=quant_dtype,
-            dtypeMax=dtypeMax,
-        )
+        triton.quant.dynamic_per_token_quant_fp8_i8(y, x.view(-1, x.shape[-1]), scale)
     else:
         raise ValueError("unsupported: static per token quant")
 
@@ -281,9 +274,9 @@ def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     x = x.view(-1, x.shape[-1])
     if scale is None:
         scale = torch.zeros(1, dtype=dtypes.fp32, device=x.device)
-        triton.quant.dynamic_per_tensor_fp8_quant(y, x, scale)
+        triton.quant.dynamic_per_tensor_quant_fp8_i8(y, x, scale)
     else:
-        triton.quant.static_per_tensor_fp8_quant(y, x, scale)
+        triton.quant.static_per_tensor_quant_fp8_i8(y, x, scale)
     return y, scale
 
 

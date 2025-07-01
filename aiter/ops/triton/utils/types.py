@@ -15,6 +15,8 @@ str_to_torch_dtype = {
     "float8_e4m3fn": e4m3_dtype,
     "e5m2fnuz": e5m2_dtype,
     "e4m3fnuz": e4m3_dtype,
+    "fp8e4m3": e4m3_dtype,
+    "fp8e5m2": e5m2_dtype,
     "int64": torch.int64,
     "int32": torch.int32,
     "int16": torch.int16,
@@ -38,3 +40,10 @@ torch_to_triton_dtype = {
     torch.int8: tl.int8,
     torch.uint8: tl.uint8,
 }
+
+
+def get_dtype_max(dtype):
+    if torch.is_floating_point(torch.tensor([], dtype=dtype)):
+        return torch.finfo(dtype).max
+    else:
+        return torch.iinfo(dtype).max

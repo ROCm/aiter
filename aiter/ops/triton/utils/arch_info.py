@@ -33,3 +33,20 @@ def get_fp8_dtypes():
         e4m3_dtype = torch.float8_e4m3fnuz
 
     return e5m2_dtype, e4m3_dtype
+
+
+def get_fp8_e4m3_dtype():
+    if get_arch() in ("gfx950"):
+        e4m3_dtype = torch.float8_e4m3fn
+    else:
+        e4m3_dtype = torch.float8_e4m3fnuz
+
+    return e4m3_dtype
+
+
+def get_num_sms():
+    # Returns the Compute Unit count of the current device
+    current_device_index = torch.cuda.current_device()
+    current_device = torch.cuda.get_device_properties(current_device_index)
+    num_sms = current_device.multi_processor_count
+    return num_sms
