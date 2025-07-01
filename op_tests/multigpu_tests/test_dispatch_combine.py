@@ -301,6 +301,16 @@ quant_types = [
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
+    "-q",
+    "--quant_type",
+    type=str,
+    choices=["No", "per_Token", "per_128x128"],
+    nargs="?",
+    const=None,
+    default=None,
+    help="quantization type",
+)
+parser.add_argument(
     "-d",
     "--dtype",
     type=str,
@@ -331,6 +341,8 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    if args.quant_type is not None:
+        quant_types = [eval(f"aiter.QuantType.{args.quant_type}")]
 
     for quant_type in quant_types:
         for dtype in l_dtype:
