@@ -164,7 +164,7 @@ def run_mori(
     # return out[:src_token_num].cpu()
 
     combine_output = mori_op.combine(out, topk_weights, topk_ids)
-    print(f"{rankID=} {combine_output.shape=} {combine_output.dtype=} {out.dtype=}")
+    # print(f"{rankID=} {combine_output.shape=} {combine_output.dtype=} {out.dtype=}")
     aiter.destroy_dist_env()
     return combine_output[:token_num].cpu()
 
@@ -294,8 +294,8 @@ l_dtype = ["bf16"]
 l_shape = [(128, 6144, 1024)]
 quant_types = [
     aiter.QuantType.No,
-    # aiter.QuantType.per_Token,
-    # aiter.QuantType.per_128x128,
+    aiter.QuantType.per_Token,
+    aiter.QuantType.per_128x128,
 ][-1:]
 
 parser = argparse.ArgumentParser(description="config input of test")
