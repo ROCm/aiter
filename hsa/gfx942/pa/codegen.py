@@ -18,7 +18,7 @@ template = """// SPDX-License-Identifier: MIT
         name, { name, path co, q_type, kv_type, gqa, mtp, msk, hp }         \\
     }
 
-struct FMoe2StageConfig
+struct AsmPaConfig
 {
     std::string name;
     std::string co_name;
@@ -30,7 +30,7 @@ struct FMoe2StageConfig
     int hp;
 };
 
-using CFG = std::unordered_map<std::string, FMoe2StageConfig>;
+using CFG = std::unordered_map<std::string, AsmPaConfig>;
 
 """
 
