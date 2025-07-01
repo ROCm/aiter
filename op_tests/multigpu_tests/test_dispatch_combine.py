@@ -118,6 +118,7 @@ def run_mori(
         hidden_dim=hdim,
         scale_dim=scale.shape[-1] if scale is not None else 0,
         scale_type_size=scale.dtype.itemsize if scale is not None else 0,
+        max_token_type_size=dtype.itemsize,
         max_num_inp_token_per_rank=128,
         num_experts_per_rank=E // world_size,
         num_experts_per_token=topk,
@@ -296,7 +297,7 @@ quant_types = [
     aiter.QuantType.No,
     aiter.QuantType.per_Token,
     aiter.QuantType.per_128x128,
-][-1:]
+][-2:]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
