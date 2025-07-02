@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 import pytest
 import aiter
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.triton.norm import (
     layer_norm,
     layernorm2d_fwd_with_add,
@@ -132,12 +133,7 @@ def get_vals():
     [(shape) for shape in get_vals()],
 )
 def test_layernorm(M, N, dtype_str, eps=1e-5):
-    arg_to_torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    dtype = arg_to_torch_dtype[dtype_str]
+    dtype = str_to_torch_dtype[dtype_str]
     torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     w_shape = (N,)
@@ -164,12 +160,7 @@ def test_layernorm(M, N, dtype_str, eps=1e-5):
     [(shape) for shape in get_vals()],
 )
 def test_fused_add_layernorm(M, N, dtype_str, eps=1e-5):
-    arg_to_torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    dtype = arg_to_torch_dtype[dtype_str]
+    dtype = str_to_torch_dtype[dtype_str]
     torch.manual_seed(0)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
     res = torch.randn(M, N, device="cuda", dtype=dtype)
@@ -198,13 +189,8 @@ def test_fused_add_layernorm(M, N, dtype_str, eps=1e-5):
     [(shape) for shape in get_vals()],
 )
 def test_layernorm_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
-    arg_to_torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    dtype = arg_to_torch_dtype[dtype_str]
-    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+    dtype = str_to_torch_dtype[dtype_str]
+    scale_dtype = str_to_torch_dtype[scale_dtype_str]
     torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
@@ -244,13 +230,8 @@ def test_layernorm_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
     [(shape) for shape in get_vals()],
 )
 def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
-    arg_to_torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    dtype = arg_to_torch_dtype[dtype_str]
-    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+    dtype = str_to_torch_dtype[dtype_str]
+    scale_dtype = str_to_torch_dtype[scale_dtype_str]
     torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
@@ -286,13 +267,8 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
     [(shape) for shape in get_vals()],
 )
 def test_layernorm_fused_add_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
-    arg_to_torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    dtype = arg_to_torch_dtype[dtype_str]
-    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+    dtype = str_to_torch_dtype[dtype_str]
+    scale_dtype = str_to_torch_dtype[scale_dtype_str]
     torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
@@ -334,13 +310,8 @@ def test_layernorm_fused_add_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1
     [(shape) for shape in get_vals()],
 )
 def test_layernorm_fused_add_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
-    arg_to_torch_dtype = {
-        "fp16": torch.float16,
-        "bf16": torch.bfloat16,
-        "fp32": torch.float32,
-    }
-    dtype = arg_to_torch_dtype[dtype_str]
-    scale_dtype = arg_to_torch_dtype[scale_dtype_str]
+    dtype = str_to_torch_dtype[dtype_str]
+    scale_dtype = str_to_torch_dtype[scale_dtype_str]
     torch.manual_seed(0)
 
     x = torch.randn(M, N, device="cuda", dtype=dtype)
