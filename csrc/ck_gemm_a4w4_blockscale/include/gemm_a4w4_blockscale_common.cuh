@@ -117,14 +117,15 @@ __forceinline__ torch::Tensor gemm_a4w4_blockscale_impl(
     torch::Tensor &B,
     torch::Tensor &a_scale,
     torch::Tensor &b_scale,
-    torch::Tensor &C)
+    torch::Tensor &C,
+    int splitK)
 {
     int M = A.size(0);
     int N = B.size(0);
     int K = A.size(1) * 2; // always fp4_x2
 
     // TODO: support batch gemm
-    int KBatch = 1;
+    int KBatch = std::pow(2, splitK);
 
     int StrideA = A.stride(-2) * 2; // always fp4_x2
     int StrideB = B.stride(-2) * 2; // always fp4_x2
