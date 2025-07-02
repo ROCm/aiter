@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 
@@ -24,7 +24,6 @@ from aiter.test_common import (
     perftest,
     benchmark,
 )
-from aiter import dtypes
 from multiprocessing import set_start_method, Pool, freeze_support
 import logging
 

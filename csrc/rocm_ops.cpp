@@ -17,8 +17,8 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "custom_all_reduce.h"
-#include "gemm_a8w8.h"
 #include "gemm_a4w4_blockscale.h"
+#include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
 #include "hipbsolgemm.cuh"
@@ -64,7 +64,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     CUSTOM_PYBIND;
     SMOOTHQUANT_PYBIND;
     BATCHED_GEMM_A8W8_PYBIND;
-    MOE_CK_PYBIND;
     // BATCHED_GEMM_A8W8_TUNE_PYBIND;
     GEMM_A8W8_ASM_PYBIND;
     GEMM_A4W4_ASM_PYBIND;

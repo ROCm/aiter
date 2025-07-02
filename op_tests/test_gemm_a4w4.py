@@ -7,8 +7,6 @@ from aiter.test_common import checkAllclose, benchmark, perftest
 from aiter import dtypes
 from aiter.utility import fp4_utils
 from aiter.ops.shuffle import shuffle_weight
-import random
-import itertools
 import argparse
 import pandas as pd
 

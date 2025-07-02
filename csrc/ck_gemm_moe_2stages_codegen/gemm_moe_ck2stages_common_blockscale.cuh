@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "gemm_moe_ck2stages.h"
 #include "ck/tensor_operation/gpu/device/impl/device_moe_gemm_blockscale.hpp"

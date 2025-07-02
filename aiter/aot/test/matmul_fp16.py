@@ -3,7 +3,7 @@
 
 import triton
 import triton.language as tl
-from aiter.aot.triton_compile import compile_kernel
+from triton.tools.compile import compile_kernel, CompileArgs
 
 
 @triton.jit
@@ -54,12 +54,13 @@ def matmul_fp16(
 
 
 if __name__ == "__main__":
-    compile_kernel(
-        __file__,
-        "matmul_fp16",
-        "*fp16:16,*fp16:16,*fp16:16,i32,i32,i32,i32,i32:1,i32,i32:1,i32:16,i32:1,16,16,16",
-        "(M+16-1)/16,(N+16-1)/16,1",
-        1,
-        3,
-        "matmul_fp16",
+    compile_args = CompileArgs(
+        path=__file__,
+        kernel_name="matmul_fp16",
+        signature="*fp16:16,*fp16:16,*fp16:16,i32,i32,i32,i32,i32:1,i32,i32:1,i32:16,i32:1,16,16,16",
+        grid="(M+16-1)/16,(N+16-1)/16,1",
+        num_warps=4,
+        num_stages=2,
+        out_name="matmul_fp16",
     )
+    compile_kernel(compile_args)

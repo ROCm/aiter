@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2023-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
 import argparse

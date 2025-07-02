@@ -25,10 +25,6 @@
 #include "py_itfs_common.h"
 #include "ck_tile/core.hpp"
 
-#ifdef USE_ROCM
-#include "quant_utils.cuh"
-#endif
-
 using fp8_type = ck_tile::fp8_t;
 
 namespace vllm
