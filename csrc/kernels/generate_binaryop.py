@@ -424,10 +424,10 @@ if __name__ == "__main__":
         p.mkdir()
     optype_str = args.optype
     dtype_str = args.dtypes
-    if args.optype == 'all':
-        optype_str = 'add, sub, mul, div'
-    if dtype_str == 'all':
-        dtype_str = 'float32_float32, bfloat16_bfloat16, float16_float16, float64_float64, bool_bool, int32_int32, int64_int64'
+    if args.optype == "all":
+        optype_str = "add, sub, mul, div"
+    if dtype_str == "all":
+        dtype_str = "float32_float32, bfloat16_bfloat16, float16_float16, float64_float64, bool_bool, int32_int32, int64_int64"
     op_list = optype_str.split(",")
     op_list = [x.strip() for x in op_list if x.strip()]
     dtype_list = dtype_str.split(",")
