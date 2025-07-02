@@ -298,8 +298,11 @@ void binary_op_dispatch(const std::string& op_type,
 
     def __init__(self, working_path, dtypes, optype):
         self.working_path = working_path
-        self.input_dtype = dtypes.split("_")[0]
-        self.other_dtype = dtypes.split("_")[1]
+        self.dtype_cmb = []
+        for i in dtypes:
+          input_dtype = i.split("_")[0]
+          other_dtype = i.split("_")[1]
+          self.dtype_cmb.append((str(input_dtype), str(other_dtype)))
         self.op_type = optype
 
     @dataclass
@@ -369,8 +372,8 @@ void binary_op_dispatch(const std::string& op_type,
         return self.API_BASE.format(F_traits_define="", F_dispatch=dispatch_str)
 
     def get_blobs(self):
-        operators = [self.op_type]
-        dtype_combinations = [(str(self.input_dtype), str(self.other_dtype))]
+        operators = self.op_type
+        dtype_combinations = self.dtype_cmb
 
         blobs = []
         for op in operators:
@@ -419,5 +422,15 @@ if __name__ == "__main__":
     p = Path(args.working_path)
     if not p.exists():
         p.mkdir()
-
-    BinaryOpCodegen(args.working_path, args.dtypes, args.optype).gen_blobs()
+    
+    optype_str = args.optype
+    dtype_str = args.dtypes
+    if args.optype == 'all':
+      optype_str = 'add, sub, mul, div'
+    if dtype_str == 'all':
+      dtype_str = 'float32_float32, bfloat16_bfloat16, float16_float16, float64_float64, bool_bool, int32_int32, int64_int64'
+    op_list = optype_str.split(',')
+    op_list = [x.strip() for x in op_list if x.strip()]
+    dtype_list = dtype_str.split(',')
+    dtype_list = [x.strip() for x in dtype_list if x.strip()]
+    BinaryOpCodegen(args.working_path, dtype_list, op_list).gen_blobs()
