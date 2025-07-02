@@ -15,6 +15,13 @@
 // Utils
 //
 
+enum class XqaStrategy
+{
+    Disable,  // disable xqa
+    External, // enable xqa by torch.Tensor transform
+    Internal // enable xqa by tensor view transform
+};
+
 CK_TILE_DEVICE bool IsDebugThreadBlock(const int x = 0, const int y = 0, const int z = 0)
 {
     return blockIdx.x == x && blockIdx.y == y && blockIdx.z == z;
@@ -58,7 +65,7 @@ template <int32_t kSizeD_,
           int32_t kBlockN1_,
           int32_t kNumWarps_,
           int32_t kWaveOccupancy_,
-          bool    kEnableXQA_>
+          XqaStrategy kXqaStrategy_>
 struct FlashMlaPrefillKernelTrait
 {
     static constexpr int32_t kSizeD                     = kSizeD_;    // hidden dimension size of query and key
@@ -83,7 +90,7 @@ struct FlashMlaPrefillKernelTrait
     static constexpr bool    kPadHeadDimV               = false;
     static constexpr bool    kPadSeqLenQ                = true;
     static constexpr bool    kPadSeqLenK                = true;
-    static constexpr bool    kEnableXQA                 = kEnableXQA_;
+    static constexpr XqaStrategy   kXqaStrategy         = kXqaStrategy_;
 
     static constexpr int32_t kNumPrefetchK  = 1;
     static constexpr int32_t kNumPrefetchV  = 1;
@@ -640,17 +647,19 @@ struct FlashMlaPrefillFwdParams
     void* __restrict__ p_softmax_lseaccum;
     void* __restrict__ p_output_accum;
 
-    int32_t size_b;         // batch count
-    int32_t size_s;         // seqlen of q
-    int32_t size_s_ori;     // seqlen of q without XQA
-    int32_t size_h;         // head count of q
-    int32_t size_h_ori;     // head count of q without XQA
-    int32_t hq_hk_ratio;    // head count of q / head count of kv
+    int32_t size_b;      // batch count
+    int32_t size_s_pk;   // seqlen of q after XQA pack
+    int32_t size_s_ori;  // seqlen of q original
+    int32_t size_s_tr;   // seqlen of q for tensor
+    int32_t size_h_pk;   // head count of q after XQA pack
+    int32_t size_h_ori;  // head count of q original
+    int32_t size_h_tr;   // head count of q for tensor
+    int32_t hq_hk_ratio; // head count of q / head count of kv
     int32_t num_splits;
     int64_t block_table_batch_stride;
     int32_t num_page_blocks;
     int32_t page_block_size;
-    float   scale_softmax;
+    float scale_softmax;
     ck_tile::mdiv mask_y_ratio_mdiv;
 
     // Use int64_t if there is int32 overflow case. For now, just use int32 to save sgpr and prevent using
@@ -738,7 +747,7 @@ CK_TILE_DEVICE static auto MakeQDram(const scalar_t* p_data,
     using Traits = typename Policy::Traits;
 
     const auto q_dram_naive = [&] {
-        if constexpr(Traits::kEnableXQA)
+        if constexpr(Traits::kXqaStrategy == XqaStrategy::Internal)
         {
             const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
                 p_data,
@@ -832,7 +841,7 @@ CK_TILE_DEVICE static auto MakeLseAccDram(scalar_t* p_data,
     using Traits = typename Policy::Traits;
 
     const auto lse_acc_dram_naive = [&] {
-        if constexpr(Traits::kEnableXQA)
+        if constexpr(Traits::kXqaStrategy == XqaStrategy::Internal)
         {
             // transpose + merge: (hq_hk_ratio, seqlen_q) -> (seqlenq * hq_hk_ratio)
             const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
@@ -875,7 +884,7 @@ CK_TILE_DEVICE static auto MakeOutAccDram(scalar_t* p_data,
     using Traits = typename Policy::Traits;
 
     const auto o_acc_dram_naive = [&] {
-        if constexpr(Traits::kEnableXQA)
+        if constexpr(Traits::kXqaStrategy == XqaStrategy::Internal)
         {
             // merge: (seqlen_q, hq_hk_ratio, headdim) -> (seqlen_q*hq_hk_ratio, headdim)
             const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
@@ -919,7 +928,7 @@ CK_TILE_DEVICE static auto MakeLseDram(scalar_t* p_data,
     using Traits = typename Policy::Traits;
 
     const auto lse_dram_naive = [&] {
-        if constexpr(Traits::kEnableXQA)
+        if constexpr(Traits::kXqaStrategy == XqaStrategy::Internal)
         {
             // transpose + merge: (hq_hk_ratio, seqlen_q) -> (seqlenq * hq_hk_ratio)
             const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
@@ -961,7 +970,7 @@ CK_TILE_DEVICE static auto MakeOutDram(scalar_t* p_data,
     using Traits = typename Policy::Traits;
 
     const auto o_dram_naive = [&] {
-        if constexpr(Traits::kEnableXQA)
+        if constexpr(Traits::kXqaStrategy == XqaStrategy::Internal)
         {
             // merge: (seqlen_q, hq_hk_ratio, headdim) -> (seqlen_q * hq_hk_ratio, headdim)
             const auto view = ck_tile::make_naive_tensor_view<ck_tile::address_space_enum::global>(
@@ -1627,19 +1636,21 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
     const auto [tile_m_id, split_id, hqid, bid] =
         kDoSplit ? GetTileIndex<Traits>(params.num_splits) : GetTileIndex<Traits>(1);
-    const auto hqid_xqa = Traits::kEnableXQA ? hqid * params.hq_hk_ratio : hqid;
-    const auto hkid     = hqid_xqa / params.hq_hk_ratio;
-    const int32_t mid   = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
+    const auto hqid_xqa =
+        (Traits::kXqaStrategy == XqaStrategy::Internal) ? hqid * params.hq_hk_ratio : hqid;
+    const auto hkid   = hqid_xqa / params.hq_hk_ratio;
+    const int32_t mid = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
 
+    constexpr bool enableXqa = (Traits::kXqaStrategy != XqaStrategy::Disable);
     // Define causal mask
-    using Mask             = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, Traits::kEnableXQA>;
+    using Mask             = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, enableXqa>;
     const int32_t seqlen_k = params.p_seqlens_k[bid];
-    Mask mask              = kIsCausal ? Mask{params.size_s,
+    Mask mask              = kIsCausal ? Mask{params.size_s_pk,
                                  seqlen_k - params.size_s_ori + 1,
-                                 params.size_s,
+                                 params.size_s_pk,
                                  seqlen_k,
                                  params.mask_y_ratio_mdiv}
-                                       : Mask{params.size_s, seqlen_k};
+                                       : Mask{params.size_s_pk, seqlen_k};
 
     auto q_dram_window_lengths =
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockK0>{});
@@ -1661,7 +1672,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     const int32_t kv_cache_width = params.num_page_blocks * params.page_block_size;
 
     const auto q_dram = MakeQDram<Policy>(
-        p_query, params.size_s_ori, params.stride_s_q, params.hq_hk_ratio, params.stride_h_q);
+        p_query, params.size_s_tr, params.stride_s_q, params.hq_hk_ratio, params.stride_h_q);
     const auto k_dram = MakeKDram<Policy>(p_key,   kv_cache_width, params.stride_s_k);
     const auto v_dram = MakeVDram<Policy>(p_value, kv_cache_width, params.stride_s_v);    
 
@@ -1687,11 +1698,11 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
         const auto lse_acc_dram = MakeLseAccDram<Policy>(p_lse_acc,
                                                          lse_acc_dram_window_lengths,
-                                                         params.size_s_ori,
+                                                         params.size_s_tr,
                                                          params.hq_hk_ratio,
                                                          params.stride_h_lseacc);
         const auto out_acc_dram = MakeOutAccDram<Policy>(p_out_acc,
-                                                         params.size_s_ori,
+                                                         params.size_s_tr,
                                                          params.stride_s_oacc,
                                                          params.hq_hk_ratio,
                                                          params.stride_h_oacc);
@@ -1723,7 +1734,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         // Assuming lse is in shape [b, h, s] and is contiguous
         acc_t* p_lse =
             reinterpret_cast<acc_t*>(params.p_softmax_lse) +
-            (int64_t(bid) * params.size_h_ori + hqid_xqa) * params.size_s_ori; // batch+head offset
+            (int64_t(bid) * params.size_h_tr + hqid_xqa) * params.size_s_tr; // batch+head offset
         out_t* p_out = reinterpret_cast<out_t*>(params.p_output) +
                        int64_t(hqid_xqa) * params.stride_h_o + // head offset
                        int64_t(bid) * params.stride_b_o;       // batch offset
@@ -1735,11 +1746,11 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
         const auto lse_dram = MakeLseDram<Policy>(p_lse,
                                                   lse_dram_window_lengths,
-                                                  params.size_s_ori,
+                                                  params.size_s_tr,
                                                   params.hq_hk_ratio,
                                                   params.stride_h_lse);
         const auto out_dram = MakeOutDram<Policy>(
-            p_out, params.size_s_ori, params.stride_s_o, params.hq_hk_ratio, params.stride_h_o);
+            p_out, params.size_s_tr, params.stride_s_o, params.hq_hk_ratio, params.stride_h_o);
 
         auto lse_dram_window =
             ck_tile::make_tile_window(lse_dram, lse_dram_window_lengths, {mid});
@@ -1783,9 +1794,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
     const int32_t lane_id          = ck_tile::get_lane_id();
     const int32_t hidx             = blockIdx.y;
     const int32_t sidx             = blockIdx.x;
-    const int32_t hsidx            = hidx * params.size_s_ori + sidx;
-    const int32_t shidx            = hidx + sidx * params.size_h_ori;
-    const int32_t size_hs          = params.size_h_ori * params.size_s_ori;
+    const int32_t hsidx            = hidx * params.size_s_tr + sidx;
+    const int32_t shidx            = hidx + sidx * params.size_h_tr;
+    const int32_t size_hs          = params.size_h_tr * params.size_s_tr;
     const index_t offset_lse_accum = split_offset * size_hs + hsidx; // offset to split 0
     const index_t offset_lse       = bidx * size_hs + hsidx;
 
@@ -1897,9 +1908,10 @@ void dispatch_fmla_fwd_splictkv_prefill(
 {
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    const int32_t num_blk   = ck_tile::integer_divide_ceil(params.size_s,  Traits::kBlockM) * params.num_splits;
-    const dim3    grid_attn = dim3(num_blk, params.size_h, params.size_b);
-    const dim3    grid_comb = dim3(params.size_s_ori, params.size_h_ori, params.size_b);  // TODO: not enable XQA
+    const int32_t num_blk =
+        ck_tile::integer_divide_ceil(params.size_s_pk, Traits::kBlockM) * params.num_splits;
+    const dim3 grid_attn = dim3(num_blk, params.size_h_pk, params.size_b);
+    const dim3 grid_comb = dim3(params.size_s_tr, params.size_h_tr, params.size_b);
 
     if (params.num_splits > 1)
     {
@@ -2052,9 +2064,9 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr bool kEnablePackQkRatio = true;
+    constexpr XqaStrategy kXqaStrategy = XqaStrategy::External;
     //                                        dqk  dv   m0  n0   n1   #warp  wave_occu
-    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64,  256, 8,     1,   kEnablePackQkRatio>;
+    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64,  256, 4,     2,   kXqaStrategy>;
     constexpr bool kForceOutAcc = false;
     using acc_t                 = float;
 
@@ -2080,34 +2092,40 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     TORCH_CHECK(num_heads_q % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
 
-    int32_t hq_hk_ratio = num_heads_q_ori / num_heads_k;
+    const int32_t hq_hk_ratio_ori = num_heads_q_ori / num_heads_k;
+    int32_t hq_hk_ratio = hq_hk_ratio_ori;
     int32_t mask_y_ratio      = 1;
 
-    if constexpr(Traits::kEnableXQA)
+    if constexpr(Traits::kXqaStrategy != XqaStrategy::Disable)
     {
-        seqlen_q     = seqlen_q_ori * hq_hk_ratio;
+        seqlen_q     = seqlen_q_ori * hq_hk_ratio_ori;
         num_heads_q  = num_heads_k;
-        mask_y_ratio = hq_hk_ratio;
-        // if(num_heads_k == 1)
-        // {
-        //     query = query.reshape({batch_size, seqlen_q, num_heads_q, head_size});
-        // }
-        // else
-        // {
-        //     query = query.view({batch_size, seqlen_q_ori, num_heads_q, hq_hk_ratio, head_size})
-        //                 .transpose(2, 3)
-        //                 .reshape({batch_size, seqlen_q, num_heads_q, head_size});
-        // }
+        mask_y_ratio = hq_hk_ratio_ori;
+        if constexpr(Traits::kXqaStrategy == XqaStrategy::External) {
+            hq_hk_ratio = 1;
+            if(num_heads_k == 1)
+            {
+                query = query.reshape({batch_size, seqlen_q, num_heads_q, head_size});
+            }
+            else
+            {
+                query = query.view({batch_size, seqlen_q_ori, num_heads_q, hq_hk_ratio_ori, head_size})
+                            .transpose(2, 3)
+                            .reshape({batch_size, seqlen_q, num_heads_q, head_size});
+            }
+        }
     }
-
+    
     const int32_t num_splits = calculate_num_splits<Traits>(batch_size, num_heads_q, seqlen_q);
     const bool    do_splits = num_splits > 1;
-
+    
+    int32_t seqlen_q_tr = Traits::kXqaStrategy == XqaStrategy::Internal ? seqlen_q_ori : seqlen_q;
+    int32_t num_heads_q_tr = Traits::kXqaStrategy == XqaStrategy::Internal ? num_heads_q_ori : num_heads_q;
     // Combine shader, which only exists when num_splits > 1, will conduct type convert by default and force.
     // Thus, kForceOutAcc doesn't work in this case.
-    auto output = torch::empty({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v},
+    auto output = torch::empty({batch_size, seqlen_q_tr, num_heads_q_tr, head_size_v},
                                (kForceOutAcc && !do_splits) ? opts_acc : opts);
-    auto softmax_lse = torch::empty({batch_size, num_heads_q_ori, seqlen_q_ori}, opts_acc);
+    auto softmax_lse = torch::empty({batch_size, num_heads_q_tr, seqlen_q_tr}, opts_acc);
 
     FlashMlaPrefillFwdParams params = {};
 
@@ -2122,10 +2140,12 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.p_softmax_lse      = softmax_lse.data_ptr();
 
     params.size_b                   = batch_size;
-    params.size_s                   = seqlen_q;
+    params.size_s_pk                   = seqlen_q;
     params.size_s_ori               = seqlen_q_ori;
-    params.size_h                   = num_heads_q;
+    params.size_s_tr                = seqlen_q_tr;
+    params.size_h_pk                   = num_heads_q;
     params.size_h_ori               = num_heads_q_ori;
+    params.size_h_tr                = num_heads_q_tr;
     params.hq_hk_ratio              = hq_hk_ratio;
     params.block_table_batch_stride = block_table.stride(0);
     params.num_page_blocks          = num_blocks;
@@ -2151,9 +2171,9 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     if(num_splits > 1)
     {
         auto output_accum =
-            torch::empty({batch_size, num_splits, seqlen_q_ori, num_heads_q_ori, head_size_v}, opts_acc);
+            torch::empty({batch_size, num_splits, seqlen_q_tr, num_heads_q_tr, head_size_v}, opts_acc);
         auto softmax_lseaccum =
-            torch::empty({batch_size, num_splits, num_heads_q_ori, seqlen_q_ori}, opts_acc);
+            torch::empty({batch_size, num_splits, num_heads_q_tr, seqlen_q_tr}, opts_acc);
 
         params.p_softmax_lseaccum = softmax_lseaccum.data_ptr();
         params.p_output_accum     = output_accum.data_ptr();
@@ -2180,23 +2200,23 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     // using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>;
     // dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, false>(params);
 
-    // if constexpr(Traits::kEnableXQA)
-    // {
-    //     // post process for out and softmax_lse
-    //     if(num_heads_k == 1)
-    //     {
-    //         output = output.reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
-    //     }
-    //     else
-    //     {
-    //         output = output.view({batch_size, seqlen_q_ori, hq_hk_ratio, num_heads_q, head_size_v})
-    //                      .transpose(2, 3)
-    //                      .reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
-    //     }
-    //     softmax_lse = softmax_lse.view({batch_size, num_heads_q, seqlen_q_ori, hq_hk_ratio})
-    //                       .transpose(2, 3)
-    //                       .reshape({batch_size, num_heads_q_ori, seqlen_q_ori});
-    // }
+    if constexpr(Traits::kXqaStrategy == XqaStrategy::External)
+    {
+        // post process for out and softmax_lse
+        if(num_heads_k == 1)
+        {
+            output = output.reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
+        }
+        else
+        {
+            output = output.view({batch_size, seqlen_q_ori, hq_hk_ratio_ori, num_heads_q, head_size_v})
+                         .transpose(2, 3)
+                         .reshape({batch_size, seqlen_q_ori, num_heads_q_ori, head_size_v});
+        }
+        softmax_lse = softmax_lse.view({batch_size, num_heads_q, seqlen_q_ori, hq_hk_ratio_ori})
+                          .transpose(2, 3)
+                          .reshape({batch_size, num_heads_q_ori, seqlen_q_ori});
+    }
 
     return {output.to(opts), softmax_lse};
 }
