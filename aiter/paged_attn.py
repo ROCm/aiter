@@ -1,6 +1,6 @@
 """
-* Copyright © Advanced Micro Devices, Inc. All rights reserved.
-* Copyright (c) 2024, The vLLM team.
+* Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+* Copyright (C) 2024-2025, The vLLM team.
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -208,8 +208,8 @@ class PagedAttention:
         value_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         kv_cache_dtype: str,
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
         asm_layout=False,
     ) -> None:
         ops.reshape_and_cache(
@@ -236,8 +236,8 @@ class PagedAttention:
         num_kv_heads: int,
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
-        k_scale: float,
-        v_scale: float,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
         tp_rank: int = 0,
         blocksparse_local_blocks: int = 0,
         blocksparse_vert_stride: int = 0,
@@ -273,7 +273,7 @@ class PagedAttention:
             if fp8_out_scale is not None:
                 output = torch.empty_like(output, dtype=dtypes.fp8)
                 cpa_fp8_out = True
-            ops.paged_attention_rocm(
+            torch.ops.aiter.paged_attention_rocm(
                 output,
                 exp_sums,
                 max_logits,

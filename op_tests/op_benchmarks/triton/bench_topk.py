@@ -19,17 +19,17 @@ DEVICE = "cuda"
 CACHE_DIR = Path.home() / ".triton" / "cache"
 BATCH_SIZES = [1, 2, 3, 4, 5, 6, 7, 8, 16, 1335]
 DIM2S = (16, 128, 256, 128256)  # row length M
-KS = (2, 8)  # top‑k values
+KS = (2, 8)  # top-k values
 
-# MI300x ceilings (single‑precision)
-BW_PEAK_BYTES = 5300e9  # 5.3 TB/s
-FLOPS_PEAK_FP32 = 163e12  # 163 TFLOP/s
+# MI300x ceilings (single-precision)
+BW_PEAK_BYTES = 5300e9  # 5.3 TB/s
+FLOPS_PEAK_FP32 = 163e12  # 163 TFLOP/s
 
 _FlopMem = namedtuple("_FlopMem", "flops bytes")
 
 
 def purge_cache() -> None:
-    """Delete Triton’s on‑disk cache so each (M,K) recompiles once."""
+    """Delete Triton's on-disk cache so each (M,K) recompiles once."""
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -53,8 +53,8 @@ def _flopmem_two_stage(B: int, M: int, K: int, chunk: int, elem_size: int) -> _F
     fl_s2 = B * _bitonic_flops(n2)
     mem = (
         B * M * elem_size  # read whole matrix
-        + bytes_s1  # stage‑1 write
-        + bytes_s1  # stage‑2 read
+        + bytes_s1  # stage-1 write
+        + bytes_s1  # stage-2 read
         + B * K * (elem_size + 8)  # final write
     )
     return _FlopMem(fl_s1 + fl_s2, mem)
@@ -127,7 +127,7 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
 
     plt.xlabel("Arithmetic intensity  AI  [FLOPs / byte]")
     plt.ylabel("Throughput  P  [FLOPs/s]")
-    plt.title(f"Roofline  (M={M}, K={K}) – Triton Top‑K")
+    plt.title(f"Roofline  (M={M}, K={K}) - Triton Top-K")
     plt.grid(True, which="both", ls=":", lw=0.6)
     plt.legend()
 
@@ -136,7 +136,7 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
     plt.tight_layout()
     plt.savefig(fname, dpi=170)
     plt.close()
-    print(f"✅  Roofline saved to {fname.resolve()}")
+    print(f"?  Roofline saved to {fname.resolve()}")
 
 
 # latency & memory benchmarks
@@ -149,7 +149,7 @@ def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None
         line_vals=["triton", "torch"],
         line_names=["Triton", "Torch"],
         styles=[("blue", "-"), ("green", "-")],
-        ylabel="Latency (µs)",
+        ylabel="Latency (us)",
         plot_name="topk_latency",
         args={},
     )
@@ -224,7 +224,7 @@ def bench_memory(batch, provider, *, dim2: int, k: int):
 
 
 def parse_args():
-    p = argparse.ArgumentParser("Triton Top‑K benchmark & Roofline")
+    p = argparse.ArgumentParser("Triton Top-K benchmark & Roofline")
     p.add_argument(
         "--save-dir", type=Path, default=Path("./figs"), help="Directory for PNG output"
     )
@@ -267,9 +267,9 @@ def run_latency_memory(args):
         for stem in ("latency", "memory"):
             path = args.save_dir / f"topk_{stem}_M={M}_K={K}.png"
             if path.exists():
-                print(f"✅  {path.name} saved")
+                print(f"?  {path.name} saved")
             else:
-                print(f"⚠️  {path.name} missing")
+                print(f"?  {path.name} missing")
 
 
 def main():

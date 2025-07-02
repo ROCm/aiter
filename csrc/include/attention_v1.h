@@ -15,7 +15,7 @@ void paged_attention_v1(
                       // [num_blocks, block_size, num_heads, head_size]
     double scale,
     torch::Tensor &block_tables,  // [num_seqs, max_num_blocks_per_seq]
-    torch::Tensor &cu_query_lens, // [num_seqs+1]
+    const std::optional<torch::Tensor>& cu_query_lens, // [num_seqs+1]
     torch::Tensor &context_lens,  // [num_seqs]
     int64_t max_context_len, const std::optional<torch::Tensor> &alibi_slopes,
     const std::string &kv_cache_dtype, const std::string &kv_cache_layout,

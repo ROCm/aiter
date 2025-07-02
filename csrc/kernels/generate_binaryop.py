@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2023-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
 import argparse
@@ -262,9 +262,9 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 template <typename Op, typename T0, typename T1>
 void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output);
 
-void binary_op_dispatch(const std::string& op_type, 
-                       torch::Tensor &input, 
-                       torch::Tensor &other, 
+void binary_op_dispatch(const std::string& op_type,
+                       torch::Tensor &input,
+                       torch::Tensor &other,
                        torch::Tensor &output) {{
     // Dispatch based on operator and input types
 {F_dispatch}
