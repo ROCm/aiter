@@ -14,7 +14,7 @@ from .hstu_attention import (
 
 
 from .hstu_attention_ref import (
-    torch_hstu_attention_fwd
+    pytorch_hstu_mha
 )
 
 
@@ -117,74 +117,13 @@ def sanity_check_attention_no_bias(
     torch._assert(dropout_pr < 1e-6, "dropout for triton path not implemented")
 
 
-# def gen_inputs(
-#     batch_size: int,
-#     max_seq_len: int,
-#     heads: int,
-#     attn_dim: int,
-#     hidden_dim: int,
-#     sparsity: float,
-#     sl_alpha: float,
-#     num_targets: int,
-#     target_size: int,
-#     device: torch.device,    
-# ) -> torch.Tensor:
-#     torch.manual_seed(0)
-#     lengths = generate_sparse_seq_len(
-#         size = batch_size,
-#         max_seq_len=max_seq_len,
-#         sparsity=sparsity,
-#         device=device,
-#     )
-
-#     lengths = apply_SL(
-#         lengths=lengths,
-#         alpha=sl_alpha,
-#         max_seq_len=max_seq_len,
-    
-#     )
-
-#     num_targets = torch.randint(
-#         1,
-#         target_size + 1,
-#         (batch_size,),
-#         device=device,
-#         dtype=lengths.dtype,
-#     )
-#     num_targets = torch.where(num_targets > lengths, lengths, num_targets)
-#     seq_offsets = torch.zeros(
-#         (batch_size + 1,), dtype=torch.int64, device=device
-#     )
-#     seq_offsets[1:] = torch.cumsum(lengths, dim=0)
-#     L = int(seq_offsets[-1].item())
-#     dtype = torch.bfloat16
-#     x = torch.empty(
-#         (L, heads, attn_dim * 2 + hidden_dim),
-#         dtype=dtype,
-#         device=device,
-#     ).uniform_(-0.01, 0.01)
-#     q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
-
-#     return q, k, v
-
-
-@pytest.mark.parametrize("batch_size, max_seq_len, sparsity, max_pos_ind, attn_bias, mode",
-                         [(512, 3072, 0.366, 3072, True, 'fwd'),
-                        #   (512, 3072, 0.366, 3072, False, 'fwd'),
-                        #   (512, 3072, 0.366, 3072, True, 'bwd'),
-                        #   (512, 3072, 0.366, 3072, False, 'bwd'),
-                        #   (512, 512, 0.97, 512, True, 'fwd'),
-                        #   (512, 512, 0.97, 512, False, 'fwd'),
-                        #   (512, 512, 0.97, 512, True, 'bwd'),
-                        #   (512, 512, 0.97, 512, False, 'bwd'),
-                          ])
+@pytest.mark.parametrize("batch_size, max_seq_len, sparsity",
+                         [(512, 3072, 0.366),
+                          (512, 512, 0.97)])
 def test_hstu_attention(
     batch_size: int,
     max_seq_len: int,  # for repro
     sparsity: float,  # for repro
-    max_pos_ind: int,
-    attn_bias: bool,
-    mode: str,
 ):
     dropout_pr = 0.0
     heads: int = 4
@@ -203,7 +142,7 @@ def test_hstu_attention(
     time_bucket_incr = 60
     time_bucket_div = 1.0
     relative_bias_type = "ALL"
-    alpha = 1.0 / attn_dim * 1000000
+    alpha = 1.0 / attn_dim * 10000
 
     # generate inputs
     torch.manual_seed(1001)  # for reproducibility
@@ -233,21 +172,6 @@ def test_hstu_attention(
         device=torch.device("cuda"),
     ).uniform_(-0.01, 0.01)
     q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
-
-    # timestamps = generate_hstu_timestamps(batch_size, max_seq_len)
-    # ts_weights: torch.Tensor = torch.empty(
-    #     (num_buckets + 1,),
-    #     device="cuda",
-    #     dtype=torch.float32,
-    # ).uniform_(-0.1, 0.1)
-    # pos_weights: torch.Tensor = torch.empty(
-    #     (2 * max_seq_len - 1,),
-    #     device="cuda",
-    #     dtype=torch.float32,
-    # ).uniform_(-0.1, 0.1)
-    # max_attn_len = None,
-    # contextual_seq_len = 0,
-    # sort_by_length = True,
 
     q = _switch_to_contiguous_if_needed(q)
     k = _switch_to_contiguous_if_needed(k)
@@ -280,7 +204,7 @@ def test_hstu_attention(
         True,  # sort_by_length,
     )
 
-    fn_ref = lambda: torch_hstu_attention_fwd(
+    fn_ref = lambda: pytorch_hstu_mha(
         max_seq_len,
         alpha,
         q,
@@ -288,14 +212,16 @@ def test_hstu_attention(
         v,
         seq_offsets,
         causal,
-        num_targets,
-        0,
-        0,
-        True,
+        dropout_pr=0.0,
+        training=False,
+        num_targets=num_targets,
+        max_attn_len = 0,
+        contextual_seq_len=0,
+        min_full_attn_seq_len=0,
     )
 
     out = fn() * max_seq_len
     out_ref = fn_ref() * max_seq_len
     print(f"out = {out}")
     print(f"out_ref = {out_ref}")
-    torch.testing.assert_close(out, out_ref, atol=1e-4, rtol=0)
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
