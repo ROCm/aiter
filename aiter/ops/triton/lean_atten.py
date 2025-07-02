@@ -77,13 +77,13 @@ def persistent_lean_attention(
         BLOCK_N,
         total_programs,
     )
-    print(
-        f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
-    )
-    print(
-        f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
-    )
-    print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
+    #print(
+    #    f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
+    #)
+    #print(
+    #    f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
+    #)
+    #print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
 
     grid = (total_programs, 1, 1)
 
@@ -128,7 +128,10 @@ def persistent_lean_attention(
         tiles_per_head=tiles_per_head,
         num_splits=num_splits,
         waves_per_eu=waves_per_eu,
-        num_warps=waves_per_eu,
+        num_warps=num_warps,
+        num_stages=1,
+        num_ctas=1,
+
     )
 
     print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
@@ -368,7 +371,9 @@ def la_persistent(
         )
 
         k_ptrs = K + k_offs
+        k_ptrs = tl.multiple_of(k_ptrs,(16,1))
         v_ptrs = V + v_offs
+        v_ptrs = tl.multiple_of(v_ptrs,(1,16))
 
         if causal:
             q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
@@ -381,6 +386,7 @@ def la_persistent(
             + offs_k[None, :] * stride_qk
         )
         q_ptrs = Q + q_offs
+        q_ptrs = tl.multiple_of(q_ptrs,(1,16))
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
@@ -390,7 +396,8 @@ def la_persistent(
 
         for l_iter in range(local_iter, local_iter_end):
             # -- compute qk ----
-            k = tl.load(k_ptrs, cache_modifier=".cg")
+            #k = tl.load(k_ptrs, cache_modifier=".cg")
+            k = tl.load(k_ptrs)
             qk = tl.dot(q, k)
             qk = qk * qk_scale
 
@@ -406,7 +413,8 @@ def la_persistent(
             acc = (
                 acc * alpha[:, None]
             )  # Scale each row of acc by the corresponding elements in alpha
-            v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+            #v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+            v = tl.load(v_ptrs)
             acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
             # -- update l_i
             l_ij = tl.sum(p, 1)  # rowsum(p)
