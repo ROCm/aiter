@@ -300,9 +300,9 @@ void binary_op_dispatch(const std::string& op_type,
         self.working_path = working_path
         self.dtype_cmb = []
         for i in dtypes:
-          input_dtype = i.split("_")[0]
-          other_dtype = i.split("_")[1]
-          self.dtype_cmb.append((str(input_dtype), str(other_dtype)))
+            input_dtype = i.split("_")[0]
+            other_dtype = i.split("_")[1]
+            self.dtype_cmb.append((str(input_dtype), str(other_dtype)))
         self.op_type = optype
 
     @dataclass
@@ -422,15 +422,14 @@ if __name__ == "__main__":
     p = Path(args.working_path)
     if not p.exists():
         p.mkdir()
-    
     optype_str = args.optype
     dtype_str = args.dtypes
     if args.optype == 'all':
-      optype_str = 'add, sub, mul, div'
+        optype_str = 'add, sub, mul, div'
     if dtype_str == 'all':
-      dtype_str = 'float32_float32, bfloat16_bfloat16, float16_float16, float64_float64, bool_bool, int32_int32, int64_int64'
-    op_list = optype_str.split(',')
+        dtype_str = 'float32_float32, bfloat16_bfloat16, float16_float16, float64_float64, bool_bool, int32_int32, int64_int64'
+    op_list = optype_str.split(",")
     op_list = [x.strip() for x in op_list if x.strip()]
-    dtype_list = dtype_str.split(',')
+    dtype_list = dtype_str.split(",")
     dtype_list = [x.strip() for x in dtype_list if x.strip()]
     BinaryOpCodegen(args.working_path, dtype_list, op_list).gen_blobs()
