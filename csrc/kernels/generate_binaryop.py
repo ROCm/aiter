@@ -439,7 +439,7 @@ if __name__ == "__main__":
         tmp_str = ""
         for input_dtype in all_type:
             for other_dtype in all_type:
-                tmp_str += (input_dtype + "_" + other_dtype + ",")
+                tmp_str += input_dtype + "_" + other_dtype + ","
         dtype_str = tmp_str
     op_list = optype_str.split(",")
     op_list = [x.strip() for x in op_list if x.strip()]
