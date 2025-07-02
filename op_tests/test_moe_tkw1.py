@@ -10,9 +10,10 @@ from aiter.fused_moe_bf16_asm import (
 )
 from aiter.fused_moe import fused_topk
 from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant, ck_moe
+from aiter import pertoken_quant
 from aiter.int4_utils import *
 from aiter import ActivationType
+import argparse
 
 BLOCK_SIZE_M = 32
 
@@ -89,32 +90,6 @@ def asm_moe_test(
         None,
         None,
         activation,
-    )
-
-
-@perftest()
-def ck_moe_test(
-    hidden_states,
-    w1,
-    w2,
-    topk_weight,
-    topk_ids,
-    # following for int8 quant
-    fc1_scale=None,  # [expert, inter_dim, 1]
-    fc2_scale=None,  # [expert, model_dim, 1]
-    fc1_smooth_scale=None,  # [expert, 1, model_dim]
-    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-):
-    return ck_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        fc1_scale,
-        fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
     )
 
 
@@ -218,14 +193,8 @@ def test_fmoe(
         else:
             out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
 
-        # test ck moe
-        out_ck, avg_ck = ck_moe_test(
-            input, w1b, w2b, topk_weights, topk_ids, None, None, None, None
-        )
-
-        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, ck_avg: {avg_ck:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us, uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
-        checkAllclose(ref2, out_ck, rtol=0.01, atol=100, msg="ck check")
     else:
         dtypeMax = 7 if use_int4 else None
         w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
@@ -334,15 +303,72 @@ def test_fmoe(
 
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
-        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
 
+
+l_dtype = ["bf16"]
+l_m = [1, 128, 256]
+l_dim = [5120]
+l_hdim = [1024]
+l_expert = [16, 128]
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    default=None,
+)
+parser.add_argument(
+    "--dim",
+    type=int,
+    default=None,
+    help="model dimension, default 5120",
+)
+parser.add_argument(
+    "--hdim",
+    type=int,
+    default=None,
+    help="hidden dimension, default 1024",
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    choices=l_expert,
+    nargs="?",
+    const=None,
+    default=None,
+    help="number of experts",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.m is not None:
+    l_m = [args.m]
+if args.dim is not None:
+    l_dim = [args.dim]
+if args.hdim is not None:
+    l_hdim = [args.hdim]
+if args.expert is not None:
+    l_expert = [args.expert]
 
 print("\ng1u1 fp8quant")
-for dtype in [dtypes.bf16]:
-    for m in [1, 128, 256]:
-        for dim in [5120]:
-            for hdim in [1024]:
-                for num_of_experts in [16, 128]:
+for dtype in l_dtype:
+    for m in l_m:
+        for dim in l_dim:
+            for hdim in l_hdim:
+                for num_of_experts in l_expert:
                     test_fmoe(
                         dtype,
                         m,

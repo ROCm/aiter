@@ -4,6 +4,7 @@ import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk
 from aiter import dtypes
+import argparse
 
 BLOCK_SIZE_M = 32
 
@@ -139,12 +140,65 @@ def test_moe_sorting(
 
 import pandas as pd
 
+l_dtype = ["bf16"]
+l_m = [1, 7, 31, 64, 128, 256, 163840]
+l_expert = [32, 256]
+l_topk = [5, 8]
+parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="data type",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    default=None,
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    choices=l_expert,
+    nargs="?",
+    const=None,
+    default=None,
+    help="number of experts",
+)
+parser.add_argument(
+    "-t",
+    "--topk",
+    type=int,
+    choices=l_topk,
+    nargs="?",
+    const=None,
+    default=None,
+    help="topk value",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.m is not None:
+    l_m = [args.m]
+if args.expert is not None:
+    l_expert = [args.expert]
+if args.topk is not None:
+    l_topk = [args.topk]
+
 df = []
 print("test test_moe_sorting, no expert mask")
-for dtype in [dtypes.bf16]:
-    for m in [1, 7, 31, 64, 128, 256, 163840][:]:
-        for E in [32, 256][:]:
-            for top in [5, 8][:]:
+for dtype in l_dtype:
+    for m in l_m:
+        for E in l_expert:
+            for top in l_topk:
                 ret = test_moe_sorting(dtype, m, 7168, 4096, E, top)
                 df.append(ret)
 df = pd.DataFrame(df)
@@ -153,10 +207,10 @@ aiter.logger.info(f"summary:\n{df}")
 
 df = []
 print("test test_moe_sorting, with expert mask")
-for dtype in [dtypes.bf16]:
-    for m in [1, 7, 31, 64, 128, 256, 163840]:
-        for E in [32, 256]:
-            for top in [5, 8]:
+for dtype in l_dtype:
+    for m in l_m:
+        for E in l_expert:
+            for top in l_topk:
                 ret = test_moe_sorting(
                     dtype, m, 4096, 4096, E, top, has_expert_mask=True
                 )

@@ -255,7 +255,7 @@ def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     y = torch.empty(shape, dtype=quant_dtype, device=device)
     if scale is None:
         scale = torch.empty((*shape[:-1], 1), dtype=dtypes.fp32, device=device)
-        triton.quant.dynamic_per_token_quant_fp8_i8(y, x, scale)
+        triton.quant.dynamic_per_token_quant_fp8_i8(y, x.view(-1, x.shape[-1]), scale)
     else:
         raise ValueError("unsupported: static per token quant")
 

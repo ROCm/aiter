@@ -627,21 +627,6 @@
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
-#define MOE_CK_PYBIND                            \
-    m.def("ck_moe",                              \
-          &ck_moe,                               \
-          py::arg("hidden_states"),              \
-          py::arg("w1"),                         \
-          py::arg("w2"),                         \
-          py::arg("topk_weights"),               \
-          py::arg("topk_ids"),                   \
-          py::arg("w1_scale")    = std::nullopt, \
-          py::arg("w2_scale")    = std::nullopt, \
-          py::arg("a1_scale")    = std::nullopt, \
-          py::arg("a2_scale")    = std::nullopt, \
-          py::arg("block_m")     = 32,           \
-          py::arg("expert_mask") = std::nullopt);
-
 #define MOE_OP_PYBIND                                                                         \
     m.def("topk_softmax", &aiter::topk_softmax, "Apply topk softmax to the gating outputs."); \
     m.def("grouped_topk",                                                                     \
@@ -759,19 +744,20 @@
           py::arg("sorted_weights") = std::nullopt);                                          \
     m.def("moe_sum", &aiter::moe_sum, "moe_sum(Tensor! input, Tensor output) -> ()");
 
-#define MOE_SORTING_PYBIND              \
-    m.def("moe_sorting_fwd",            \
-          &moe_sorting_fwd,             \
-          py::arg("topk_ids"),          \
-          py::arg("topk_weights"),      \
-          py::arg("sorted_token_ids"),  \
-          py::arg("sorted_weights"),    \
-          py::arg("sorted_expert_ids"), \
-          py::arg("num_valid_ids"),     \
-          py::arg("moe_buf"),           \
-          py::arg("num_experts"),       \
-          py::arg("unit_size"),         \
-          py::arg("local_expert_mask") = std::nullopt);
+#define MOE_SORTING_PYBIND                             \
+    m.def("moe_sorting_fwd",                           \
+          &moe_sorting_fwd,                            \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("num_experts"),                      \
+          py::arg("unit_size"),                        \
+          py::arg("local_expert_mask") = std::nullopt, \
+          py::arg("num_local_tokens")  = std::nullopt);
 
 #define NORM_PYBIND                                               \
     m.def("layernorm2d_fwd",                                      \
