@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2023-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
 import argparse
@@ -66,6 +66,7 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
   constexpr uint32_t PATTERN_CONTIGUOUS = 4;
   constexpr uint32_t PATTERN_BROADCAST_2 = 5;   // (m, n, k), (m, n, 1)
   constexpr uint32_t PATTERN_BROADCAST_3 = 6;   // (m, n, k), (   n, 1)
+  constexpr uint32_t PATTERN_BROADCAST_4 = 7;   // (m, n, k), (m, 1, 1)
 
   // contiguous case
   if (!is_support)
@@ -122,7 +123,7 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
             is_support &= input.size(bcast_dim) == 1 ? other.size(bcast_dim) != 1 : true;
             pattern = is_support ? bcast_pattern[bcast_dim] : 0;
             order_flag = input.size(bcast_dim) != 1 ? true : false;
-            if (bcast_dim == 1) order_flag = !order_flag;
+            // if (bcast_dim == 1) order_flag = !order_flag;
           }
         };
         // (m, n, k), (1, n, k) or (1, n, k), (m, n, k)
@@ -131,6 +132,17 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
         broadcast_3d_case(1);
         // (m, n, k), (m, n, 1) or (m, n, 1), (m, n, k)
         broadcast_3d_case(2);
+
+
+        bool first_dim_eq = input.size(0) == other.size(0);
+        bool input_bcast_last2dim = input.size(1) == 1 && input.size(2) == 1;
+        bool other_bcast_last2dim = other.size(1) == 1 && other.size(2) == 1;
+        if (first_dim_eq && (input_bcast_last2dim || other_bcast_last2dim)) // broadcast in last 2 dim
+        {
+          is_support = true;
+          order_flag = other_bcast_last2dim ? true : false;
+          pattern = PATTERN_BROADCAST_4;
+        }
       }
       // (m, n, k), (n, 1) or (n, 1), (m, n, k)
       else if (input.dim() == 2 || other.dim() == 2)
@@ -213,14 +225,6 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 
   if (is_support)
   {
-    auto in0_dtype = input.dtype();
-    auto in1_dtype = other.dtype();
-    torch::ScalarType out_dtype = torch::promote_types(input.scalar_type(), other.scalar_type());
-    std::vector<int64_t> out_shape = broadcastShapes(input, other);
-    auto device = input.device();
-    auto options = torch::TensorOptions().dtype(out_dtype).device(input.device());
-
-
     switch (pattern)
     {
       case PATTERN_TRANSPOSE:
@@ -241,16 +245,20 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
       case PATTERN_BROADCAST_3:
         binary_operation_process<6, Op, T0, T1>(input, other, output, order_flag);
         break;
+      case PATTERN_BROADCAST_4:
+        binary_operation_process<7, Op, T0, T1>(input, other, output, order_flag);
+        break;
       default:
         return ;
     }
+    return ;
   }
   else
   {
+  output = aiter::aten_compute<Op>(input, other);
   return ;
   }
 }
-
 """
 
     API_BASE = """
@@ -258,17 +266,13 @@ void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &o
 // Copyright (c) 2023, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "binary_op_api_common.hpp"
-
-template <typename Op, typename T0, typename T1>
-void binary_op_impl(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output);
-
-void binary_op_dispatch(const std::string& op_type, 
-                       torch::Tensor &input, 
-                       torch::Tensor &other, 
+void binary_op_dispatch(const std::string& op_type,
+                       torch::Tensor &input,
+                       torch::Tensor &other,
                        torch::Tensor &output) {{
     // Dispatch based on operator and input types
 {F_dispatch}
-    AT_ERROR("Unsupported operator or dtype combination");
+    //AT_ERROR("Unsupported operator or dtype combination");
 }}
 """
 
@@ -292,8 +296,14 @@ void binary_op_dispatch(const std::string& op_type,
 {F_instance_def}
 """
 
-    def __init__(self, working_path):
+    def __init__(self, working_path, dtypes, optype):
         self.working_path = working_path
+        self.dtype_cmb = []
+        for i in dtypes:
+            input_dtype = i.split("_")[0]
+            other_dtype = i.split("_")[1]
+            self.dtype_cmb.append((str(input_dtype), str(other_dtype)))
+        self.op_type = optype
 
     @dataclass
     class h_traits:
@@ -304,6 +314,10 @@ void binary_op_dispatch(const std::string& op_type,
         @property
         def trait_name(self) -> str:
             return f"{OPERATOR_MAP[self.F_op_type]}, {DATA_TYPE_MAP[self.F_in0_type]}, {DATA_TYPE_MAP[self.F_in1_type]}"
+
+        @property
+        def call_name(self) -> str:
+            return f"binary_op_impl<{self.trait_name}>"
 
         @property
         def def_name(self) -> str:
@@ -358,14 +372,8 @@ void binary_op_dispatch(const std::string& op_type,
         return self.API_BASE.format(F_traits_define="", F_dispatch=dispatch_str)
 
     def get_blobs(self):
-        operators = ["add", "sub", "mul", "div"]
-        dtype_combinations = [
-            ("float32", "float32"),
-            ("float16", "float16"),
-            ("bfloat16", "bfloat16"),
-            ("float32", "float16"),
-            ("float16", "float32"),
-        ]
+        operators = self.op_type
+        dtype_combinations = self.dtype_cmb
 
         blobs = []
         for op in operators:
@@ -399,10 +407,42 @@ if __name__ == "__main__":
         default="./generated",
         help="Output directory for generated files",
     )
+
+    parser.add_argument("-o", "--optype", default="add", help="binary operator optype")
+
+    parser.add_argument(
+        "-t",
+        "--dtypes",
+        default="float32_float32",
+        help="input tensor, other tensor dtype",
+    )
+
     args = parser.parse_args()
 
     p = Path(args.working_path)
     if not p.exists():
         p.mkdir()
-
-    BinaryOpCodegen(args.working_path).gen_blobs()
+    optype_str = args.optype
+    dtype_str = args.dtypes
+    if args.optype == "all":
+        optype_str = "add, sub, mul, div"
+    if dtype_str == "all":
+        all_type = [
+            "float32",
+            "bfloat16",
+            "float16",
+            "float64",
+            "bool",
+            "int32",
+            "int64",
+        ]
+        tmp_str = ""
+        for input_dtype in all_type:
+            for other_dtype in all_type:
+                tmp_str += input_dtype + "_" + other_dtype + ","
+        dtype_str = tmp_str
+    op_list = optype_str.split(",")
+    op_list = [x.strip() for x in op_list if x.strip()]
+    dtype_list = dtype_str.split(",")
+    dtype_list = [x.strip() for x in dtype_list if x.strip()]
+    BinaryOpCodegen(args.working_path, dtype_list, op_list).gen_blobs()

@@ -3,6 +3,7 @@
 #include "activation.h"
 #include "aiter_enum.h"
 #include "aiter_operator.h"
+#include "aiter_unary.h"
 #include "asm_gemm_a4w4.h"
 #include "asm_gemm_a8w8.h"
 #include "attention.h"
@@ -16,8 +17,8 @@
 #include "communication_asm.h"
 #include "custom.h"
 #include "custom_all_reduce.h"
-#include "gemm_a8w8.h"
 #include "gemm_a4w4_blockscale.h"
+#include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
 #include "hipbsolgemm.cuh"
@@ -87,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
     AITER_OPERATOR_PYBIND;
+    AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
     CACHE_PYBIND;
     HIPBSOLGEMM_PYBIND;

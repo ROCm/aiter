@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import pytest
 import torch
 import triton
-import triton.language as tl
 
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype

@@ -20,7 +20,6 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.test_common import checkAllclose
 from aiter.int4_utils import (
     rearrange_4bit_elements,
     convert_int8_to_uint32_int4,

@@ -4,7 +4,6 @@ import torch
 import triton.language as tl
 import sys
 import time
-import os
 import tempfile
 import re
 
