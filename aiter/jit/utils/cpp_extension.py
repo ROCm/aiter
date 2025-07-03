@@ -225,6 +225,12 @@ COMMON_HIPCC_FLAGS = [
     "-DCUDA_HAS_FP16=1",
     "-D__HIP_NO_HALF_OPERATORS__=1",
     "-D__HIP_NO_HALF_CONVERSIONS__=1",
+    "-mcmodel=large",
+    "-fno-unique-section-names",
+    "-ffunction-sections",
+    "-fdata-sections",
+    "-fvisibility=hidden",
+    "-fvisibility-inlines-hidden",
 ]
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
@@ -1362,6 +1368,11 @@ def verify_ninja_availability():
 
 
 def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude):
+    extra_ldflags.append("-mcmodel=large")
+    extra_ldflags.append("-ffunction-sections")
+    extra_ldflags.append("-fdata-sections ")
+    extra_ldflags.append("-Wl,--gc-sections")
+    extra_ldflags.append("-Wl,--cref")
     if not torch_exclude:
         import torch
 
