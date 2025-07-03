@@ -431,10 +431,7 @@ if __name__ == "__main__":
             "float32",
             "bfloat16",
             "float16",
-            "float64",
-            "bool",
             "int32",
-            "int64",
         ]
         tmp_str = ""
         for input_dtype in all_type:
