@@ -340,7 +340,13 @@ def batched_gemm_afp4wfp4_pre_quant(
     Bx, M, K = x.shape
     Bw, K, N = w.shape
     By, _, _ = y.shape
-    assert Bx == Bw == By
+    if y is not None:
+        By, _, _ = y.shape
+        assert Bx == Bw == By
+    else:
+        assert Bx == Bw
+        y = torch.empty((Bx, M, N), dtype=dtype, device=x.device)
+
     Batch = Bx
 
     if config is None:
