@@ -1,7 +1,6 @@
 import argparse
 import sys
 import torch
-import triton
 from triton.testing import runtime
 from op_tests.triton_tests.test_rope_triton import generate_rope_inputs
 from aiter.ops.triton.rope import RotateStyle

@@ -5,7 +5,10 @@ import triton
 from op_tests.triton_tests.test_batched_gemm_afp4wfp4 import (
     generate_batched_gemm_afp4wfp4_inputs,
 )
-from utils.benchmark_utils import get_model_configs, get_available_models
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+)
 
 from aiter.ops.triton.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,

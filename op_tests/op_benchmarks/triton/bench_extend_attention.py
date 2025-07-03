@@ -2,7 +2,11 @@ from aiter.ops.triton import extend_attention, prefill_attention
 
 import triton
 
-from utils.benchmark_utils import get_model_configs, get_available_models, print_vgpr
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+    print_vgpr,
+)
 import torch
 import argparse
 
