@@ -46,7 +46,7 @@ typedef __hip_bfloat16 nv_bfloat16;
     }                                                               \
   } while (0)
 
-namespace vllm
+namespace aiter
 {
 
   constexpr int kMaxBlocks = 64;
@@ -1028,11 +1028,11 @@ namespace vllm
       CUDACHECK(cudaIpcCloseMemHandle(ptr));
     }
   }
-}; // namespace vllm
+}; // namespace aiter
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
- * template void vllm::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
+ * template void aiter::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
  half *, int, int, int);
 */
-} // namespace vllm
+} // namespace aiter
