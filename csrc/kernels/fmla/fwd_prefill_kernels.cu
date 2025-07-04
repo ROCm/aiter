@@ -19,7 +19,7 @@ enum class XqaStrategy
 {
     Disable,  // disable xqa
     External, // enable xqa by torch.Tensor transform
-    Internal // enable xqa by tensor view transform
+    Internal  // enable xqa by tensor view transform
 };
 
 CK_TILE_DEVICE bool IsDebugThreadBlock(const int x = 0, const int y = 0, const int z = 0)
@@ -1256,10 +1256,10 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
     // 6. Main loop
     //
-
     // Define main loop
     auto main_loop = [&]<bool IsEvenLoop>(int32_t loop_idx)
     {
+        __builtin_amdgcn_sched_barrier(0);
         ck_tile::clear_tile(s_acc);
 
         // I. QK GEMM
@@ -1284,7 +1284,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         ck_tile::move_tile_window(k_dram_window, qk_direction);
         ck_tile::store_tile(k_lds_window, k_block_tile);
         k_block_tile = ck_tile::load_tile(k_dram_window);
-
         // Main part of QK GEMM_0: conduct GEMM and load K tiles 
         if constexpr (k0_loops > 2)
         {
@@ -1302,6 +1301,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 k_block_tile = ck_tile::load_tile(k_dram_window);
             });
         }
+        __builtin_amdgcn_sched_barrier(0);
 
         // Tailing 2 tiles of QK GEMM_0
         ck_tile::block_sync_lds();
@@ -1309,7 +1309,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
         ck_tile::block_sync_lds();
         ck_tile::store_tile(k_lds_window, k_block_tile);
-
         ck_tile::block_sync_lds();
         gemm_0(s_acc, q_regs[(k0_loops - 1) % 2], k_lds_window);
 
@@ -1317,7 +1316,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
         // prefetch load V tile
         auto v_prefetch = ck_tile::load_tile(v_dram_windows[0]);
-        
 
         // II. scale_s, mask, softmax
         //
@@ -1330,7 +1328,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             k_origin.at(ck_tile::number<0>{}),
             ck_tile::number<Traits::kBlockM>{},
             ck_tile::number<Traits::kBlockN0>{});
-
+        __builtin_amdgcn_sched_barrier(0);
         if (need_perpixel_check)
         {
             ck_tile::set_tile_if(
@@ -1342,7 +1340,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     return mask.IsOutOfBound(row, col);
                 });
         }
-
+        __builtin_amdgcn_sched_barrier(0);
         auto s_acc_shuffled = [&]()
         {
             constexpr int32_t kWarpGemmM = Traits::QKWarpTile::at(ck_tile::number<0>{});
@@ -1385,7 +1383,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         const auto m_old = m;
         ck_tile::tile_elementwise_inout(
             [](auto& e0, auto e1, auto e2) { e0 = ck_tile::max(e1, e2); }, m, m_old, m_local);
-
+        __builtin_amdgcn_sched_barrier(0);
         // Compute exp(x_i - m)
         auto p_intermedia = ck_tile::make_static_distributed_tensor<acc_t>(s_acc_shuffled.get_tile_distribution());
         const auto p_spans = decltype(p_intermedia)::get_distributed_spans();
@@ -1407,7 +1405,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         // Compute row sum of exp(x_i - m)
         auto rowsum_p = block_reduce_2d(p_intermedia, reduce_sum_func.GetIdentityValue<acc_t>(), reduce_sum_func);
         block_reduce_2d_sync(rowsum_p, reduce_sum_func);
-
+        __builtin_amdgcn_sched_barrier(0);
         // Calculate new l and adjust old output acc
         constexpr auto o_spans = ck_tile::remove_cvref_t<decltype(o_acc[0])>::get_distributed_spans();
         ck_tile::sweep_tile_span(
@@ -1437,7 +1435,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                         });
                     });
             });
-
+        __builtin_amdgcn_sched_barrier(0);
 
         // III. GEMM for PV
         //
@@ -1450,7 +1448,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             auto v_shuffled = ck_tile::make_static_distributed_tensor<scalar_t>(Policy::MakeShuffledVRegBlockDescriptor());
             ck_tile::shuffle_tile(v_shuffled, v_prefetch);
             ck_tile::store_tile(v_lds_window, v_shuffled);
-
+            __builtin_amdgcn_sched_barrier(0);
             if constexpr (k1_loops > 1)
             {
                 ck_tile::static_for<0, k1_loops - 1, 1>{}([&](auto k1_id)
@@ -1468,6 +1466,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     v_dram_windows[n1_id].update_page_idx_and_valids(v_offsets, v_valids);
 
                     auto v = ck_tile::load_tile(v_dram_windows[n1_id]); // load next v
+                    __builtin_amdgcn_sched_barrier(0);
                     ck_tile::block_sync_lds();
 
                     gemm_1(o_acc[n1_id],
@@ -1476,21 +1475,21 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                                ck_tile::sequence<0, k1_id * Traits::kBlockK1>{},
                                ck_tile::sequence<Traits::kBlockM, (k1_id + 1) * Traits::kBlockK1>{}),
                            v_lds_window);
-                    ck_tile::block_sync_lds();
-
+                    ck_tile::block_sync_lds();  
                     auto v_shuffled = ck_tile::make_static_distributed_tensor<scalar_t>(
                         Policy::MakeShuffledVRegBlockDescriptor());
                         ck_tile::shuffle_tile(v_shuffled, v);
                         ck_tile::store_tile(v_lds_window, v_shuffled); // store the prefetch
+                    __builtin_amdgcn_sched_barrier(0); // userful
                 });
             }
-
+            __builtin_amdgcn_sched_barrier(0);
             // Output tail
             ck_tile::block_sync_lds();
 
             if constexpr (n1_id < (n1_loops-1))
             {
-                v_prefetch = ck_tile::load_tile(v_dram_windows[n1_id + 1]);
+                v_prefetch = ck_tile::load_tile(v_dram_windows[n1_id + 1]);  
                 // TODO: The following code is not necessary but it positively affects performance for unknown reason.
                 // Remove the following code once it no longer affects.
                 ck_tile::set_tile_if(
@@ -1517,7 +1516,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             }
             ck_tile::block_sync_lds();
         });
-
+        __builtin_amdgcn_sched_barrier(0);
         if ((loop_idx + 1) < num_total_loop)
         {
             // Move K to next block of column
@@ -1525,7 +1524,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 {0, IsEvenLoop ? Traits::kBlockK0 * (k0_loops - 1) : 0};
             ck_tile::move_tile_window(k_dram_window_origin, {Traits::kBlockN0, 0});
             k_dram_window.set_window_origin(k_dram_window_origin.get_window_origin() + next_qk_origin);
-
             // Recalculate offsets
             ck_tile::static_for<0, kKNumRepeat, 1>{}([&](auto rid)
             {
@@ -1537,7 +1535,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 k_valids[rid] = (seqlen_idx < seqlen_k_end);
             });
             k_dram_window.update_page_idx_and_valids(k_offsets, k_valids);
-
             // Move to next V block
             ck_tile::static_for<0, n1_loops, 1>{}([&](auto n1_id)
             {
@@ -1553,6 +1550,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 v_dram_windows[n1_id].update_page_idx_and_valids(v_offsets, v_valids);
             });
         }
+        __builtin_amdgcn_sched_barrier(0);
     };
 
     // Execute the loop
@@ -1645,7 +1643,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     // Define causal mask
     using Mask             = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, enableXqa>;
     const int32_t seqlen_k = params.p_seqlens_k[bid];
-    Mask mask              = kIsCausal ? Mask{params.size_s_pk,
+    Mask mask              = kIsCausal ? Mask{params.size_s_ori,
                                  seqlen_k - params.size_s_ori + 1,
                                  params.size_s_pk,
                                  seqlen_k,
