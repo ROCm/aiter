@@ -140,7 +140,7 @@ def tune_gemm_list(
                             0.1,
                         )
                     )
-                total_kernel_nums = total_kernel_nums + 1
+                    total_kernel_nums = total_kernel_nums + 1
 
             tasks_data.append((total_kernel_nums, ()))
     if task:

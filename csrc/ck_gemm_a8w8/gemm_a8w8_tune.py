@@ -82,7 +82,6 @@ def tune_gemm_list(
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
-    print(f"cu_num:{cu_num}")
     task = []
     tasks_data = []
     for i in range(len(untunedf)):
@@ -124,7 +123,11 @@ def tune_gemm_list(
                             1e-2,
                         )
                     )
+<<<<<<< HEAD
                 total_kernel_nums = total_kernel_nums + 1
+=======
+                    total_kernel_nums = total_kernel_nums + 1
+>>>>>>> 2df2c1ff (enable parallel tuning on CK kernels)
 
             tasks_data.append((total_kernel_nums, input_datas))
     if task:
