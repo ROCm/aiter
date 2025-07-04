@@ -411,7 +411,7 @@ def _attn_fwd(
     # num blocks along seqlen
 
     off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS - 1, NUM_XCD)
+    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
     start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
     off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
 
