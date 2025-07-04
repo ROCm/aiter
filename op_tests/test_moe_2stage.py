@@ -424,7 +424,7 @@ l_tokenNum = [
     256,
     1024,
     4096,
-    163840,
+    32768,
 ]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
