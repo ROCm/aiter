@@ -21,12 +21,6 @@ def get_scaled_dot_format_string(dtype: tl.dtype):
     return mapping[dtype]
 
 
-@triton.heuristics(
-    {
-        "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
-    }
-)
 @triton.jit
 def _fused_moe_kernel_mxfp4(
     # Pointers to matrices
@@ -67,7 +61,6 @@ def _fused_moe_kernel_mxfp4(
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
-    GRID_MN: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
 ):
@@ -134,8 +127,14 @@ def _fused_moe_kernel_mxfp4(
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_work_tiles = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M) * num_pid_n
+
     NUM_XCDS: tl.constexpr = 8
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    if pid < num_work_tiles:
+        pid = remap_xcd(pid, num_work_tiles, NUM_XCDS)
+    else:
+        return # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
@@ -144,9 +143,6 @@ def _fused_moe_kernel_mxfp4(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens

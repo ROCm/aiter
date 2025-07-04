@@ -43,12 +43,6 @@ def moe_set_quant_func(func):
     _MOE_A_QUANT_FUNC = func
 
 
-@triton.heuristics(
-    {
-        "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
-    }
-)
 @triton.jit
 def _fused_moe_kernel(
     # Pointers to matrices
@@ -96,7 +90,6 @@ def _fused_moe_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
-    GRID_MN: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -131,8 +124,14 @@ def _fused_moe_kernel(
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    num_work_tiles = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M) * num_pid_n
+
     NUM_XCDS: tl.constexpr = 8
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    if pid < num_work_tiles:
+        pid = remap_xcd(pid, num_work_tiles, NUM_XCDS)
+    else:
+        return # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # Create pointers for the first blocks of A and B.
@@ -140,9 +139,6 @@ def _fused_moe_kernel(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens

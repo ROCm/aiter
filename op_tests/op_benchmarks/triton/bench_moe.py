@@ -5,13 +5,14 @@ import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
-from utils.benchmark_utils import (
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
 )
 
 
 def model_benchmark_configs(args):
+    no_bench_stage2 = args.no_bench_stage2
     config_file = args.model_configs
     configs = get_model_configs(
         config_path=config_file, models="mistral" if args.model is None else args.model
@@ -23,15 +24,16 @@ def model_benchmark_configs(args):
     for model_name, config in configs.items():
         N1 = config["intermediate_size"]
         K1 = config["hidden_size"]
+        if no_bench_stage2:
+            N2 = config["hidden_size"]
+            K2 = config["intermediate_size"] // 2
 
-        N2 = config["hidden_size"]
-        K2 = config["intermediate_size"] // 2
-
-        E = 8
-        top_k = 2
+        E = config["num_expert"]
+        top_k = config["top_k"]
 
         moe_configs.append((model_name, M, N1, K1, E, top_k))
-        moe_configs.append((model_name, M, N2, K2, E, top_k))
+        if no_bench_stage2:
+            moe_configs.append((model_name, M, N2, K2, E, top_k))
 
     return moe_configs
 
@@ -200,8 +202,9 @@ def run_benchmark(args):
             a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
         # TODO add the int4 case
 
+        max_expert_loaded = min(E, top_k * M)
         # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
-        mem_read = (M * K) * a_bytes + (E * N * K) * b_bytes
+        mem_read = (M * K) * a_bytes + (max_expert_loaded * N * K) * b_bytes
 
         mem_write = (M * top_k * N) * c_bytes
         mem = mem_read + mem_write
@@ -266,6 +269,7 @@ def parse_args():
     parser.add_argument("-fp8_w8a8", action="store_true", default=False)
     parser.add_argument("-int4_w4a16", action="store_true", default=False)
     parser.add_argument("-has_zp", action="store_true", default=False)
+    parser.add_argument("-no_bench_stage2", action="store_false", default=True)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-fp8_type", default="e5m2fnuz")
     args = parser.parse_args()
