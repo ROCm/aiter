@@ -560,8 +560,6 @@ def fused_moe_2stages(
         )
 
     elif quant_type != QuantType.per_128x128:
-        if quant_type == QuantType.per_Token:
-            a2 = a2.view(token_num, -1)
         a2, a2_scale = quant_func(a2, scale=a2_scale, quant_dtype=q_dtype_a)
         a2 = a2.view(token_num, topk, inter_dim)
     else:
