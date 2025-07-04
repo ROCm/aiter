@@ -62,11 +62,11 @@ def gemm_a4w4_blockscale(
 
 @compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
 def gemm_a4w4_blockscale_tune(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-    kernelId: int,
-    splitK=0,
-): ...
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
