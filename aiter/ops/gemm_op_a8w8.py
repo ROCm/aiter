@@ -99,6 +99,7 @@ def get_CKGEMM_config(
         )
     config = get_CKGEMM_config.ckgemm_dict.get((M, N, K), None)
     if config != None:
+        print(f"shape M:{M}, N:{N}, K:{K} is tuned, in CKGEMM!")
         mnk = config["kernelName"].split("_")[2].split("x")[1:]
         config["tile_m"] = int(mnk[0])
         config["tile_n"] = int(mnk[1])
@@ -118,7 +119,10 @@ def get_ASMGEMM_config(M: int, N: int, K: int, bias: bool, dtype: torch.dtype):
         get_ASMGEMM_config.asmgemm_dict = asmGemmDictDf.set_index(
             ["M", "N", "K", "bias", "outdtype"]
         ).to_dict("index")
-    return get_ASMGEMM_config.asmgemm_dict.get((M, N, K, bias, str(dtype)), None)
+    config = get_ASMGEMM_config.asmgemm_dict.get((M, N, K, bias, str(dtype)), None)
+    if config is not None:
+        print(f"shape M:{M}, N:{N}, K:{K} is tuned, in ASMGEMM !")
+    return config
 
 
 def gemm_a8w8_ASM(
@@ -235,26 +239,26 @@ def flatmm_a8w8_blockscale_ASM(
 
 @compile_ops("module_gemm_a8w8_tune", fc_name="gemm_a8w8_tune")
 def gemm_a8w8_tune(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-    kernelId: int,
-    splitK=0,
-): ...
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_gemm_a8w8_blockscale_tune", fc_name="gemm_a8w8_blockscale_tune")
 def gemm_a8w8_blockscale_tune(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-    kernelId: int,
-    splitK=0,
-): ...
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    kernelId: int = 0,
+    splitK: int = 0,
+) -> torch.Tensor: ...
 @compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune")
 def gemm_a8w8_bpreshuffle_tune(
     XQ: Tensor,

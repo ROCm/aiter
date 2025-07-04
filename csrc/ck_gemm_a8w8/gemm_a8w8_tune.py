@@ -8,7 +8,9 @@ import torch.nn.functional as F
 from aiter import dtypes
 from aiter.test_common import perftest
 from gemm_a8w8_common import kernels_list
+from aiter.utility.mp_tuner import mp_tuner
 import argparse
+import time
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -38,7 +40,8 @@ def get_untuned_gemm_list(untuned_gemm_file):
         untuned_gemm_file
     ), f"Not exist a8w8_untuned_gemm.csv file: {untuned_gemm_file}"
     untunedf = pd.read_csv(untuned_gemm_file)
-    return untunedf
+    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+    return filtered_df
 
 
 def get_tuned_gemm_list(tuned_gemm_file):
@@ -51,87 +54,92 @@ def get_tuned_gemm_list(tuned_gemm_file):
     return tunedf
 
 
-@perftest()
-def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
-    aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
-    return out
-
-
-def tune_gemm(m, n, k, useSplitK=False):
-    dim = (m, n, k)
+def generate_data(m, n, k):
     x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device="cuda")
     weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device="cuda")
     x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device="cuda")
     w_scale = torch.rand([1, n], dtype=dtypes.bf16, device="cuda")
     out = torch.empty(m, n, dtype=dtypes.bf16, device="cuda")
-
-    ref_out = run_torch(x, weight, x_scale, w_scale)
-
-    print(f"*******************M:{m} X N:{n} X K:{k}**************************")
-    print(f"Start tuning a8w8 gemm kernel for M:{m}, N:{n}, K{k}:")
-    kernels_num = len(kernels_list)
-    best_kernelConfig = (-1, 0)
-    best_time = -1
-    for i in range(kernels_num):
-        kernel = kernels_list[i]
-        maxsplitK = (
-            aiter.compute_gemm_SplitK(
-                m, n, k, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK
-            )
-            if useSplitK
-            else 0
-        )
-        for splitK in range(maxsplitK + 1):
-            try:
-                (out), avg_t = kernel_instance_test(
-                    x, weight, x_scale, w_scale, out, i, splitK
-                )
-                isClosed = checkClose(ref_out, out, rtol=1e-2, atol=0.01)
-                if isClosed:
-                    print(
-                        f"{str(dim):<20} kernelid:{i:<3d}\t avg: {avg_t:<8.2f} us, {kernel.name}, {splitK=}"
-                    )
-                    if best_time < 0 or avg_t < best_time:
-                        best_kernelConfig = (i, splitK)
-                        best_time = avg_t
-                else:
-                    print(
-                        f"{str(dim):<20} kernelid:{i:<3d}\t No pass         , {kernel.name}, {splitK=}"
-                    )
-            except RuntimeError:
-                print(
-                    f"{str(dim):<20} kernelid:{i:<3d}\t No support      , {kernel.name}, {splitK=}"
-                )
-
-    best_kernelId, splitK = best_kernelConfig
-    if best_kernelConfig[0] == -1:
-        print(f"No kernel can be used for M:{m}, N:{n}, K:{k}")
-        best_time = "nan"
-    else:
-        best_time = round(best_time, 4)
-
-        print(
-            f"Tuning result for M:{m}, N:{n}, K:{k} is kernelId={best_kernelId} {kernels_list[best_kernelId].name} {splitK=}, {best_time}us"
-        )
-    print(f"*******************M:{m} X N:{n} X K{k}**************************")
-
-    return best_kernelId, splitK, best_time
+    # x.share_memory_()
+    # weight.share_memory_()
+    # x_scale.share_memory_()
+    # w_scale.share_memory_()
+    return x, weight, x_scale, w_scale, out
 
 
-def tune_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False):
+def gemm_a8w8_ref(x, weight, x_scale, w_scale):
+    return run_torch(x, weight, x_scale, w_scale)
+
+
+def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
+
+    aiter.gemm_a8w8_tune(x, weight, x_scale, w_scale, out, kernelId, splitK)
+    return out
+
+
+def tune_gemm_list(
+    untunedf, tunedf, issorted=False, useSplitK=False, mp_num=1, shape_grouped=False
+):
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    print(f"cu_num:{cu_num}")
+    task = []
+    tasks_data = []
     for i in range(len(untunedf)):
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
         K = untunedf.loc[i, "K"]
+        kernels_num = len(kernels_list)
 
-        if tunedf[(tunedf["M"] == M) & (tunedf["N"] == N) & (tunedf["K"] == K)].empty:
-            kernelId, splitK, time = tune_gemm(M, N, K, useSplitK)
+        if tunedf[
+            (tunedf["M"] == M)
+            & (tunedf["N"] == N)
+            & (tunedf["K"] == K)
+            & (tunedf["cu_num"] == cu_num)
+        ].empty:
+            input_datas = generate_data(M, N, K)
+            total_kernel_nums = 0
+            for i in range(kernels_num):
+                kernel = kernels_list[i]
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(
+                        M, N, K, kernel.MPerBLOCK, kernel.NPerBLOCK, kernel.KPerBLOCK
+                    )
+                    if useSplitK
+                    else 0
+                )
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), i, splitK)
+                    task.append(
+                        (
+                            info,
+                            run_gemm_a8w8,
+                            (i, splitK),
+                            {},
+                            gemm_a8w8_ref,
+                            (),
+                            {},
+                            None,
+                            1e-2,
+                            1e-2,
+                        )
+                    )
+                total_kernel_nums = total_kernel_nums + 1
+
+            tasks_data.append((total_kernel_nums, input_datas))
+    if task:
+        ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
+        for el in ret:
+            info, time, err_ratio = el
+            (cu_num, M, N, K), kernelId, splitK = info
             kernelName = "None" if kernelId == -1 else kernels_list[kernelId].name
             temp = pd.DataFrame(
                 {
                     "M": [M],
                     "N": [N],
                     "K": [K],
+                    "cu_num": [cu_num],
                     "kernelId": [kernelId],
                     "splitK": [splitK],
                     "us": [time],
@@ -140,8 +148,8 @@ def tune_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False):
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-        else:
-            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
+    else:
+        print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
         print()
         print()
     if issorted:
@@ -166,6 +174,13 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--mp",
+        type=int,
+        default=torch.cuda.device_count(),
+        help="Tuning on multiple GPUs using multiple processes",
+    )
+
+    parser.add_argument(
         "-o",
         "--tune_file",
         default="aiter/configs/a8w8_tuned_gemm.csv",
@@ -187,5 +202,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
-    tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK)
+    start_time = time.time()
+    tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
+    end_time = time.time()
+    print("tune time: ", end_time - start_time)
     tunedf.to_csv(args.tune_file, index=False)
