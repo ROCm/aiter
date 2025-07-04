@@ -467,7 +467,13 @@ parser.add_argument(
     "--quant",
     type=int,
     choices=range(len(l_quant)),
-    help="select quantization type",
+    help="select quantization type:\n \
+        0 : aiter.QuantType.No, None, None),  # a16w16\n \
+        1: aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8  # a8w8\n \
+        2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8\n \
+        3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4\n \
+        4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4\n \
+        # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test",
 )
 
 parser.add_argument(

@@ -92,7 +92,6 @@ parser.add_argument(
 parser.add_argument(
     "-m",
     type=int,
-    choices=l_m,
     nargs="?",
     const=None,
     default=None,
@@ -101,7 +100,6 @@ parser.add_argument(
 parser.add_argument(
     "-n",
     type=int,
-    choices=l_n,
     nargs="?",
     const=None,
     default=None,

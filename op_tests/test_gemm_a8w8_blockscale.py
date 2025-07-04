@@ -143,16 +143,15 @@ parser.add_argument(
     help="data type",
 )
 parser.add_argument(
-    "-m", type=int, choices=l_m, nargs="?", const=None, default=None, help="shape"
+    "-m", type=int, nargs="?", const=None, default=None, help="dim m. e.g. -m 1280"
 )
 parser.add_argument(
     "-nk",
     type=dtypes.str2tuple,
-    choices=l_nk,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="shape of nk, the format of input is n,k, e.g. -nk 4096,512",
 )
 
 args = parser.parse_args()

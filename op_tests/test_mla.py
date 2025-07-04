@@ -378,30 +378,52 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
-list_dtype = [(dtypes.bf16, dtypes.bf16)]
-list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192]
-list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256]
+list_dtype = ["bf16"]
+l_kv_dtype = ["bf16"]
 list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
 
 parser = argparse.ArgumentParser(description="config input of test")
+parser.add_argument("-k", "--kv_lora_rank", type=int, default=512, help="kv lora rank")
+parser.add_argument(
+    "-qn", "--qk_nope_head_dim", type=int, default=128, help="qk nope head dim"
+)
+parser.add_argument(
+    "-qr", "--qk_rope_head_dim", type=int, default=64, help="qk rope head dim"
+)
+parser.add_argument("-vh", "--v_head_dim", type=int, default=128, help="v head dim")
+parser.add_argument("-blk", "--block_size", type=int, default=1, help="block size")
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=["bf16"],
+    nargs="*",
+    default=["bf16"],
+    help="data type of Q",
+)
+parser.add_argument(
+    "-kvd",
+    "--kv_dtype",
+    type=str,
+    choices=["bf16"],
+    nargs="*",
+    default=["bf16"],
+    help="data type of KV",
+)
 parser.add_argument(
     "-c",
     "--ctxLen",
     type=int,
-    choices=list_ctx_len,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
     help="context length",
 )
 parser.add_argument(
     "-b",
     "--batchSize",
     type=int,
-    choices=list_batch_size,
-    nargs="?",
-    const=None,
-    default=None,
+    nargs="*",
+    default=[1, 3, 5, 16, 32, 64, 128, 256],
     help="batch size",
 )
 parser.add_argument(
@@ -418,29 +440,27 @@ parser.add_argument(
 import pandas as pd
 
 args = parser.parse_args()
-if args.ctxLen is not None:
-    list_ctx_len = [args.ctxLen]
-if args.batchSize is not None:
-    list_batch_size = [args.batchSize]
+list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
+l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
 if args.nhead is not None:
     list_nhead = [args.nhead]
 
 for nhead, mtp in list_nhead:
     df = []
-    for (dtype, kvtype), ctx_len, batch_size in itertools.product(
-        list_dtype, list_ctx_len, list_batch_size
+    for dtype, kvtype, ctx_len, batch_size in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
     ):
         ret = test_mla(
             ctx_len,
             batch_size,
             nhead,
-            kv_lora_rank,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            v_head_dim,
+            args.kv_lora_rank,
+            args.qk_nope_head_dim,
+            args.qk_rope_head_dim,
+            args.v_head_dim,
             dtype,
             kvtype,
-            block_size,
+            args.block_size,
             varlen=False,
             mtp=mtp,
         )

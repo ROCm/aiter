@@ -96,11 +96,10 @@ parser.add_argument(
 parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
-    choices=l_mnk,
     nargs="?",
     const=None,
     default=None,
-    help="shape of mnk",
+    help="shape of mnk, the format of input is m,n,k, e.g. -mnk 1280,8192,1024",
 )
 
 args = parser.parse_args()
