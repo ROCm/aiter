@@ -1,11 +1,41 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from functools import partial
 
 import pytest
 import torch
-from aiter.ops.triton.routing import routing_sigmoid_top1, torch_routing_sigmoid_top1
+from aiter.ops.triton.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
+
+
+def torch_routing_sigmoid_top1(
+    x, w, topk, fused_shared_experts=False, dummy_ids=None, dummy_weights=None
+):
+    scores = torch.matmul(x, w)  # [M, N]
+
+    scores = torch.sigmoid(scores.to(torch.float32))  # [M, N]
+
+    assert topk == 1
+
+    topk_weights, topk_ids = torch.topk(scores, topk, dim=1)  # [M, topk]
+
+    topk_ids = topk_ids.to(torch.int32)
+    topk_weights = topk_weights.to(torch.float32)
+
+    if fused_shared_experts:
+        topk_ids = torch.cat(
+            [
+                topk_ids,
+                dummy_ids,
+            ],
+            dim=1,
+        )
+        topk_weights = torch.cat(
+            [topk_weights, dummy_weights],
+            dim=1,
+        )
+
+    return topk_ids, topk_weights
 
 
 @pytest.mark.parametrize("M", [128, 1024, 2048, 4096, 8192])

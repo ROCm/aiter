@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional, Dict
+import functools
+import json
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from typing import Optional
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
     _is_fp8,
@@ -1525,6 +1529,19 @@ def is_contiguous(x, name):
         return x.contiguous()
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict["bkwd_onekernel"]
+
+
 def flash_attn_onekernel_backward(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -1551,6 +1568,7 @@ def flash_attn_onekernel_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
+    config: Optional[Dict[str, any]] = None,
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -1620,12 +1638,8 @@ def flash_attn_onekernel_backward(
     BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
 
     # Configs
-    NUM_WARPS, NUM_STAGES = 4, 1
-    WAVES_PER_EU = 1
-    PRE_BLOCK = 128
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    BLK_SLICE_FACTOR = 2
-    matrix_instr_nonkdim = 16
+    if config is None:
+        config = _get_config()
 
     # init delta
     delta = torch.zeros_like(softmax_lse)
@@ -1638,7 +1652,11 @@ def flash_attn_onekernel_backward(
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
-    pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, num_q_heads)
+    pre_grid = (
+        triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]),
+        batch,
+        num_q_heads,
+    )
     _bwd_preprocess[pre_grid](
         o,
         do,
@@ -1649,7 +1667,7 @@ def flash_attn_onekernel_backward(
         cu_seqlens_q,
         max_seqlen_q,
         descale_do,
-        BLOCK_M=PRE_BLOCK,
+        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
         BLOCK_D_MODEL=head_sz,
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
@@ -1670,29 +1688,14 @@ def flash_attn_onekernel_backward(
         dropout_strides = (0, 0, 0, 0)
 
     seqlen = max(max_seqlen_q, max_seqlen_k)
+
+    config_onekernel = config["onekernel"]
     grid = (
         num_k_heads,
-        triton.cdiv(seqlen, BLOCK_N1),
+        triton.cdiv(seqlen, config_onekernel["BLOCK_N1"]),
         batch,
     )
-    NUM_WARPS, NUM_STAGES = 4, 1
-    WAVES_PER_EU = 1
-    BLOCK_M1, BLOCK_N1, BLOCK_M2, BLOCK_N2 = 32, 128, 128, 32
-    BLK_SLICE_FACTOR = 2
-    matrix_instr_nonkdim = 16
 
-    onekernel_config = {
-        "BLOCK_M1": BLOCK_M1,
-        "BLOCK_N1": BLOCK_N1,
-        "BLOCK_M2": BLOCK_M2,
-        "BLOCK_N2": BLOCK_N2,
-        "BLK_SLICE_FACTOR": BLK_SLICE_FACTOR,
-        "waves_per_eu": WAVES_PER_EU,
-        "matrix_instr_nonkdim": matrix_instr_nonkdim,
-        "num_warps": NUM_WARPS,
-        "num_ctas": 1,
-        "num_stages": NUM_STAGES,
-    }
     if causal:
         bwd_kernel_causal[grid](
             q,
@@ -1744,7 +1747,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **onekernel_config,
+            **config_onekernel,
         )
     else:
         bwd_kernel_noncausal[grid](
@@ -1797,7 +1800,7 @@ def flash_attn_onekernel_backward(
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **onekernel_config,
+            **config_onekernel,
         )
 
     return delta
