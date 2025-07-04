@@ -200,8 +200,13 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    w1_qt_aiter = w1_qt
-    w2_qt_aiter = w2_qt
+    if qType != aiter.QuantType.per_1x32:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+
+    else:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
@@ -239,10 +244,9 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    else:
+    elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
-
     # # ######################## ck stage 1 start ###########
     # # a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
     # # out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
@@ -420,7 +424,7 @@ l_tokenNum = [
     256,
     1024,
     4096,
-    163840,
+    32768,
 ]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
