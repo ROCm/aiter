@@ -603,7 +603,7 @@ if __name__ == "__main__":
         "--quant_cache_dtype",
         type=str,
         choices=["none"],
-        default=[None],
+        default=["none"],
         nargs="*",
         help="""Quantization cache dtype.
     e.g. -q none""",
@@ -613,10 +613,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if not args.pa_variant == [PAVariant.Shomy]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
-    if not args.quant_cache_dtype == [None]:
-        args.quant_cache_dtype = [
-            None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
-        ]
+    args.quant_cache_dtype = [
+        None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
+    ]
 
     for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
         args.ctx_len,
