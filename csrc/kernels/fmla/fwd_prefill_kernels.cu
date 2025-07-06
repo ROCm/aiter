@@ -1149,8 +1149,8 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
     // 3. Quick exit if no work to do
     //
-    const int32_t num_total_loop =
-        ck_tile::integer_divide_ceil(seqlen_k_end - seqlen_k_start, Traits::kBlockN0);
+    const int32_t num_total_loop = __builtin_amdgcn_readfirstlane(
+        ck_tile::integer_divide_ceil(seqlen_k_end - seqlen_k_start, Traits::kBlockN0));
 
     if (num_total_loop <= 0)
     {
@@ -1257,17 +1257,16 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
     // 6. Main loop
     //
     // Define main loop
-    auto main_loop = [&]<bool IsEvenLoop>(int32_t loop_idx)
+    auto main_loop = [&](int32_t loop_idx, bool is_even_loop)
     {
-        __builtin_amdgcn_sched_barrier(0);
         ck_tile::clear_tile(s_acc);
 
         // I. QK GEMM
         //
-        constexpr ck_tile::array<int32_t, 2> qk_origin =
-            {0, IsEvenLoop ? 0 : Traits::kBlockK0 * (k0_loops - 1)};
-        constexpr ck_tile::array<int32_t, 2> qk_direction =
-            {0, IsEvenLoop ? Traits::kBlockK0 : -Traits::kBlockK0};
+        ck_tile::array<int32_t, 2> qk_origin =
+            {0, is_even_loop ? 0 : Traits::kBlockK0 * (k0_loops - 1)};
+        ck_tile::array<int32_t, 2> qk_direction =
+            {0, is_even_loop ? Traits::kBlockK0 : -Traits::kBlockK0};
         auto q_dram_window = ck_tile::make_tile_window(
             q_dram_window_.get_bottom_tensor_view(),
             q_dram_window_.get_window_lengths(),
@@ -1301,7 +1300,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 k_block_tile = ck_tile::load_tile(k_dram_window);
             });
         }
-        __builtin_amdgcn_sched_barrier(0);
 
         // Tailing 2 tiles of QK GEMM_0
         ck_tile::block_sync_lds();
@@ -1324,11 +1322,10 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         // Note that masking is also required when k is padded
         const auto k_origin = k_dram_window_origin.get_window_origin();
         const bool need_perpixel_check = mask.IsEdgeTile(
-            q_origin.at(ck_tile::number<0>{}),
-            k_origin.at(ck_tile::number<0>{}),
+            __builtin_amdgcn_readfirstlane(q_origin.at(ck_tile::number<0>{})),
+            __builtin_amdgcn_readfirstlane(k_origin.at(ck_tile::number<0>{})),
             ck_tile::number<Traits::kBlockM>{},
             ck_tile::number<Traits::kBlockN0>{});
-        __builtin_amdgcn_sched_barrier(0);
         if (need_perpixel_check)
         {
             ck_tile::set_tile_if(
@@ -1340,7 +1337,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     return mask.IsOutOfBound(row, col);
                 });
         }
-        __builtin_amdgcn_sched_barrier(0);
         auto s_acc_shuffled = [&]()
         {
             constexpr int32_t kWarpGemmM = Traits::QKWarpTile::at(ck_tile::number<0>{});
@@ -1383,7 +1379,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         const auto m_old = m;
         ck_tile::tile_elementwise_inout(
             [](auto& e0, auto e1, auto e2) { e0 = ck_tile::max(e1, e2); }, m, m_old, m_local);
-        __builtin_amdgcn_sched_barrier(0);
         // Compute exp(x_i - m)
         auto p_intermedia = ck_tile::make_static_distributed_tensor<acc_t>(s_acc_shuffled.get_tile_distribution());
         const auto p_spans = decltype(p_intermedia)::get_distributed_spans();
@@ -1405,7 +1400,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         // Compute row sum of exp(x_i - m)
         auto rowsum_p = block_reduce_2d(p_intermedia, reduce_sum_func.GetIdentityValue<acc_t>(), reduce_sum_func);
         block_reduce_2d_sync(rowsum_p, reduce_sum_func);
-        __builtin_amdgcn_sched_barrier(0);
         // Calculate new l and adjust old output acc
         constexpr auto o_spans = ck_tile::remove_cvref_t<decltype(o_acc[0])>::get_distributed_spans();
         ck_tile::sweep_tile_span(
@@ -1435,7 +1429,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                         });
                     });
             });
-        __builtin_amdgcn_sched_barrier(0);
 
         // III. GEMM for PV
         //
@@ -1448,8 +1441,9 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             auto v_shuffled = ck_tile::make_static_distributed_tensor<scalar_t>(Policy::MakeShuffledVRegBlockDescriptor());
             ck_tile::shuffle_tile(v_shuffled, v_prefetch);
             ck_tile::store_tile(v_lds_window, v_shuffled);
-            __builtin_amdgcn_sched_barrier(0);
-            if constexpr (k1_loops > 1)
+            __builtin_amdgcn_sched_barrier(0); // This barrier decrease the useage of vgprs, but
+                                               // negatively affects performance for small seqlen.
+            if constexpr(k1_loops > 1)
             {
                 ck_tile::static_for<0, k1_loops - 1, 1>{}([&](auto k1_id)
                 {
@@ -1466,7 +1460,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     v_dram_windows[n1_id].update_page_idx_and_valids(v_offsets, v_valids);
 
                     auto v = ck_tile::load_tile(v_dram_windows[n1_id]); // load next v
-                    __builtin_amdgcn_sched_barrier(0);
+                    // __builtin_amdgcn_sched_barrier(0);  // decrease the useage of vgprs
                     ck_tile::block_sync_lds();
 
                     gemm_1(o_acc[n1_id],
@@ -1480,18 +1474,17 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                         Policy::MakeShuffledVRegBlockDescriptor());
                         ck_tile::shuffle_tile(v_shuffled, v);
                         ck_tile::store_tile(v_lds_window, v_shuffled); // store the prefetch
-                    __builtin_amdgcn_sched_barrier(0); // userful
+                    // __builtin_amdgcn_sched_barrier(0); // decrease the useage of vgprs
                 });
             }
-            __builtin_amdgcn_sched_barrier(0);
             // Output tail
             ck_tile::block_sync_lds();
 
             if constexpr (n1_id < (n1_loops-1))
             {
-                v_prefetch = ck_tile::load_tile(v_dram_windows[n1_id + 1]);  
-                // TODO: The following code is not necessary but it positively affects performance for unknown reason.
-                // Remove the following code once it no longer affects.
+                v_prefetch = ck_tile::load_tile(v_dram_windows[n1_id + 1]);
+                // TODO: The following code is not necessary but it positively affects performance
+                // for unknown reason. Remove the following code once it no longer affects.
                 ck_tile::set_tile_if(
                     v_prefetch, ck_tile::numeric<scalar_t>::zero(),
                     [&](auto ids)
@@ -1500,7 +1493,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                         return (loop_idx * Traits::kBlockN0 + col) >= seqlen_k;
                     });
             }
-
             if constexpr (k1_loops > 1)
             {
                 gemm_1(o_acc[n1_id],
@@ -1516,12 +1508,11 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             }
             ck_tile::block_sync_lds();
         });
-        __builtin_amdgcn_sched_barrier(0);
         if ((loop_idx + 1) < num_total_loop)
         {
             // Move K to next block of column
-            constexpr ck_tile::array<int32_t, 2> next_qk_origin =
-                {0, IsEvenLoop ? Traits::kBlockK0 * (k0_loops - 1) : 0};
+            ck_tile::array<int32_t, 2> next_qk_origin =
+                {0, is_even_loop ? Traits::kBlockK0 * (k0_loops - 1) : 0};
             ck_tile::move_tile_window(k_dram_window_origin, {Traits::kBlockN0, 0});
             k_dram_window.set_window_origin(k_dram_window_origin.get_window_origin() + next_qk_origin);
             // Recalculate offsets
@@ -1550,21 +1541,16 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 v_dram_windows[n1_id].update_page_idx_and_valids(v_offsets, v_valids);
             });
         }
-        __builtin_amdgcn_sched_barrier(0);
     };
 
     // Execute the loop
-    main_loop.template operator()<true>(0);
-    for (int32_t loop_idx = 1; (loop_idx + 1) < num_total_loop; (loop_idx += 2))
+    // Replace static parity loops with dynamic parity loops. This change affects performance
+    // divergently.
+    for(int32_t loop_idx = __builtin_amdgcn_readfirstlane(0); loop_idx < num_total_loop;
+        loop_idx += 1)
     {
-        main_loop.template operator()<false>(loop_idx);
-        main_loop.template operator()<true>(loop_idx + 1);
+        main_loop(loop_idx, __builtin_amdgcn_readfirstlane((loop_idx % 2 == 0)));
     }
-    if ((num_total_loop % 2) == 0)
-    {
-        main_loop.template operator()<false>(num_total_loop - 1);
-    }
-
 
     // 7. Store LSE
     //
@@ -2062,7 +2048,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr XqaStrategy kXqaStrategy = XqaStrategy::External;
+    constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
     //                                        dqk  dv   m0  n0   n1   #warp  wave_occu
     using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64,  256, 4,     2,   kXqaStrategy>;
     constexpr bool kForceOutAcc = false;
