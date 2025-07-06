@@ -10,7 +10,7 @@
 using BlockwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &)>;
+                  torch::Tensor &, int)>;
 
 // Define a custom hash function for std::tuple<int, int, int>
 struct IntTupleHash
@@ -91,7 +91,8 @@ torch::Tensor gemm_a4w4_blockscale(
     torch::Tensor& WQ,
     torch::Tensor& x_scale,
     torch::Tensor& w_scale,
-    torch::Tensor& Y)
+    torch::Tensor& Y,
+    int splitK)
 {
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(),
@@ -103,11 +104,11 @@ torch::Tensor gemm_a4w4_blockscale(
 
   if (Y.dtype() == at::ScalarType::Half)
   {
-    blockscale_dispatch<F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+    blockscale_dispatch<F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, splitK);
   }
   else if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    blockscale_dispatch<B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y);
+    blockscale_dispatch<B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, splitK);
   }
   else
   {

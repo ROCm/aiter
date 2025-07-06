@@ -324,7 +324,8 @@
           py::arg("WQ"),            \
           py::arg("x_scale"),       \
           py::arg("w_scale"),       \
-          py::arg("Out"));
+          py::arg("Out"),           \
+          py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND \
     m.def("gemm_a8w8_blockscale",   \
