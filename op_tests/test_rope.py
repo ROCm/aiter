@@ -1119,7 +1119,9 @@ dim_freqs: {str(freqs_h.shape):<20}
 
 if __name__ == "__main__":
     l_dtype = ("fp16", "bf16")
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument(
         "--no_check",
         action="store_true",
@@ -1143,7 +1145,8 @@ if __name__ == "__main__":
         nargs="?",
         const=None,
         default=None,
-        help="data type",
+        help="""Data type.
+    e.g.: -d bf16""",
     )
     parser.add_argument(
         "-t",
@@ -1151,7 +1154,9 @@ if __name__ == "__main__":
         default=(False, True),
         nargs="*",
         type=dtypes.str2bool,
-        help="Transpose output. Default: (False, True).",
+        help="""Transpose output. Default: (False, True).
+    e.g.: -t f   # for False
+    e.g.: -t t   # for True""",
     )
     parser.add_argument(
         "-b",
@@ -1159,7 +1164,8 @@ if __name__ == "__main__":
         type=int,
         default=[4],
         nargs="*",
-        help="Batch sizes for testing. The default is 4, but you can choose from: 1, 2, 4.",
+        help="""Batch sizes for testing. The default is 4, but you can choose from: 1, 2, 4.
+    e.g.: -b 1""",
     )
     parser.add_argument(
         "-s",
@@ -1167,7 +1173,8 @@ if __name__ == "__main__":
         type=int,
         default=[2048],
         nargs="*",
-        help="Sequence sizes to test. Default: 2048, but you can choose from: 1024, 2048, 4096.",
+        help="""Sequence sizes to test. Default: 2048, but you can choose from: 1024, 2048, 4096.
+    e.g.: -s 1024""",
     )
     parser.add_argument(
         "-hs",
@@ -1175,7 +1182,8 @@ if __name__ == "__main__":
         type=int,
         default=[64],
         nargs="*",
-        help="Head sizes to test. Default is 64, but you can choose from: 32, 64.",
+        help="""Head sizes to test. Default is 64, but you can choose from: 32, 64.
+    e.g.: -hs 32""",
     )
     parser.add_argument(
         "-hd",
@@ -1183,7 +1191,8 @@ if __name__ == "__main__":
         type=int,
         default=[256],
         nargs="*",
-        help="Hidden dimensions to test. Default is 256, bui you can choose from: 128, 256.",
+        help="""Hidden dimensions to test. Default is 256, bui you can choose from: 128, 256.
+    e.g.: -hd 128""",
     )
     parser.add_argument(
         "-ht",
@@ -1191,7 +1200,8 @@ if __name__ == "__main__":
         default=[64],
         nargs="*",
         type=int,
-        help="Height sizes to test. Default is 64, but you can choose from: 32, 64.",
+        help="""Height sizes to test. Default is 64, but you can choose from: 32, 64.
+    e.g.: -ht 32""",
     )
     parser.add_argument(
         "-wd",
@@ -1199,7 +1209,8 @@ if __name__ == "__main__":
         default=[64],
         nargs="*",
         type=int,
-        help="Width sizes to test. Default is 64, but you can choose from: 32, 64.",
+        help="""Width sizes to test. Default is 64, but you can choose from: 32, 64.
+    e.g.: -wd 32""",
     )
     parser.add_argument(
         "-m",
@@ -1207,7 +1218,8 @@ if __name__ == "__main__":
         default=[0, 3],
         nargs="*",
         type=int,
-        help="Margin sizes to test. Default is 0, 3.",
+        help="""Margin sizes to test. Default is [0,3].
+    e.g.: -m 0""",
     )
     d_rs = {"neox": RotateStyle.NEOX, "gptj": RotateStyle.GPTJ}
     parser.add_argument(
@@ -1217,6 +1229,8 @@ if __name__ == "__main__":
         type=str,
         choices=list(d_rs.keys()),
         nargs="*",
+        help="""Rotate style. Default is all combinations of neox and gptj.
+    e.g.: -rs neox""",
     )
     d_rr = {
         # [0]: rotary percentage, [1]: reuse front part, [2]: nope first
@@ -1234,7 +1248,9 @@ if __name__ == "__main__":
         type=int,
         nargs="*",
         choices=list(d_rr.keys()),
-        help="Rotary percentage and reuse front part. Default is all combinations of (1.0, True, False), (1.0, False, False), (0.5, False, False), (0.5, True, False), (0.5, True, True), (0.5, False, True).",
+        help="""Rotary percentage and reuse front part. Default is all combinations of: 
+(1.0, True, False), (1.0, False, False), (0.5, False, False), (0.5, True, False), (0.5, True, True), (0.5, False, True).
+    e.g.: -rr 0  # for (1.0, True, False)""",
     )
 
     args = parser.parse_args()

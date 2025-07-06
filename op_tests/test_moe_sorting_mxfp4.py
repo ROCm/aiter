@@ -88,7 +88,10 @@ list_dim = [4096, 6144, 8192]
 list_Expert = [32, 256, 257, 512]
 list_topk = [5, 8]
 list_m = [1, 31, 64, 128, 256, 10000, 163840]
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -97,13 +100,16 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
-    "--dim",
+    "-dim",
     choices=list_dim,
     type=int,
     default=None,
+    help="""Model dimension.
+    e.g.: -dim 4096""",
 )
 parser.add_argument(
     "-e",
@@ -111,6 +117,8 @@ parser.add_argument(
     choices=list_Expert,
     type=int,
     default=None,
+    help="""Number of experts.
+    e.g.: -e 32""",
 )
 parser.add_argument(
     "-t",
@@ -118,11 +126,15 @@ parser.add_argument(
     choices=list_topk,
     type=int,
     default=None,
+    help="""Number of top experts.
+    e.g.: -t 5""",
 )
 parser.add_argument(
     "-m",
     type=int,
     default=None,
+    help="""M of mnk.
+    e.g.: -m 64""",
 )
 
 args = parser.parse_args()

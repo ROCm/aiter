@@ -892,14 +892,18 @@ def test_paged_attention(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test Paged Attention ragged.")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test Paged Attention ragged.",
+    )
     parser.add_argument(
         "-c",
         "--ctx_len",
         type=int,
         default=[1, 26, 128, 4097],
         nargs="*",
-        help="Context length for the test",
+        help="""Context length.
+    e.g. -c 128""",
     )
     parser.add_argument(
         "-p",
@@ -908,7 +912,7 @@ if __name__ == "__main__":
         choices=[member.name for member in PAVariant],
         default=[PAVariant.Shomy, PAVariant.Asm],
         nargs="*",
-        help=f"Paged Attention variant to test. {[member.name for member in PAVariant]}",
+        help="Paged Attention variant to test.\n" + "    e.g. -p Shomy\n",
     )
     parser.add_argument(
         "-q",
@@ -917,7 +921,8 @@ if __name__ == "__main__":
         choices=["none", "fp8", "i8"],
         default=[None, dtypes.fp8, dtypes.i8],
         nargs="*",
-        help="Quantization cache dtype.",
+        help="""Quantization cache dtype.
+        e.g. -q fp8""",
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()

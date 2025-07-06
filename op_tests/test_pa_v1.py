@@ -575,14 +575,18 @@ def test_paged_attention(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Test Paged Attention V1")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test Paged Attention V1",
+    )
     parser.add_argument(
         "-c",
         "--ctx_len",
         type=int,
         default=[2048],
         nargs="*",
-        help="Context length for the test",
+        help="""Context length.
+    e.g. -c 2048""",
     )
     parser.add_argument(
         "-p",
@@ -591,22 +595,28 @@ if __name__ == "__main__":
         choices=[member.name for member in PAVariant],
         default=[PAVariant.Shomy],
         nargs="*",
-        help=f"Paged Attention variant to test. {[member.name for member in PAVariant]}",
+        help=f"Paged Attention variant to test. {[member.name for member in PAVariant]}\n"
+        + "    e.g. -p Shomy\n",
     )
     parser.add_argument(
         "-q",
         "--quant_cache_dtype",
         type=str,
-        choices=[None],
+        choices=["none"],
         default=[None],
         nargs="*",
-        help="Quantization cache dtype.",
+        help="""Quantization cache dtype.
+    e.g. -q none""",
     )
 
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
     if not args.pa_variant == [PAVariant.Shomy]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
+    if not args.quant_cache_dtype == [None]:
+        args.quant_cache_dtype = [
+            None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
+        ]
 
     for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
         args.ctx_len,

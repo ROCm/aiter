@@ -72,7 +72,10 @@ l_mnk = [
     (8192, 8192, 1024),
 ]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -81,7 +84,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-b",
@@ -91,7 +95,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="batch size",
+    help="""Batch size.
+    e.g.: -b 16""",
 )
 parser.add_argument(
     "-mnk",
@@ -99,7 +104,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape of mnk, the format of input is m,n,k, e.g. -mnk 1280,8192,1024",
+    help="""shape of mnk.
+    e.g. -mnk 1280,8192,1024""",
 )
 
 args = parser.parse_args()

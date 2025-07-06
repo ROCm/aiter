@@ -290,7 +290,10 @@ def test_fmoe(
 l_dtype = ["bf16"]
 l_m = [1, 2, 5, 16, 32, 163840]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -299,7 +302,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 
 parser.add_argument(
@@ -308,18 +312,24 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
+    help="""M of mnk.
+    e.g.: -m 32""",
 )
 
 parser.add_argument(
-    "--dim",
+    "-dim",
     type=int,
     default=7168,
+    help="""Hidden dimension. Default is 7168.
+    e.g.: -dim 7168""",
 )
 
 parser.add_argument(
-    "--idim",
+    "-idim",
     type=int,
     default=256,
+    help="""Intermediate dimension. Default is 256.
+    e.g.: -idim 256""",
 )
 
 args = parser.parse_args()

@@ -339,7 +339,10 @@ def test_fmoe_ep(
         # checkAllclose(ref2, avg_ck, rtol=0.01, atol=10)
 
 
-parser = argparse.ArgumentParser(description="select test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="select test",
+)
 l_test = [
     "test_fmoe_16_bit",
     "g1u1_no_quant",
@@ -355,7 +358,8 @@ parser.add_argument(
     type=str,
     choices=l_test,
     default=None,
-    help="select test to run",
+    help="""Select test to run.
+    e.g.: -t g1u1_int8quant""",
 )
 args = parser.parse_args()
 if args.test is not None:

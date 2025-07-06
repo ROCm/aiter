@@ -643,7 +643,10 @@ def test_reshape_and_cache(
     )
 
 
-parser = argparse.ArgumentParser(description="selec run whicn test.")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="selec run whicn test.",
+)
 parser.add_argument(
     "-t",
     "--test",
@@ -665,7 +668,8 @@ parser.add_argument(
         "bf16tofp8_asm_pa128",
         "bf16tofp8_asm_pa256",
     ],
-    help="select which test to run, default is all",
+    help="""select which test to run, default is all
+    e.g.: -t fp16tofp8""",
 )
 args = parser.parse_args()
 for test in args.test:

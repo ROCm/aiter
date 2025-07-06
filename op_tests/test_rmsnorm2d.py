@@ -92,7 +92,10 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
 l_dtype = ["fp16", "bf16"]
 l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 l_n = [4096, 8192, 16384, 32768, 65536]
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -101,7 +104,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
@@ -109,6 +113,8 @@ parser.add_argument(
     type=int,
     nargs="?",
     default=None,
+    help="""M of mnk.
+    e.g.: -m 32""",
 )
 parser.add_argument(
     "-n",
@@ -116,6 +122,8 @@ parser.add_argument(
     type=int,
     nargs="?",
     default=None,
+    help="""N of mnk.
+    e.g.: -n 1024""",
 )
 
 args = parser.parse_args()

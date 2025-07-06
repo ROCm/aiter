@@ -182,7 +182,10 @@ l_expert = [64, 256]
 l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
 l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -191,7 +194,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-e",
@@ -201,12 +205,15 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of experts",
+    help="""Number of experts.
+    e.g.: -e 64""",
 )
 parser.add_argument(
     "-m",
     type=int,
     default=None,
+    help="""M of mnk.
+    e.g.: -m 64""",
 )
 parser.add_argument(
     "-t",
@@ -216,7 +223,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of tokens",
+    help="""Number of tokens.
+    e.g.: -t 64""",
 )
 
 args = parser.parse_args()

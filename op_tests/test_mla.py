@@ -382,16 +382,50 @@ list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
 list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
 
-parser = argparse.ArgumentParser(description="config input of test")
-parser.add_argument("-k", "--kv_lora_rank", type=int, default=512, help="kv lora rank")
-parser.add_argument(
-    "-qn", "--qk_nope_head_dim", type=int, default=128, help="qk nope head dim"
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
 )
 parser.add_argument(
-    "-qr", "--qk_rope_head_dim", type=int, default=64, help="qk rope head dim"
+    "-k",
+    "--kv_lora_rank",
+    type=int,
+    default=512,
+    help="""kv lora rank.
+    e.g.: -k 512""",
 )
-parser.add_argument("-vh", "--v_head_dim", type=int, default=128, help="v head dim")
-parser.add_argument("-blk", "--block_size", type=int, default=1, help="block size")
+parser.add_argument(
+    "-qn",
+    "--qk_nope_head_dim",
+    type=int,
+    default=128,
+    help="""qk nope head dim.
+    e.g.: -qn 128""",
+)
+parser.add_argument(
+    "-qr",
+    "--qk_rope_head_dim",
+    type=int,
+    default=64,
+    help="""qk rope head dim.
+    e.g.: -qr 64""",
+)
+parser.add_argument(
+    "-vh",
+    "--v_head_dim",
+    type=int,
+    default=128,
+    help="""v head dim.
+    e.g.: -vh 128""",
+)
+parser.add_argument(
+    "-blk",
+    "--block_size",
+    type=int,
+    default=1,
+    help="""Block size.
+    e.g.: -blk 1""",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -399,7 +433,8 @@ parser.add_argument(
     choices=["bf16"],
     nargs="*",
     default=["bf16"],
-    help="data type of Q",
+    help="""Data type of Q.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-kvd",
@@ -408,7 +443,8 @@ parser.add_argument(
     choices=["bf16"],
     nargs="*",
     default=["bf16"],
-    help="data type of KV",
+    help="""Data type of KV.
+    e.g.: -kvd bf16""",
 )
 parser.add_argument(
     "-c",
@@ -416,7 +452,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
-    help="context length",
+    help="""Context length.
+    e.g.: -c 21""",
 )
 parser.add_argument(
     "-b",
@@ -424,7 +461,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[1, 3, 5, 16, 32, 64, 128, 256],
-    help="batch size",
+    help="""Batch size.
+    e.g.: -b 16""",
 )
 parser.add_argument(
     "-n",
@@ -434,7 +472,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""Number of heads.
+    e.g.: -n 16,1""",
 )
 
 import pandas as pd

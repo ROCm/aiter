@@ -262,6 +262,7 @@ def test_reshape_and_cache(
 
 
 parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
     description="Test different data types of quant.",
 )
 parser.add_argument(
@@ -271,7 +272,8 @@ parser.add_argument(
     choices=["fp16tofp8", "fp16toi8", "bf16toi8"],
     default=["fp16tofp8", "fp16toi8", "bf16toi8"],
     nargs="*",
-    help="test type, default is all",
+    help="""select which test to run, default is all
+    e.g.: -t fp16tofp8""",
 )
 
 args = parser.parse_args()

@@ -810,7 +810,10 @@ l_num_heads = [(4, 1), (8, 1), (32, 8)]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
 l_dtype = ["fp16", "bf16"]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -819,7 +822,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 
 parser.add_argument(
@@ -830,7 +834,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of heads (num_query_heads, num_kv_heads)",
+    help="""Number of heads (num_query_heads, num_kv_heads)
+    e.g.: -n 4,1""",
 )
 
 parser.add_argument(
@@ -841,7 +846,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="context length",
+    help="""Context length.
+    e.g. -c 128""",
 )
 
 args = parser.parse_args()

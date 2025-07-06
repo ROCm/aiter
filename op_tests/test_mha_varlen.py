@@ -382,14 +382,18 @@ def test_flash_attn_varlen_func(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="config input of test")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
     parser.add_argument(
         "-b",
         "--batch_size",
         type=int,
         nargs="?",
         default=4,
-        help="batch size, e.g. -b 4",
+        help="""Batch size.
+    e.g.: -b 16""",
     )
     parser.add_argument(
         "-nh",
@@ -397,7 +401,8 @@ if __name__ == "__main__":
         type=int,
         nargs="?",
         default=4,
-        help="number of attention heads, e.g. -nheads 4",
+        help="""Number of attention heads.
+    e.g. -nh 4""",
     )
     parser.add_argument(
         "-s",
@@ -405,21 +410,24 @@ if __name__ == "__main__":
         type=dtypes.str2tuple,
         nargs="?",
         default=(4, 4),
-        help="sequence length of query, e.g. -s 4,4",
+        help="""Sequence length of query&key.
+    e.g. -s 4,4""",
     )
     parser.add_argument(
         "-d",
         type=int,
         nargs="?",
         default=192,
-        help="dimension of query and key, e.g. -d 192",
+        help="""Dimension of query&key.
+    e.g. -d 192""",
     )
     parser.add_argument(
         "-dv",
         type=int,
         nargs="?",
         default=192,
-        help="dimension of value, e.g. -dv 192",
+        help="""Dimension of value.
+    e.g. -dv 192""",
     )
     parser.add_argument(
         "-dp",
@@ -427,7 +435,8 @@ if __name__ == "__main__":
         type=float,
         nargs="?",
         default=0.0,
-        help="dropout probability, e.g. -dp 0.0",
+        help="""Dropout probability."
+    e.g. -dp 0.0""",
     )
     parser.add_argument(
         "-msq",
@@ -435,63 +444,75 @@ if __name__ == "__main__":
         type=int,
         nargs="?",
         default=1,
-        help="minimum sequence length of query, e.g. -msq 1",
+        help="""Minimum sequence length of query.
+    e.g. -msq 1""",
     )
     parser.add_argument(
         "-c",
         "--causal",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="use causal attention, default is True.",
+        help="""Causal attention, default is True.
+    -c or --causal    # enable causal attention
+    --no-causal       # disable causal attention""",
     )
     parser.add_argument(
         "-l",
         "--local",
         action="store_true",
         default=False,
-        help="use local attention, e.g. -l",
+        help="""Local attention. default is False.
+    e.g. -l or --local    # enable local attention""",
     )
     parser.add_argument(
         "-bt",
         "--bias_type",
         type=str,
         default="no",
-        help="type of bias",
+        help="Type of bias.",
     )
     parser.add_argument(
         "-det",
         "--deterministic",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="use deterministic attention, default is True.",
+        help="""Deterministic attention, default is True.
+    -det or --deterministic    # enable deterministic attention
+    --no-deterministic         # disable deterministic attention""",
     )
     parser.add_argument(
         "-mha",
         "--mha_type",
         type=str,
         default="mha",
-        help="type of multi-head attention, e.g. -mha mha/mqa/gqa",
+        help="""Type of multi-head attention.
+    e.g. -mha mha/mqa/gqa""",
     )
     parser.add_argument(
         "-dt",
         "--dtype",
         type=str,
         default="bf16",
-        help="data type",
+        help="""Data type.
+    e.g.: -dt bf16""",
     )
     parser.add_argument(
         "-rlse",
         "--return_lse",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="return logsumexp, default is False.",
+        help="""return logsumexp, default is False.
+    -rlse or --return_lse    # enable return logsumexp
+    --no-return_lse          # disable return logsumexp""",
     )
     parser.add_argument(
         "-rap",
         "--return_attn_probs",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="return attention probabilities, default is False.",
+        help="""return attention probabilities, default is False.
+    -rap or --return_attn_probs    # enable return attention probabilities
+    --no-return_attn_probs        # disable return attention probabilities""",
     )
 
     args = parser.parse_args()
