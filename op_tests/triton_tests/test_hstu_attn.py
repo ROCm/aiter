@@ -1,12 +1,8 @@
-import contextlib
-import os
-from typing import Optional
-
-import click
-import torch
 
 import pytest
-
+import os
+import torch
+from typing import Optional
 
 from .hstu_attention import (
     _AttentionFunction,
