@@ -259,17 +259,16 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
+        gfx = get_gfx()
         ret = alibi_slopes is None
         ret &= bias is None
         ret &= dropout_p == 0.0
         ret &= seqlen_q == seqlen_k
-        ret &= seqlen_q % 256 == 0
+        ret &= seqlen_q >= 384
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
-        ret &= mask or nmask
-        ret &= return_lse
-        # ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= (return_lse and gfx == "gfx950") or (mask and gfx == "gfx942")
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]

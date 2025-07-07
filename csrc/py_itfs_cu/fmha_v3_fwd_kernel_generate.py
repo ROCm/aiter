@@ -127,7 +127,6 @@ class fmha_fwd_v3_kernel
     {{
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
-        std::cout << "==================" << kernel_func_name << "==================" << std::endl;
         std::string AITER_ASM_DIR = "{F_AITER_ASM_DIR}";
         HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
@@ -224,10 +223,10 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
 }} // namespace aiter
 """
 
-# MI350 support list:
+# GFX950 support list:
 # lse: must
 # mask: option
-GFX942_DISPATCH = """
+GFX950_DISPATCH = """
             if (t.has_lse == true) {{
                 if (t.mask_type == mask_enum::no_mask) {{
                     using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
@@ -240,17 +239,17 @@ GFX942_DISPATCH = """
             }}
 """
 
-# MI300 support list:
+# GFX942 support list:
 # lse: option
-# mask: not support
-GFX950_DISPATCH = """
-            if ((t.mask_type == mask_enum::no_mask)) {{
+# mask: must be causal
+GFX942_DISPATCH = """
+            if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {{
                 if (t.has_lse == false) {{
-                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
+                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false>;
                     r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
                 }}
                 else {{
-                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
+                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false>;
                     r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
                 }}
             }}
