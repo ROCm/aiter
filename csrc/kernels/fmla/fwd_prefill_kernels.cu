@@ -2050,7 +2050,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 {
     constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
     //                                        dqk  dv   m0  n0   n1   #warp  wave_occu
-    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64,  256, 4,     2,   kXqaStrategy>;
+    using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 64,  256, 8,     1,   kXqaStrategy>;
     constexpr bool kForceOutAcc = false;
     using acc_t                 = float;
 
