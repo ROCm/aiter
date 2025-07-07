@@ -23,6 +23,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                                   bool has_lse,
                                   bool has_dropout,
                                   bool use_ext_asm,
+                                  bool v3_spec = false,
                                   bool skip_min_seqlen_q = false)
 {{
     return mha_fwd_traits(head_size_q,
@@ -35,6 +36,7 @@ mha_fwd_traits get_mha_fwd_traits(int head_size_q,
                           has_lse,
                           has_dropout,
                           use_ext_asm,
+                          v3_spec,
                           skip_min_seqlen_q);
 }}
 
@@ -70,7 +72,8 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
-              bool use_ext_asm)
+              bool use_ext_asm,
+              bool v3_spec)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -85,6 +88,7 @@ float mha_fwd(mha_fwd_args args,
                                      has_lse,
                                      has_dropout,
                                      use_ext_asm,
+                                     v3_spec,
                                      args.min_seqlen_q != 0);
     float t = -1;
     {F_inner_dispatch}
@@ -135,7 +139,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                      bias_type,
                                      has_lse,
                                      has_dropout,
-                                     use_ext_asm);
+                                     use_ext_asm,
+                                     v3_spec);
     return fmha_batch_prefill(traits, args, stream_config);
 }"""
 
