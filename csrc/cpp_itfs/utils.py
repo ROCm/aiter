@@ -26,6 +26,7 @@ AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
@@ -121,13 +122,15 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         "-U__HIP_NO_HALF_OPERATORS__",
         "-mllvm",
         "--amdgpu-kernarg-preload-count=16",
-        # "-v", "--save-temps",
         "-Wno-unused-result",
         "-Wno-switch-bool",
         "-Wno-vla-cxx-extension",
         "-Wno-undefined-func-template",
         "-fgpu-flush-denormals-to-zero",
     ]
+
+    if AITER_DEBUG:
+        cxxflags += ["-g", "-fverbose-asm", "--save-temps", "-Wno-gnu-line-marker"]
 
     # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
     hip_version = get_hip_version()
