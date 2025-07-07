@@ -144,7 +144,10 @@ l_dtype = ["bf16"]
 l_m = [1, 7, 31, 64, 128, 256, 163840]
 l_expert = [32, 256]
 l_topk = [5, 8]
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -153,12 +156,15 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
     default=None,
+    help="""M of mnk.
+    e.g.: -m 64""",
 )
 parser.add_argument(
     "-e",
@@ -168,7 +174,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of experts",
+    help="""Number of experts.
+    e.g.: -e 32""",
 )
 parser.add_argument(
     "-t",
@@ -178,7 +185,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="topk value",
+    help="""Number of top experts.
+    e.g.: -t 5""",
 )
 
 args = parser.parse_args()

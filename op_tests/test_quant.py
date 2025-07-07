@@ -76,7 +76,10 @@ l_n = [4096, 8192]
 l_m = [1, 2, 16, 32, 64, 128, 192, 256, 512, 1024, 16384, 163840]
 import pandas as pd
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -85,7 +88,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-n",
@@ -93,6 +97,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=None,
+    help="""N of mnk.
+    e.g.: -n 1024""",
 )
 parser.add_argument(
     "-m",
@@ -100,6 +106,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=None,
+    help="""M of mnk.
+    e.g.: -m 32""",
 )
 parser.add_argument(
     "-q",
@@ -108,7 +116,8 @@ parser.add_argument(
     choices=list(d_quant.keys()),
     nargs="*",
     default=list(d_quant.keys()),
-    help="quantization type",
+    help="""Quantization type.
+    e.g.: -q fp8_tensor""",
 )
 
 args = parser.parse_args()

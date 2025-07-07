@@ -437,7 +437,10 @@ l_quant = [
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -446,7 +449,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 
 parser.add_argument(
@@ -455,6 +459,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
+    help="""Model dimension.
+    e.g.: -dim 6144,4096""",
 )
 
 parser.add_argument(
@@ -464,14 +470,22 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of tokens",
+    help="""Number of tokens.
+    e.g.: -t 1024""",
 )
 
 parser.add_argument(
+    "-q",
     "--quant",
     type=int,
     choices=range(len(l_quant)),
-    help="select quantization type",
+    help="""select quantization type:
+    0 : aiter.QuantType.No, None, None),  # a16w16
+    1: aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8  # a8w8
+    2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
+    3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
+    4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test""",
 )
 
 parser.add_argument(
@@ -480,7 +494,8 @@ parser.add_argument(
     type=str,
     choices=["silu", "gelu"],
     default=None,
-    help="select activation type",
+    help="""Select activation type.
+    e.g.: -a silu""",
 )
 
 parser.add_argument(
@@ -490,7 +505,9 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="whether to do weight in stage 1",
+    help="""Whether to do weight in stage 1. Default is [False, True].
+    -s f    # False.
+    -s t    # True.""",
 )
 
 parser.add_argument(
@@ -498,7 +515,8 @@ parser.add_argument(
     "--expert",
     type=int,
     default=8,
-    help="number of experts",
+    help="""Number of experts.
+    e.g.: -e 8""",
 )
 
 parser.add_argument(
@@ -506,7 +524,8 @@ parser.add_argument(
     "--topk",
     type=int,
     default=2,
-    help="number of top experts",
+    help="""Number of top experts.
+    e.g.: -k 2""",
 )
 
 args = parser.parse_args()
