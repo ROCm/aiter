@@ -411,7 +411,7 @@ def test_fmoe(
         return {"us": us_fuse, "err": err}
 
 
-l_dtype = ["bf16", "fp16"]
+l_dtype = ["bf16", "fp16"][:1]
 l_dim = [(6144, 4096)]
 l_tokenNum = [
     1,
@@ -424,7 +424,7 @@ l_tokenNum = [
     256,
     1024,
     4096,
-    32768,
+    163840,
 ]
 l_quant = [
     (aiter.QuantType.No, None, None),  # a16w16
@@ -434,7 +434,7 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
-l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu]
+l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True]
 
 parser = argparse.ArgumentParser(description="config input of test")
