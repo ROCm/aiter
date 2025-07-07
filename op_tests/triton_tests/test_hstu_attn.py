@@ -3,6 +3,8 @@ import pytest
 import os
 import torch
 from typing import Optional, Tuple
+import torch.nn.functional as F
+
 from aiter.ops.triton.hstu_attention import (
     _AttentionFunction,
 )
