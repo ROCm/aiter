@@ -3,11 +3,9 @@ import pytest
 import os
 import torch
 from typing import Optional
-
-from .hstu_attention import (
+from aiter.ops.triton.hstu_attention import (
     _AttentionFunction,
 )
-
 
 from .hstu_attention_ref import (
     pytorch_hstu_mha
