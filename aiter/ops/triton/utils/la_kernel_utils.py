@@ -377,6 +377,9 @@ def la_persistent(
         print(
             f"    b_seq_size={b_seq_size}, k_offs.shape={k_offs.shape}, k_offs={k_offs}"
         )
+        print(
+            f"    b_seq_size={b_seq_size}, v_offs.shape={v_offs.shape}, v_offs={v_offs}"
+        )
         # k_ptrs = K + k_offs
         # k_ptrs = tl.multiple_of(k_ptrs,(16,1))
         # v_ptrs = V + v_offs
@@ -392,7 +395,7 @@ def la_persistent(
             + offs_m[:, None] * stride_qm
             + offs_k[None, :] * stride_qk
         )
-        # print(f"    q_idx={q_idx}, q_offs.shape={q_offs.shape}, q_offs={q_offs}")
+        print(f"    q_idx={q_idx}, q_offs.shape={q_offs.shape}, q_offs={q_offs}")
         o_h_offs = (
             q_idx * BLOCK_M * stride_om
             + tile_head_idx * stride_oh
@@ -409,7 +412,7 @@ def la_persistent(
 
         # q = tl.load(q_ptrs)
         offs_m = torch.arange(BLOCK_M)
-        OFFSM = q_idx * BLOCK_M + offs_m
+        # OFFSM = q_idx * BLOCK_M + offs_m
         offs_n = torch.arange(BLOCK_N)
         for l_iter in range(local_iter, local_iter_end):
             """
@@ -462,7 +465,7 @@ def la_persistent(
                 + offs_m[:, None] * stride_opm
                 + offs_k[None, :] * stride_opn
             )
-            print(f" Non host block write partial result")
+            print(" Non host block write partial result")
             print(f"mp_ptrs.shape={mp_ptrs.shape}")
             print(f"mp_ptrs={mp_ptrs}")
             # print(f"Mp.shape={Mp.shape}, Mp={Mp}")
@@ -486,7 +489,7 @@ def la_persistent(
                 + offs_m[:, None] * stride_om
                 + offs_k[None, :] * stride_on
             )
-            o_ptrs = Out + o_h_offs
+            # o_ptrs = Out + o_h_offs
             if not finishing_block:
                 # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
                 """
@@ -537,8 +540,9 @@ def la_persistent(
                         + offs_k[None, :] * stride_opn
                     )
                     print(f"    Host-NonFinishing block offs_mplp={offs_mplp}")
-                    # print(f"    Host-NonFinishing block mp_ptrs={mp_ptrs}")
-                    op_ptrs = Op + op_h_offs
+                    print(f"    Host-NonFinishing block mp_ptrs={mp_ptrs}")
+                    print(f"    Host-NonFinishing block lp_ptrs={lp_ptrs}")
+                    # op_ptrs = Op + op_h_offs
 
         # update iter
         iter = iter + (local_iter_end - local_iter)
@@ -599,7 +603,7 @@ def main():
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
     # Triton LeanAttention output
-    la_out = persistent_lean_attention(
+    persistent_lean_attention(
         q,
         k,
         v,
