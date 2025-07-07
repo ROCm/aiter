@@ -475,8 +475,19 @@
     "module_aiter_operator": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_operator_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/include/aiter_operator.h'",
-            "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'",
+            "f'{AITER_CSRC_DIR}/include/binary_operator.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/binary_operator.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/generate_binaryop.py --working_path {{}} --optype all --dtypes all'"
+    },
+    "module_aiter_unary": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/aiter_unary_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/unary_operator.cu'"
         ],
         "flags_extra_cc": [],
@@ -484,7 +495,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/kernels/generate_binaryop.py --working_path {{}}'"
+        "blob_gen_cmd": "''"
     },
     "module_quant": {
         "srcs": [
@@ -493,7 +504,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DENABLE_FP8'"
+            "'-DENABLE_FP8'",
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -756,11 +768,8 @@
         "srcs": [
             "f'{AITER_GRADLIB_DIR}/csrc/rocsolgemm.cu'"
         ],
-        "flags_extra_cc": [
-            "'-O3'"
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-O3'",
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'"
@@ -776,11 +785,8 @@
         "srcs": [
             "f'{AITER_GRADLIB_DIR}/csrc/hipbsolgemm.cu'"
         ],
-        "flags_extra_cc": [
-            "'-O3'"
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-O3'",
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'",

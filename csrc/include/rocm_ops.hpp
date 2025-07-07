@@ -17,7 +17,8 @@
     m.def("add_", &aiter_add_, "apply for add_ with transpose and broadcast."); \
     m.def("mul_", &aiter_mul_, "apply for mul_ with transpose and broadcast."); \
     m.def("sub_", &aiter_sub_, "apply for sub_ with transpose and broadcast."); \
-    m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast."); \
+    m.def("div_", &aiter_div_, "apply for div_ with transpose and broadcast.");
+#define AITER_UNARY_PYBIND                                                      \
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid.");                     \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
@@ -323,7 +324,8 @@
           py::arg("WQ"),            \
           py::arg("x_scale"),       \
           py::arg("w_scale"),       \
-          py::arg("Out"));
+          py::arg("Out"),           \
+          py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND \
     m.def("gemm_a8w8_blockscale",   \

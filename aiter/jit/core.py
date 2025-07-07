@@ -10,7 +10,7 @@ import types
 import importlib
 import functools
 import traceback
-from typing import List, Optional
+from typing import List, Optional, Callable, Any
 import logging
 import json
 import multiprocessing
@@ -290,6 +290,7 @@ def build_module(
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
             "-Wno-macro-redefined",
+            "-Wno-missing-template-arg-list-after-template-kw",
             "-fgpu-flush-denormals-to-zero",
         ]
 
@@ -478,7 +479,11 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
-def compile_ops(_md_name: str, fc_name: Optional[str] = None):
+def compile_ops(
+    _md_name: str,
+    fc_name: Optional[str] = None,
+    gen_func: Optional[Callable[..., dict[str, Any]]] = None,
+):
     def decorator(func):
         func.arg_checked = False
 
@@ -497,6 +502,9 @@ def compile_ops(_md_name: str, fc_name: Optional[str] = None):
                     rebuilded_list.append(md_name)
                     raise ModuleNotFoundError("")
                 if module is None:
+                    if gen_func is not None:
+                        gen_build_args = gen_func(*args, **kwargs)
+                        custom_build_args.update(gen_build_args)
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
             except ModuleNotFoundError:

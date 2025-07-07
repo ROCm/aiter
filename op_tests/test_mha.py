@@ -301,20 +301,111 @@ def test_flash_attn_output(
         assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
 
-parser = argparse.ArgumentParser(description="config input of test")
-parser.add_argument("-b", "--batch_size", type=int, default=2)
-parser.add_argument("-n", "--nheads", type=int, default=5)
-parser.add_argument("-q", "--seqlen_q", type=int, default=512)
-parser.add_argument("-k", "--seqlen_k", type=int, default=512)
-parser.add_argument("-d", "--d", type=int, default=128)
-parser.add_argument("-v", "--d_v", type=int, default=128)
-parser.add_argument("-p", "--dropout_p", type=float, default=0.0)
-parser.add_argument("-c", "--causal", action="store_true")
-parser.add_argument("-l", "--local", action="store_true")
-parser.add_argument("-bt", "--bias_type", type=str, default="no")
-parser.add_argument("-det", "--deterministic", action="store_true")
-parser.add_argument("-m", "--mha_type", type=str, default="mha")
-parser.add_argument("-dtype", "--dtype", type=str, default="bf16")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-b",
+    "--batch_size",
+    type=int,
+    default=2,
+    help="""Batch size. Default is 2.
+    e.g.: -b 16""",
+)
+parser.add_argument(
+    "-n",
+    "--nheads",
+    type=int,
+    default=5,
+    help="""Number of heads. Default is 5.
+    e.g.: -n 8""",
+)
+parser.add_argument(
+    "-q",
+    "--seqlen_q",
+    type=int,
+    default=512,
+    help="""Sequence length for query. Default is 512.
+    e.g.: -q 1024""",
+)
+parser.add_argument(
+    "-k",
+    "--seqlen_k",
+    type=int,
+    default=512,
+    help="""Sequence length for key. Default is 512.
+    e.g.: -k 1024""",
+)
+parser.add_argument(
+    "-d",
+    "--d",
+    type=int,
+    default=128,
+    help="""Dimension of query and key. Default is 128.
+    e.g.: -d 256""",
+)
+parser.add_argument(
+    "-v",
+    "--d_v",
+    type=int,
+    default=128,
+    help="""Dimension of value. Default is 128.
+    e.g.: -v 256""",
+)
+parser.add_argument(
+    "-p",
+    "--dropout_p",
+    type=float,
+    default=0.0,
+    help="""Dropout probability. Default is 0.0.
+    e.g.: -p 0.1""",
+)
+parser.add_argument(
+    "-c",
+    "--causal",
+    action="store_true",
+    help="""Causal attention. Default is False.
+    -c or --causal    # enable causal attention""",
+)
+parser.add_argument(
+    "-l",
+    "--local",
+    action="store_true",
+    help="""Local attention. Default is False.
+    -l or --local    # enable local attention""",
+)
+parser.add_argument(
+    "-bt",
+    "--bias_type",
+    type=str,
+    default="no",
+    help="""Bias type. Default is 'no'.
+    e.g.: -bt no""",
+)
+parser.add_argument(
+    "-det",
+    "--deterministic",
+    action="store_true",
+    help="""Deterministic attention. Default is False.
+    -det or --deterministic    # enable deterministic attention""",
+)
+parser.add_argument(
+    "-m",
+    "--mha_type",
+    type=str,
+    default="mha",
+    help="""Type of multi-head attention.
+    e.g.: -m mha""",
+)
+parser.add_argument(
+    "-dtype",
+    "--dtype",
+    type=str,
+    default="bf16",
+    help="""Data type.
+    e.g.: -d bf16""",
+)
 if __name__ == "__main__":
     args = parser.parse_args()
     dtype = dtypes.d_dtypes[args.dtype]

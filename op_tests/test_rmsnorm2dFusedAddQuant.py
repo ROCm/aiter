@@ -255,6 +255,7 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant(l_m: list, l_n: list):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
         prog="test_rmsnorm2dFusedSQuant",
         description="Test ck rmsnorm2d Fused add and SmoothQuant",
     )
@@ -272,12 +273,16 @@ if __name__ == "__main__":
         type=int,
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
         nargs="*",
+        help="""M of mnk.
+    e.g.: -m 32""",
     )
     parser.add_argument(
         "-n",
         type=int,
         default=[1024, 2048],
         nargs="*",
+        help="""N of mnk.
+    e.g.: -n 1024""",
     )
     # parser.add_argument(
     #     "--GPUID",
