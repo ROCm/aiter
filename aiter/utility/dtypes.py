@@ -11,7 +11,7 @@ defaultDtypes = {
 
 
 def get_dtype_fp8():
-    return defaultDtypes[get_gfx()]["fp8"]
+    return defaultDtypes.get(get_gfx(), {"fp8": torch.uint8})["fp8"]
 
 
 i4x2 = getattr(torch, "int4", torch.uint8)
