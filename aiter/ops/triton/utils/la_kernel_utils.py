@@ -468,6 +468,7 @@ def la_persistent(
             print(" Non host block write partial result")
             print(f"mp_ptrs.shape={mp_ptrs.shape}")
             print(f"mp_ptrs={mp_ptrs}")
+            print(f"op_ptrs={op_ptrs}")
             # print(f"Mp.shape={Mp.shape}, Mp={Mp}")
 
             # tl.store(mp_ptrs, m_i, cache_modifier=".wt")
@@ -489,6 +490,7 @@ def la_persistent(
                 + offs_m[:, None] * stride_om
                 + offs_k[None, :] * stride_on
             )
+            print(f"o_h_offs={o_h_offs}")
             # o_ptrs = Out + o_h_offs
             if not finishing_block:
                 # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
@@ -542,6 +544,7 @@ def la_persistent(
                     print(f"    Host-NonFinishing block offs_mplp={offs_mplp}")
                     print(f"    Host-NonFinishing block mp_ptrs={mp_ptrs}")
                     print(f"    Host-NonFinishing block lp_ptrs={lp_ptrs}")
+                    print(f"    Host-NonFinishing block op_h_offs={op_h_offs}")
                     # op_ptrs = Op + op_h_offs
 
         # update iter
