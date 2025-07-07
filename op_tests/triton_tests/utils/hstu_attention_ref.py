@@ -1,8 +1,9 @@
 
 import torch
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 import torch.nn.functional as F
 
+# create attention mask
 def _get_valid_attn_mask(
     device: torch.device,
     causal: bool,
@@ -57,6 +58,7 @@ def _get_valid_attn_mask(
     return valid_attn_mask
 
 
+# convert sequence input from jagged format to padded dense format 
 def jagged_to_padded_dense(q: torch.Tensor, offsets: torch.Tensor, max_seq_len: int, padding_value):
     assert len(q.shape) == 2, "q needs to be 2-dim tensor"
     L, D = q.shape
@@ -71,7 +73,8 @@ def jagged_to_padded_dense(q: torch.Tensor, offsets: torch.Tensor, max_seq_len: 
     return padded_q
 
 
-def pad_sequence_1(q: torch.Tensor, seq_offsets: torch.Tensor, N: int, padding_value):
+# pad sequence according to max sequence len
+def pad_sequence(q: torch.Tensor, seq_offsets: torch.Tensor, N: int, padding_value):
     L, D = q.shape
     padded_q = jagged_to_padded_dense(
         q.reshape(L, D),
@@ -83,7 +86,7 @@ def pad_sequence_1(q: torch.Tensor, seq_offsets: torch.Tensor, N: int, padding_v
     return padded_q
 
 
-def _pad_qkv(
+def qkv_to_padded_dense(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -92,13 +95,14 @@ def _pad_qkv(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     L, H, D = q.shape
     V = v.shape[2]
-    padded_q = pad_sequence_1(q.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2)
-    padded_k = pad_sequence_1(k.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2)
-    padded_v = pad_sequence_1(v.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2)
+    padded_q = pad_sequence(q.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2)
+    padded_k = pad_sequence(k.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2)
+    padded_v = pad_sequence(v.reshape(L, H * D), seq_offsets, N, 0.0).view(-1, N, H, D).transpose(1, 2)
     
     return padded_q, padded_k, padded_v
 
 
+# convert sequences from dense format to jagged format
 def dense_to_jagged(seq: torch.Tensor, offsets: torch.Tensor, L: int):
     B, N, HV = seq.shape
     assert L == offsets[-1], f"jagged dim mismatch {offsets[-1]} != {L}!"
@@ -112,7 +116,8 @@ def dense_to_jagged(seq: torch.Tensor, offsets: torch.Tensor, L: int):
     return out
 
 
-def pytorch_hstu_mha(
+#torch hstu reference implementation
+def torch_hstu_attention(
     max_seq_len: int,
     alpha: float,
     q: torch.Tensor,
@@ -129,7 +134,7 @@ def pytorch_hstu_mha(
 ) -> torch.Tensor:
     L, H, _ = q.shape
     V = v.shape[2]
-    q, k, v = _pad_qkv(
+    q, k, v = qkv_to_padded_dense(
         q, k, v, seq_offsets, max_seq_len
     )  # [B, H, N, D) and [B, H, N, V]
     qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
@@ -154,4 +159,3 @@ def pytorch_hstu_mha(
         seq_offsets,
         L,
     ).view(L, H, V)
-
