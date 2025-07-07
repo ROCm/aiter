@@ -273,7 +273,10 @@ def test_batch_prefill_with_paged_kv_cache(
 l_causal = [False, True]
 l_logits_soft_cap = [0.0, 30.0]
 l_dtype = ["fp16", "bf16"]
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-c",
     "--causal",
@@ -281,7 +284,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="causal mask mode",
+    help="""Causal mask mode (False or True).
+    e.g.: -c false""",
 )
 parser.add_argument(
     "-l",
@@ -291,7 +295,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="logits soft cap value",
+    help="""Logits soft cap.
+    e.g.: -l 30.0""",
 )
 parser.add_argument(
     "-d",
@@ -301,7 +306,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from csrc.cpp_itfs.utils import (
     not_built,
     run_lib,
 )
-from aiter.aot.triton.compile import compile_kernel
+from triton.tools.compile import compile_kernel, CompileArgs
 import triton
 import functools
 
@@ -56,16 +56,23 @@ def compile(
             kernel_name = "_ZN5aiter39mla_dec_stage1_bf16_a16w16_subQ16_mqa16E"
 
         bin_size, bin_data = transfer_hsaco(hsaco_path)
-        triton_kernel, triton_header, triton_source = compile_kernel(
-            f"{AITER_CORE_DIR}/aiter/mla.py",
-            "_fwd_kernel_stage2_asm",
-            f"*fp32:16,*fp32:16,*bf16:16,*i32:16,*i32:16,i32,i32,i32,i32,i32,i32,i32,i32,{num_kv_splits},{triton.next_power_of_2(v_head_dim)},{v_head_dim},{mgcs[gqa_ratio]}",
-            "bs,nheads,max_seqlen_q",
-            4,
-            2,
-            "decode_mla_stage2_asm",
-            waves_per_eu=4,
+        compile_args = CompileArgs(
+            path=f"{AITER_CORE_DIR}/aiter/mla.py",
+            kernel_name="_fwd_kernel_stage2_asm",
+            signature=f"*fp32:16,*fp32:16,*bf16:16,*i32:16,*i32:16,i32,i32,i32,i32,i32,i32,i32,i32,{num_kv_splits},{triton.next_power_of_2(v_head_dim)},{v_head_dim},{mgcs[gqa_ratio]}",
+            grid="bs,nheads,max_seqlen_q",
+            num_warps=4,
+            num_stages=2,
+            out_name="decode_mla_stage2_asm",
         )
+        triton_kernel, output_files = compile_kernel(compile_args)
+        triton_header = None
+        triton_source = None
+        for output_file in output_files:
+            if output_file.suffix == ".h":
+                triton_header = output_file
+            elif output_file.suffix == ".cpp":
+                triton_source = output_file
 
         return compile_template_op(
             src_template,

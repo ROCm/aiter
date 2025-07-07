@@ -24,8 +24,6 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
 
-#define GCN_MFMA_INSTR1 __builtin_amdgcn_mfma_f32_16x16x4f32
-#define GCN_MFMA_INSTR __builtin_amdgcn_mfma_f32_4x4x4f16
 
 using floatx4   = __attribute__((__vector_size__(4 * sizeof(float)))) float;
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(_Float16)))) _Float16;
@@ -73,26 +71,6 @@ __device__ __forceinline__ _B16x8 load_ntmprl_16Byte(const _B16x8* addr)
     auto dat3       = loadnt(addr_alias + 3);
     auto res        = make_float4(dat0, dat1, dat2, dat3);
     return *reinterpret_cast<_B16x8*>(&res);
-}
-///////////////////////////////////
-
-template <typename T, int absz, int cbid, int blgp>
-__device__ __forceinline__ floatx4 gcn_mfma4x4x4_instr(const _B16x4& inpA,
-                                                       const _B16x4& inpB,
-                                                       const floatx4& inpC)
-{
-    if constexpr(std::is_same<T, _Float16>::value)
-    {
-        return __builtin_amdgcn_mfma_f32_4x4x4f16(inpA, inpB, inpC, absz, cbid, blgp);
-    }
-    else if constexpr(std::is_same<T, __hip_bfloat16>::value)
-    {
-        return __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(inpA, inpB, inpC, absz, cbid, blgp);
-    }
-    else
-    {
-        static_assert(false, "unsupported 16b dtype");
-    }
 }
 
 #if defined(__gfx950__)
@@ -283,50 +261,6 @@ __device__ __forceinline__ _B16x4 addx4(const _B16x4& inp1, const _B16x4& inp2)
     }
 }
 
-template <typename T, vllm::Fp8KVCacheDataType KV_DTYPE>
-__device__ __forceinline__ _B16x8 scaled_convert_b8x8(const _B8x8 input, const float scale)
-{
-    union alignas(16)
-    {
-        uint4 u4;
-        _B16x8 u16x8;
-        vllm::bf16_8_t b16x8;
-    } tmp;
-    if constexpr(std::is_same<T, _Float16>::value)
-    {
-        tmp.u4 = vllm::fp8::scaled_convert<uint4, _B8x8, KV_DTYPE>(input, scale);
-        return tmp.u16x8;
-    }
-    else if constexpr(std::is_same<T, __hip_bfloat16>::value)
-    {
-        tmp.b16x8 = vllm::fp8::scaled_convert<vllm::bf16_8_t, _B8x8, KV_DTYPE>(input, scale);
-        return tmp.u16x8;
-    }
-    else
-    {
-        static_assert(false, "unsupported 16b dtype");
-    }
-}
-
-template <typename T>
-__device__ __forceinline__ _B16x8 scaled_convert_b8x8_custom(const _B8x8 input, const float scale)
-{
-    union
-    {
-        floatx4 f32x4[2];
-        vllm::Float8_ f32x8;
-    } tmpf8;
-    tmpf8.f32x8 =
-        vllm::fp8::vec_conversion<vllm::Float8_, uint2>(*reinterpret_cast<const uint2*>(&input));
-
-    tmpf8.f32x4[0] *= scale;
-    tmpf8.f32x4[1] *= scale;
-
-    _B16x8 ret;
-    ret.xy[0] = from_floatx4<T>(tmpf8.f32x4[0]);
-    ret.xy[1] = from_floatx4<T>(tmpf8.f32x4[1]);
-    return ret;
-}
 
 __device__ __forceinline__ floatx4 to_float_fp8x4(const _B8x4& inp)
 {
@@ -401,7 +335,6 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input)
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
-          typename OUTT,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -427,7 +360,6 @@ __device__ void _paged_attention_kernel(
                                     // max_num_partitions]
     scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
                                     // head_size]
-    OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* k_scale_ptr,
@@ -504,8 +436,6 @@ __device__ void _paged_attention_kernel(
 
     const int num_context_blocks = DIVIDE_ROUND_UP(context_len, BLOCK_SIZE);
     const int last_ctx_block     = num_context_blocks - 1;
-
-    
 
     int kphysical_block_number[TLOOP];
 
@@ -626,20 +556,6 @@ __device__ void _paged_attention_kernel(
 
     int vphysical_block_number[VTLOOP][VBLOCKS_PER_LANE];
 
-#define DEBUG_PRINT 0
-#define THREAD_IDX 255
-#define BLOCK_IDX 0
-
-#if DEBUG_PRINT
-#define DEBUG_STMTS(stmts)                                   \
-    if(threadIdx.x == THREAD_IDX && blockIdx.y == BLOCK_IDX) \
-    {                                                        \
-        stmts                                                \
-    }
-#else
-#define DEBUG_STMTS(stmts)
-#endif
-
     // fetch v physical block numbers
     for(int vtoken_depth = 0; vtoken_depth < VTLOOP; vtoken_depth++)
     {
@@ -652,16 +568,6 @@ __device__ void _paged_attention_kernel(
             const int vblock_idx =
                 (vglobal_token_idx < context_len) ? vglobal_token_idx / BLOCK_SIZE : last_ctx_block;
             vphysical_block_number[vtoken_depth][vblock_depth] = block_table_seq[vblock_idx];
-
-            DEBUG_STMTS(printf("[POYENC] id: (%3d, %3d), loop: (%d, %d), vlocal_token_idx: %3d, "
-                               "vglobal_token_idx: %3d, vblock_idx: %2d\n",
-                               BLOCK_IDX,
-                               THREAD_IDX,
-                               vtoken_depth,
-                               vblock_depth,
-                               vlocal_token_idx,
-                               vglobal_token_idx,
-                               vblock_idx);)
         }
     }
 

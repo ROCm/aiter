@@ -193,61 +193,61 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
     print(" [passed~]")
 
 
-def test_rmsnorm2d():
+def test_rmsnorm2d(l_m: list, l_n: list):
     print("\nstart rmsnorm2d test")
     for dtype in [dtypes.bf16]:
-        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-            for n in [1024, 2048]:
+        for m in l_m:
+            for n in l_n:
                 test_rmsnorm2d_instance(dtype, m, n)
 
 
-def test_rmsnorm2d_fuseAdd():
+def test_rmsnorm2d_fuseAdd(l_m: list, l_n: list):
     print("\nstart rmsnorm2d fuse add test")
     for dtype in [dtypes.bf16]:
-        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-            for n in [1024, 2048]:
+        for m in l_m:
+            for n in l_n:
                 test_rmsnorm2d_fuseAdd_instance(dtype, m, n)
 
 
-def test_rmsnorm2d_fuseSmoothquant():
+def test_rmsnorm2d_fuseSmoothquant(l_m: list, l_n: list):
     print("\nstart rmsnorm2d fuse Smoothquant test")
     for scaleType in [dtypes.fp32]:
         for dtype in [dtypes.bf16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [1024, 2048]:
+            for m in l_m:
+                for n in l_n:
                     test_rmsnorm2d_fuseSmoothquant_instance(
                         dtype, m, n, xscaleType=scaleType, yscaleType=scaleType
                     )
 
 
-def test_rmsnorm2d_fuseAdd_Smoothquant():
+def test_rmsnorm2d_fuseAdd_Smoothquant(l_m: list, l_n: list):
     print("\nstart rmsnorm2d fuse add Smoothquant test")
     for scaleType in [dtypes.fp32]:
         for dtype in [dtypes.bf16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [1024, 2048]:
+            for m in l_m:
+                for n in l_n:
                     test_rmsnorm2d_fuseAdd_Smoothquant_instance(
                         dtype, m, n, xscaleType=scaleType, yscaleType=scaleType
                     )
 
 
-def test_rmsnorm2d_fuseDynamicquant():
+def test_rmsnorm2d_fuseDynamicquant(l_m: list, l_n: list):
     print("\nstart rmsnorm2d fuse Smoothquant test")
     for scaleType in [dtypes.fp32]:
         for dtype in [dtypes.fp16, dtypes.bf16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [1024, 2048]:
+            for m in l_m:
+                for n in l_n:
                     test_rmsnorm2d_fuseDynamicquant_instance(
                         dtype, m, n, yscaleType=scaleType
                     )
 
 
-def test_rmsnorm2d_fuseAdd_Dynamicquant():
+def test_rmsnorm2d_fuseAdd_Dynamicquant(l_m: list, l_n: list):
     print("\nstart rmsnorm2d fuse add Smoothquant test")
     for scaleType in [dtypes.fp32]:
         for dtype in [dtypes.fp16, dtypes.bf16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [1024, 2048]:
+            for m in l_m:
+                for n in l_n:
                     test_rmsnorm2d_fuseAdd_Dynamicquant_instance(
                         dtype, m, n, yscaleType=scaleType
                     )
@@ -255,6 +255,7 @@ def test_rmsnorm2d_fuseAdd_Dynamicquant():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
         prog="test_rmsnorm2dFusedSQuant",
         description="Test ck rmsnorm2d Fused add and SmoothQuant",
     )
@@ -267,6 +268,22 @@ if __name__ == "__main__":
         + "5:test_rmsnorm2d_fuseDynamicquant, \n6:test_rmsnorm2d_fuseAdd_Dynamicquant",
         default=1,
     )
+    parser.add_argument(
+        "-m",
+        type=int,
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        nargs="*",
+        help="""M of mnk.
+    e.g.: -m 32""",
+    )
+    parser.add_argument(
+        "-n",
+        type=int,
+        default=[1024, 2048],
+        nargs="*",
+        help="""N of mnk.
+    e.g.: -n 1024""",
+    )
     # parser.add_argument(
     #     "--GPUID",
     #     type=str,
@@ -275,14 +292,14 @@ if __name__ == "__main__":
     # )
     args = parser.parse_args()
     if args.mode == 1:
-        test_rmsnorm2d()
+        test_rmsnorm2d(args.m, args.n)
     elif args.mode == 2:
-        test_rmsnorm2d_fuseAdd()
+        test_rmsnorm2d_fuseAdd(args.m, args.n)
     elif args.mode == 3:
-        test_rmsnorm2d_fuseSmoothquant()
+        test_rmsnorm2d_fuseSmoothquant(args.m, args.n)
     elif args.mode == 4:
-        test_rmsnorm2d_fuseAdd_Smoothquant()
+        test_rmsnorm2d_fuseAdd_Smoothquant(args.m, args.n)
     elif args.mode == 5:
-        test_rmsnorm2d_fuseDynamicquant()
+        test_rmsnorm2d_fuseDynamicquant(args.m, args.n)
     elif args.mode == 6:
-        test_rmsnorm2d_fuseAdd_Dynamicquant()
+        test_rmsnorm2d_fuseAdd_Dynamicquant(args.m, args.n)

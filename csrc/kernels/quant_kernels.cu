@@ -144,7 +144,7 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     inverted_scale =
         std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? inverted_scale : 1.0f / inverted_scale;
 
-    using DTYPE_STORE = ck_tile::vector_traits<DTYPE_O>::scalar_type;
+    using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
     auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global, ck_tile::amd_buffer_coherence_enum::glc>(out_ptr, oob_o);
     buffer_o.init_raw();

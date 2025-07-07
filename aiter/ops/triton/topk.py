@@ -39,7 +39,7 @@ def _topk_kernel(
     out_v_ptr = OUT_V + pid * stride_ovm
     out_i_ptr = OUT_I + pid * stride_oim
 
-    # unrolled exactly K iterations — no break/continue needed
+    # unrolled exactly K iterations -- no break/continue needed
     for j in core.static_range(0, K):
         vmax = tl.max(vals, axis=0)
         eq = vals == vmax
@@ -68,7 +68,7 @@ def one_stage_topk(
     B, M = x.shape
     BLOCK = _pick_block(M, k)
     if M > BLOCK or BLOCK > 1024:
-        raise ValueError("row length too large for this kernel (≤1024)")
+        raise ValueError("row length too large for this kernel (<=1024)")
 
     out_v = torch.empty((B, k), device=x.device, dtype=x.dtype)
     out_i = torch.empty((B, k), device=x.device, dtype=torch.int64)
@@ -355,9 +355,9 @@ chosen automatically based on the row length "M".
 
 Algorithm selection
 -------------------
-- 1-stage kernel - used when M ≤ 1024 ("tiny" rows).  
+- 1-stage kernel - used when M <= 1024 ("tiny" rows).
   Each row is processed by one Triton launch.
-- 2-stage kernel - used when M > 1024 ("large" rows).  
+- 2-stage kernel - used when M > 1024 ("large" rows).
   The row is first tiled, each tile computes a local Top-K, and the partial
   results are merged in a second stage.
 

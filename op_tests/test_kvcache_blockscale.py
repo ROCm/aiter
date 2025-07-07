@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, run_perftest, benchmark
 from typing import Tuple
 from aiter import dtypes
 import functools
+import argparse
 
 MAX_TOKEN_SUPPORTED = 16384
 
@@ -642,75 +643,109 @@ def test_reshape_and_cache(
     )
 
 
-print("\nstart quant fp16->fp8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.fp16,
-    dtypes.fp8,
-    quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="selec run whicn test.",
 )
-print("\nstart quant fp16->i8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.fp16,
-    dtypes.i8,
-    quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.i8},
+parser.add_argument(
+    "-t",
+    "--test",
+    type=str,
+    choices=[
+        "fp16tofp8",
+        "fp16toi8",
+        "bf16toi8",
+        "bf16tofp8",
+        "bf16tofp8_asm_pa128",
+        "bf16tofp8_asm_pa256",
+    ],
+    nargs="*",
+    default=[
+        "fp16tofp8",
+        "fp16toi8",
+        "bf16toi8",
+        "bf16tofp8",
+        "bf16tofp8_asm_pa128",
+        "bf16tofp8_asm_pa256",
+    ],
+    help="""select which test to run, default is all
+    e.g.: -t fp16tofp8""",
 )
-print("\nstart quant bf16->i8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.bf16,
-    dtypes.i8,
-    quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.i8},
-)
-
-print("\nstart quant bf16->fp8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    128,
-    dtypes.bf16,
-    dtypes.fp8,
-    quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
-)
-
-
-print("\nstart quant bf16->fp8, for asm pa ori_block_size=128")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.bf16,
-    dtypes.fp8,
-    quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
-    ori_block_size=128,
-)
-
-print("\nstart quant bf16->fp8, for asm pa ori_block_size=256")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.bf16,
-    dtypes.fp8,
-    quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
-    ori_block_size=256,
-)
+args = parser.parse_args()
+for test in args.test:
+    if test == "fp16tofp8":
+        print("\nstart quant fp16->fp8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.fp16,
+            dtypes.fp8,
+            quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
+        )
+    elif test == "fp16toi8":
+        print("\nstart quant fp16->i8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.fp16,
+            dtypes.i8,
+            quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.i8},
+        )
+    elif test == "bf16toi8":
+        print("\nstart quant bf16->i8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.bf16,
+            dtypes.i8,
+            quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.i8},
+        )
+    elif test == "bf16tofp8":
+        print("\nstart quant bf16->fp8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            128,
+            dtypes.bf16,
+            dtypes.fp8,
+            quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
+        )
+    elif test == "bf16tofp8_asm_pa128":
+        print("\nstart quant bf16->fp8, for asm pa ori_block_size=128")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.bf16,
+            dtypes.fp8,
+            quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
+            ori_block_size=128,
+        )
+    elif test == "bf16tofp8_asm_pa256":
+        print("\nstart quant bf16->fp8, for asm pa ori_block_size=256")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.bf16,
+            dtypes.fp8,
+            quantCfg={"y_scale_dtype": dtypes.fp32, "quant_dtype": dtypes.fp8},
+            ori_block_size=256,
+        )
+    else:
+        raise ValueError(f"unknown test {test}, please check the code.")

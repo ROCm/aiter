@@ -40,7 +40,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int splitK
     )
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
@@ -73,7 +74,7 @@ torch::Tensor
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
         // Run kernel instance.
-        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y);
+        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
 """
         if self.istune:
             INSTANCE_IMPL_str = INSTANCE_IMPL.format(
@@ -109,7 +110,8 @@ template torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y
+    torch::Tensor &Y,
+    int splitK
     );
 
 """
@@ -189,7 +191,8 @@ torch::Tensor
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
     torch::Tensor &w_scale,
-    torch::Tensor &Y);
+    torch::Tensor &Y,
+    int splitK);
 """
         MAINFEST_end = """
 

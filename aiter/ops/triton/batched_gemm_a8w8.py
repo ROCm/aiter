@@ -7,7 +7,6 @@ import json
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 

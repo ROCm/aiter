@@ -187,22 +187,6 @@ def moe_stage1_g1u1(
 ) -> None: ...
 
 
-@compile_ops("module_moe")
-def ck_moe(
-    hidden_states: Tensor,
-    w1: Tensor,
-    w2: Tensor,
-    topk_weight: Tensor,
-    topk_ids: Tensor,
-    fc1_scale: Optional[Tensor] = None,
-    fc2_scale: Optional[Tensor] = None,
-    fc1_smooth_scale: Optional[Tensor] = None,
-    fc2_smooth_scale: Optional[Tensor] = None,
-    block_m: Optional[int] = 32,
-    expert_mask: Optional[Tensor] = None,
-): ...
-
-
 @compile_ops("module_moe_ck2stages")
 def ck_moe_stage1(
     hidden_states: Tensor,

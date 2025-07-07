@@ -120,7 +120,7 @@ if PREBUILD_KERNELS == 1:
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
-    packages=["aiter_meta", "aiter"],
+    packages=["aiter_meta", "aiter", "csrc"],
     include_package_data=True,
     package_data={
         "": ["*"],

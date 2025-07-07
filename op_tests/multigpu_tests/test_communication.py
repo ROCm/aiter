@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.distributed as dist
@@ -322,11 +322,10 @@ parser.add_argument(
     "-s",
     "--shape",
     type=dtypes.str2tuple,
-    choices=l_shape,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="shape. e.g. -s 128,8192",
 )
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
 import argparse
@@ -11,7 +11,7 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
-#include <unordered_map> 
+#include <unordered_map>
 
 #define ADD_CFG(q_type, kv_type, gqa, mtp, msk, hp, path, name, co)         \\
     {                                         \\

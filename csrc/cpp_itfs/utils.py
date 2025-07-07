@@ -11,14 +11,24 @@ import hashlib
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
-GPU_ARCH = subprocess.run(
-    "/opt/rocm/bin/offload-arch", shell=True, capture_output=True, text=True
-).stdout.strip()
+DEFAULT_GPU_ARCH = (
+    subprocess.run(
+        "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
+    )
+    .stdout.strip()
+    .split("\n")[0]
+)
+GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
+AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
 
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
+
+if AITER_REBUILD >= 1:
+    subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
 os.makedirs(BUILD_DIR, exist_ok=True)
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
@@ -51,14 +61,27 @@ def get_hip_version():
 
 
 def validate_and_update_archs():
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    archs = GPU_ARCH.split(";")
+    archs = [arch.strip() for arch in archs]
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx1100"]
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx940",
+        "gfx941",
+        "gfx942",
+        "gfx950",
+        "gfx1100",
+    ]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
         arch in allowed_archs for arch in archs
     ), f"One of GPU archs of {archs} is invalid or not supported"
+    for i in range(len(archs)):
+        if archs[i] == "native":
+            archs[i] = DEFAULT_GPU_ARCH
+
     return archs
 
 
@@ -80,7 +103,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     init_build_dir(sub_build_dir)
     include_dir = f"{sub_build_dir}/include"
     os.makedirs(include_dir, exist_ok=True)
-    for include in includes:
+    for include in includes + [f"{CK_DIR}/include"]:
         if os.path.isdir(include):
             shutil.copytree(include, include_dir, dirs_exist_ok=True)
         else:
@@ -155,15 +178,12 @@ def hash_signature(signature: str):
 
 @lru_cache(maxsize=None)
 def get_default_func_name(md_name, args: tuple):
-    signature = "_".join([str(arg) for arg in args])
+    signature = "_".join([str(arg).lower() for arg in args])
     return f"{md_name}_{hash_signature(signature)}"
 
 
 def not_built(folder):
-    return (
-        not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
-        or os.environ.get("AITER_FORCE_COMPILE", "0") == "1"
-    )
+    return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
 
 
 def compile_template_op(
@@ -181,6 +201,7 @@ def compile_template_op(
         func_name = get_default_func_name(md_name, tuple(kwargs.values()))
     if folder is None:
         folder = func_name
+
     if not_built(folder):
         if includes is None:
             includes = []

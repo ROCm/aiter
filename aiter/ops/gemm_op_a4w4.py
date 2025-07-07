@@ -4,13 +4,9 @@
 import torch
 from torch import Tensor
 from typing import Optional
-import functools
-import pandas as pd
 from ..jit.core import (
     compile_ops,
-    AITER_ROOT_DIR,
 )
-from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 
 
@@ -60,6 +56,7 @@ def gemm_a4w4_blockscale(
     x_scale: Tensor,  # x_scale:[M, K/32] e8m0 paded
     w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
+    splitK: Optional[int] = 0,
 ): ...
 
 

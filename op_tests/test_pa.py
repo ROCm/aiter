@@ -83,7 +83,6 @@ def kv_cache_factory(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
 
-    scale = head_size**-0.5
     x = 16 // torch_dtype.itemsize
     k_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
     k_caches: List[torch.Tensor] = []
@@ -493,7 +492,7 @@ def test_paged_attention(
 ) -> None:
     torch.set_default_device(device)
     # Using default kv_scale
-    k_scale = v_scale = 1.0
+    k_scale = v_scale = torch.tensor(1.0, device=device, dtype=dtypes.fp32)
     scale = float(1.0 / (head_size**0.5))
     num_query_heads, num_kv_heads = num_heads
     alibi_slopes = None
@@ -647,8 +646,8 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                k_scale_.item(),
-                v_scale_.item(),
+                k_scale_,
+                v_scale_,
             )
             checkAllclose(
                 out_golden,
@@ -810,7 +809,10 @@ l_num_heads = [(4, 1), (8, 1), (32, 8)]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
 l_dtype = ["fp16", "bf16"]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -819,7 +821,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 
 parser.add_argument(
@@ -830,7 +833,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of heads (num_query_heads, num_kv_heads)",
+    help="""Number of heads (num_query_heads, num_kv_heads)
+    e.g.: -n 4,1""",
 )
 
 parser.add_argument(
@@ -841,7 +845,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="context length",
+    help="""Context length.
+    e.g. -c 128""",
 )
 
 args = parser.parse_args()

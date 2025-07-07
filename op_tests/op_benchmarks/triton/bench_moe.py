@@ -2,7 +2,6 @@ import sys
 import argparse
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
 from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16

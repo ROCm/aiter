@@ -271,13 +271,11 @@ __device__ __forceinline__ void elementwise_copy(
 {
     if (did_end > did_start)
     {
-        #pragma unroll
         for (int32_t hid = threadIdx.y; hid < hid_end; hid += blockDim.y)
         {
             const int32_t offset_i = hid * stride_i_h;
             const int32_t offset_o = hid * stride_o_h;
 
-            #pragma unroll
             for (int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
             {
                 p_output[offset_o + did * stride_o_d] = p_input[offset_i + did * stride_i_d];
@@ -303,7 +301,6 @@ __device__ __forceinline__ void elementwise_copy_2c(
     {
         const int32_t hid_min_end = hid_end_x < hid_end_y ? hid_end_x : hid_end_y;
 
-        #pragma unroll
         for (int32_t hid = threadIdx.y; hid < hid_min_end; hid += blockDim.y)
         {
             const int32_t offset_ix = hid * stride_ix_h;
@@ -311,7 +308,6 @@ __device__ __forceinline__ void elementwise_copy_2c(
             const int32_t offset_ox = hid * stride_ox_h;
             const int32_t offset_oy = hid * stride_oy_h;
 
-            #pragma unroll
             for (int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
             {
                 p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
@@ -319,26 +315,22 @@ __device__ __forceinline__ void elementwise_copy_2c(
             }
         }
 
-        #pragma unroll
         for (int32_t hid = threadIdx.y + hid_min_end; hid < hid_end_x; hid += blockDim.y)
         {
             const int32_t offset_ix = hid * stride_ix_h;
             const int32_t offset_ox = hid * stride_ox_h;
 
-            #pragma unroll
             for (int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
             {
                 p_output_x[offset_ox + did * stride_ox_d] = p_input_x[offset_ix + did * stride_ix_d];
             }
         }
 
-        #pragma unroll
         for (int32_t hid = threadIdx.y + hid_min_end; hid < hid_end_y; hid += blockDim.y)
         {
             const int32_t offset_iy = hid * stride_iy_h;
             const int32_t offset_oy = hid * stride_oy_h;
 
-            #pragma unroll
             for (int32_t did = threadIdx.x + did_start; did < did_end; did += blockDim.x)
             {
                 p_output_y[offset_oy + did * stride_oy_d] = p_input_y[offset_iy + did * stride_iy_d];
@@ -369,14 +361,12 @@ struct OpUncachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float input_0, input_1;
@@ -424,14 +414,12 @@ struct OpUncachedFwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, true, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float input_x_0, input_x_1, input_y_0, input_y_1;
@@ -450,7 +438,6 @@ struct OpUncachedFwd
                     p_output_y, output_y_0, output_y_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
             {
                 float input_x_0, input_x_1;
@@ -463,7 +450,6 @@ struct OpUncachedFwd
                     p_output_x, output_x_0, output_x_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
             {
                 float input_y_0, input_y_1;
@@ -509,14 +495,12 @@ struct OpUncachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float output_grad_0, output_grad_1;
@@ -564,14 +548,12 @@ struct OpUncachedBwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_uncached<RotateStyle, false, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_freqs, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float output_grad_x_0, output_grad_x_1, output_grad_y_0, output_grad_y_1;
@@ -590,7 +572,6 @@ struct OpUncachedBwd
                     p_input_grads_y, input_grad_y_0, input_grad_y_1, did, hid, stride_iy_d, stride_iy_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
             {
                 float output_grad_x_0, output_grad_x_1;
@@ -603,7 +584,6 @@ struct OpUncachedBwd
                     p_input_grads_x, input_grad_x_0, input_grad_x_1, did, hid, stride_ix_d, stride_ix_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
             {
                 float output_grad_y_0, output_grad_y_1;
@@ -650,14 +630,12 @@ struct OpCachedFwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float input_0, input_1;
@@ -706,14 +684,12 @@ struct OpCachedFwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, true, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float input_x_0, input_x_1, input_y_0, input_y_1;
@@ -732,7 +708,6 @@ struct OpCachedFwd
                     p_output_y, output_y_0, output_y_1, did, hid, stride_oy_d, stride_oy_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
             {
                 float input_x_0, input_x_1;
@@ -745,7 +720,6 @@ struct OpCachedFwd
                     p_output_x, output_x_0, output_x_1, did, hid, stride_ox_d, stride_ox_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
             {
                 float input_y_0, input_y_1;
@@ -792,14 +766,12 @@ struct OpCachedBwd
         const int32_t size_half_r = size_r >> 1;
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_h; hid += blockDim.y)
             {
                 float output_grad_0, output_grad_1;
@@ -848,14 +820,12 @@ struct OpCachedBwd
         const int32_t did_start   = NopeFirst ? (size_d - size_r) : 0;
         const int32_t size_min_h  = min(size_h_x, size_h_y);
 
-        #pragma unroll
         for (int32_t did = threadIdx.x + did_start; did < size_half_r; did += blockDim.x)
         {
             float cos_0, sin_0, cos_1, sin_1;
             load_cos_sin_cached<RotateStyle, false, ReuseFreqsFrontPart>(
                 &cos_0, &sin_0, &cos_1, &sin_1, p_cos, p_sin, did - did_start, size_half_r);
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y; hid < size_min_h; hid += blockDim.y)
             {
                 float output_grad_x_0, output_grad_x_1, output_grad_y_0, output_grad_y_1;
@@ -874,7 +844,6 @@ struct OpCachedBwd
                     p_input_grads_y, input_grad_y_0, input_grad_y_1, did, hid, stride_iy_d, stride_iy_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_x; hid += blockDim.y)
             {
                 float output_grad_x_0, output_grad_x_1;
@@ -887,7 +856,6 @@ struct OpCachedBwd
                     p_input_grads_x, input_grad_x_0, input_grad_x_1, did, hid, stride_ix_d, stride_ix_h, size_half_r);
             }
 
-            #pragma unroll
             for (int32_t hid = threadIdx.y + size_min_h; hid < size_h_y; hid += blockDim.y)
             {
                 float output_grad_y_0, output_grad_y_1;
