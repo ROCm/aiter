@@ -22,6 +22,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "hip_compat.h"
 #include "dispatch_utils.h"
+#include "hip_reduce.h"
 
 #ifndef USE_ROCM
     #include <cub/util_type.cuh>
@@ -268,6 +269,10 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     // We defined our own aligned array and use it here to avoid the dependency on CUTLASS.
     using AccessType = AlignedArray<float, ELTS_PER_LDG>;
 
+    using kvp = hipcub::KeyValuePair<int, float>;
+    // hipcub::ArgMax arg_max;
+    // hipcub::ArgMin arg_min;
+
     // Finally, we pull in the data from global mem
     float row_chunk[VPT];
     AccessType* row_chunk_vec_ptr = reinterpret_cast<AccessType*>(&row_chunk);
@@ -288,11 +293,12 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     }
 
 // Now, we find the max within the thread group and distribute among the threads. We use a butterfly reduce.
-#pragma unroll
-    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-    {
-        thread_max = max(thread_max, VLLM_SHFL_XOR_SYNC_WIDTH(thread_max, mask, THREADS_PER_ROW));
-    }
+// #pragma unroll
+//     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
+//     {
+//         thread_max = max(thread_max, VLLM_SHFL_XOR_SYNC_WIDTH(thread_max, mask, THREADS_PER_ROW));
+//     }
+    thread_max = multithread_reduce(thread_max, [](float a, float b){return max(a, b);}, THREADS_PER_ROW);
 
     // From this point, thread max in all the threads have the max within the row.
     // Now, we subtract the max from each element in the thread and take the exp. We also compute the thread local sum.
@@ -305,11 +311,12 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
     }
 
 // Now, we perform the sum reduce within each thread group. Similar to the max reduce, we use a bufferfly pattern.
-#pragma unroll
-    for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-    {
-        row_sum += VLLM_SHFL_XOR_SYNC_WIDTH(row_sum, mask, THREADS_PER_ROW);
-    }
+// #pragma unroll
+//     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
+//     {
+//         row_sum += VLLM_SHFL_XOR_SYNC_WIDTH(row_sum, mask, THREADS_PER_ROW);
+//     }
+    row_sum = multithread_reduce(row_sum, [](float a, float b){return a + b;}, THREADS_PER_ROW);
 
     // From this point, all threads have the max and the sum for their rows in the thread_max and thread_sum variables
     // respectively. Finally, we can scale the rows for the softmax. Technically, for top-k gating we don't need to
@@ -356,19 +363,31 @@ __launch_bounds__(WARPS_PER_CTA *WARP_SIZE) __global__
 // Now, we perform the argmax reduce. We use the butterfly pattern so threads reach consensus about the max.
 // This will be useful for K > 1 so that the threads can agree on "who" had the max value. That thread can
 // then blank out their max with -inf and the warp can run more iterations...
-#pragma unroll
-        for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-        {
-            float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
-            int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
+// #pragma unroll
+//         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
+//         {
+//             float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
+//             int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
 
-            // We want lower indices to "win" in every thread so we break ties this way
-            if (other_max > max_val || (other_max == max_val && other_expert < expert))
+//             // We want lower indices to "win" in every thread so we break ties this way
+//             if (other_max > max_val || (other_max == max_val && other_expert < expert))
+//             {
+//                 max_val = other_max;
+//                 expert = other_expert;
+//             }
+//         }
+        
+        auto arg_max = [](const kvp &a, const kvp &b) {
+            if (a.value > b.value || (a.value == b.value && a.key < b.key))
             {
-                max_val = other_max;
-                expert = other_expert;
+                return a;
             }
-        }
+            return b;
+        };
+        kvp thread_kvp = {expert, max_val};
+        thread_kvp = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
+        max_val = thread_kvp.value;
+        expert = thread_kvp.key;
 
         // Write the max for this k iteration to global memory.
         if (thread_group_idx == 0)
@@ -517,6 +536,9 @@ void topkGatingSoftmaxKernelLauncher(
             break;
         case 256:
             LAUNCH_SOFTMAX(256, WARPS_PER_TB);
+            break;
+        case 512:
+            LAUNCH_SOFTMAX(512, 1);
             break;
         default: {
             TORCH_CHECK(softmax_workspace != nullptr,
