@@ -269,7 +269,7 @@ def _flash_attn_forward(
         ret &= nhead_q % nhead_k == 0
         ret &= mask or nmask
         ret &= return_lse
-        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        # ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
