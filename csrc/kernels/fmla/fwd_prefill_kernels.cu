@@ -1149,8 +1149,8 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
     // 3. Quick exit if no work to do
     //
-    const int32_t num_total_loop = __builtin_amdgcn_readfirstlane(
-        ck_tile::integer_divide_ceil(seqlen_k_end - seqlen_k_start, Traits::kBlockN0));
+    const int32_t num_total_loop =
+        ck_tile::integer_divide_ceil(seqlen_k_end - seqlen_k_start, Traits::kBlockN0);
 
     if (num_total_loop <= 0)
     {
@@ -1256,9 +1256,9 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
     // 6. Main loop
     //
-    // Define main loop
-    auto main_loop = [&](int32_t loop_idx, bool is_even_loop)
+    for(int32_t loop_idx = 0; loop_idx < num_total_loop; loop_idx += 1)
     {
+        const bool is_even_loop = (loop_idx % 2 == 0);
         ck_tile::clear_tile(s_acc);
 
         // I. QK GEMM
@@ -1283,6 +1283,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         ck_tile::move_tile_window(k_dram_window, qk_direction);
         ck_tile::store_tile(k_lds_window, k_block_tile);
         k_block_tile = ck_tile::load_tile(k_dram_window);
+
         // Main part of QK GEMM_0: conduct GEMM and load K tiles 
         if constexpr (k0_loops > 2)
         {
@@ -1307,6 +1308,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 
         ck_tile::block_sync_lds();
         ck_tile::store_tile(k_lds_window, k_block_tile);
+
         ck_tile::block_sync_lds();
         gemm_0(s_acc, q_regs[(k0_loops - 1) % 2], k_lds_window);
 
@@ -1326,6 +1328,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             __builtin_amdgcn_readfirstlane(k_origin.at(ck_tile::number<0>{})),
             ck_tile::number<Traits::kBlockM>{},
             ck_tile::number<Traits::kBlockN0>{});
+
         if (need_perpixel_check)
         {
             ck_tile::set_tile_if(
@@ -1337,6 +1340,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     return mask.IsOutOfBound(row, col);
                 });
         }
+
         auto s_acc_shuffled = [&]()
         {
             constexpr int32_t kWarpGemmM = Traits::QKWarpTile::at(ck_tile::number<0>{});
@@ -1379,6 +1383,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         const auto m_old = m;
         ck_tile::tile_elementwise_inout(
             [](auto& e0, auto e1, auto e2) { e0 = ck_tile::max(e1, e2); }, m, m_old, m_local);
+
         // Compute exp(x_i - m)
         auto p_intermedia = ck_tile::make_static_distributed_tensor<acc_t>(s_acc_shuffled.get_tile_distribution());
         const auto p_spans = decltype(p_intermedia)::get_distributed_spans();
@@ -1400,6 +1405,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         // Compute row sum of exp(x_i - m)
         auto rowsum_p = block_reduce_2d(p_intermedia, reduce_sum_func.GetIdentityValue<acc_t>(), reduce_sum_func);
         block_reduce_2d_sync(rowsum_p, reduce_sum_func);
+
         // Calculate new l and adjust old output acc
         constexpr auto o_spans = ck_tile::remove_cvref_t<decltype(o_acc[0])>::get_distributed_spans();
         ck_tile::sweep_tile_span(
@@ -1429,6 +1435,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                         });
                     });
             });
+
 
         // III. GEMM for PV
         //
@@ -1460,7 +1467,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                     v_dram_windows[n1_id].update_page_idx_and_valids(v_offsets, v_valids);
 
                     auto v = ck_tile::load_tile(v_dram_windows[n1_id]); // load next v
-                    // __builtin_amdgcn_sched_barrier(0);  // decrease the useage of vgprs
                     ck_tile::block_sync_lds();
 
                     gemm_1(o_acc[n1_id],
@@ -1469,12 +1475,12 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                                ck_tile::sequence<0, k1_id * Traits::kBlockK1>{},
                                ck_tile::sequence<Traits::kBlockM, (k1_id + 1) * Traits::kBlockK1>{}),
                            v_lds_window);
-                    ck_tile::block_sync_lds();  
+                    ck_tile::block_sync_lds();
+
                     auto v_shuffled = ck_tile::make_static_distributed_tensor<scalar_t>(
                         Policy::MakeShuffledVRegBlockDescriptor());
                         ck_tile::shuffle_tile(v_shuffled, v);
                         ck_tile::store_tile(v_lds_window, v_shuffled); // store the prefetch
-                    // __builtin_amdgcn_sched_barrier(0); // decrease the useage of vgprs
                 });
             }
             // Output tail
@@ -1541,15 +1547,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
                 v_dram_windows[n1_id].update_page_idx_and_valids(v_offsets, v_valids);
             });
         }
-    };
-
-    // Execute the loop
-    // Replace static parity loops with dynamic parity loops. This change affects performance
-    // divergently.
-    for(int32_t loop_idx = __builtin_amdgcn_readfirstlane(0); loop_idx < num_total_loop;
-        loop_idx += 1)
-    {
-        main_loop(loop_idx, __builtin_amdgcn_readfirstlane((loop_idx % 2 == 0)));
     }
 
     // 7. Store LSE
@@ -2060,18 +2057,18 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     static_assert(std::is_same_v<acc_t, float>);
     auto opts_acc = opts.dtype(torch::kFloat32);
 
-    const int32_t batch_size = query.size(0);
-    const int32_t seqlen_q_ori = query.size(1);
+    const int32_t batch_size      = query.size(0);
+    const int32_t seqlen_q_ori    = query.size(1);
     const int32_t num_heads_q_ori = query.size(2);
-    int32_t seqlen_q = seqlen_q_ori;
-    int32_t num_heads_q = num_heads_q_ori;
+    int32_t seqlen_q              = seqlen_q_ori;
+    int32_t num_heads_q           = num_heads_q_ori;
 
     const int32_t head_size = query.size(3);
     TORCH_CHECK((head_size == 576) && (head_size_v == 512), "Only support QK head dim 576 and V head dim 512!");
 
-    const int32_t num_blocks = key_cache.size(0);
+    const int32_t num_blocks      = key_cache.size(0);
     const int32_t page_block_size = key_cache.size(1);
-    const int32_t num_heads_k = key_cache.size(2);
+    const int32_t num_heads_k     = key_cache.size(2);
 
     TORCH_CHECK(num_heads_q % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
@@ -2099,7 +2096,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
             }
         }
     }
-    
+
     const int32_t num_splits = calculate_num_splits<Traits>(batch_size, num_heads_q, seqlen_q);
     const bool    do_splits = num_splits > 1;
     
@@ -2124,10 +2121,10 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.p_softmax_lse      = softmax_lse.data_ptr();
 
     params.size_b                   = batch_size;
-    params.size_s_pk                   = seqlen_q;
+    params.size_s_pk                = seqlen_q;
     params.size_s_ori               = seqlen_q_ori;
     params.size_s_tr                = seqlen_q_tr;
-    params.size_h_pk                   = num_heads_q;
+    params.size_h_pk                = num_heads_q;
     params.size_h_ori               = num_heads_q_ori;
     params.size_h_tr                = num_heads_q_tr;
     params.hq_hk_ratio              = hq_hk_ratio;
@@ -2138,18 +2135,18 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 
     params.mask_y_ratio_mdiv = ck_tile::mdiv{static_cast<uint32_t>(mask_y_ratio)};
 
-    params.stride_b_q = query.stride(0);
-    params.stride_s_q = query.stride(1);
-    params.stride_h_q = query.stride(2);
-    params.stride_b_k = key_cache.stride(0);
-    params.stride_s_k = key_cache.stride(1); // size_hk * size_d
-    params.stride_h_k = key_cache.stride(2);
-    params.stride_b_v = vcache.stride(0);
-    params.stride_s_v = vcache.stride(1);    // size_hk * size_d
-    params.stride_h_v = vcache.stride(2);
-    params.stride_b_o = output.stride(0);
-    params.stride_s_o = output.stride(1);
-    params.stride_h_o = output.stride(2);
+    params.stride_b_q   = query.stride(0);
+    params.stride_s_q   = query.stride(1);
+    params.stride_h_q   = query.stride(2);
+    params.stride_b_k   = key_cache.stride(0);
+    params.stride_s_k   = key_cache.stride(1); // size_hk * size_d
+    params.stride_h_k   = key_cache.stride(2);
+    params.stride_b_v   = vcache.stride(0);
+    params.stride_s_v   = vcache.stride(1); // size_hk * size_d
+    params.stride_h_v   = vcache.stride(2);
+    params.stride_b_o   = output.stride(0);
+    params.stride_s_o   = output.stride(1);
+    params.stride_h_o   = output.stride(2);
     params.stride_h_lse = softmax_lse.stride(1);
 
     if(num_splits > 1)
