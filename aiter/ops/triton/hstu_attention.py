@@ -24,13 +24,6 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 
-# from generative_recommenders.common import (
-#     autotune_max_seq_len,
-#     prev_power_of_2,
-#     switch_to_contiguous_if_needed,
-#     triton_autotune,
-# )
-
 try:
     from triton.language.extra.libdevice import fast_dividef, fast_expf  # @manual=//triton:triton
 except ImportError:
