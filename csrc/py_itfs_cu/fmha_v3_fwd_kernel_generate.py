@@ -87,8 +87,7 @@ template <typename DataType_,
           ck_tile::index_t HDim_,
           ck_tile::index_t MaskType_,
           bool kIsSEQPad_,
-          bool kIsHDPad_,
-          int kStoreLse_>
+          bool kIsHDPad_>
 struct fmha_fwd_kernel_selector
 {{
     using DataType                              = ck_tile::remove_cvref_t<DataType_>;
@@ -96,7 +95,6 @@ struct fmha_fwd_kernel_selector
     static constexpr ck_tile::index_t MaskType  = MaskType_;
     static constexpr bool kIsSEQPad             = kIsSEQPad_;
     static constexpr bool kIsHDPad              = kIsHDPad_;
-    static constexpr int kStoreLse              = kStoreLse_;
 }};
 
 
@@ -192,7 +190,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
     args.Hs_kv    = a.nhead_stride_k * 2;
     args.BAs_kv   = a.batch_stride_k * 2;
     args.opt      = 5;
-    args.s_lse    = fmha_fwd_kernel_selector::kStoreLse;
+    args.s_lse    = a.lse_ptr != nullptr;
 
     auto traits = fmha_fwd_v3_traits{{a.batch,
                                      a.nhead_q,
