@@ -510,7 +510,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DENABLE_FP8'"
+            "'-DENABLE_FP8'",
+            "'-DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN=0'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
@@ -773,11 +774,8 @@
         "srcs": [
             "f'{AITER_GRADLIB_DIR}/csrc/rocsolgemm.cu'"
         ],
-        "flags_extra_cc": [
-            "'-O3'"
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-O3'",
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'"
@@ -793,11 +791,8 @@
         "srcs": [
             "f'{AITER_GRADLIB_DIR}/csrc/hipbsolgemm.cu'"
         ],
-        "flags_extra_cc": [
-            "'-O3'"
-        ],
+        "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-O3'",
             "'-U__CUDA_NO_HALF_OPERATORS__'",
             "'-U__CUDA_NO_HALF_CONVERSIONS__'",
             "'-ftemplate-depth=1024'",

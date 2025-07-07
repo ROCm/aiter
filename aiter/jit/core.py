@@ -290,6 +290,7 @@ def build_module(
             "-Wno-vla-cxx-extension",
             "-Wno-undefined-func-template",
             "-Wno-macro-redefined",
+            "-Wno-missing-template-arg-list-after-template-kw",
             "-fgpu-flush-denormals-to-zero",
         ]
 
