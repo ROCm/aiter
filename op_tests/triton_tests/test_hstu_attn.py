@@ -213,6 +213,4 @@ def test_hstu_attention(
 
     out = fn() * max_seq_len
     out_ref = fn_ref() * max_seq_len
-    print(f"out = {out}")
-    print(f"out_ref = {out_ref}")
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
