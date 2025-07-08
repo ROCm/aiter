@@ -100,10 +100,10 @@ def _batched_gemm_bf16_kernel(
     tl.assume(pid_n >= 0)
 
     # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
-    batch_id = batch_id.to(tl.int64)
-    stride_ab = stride_ab.to(tl.int64)
-    stride_bb = stride_bb.to(tl.int64)
-    stride_cb = stride_cb.to(tl.int64)
+    batch_id = tl.cast(batch_id, tl.int64)
+    stride_ab = tl.cast(stride_ab, tl.int64)
+    stride_bb = tl.cast(stride_bb, tl.int64)
+    stride_cb = tl.cast(stride_cb, tl.int64)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
