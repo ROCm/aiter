@@ -80,17 +80,17 @@ RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
                 EDataType>;
         }
     }
-    else if(K >= 192 && K % 64 ==0)
+    else if(K >= 192 && K % 64 == 0)
     {
-        if(M < 32)
+        if(M < 128)
         {
-            return a8w8_bpreshuffle_64x16x256x64_16x16_16x16_4x16x1_4x16x1_1x8x1x8_8x8x1_1x8_intrawave_v1<
+            return a8w8_bpreshuffle_128x16x256x64_16x16_16x16_4x16x1_4x32x1_1x16x1x8_8x8x1_1x2_intrawave_v1<
                 DDataType,
                 EDataType>;
         }
         else if(M <= 256)
         {
-            return a8w8_bpreshuffle_128x32x256x64_16x16_16x16_4x32x1_4x32x1_1x8x1x16_8x8x1_1x4_intrawave_v1<
+            return a8w8_bpreshuffle_256x32x256x64_16x16_16x16_4x32x1_4x64x1_1x32x1x8_8x8x1_2x1_intrawave_v1<
                 DDataType,
                 EDataType>;
         }
