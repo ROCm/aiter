@@ -30,7 +30,7 @@ def get_x_values():
 
 def run_benchmark(args):
 
-    x_names = ['B', 'N', 'S', 'heads', 'hdim', 'hidendim']
+    x_names = ['batch_size', 'max_seq_len', 'sparsity', 'heads', 'attn_dim', 'hidden_dim']
     if args.user_input:
         x_val_list = [(args.b, args.max_seq_len, args.sparsity, args.heads, args.head_dim, args.hidden_him)]
     else:
@@ -61,14 +61,14 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_hstu_attn(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim):
-        dtype = args.dtype
-        assert dtype in ['fp16', 'bf16'], "only fp16 or bf16 data types are supported!"
-        metric = args.metric
+    def bench_hstu_attn(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim, metric, provider):
+        type_str = args.dtype
+        assert type_str in ['fp16', 'bf16'], "only fp16 or bf16 data types are supported!"
+        # metric = args.metric
         dropout_pr = 0.0
         target_size: int = 20
         sl_alpha: float = 2.0
-        in_type = str_to_torch_dtype[dtype]
+        dtype = str_to_torch_dtype[type_str]
 
         invalid_attn_mask_type = "lower_triangular"
         causal = True
@@ -196,7 +196,7 @@ def parse_args():
         help="hidden dimension",
     )
     parser.add_argument(
-        "--hidden_dim",
+        "--dtype",
         type=str,
         default='bf16',
         help="data type, default (bfloat16)",
