@@ -9,7 +9,8 @@ from op_tests.triton_tests.test_hstu_attn import (
     generate_sparse_seq_len,
     apply_SL,
     sanity_check_attention,
-
+    get_flops,
+    get_bytes,
 )
 
 
@@ -138,12 +139,14 @@ def run_benchmark(args):
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
-        # elif metric == "throughput":
-        #     tflops = flops / ms * 1e-9
-        #     return tflops
-        # elif metric == "bandwidth":
-        #     bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        #     return bandwidth
+        elif metric == "throughput":
+            flops = get_flops(seq_offsets, batch_size, heads, attn_dim, hidden_dim)
+            tflops = flops / ms * 1e-9
+            return tflops
+        elif metric == "bandwidth":
+            bytes = get_bytes(seq_offsets, batch_size, heads, attn_dim, hidden_dim, q.element_size())
+            bandwidth = bytes / (ms * 1e-3) * 1e-9  # GB/s
+            return bandwidth
         else:
             raise ValueError("Unknown metric: " + metric)
 

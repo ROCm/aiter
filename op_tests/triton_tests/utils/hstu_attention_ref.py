@@ -159,3 +159,36 @@ def torch_hstu_attention(
         seq_offsets,
         L,
     ).view(L, H, V)
+
+
+# calculate flops of the hstu attention
+def get_flops(seq_offsets: torch.Tensor, 
+              batch_size: int,
+              heads: int,
+              attn_dim: int,
+              hidden_dim: int):
+    total_flops = 0.0
+    seq_num = seq_offsets.shape[0] - 1
+    for i in range(seq_num):
+        len = seq_offsets[i + 1] - seq_offsets[i]
+        flops = 2 * len * len * (attn_dim + hidden_dim) * batch_size * heads
+        total_flops += flops
+
+    return total_flops
+
+
+def get_bytes(seq_offsets: torch.Tensor, 
+                   batch_size: int,
+                   heads: int,
+                   attn_dim: int,
+                   hidden_dim: int,
+                   elem_size: int):
+
+    seq_num = seq_offsets.shape[0] - 1
+    total_bytes = 0
+    for i in range(seq_num):
+        len = seq_offsets[i + 1] - seq_offsets[i]
+        bytes = 2 * len * (attn_dim + len + hidden_dim) * batch_size * heads * elem_size
+        total_bytes += bytes
+
+    return total_bytes
