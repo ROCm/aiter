@@ -15,6 +15,35 @@ class RotateStyle(IntEnum):
 
 
 @triton.jit
+def _get_neox_rotated_x_1D(
+    x,
+    x_rotated_mask,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
+):
+    x_rotated = tl.where(x_rotated_mask, x, -x)
+    x_rotated = tl.reshape(x_rotated, (2, BLOCK_D_HALF))
+    x_rotated = tl.flip(x_rotated, 1)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
+    x_rotated = tl.flip(x_rotated, 0)
+    return x_rotated
+
+
+@triton.jit
+def _get_gptj_rotated_x_1D(
+    x,
+    x_rotated_mask,
+    BLOCK_D: tl.constexpr,
+    BLOCK_D_HALF: tl.constexpr,
+):
+    x_rotated = tl.where(x_rotated_mask, x, -x)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_D_HALF, 2))
+    x_rotated = tl.flip(x_rotated, 1)
+    x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
+    return x_rotated
+
+
+@triton.jit
 def _get_neox_rotated_x(
     x,
     x_rotated_mask,

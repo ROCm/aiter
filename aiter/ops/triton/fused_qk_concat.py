@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.rope import _get_gptj_rotated_x, _get_neox_rotated_x
+from aiter.ops.triton.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
 
 
 @triton.jit
@@ -209,12 +209,12 @@ def _unit_rope_cat(
 
     if IS_NEOX:
         x_rotated_mask = d_pe_offs < BLOCK_D_HALF_pe
-        x_pe_rotated = _get_neox_rotated_x(
+        x_pe_rotated = _get_neox_rotated_x_1D(
             x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
     else:
         x_rotated_mask = d_pe_offs % 2 == 0
-        x_pe_rotated = _get_gptj_rotated_x(
+        x_pe_rotated = _get_gptj_rotated_x_1D(
             x_pe, x_rotated_mask, BLOCK_D_pe, BLOCK_D_HALF_pe
         )
 
