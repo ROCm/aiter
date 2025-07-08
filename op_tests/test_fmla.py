@@ -239,4 +239,4 @@ if __name__ == "__main__":
     #     test_flash_mla(dtype, b, s, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, False, True)
 
     # test_flash_mla(dtype, b, s_q, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, True, False)
-    test_flash_mla(torch.float16, 32, 3, 6001, 16, 1, 576, dv, 16, True, False, True, True)
+    test_flash_mla(torch.bfloat16, 32, 3, 6001, 16, 1, 576, dv, 16, True, False, True, True)

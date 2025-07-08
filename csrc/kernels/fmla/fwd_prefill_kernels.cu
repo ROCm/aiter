@@ -14,8 +14,7 @@
 // =====================================================================================================================
 // Utils
 //
-#define ZZDebug
-#define FMLA_FWD_FAST_EXP2 1
+// #define FMLA_FWD_FAST_EXP2 1
 #define DEBUG_ONE_KERNEL 0
 #define HEADV 512
 
@@ -1001,57 +1000,6 @@ public:
                                                     ck_tile::sequence<1, 3>>{});
         }
     }
-
-#ifdef ZZDebug
-    CK_TILE_DEVICE static auto MakeKRopeLdsDebugTileWindow(scalar_t* k_lds_ptr)
-    {
-        auto k_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
-            k_lds_ptr, MakeKLdsLoadBlockDescriptor<true>());
-
-        return ck_tile::make_tile_window(k_lds,
-            ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{},
-                                ck_tile::number<64>{}), 
-            {0, 0},
-                                // ck_tile::number<Traits::kSizeD>{}), {0, 0},
-            MakeKDramTileDistribution<true>());
-            // debug_k_dis);
-    }
-    CK_TILE_DEVICE static auto MakeKLdsDebugTileWindow(scalar_t* k_lds_ptr)
-    {
-        auto k_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
-            k_lds_ptr, MakeKLdsLoadBlockDescriptor<false>());
-
-        auto debug_k_dis = ck_tile::make_static_tile_distribution(
-            ck_tile::tile_distribution_encoding<
-                ck_tile::sequence<>,
-                ck_tile::tuple<ck_tile::sequence<1, 2, 8, 1>, ck_tile::sequence<8, 1, 8, 8>>,
-                ck_tile::tuple<ck_tile::sequence<1, 2>, ck_tile::sequence<1, 2>>,
-                ck_tile::tuple<ck_tile::sequence<1, 1>, ck_tile::sequence<2, 2>>,
-                ck_tile::sequence<1, 1, 2, 2>,
-                ck_tile::sequence<0, 3, 0, 3>>{});
-
-        return ck_tile::make_tile_window(k_lds,
-            ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{},
-                                ck_tile::number<512>{}), 
-            {0, 0},
-                                // ck_tile::number<Traits::kSizeD>{}), {0, 0},
-            // MakeKDramTileDistribution());
-            debug_k_dis);
-    }
-    CK_TILE_DEVICE static auto MakeVLdsDebugTileWindow(scalar_t* k_lds_ptr)
-    {
-        auto v_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
-            k_lds_ptr, MakeVLdsLoadBlockDescriptor());
-
-        return ck_tile::make_tile_window(v_lds,
-            ck_tile::make_tuple(ck_tile::number<Traits::kSizeDV>{},
-                                ck_tile::number<Traits::kBlockN0>{}), 
-            {0, 0},
-                                // ck_tile::number<Traits::kSizeD>{}), {0, 0},
-            MakeVTTileDistribution());
-            // debug_k_dis);
-    }
-#endif
 };
 
 template <typename Traits, typename scalar_t, typename acc_t>
@@ -1152,13 +1100,6 @@ struct FlashMlaPrefillFwdParams
     void* __restrict__ p_softmax_lse;
     void* __restrict__ p_softmax_lseaccum;
     void* __restrict__ p_output_accum;
-#ifdef ZZDebug
-    void* __restrict__ p_debug_m;
-    void* __restrict__ p_debug_value;
-    void* __restrict__ p_debug_p;
-    void* __restrict__ p_debug_output;
-    void* __restrict__ p_debug_q;
-#endif
 
     int32_t size_b;      // batch count
     int32_t size_s_pk;   // seqlen of q after XQA pack
@@ -1969,7 +1910,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         }
 
         s_acc_shuffled = ShuffleSacc<Policy>(
-            s_acc, p_smem + GetPSmemStart());
+            s_acc, p_smem + Policy::GetPSmemStart());
 
         // Get max of row
         auto m_local = block_reduce_2d(s_acc_shuffled, reduce_max_func.GetIdentityValue<acc_t>(), reduce_max_func);
@@ -2152,10 +2093,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             });
         }
     }
-    if ((num_total_loop % 2) == 0)
-    {
-        main_loop.template operator()<false>(num_total_loop - 1);
-    }
 
     // 7. tile epilogue: store LSE, Adjust and output
     kn_fmla_fwd_splitkv_prefill_tile_epilogue<Traits, scalar_t, acc_t, out_t>(
@@ -2196,9 +2133,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
     Mask                            mask,
     float                           scale_s,
     uint8_t*                        p_smem
-#ifdef ZZDebug
-    ,const FlashMlaPrefillFwdParams& params
-#endif
     )
 {
     using Policy = FlashMlaPrefillPolicy<Traits, scalar_t, acc_t>;
@@ -2575,7 +2509,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
         }
 
         s_acc_shuffled = ShuffleSacc<Policy>(
-            s_acc, p_smem + GetPSmemStart());
+            s_acc, p_smem + Policy::GetPSmemStart());
 
         // Get max of row
         auto m_local = block_reduce_2d(s_acc_shuffled, reduce_max_func.GetIdentityValue<acc_t>(), reduce_max_func);
@@ -2722,96 +2656,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
                 vt_ld_lds_window.set_window_origin({(n1_id + 1) * Traits::kBlockN1, 0});
             });
         }
-
-#ifdef ZZDebug
-        __builtin_amdgcn_sched_barrier(0);
-        // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && )
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && loop_idx == 0)
-        {
-   //          auto debug_k_dram = ck_tile::make_naive_tensor_view(
-   //              reinterpret_cast<scalar_t*>(params.p_debug_value),
-   //              ck_tile::make_tuple(Traits::kBlockN0, Traits::kSizeD),
-   //              ck_tile::make_tuple(Traits::kSizeD, 1),  // strides
-   //              ck_tile::number<8>{},
-   //              ck_tile::number<1>{});
-   //          auto debug_k_window = ck_tile::make_tile_window(
-   //              debug_k_dram,
-   //              ck_tile::make_tuple(Traits::kBlockN0, 512),
-   //              {0, 0});
-			//
-   //          auto debug_k_rope_window = ck_tile::make_tile_window(
-   //              debug_k_dram,
-   //              ck_tile::make_tuple(Traits::kBlockN0, 64),
-   //              {0, Traits::kSizeNope});
-			//
-   //          auto debug_k_rope_lds_window  = Policy::MakeKRopeLdsDebugTileWindow(k_rope_lds_ptr);
-   //          ck_tile::move_tile_window(debug_k_rope_lds_window, {16, 0});
-			//
-   //          auto debug_k_lds_window  = Policy::MakeKLdsDebugTileWindow(k_nope_lds_ptr);
-   //          ck_tile::move_tile_window(debug_k_lds_window, {16, 0});
-   //      
-   //          ck_tile::block_sync_lds();
-   //          // ck_tile::move_tile_window(debug_k_lds_window, {Traits::kBlockN0, 0});
-   //          auto k_block_tile_debug = ck_tile::load_tile(debug_k_lds_window);
-   //          auto k_rope_block_tile_debug = ck_tile::load_tile(debug_k_rope_lds_window);
-   //          // auto k_block_tile_debug = ck_tile::load_tile(k_rope_dram_window);
-   //          ck_tile::block_sync_lds();
-			//
-   //          ck_tile::store_tile(debug_k_window, k_block_tile_debug);
-			// __builtin_amdgcn_sched_barrier(0);
-   //          ck_tile::store_tile(debug_k_rope_window, k_rope_block_tile_debug);
-
-            auto debug_v_dram = ck_tile::make_naive_tensor_view(
-                reinterpret_cast<scalar_t*>(params.p_debug_value),
-                ck_tile::make_tuple(Traits::kSizeDV, Traits::kBlockN0),
-                ck_tile::make_tuple(Traits::kBlockN0, 1),  // strides
-                ck_tile::number<8>{},
-                ck_tile::number<1>{});
-            auto debug_v_window = ck_tile::make_tile_window(
-                debug_v_dram,
-                ck_tile::make_tuple(HEADV, Traits::kBlockN0),
-                {0, 0},
-                Policy::MakeVTTileDistribution());
-
-            auto debug_v_lds_window  = Policy::MakeVLdsDebugTileWindow(vt_lds_ptr);
-        
-            ck_tile::block_sync_lds();
-            // ck_tile::move_tile_window(debug_k_lds_window, {Traits::kBlockN0, 0});
-            auto v_block_tile_debug = ck_tile::load_tile(debug_v_lds_window);
-            // auto k_block_tile_debug = ck_tile::load_tile(k_rope_dram_window);
-            ck_tile::block_sync_lds();
-
-            ck_tile::store_tile(debug_v_window, v_block_tile_debug);
-			__builtin_amdgcn_sched_barrier(0);
-
-            auto debug_s_dram = ck_tile::make_naive_tensor_view(
-            	reinterpret_cast<scalar_t*>(params.p_debug_p),
-            	ck_tile::make_tuple(Traits::kBlockM, Traits::kBlockN0),
-            	ck_tile::make_tuple(Traits::kBlockN0, 1),  // strides
-                ck_tile::number<8>{},
-                ck_tile::number<1>{});
-            auto debug_s_window = ck_tile::make_tile_window(
-            	debug_s_dram,
-            	ck_tile::make_tuple(Traits::kBlockM, Traits::kBlockN0),
-            	{0, 0});
-            ck_tile::store_tile(debug_s_window, ck_tile::cast_tile<scalar_t>(p));
-
-
-            // auto debug_q_dram = ck_tile::make_naive_tensor_view(
-            // 	reinterpret_cast<scalar_t*>(params.p_debug_q),
-            // 	ck_tile::make_tuple(Traits::kBlockM, Traits::kSizeD),
-            // 	ck_tile::make_tuple(Traits::kSizeD, 1),  // strides
-            //     ck_tile::number<8>{},
-            //     ck_tile::number<1>{});
-            // auto debug_q_window = ck_tile::make_tile_window(
-            // 	debug_q_dram,
-            // 	ck_tile::make_tuple(Traits::kBlockM, Traits::kSizeDV),
-            // 	{0, 0});
-            // ck_tile::store_tile(debug_q_window, ck_tile::cast_tile<scalar_t>(o_acc[0]));
-        }
-        __builtin_amdgcn_sched_barrier(0);
-#endif
-
     };
 
 
@@ -2826,26 +2670,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
     {
         main_loop.template operator()<false>(num_total_loop - 1);
     }
-
-#ifdef ZZDebug
-    __builtin_amdgcn_sched_barrier(0);
-    // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && )
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0)
-    {
-        auto debug_q_dram = ck_tile::make_naive_tensor_view(
-            reinterpret_cast<scalar_t*>(params.p_debug_q),
-            ck_tile::make_tuple(Traits::kBlockM, Traits::kSizeD),
-            ck_tile::make_tuple(Traits::kSizeD, 1),  // strides
-            ck_tile::number<8>{},
-            ck_tile::number<1>{});
-        auto debug_q_window = ck_tile::make_tile_window(
-            debug_q_dram,
-            ck_tile::make_tuple(Traits::kBlockM, Traits::kSizeDV),
-            {0, 0});
-        ck_tile::store_tile(debug_q_window, ck_tile::cast_tile<scalar_t>(o_acc[0]));
-    }
-    __builtin_amdgcn_sched_barrier(0);
-#endif
 
     // 7. tile epilogue: store LSE, Adjust and output
     kn_fmla_fwd_splitkv_prefill_tile_epilogue<Traits, scalar_t, acc_t, out_t>(
@@ -3004,11 +2828,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 #else
             params.scale_softmax,
 #endif
-                p_smem
-#ifdef ZZDebug
-                ,params
-#endif
-                );
+                p_smem);
         }
     }
     else
@@ -3056,9 +2876,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                 0, // split_id
                 mask,
 #if FMLA_FWD_FAST_EXP2
-            static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
+                static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
 #else
-            params.scale_softmax,
+                params.scale_softmax,
 #endif
                 p_smem);
         }
@@ -3086,15 +2906,11 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                 split_id,
                 mask,
 #if FMLA_FWD_FAST_EXP2
-            static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
+                static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
 #else
-            params.scale_softmax,
+                params.scale_softmax,
 #endif
-                p_smem
-#ifdef ZZDebug
-                ,params
-#endif
-                );
+                p_smem);
         }
     }    
 }
@@ -3155,7 +2971,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill_combine(
         #pragma unroll
         for (int32_t i = 0; i < kNumLsePerThr; ++i)
         {
+#ifdef FMLA_FWD_FAST_EXP2
             static_assert(0, "have not figured out if need exp2 here");
+#endif
             sum_lse += ck_tile::exp(local_lse[i] - max_lse);
         }
         #pragma unroll
@@ -3237,20 +3055,21 @@ void dispatch_fmla_fwd_splictkv_prefill(
     const dim3 grid_attn = dim3(num_blk, params.size_h_pk, params.size_b);
     const dim3 grid_comb = dim3(params.size_s_tr, params.size_h_tr, params.size_b);
 
+
     if (params.num_splits > 1)
     {
-        // // out_t is not take into consideration when doing splits because combine shader is always expected to do
-        // // the final output type conversion.
-        // auto kn_attn = &kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, acc_t, kIsCausal, true>;
-        // auto kn_comb =
-        //     (params.num_splits <= 32)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 32,  scalar_t, acc_t> :
-        //     // (params.num_splits <= 64)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 64,  scalar_t, acc_t> :
-        //     // (params.num_splits <= 96)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 96,  scalar_t, acc_t> :
-        //     // (params.num_splits <= 128) ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 128, scalar_t, acc_t> :
-        //     static_cast<decltype(kn_fmla_fwd_splictkv_prefill_combine<Traits, 32, scalar_t, acc_t>)*>(nullptr);
-        // TORCH_CHECK(kn_comb != nullptr, "num_splits is larger than expected (<=128) !");
-        // kn_attn<<<grid_attn, Traits::kNumThreads, 0, stream>>>(params);
-        // kn_comb<<<grid_comb, Traits::kNumThreadsCombine, 0, stream>>>(params);
+        // out_t is not take into consideration when doing splits because combine shader is always expected to do
+        // the final output type conversion.
+        auto kn_attn = &kn_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, acc_t, kIsCausal, true>;
+        auto kn_comb =
+            (params.num_splits <= 32)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 32,  scalar_t, acc_t> :
+            // (params.num_splits <= 64)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 64,  scalar_t, acc_t> :
+            // (params.num_splits <= 96)  ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 96,  scalar_t, acc_t> :
+            // (params.num_splits <= 128) ? &kn_fmla_fwd_splictkv_prefill_combine<Traits, 128, scalar_t, acc_t> :
+            static_cast<decltype(kn_fmla_fwd_splictkv_prefill_combine<Traits, 32, scalar_t, acc_t>)*>(nullptr);
+        TORCH_CHECK(kn_comb != nullptr, "num_splits is larger than expected (<=128) !");
+        kn_attn<<<grid_attn, Traits::kNumThreads, 0, stream>>>(params);
+        kn_comb<<<grid_comb, Traits::kNumThreadsCombine, 0, stream>>>(params);
     }
     else
     {
@@ -3411,7 +3230,8 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     constexpr bool kKVLoadOnce        = false;
     constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
     //                                        dqk  dv     m0  n0  n1     #warp  wave_occu
-    using Traits = FlashMlaPrefillKernelTrait<576, HEADV, 64, 16, HEADV, 4,     2, true, kXqaStrategy>;
+    // using Traits = FlashMlaPrefillKernelTrait<576, HEADV, 64, 16, HEADV, 4,     1, kKVLoadOnce, kXqaStrategy>;
+	using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 16,  512, 8,     1,   true, kXqaStrategy>;
     constexpr bool kForceOutAcc = false;
     using acc_t                 = float;
 
@@ -3484,21 +3304,6 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     params.p_output           = output.data_ptr();
     params.p_softmax_lse      = softmax_lse.data_ptr();
 
-#ifdef ZZDebug
-    auto debug_m_inner = torch::zeros({2, Traits::kBlockM}, opts);
-    auto debug_v_inner = torch::zeros({Traits::kBlockN0, Traits::kSizeD}, opts);
-    // auto debug_v_inner = torch::zeros({Traits::kBlockN, head_size_v}, opts);
-    auto debug_p_inner = torch::zeros({Traits::kBlockM, Traits::kBlockN0}, opts);
-    auto debug_o_inner = torch::zeros({Traits::kBlockM, Traits::kSizeD}, opts);
-    auto debug_q_inner = torch::zeros({Traits::kBlockM, Traits::kSizeD}, opts);
-
-    params.p_debug_m          = debug_m_inner.data_ptr();
-    params.p_debug_value      = debug_v_inner.data_ptr();
-    params.p_debug_p          = debug_p_inner.data_ptr();
-    params.p_debug_output     = debug_o_inner.data_ptr();
-    params.p_debug_q          = debug_q_inner.data_ptr();
-#endif
-
     params.size_b                   = batch_size;
     params.size_s_pk                = seqlen_q;
     params.size_s_ori               = seqlen_q_ori;
@@ -3546,15 +3351,14 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
         params.stride_sp_lseacc   = softmax_lseaccum.stride(1);
     }
 
-    dispatch_fmla_fwd_splictkv_prefill<Traits, ck_tile::bf16_t, float, ck_tile::bf16_t, true>(params);
-    // DISPATCH_FMLA_TYPES(
-    //     query.scalar_type(),
-    //     is_causal,
-    //     "fmla_fwd",
-    //     [&](){
-    //         dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, Is_causal>(params);
-    //     }();
-    // );
+    DISPATCH_FMLA_TYPES(
+        query.scalar_type(),
+        is_causal,
+        "fmla_fwd",
+        [&](){
+            dispatch_fmla_fwd_splictkv_prefill<Traits, scalar_t, acc_t, out_t, Is_causal>(params);
+        }();
+    );
     // assert(is_causal == false);
     // assert(query.scalar_type() == at::ScalarType::BFloat16);
     // using scalar_t = ck_tile::bf16_t;
@@ -3579,9 +3383,5 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
                           .reshape({batch_size, num_heads_q_ori, seqlen_q_ori});
     }
 
-#ifdef ZZDebug
-    return {output.to(opts), softmax_lse, debug_m_inner, debug_p_inner, debug_v_inner, debug_o_inner, debug_q_inner};
-#else
     return {output.to(opts), softmax_lse};
-#endif
 }
