@@ -12,7 +12,7 @@ from op_tests.triton_tests.utils.hstu_attention_ref import (
 )
 
 
-def _switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
+def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         # Tell Dynamo this data-dependent value is in the range (0, 10**9)
         torch._check(x.size(0) > 0)
@@ -112,8 +112,6 @@ def sanity_check_attention(
     torch._assert(dropout_pr < 1e-6, "dropout for triton path not implemented")
 
 
-
-
 @pytest.mark.parametrize("batch_size, max_seq_len, sparsity",
                          [(512, 3072, 0.366),
                           (512, 512, 0.97)])
@@ -164,9 +162,9 @@ def test_hstu_attention(
     ).uniform_(-0.01, 0.01)
     q, k, v = torch.split(x, [attn_dim, attn_dim, hidden_dim], dim=-1)
 
-    q = _switch_to_contiguous_if_needed(q)
-    k = _switch_to_contiguous_if_needed(k)
-    v = _switch_to_contiguous_if_needed(v)
+    q = switch_to_contiguous_if_needed(q)
+    k = switch_to_contiguous_if_needed(k)
+    v = switch_to_contiguous_if_needed(v)
 
     sanity_check_attention(
         max_seq_len=max_seq_len,
