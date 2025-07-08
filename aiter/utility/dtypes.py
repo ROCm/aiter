@@ -9,17 +9,17 @@ defaultDtypes = {
     "gfx950": {"fp8": torch.float8_e4m3fn},
 }
 
-_f8_fallback = torch.uint8
+_8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx(), {"fp8": _f8_fallback})["fp8"]
+    return defaultDtypes.get(get_gfx(), {"fp8": _8bit_fallback})["fp8"]
 
 
-i4x2 = getattr(torch, "int4", _f8_fallback)
-fp4x2 = getattr(torch, "float4_e2m1fn_x2", _f8_fallback)
+i4x2 = getattr(torch, "int4", _8bit_fallback)
+fp4x2 = getattr(torch, "float4_e2m1fn_x2", _8bit_fallback)
 fp8 = get_dtype_fp8()
-fp8_e8m0 = getattr(torch, "float8_e8m0fnu", _f8_fallback)
+fp8_e8m0 = getattr(torch, "float8_e8m0fnu", _8bit_fallback)
 fp16 = torch.float16
 bf16 = torch.bfloat16
 fp32 = torch.float32
