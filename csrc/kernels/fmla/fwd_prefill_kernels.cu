@@ -2137,25 +2137,24 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
 {
     using Policy = FlashMlaPrefillPolicy<Traits, scalar_t, acc_t>;
 
-
     // 1. Allocate LDS
     //
     const auto k_rope_smem_offset = (Traits::kNumPrefetchK * Policy::template GetSingleKSpaceSize<false>());
 
     const auto k_nope_repeat_smem_offset = Policy::GetKNopeSingleRepeatSize();
-	constexpr auto k_oob_ck = ck_tile::bool_constant<true>{};
-	constexpr auto k_pre_np = ck_tile::bool_constant<false>{};
+    constexpr auto k_oob_ck = ck_tile::bool_constant<true>{};
+    constexpr auto k_pre_np = ck_tile::bool_constant<false>{};
 
     auto k_nope_lds_ptr = reinterpret_cast<scalar_t*>(p_smem);
-	auto k_nope_st_lds_windows = ck_tile::generate_tuple(
-		[&](auto i_buf) {
-			return ck_tile::make_tile_window(
-				ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
-					k_nope_lds_ptr, Policy::template MakeKLdsStoreBlockDescriptor<false>(i_buf)),
-				Policy::template MakeKLdsStoreBlockDescriptor<false>(i_buf).get_lengths(),
-				// ck_tile::make_tuple(ck_tile::number<4>{}, ck_tile::number<4>{}, ck_tile::number<128>{}),
-				{0, 0, 0});
-		},
+    auto k_nope_st_lds_windows = ck_tile::generate_tuple(
+        [&](auto i_buf) {
+            return ck_tile::make_tile_window(
+                ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
+                    k_nope_lds_ptr, Policy::template MakeKLdsStoreBlockDescriptor<false>(i_buf)),
+                Policy::template MakeKLdsStoreBlockDescriptor<false>(i_buf).get_lengths(),
+                // ck_tile::make_tuple(ck_tile::number<4>{}, ck_tile::number<4>{}, ck_tile::number<128>{}),
+                {0, 0, 0});
+        },
         ck_tile::number<Traits::kNumPrefetchK>{});
     auto k_nope_ld_lds_view = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
         k_nope_lds_ptr, Policy::template MakeKLdsLoadBlockDescriptor<false>());
@@ -2165,15 +2164,15 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
         {0, 0});
 
     auto k_rope_lds_ptr = reinterpret_cast<scalar_t*>(p_smem + k_rope_smem_offset);
-	auto k_rope_st_lds_windows = ck_tile::generate_tuple(
-		[&](auto i_buf) {
-			return ck_tile::make_tile_window(
-				ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
-					k_rope_lds_ptr, Policy::template MakeKLdsStoreBlockDescriptor<true>(i_buf)),
-				Policy::template MakeKLdsStoreBlockDescriptor<true>(i_buf).get_lengths(),
-				// ck_tile::make_tuple(ck_tile::number<2>{}, ck_tile::number<4>{}, ck_tile::number<128>{}),
-				{0, 0, 0});
-		},
+    auto k_rope_st_lds_windows = ck_tile::generate_tuple(
+        [&](auto i_buf) {
+            return ck_tile::make_tile_window(
+                ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
+                    k_rope_lds_ptr, Policy::template MakeKLdsStoreBlockDescriptor<true>(i_buf)),
+                Policy::template MakeKLdsStoreBlockDescriptor<true>(i_buf).get_lengths(),
+                // ck_tile::make_tuple(ck_tile::number<2>{}, ck_tile::number<4>{}, ck_tile::number<128>{}),
+                {0, 0, 0});
+        },
         ck_tile::number<Traits::kNumPrefetchK>{});
     auto k_rope_ld_lds_view = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
         k_rope_lds_ptr, Policy::template MakeKLdsLoadBlockDescriptor<true>());
@@ -2337,7 +2336,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
         __builtin_amdgcn_s_barrier();
         ck_tile::move_tile_window(k_dram_window, {0, Traits::kMaxSplits});
     });
-	ck_tile::move_tile_window(k_dram_window, {0, -Traits::kSizeNope});
+    ck_tile::move_tile_window(k_dram_window, {0, -Traits::kSizeNope});
 
     auto k_rope_dist = Policy::template MakeKDramTileDistribution<true>();
     auto k_rope_coord = k_rope_dist.calculate_index();
@@ -2390,11 +2389,11 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
         constexpr auto k_ld_end   = ck_tile::number<k_ld_begin + Traits::kBlockN0>{};
         constexpr ck_tile::array<int32_t, 2> v_lds_direction = { IsEvenLoop ? Traits::kBlockN0 : -Traits::kBlockN0, -Traits::kSizeNope };
 
-		auto vt_tile = ck_tile::make_static_distributed_tensor<scalar_t>(Policy::MakeVTTileDistribution());
+        auto vt_tile = ck_tile::make_static_distributed_tensor<scalar_t>(Policy::MakeVTTileDistribution());
 #pragma unroll 2
         for (int32_t vidx = 0; vidx < Traits::kKNumRepeat; ++vidx)
         {
-			auto v_tile  = ck_tile::load_tile(v_ld_lds_window);
+            auto v_tile  = ck_tile::load_tile(v_ld_lds_window);
             ck_tile::move_tile_window(v_ld_lds_window, {0, Traits::kMaxSplits});
             auto vt_thread_buffer = vt_tile.get_thread_buffer().get();
 
@@ -2429,43 +2428,43 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
 
             // I. QK GEMM
             //
-			if constexpr (k0_loops > 1)
-			{
-				constexpr ck_tile::array<int32_t, 2> qk_direction = {0, Traits::kBlockK0};
-				ck_tile::static_for<0, k0_loops, 1>{}(
-					[&](auto k0_id)
-					{
-						ck_tile::block_sync_lds();
-						gemm_0(s_acc,
-							   ck_tile::get_slice_tile(q_reg_nope,
-								   ck_tile::sequence<0, k0_id * Traits::kBlockK0>{},
-								   ck_tile::sequence<Traits::kBlockM, (k0_id + 1) * Traits::kBlockK0>{}),
-							   k_nope_ld_lds_window);
+            if constexpr (k0_loops > 1)
+            {
+                constexpr ck_tile::array<int32_t, 2> qk_direction = {0, Traits::kBlockK0};
+                ck_tile::static_for<0, k0_loops, 1>{}(
+                    [&](auto k0_id)
+                    {
+                        ck_tile::block_sync_lds();
+                        gemm_0(s_acc,
+                               ck_tile::get_slice_tile(q_reg_nope,
+                                   ck_tile::sequence<0, k0_id * Traits::kBlockK0>{},
+                                   ck_tile::sequence<Traits::kBlockM, (k0_id + 1) * Traits::kBlockK0>{}),
+                               k_nope_ld_lds_window);
 
-						// pre-load k
-						ck_tile::move_tile_window(k_nope_ld_lds_window, qk_direction);
-					});
-			}
-			if constexpr (k0_loops == 1)
-			{
-				ck_tile::block_sync_lds();
-				__builtin_amdgcn_s_waitcnt(3952);
-				gemm_0(s_acc,
-					   q_reg_nope,
-					   ck_tile::get_slice_tile(k_nope_ld_lds_window,
-							ck_tile::sequence<k_ld_begin, 0>{},
-							ck_tile::sequence<k_ld_end, Traits::kSizeNope>{}));
-				ck_tile::block_sync_lds();
-			}
+                        // pre-load k
+                        ck_tile::move_tile_window(k_nope_ld_lds_window, qk_direction);
+                    });
+            }
+            if constexpr (k0_loops == 1)
+            {
+                ck_tile::block_sync_lds();
+                __builtin_amdgcn_s_waitcnt(3952);
+                gemm_0(s_acc,
+                       q_reg_nope,
+                       ck_tile::get_slice_tile(k_nope_ld_lds_window,
+                            ck_tile::sequence<k_ld_begin, 0>{},
+                            ck_tile::sequence<k_ld_end, Traits::kSizeNope>{}));
+                ck_tile::block_sync_lds();
+            }
 
-			// QK rope tail
-			ck_tile::block_sync_lds();
-			// __builtin_amdgcn_s_waitcnt(3952);
-			gemm_0_rope(s_acc,
-						q_reg_rope,
-						ck_tile::get_slice_tile(k_rope_ld_lds_window,
-							ck_tile::sequence<k_ld_begin, 0>{},
-							ck_tile::sequence<k_ld_end, Traits::kSizeRope>{}));
+            // QK rope tail
+            ck_tile::block_sync_lds();
+            // __builtin_amdgcn_s_waitcnt(3952);
+            gemm_0_rope(s_acc,
+                        q_reg_rope,
+                        ck_tile::get_slice_tile(k_rope_ld_lds_window,
+                            ck_tile::sequence<k_ld_begin, 0>{},
+                            ck_tile::sequence<k_ld_end, Traits::kSizeRope>{}));
 
             ck_tile::tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, s_acc);
         }
@@ -2610,22 +2609,22 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             });
             k_rope_dram_window.update_page_idx_and_valids(k_rope_offsets, k_rope_valids);
 
-			ck_tile::static_for<0, 4, 1>{}([&](auto rid)
-			{
-				ck_tile::async_load_tile_raw(
-					k_nope_st_lds_windows.at(k_st_idx{}), k_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
-				__builtin_amdgcn_sched_barrier(0);
-				ck_tile::async_load_fence(k_dram_window.get_num_of_access());
-				__builtin_amdgcn_s_barrier();
-				ck_tile::move_tile_window(k_dram_window, {0, Traits::kMaxSplits});
-			});
+            ck_tile::static_for<0, 4, 1>{}([&](auto rid)
+            {
+                ck_tile::async_load_tile_raw(
+                    k_nope_st_lds_windows.at(k_st_idx{}), k_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
+                __builtin_amdgcn_sched_barrier(0);
+                ck_tile::async_load_fence(k_dram_window.get_num_of_access());
+                __builtin_amdgcn_s_barrier();
+                ck_tile::move_tile_window(k_dram_window, {0, Traits::kMaxSplits});
+            });
             ck_tile::move_tile_window(k_dram_window, {0, -Traits::kSizeNope});
 
-			ck_tile::async_load_tile_raw(
-				k_rope_st_lds_windows.at(k_st_idx{}), k_rope_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_rope_smem_offset);
-			__builtin_amdgcn_sched_barrier(0);
-			ck_tile::async_load_fence(k_rope_dram_window.get_num_of_access());
-			__builtin_amdgcn_s_barrier();
+            ck_tile::async_load_tile_raw(
+                k_rope_st_lds_windows.at(k_st_idx{}), k_rope_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_rope_smem_offset);
+            __builtin_amdgcn_sched_barrier(0);
+            ck_tile::async_load_fence(k_rope_dram_window.get_num_of_access());
+            __builtin_amdgcn_s_barrier();
         }
 
         const auto p = ck_tile::cast_tile<scalar_t>(p_intermedia);
@@ -2912,7 +2911,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 #endif
                 p_smem);
         }
-    }    
+    }
 }
 
 template <typename Traits, int32_t kMaxSplits, typename out_t, typename in_t>
@@ -3081,26 +3080,6 @@ void dispatch_fmla_fwd_splictkv_prefill(
 // =====================================================================================================================
 // Interfaces
 //
-#if DEBUG_ONE_KERNEL
-#define DISPATCH_FMLA_TYPES(TYPE, IS_CAUSAL, NAME, ...)                      \
-    switch ((TYPE))                                                          \
-    {                                                                        \
-        case at::ScalarType::Half:                                           \
-        {                                                                    \
-            using scalar_t = ck_tile::fp16_t;                                \
-            using out_t = std::conditional_t<kForceOutAcc, acc_t, scalar_t>; \
-            if ((IS_CAUSAL))                                                 \
-            {                                                                \
-                constexpr bool Is_causal = true;                             \
-                __VA_ARGS__;                                                 \
-            }                                                                \
-            break;                                                           \
-        }                                                                    \
-        default:                                                             \
-            TORCH_CHECK(false, NAME " does't support ",                      \
-                        toString((TYPE)), ".");                              \
-    }
-#else
 #define DISPATCH_FMLA_TYPES(TYPE, IS_CAUSAL, NAME, ...)                      \
     switch ((TYPE))                                                          \
     {                                                                        \
@@ -3140,7 +3119,6 @@ void dispatch_fmla_fwd_splictkv_prefill(
             TORCH_CHECK(false, NAME " does't support ",                      \
                         toString((TYPE)), ".");                              \
     }
-#endif
 
 int num_splits_heuristic(int batch_nhead_mblocks, int num_SMs, int num_n_blocks, int max_splits)
 {
@@ -3229,9 +3207,10 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 {
     constexpr bool kKVLoadOnce        = false;
     constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
-    //                                        dqk  dv     m0  n0  n1     #warp  wave_occu
-    // using Traits = FlashMlaPrefillKernelTrait<576, HEADV, 64, 16, HEADV, 4,     1, kKVLoadOnce, kXqaStrategy>;
-	using Traits = FlashMlaPrefillKernelTrait<576, 512, 64, 16,  512, 8,     1,   true, kXqaStrategy>;
+    //                             dqk  dv   m0  n0  n1   #warp  wave_occu
+    using Traits = std::conditional_t<kKVLoadOnce,
+        FlashMlaPrefillKernelTrait<576, 512, 64, 16, 512, 8,     1,   kKVLoadOnce, kXqaStrategy>,
+        FlashMlaPrefillKernelTrait<576, 512, 64, 64, 256, 4,     2,   kKVLoadOnce, kXqaStrategy>>;
     constexpr bool kForceOutAcc = false;
     using acc_t                 = float;
 
@@ -3283,7 +3262,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
 
     const int32_t num_splits = calculate_num_splits<Traits>(batch_size, num_heads_q, seqlen_q);
     const bool    do_splits = num_splits > 1;
-    
+
     int32_t seqlen_q_tr = Traits::kXqaStrategy == XqaStrategy::Internal ? seqlen_q_ori : seqlen_q;
     int32_t num_heads_q_tr = Traits::kXqaStrategy == XqaStrategy::Internal ? num_heads_q_ori : num_heads_q;
     // Combine shader, which only exists when num_splits > 1, will conduct type convert by default and force.
