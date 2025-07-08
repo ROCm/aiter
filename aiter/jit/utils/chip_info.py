@@ -36,7 +36,7 @@ def get_cu_num():
             [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
         output = result.stdout
-        devices = re.split(r'Agent\s*\d+', output)
+        devices = re.split(r"Agent\s*\d+", output)
         gpu_compute_units = []
         for device in devices:
             for line in device.split("\n"):
@@ -47,5 +47,20 @@ def get_cu_num():
                     break
     except Exception as e:
         raise RuntimeError(f"Get GPU Compute Unit from rcominfo failed {str(e)}")
-    assert(len(set(gpu_compute_units)) == 1)
+    assert len(set(gpu_compute_units)) == 1
     return gpu_compute_units[0]
+
+
+def get_dev_name():
+    gfx = get_gfx()
+
+    if gfx == "gfx942":
+        cu = get_cu_num()
+        if cu == 304:
+            return "MI300"
+        elif cu == 80 or cu == 64:
+            return "MI308"
+    elif gfx == "gfx950":
+        return "MI350"
+    else:
+        raise RuntimeError("Unsupported gfx")

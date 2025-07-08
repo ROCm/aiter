@@ -268,7 +268,9 @@ def _flash_attn_forward(
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
-        ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942" and get_cu_num() == 80)
+        ret &= (return_lse and gfx == "gfx950") or (
+            gfx == "gfx942" and get_cu_num() == 80
+        )
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
