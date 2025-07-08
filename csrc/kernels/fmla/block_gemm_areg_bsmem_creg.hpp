@@ -5,6 +5,7 @@
 
 #include <ck_tile/core.hpp>
 
+
 // This Block GEMM policy inherits from ck_tile's BlockGemmARegBSmemCRegV2CustomPolicy
 template <typename AType_,
           typename BType_,
@@ -28,7 +29,7 @@ struct BlockGemmARegBSmemCRegPolicy
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr auto GetWarpGemmMWarpNWarp()
     {
-        return ck_tile::make_tuple(WarpGemm{}, kMWarps, kNWarps);
+        return ck_tile::make_tuple(WarpGemm{}, kMWarps, kNWarps, kKWarps);
     }
 };
 
@@ -74,13 +75,14 @@ struct BlockGemmARegBSmemCReg
 
         constexpr int32_t MWarp = config.template at<1>();
         constexpr int32_t NWarp = config.template at<2>();
+        constexpr int32_t KWarp = config.template at<3>();
 
         constexpr int32_t MIterPerWarp = MPerBlock / (MWarp * WG::kM);
         constexpr int32_t NIterPerWarp = NPerBlock / (NWarp * WG::kN);
-        constexpr int32_t KIterPerWarp = KPerBlock / WG::kK;
+        constexpr int32_t KIterPerWarp = KPerBlock / (KWarp * WG::kK);
 
-        constexpr int32_t NPerBlockPerIter = NPerBlock / NIterPerWarp;
-        constexpr int32_t KPerBlockPerIter = KPerBlock / KIterPerWarp;
+        constexpr int32_t NPerBlockPerIter = NPerBlock / NIterPerWarp / NWarp;
+        constexpr int32_t KPerBlockPerIter = KPerBlock / KIterPerWarp / KWarp;
 
         const int32_t iNWarp = ck_tile::get_warp_id() % NWarp;
 
@@ -98,22 +100,9 @@ struct BlockGemmARegBSmemCReg
         auto b_warp_window_tmp = ck_tile::make_tile_window(
             b_block_window_tmp.get_bottom_tensor_view(),
             ck_tile::make_tuple(ck_tile::number<WG::kN>{}, ck_tile::number<WG::kK>{}),
-            b_block_window_tmp.get_window_origin() + ck_tile::multi_index<2>{iNWarp * WG::kN, 0},
+            b_block_window_tmp.get_window_origin() + ck_tile::multi_index<2>{iNWarp * (NPerBlock / NWarp), 0},
             ck_tile::make_static_tile_distribution(typename WG::BWarpDstrEncoding{}));
 
-#if 0 // FIXME: using array will cause register spill
-        array<array<decltype(b_warp_window_tmp), KIterPerWarp>, NIterPerWarp> b_warp_windows{
-            {b_warp_window_tmp}};
-
-        for(int32_t nIter = 0; nIter < NIterPerWarp; nIter++)
-        {
-            for(int32_t kIter = 0; kIter < KIterPerWarp; kIter++)
-            {
-                move_tile_window(b_warp_windows(nIter)(kIter),
-                                 {nIter * NPerBlockPerIter, kIter * KPerBlockPerIter});
-            }
-        }
-#else
         ck_tile::statically_indexed_array<
             ck_tile::statically_indexed_array<decltype(b_warp_window_tmp), KIterPerWarp>,
             NIterPerWarp>
@@ -124,10 +113,9 @@ struct BlockGemmARegBSmemCReg
                 b_warp_windows(nIter)(kIter) = b_warp_window_tmp;
 
                 ck_tile::move_tile_window(b_warp_windows(nIter)(kIter),
-                                          {nIter * NPerBlockPerIter, kIter * KPerBlockPerIter});
+                                          {nIter * WG::kN, kIter * WG::kK});
             });
         });
-#endif
 
         // check C-block-distribution
         static_assert(
@@ -154,7 +142,7 @@ struct BlockGemmARegBSmemCReg
         ck_tile::static_for<0, KIterPerWarp, 1>{}([&](auto kIter) {
             ck_tile::static_for<0, NIterPerWarp, 1>{}([&](auto nIter) {
                 // read B warp tensor from B Block window
-                const auto b_warp_tensor = load_tile(b_warp_windows(nIter)(kIter));
+                const auto b_warp_tensor = ck_tile::load_tile(b_warp_windows(nIter)(kIter));
 
                 ck_tile::static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
                     // read A warp tensor from A block tensor
@@ -194,11 +182,12 @@ struct BlockGemmARegBSmemCReg
 
         constexpr int32_t MWarp = config.template at<1>();
         constexpr int32_t NWarp = config.template at<2>();
+        constexpr int32_t KWarp = config.template at<3>();
 
         constexpr int32_t MIterPerWarp = MPerBlock / (MWarp * WG::kM);
-        constexpr int32_t KIterPerWarp = KPerBlock / WG::kK;
+        constexpr int32_t KIterPerWarp = KPerBlock / (KWarp * WG::kK);
 
-        constexpr auto a_block_outer_dstr_encoding =
+        constexpr auto a_block_outer_dstr_encoding = 
             ck_tile::tile_distribution_encoding<
                 ck_tile::sequence<NWarp>,
                 ck_tile::tuple<ck_tile::sequence<MIterPerWarp, MWarp>, ck_tile::sequence<KIterPerWarp>>,
@@ -213,32 +202,72 @@ struct BlockGemmARegBSmemCReg
         return ck_tile::make_static_tile_distribution(a_block_dstr_encode);
     }
 
-    CK_TILE_DEVICE static constexpr auto GetCBlockTileDistributionEncoding()
+    CK_TILE_DEVICE static constexpr auto GetCBlockShape()
     {
-        constexpr int32_t MPerBlock = BlockGemmShape::kM;
-        constexpr int32_t NPerBlock = BlockGemmShape::kN;
-
         constexpr auto config = Policy::template GetWarpGemmMWarpNWarp<Problem>();
 
         using WG = ck_tile::remove_cvref_t<decltype(config.template at<0>())>;
 
+        constexpr int32_t MPerBlock = BlockGemmShape::kM;
+        constexpr int32_t NPerBlock = BlockGemmShape::kN;
+
         constexpr int32_t MWarp = config.template at<1>();
         constexpr int32_t NWarp = config.template at<2>();
 
+        constexpr int32_t MVector = WG::WarpGemmAttribute::Impl::kCM1PerLane;
+        constexpr int32_t NVector = WG::WarpGemmAttribute::Impl::kCM0PerLane;
+
+        constexpr int32_t MthrPerWarp = WG::WarpGemmAttribute::Impl::kCMLane;
+        constexpr int32_t NThrPerWarp = WG::WarpGemmAttribute::Impl::kCNLane;
+
+        constexpr int32_t NIterPerWarp = NPerBlock / (NWarp * WG::kN); // 16 = 256 / (1 * 16)
+
+        constexpr int32_t MWarpTile = MthrPerWarp * MVector; // 64 = 4 * 16
+        constexpr int32_t NWarpTile = NThrPerWarp * NVector;
+
+        using BlockTile  = ck_tile::sequence<MPerBlock, NPerBlock>;
+        using BlockWarps = ck_tile::sequence<MWarp, NWarp>;
+        using WarpTile   = ck_tile::sequence<MWarpTile, NWarpTile>;
+        using Vector     = ck_tile::sequence<MVector, NVector>;
+
+        return ck_tile::Generic2dBlockShape<BlockTile, BlockWarps, WarpTile, Vector>{};
+    }
+
+    CK_TILE_DEVICE static constexpr auto GetCBlockTileDistributionEncoding()
+    {
+        constexpr auto config = Policy::template GetWarpGemmMWarpNWarp<Problem>();
+        using WG = ck_tile::remove_cvref_t<decltype(config.template at<0>())>;
+        using BlockShape = ck_tile::remove_cvref_t<decltype(GetCBlockShape())>;
+
+        static_assert((BlockShape::Block_M == BlockGemmShape::kM) &&
+                      (BlockShape::Block_N == BlockGemmShape::kN));
+        static_assert((BlockShape::WarpPerBlock_M == config.template at<1>()) &&
+                      (BlockShape::WarpPerBlock_N == config.template at<2>()));
+
+        constexpr int32_t MPerBlock = BlockShape::Block_M;
+        constexpr int32_t NPerBlock = BlockShape::Block_N;
+        constexpr int32_t KPerBlock = BlockGemmShape::kK;
+
+        constexpr int32_t MWarp = BlockShape::WarpPerBlock_M;
+        constexpr int32_t NWarp = BlockShape::WarpPerBlock_N;
+        constexpr int32_t KWarp = config.template at<3>();
+
         constexpr int32_t MIterPerWarp = MPerBlock / (MWarp * WG::kM);
         constexpr int32_t NIterPerWarp = NPerBlock / (NWarp * WG::kN);
+        constexpr int32_t KIterPerWarp = KPerBlock / (KWarp * WG::kK);
 
-        constexpr auto c_block_outer_dstr_encoding = ck_tile::tile_distribution_encoding<
-            ck_tile::sequence<>,
-            ck_tile::tuple<ck_tile::sequence<MIterPerWarp, MWarp>, ck_tile::sequence<NWarp, NIterPerWarp>>,
-            ck_tile::tuple<ck_tile::sequence<1, 2>>,
-            ck_tile::tuple<ck_tile::sequence<1, 0>>,
-            ck_tile::sequence<1, 2>,
-            ck_tile::sequence<0, 1>>{};
+        constexpr auto c_block_outer_dstr_encoding =
+            ck_tile::tile_distribution_encoding<
+                ck_tile::sequence<>,
+                ck_tile::tuple<ck_tile::sequence<MIterPerWarp, MWarp>, ck_tile::sequence<NWarp, NIterPerWarp>>,
+                ck_tile::tuple<ck_tile::sequence<1, 2>>,
+                ck_tile::tuple<ck_tile::sequence<1, 0>>,
+                ck_tile::sequence<1, 2>,
+                ck_tile::sequence<0, 1>>{};
 
         constexpr auto c_block_dstr_encode = ck_tile::detail::make_embed_tile_distribution_encoding(
             c_block_outer_dstr_encoding, typename WG::CWarpDstrEncoding{});
-
+        
         return c_block_dstr_encode;
     }
 
@@ -258,5 +287,11 @@ struct BlockGemmARegBSmemCReg
         auto c_block_tensor = MakeCBlockTile();
         operator()(c_block_tensor, a_block_tensor_tmp, b_block_window_tmp);
         return c_block_tensor;
+    }
+
+    CK_TILE_DEVICE static constexpr int32_t GetWarpPerBlockN()
+    {
+        constexpr auto config = Policy::template GetWarpGemmMWarpNWarp<Problem>();
+        return config.template at<2>();
     }
 };
