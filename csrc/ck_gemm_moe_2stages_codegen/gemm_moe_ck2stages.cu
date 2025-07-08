@@ -13,7 +13,7 @@ using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
 // API for user aiter.ck_moe_stage1(...)
 
 template <int stage = 1>
-MoeKernel moe_dispatch(std::string &kernelName, int block_m)
+MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim)
 {
     static const auto lookup = []
     {
@@ -36,7 +36,7 @@ MoeKernel moe_dispatch(std::string &kernelName, int block_m)
     }
     else
     {
-        return moe_stage2_heuristic_dispatch(block_m);
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim);
     }
 }
 
@@ -83,7 +83,12 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
         return;
     }
 
-    auto kernel = moe_dispatch<1>(kernelName, MPerBlock);
+    if (hidden_states.dtype() == at::ScalarType::Byte && w1.dtype() == at::ScalarType::Byte)
+    {
+        K *= 2;
+    }
+
+    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
            tokens, sorted_size, N, K, topk,
@@ -129,8 +134,11 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
         std::cerr << "detect null ptr !" << std::endl;
         return;
     }
-
-    auto kernel = moe_dispatch<2>(kernelName, MPerBlock);
+    if (inter_states.dtype() == at::ScalarType::Byte && w2.dtype() == at::ScalarType::Byte)
+    {
+        K *= 2;
+    }
+    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K);
 
     kernel(at::cuda::getCurrentCUDAStream().stream(),
            tokens, sorted_size, N, K, topk,
