@@ -181,7 +181,7 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
-l_dtype = ["bf16", "fp16"]
+l_dtype = ["fp32", "bf16", "fp16"]
 l_expert = [64, 256]
 l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
 l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
