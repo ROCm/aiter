@@ -16,6 +16,7 @@ from op_tests.triton_tests.test_hstu_attn import (
 
 def get_x_values():
     x_vals = [
+        (512, 512, 0.97, 4, 128, 128),
         (512, 3072, 0.366, 4, 128, 128),
         (1024, 1024, 0.768, 4, 128, 128),
         (32, 1024, 0.5, 4, 128, 128),
@@ -41,7 +42,7 @@ def run_benchmark(args):
     elif args.metric == "throughput":
         ylabel = "Throughput (TFLOPS)"
     elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
+        ylabel = "Bandwidth (GBs)"
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
@@ -56,7 +57,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("green", "-")],
         ylabel=ylabel,
-        plot_name=f"HSTU attention Benchmark ({args.dtype})",
+        plot_name=f"HSTU attention Benchmark, {ylabel}",
         args={"metric": args.metric},
     )
 
@@ -140,11 +141,12 @@ def run_benchmark(args):
         if metric == "time":
             return ms
         elif metric == "throughput":
-            flops = get_flops(seq_offsets, batch_size, heads, attn_dim, hidden_dim)
+            flops = get_flops(seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim)
             tflops = flops / ms * 1e-9
             return tflops
         elif metric == "bandwidth":
-            bytes = get_bytes(seq_offsets, batch_size, heads, attn_dim, hidden_dim, q.element_size())
+            elem_size = q.element_size()
+            bytes = get_bytes(seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size)
             bandwidth = bytes / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
         else:
