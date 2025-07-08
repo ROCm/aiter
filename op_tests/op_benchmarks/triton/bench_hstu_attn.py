@@ -33,7 +33,7 @@ def run_benchmark(args):
 
     x_names = ['batch_size', 'max_seq_len', 'sparsity', 'heads', 'attn_dim', 'hidden_dim']
     if args.user_input:
-        x_val_list = [(args.b, args.max_seq_len, args.sparsity, args.heads, args.head_dim, args.hidden_him)]
+        x_val_list = [(args.b, args.max_seq_len, args.sparsity, args.heads, args.head_dim, args.hidden_dim)]
     else:
         x_val_list = get_x_values()
 
@@ -162,7 +162,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "-b",
+        "--b",
         type=int,
         default=512,
         help="Batch dim of input sequences",
