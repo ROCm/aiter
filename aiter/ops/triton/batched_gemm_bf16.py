@@ -100,6 +100,8 @@ def _batched_gemm_bf16_kernel(
     tl.assume(pid_n >= 0)
 
     # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
+    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
+    # See https://github.com/ROCm/aiter/pull/597 for rationale
     batch_id = tl.cast(batch_id, tl.int64)
     stride_ab = tl.cast(stride_ab, tl.int64)
     stride_bb = tl.cast(stride_bb, tl.int64)
