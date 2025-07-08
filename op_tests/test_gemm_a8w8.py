@@ -103,12 +103,11 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     weight, w_scale = aiter.per_tensor_quant(weight, quant_dtype=quantDtype)
     bias = None
 
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     if m <= 2:
-        a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+        b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
     else:
-        a, avg_a = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
-
-    b, avg_b = run_gemm_skinny(x, weight, x_scale, w_scale, None, dtype, cu_count)
+        b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
@@ -323,7 +322,10 @@ l_mnk_nm = [
     (16384, 8192, 1024),
 ]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -332,7 +334,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-q",
@@ -342,16 +345,17 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""Date type of quantization.
+    e.g.: -q fp8""",
 )
 parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
-    choices=l_mnk_nm,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""shape of mnk.
+    e.g. -mnk 1280,8192,1024""",
 )
 
 args = parser.parse_args()

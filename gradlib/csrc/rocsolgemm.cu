@@ -78,7 +78,7 @@ namespace
     int M;
     int N;
     int K;
-    hipblasDatatype_t dtype;
+    hipblasDiagType_t dtype;
 
     friend auto operator<(const MatMulConfig &left, const MatMulConfig &right) -> bool
     {
@@ -114,7 +114,7 @@ hipblasStatus_t hipblasLtMatmul_wrapper(
     const void *beta,
     void *c,
     int ldc,
-    hipblasDatatype_t dtype,
+    hipblasDiagType_t dtype,
     hipStream_t &stream)
 {
   // TODO: flag is not supported for hipblasLt yet
@@ -457,7 +457,7 @@ torch::Tensor RocSolIdxBlas(
 
   /*
   int flag { 0 };
-  hipblasDatatype_t hipblasType;
+  hipblasDiagType_t hipblasType;
   if (abcType == at::kHalf) {
     hipblasType = HIPBLAS_R_16F;
   } else if (abcType == at::kBFloat16) {

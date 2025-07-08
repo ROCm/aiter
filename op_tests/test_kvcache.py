@@ -6,6 +6,7 @@ import aiter
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
 from typing import Tuple
+import argparse
 
 MAX_TOKEN_SUPPORTED = 16384
 
@@ -260,37 +261,59 @@ def test_reshape_and_cache(
     )
 
 
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="Test different data types of quant.",
+)
+parser.add_argument(
+    "-t",
+    "--test",
+    type=str,
+    choices=["fp16tofp8", "fp16toi8", "bf16toi8"],
+    default=["fp16tofp8", "fp16toi8", "bf16toi8"],
+    nargs="*",
+    help="""select which test to run, default is all
+    e.g.: -t fp16tofp8""",
+)
+
+args = parser.parse_args()
 test_reshape_and_cache(4097, 128, (8, 1), 128, 16, dtypes.bf16, dtypes.bf16)
-print("\nstart quant fp16->fp8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.fp16,
-    dtypes.fp8,
-    quantCfg={"quant_dtype": dtypes.fp8},
-)
-print("\nstart quant fp16->i8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.fp16,
-    dtypes.i8,
-    quantCfg={"quant_dtype": dtypes.i8},
-)
-print("\nstart quant bf16->i8")
-test_reshape_and_cache(
-    4097,
-    128,
-    (8, 1),
-    128,
-    16,
-    dtypes.bf16,
-    dtypes.i8,
-    quantCfg={"quant_dtype": dtypes.i8},
-)
+for test in args.test:
+    if test == "fp16tofp8":
+        print("\nstart quant fp16->fp8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.fp16,
+            dtypes.fp8,
+            quantCfg={"quant_dtype": dtypes.fp8},
+        )
+    elif test == "fp16toi8":
+        print("\nstart quant fp16->i8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.fp16,
+            dtypes.i8,
+            quantCfg={"quant_dtype": dtypes.i8},
+        )
+    elif test == "bf16toi8":
+        print("\nstart quant bf16->i8")
+        test_reshape_and_cache(
+            4097,
+            128,
+            (8, 1),
+            128,
+            16,
+            dtypes.bf16,
+            dtypes.i8,
+            quantCfg={"quant_dtype": dtypes.i8},
+        )
+    else:
+        raise ValueError(f"Unknown test type: {test}")

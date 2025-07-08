@@ -29,8 +29,8 @@ torch::Tensor all_reduce_asm(torch::Tensor &input,
         inp_ptr = reg_buffer.data_ptr();
     }
 
-    auto ca = reinterpret_cast<vllm::CustomAllreduce *>(_ca);
-    using RD = vllm::RankData;
+    auto ca = reinterpret_cast<aiter::CustomAllreduce *>(_ca);
+    using RD = aiter::RankData;
 
     RD *input_rd = ca->get_buffer_RD(stream, inp_ptr);
     RD *sig_rd = ca->get_buffer_RD(stream, reg_sig.data_ptr());
@@ -138,8 +138,8 @@ std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor &input
         inp_ptr = reg_buffer.data_ptr();
     }
 
-    auto ca = reinterpret_cast<vllm::CustomAllreduce *>(_ca);
-    using RD = vllm::RankData;
+    auto ca = reinterpret_cast<aiter::CustomAllreduce *>(_ca);
+    using RD = aiter::RankData;
 
     RD *sig_rd = ca->get_buffer_RD(stream, reg_sig.data_ptr());
     RD *reg_rd = ca->get_buffer_RD(stream, reg_buffer.data_ptr());
@@ -280,8 +280,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> all_reduce_rmsnorm_quant
         inp_ptr = reg_buffer.data_ptr();
     }
 
-    auto ca = reinterpret_cast<vllm::CustomAllreduce *>(_ca);
-    using RD = vllm::RankData;
+    auto ca = reinterpret_cast<aiter::CustomAllreduce *>(_ca);
+    using RD = aiter::RankData;
 
     RD *sig_rd = ca->get_buffer_RD(stream, reg_sig.data_ptr());
     RD *reg_rd = ca->get_buffer_RD(stream, reg_buffer.data_ptr());
