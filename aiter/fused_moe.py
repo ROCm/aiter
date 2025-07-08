@@ -451,11 +451,6 @@ def get_2stage_cfgs(
     )
 
 
-@functools.lru_cache()
-def get1tensor(device):
-    return torch.tensor(1.0, dtype=torch.float, device=device)
-
-
 def fused_moe_2stages(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
