@@ -1,36 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-
-
-# TODO use upstream rotation code in the future
-@triton.jit
-def _get_neox_rotated_x(
-    x,
-    x_rotated_mask,
-    BLOCK_D: tl.constexpr,
-    BLOCK_D_HALF: tl.constexpr,
-):
-    x_rotated = tl.where(x_rotated_mask, x, -x)
-    x_rotated = tl.reshape(x_rotated, (2, BLOCK_D_HALF))
-    x_rotated = tl.flip(x_rotated, 1)
-    x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
-    x_rotated = tl.flip(x_rotated, 0)
-    return x_rotated
-
-
-@triton.jit
-def _get_gptj_rotated_x(
-    x,
-    x_rotated_mask,
-    BLOCK_D: tl.constexpr,
-    BLOCK_D_HALF: tl.constexpr,
-):
-    x_rotated = tl.where(x_rotated_mask, x, -x)
-    x_rotated = tl.reshape(x_rotated, (BLOCK_D_HALF, 2))
-    x_rotated = tl.flip(x_rotated, 1)
-    x_rotated = tl.reshape(x_rotated, (BLOCK_D,))
-    return x_rotated
+from aiter.ops.triton.rope import _get_gptj_rotated_x, _get_neox_rotated_x
 
 
 @triton.jit
@@ -148,6 +119,21 @@ def fused_qk_cat(
     k1: torch.Tensor,
     k2: torch.Tensor,
 ):
+    """
+    Concat q1 with q2 and k1 with k2 along the last dimension
+
+    Key parameters:
+    - q1: Matrix X with shape (B, QH, D1).
+    - q2: Matrix W with shape (B, QH, D2).
+    - k1: Matrix X with shape (B, KH, D1).
+    - k2: Matrix W with shape (B, KH, D2).
+
+    QH must be multiple of KH
+
+    Returns:
+    - q_out: The output matrix with shape (B, QH, D1+D2).
+    - k_out: The output matrix with shape (B, KH, D1+D2).
+    """
     b, qh, d1 = q1.shape
     b2, qh2, d2 = q2.shape
     bk, kh, dk1 = k1.shape
@@ -367,6 +353,21 @@ def fused_qk_rope_cat(
     sin: torch.Tensor,
     is_neox: bool,
 ):
+    """
+    Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
+
+    Key parameters:
+    - q_nope: Matrix X with shape (B, QH, D1).
+    - q_pe: Matrix W with shape (B, QH, D2).
+    - k_nope: Matrix X with shape (B, KH, D1).
+    - k_pe: Matrix W with shape (B, KH, D2).
+
+    QH must be multiple of KH
+
+    Returns:
+    - q_out: The output matrix with shape (B, QH, D1+D2).
+    - k_out: The output matrix with shape (B, KH, D1+D2).
+    """
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
     bk, kh, dk1 = k_nope.shape
