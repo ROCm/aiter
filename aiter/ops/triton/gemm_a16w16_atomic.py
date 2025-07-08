@@ -67,16 +67,16 @@ def _gemm_a16_w16_atomic_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
-    pid = remap_xcd(pid, GRID_MN)
     if NUM_KSPLIT == 1:
+        pid = remap_xcd(pid, GRID_MN)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
-        pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(pid_k >= 0)
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
@@ -152,10 +152,22 @@ def _get_config(
                 _get_config._config_dict[key] = config
         else:
             key = "default"  # fall back to default config
-    if M <= 128 and "small" in _get_config._config_dict[key]:
+            # single config. for the default path
+            return _get_config._config_dict[key]["any"]
+    if M < 32:
         return _get_config._config_dict[key]["small"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32:
+            return _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64:
+            return _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128:
+            return _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256:
+        return _get_config._config_dict[key]["large"]
     else:
-        return _get_config._config_dict[key]["any"]
+        return _get_config._config_dict[key]["xlarge"]
 
 
 def gemm_a16w16_atomic(
