@@ -1,6 +1,6 @@
 import torch
 import pytest
-from aiter.ops.triton.fused_elementwise import fused_mul_add
+from aiter.ops.triton.fused_mul_add import fused_mul_add
 
 
 def generate_qk_inputs(shape, a_type_is_scalar, b_type_is_scalar, dtype):
