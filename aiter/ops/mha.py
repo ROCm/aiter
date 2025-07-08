@@ -4,7 +4,7 @@
 from torch import Tensor, Generator
 from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..utility import dtypes
 import torch
 
@@ -268,7 +268,7 @@ def _flash_attn_forward(
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
-        ret &= (return_lse and gfx == "gfx950") or (mask and gfx == "gfx942")
+        ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942" and get_cu_num() == 80)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
