@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -474,7 +474,11 @@ def rotate_half_gptj(x):
     return x.flatten(-2)
 
 
-def ref_rope_sbhd_fwd(x, freqs, rotate_style, reuse_freqs_front_part, nope_first):
+def ref_rope_sbhd_fwd(
+    x_, freqs_, rotate_style, reuse_freqs_front_part, nope_first, simulate_cached
+):
+    x = x_.to(dtype=torch.float32)
+    freqs = freqs_.to(dtype=torch.float32)
     rotate_half = (
         rotate_half_neox if rotate_style == RotateStyle.NEOX else rotate_half_gptj
     )
@@ -489,16 +493,34 @@ def ref_rope_sbhd_fwd(x, freqs, rotate_style, reuse_freqs_front_part, nope_first
             freqs = freqs.repeat([1] * (freqs.dim() - 1) + [2])
         elif rotate_style == RotateStyle.GPTJ:
             freqs = freqs.repeat_interleave(2, dim=-1)
-    x_embed = (x * torch.cos(freqs)) + (rotate_half(x) * torch.sin(freqs))
+    cos = (
+        torch.cos(freqs).to(dtype=freqs_.dtype).to(dtype=torch.float32)
+        if simulate_cached
+        else torch.cos(freqs)
+    )
+    sin = (
+        torch.sin(freqs).to(dtype=freqs_.dtype).to(dtype=torch.float32)
+        if simulate_cached
+        else torch.sin(freqs)
+    )
+    x_embed = (x * cos) + (rotate_half(x) * sin)
     return (
-        torch.cat((x_forward, x_embed.to(dtype=x.dtype)), dim=-1)
+        torch.cat((x_forward, x_embed.to(dtype=x.dtype)), dim=-1).to(dtype=x_.dtype)
         if nope_first
-        else torch.cat((x_embed.to(dtype=x.dtype), x_forward), dim=-1)
+        else torch.cat((x_embed.to(dtype=x.dtype), x_forward), dim=-1).to(
+            dtype=x_.dtype
+        )
     )
 
 
 def ref_rope_thd_fwd(
-    x, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first
+    x,
+    cu_seqlens,
+    freqs,
+    rotate_style,
+    reuse_freqs_front_part,
+    nope_first,
+    simulate_cached,
 ):
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     x_embed = torch.cat(
@@ -509,6 +531,7 @@ def ref_rope_thd_fwd(
                 rotate_style,
                 reuse_freqs_front_part,
                 nope_first,
+                simulate_cached,
             )
             for xi in torch.split(x, seqlens)
         ]
@@ -516,7 +539,12 @@ def ref_rope_thd_fwd(
     return x_embed.squeeze(1)
 
 
-def ref_rope_2d_fwd(x, size_h, size_w, cos_h, sin_h, cos_w, sin_w, rotate_style):
+def ref_rope_2d_fwd(x_, size_h, size_w, cos_h_, sin_h_, cos_w_, sin_w_, rotate_style):
+    x = x_.to(dtype=torch.float32)
+    cos_h = cos_h_.to(dtype=torch.float32)
+    sin_h = sin_h_.to(dtype=torch.float32)
+    cos_w = cos_w_.to(dtype=torch.float32)
+    sin_w = sin_w_.to(dtype=torch.float32)
     rotate_half = (
         rotate_half_neox if rotate_style == RotateStyle.NEOX else rotate_half_gptj
     )
@@ -529,7 +557,7 @@ def ref_rope_2d_fwd(x, size_h, size_w, cos_h, sin_h, cos_w, sin_w, rotate_style)
     cos_w = cos_w[:, :size_w].unsqueeze(1)  # [1, 1, W, 1, D//2]
     sin_w = sin_w[:, :size_w].unsqueeze(1)  # [1, 1, W, 1, D//2]
     x2 = (x2 * cos_w) + (rotate_half(x2) * sin_w)
-    return torch.cat([x1, x2], dim=-1).view(s, b, h, d).to(dtype=x.dtype)
+    return torch.cat([x1, x2], dim=-1).view(s, b, h, d).to(dtype=x_.dtype)
 
 
 def test_rope_sbhd(
@@ -552,10 +580,16 @@ nope_first: {nope_first}, \
 transpose_output: {transpose_output}
 """
 
+    input_cached = input.clone().detach().requires_grad_(True)
+
     ref = ref_rope_sbhd_fwd(
-        input, freqs, rotate_style, reuse_freqs_front_part, nope_first
+        input, freqs, rotate_style, reuse_freqs_front_part, nope_first, False
+    )
+    ref_cached = ref_rope_sbhd_fwd(
+        input_cached, freqs, rotate_style, reuse_freqs_front_part, nope_first, True
     )
     ref.backward(grad)
+    ref_cached.backward(grad)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
@@ -567,7 +601,7 @@ transpose_output: {transpose_output}
         grad, freqs, rotate_style, reuse_freqs_front_part, nope_first, transpose_output
     )
     hip_cached_fwd, hip_cached_fwd_avg = hip_rope_cached_fwd(
-        input,
+        input_cached,
         cos,
         sin,
         rotate_style,
@@ -586,21 +620,31 @@ transpose_output: {transpose_output}
     )
 
     checkAllclose(
-        ref, hip_fwd, msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n"
+        ref,
+        hip_fwd,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"rope_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         input.grad,
         hip_bwd,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
-        ref,
+        ref_cached,
         hip_cached_fwd,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_fwd - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
-        input.grad,
+        input_cached.grad,
         hip_cached_bwd,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_bwd - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n",
     )
 
@@ -633,14 +677,25 @@ nope_first: {nope_first}, \
 transpose_output: {transpose_output}
 """
 
+    input_x_cached = input_x.clone().detach().requires_grad_(True)
+    input_y_cached = input_y.clone().detach().requires_grad_(True)
+
     ref_x = ref_rope_sbhd_fwd(
-        input_x, freqs, rotate_style, reuse_freqs_front_part, nope_first
+        input_x, freqs, rotate_style, reuse_freqs_front_part, nope_first, False
     )
     ref_y = ref_rope_sbhd_fwd(
-        input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first
+        input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first, False
+    )
+    ref_x_cached = ref_rope_sbhd_fwd(
+        input_x_cached, freqs, rotate_style, reuse_freqs_front_part, nope_first, True
+    )
+    ref_y_cached = ref_rope_sbhd_fwd(
+        input_y_cached, freqs, rotate_style, reuse_freqs_front_part, nope_first, True
     )
     ref_x.backward(grad_x)
     ref_y.backward(grad_y)
+    ref_x_cached.backward(grad_x)
+    ref_y_cached.backward(grad_y)
 
     cos = torch.cos(freqs)
     sin = torch.sin(freqs)
@@ -664,8 +719,8 @@ transpose_output: {transpose_output}
         transpose_output,
     )
     (hip_cached_fwd_x, hip_cached_fwd_y), hip_cached_fwd_avg = hip_rope_cached_2c_fwd(
-        input_x,
-        input_y,
+        input_x_cached,
+        input_y_cached,
         cos,
         sin,
         rotate_style,
@@ -687,41 +742,57 @@ transpose_output: {transpose_output}
     checkAllclose(
         ref_x,
         hip_fwd_x,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_2c_fwd_x - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         ref_y,
         hip_fwd_y,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_2c_fwd_y - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         input_x.grad,
         hip_bwd_x,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_2c_bwd_x - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         input_y.grad,
         hip_bwd_y,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_2c_bwd_y - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
-        ref_x,
+        ref_x_cached,
         hip_cached_fwd_x,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_2c_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
-        ref_y,
+        ref_y_cached,
         hip_cached_fwd_y,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_2c_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
-        input_x.grad,
+        input_x_cached.grad,
         hip_cached_bwd_x,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_2c_bwd_x - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
-        input_y.grad,
+        input_y_cached.grad,
         hip_cached_bwd_y,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_2c_bwd_y - avg: {hip_cached_bwd_avg:<8.2f} us - {input_msg}\n",
     )
 
@@ -758,6 +829,7 @@ transpose_output: {transpose_output}
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
     )
 
     cos = torch.cos(freqs)
@@ -790,6 +862,8 @@ transpose_output: {transpose_output}
     checkAllclose(
         ref,
         hip_cached_fwd,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_position_fwd - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n",
     )
 
@@ -828,6 +902,7 @@ transpose_output: {transpose_output}
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
     )
     ref_y = ref_rope_sbhd_fwd(
         input_y,
@@ -837,6 +912,7 @@ transpose_output: {transpose_output}
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
     )
 
     cos = torch.cos(freqs)
@@ -875,11 +951,15 @@ transpose_output: {transpose_output}
     checkAllclose(
         ref_x,
         hip_cached_fwd_x,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_position_2d_fwd_x - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         ref_y,
         hip_cached_fwd_y,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_cached_position_2d_fwd_y - avg: {hip_cached_fwd_avg:<8.2f} us - {input_msg}\n",
     )
 
@@ -919,6 +999,7 @@ nope_first: {nope_first}
             rotate_style,
             True,
             nope_first,
+            True,
         )
         ref_y = ref_rope_sbhd_fwd(
             input_y,
@@ -928,6 +1009,7 @@ nope_first: {nope_first}
             rotate_style,
             True,
             nope_first,
+            True,
         )
         h_y = input_y.shape[2]
         hip_input_x, hip_input_y = input_x, input_y
@@ -980,16 +1062,32 @@ nope_first: {nope_first}
                 offsets.view(-1),
             )
 
-        checkAllclose(ref_x, hip_input_x, msg=f"correction: hip_fwd_x - {input_msg}\n")
-        checkAllclose(ref_y, hip_input_y, msg=f"correction: hip_fwd_y - {input_msg}\n")
+        checkAllclose(
+            ref_x,
+            hip_input_x,
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"correction: hip_fwd_x - {input_msg}\n",
+        )
+        checkAllclose(
+            ref_y,
+            hip_input_y,
+            rtol=1e-3,
+            atol=1e-3,
+            msg=f"correction: hip_fwd_y - {input_msg}\n",
+        )
         checkAllclose(
             ref_x,
             leg_input_x.view(s, b, h_x, d),
+            rtol=1e-3,
+            atol=1e-3,
             msg=f"correction: leg_fwd_x - {input_msg}\n",
         )
         checkAllclose(
             ref_y,
             leg_input_y.view(s, b, h_y, d),
+            rtol=1e-3,
+            atol=1e-3,
             msg=f"correction: leg_fwd_y - {input_msg}\n",
         )
 
@@ -1061,7 +1159,13 @@ cu_seqlens: {cu_seqlens}
     torch.set_printoptions(profile="default")
 
     ref = ref_rope_thd_fwd(
-        input, cu_seqlens, freqs, rotate_style, reuse_freqs_front_part, nope_first
+        input,
+        cu_seqlens,
+        freqs,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope_first,
+        False,
     )
     ref.backward(grad)
 
@@ -1073,11 +1177,17 @@ cu_seqlens: {cu_seqlens}
     )
 
     checkAllclose(
-        ref, hip_fwd, msg=f"rope_thd_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n"
+        ref,
+        hip_fwd,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"rope_thd_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         input.grad,
         hip_bwd,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_thd_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n",
     )
 
@@ -1108,11 +1218,17 @@ dim_freqs: {str(freqs_h.shape):<20}
     )
 
     checkAllclose(
-        ref, hip_fwd, msg=f"rope_2d_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n"
+        ref,
+        hip_fwd,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"rope_2d_fwd - avg: {hip_fwd_avg:<8.2f} us - {input_msg}\n",
     )
     checkAllclose(
         input.grad,
         hip_bwd,
+        rtol=1e-3,
+        atol=1e-3,
         msg=f"rope_2d_bwd - avg: {hip_bwd_avg:<8.2f} us - {input_msg}\n",
     )
 
@@ -1248,7 +1364,7 @@ if __name__ == "__main__":
         type=int,
         nargs="*",
         choices=list(d_rr.keys()),
-        help="""Rotary percentage and reuse front part. Default is all combinations of: 
+        help="""Rotary percentage and reuse front part. Default is all combinations of:
 (1.0, True, False), (1.0, False, False), (0.5, False, False), (0.5, True, False), (0.5, True, True), (0.5, False, True).
     e.g.: -rr 0  # for (1.0, True, False)""",
     )
