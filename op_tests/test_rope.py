@@ -475,7 +475,7 @@ def rotate_half_gptj(x):
 
 
 def ref_rope_sbhd_fwd(
-    x_, freqs_, rotate_style, reuse_freqs_front_part, nope_first, simulate_cached
+    x_, freqs_, rotate_style, reuse_freqs_front_part, nope_first, simulate_cached=False
 ):
     x = x_.to(dtype=torch.float32)
     freqs = freqs_.to(dtype=torch.float32)
@@ -520,7 +520,7 @@ def ref_rope_thd_fwd(
     rotate_style,
     reuse_freqs_front_part,
     nope_first,
-    simulate_cached,
+    simulate_cached=False,
 ):
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     x_embed = torch.cat(
