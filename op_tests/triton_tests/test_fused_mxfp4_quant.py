@@ -1,6 +1,6 @@
 import torch
 import pytest
-from aiter.ops.triton.fused_quant import (
+from aiter.ops.triton.fused_mxfp4_quant import (
     fused_flatten_mxfp4_quant,
     fused_rms_mxfp4_quant,
 )
