@@ -120,7 +120,7 @@ def fused_rms_mxfp4_quant(
         2. perform RMS norm along the last dimenion for inp1
         3. if inp2 is not None, perform RMS norm along the last dimenion for inp2
         4. perform mxfp4 quantization for inp1 only
-        
+
     Key parameters:
     - x: Matrix X with shape (M, N1, N2).
 
