@@ -465,7 +465,7 @@ def _get_config(
 
     if M < 32:
         return _get_config._config_dict[key]["small"]
-    elif M <= 128:
+    elif M <= 256:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
             return _get_config._config_dict[key]["medium_M32"]
@@ -473,7 +473,9 @@ def _get_config(
             return _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128:
             return _get_config._config_dict[key]["medium_M128"]
-    elif M <= 256:
+        elif BLK_M == 256:
+            return _get_config._config_dict[key]["medium_M256"]
+    elif M <= 512:
         return _get_config._config_dict[key]["large"]
     else:
         return _get_config._config_dict[key]["xlarge"]
