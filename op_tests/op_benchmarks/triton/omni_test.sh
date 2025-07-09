@@ -3,7 +3,7 @@
 # Simple benchmark runner that generates JSON files
 # Usage: ./run_benchmarks.sh [output_dir] [parallel_jobs]
 
-OUTPUT_DIR=${1:-"json_outputs"}
+OUTPUT_DIR=${1:-"outputs"}
 PARALLEL_JOBS=${2:-1}
 
 # Create output directory
@@ -25,12 +25,12 @@ run_benchmark() {
     
     IFS=',' read -r batch hq hk sq sk d_head layout extra_flags output_name <<< "$config"
     
-    local json_file="${output_dir}/${output_name}.json"
+    local csv_file="${output_dir}/${output_name}.csv"
     
     echo "Running: $output_name"
     
     # Build the command
-    local cmd="omniprobe -a MessageLogger -v -i -c ~/.triton/cache -t json -l $json_file -d 1 -- python single_test_mha.py"
+    local cmd="omniprobe -a BasicBlockAnalysis -v -i -c ~/.triton/cache -t csv -l $csv_file -d 1 -- python single_test_mha.py"
     cmd="$cmd -b $batch -hq $hq -hk $hk -sq $sq -sk $sk -d $d_head -layout $layout"
     
     # Add extra flags if any
