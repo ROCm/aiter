@@ -819,7 +819,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr bool kKVLoadOnce         = true;
+    constexpr bool kKVLoadOnce         = false;
     constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
     //TODO:
     // cases need maintenance:
