@@ -339,7 +339,6 @@ def batched_gemm_afp4wfp4_pre_quant(
 
     Bx, M, K = x.shape
     Bw, K, N = w.shape
-    By, _, _ = y.shape
     if y is not None:
         By, _, _ = y.shape
         assert Bx == Bw == By
@@ -437,3 +436,4 @@ def batched_gemm_afp4wfp4_pre_quant(
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
         )
+    return y
