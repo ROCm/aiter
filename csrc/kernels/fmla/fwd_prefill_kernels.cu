@@ -315,14 +315,34 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
     constexpr bool enableXqa = (Traits::kXqaStrategy != XqaStrategy::Disable);
     // Define causal mask
-    using Mask             = ck_tile::SimplifiedGenericAttentionMask<kIsCausal, enableXqa>;
-    const int32_t seqlen_k = __builtin_amdgcn_readfirstlane(params.p_seqlens_k[bid]);
-    Mask mask              = kIsCausal ? Mask{params.size_s_ori,
-                                              seqlen_k - params.size_s_ori + 1,
-                                              params.size_s_pk,
-                                              seqlen_k,
-                                              params.mask_y_ratio_mdiv}
-                                       : Mask{params.size_s_pk, seqlen_k};
+    using Mask             = std::conditional_t<enableXqa,
+                                                ck_tile::SimplifiedRatioAttentionMask<kIsCausal>,
+                                                ck_tile::SimplifiedGenericAttentionMask<kIsCausal>>;
+    const int32_t seqlen_k = params.p_seqlens_k[bid];
+    Mask mask = [&] {
+        if constexpr(kIsCausal)
+        {
+            if constexpr(enableXqa)
+            {
+                return Mask{params.size_s_ori,
+                            seqlen_k - params.size_s_ori + 1,
+                            params.size_s_pk,
+                            seqlen_k,
+                            params.mask_y_ratio_mdiv};
+            }
+            else
+            {
+                return Mask{params.size_s_ori,
+                            seqlen_k - params.size_s_ori + 1,
+                            params.size_s_ori,
+                            seqlen_k};
+            }
+        }
+        else
+        {
+            return Mask{params.size_s_pk, seqlen_k};
+        }
+    }();
 
     constexpr auto q_dram_window_lengths =
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockK0>{});
