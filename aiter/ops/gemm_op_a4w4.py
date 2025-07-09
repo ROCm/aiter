@@ -56,6 +56,7 @@ def gemm_a4w4_blockscale(
     x_scale: Tensor,  # x_scale:[M, K/32] e8m0 paded
     w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
+    splitK: Optional[int] = 0,
 ): ...
 
 

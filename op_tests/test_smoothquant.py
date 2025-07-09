@@ -57,7 +57,9 @@ def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
 
 if __name__ == "__main__":
     l_dtype = ["bf16", "fp16"]
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
     parser.add_argument(
         "-d",
         "--dtype",
@@ -66,19 +68,24 @@ if __name__ == "__main__":
         nargs="?",
         const=None,
         default=None,
-        help="data type",
+        help="""Data type.
+    e.g.: -d bf16""",
     )
     parser.add_argument(
         "-m",
         type=int,
         default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
         nargs="*",
+        help="""M of mnk.
+    e.g.: -m 32""",
     )
     parser.add_argument(
         "-n",
         type=int,
         default=[10, 1024, 2048],
         nargs="*",
+        help="""N of mnk.
+    e.g.: -n 1024""",
     )
     args = parser.parse_args()
     if args.dtype is None:

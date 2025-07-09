@@ -142,11 +142,10 @@ parser.add_argument(
     "-s",
     "--shape",
     type=dtypes.str2tuple,
-    choices=l_shape,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="shape. e.g. -s 128,8192",
 )
 
 if __name__ == "__main__":

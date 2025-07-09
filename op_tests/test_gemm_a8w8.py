@@ -322,7 +322,10 @@ l_mnk_nm = [
     (16384, 8192, 1024),
 ]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -331,7 +334,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-q",
@@ -341,16 +345,17 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""Date type of quantization.
+    e.g.: -q fp8""",
 )
 parser.add_argument(
     "-mnk",
     type=dtypes.str2tuple,
-    choices=l_mnk_nm,
     nargs="?",
     const=None,
     default=None,
-    help="shape",
+    help="""shape of mnk.
+    e.g. -mnk 1280,8192,1024""",
 )
 
 args = parser.parse_args()

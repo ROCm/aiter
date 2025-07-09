@@ -11,6 +11,7 @@ from aiter import pertoken_quant
 from aiter import dtypes
 from enum import Enum
 from einops import rearrange
+import argparse
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -573,12 +574,52 @@ def test_paged_attention(
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Test Paged Attention V1",
+    )
+    parser.add_argument(
+        "-c",
+        "--ctx_len",
+        type=int,
+        default=[2048],
+        nargs="*",
+        help="""Context length.
+    e.g. -c 2048""",
+    )
+    parser.add_argument(
+        "-p",
+        "--pa_variant",
+        type=str,
+        choices=[member.name for member in PAVariant],
+        default=[PAVariant.Shomy],
+        nargs="*",
+        help=f"Paged Attention variant to test. {[member.name for member in PAVariant]}\n"
+        + "    e.g. -p Shomy\n",
+    )
+    parser.add_argument(
+        "-q",
+        "--quant_cache_dtype",
+        type=str,
+        choices=["none"],
+        default=["none"],
+        nargs="*",
+        help="""Quantization cache dtype.
+    e.g. -q none""",
+    )
+
     torch.set_printoptions(sci_mode=False)
+    args = parser.parse_args()
+    if not args.pa_variant == [PAVariant.Shomy]:
+        args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
+    args.quant_cache_dtype = [
+        None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
+    ]
 
     for ctx_len, pa_variant, quant_cache_dtype in itertools.product(
-        [2048],
-        [PAVariant.Shomy],
-        [None],
+        args.ctx_len,
+        args.pa_variant,
+        args.quant_cache_dtype,
     ):
 
         if pa_variant == PAVariant.Shomy:

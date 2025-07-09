@@ -200,8 +200,13 @@ def test_fmoe(
         w1_qt, w1_scale = torch_quant(w1, quant_dtype=WQDType)
         w2_qt, w2_scale = torch_quant(w2, quant_dtype=WQDType)
 
-    w1_qt_aiter = w1_qt
-    w2_qt_aiter = w2_qt
+    if qType != aiter.QuantType.per_1x32:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
+
+    else:
+        w1_qt = w1_qt_aiter = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+        w2_qt = w2_qt_aiter = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
 
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
@@ -239,10 +244,9 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    else:
+    elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
-
     # # ######################## ck stage 1 start ###########
     # # a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
     # # out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
@@ -407,7 +411,7 @@ def test_fmoe(
         return {"us": us_fuse, "err": err}
 
 
-l_dtype = ["bf16", "fp16"]
+l_dtype = ["bf16", "fp16"][:1]
 l_dim = [(6144, 4096)]
 l_tokenNum = [
     1,
@@ -430,10 +434,13 @@ l_quant = [
     (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
     # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test
 ]
-l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu]
+l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
 l_doweight_stage1 = [False, True]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -442,7 +449,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 
 parser.add_argument(
@@ -451,6 +459,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
+    help="""Model dimension.
+    e.g.: -dim 6144,4096""",
 )
 
 parser.add_argument(
@@ -460,14 +470,22 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of tokens",
+    help="""Number of tokens.
+    e.g.: -t 1024""",
 )
 
 parser.add_argument(
+    "-q",
     "--quant",
     type=int,
     choices=range(len(l_quant)),
-    help="select quantization type",
+    help="""select quantization type:
+    0 : aiter.QuantType.No, None, None),  # a16w16
+    1: aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8  # a8w8
+    2: aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8  # a8w8
+    3: aiter.QuantType.per_Token, dtypes.fp8, torch.int4  # a8w4
+    4: aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2  # a4w4
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8 TODO add test""",
 )
 
 parser.add_argument(
@@ -476,7 +494,8 @@ parser.add_argument(
     type=str,
     choices=["silu", "gelu"],
     default=None,
-    help="select activation type",
+    help="""Select activation type.
+    e.g.: -a silu""",
 )
 
 parser.add_argument(
@@ -486,7 +505,9 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="whether to do weight in stage 1",
+    help="""Whether to do weight in stage 1. Default is [False, True].
+    -s f    # False.
+    -s t    # True.""",
 )
 
 parser.add_argument(
@@ -494,7 +515,8 @@ parser.add_argument(
     "--expert",
     type=int,
     default=8,
-    help="number of experts",
+    help="""Number of experts.
+    e.g.: -e 8""",
 )
 
 parser.add_argument(
@@ -502,7 +524,8 @@ parser.add_argument(
     "--topk",
     type=int,
     default=2,
-    help="number of top experts",
+    help="""Number of top experts.
+    e.g.: -k 2""",
 )
 
 args = parser.parse_args()

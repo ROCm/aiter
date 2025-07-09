@@ -399,7 +399,10 @@ l_qlen = [1, 2, 3, 4]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
 l_batch_size = [128]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -408,7 +411,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-n",
@@ -416,7 +420,8 @@ parser.add_argument(
     type=dtypes.str2tuple,
     choices=l_num_heads,
     default=None,
-    help="number of heads, e.g. 8,1",
+    help="""Number of heads.
+    e.g. -n 8,1""",
 )
 parser.add_argument(
     "-q",
@@ -424,7 +429,8 @@ parser.add_argument(
     type=int,
     choices=l_qlen,
     default=None,
-    help="query length, e.g. 1, 2, 3, 4",
+    help="""Query length.
+    e.g. -q 1""",
 )
 parser.add_argument(
     "-c",
@@ -432,7 +438,8 @@ parser.add_argument(
     type=int,
     choices=l_ctx_len,
     default=None,
-    help="context length, e.g. 7, 26, 57, 66, 109, 128, 257, 282, 4097",
+    help="""Context length.
+    e.g. -c 128""",
 )
 parser.add_argument(
     "-b",
@@ -440,7 +447,8 @@ parser.add_argument(
     type=int,
     choices=l_batch_size,
     default=None,
-    help="batch size, e.g. 128",
+    help="""Batch size.
+    e.g. -b 128""",
 )
 
 args = parser.parse_args()

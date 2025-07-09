@@ -17,7 +17,7 @@ torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
-@perftest()
+@perftest(num_iters=2, num_warmup=1)
 def test_nofuse(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -28,21 +28,21 @@ def test_nofuse(
 
     M, _ = hidden_states.shape
 
-    topk_weights = torch.empty(M, topk, dtype=dtypes.fp32, device=hidden_states.device)
-    topk_ids = torch.empty(M, topk, dtype=dtypes.i32, device=hidden_states.device)
-    token_expert_indicies = torch.empty(
-        M, topk, dtype=dtypes.i32, device=hidden_states.device
+    gating_output = torch.nn.functional.softmax(
+        gating_output.float(),
+        dim=-1,
     )
-
-    aiter.topk_softmax(
-        topk_weights, topk_ids, token_expert_indicies, gating_output.float(), False
+    topk_weights, topk_ids = gating_output.topk(
+        k=topk,
+        dim=-1,
+        largest=True,
+        sorted=True,
     )
-    del token_expert_indicies  # Not used. Will be used in the future.
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    return topk_weights, topk_ids
+    return topk_weights, topk_ids.to(dtypes.i32)
 
 
 @perftest()
@@ -68,8 +68,12 @@ def test_topk_softmax(dtype, token, E, topk):
     (topk_weights_b, topk_ids_b), avg_b = test_fuse(
         hidden_states, gating_output, topk, True
     )
-    err = checkAllclose(topk_weights_a, topk_weights_b, atol=0.03)
-    checkAllclose(topk_ids_a, topk_ids_b, atol=0, msg="topk_ids")
+    id_ref, _ref = torch.sort(topk_ids_a)
+    w_ref = topk_weights_a.gather(1, _ref)
+    id_aiter, _aiter = torch.sort(topk_ids_b)
+    w_aiter = topk_weights_b.gather(1, _aiter)
+    err = checkAllclose(w_ref, w_aiter)
+    checkAllclose(id_ref, id_aiter, msg="topk_ids")
     return {"err": err, "us": avg_b}
 
 
@@ -177,12 +181,15 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
-l_dtype = ["bf16", "fp16"]
+l_dtype = ["fp32", "bf16", "fp16"]
 l_expert = [64, 256]
 l_m = [1, 8, 16, 32, 64, 128, 256, 65536, 163840]
 l_token = [1, 2, 5, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 10000, 16384]
 
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -191,7 +198,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-e",
@@ -201,12 +209,15 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of experts",
+    help="""Number of experts.
+    e.g.: -e 64""",
 )
 parser.add_argument(
     "-m",
     type=int,
     default=None,
+    help="""M of mnk.
+    e.g.: -m 64""",
 )
 parser.add_argument(
     "-t",
@@ -216,7 +227,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of tokens",
+    help="""Number of tokens.
+    e.g.: -t 64""",
 )
 
 args = parser.parse_args()

@@ -14,6 +14,7 @@ from aiter.test_mha_common import (
     pad_rearrange_dropout_mask_hts_to_bhss,
 )
 import pytest
+import argparse
 
 
 def run_torch(
@@ -381,37 +382,158 @@ def test_flash_attn_varlen_func(
 
 
 if __name__ == "__main__":
-    batch_size = 4
-    nheads = 4
-    (seqlen_q, seqlen_k) = (4, 4)
-    d = 192
-    d_v = 192
-    dropout_p = 0.0
-    min_seqlen_q = 1
-    causal = True
-    local = False
-    bias_type = "no"
-    deterministic = True
-    mha_type = "mha"
-    dtype = dtypes.bf16
-    return_lse = False
-    return_attn_probs = False
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        type=int,
+        nargs="?",
+        default=4,
+        help="""Batch size.
+    e.g.: -b 16""",
+    )
+    parser.add_argument(
+        "-nh",
+        "--nheads",
+        type=int,
+        nargs="?",
+        default=4,
+        help="""Number of attention heads.
+    e.g. -nh 4""",
+    )
+    parser.add_argument(
+        "-s",
+        "--seqlen_q_k",
+        type=dtypes.str2tuple,
+        nargs="?",
+        default=(4, 4),
+        help="""Sequence length of query&key.
+    e.g. -s 4,4""",
+    )
+    parser.add_argument(
+        "-d",
+        type=int,
+        nargs="?",
+        default=192,
+        help="""Dimension of query&key.
+    e.g. -d 192""",
+    )
+    parser.add_argument(
+        "-dv",
+        type=int,
+        nargs="?",
+        default=192,
+        help="""Dimension of value.
+    e.g. -dv 192""",
+    )
+    parser.add_argument(
+        "-dp",
+        "--dropout_p",
+        type=float,
+        nargs="?",
+        default=0.0,
+        help="""Dropout probability."
+    e.g. -dp 0.0""",
+    )
+    parser.add_argument(
+        "-msq",
+        "--min_seqlen_q",
+        type=int,
+        nargs="?",
+        default=1,
+        help="""Minimum sequence length of query.
+    e.g. -msq 1""",
+    )
+    parser.add_argument(
+        "-c",
+        "--causal",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="""Causal attention, default is True.
+    -c or --causal    # enable causal attention
+    --no-causal       # disable causal attention""",
+    )
+    parser.add_argument(
+        "-l",
+        "--local",
+        action="store_true",
+        default=False,
+        help="""Local attention. default is False.
+    e.g. -l or --local    # enable local attention""",
+    )
+    parser.add_argument(
+        "-bt",
+        "--bias_type",
+        type=str,
+        default="no",
+        help="Type of bias.",
+    )
+    parser.add_argument(
+        "-det",
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="""Deterministic attention, default is True.
+    -det or --deterministic    # enable deterministic attention
+    --no-deterministic         # disable deterministic attention""",
+    )
+    parser.add_argument(
+        "-mha",
+        "--mha_type",
+        type=str,
+        default="mha",
+        help="""Type of multi-head attention.
+    e.g. -mha mha/mqa/gqa""",
+    )
+    parser.add_argument(
+        "-dt",
+        "--dtype",
+        type=str,
+        default="bf16",
+        help="""Data type.
+    e.g.: -dt bf16""",
+    )
+    parser.add_argument(
+        "-rlse",
+        "--return_lse",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="""return logsumexp, default is False.
+    -rlse or --return_lse    # enable return logsumexp
+    --no-return_lse          # disable return logsumexp""",
+    )
+    parser.add_argument(
+        "-rap",
+        "--return_attn_probs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="""return attention probabilities, default is False.
+    -rap or --return_attn_probs    # enable return attention probabilities
+    --no-return_attn_probs        # disable return attention probabilities""",
+    )
+
+    args = parser.parse_args()
+    dtype = dtypes.d_dtypes[args.dtype]
+    (seqlen_q, seqlen_k) = args.seqlen_q_k
 
     test_flash_attn_varlen_func(
-        batch_size,
-        nheads,
+        args.batch_size,
+        args.nheads,
         seqlen_q,
         seqlen_k,
-        d,
-        d_v,
-        min_seqlen_q,
-        dropout_p,
-        causal,
-        local,
-        bias_type,
-        deterministic,
-        mha_type,
+        args.d,
+        args.dv,
+        args.min_seqlen_q,
+        args.dropout_p,
+        args.causal,
+        args.local,
+        args.bias_type,
+        args.deterministic,
+        args.mha_type,
         dtype,
-        return_lse,
-        return_attn_probs,
+        args.return_lse,
+        args.return_attn_probs,
     )

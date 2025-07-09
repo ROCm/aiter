@@ -310,7 +310,10 @@ l_m = [1, 128, 256]
 l_dim = [5120]
 l_hdim = [1024]
 l_expert = [16, 128]
-parser = argparse.ArgumentParser(description="config input of test")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
 parser.add_argument(
     "-d",
     "--dtype",
@@ -319,24 +322,29 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="data type",
+    help="""Data type.
+    e.g.: -d bf16""",
 )
 parser.add_argument(
     "-m",
     type=int,
     default=None,
+    help="""M of mnk.
+    e.g.: -m 64""",
 )
 parser.add_argument(
-    "--dim",
+    "-dim",
     type=int,
     default=None,
-    help="model dimension, default 5120",
+    help="""model dimension, default 5120
+    e.g.: -dim 5120""",
 )
 parser.add_argument(
-    "--hdim",
+    "-hdim",
     type=int,
     default=None,
-    help="hidden dimension, default 1024",
+    help="""Hidden dimension, default 1024
+    e.g.: -hdim 1024""",
 )
 parser.add_argument(
     "-e",
@@ -346,7 +354,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="number of experts",
+    help="""Number of experts.
+    e.g.: -e 16""",
 )
 
 args = parser.parse_args()

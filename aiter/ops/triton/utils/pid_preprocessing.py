@@ -57,8 +57,8 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
 @triton.jit
 def pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M: tl.constexpr = 1):
     if GROUP_SIZE_M == 1:
-        pid_m = pid % num_pid_m
-        pid_n = pid // num_pid_m
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
     else:
         num_pid_in_group = GROUP_SIZE_M * num_pid_n
         group_id = pid // num_pid_in_group
