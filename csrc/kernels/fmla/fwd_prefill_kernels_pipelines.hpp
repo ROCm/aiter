@@ -105,7 +105,7 @@ template<typename Traits,
          typename OaccBlockTileType,
          typename MLBlockTileType,
          typename Mask>
-CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile_epilogue(
+CK_TILE_DEVICE static inline void kn_fmla_fwd_splitkv_prefill_tile_epilogue(
     LseDramBlockWindow& lse_dram_window_,
     OutDramBlockWindow& out_dram_window_,
     OaccBlockTileType*  o_acc,
@@ -171,8 +171,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile_epilogue(
         {
             ck_tile::move_tile_window(out_dram_window_, {0, Traits::kBlockN1});
         }
-    }
-    );
+    });
 }
 
 template<typename Traits,
@@ -1176,9 +1175,9 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             {
                 const int32_t seqlen_idx = seqlen_k_base_idx + (loop_idx + 1) * Traits::kBlockN0 +
                                            Traits::kBlockN0 / kKNumRepeat * rid.value;
-                const int32_t page_idx   = seqlen_idx / Traits::kPageBlockSize;
-                const int32_t inside_idx = seqlen_idx % Traits::kPageBlockSize;
-                k_offsets[rid] = (p_block_table[page_idx] * Traits::kPageBlockSize + inside_idx) * stride_s_k;
+                const int32_t page_idx   = seqlen_idx / page_block_size;
+                const int32_t inside_idx = seqlen_idx % page_block_size;
+                k_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
                 k_valids[rid] = (seqlen_idx < seqlen_k_end);
             });
             k_dram_window.update_page_idx_and_valids(k_offsets, k_valids);
@@ -1187,9 +1186,9 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             {
                 const int32_t seqlen_idx = seqlen_k_rope_base_idx + (loop_idx + 1) * Traits::kBlockN0 +
                                            Traits::kBlockN0 / kKRopeNumRepeat * rid.value;
-                const int32_t page_idx   = seqlen_idx / Traits::kPageBlockSize;
-                const int32_t inside_idx = seqlen_idx % Traits::kPageBlockSize;
-                k_rope_offsets[rid] = (p_block_table[page_idx] * Traits::kPageBlockSize + inside_idx) * stride_s_k;
+                const int32_t page_idx   = seqlen_idx / page_block_size;
+                const int32_t inside_idx = seqlen_idx % page_block_size;
+                k_rope_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
                 k_rope_valids[rid] = (seqlen_idx < seqlen_k_end);
             });
             k_rope_dram_window.update_page_idx_and_valids(k_rope_offsets, k_rope_valids);

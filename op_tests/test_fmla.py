@@ -134,7 +134,7 @@ def test_flash_mla(dtype, b, s_q, mean_sk, h_q, h_kv, d, dv, page_block_size, ca
     blocked_k = torch.randn(block_table.numel(), page_block_size, h_kv, d, device="cuda", dtype=dtype)
     for i in range(b):
         blocked_k.view(b, max_seqlen_pad, h_kv, d)[i, cache_seqlens[i].item():] = (
-            # float("nan")
+            # float("nan")  #TODO: fix asyn load valids
             float(0)
         )
     blocked_v = blocked_k[..., :dv]
@@ -204,13 +204,13 @@ if __name__ == "__main__":
     d, dv = 576, 512
 
     for (dtype, b, s, h_q, s_q, page_block_size, varlen, causal) in itertools.product(
-        (torch.bfloat16,)[:],
+        (torch.bfloat16, torch.float16)[:],
         [1, 3, 5, 16, 32, 64, 128, 256][3:4],
         [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
         (1, 16, 64, 128)[:],
         # (1, 2), # s_q for decode
         (64,),  # s_q for prefill
-        (16, 64)[:],
+        (1, 16, 64)[:],
         (False, True)[:],
         (False, True)[:]
     ):
