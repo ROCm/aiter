@@ -761,6 +761,10 @@
     "module_fmla_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/fmla/block_gemm_areg_bsmem_creg.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/fmla/fwd_kernels_params.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/fmla/fwd_kernels_traits.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/fmla/fwd_prefill_kernels_policy.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/fmla/fwd_prefill_kernels_pipelines.hpp'",
             "f'{AITER_CSRC_DIR}/kernels/fmla/entry.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fmla/fwd_decode_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/fmla/fwd_prefill_kernels.cu'",
