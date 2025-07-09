@@ -144,9 +144,7 @@ def test_batched_gemm_afp4_wfp4_pre_quant(B: int, M: int, N: int, K: int, dtype)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, _, w_scales = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
-        B, M, N, K
-    )
+    x, w, _, w_scales = generate_batched_gemm_afp4wfp4_pre_quant_inputs(B, M, N, K)
     out = torch.empty(B, x.shape[1], w.shape[2], device=x.device, dtype=dtype)
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)

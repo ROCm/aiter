@@ -135,9 +135,7 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
 
     if output:
         out = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-        out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, out).to(
-            dtype
-        )
+        out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, out).to(dtype)
     else:
         out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
 
