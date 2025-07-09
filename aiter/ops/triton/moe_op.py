@@ -849,7 +849,7 @@ def _fused_moe_persistent_kernel(
                 offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
             )
             # Compute the B pointer
-            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
             b_ptrs = (
                 b_ptr
                 + off_experts * stride_be

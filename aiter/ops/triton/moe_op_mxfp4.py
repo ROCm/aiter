@@ -170,7 +170,7 @@ def _fused_moe_kernel_mxfp4(
     a_scale = tl.load(a_scale_ptr)
     b_scale = tl.load(b_scale_ptr + off_expert)
     # Set offsets of B on dim N
-    offs_b_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_b_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_b_n = tl.max_contiguous(
         tl.multiple_of(offs_b_n % N, BLOCK_SIZE_N), BLOCK_SIZE_N
     )
