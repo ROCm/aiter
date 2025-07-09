@@ -975,7 +975,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
     __builtin_amdgcn_s_barrier();
 
 
-
     // 6. Main loop
     //
     // Define main loop
