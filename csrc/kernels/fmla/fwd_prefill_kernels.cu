@@ -389,7 +389,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
             ck_tile::make_tile_window(out_acc_dram, out_acc_dram_window_lengths, {mid, 0});
 
 
-        if constexpr (!Traits::kKVLoadOnce) {
+        if constexpr (Traits::kKVLoadOnce == false) {
             kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t, out_t>(
                 q_dram_window,
                 k_dram_window,
@@ -471,7 +471,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         auto out_dram_window =
             ck_tile::make_tile_window(out_dram, out_dram_window_lengths, {mid, 0});
 
-        if constexpr (!Traits::kKVLoadOnce)
+        if constexpr (Traits::kKVLoadOnce == false)
         {
             kn_fmla_fwd_splitkv_prefill_tile<Traits, scalar_t, acc_t, out_t>(
                 q_dram_window,
@@ -819,7 +819,7 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr bool kKVLoadOnce         = true;
+    constexpr bool kKVLoadOnce         = false;
     constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
     //TODO:
     // cases need maintenance:
