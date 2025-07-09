@@ -58,12 +58,17 @@ def fused_mul_add(
     """
     Computes elementwise multiplicated and addtion: out = x * a + b
 
-    x must be a torch.Tensor, but with arbitrary shape,
-    a can be float, int, or torch.Tensor with shape (1, ) or the same shape as x
-    b can be float, int, or torch.Tensor with shape (1, ) or the same shape as x
+    Key parameters:
+    - x: must be a torch.Tensor, but with arbitrary shape,
+    - a: can be float, int, or torch.Tensor with shape (1, ) or the same shape as x
+    - b: can be float, int, or torch.Tensor with shape (1, ) or the same shape as x
 
-    if out is None, the kernel will perform inplace computation on x
+    all tensors must be contiguous
 
+    if out is None, the kernel will perform inplace computation on x instead of creating a new tensor
+
+    Returns:
+    - out: same shape as x
     """
 
     N = x.numel()
