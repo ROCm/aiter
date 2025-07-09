@@ -51,7 +51,7 @@ def get_cu_num():
     return gpu_compute_units[0]
 
 
-def get_dev_name():
+def get_device_name():
     gfx = get_gfx()
 
     if gfx == "gfx942":

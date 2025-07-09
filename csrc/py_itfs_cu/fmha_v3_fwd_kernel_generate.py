@@ -11,7 +11,7 @@ from typing import Optional
 this_dir = os.path.abspath(__file__)
 sys.path.insert(0, str(Path(this_dir).parents[2] / "aiter/"))
 from jit.core import get_asm_dir
-from jit.utils.chip_info import get_gfx, get_dev_name
+from jit.utils.chip_info import get_gfx, get_device_name
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -287,9 +287,10 @@ TUNE_KNOB = """if (a.mask_type != 0 && ((a.nhead_q % 8 != 0) || (a.seqlen_q > 16
 
 
 def write_blobs(output_dir: Optional[str]) -> None:
-    ts_kv = 32 if get_gfx() == "gfx942" else 64
-    arch_dispatch = GFX942_DISPATCH if get_gfx() == "gfx942" else GFX950_DISPATCH
-    asm_sub_dir = get_dev_name() + "/"
+    gfx = get_gfx()
+    ts_kv = 32 if gfx == "gfx942" else 64
+    arch_dispatch = GFX942_DISPATCH if gfx == "gfx942" else GFX950_DISPATCH
+    asm_sub_dir = get_device_name() + "/" if gfx == "gfx942" else ""
 
     if output_dir is None:
         output_dir = Path(__file__).parent
@@ -302,7 +303,7 @@ def write_blobs(output_dir: Optional[str]) -> None:
         F_AITER_ASM_DIR=get_asm_dir() + "fmha_v3_fwd/" + asm_sub_dir,
         F_tile_size_kv=ts_kv,
         F_dispatch=arch_dispatch,
-        F_tune_knob=TUNE_KNOB if get_gfx() == "gfx950" else "",
+        F_tune_knob=TUNE_KNOB if gfx == "gfx950" else "",
     )
 
     (output_dir / FMHA_FWD_API_FILENAME).write_text(forward_kernel)
