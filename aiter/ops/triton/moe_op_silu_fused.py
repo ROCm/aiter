@@ -890,7 +890,7 @@ def _fused_moe_persistent_silu_kernel(
         offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
         token_mask = offs_token < num_valid_tokens
-        off_experts = tl.load(expert_ids_ptr + pid_m)
+        off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
         # silu ptrs
         BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
