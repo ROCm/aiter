@@ -219,7 +219,7 @@ def _fused_flatten_mxfp4_quant(
     x_stride_n1,
     x_stride_n2,
     out_stride_m,
-    out_stide_n,
+    out_stride_n,
     out_scales_stride_m,
     out_scales_stride_n,
     N2,
@@ -242,7 +242,7 @@ def _fused_flatten_mxfp4_quant(
     tl.store(
         out_ptr
         + m * out_stride_m
-        + (n1 * (BLOCK_SIZE_N2 // 2) + half_block_offs) * out_stide_n,
+        + (n1 * (BLOCK_SIZE_N2 // 2) + half_block_offs) * out_stride_n,
         out,
         mask=half_block_offs < (N2 // 2),
     )
