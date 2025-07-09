@@ -115,10 +115,25 @@ def fused_rms_mxfp4_quant(
     res1=None,
 ):
     """
-    Apply rms norm to both inp1 and inp2, then quantize the result of inp1.
-    Skip the second rms norm if inp2 is None.
+    This op contains several steps:
+        1. if res1 is not None, inp1 = inp1 + res1, and store inp1 to out_res1
+        2. perform RMS norm along the last dimenion for inp1
+        3. if inp2 is not None, perform RMS norm along the last dimenion for inp2
+        4. perform mxfp4 quantization for inp1 only
+        
+    Key parameters:
+    - x: Matrix X with shape (M, N1, N2).
 
-    If res1 is provided, it is added to inp1 before rms norm calculation.
+    Returns:
+    - out1_fp4: The output matrix with shape (M, N1 // 2).
+    - out1_bs: The output matrix with shape (M, cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)).
+    - out2: The output matrix with shape (M, N2).
+    - out_res1: The output matrix with shape (M, N1).
+
+        if both inp2 and res1 provided, return (out1_fp4, out1_bs), out2, out_res1
+        if inp2 provided, return (out1_fp4, out1_bs), out2
+        if res1 provided, return (out1_fp4, out1_bs), out_res1
+        if both inp2 and res1 not provided, return (out1_fp4, out1_bs)
     """
 
     MXFP4_QUANT_BLOCK_SIZE = 32
@@ -244,6 +259,16 @@ def _fused_flatten_mxfp4_quant(
 def fused_flatten_mxfp4_quant(
     x: torch.Tensor,
 ):
+    """
+    Flatten the last two dimension of x and perform mxfp4 quantization along the last dimension
+
+    Key parameters:
+    - x: Matrix X with shape (M, N1, N2).
+
+    Returns:
+    - out: The output matrix with shape (M, (N1 * N2) // 2).
+    - out_block_scales: The output matrix with shape (M, cdiv(N1 * N2, MXFP4_QUANT_BLOCK_SIZE)).
+    """
     M, N1, N2 = x.shape
 
     MXFP4_QUANT_BLOCK_SIZE = 32
