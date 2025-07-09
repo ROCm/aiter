@@ -29,7 +29,7 @@ from aiter import ActivationType as ActivationType
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
-
+import time
 torch.set_default_device("cuda")
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
@@ -430,11 +430,11 @@ def go(
         if tasks is None and tasks_ck is None:
             print("no moe solution can tune for ", line)
             continue
+        print(f"tasks is {len(tasks)}, tasks_ck is {len(tasks_ck)}")
         in_data = [(len(tasks) + len(tasks_ck), ())]
-        rets = mp_tuner(tasks + tasks_ck, in_data)
+        rets = mp_tuner(tasks + tasks_ck, in_data, 1, True)
 
         profileDF = []
-        print("tuning moe solution for ", rets)
         for (stage, kernelName, block_m), us, err in rets:
             if us == float("inf"):
                 continue
@@ -583,6 +583,7 @@ if __name__ == "__main__":
 
     tunedf = None
     # tunedf = pd.read_csv(args.tune_file)
+
     profiles, tunedf = go(untunedf, tunedf)
     if old_tunedf is not None and tunedf is not None:
         tunedf = pd.concat([old_tunedf, tunedf], axis=0)

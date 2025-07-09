@@ -31,7 +31,7 @@ def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle_CK(x, weight, x_scale, w_scale, dtype)
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, dtype)
 
 
 @perftest()
