@@ -849,7 +849,9 @@ def _fused_moe_persistent_kernel(
                 offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
             )
             # Compute the B pointer
-            offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+            offs_bn = (
+                pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+            ) % N
             b_ptrs = (
                 b_ptr
                 + off_experts * stride_be
@@ -858,7 +860,9 @@ def _fused_moe_persistent_kernel(
 
             if use_int8_w8a16:
                 b_scale_ptrs = (
-                    b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn[None, :] * stride_bsn
                 )
                 b_scale = tl.load(b_scale_ptrs)
 
@@ -884,7 +888,8 @@ def _fused_moe_persistent_kernel(
                 else:
                     a = tl.load(
                         a_ptrs,
-                        mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                        mask=token_mask[:, None]
+                        & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                         other=0.0,
                     )
                     b = tl.load(
@@ -898,10 +903,14 @@ def _fused_moe_persistent_kernel(
                         k_start = k * BLOCK_SIZE_K
                         offs_ks = k_start // group_k
                         a_scale = tl.load(
-                            a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
+                            a_scale_ptrs + offs_ks * stride_ask,
+                            mask=token_mask,
+                            other=0.0,
                         )
                         b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
-                        accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                        accumulator += (
+                            tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                        )
                     else:
                         accumulator = tl.dot(a, b, acc=accumulator)
                 else:
@@ -928,7 +937,9 @@ def _fused_moe_persistent_kernel(
             # -----------------------------------------------------------
             # Write back the block of the output
             offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-            c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            c_ptrs = (
+                c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            )
             c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
             tl.store(c_ptrs, accumulator, mask=c_mask)
 
