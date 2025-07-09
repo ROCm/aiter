@@ -126,7 +126,7 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
     w_f32 = mxfp4_to_f32(w.transpose(-2, -1))
@@ -144,13 +144,13 @@ def test_batched_gemm_afp4_wfp4_pre_quant(B: int, M: int, N: int, K: int, dtype)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+    x, w, _, w_scales = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
         B, M, N, K
     )
     out = torch.empty(B, x.shape[1], w.shape[2], device=x.device, dtype=dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    batched_gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype, out)
+    batched_gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)

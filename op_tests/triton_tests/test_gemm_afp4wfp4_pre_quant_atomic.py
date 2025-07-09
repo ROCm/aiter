@@ -108,7 +108,7 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
     w_f32 = mxfp4_to_f32(w.transpose(-2, -1))
@@ -135,12 +135,12 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
 
     if output:
         out = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-        out = gemm_afp4wfp4_pre_quant(x, w, None, w_scales, torch.float32, out).to(
+        out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, out).to(
             dtype
         )
     else:
-        out = gemm_afp4wfp4_pre_quant(x, w, None, w_scales, torch.float32).to(dtype)
+        out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
 
-    torch_out = run_torch(x, w, None, w_scales, dtype).to(dtype)
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
     torch.testing.assert_close(torch_out, out)
