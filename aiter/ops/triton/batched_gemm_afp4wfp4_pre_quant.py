@@ -314,7 +314,6 @@ def _get_config(
 def batched_gemm_afp4wfp4_pre_quant(
     x,
     w,
-    x_scales,
     w_scales,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
@@ -322,15 +321,13 @@ def batched_gemm_afp4wfp4_pre_quant(
 ):
     """
     Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
+    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
     Every 32 elements in the K dimension share one e8m0 scale.
-
+    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
 
     Key parameters:
     - X: Matrix X with shape (B, M, K).
     - W: Matrix W with shape (B, K, N).
-    - X_scales: Matrix with shape (B, M, K // 32)
     - W_scales: Matrix with shape (B, N, K // 32)
 
     Returns:
