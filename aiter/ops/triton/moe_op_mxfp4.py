@@ -21,6 +21,11 @@ def get_scaled_dot_format_string(dtype: tl.dtype):
     return mapping[dtype]
 
 
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+    }
+)
 @triton.jit
 def _fused_moe_kernel_mxfp4(
     # Pointers to matrices
@@ -58,6 +63,7 @@ def _fused_moe_kernel_mxfp4(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
@@ -276,16 +282,25 @@ def _fused_moe_kernel_mxfp4(
     for k in range(0, tl.cdiv(K, PACKED_BLOCK_K_A)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_a_k[None, :] < (K - k * PACKED_BLOCK_K_A)),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_b_k[:, None] < (K - k * PACKED_BLOCK_K_B),
-            other=0.0,
-        )
+        if EVEN_K:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None]
+                & (offs_a_k[None, :] < (K - k * PACKED_BLOCK_K_A)),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_b_k[:, None] < (K - k * PACKED_BLOCK_K_B),
+                other=0.0,
+            )
         # We accumulate along the K dimension.
         if is_a_microscaled_format or is_b_microscaled_format:
             a_format: tl.constexpr = get_scaled_dot_format_string(a.dtype)
