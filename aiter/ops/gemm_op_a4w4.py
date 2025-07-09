@@ -11,7 +11,6 @@ from ..jit.core import (
 from ..jit.utils.chip_info import get_cu_num
 import functools
 import pandas as pd
-import inspect
 
 
 @functools.lru_cache(maxsize=1024)
@@ -25,7 +24,7 @@ def get_CKGEMM_config(M: int, N: int, K: int):
         ).to_dict("index")
     cu_num = get_cu_num()
     config = get_CKGEMM_config.ckgemm_dict.get((cu_num, M, N, K), None)
-    if config != None:
+    if config is not None:
         print(
             f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
         )
@@ -60,7 +59,7 @@ def gemm_a4w4(
     if m >= 256:
         ck_config = get_CKGEMM_config(m, n, k)
         splitK = 0
-        if ck_config != None:
+        if ck_config is not None:
             splitK = ck_config["splitK"]
         return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
     return gemm_a4w4_asm(A, B, A_scale, B_scale, out, bias, alpha, beta, bpreshuffle)

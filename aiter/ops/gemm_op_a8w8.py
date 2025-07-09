@@ -136,9 +136,9 @@ def gemm_a8w8(
     n = WQ.shape[0]
     k = XQ.shape[-1]
     ck_config = get_CKGEMM_config(m, n, k)
-    if ck_config == None and dtype == dtypes.bf16 and bias != None:
+    if ck_config == None and dtype == dtypes.bf16 and bias is not None:
         res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype)
-        if res != None:
+        if res is not None:
             return res
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
