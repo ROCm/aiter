@@ -405,9 +405,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                 split_id,
                 mask,
 #if FMLA_FWD_FAST_EXP2
-            static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
+                static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
 #else
-            params.scale_softmax,
+                params.scale_softmax,
 #endif
                 p_smem);
         }
@@ -436,9 +436,9 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                 split_id,
                 mask,
 #if FMLA_FWD_FAST_EXP2
-            static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
+                static_cast<float>(params.scale_softmax * ck_tile::log2e_v<>),
 #else
-            params.scale_softmax,
+                params.scale_softmax,
 #endif
                 p_smem);
         }

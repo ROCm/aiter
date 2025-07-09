@@ -30,7 +30,6 @@ struct FlashMlaPrefillKernelTrait
     static constexpr int32_t kSizeNope                  = 512;  //tmp force 512
     static constexpr int32_t kSizeRope                  = kSizeD - kSizeNope;
     static constexpr int32_t kNumWarps                  = kNumWarps_;
-    static constexpr int32_t kPageBlockSize             = 16;
     static constexpr int32_t kNumThreads                = kNumWarps * ck_tile::get_warp_size();
     static constexpr int32_t kWaveOccupancy             = kWaveOccupancy_;
     static constexpr int32_t kNumWarpsSoftmax           = 4;
@@ -45,8 +44,8 @@ struct FlashMlaPrefillKernelTrait
     static constexpr int32_t kFixedOverheadNumBlocks    = 5;
     static constexpr int32_t kMaxBatchSize              = 4096;
     static constexpr int32_t kCuReuse                   = 2;
-    static constexpr int32_t kMaxSplits                 = 128;
-    static constexpr int32_t kKNumRepeat                = kSizeNope / kMaxSplits;
+    static constexpr int32_t kKIterations               = 128;
+    static constexpr int32_t kKNopeLdsRepeat            = kSizeNope / kKIterations;
     static constexpr bool    kPadHeadDimQ               = false;
     static constexpr bool    kPadHeadDimV               = false;
     static constexpr bool    kPadSeqLenQ                = true;

@@ -318,14 +318,14 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
         {seqlen_k_start, 0});
     auto k_dist = Policy::MakeKDramTileDistribution();
     auto k_coord = k_dist.calculate_index();
-    constexpr auto kKNumRepeat = Policy::GetNumRepeatOfKDramTileDistribution();
+    constexpr auto kKNopeLdsRepeat = Policy::GetNumRepeatOfKDramTileDistribution();
     constexpr auto kKPageIdxDim = ck_tile::number<0>{};
     const int32_t seqlen_k_base_idx = k_coord[kKPageIdxDim] + seqlen_k_start;
-    ck_tile::statically_indexed_array<int32_t, kKNumRepeat> k_offsets;
-    ck_tile::statically_indexed_array<bool, kKNumRepeat> k_valids;
-    ck_tile::static_for<0, kKNumRepeat, 1>{}([&](auto rid)
+    ck_tile::statically_indexed_array<int32_t, kKNopeLdsRepeat> k_offsets;
+    ck_tile::statically_indexed_array<bool, kKNopeLdsRepeat> k_valids;
+    ck_tile::static_for<0, kKNopeLdsRepeat, 1>{}([&](auto rid)
     {
-        const int32_t seqlen_idx = seqlen_k_base_idx + Traits::kBlockN0 / kKNumRepeat * rid.value;
+        const int32_t seqlen_idx = seqlen_k_base_idx + Traits::kBlockN0 / kKNopeLdsRepeat * rid.value;
         const int32_t page_idx   = seqlen_idx / page_block_size;
         const int32_t inside_idx = seqlen_idx % page_block_size;
         k_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
@@ -650,10 +650,10 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             ck_tile::move_tile_window(k_dram_window_origin, {Traits::kBlockN0, 0});
             k_dram_window.set_window_origin(k_dram_window_origin.get_window_origin() + next_qk_origin);
             // Recalculate offsets
-            ck_tile::static_for<0, kKNumRepeat, 1>{}([&](auto rid)
+            ck_tile::static_for<0, kKNopeLdsRepeat, 1>{}([&](auto rid)
             {
                 const int32_t seqlen_idx = seqlen_k_base_idx + (loop_idx + 1) * Traits::kBlockN0 +
-                                           Traits::kBlockN0 / kKNumRepeat * rid.value;
+                                           Traits::kBlockN0 / kKNopeLdsRepeat * rid.value;
                 const int32_t page_idx   = seqlen_idx / page_block_size;
                 const int32_t inside_idx = seqlen_idx % page_block_size;
                 k_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
@@ -886,47 +886,83 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
     constexpr auto k_rope_dram_window_lengths =
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{}, ck_tile::number<Traits::kSizeRope>{});
 
-    auto k_dist = Policy::template MakeKDramTileDistribution<false>();
-    auto k_coord = k_dist.calculate_index();
-    constexpr auto kKNumRepeat = Policy::template GetNumRepeatOfKDramTileDistribution<false>();
+    // auto k_dist = Policy::template MakeKDramTileDistribution<false>();
+    // auto k_coord = k_dist.calculate_index();
+    // constexpr auto kKNopeLdsRepeat = Policy::template GetNumRepeatOfKDramTileDistribution<false>();
+    // constexpr auto kKPageIdxDim = ck_tile::number<0>{};
+    // const int32_t seqlen_k_base_idx = k_coord[kKPageIdxDim] + seqlen_k_start;
+    // ck_tile::statically_indexed_array<int32_t, kKNopeLdsRepeat> k_offsets;
+    // ck_tile::statically_indexed_array<bool, kKNopeLdsRepeat> k_valids;
+    // ck_tile::static_for<0, kKNopeLdsRepeat, 1>{}([&](auto rid)
+    // {
+    //     const int32_t seqlen_idx = seqlen_k_base_idx + Traits::kBlockN0 / kKNopeLdsRepeat * rid.value;
+    //     const int32_t page_idx   = seqlen_idx / page_block_size;
+    //     const int32_t inside_idx = seqlen_idx % page_block_size;
+    //     k_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
+    //     k_valids[rid] = (seqlen_idx < seqlen_k_end);
+    // });
+    // auto k_dram_window = ck_tile::make_tile_scatter_gather(
+    //     k_dram_tensor_view_,
+    //     k_nope_dram_window_lengths,
+    //     {seqlen_k_start, 0},
+    //     k_dist,
+    //     k_offsets,
+    //     k_valids,
+    //     kKPageIdxDim);
+    // k_dram_window.init_raw();
+    // ck_tile::static_for<0, Traits::kKNopeLdsRepeat, 1>{}([&](auto rid)
+    // {
+    //     ck_tile::async_load_tile_raw(
+    //         k_nope_st_lds_windows.at(ck_tile::number<0>{}), k_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
+    //     __builtin_amdgcn_sched_barrier(0);
+    //     ck_tile::async_load_fence(k_dram_window.get_num_of_access());
+    //     __builtin_amdgcn_s_barrier();
+    //     ck_tile::move_tile_window(k_dram_window, {0, Traits::kKIterations});
+    // });
+    // ck_tile::move_tile_window(k_dram_window, {0, -Traits::kSizeNope});
+    //
+
     constexpr auto kKPageIdxDim = ck_tile::number<0>{};
-    const int32_t seqlen_k_base_idx = k_coord[kKPageIdxDim] + seqlen_k_start;
-    ck_tile::statically_indexed_array<int32_t, kKNumRepeat> k_offsets;
-    ck_tile::statically_indexed_array<bool, kKNumRepeat> k_valids;
-    ck_tile::static_for<0, kKNumRepeat, 1>{}([&](auto rid)
+
+    auto k_nope_dist = Policy::template MakeKDramTileDistribution<false>();
+    auto k_nope_coord = k_nope_dist.calculate_index();
+    constexpr auto kKNopeNumRepeat = Policy::template GetNumRepeatOfKDramTileDistribution<false>();
+    const int32_t seqlen_k_nope_base_idx = k_nope_coord[kKPageIdxDim] + seqlen_k_start;
+    ck_tile::statically_indexed_array<int32_t, kKNopeNumRepeat> k_nope_offsets;
+    ck_tile::statically_indexed_array<bool, kKNopeNumRepeat> k_nope_valids;
+    ck_tile::static_for<0, kKNopeNumRepeat, 1>{}([&](auto rid)
     {
-        const int32_t seqlen_idx = seqlen_k_base_idx + Traits::kBlockN0 / kKNumRepeat * rid.value;
+        const int32_t seqlen_idx = seqlen_k_nope_base_idx + Traits::kBlockN0 / kKNopeNumRepeat * rid.value;
         const int32_t page_idx   = seqlen_idx / page_block_size;
         const int32_t inside_idx = seqlen_idx % page_block_size;
-        k_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
-        k_valids[rid] = (seqlen_idx < seqlen_k_end);
+        k_nope_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
+        k_nope_valids[rid] = (seqlen_idx < seqlen_k_end);
     });
-    auto k_dram_window = ck_tile::make_tile_scatter_gather(
+    auto k_nope_dram_window = ck_tile::make_tile_scatter_gather(
         k_dram_tensor_view_,
         k_nope_dram_window_lengths,
         {seqlen_k_start, 0},
-        k_dist,
-        k_offsets,
-        k_valids,
+        k_nope_dist,
+        k_nope_offsets,
+        k_nope_valids,
         kKPageIdxDim);
-    k_dram_window.init_raw();
-
-    ck_tile::static_for<0, Traits::kKNumRepeat, 1>{}([&](auto rid)
+    k_nope_dram_window.init_raw();
+    ck_tile::static_for<0, Traits::kKNopeLdsRepeat, 1>{}([&](auto rid)
     {
         ck_tile::async_load_tile_raw(
-            k_nope_st_lds_windows.at(ck_tile::number<0>{}), k_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
+            k_nope_st_lds_windows.at(ck_tile::number<0>{}), k_nope_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
         __builtin_amdgcn_sched_barrier(0);
-        ck_tile::async_load_fence(k_dram_window.get_num_of_access());
+        ck_tile::async_load_fence(k_nope_dram_window.get_num_of_access());
         __builtin_amdgcn_s_barrier();
-        ck_tile::move_tile_window(k_dram_window, {0, Traits::kMaxSplits});
+        ck_tile::move_tile_window(k_nope_dram_window, {0, Traits::kKIterations});
     });
-    ck_tile::move_tile_window(k_dram_window, {0, -Traits::kSizeNope});
+    ck_tile::move_tile_window(k_nope_dram_window, {0, -Traits::kSizeNope});
+
 
     auto k_rope_dist = Policy::template MakeKDramTileDistribution<true>();
     auto k_rope_coord = k_rope_dist.calculate_index();
     constexpr auto kKRopeNumRepeat = Policy::template GetNumRepeatOfKDramTileDistribution<true>();
-    constexpr auto kKRopePageIdxDim = ck_tile::number<0>{};
-    const int32_t seqlen_k_rope_base_idx = k_rope_coord[kKRopePageIdxDim] + seqlen_k_start;
+    const int32_t seqlen_k_rope_base_idx = k_rope_coord[kKPageIdxDim] + seqlen_k_start;
     ck_tile::statically_indexed_array<int32_t, kKRopeNumRepeat> k_rope_offsets;
     ck_tile::statically_indexed_array<bool, kKRopeNumRepeat> k_rope_valids;
     ck_tile::static_for<0, kKRopeNumRepeat, 1>{}([&](auto rid)
@@ -944,7 +980,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
         k_rope_dist,
         k_rope_offsets,
         k_rope_valids,
-        kKRopePageIdxDim);
+        kKPageIdxDim);
     k_rope_dram_window.init_raw();
 
     ck_tile::async_load_tile_raw(
@@ -975,10 +1011,10 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
 
         auto vt_tile = ck_tile::make_static_distributed_tensor<scalar_t>(Policy::MakeVTTileDistribution());
 #pragma unroll 2
-        for (int32_t vidx = 0; vidx < Traits::kKNumRepeat; ++vidx)
+        for (int32_t vidx = 0; vidx < Traits::kKNopeLdsRepeat; ++vidx)
         {
             auto v_tile  = ck_tile::load_tile(v_ld_lds_window);
-            ck_tile::move_tile_window(v_ld_lds_window, {0, Traits::kMaxSplits});
+            ck_tile::move_tile_window(v_ld_lds_window, {0, Traits::kKIterations});
             auto vt_thread_buffer = vt_tile.get_thread_buffer().get();
 
             auto k_thread_buffer = v_tile.get_thread_buffer().get();
@@ -999,7 +1035,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             });
             // ck_tile::block_sync_lds();
             ck_tile::store_tile(vt_st_lds_window, vt_tile);
-            ck_tile::move_tile_window(vt_st_lds_window, {Traits::kMaxSplits, 0});
+            ck_tile::move_tile_window(vt_st_lds_window, {Traits::kKIterations, 0});
             ck_tile::block_sync_lds();
         }
         ck_tile::move_tile_window(vt_st_lds_window, {-Traits::kSizeNope, 0});
@@ -1032,7 +1068,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             if constexpr (k0_loops == 1)
             {
                 ck_tile::block_sync_lds();
-                __builtin_amdgcn_s_waitcnt(3952);
                 gemm_0(s_acc,
                        q_reg_nope,
                        ck_tile::get_slice_tile(k_nope_ld_lds_window,
@@ -1042,8 +1077,8 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             }
 
             // QK rope tail
+            // TODO: If delete this block_sync_lds will introduce mismatch. Fix it.
             ck_tile::block_sync_lds();
-            // __builtin_amdgcn_s_waitcnt(3952);
             gemm_0_rope(s_acc,
                         q_reg_rope,
                         ck_tile::get_slice_tile(k_rope_ld_lds_window,
@@ -1072,7 +1107,7 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
 
         // Masking
         // Note that masking is also required when k is padded
-        const auto k_origin = k_dram_window.get_window_origin();
+        const auto k_origin = k_nope_dram_window.get_window_origin();
         const bool need_perpixel_check = mask.IsEdgeTile(
             __builtin_amdgcn_readfirstlane(q_origin.at(ck_tile::number<0>{})),
             __builtin_amdgcn_readfirstlane(k_origin.at(ck_tile::number<0>{})),
@@ -1167,20 +1202,20 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
         //
         if (loop_idx != num_total_loop - 1) {
             // Load next K
-            ck_tile::move_tile_window(k_dram_window, {Traits::kBlockN0, 0});
+            ck_tile::move_tile_window(k_nope_dram_window, {Traits::kBlockN0, 0});
             ck_tile::move_tile_window(k_rope_dram_window, {Traits::kBlockN0, 0});
 
             // Recalculate offsets
-            ck_tile::static_for<0, kKNumRepeat, 1>{}([&](auto rid)
+            ck_tile::static_for<0, kKNopeNumRepeat, 1>{}([&](auto rid)
             {
-                const int32_t seqlen_idx = seqlen_k_base_idx + (loop_idx + 1) * Traits::kBlockN0 +
-                                           Traits::kBlockN0 / kKNumRepeat * rid.value;
+                const int32_t seqlen_idx = seqlen_k_nope_base_idx + (loop_idx + 1) * Traits::kBlockN0 +
+                                           Traits::kBlockN0 / kKNopeNumRepeat * rid.value;
                 const int32_t page_idx   = seqlen_idx / page_block_size;
                 const int32_t inside_idx = seqlen_idx % page_block_size;
-                k_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
-                k_valids[rid] = (seqlen_idx < seqlen_k_end);
+                k_nope_offsets[rid] = (p_block_table[page_idx] * page_block_size + inside_idx) * stride_s_k;
+                k_nope_valids[rid] = (seqlen_idx < seqlen_k_end);
             });
-            k_dram_window.update_page_idx_and_valids(k_offsets, k_valids);
+            k_nope_dram_window.update_page_idx_and_valids(k_nope_offsets, k_nope_valids);
 
             ck_tile::static_for<0, kKRopeNumRepeat, 1>{}([&](auto rid)
             {
@@ -1196,13 +1231,13 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_load_once_tile(
             ck_tile::static_for<0, 4, 1>{}([&](auto rid)
             {
                 ck_tile::async_load_tile_raw(
-                    k_nope_st_lds_windows.at(k_st_idx{}), k_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
+                    k_nope_st_lds_windows.at(k_st_idx{}), k_nope_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_nope_repeat_smem_offset * rid);
                 __builtin_amdgcn_sched_barrier(0);
-                ck_tile::async_load_fence(k_dram_window.get_num_of_access());
+                ck_tile::async_load_fence(k_nope_dram_window.get_num_of_access());
                 __builtin_amdgcn_s_barrier();
-                ck_tile::move_tile_window(k_dram_window, {0, Traits::kMaxSplits});
+                ck_tile::move_tile_window(k_nope_dram_window, {0, Traits::kKIterations});
             });
-            ck_tile::move_tile_window(k_dram_window, {0, -Traits::kSizeNope});
+            ck_tile::move_tile_window(k_nope_dram_window, {0, -Traits::kSizeNope});
 
             ck_tile::async_load_tile_raw(
                 k_rope_st_lds_windows.at(k_st_idx{}), k_rope_dram_window, ck_tile::number<-1>{}, k_oob_ck, k_pre_np, k_rope_smem_offset);

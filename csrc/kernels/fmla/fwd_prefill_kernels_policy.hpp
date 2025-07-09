@@ -152,7 +152,7 @@ public:
     CK_TILE_HOST_DEVICE static constexpr auto GetAlignmentLse()
     {
         return GetVectorSizeForTile<Traits::kNumWarps,
-                                    Traits::kMaxSplits,
+                                    Traits::kKIterations,
                                     Traits::kBlockM,
                                     AccType>();
     }
@@ -287,8 +287,8 @@ public:
     CK_TILE_HOST_DEVICE static constexpr auto GetSingleKElementSpaceSize()
     {
         constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kMaxSplits;
-        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNumRepeat;
+        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
+        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNopeLdsRepeat;
         constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
         constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
 
@@ -318,8 +318,8 @@ public:
     {
         // K is always k-major, we use async-copy to load into LDS
         constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kMaxSplits;
-        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNumRepeat;
+        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
+        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNopeLdsRepeat;
         constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
         constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
         constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
@@ -412,8 +412,8 @@ public:
     {
         // K is always k-major, we use async-copy to load into LDS
         constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kMaxSplits;
-        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNumRepeat;
+        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
+        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNopeLdsRepeat;
         constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
         constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
         constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
@@ -739,7 +739,7 @@ public:
         {
             constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
             constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-            constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kMaxSplits;
+            constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
             constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
             constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
 
@@ -788,7 +788,7 @@ public:
     {
         constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
         constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = Traits::kMaxSplits;
+        constexpr ck_tile::index_t kKPerBlock = Traits::kKIterations;
         constexpr ck_tile::index_t kKNumWarps = Traits::kNumWarps;
         constexpr ck_tile::index_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
         constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
@@ -818,7 +818,7 @@ public:
     {
         constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
         constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = Traits::kMaxSplits;
+        constexpr ck_tile::index_t kKPerBlock = Traits::kKIterations;
         constexpr ck_tile::index_t kKNumWarps = Traits::kNumWarps;
         constexpr ck_tile::index_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
         constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
