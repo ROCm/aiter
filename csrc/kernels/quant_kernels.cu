@@ -45,7 +45,8 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                       int32_t ori_cols,
                                                       int32_t ori_row_stride,
                                                       bool shuffle_scale = true,
-                                                      int32_t const* __restrict__ num_rows = nullptr)
+                                                      int32_t const* __restrict__ num_rows = nullptr,
+                                                      const int32_t num_cols_factor = 1)
 {
     auto fp4_scale_shuffle_id = [](int32_t scaleN_pad, int32_t x, int32_t y) {
         return (x / 32 * scaleN_pad) * 32 + (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
@@ -53,7 +54,7 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     };
     if (num_rows != nullptr)
     {
-        ori_rows = *num_rows;
+        ori_rows = *num_rows * num_cols_factor;
     }
     int num_thread_per_group = group_size / thread_data_size;
     int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
@@ -419,12 +420,13 @@ __global__ void dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                       DTYPE_I* __restrict__ input,
                                                       float const* __restrict__ scale_ub,
                                                       const int32_t cols,
-                                                      int32_t const* __restrict__ num_rows = nullptr)
+                                                      int32_t const* __restrict__ num_rows = nullptr,
+                                                      const int32_t num_rows_factor = 1)
 {
     const int token_idx = blockIdx.x;
     if (num_rows != nullptr)
     {
-        int32_t rows = *num_rows;
+        int32_t rows = *num_rows * num_rows_factor;
         if (token_idx >= rows)
             return;
     }
@@ -507,7 +509,8 @@ void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
             reinterpret_cast<input_dtype*>(input.data_ptr()),                               \
             scale_ub.has_value() ? scale_ub->data_ptr<float>() : nullptr,                   \
             cols,                                                                           \
-            num_rows_ptr);                                                                  \
+            num_rows_ptr,                                                                   \
+            num_rows_factor);                                                               \
     });
 
 #define DYNAMIC_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(quant_kernel, DTYPE_O, cols) \
@@ -579,7 +582,8 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                                     torch::Tensor& scales,
                                     std::optional<at::Tensor> const& scale_ub,
                                     bool shuffle_scale = false,
-                                    std::optional<at::Tensor> const& num_rows = std::nullopt)
+                                    std::optional<at::Tensor> const& num_rows = std::nullopt,
+                                    int num_rows_factor = 1)
 {
     TORCH_CHECK(input.is_contiguous());
     TORCH_CHECK(out.is_contiguous());
@@ -618,7 +622,8 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         ori_cols,
                         ori_cols,
                         shuffle_scale,
-                        num_rows_ptr);
+                        num_rows_ptr,
+                        num_rows_factor);
                 });
         }
         else if(out.dtype() == torch::kInt8)
@@ -642,7 +647,8 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         ori_cols,
                         ori_cols,
                         shuffle_scale,
-                        num_rows_ptr);
+                        num_rows_ptr,
+                        num_rows_factor);
                 });
         }
 #if defined(__Float4_e2m1fn_x2)
@@ -669,7 +675,8 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                         ori_cols,
                         ori_cols,
                         shuffle_scale,
-                        num_rows_ptr);
+                        num_rows_ptr,
+                        num_rows_factor);
                 });
         }
 #endif
@@ -711,7 +718,8 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                                         torch::Tensor& scales,
                                         int group_size     = 32,
                                         bool shuffle_scale = true,
-                                        std::optional<at::Tensor> const& num_rows = std::nullopt)
+                                        std::optional<at::Tensor> const& num_rows = std::nullopt,
+                                        int num_rows_factor = 1)
 {
     TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
@@ -753,7 +761,8 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
                 cols,
                 row_stride,
                 shuffle_scale,
-                num_rows_ptr);
+                num_rows_ptr,
+                num_rows_factor);
         });
 #else
     TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");

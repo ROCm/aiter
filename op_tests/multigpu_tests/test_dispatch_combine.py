@@ -248,7 +248,9 @@ def test_dispatch_combine(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
         quant_type=quant_type,
-        num_local_tokens=torch.tensor([tokenNum], dtype=dtypes.i32, device=tokens.device)
+        num_local_tokens=torch.tensor(
+            [tokenNum], dtype=dtypes.i32, device=tokens.device
+        ),
     )
     ref = run_ref(
         world_size,
@@ -302,7 +304,7 @@ quant_types = [
     aiter.QuantType.No,
     aiter.QuantType.per_Token,
     aiter.QuantType.per_128x128,
-][-1:]
+][-2:]
 
 parser = argparse.ArgumentParser(description="config input of test")
 parser.add_argument(
