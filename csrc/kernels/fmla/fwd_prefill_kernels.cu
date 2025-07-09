@@ -819,8 +819,14 @@ std::vector<torch::Tensor> flash_mla_fwd_prefill_with_kvcache_impl(
     const float          softmax_scale,
     const bool           is_causal)
 {
-    constexpr bool kKVLoadOnce         = false;
+    constexpr bool kKVLoadOnce         = true;
     constexpr XqaStrategy kXqaStrategy = XqaStrategy::Internal;
+    //TODO:
+    // cases need maintenance:
+    //     warp4 + load_once=false + occ=2
+    //     warp8 + load_once=true  + occ=1
+    // targe case:
+    // warp4 + load_once=true + occ=1
     //                             dqk  dv   m0  n0  n1   #warp  wave_occu
     using Traits = std::conditional_t<kKVLoadOnce,
         FlashMlaPrefillKernelTrait<576, 512, 64, 16, 512, 8,     1,   kKVLoadOnce, kXqaStrategy>,

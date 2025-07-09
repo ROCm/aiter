@@ -544,8 +544,8 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVLdsStoreBlockDescriptor()
     {
-        constexpr ck_tile::index_t kNPerBlock = 512;
-        constexpr ck_tile::index_t kKPerBlock = 16;
+        constexpr ck_tile::index_t kNPerBlock = Traits::kSizeDV;
+        constexpr ck_tile::index_t kKPerBlock = Traits::kBlockK1;
 
         constexpr ck_tile::index_t kKPack  = 16 / sizeof(scalar_t);
 
@@ -568,8 +568,8 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVLdsLoadBlockDescriptor()
     {
-        constexpr ck_tile::index_t kNPerBlock = 512;
-        constexpr ck_tile::index_t kKPerBlock = 16;
+        constexpr ck_tile::index_t kNPerBlock = Traits::kSizeDV;
+        constexpr ck_tile::index_t kKPerBlock = Traits::kBlockK1;
         constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
         constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
         constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
@@ -737,17 +737,8 @@ public:
         }
         else
         {
-            // TODO: add distribution calculate
-            // return ck_tile::make_static_tile_distribution(
-            //     ck_tile::tile_distribution_encoding<
-            //         ck_tile::sequence<>,
-            //         ck_tile::tuple<ck_tile::sequence<1, 1, 8, 2>, ck_tile::sequence<9, 4, 8, 2>>,
-            //         ck_tile::tuple<ck_tile::sequence<1, 2>, ck_tile::sequence<1, 2>>,
-            //         ck_tile::tuple<ck_tile::sequence<1, 1>, ck_tile::sequence<2, 2>>,
-            //         ck_tile::sequence<1, 1, 2, 2>,
-            //         ck_tile::sequence<0, 3, 0, 3>>{});
-            constexpr int32_t kBlockSize = Traits::kNumThreads;
-            constexpr int32_t kNPerBlock = Traits::kBlockN0;
+            constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
+            constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
             constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kMaxSplits;
             constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
             constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
@@ -788,7 +779,6 @@ public:
         using VDstrEncode = typename decltype(MakeVTileDistribution())::DstrEncode;
 
         constexpr ck_tile::index_t VKVectors = VDstrEncode::hs_lengthss_[ck_tile::number<0>{}][ck_tile::number<3>{}];
-        // constexpr ck_tile::index_t VNVectors = VDstrEncode::hs_lengthss_[ck_tile::number<1>{}][ck_tile::number<3>{}];
         constexpr ck_tile::index_t VKRepeats = VKVectors / 2;
         return VKRepeats;
     }
@@ -796,12 +786,28 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVTileDistribution()
     {
+        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
+        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
+        constexpr ck_tile::index_t kKPerBlock = Traits::kMaxSplits;
+        constexpr ck_tile::index_t kKNumWarps = Traits::kNumWarps;
+        constexpr ck_tile::index_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
+        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+
+        constexpr ck_tile::index_t kKVector = 4 / sizeof(scalar_t);
+        constexpr ck_tile::index_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
+
+        constexpr ck_tile::index_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
+        constexpr ck_tile::index_t kLaneGroups  = warpSize / kKLanes;
+
+        constexpr ck_tile::index_t kNRepeart = kNPerBlock / (kLaneGroups * kNVector);
+        constexpr ck_tile::index_t kKRepeart = kKPerBlock / (kKNumWarps * kKLanes * kKVector);
+
         return ck_tile::make_static_tile_distribution(
             ck_tile::tile_distribution_encoding<
                 ck_tile::sequence<>,
-                    // ck_tile::sequence<1, 1, 8, 2>,
-                    // ck_tile::sequence<8, 4, 8, 2>,
-                ck_tile::tuple<ck_tile::sequence<1, 1, 4, 4>, ck_tile::sequence<1, 4, 16, 2>>,
+                ck_tile::tuple<
+                    ck_tile::sequence<kNRepeart, kNNumWarps, kLaneGroups, kNVector>,
+                    ck_tile::sequence<kKRepeart, kKNumWarps, kKLanes, kKVector>>,
                 ck_tile::tuple<ck_tile::sequence<1, 2>, ck_tile::sequence<1, 2>>,
                 ck_tile::tuple<ck_tile::sequence<1, 1>, ck_tile::sequence<2, 2>>,
                 ck_tile::sequence<1, 1, 2, 2>,
@@ -810,18 +816,30 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVTTileDistribution()
     {
+        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
+        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
+        constexpr ck_tile::index_t kKPerBlock = Traits::kMaxSplits;
+        constexpr ck_tile::index_t kKNumWarps = Traits::kNumWarps;
+        constexpr ck_tile::index_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
+        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+
+        constexpr ck_tile::index_t kKVector = 4 / sizeof(scalar_t);
+        constexpr ck_tile::index_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
+
+        constexpr ck_tile::index_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
+        constexpr ck_tile::index_t kLaneGroups  = warpSize / kKLanes;
+
+        constexpr ck_tile::index_t kNRepeart = kNPerBlock / (kLaneGroups * kNVector);
+        constexpr ck_tile::index_t kKRepeart = kKPerBlock / (kKNumWarps * kKLanes * kKVector);
+
         return ck_tile::make_static_tile_distribution(
             ck_tile::tile_distribution_encoding<
                 ck_tile::sequence<>,
                 ck_tile::tuple<
-                    // ck_tile::sequence<8, 4, 8, 2>,
-                    // ck_tile::sequence<1, 1, 8, 2>>,
-                    ck_tile::sequence<1, 4, 16, 2>,
-                    ck_tile::sequence<1, 1, 4, 4>>,
+                    ck_tile::sequence<kKRepeart, kKNumWarps, kKLanes, kKVector>,
+                    ck_tile::sequence<kNRepeart, kNNumWarps, kLaneGroups, kNVector>>,
                 ck_tile::tuple<ck_tile::sequence<2, 1>, ck_tile::sequence<2, 1>>,
                 ck_tile::tuple<ck_tile::sequence<1, 1>, ck_tile::sequence<2, 2>>,
-                // ck_tile::sequence<2, 2, 1, 1>,
-                // ck_tile::sequence<0, 3, 0, 3>>{});
                 ck_tile::sequence<1, 1, 2, 2>,
                 ck_tile::sequence<0, 3, 0, 3>>{});
     }
