@@ -13,28 +13,6 @@ const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-template <typename T, typename F>
-__device__ constexpr T multithread_reduce(T data, F reduce_op, int stage)
-{
-    if(stage == 1)
-    {
-        return data;
-    }
-    if(stage >= 2)
-    {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-    }
-    if(stage >= 4)
-    {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-    }
-    if(stage == 8)
-    {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
-    }
-    return data;
-}
-
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32>
 __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                       float* __restrict__ scale,

@@ -263,7 +263,7 @@ def _flash_attn_forward(
         ret &= bias is None
         ret &= dropout_p == 0.0
         ret &= seqlen_q == seqlen_k
-        ret &= seqlen_q % 256 == 0
+        ret &= seqlen_q >= 384
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
