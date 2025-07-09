@@ -7,7 +7,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <ck_tile/core.hpp>
 #include <ck_tile/host.hpp>
-// #include <ck_tile/ops/gemm.hpp>
 #include <ck_tile/ops/reduce.hpp>
 #include "fwd_kernels_traits.hpp"
 #include "block_gemm_areg_bsmem_creg.hpp"
@@ -157,11 +156,10 @@ public:
                                     AccType>();
     }
 
-    template<bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock = Traits::kBlockK0>
     CK_TILE_HOST_DEVICE static constexpr auto GetQKBlockGemm()
     {
-        constexpr int32_t BlockTileK = !Traits::kKVLoadOnce ? Traits::kBlockK0 :
-                                       IsLoadOnceRope ? Traits::kSizeRope : Traits::kSizeNope;
+        constexpr int32_t BlockTileK = (Traits::kKVLoadOnce == false) ? Traits::kBlockK0 : KPerBlock;
         using BlockTile     = ck_tile::sequence<Traits::kBlockM, Traits::kBlockN0, BlockTileK>;
         using BlockWarps    = ck_tile::sequence<Traits::Gemm0ColWarps, Traits::Gemm0RowWarps, 1>;
         using TileGemmShape = ck_tile::TileGemmShape<BlockTile, BlockWarps, typename Traits::QKWarpTile>;
@@ -280,91 +278,95 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto GetKNopeSingleRepeatSize()
     {
-        return (Traits::kSizeRope * 2 + 8) * sizeof(scalar_t); // 2 = lane group 8 = padsize
+        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
+        return (Traits::kKIterations + kKPack) * sizeof(scalar_t);
     }
 
-    template <bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock, int32_t RepeatK>
     CK_TILE_HOST_DEVICE static constexpr auto GetSingleKElementSpaceSize()
     {
-        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
-        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNopeLdsRepeat;
-        constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
-        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+        constexpr int32_t kNPerBlock = Traits::kBlockN0;
+        constexpr int32_t kKPerBlock = KPerBlock;
+        constexpr int32_t kRepeatK   = RepeatK;
+        constexpr int32_t NumWarps   = Traits::kNumWarps;
+        constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr ck_tile::index_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr ck_tile::index_t KVector = 4  / sizeof(scalar_t);
-        constexpr ck_tile::index_t kPad    = kKPack;
+        // 16 means max load elemtments number in an instrution: b128->16bytes
+        // 4  means max load elemtments number to lds in gfx942: b32 ->4bytes
+        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
+        constexpr int32_t KVector = 4  / sizeof(scalar_t);
+        constexpr int32_t kPad    = kKPack;
 
-        static_assert(warpSize * KVector >= kKPerBlock &&
-                      warpSize * KVector % kKPerBlock == 0);
-        constexpr ck_tile::index_t LanesPerK  = kKPerBlock / KVector;
-        constexpr ck_tile::index_t LaneGroups = warpSize / LanesPerK;
-        constexpr ck_tile::index_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps);
+        static_assert((warpSize * KVector >= kKPerBlock) &&
+                      (warpSize * KVector % kKPerBlock == 0));
+        constexpr int32_t LanesPerK  = kKPerBlock / KVector;
+        constexpr int32_t LaneGroups = warpSize / LanesPerK;
+        constexpr int32_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps);
 
         return NumIssues * NumWarps * kRepeatK * (warpSize * KVector + kPad);
     }
 
-    template <bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock, int32_t RepeatK>
     CK_TILE_HOST_DEVICE static constexpr auto GetSingleKSpaceSize()
     {
-        return GetSingleKElementSpaceSize<IsLoadOnceRope>() * sizeof(scalar_t);
+        return GetSingleKElementSpaceSize<KPerBlock, RepeatK>() * sizeof(scalar_t);
     }
 
-    template <bool IsLoadOnceRope = false,
-              ck_tile::index_t IBuf = 0>
+    template <int32_t KPerBlock,
+              int32_t RepeatK,
+              int32_t IBuf = 0>
     CK_TILE_HOST_DEVICE static constexpr auto
         MakeKLdsStoreBlockDescriptor(ck_tile::number<IBuf> = ck_tile::number<0>{})
     {
         // K is always k-major, we use async-copy to load into LDS
-        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
-        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNopeLdsRepeat;
-        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
-        constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
-        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+        constexpr int32_t kNPerBlock = Traits::kBlockN0;
+        constexpr int32_t kKPerBlock = KPerBlock;
+        constexpr int32_t kRepeatK   = RepeatK;
+        constexpr int32_t kBlockSize = Traits::kNumThreads;
+        constexpr int32_t NumWarps   = Traits::kNumWarps;
+        constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr ck_tile::index_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr ck_tile::index_t KVector = 4  / sizeof(scalar_t);
-        constexpr ck_tile::index_t kPad = 
+        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
+        constexpr int32_t KVector = 4  / sizeof(scalar_t);
+        constexpr int32_t kPad = 
             kKPack; // for async-copy, this pad is between warps. Optimize this for lds_read speed
 
         static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
-        constexpr ck_tile::index_t LanesPerK =
+        constexpr int32_t LanesPerK =
             kKPerBlock / KVector; // 
-        constexpr ck_tile::index_t LaneGroups =
+        constexpr int32_t LaneGroups =
             warpSize /
             LanesPerK; // how many groups (within a wave), they may load different N, but same K
-        constexpr ck_tile::index_t NumIssues = kNPerBlock / (LaneGroups * NumWarps);
+        constexpr int32_t NumIssues = kNPerBlock / (LaneGroups * NumWarps);
         static_assert(NumIssues == kNPerBlock * kKPerBlock / (kBlockSize * KVector));
 
-        if constexpr(IsLoadOnceRope)
+        constexpr int32_t BufferSize = GetSingleKElementSpaceSize<KPerBlock, kRepeatK>();
+
+        if constexpr (KPerBlock == Traits::kSizeRope)
         {
             constexpr auto k_lds_block_desc_0 = make_naive_tensor_descriptor_with_offset(
                 ck_tile::make_tuple(ck_tile::number<NumIssues>{},  // n0
-                           ck_tile::number<LaneGroups>{}, // n1
-                           ck_tile::number<NumWarps>{},   // n2
-                           ck_tile::number<LanesPerK>{},  // k0
-                           ck_tile::number<KVector>{}),   // k1
+                                    ck_tile::number<LaneGroups>{}, // n1
+                                    ck_tile::number<NumWarps>{},   // n2
+                                    ck_tile::number<LanesPerK>{},  // k0
+                                    ck_tile::number<KVector>{}),   // k1
                 ck_tile::make_tuple(ck_tile::number<NumWarps * (warpSize * KVector + kPad)>{},
-                           ck_tile::number<kKPerBlock>{},
-                           ck_tile::number<warpSize * KVector + kPad>{},
-                           ck_tile::number<KVector>{},
-                           ck_tile::number<1>{}),
-                ck_tile::number<IBuf * GetSingleKElementSpaceSize<true>()>{},
+                                    ck_tile::number<kKPerBlock>{},
+                                    ck_tile::number<warpSize * KVector + kPad>{},
+                                    ck_tile::number<KVector>{},
+                                    ck_tile::number<1>{}),
+                ck_tile::number<IBuf * BufferSize>{},
                 ck_tile::number<KVector>{},
                 ck_tile::number<1>{});
 
-            // TODO this layout is hard coded, and will be used in async copy buffer view load
-            // in LDS the real layout is (bufs, N0, N2, N1*K0*K1)
             constexpr auto k_lds_block_desc_issues_warps_lanes = ck_tile::transform_tensor_descriptor(
                 k_lds_block_desc_0,
-                ck_tile::make_tuple(make_pass_through_transform(ck_tile::number<NumIssues>{}),
-                           ck_tile::make_pass_through_transform(ck_tile::number<NumWarps>{}),
-                           ck_tile::make_merge_transform(ck_tile::make_tuple(
-                               ck_tile::number<LaneGroups>{},
-                               ck_tile::number<LanesPerK>{}, 
-                               ck_tile::number<KVector>{}))),
+                ck_tile::make_tuple(ck_tile::make_pass_through_transform(ck_tile::number<NumIssues>{}),
+                                    ck_tile::make_pass_through_transform(ck_tile::number<NumWarps>{}),
+                                    ck_tile::make_merge_transform(ck_tile::make_tuple(
+                                        ck_tile::number<LaneGroups>{},
+                                        ck_tile::number<LanesPerK>{}, 
+                                        ck_tile::number<KVector>{}))),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<2>{}, ck_tile::sequence<1, 3, 4>{}),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}, ck_tile::sequence<2>{}));
 
@@ -376,7 +378,7 @@ public:
                 ck_tile::make_tuple(ck_tile::number<NumIssues>{},  // n0
                            ck_tile::number<LaneGroups>{}, // n1
                            ck_tile::number<NumWarps>{},   // n2
-                           ck_tile::number<kRepeatK>{},  // krepeatK
+                           ck_tile::number<kRepeatK>{},   // krepeatK
                            ck_tile::number<LanesPerK>{},  // k0
                            ck_tile::number<KVector>{}),   // k1
                 ck_tile::make_tuple(ck_tile::number<NumWarps* kRepeatK * (warpSize * KVector + kPad)>{},
@@ -385,7 +387,7 @@ public:
                            ck_tile::number<(warpSize * KVector + kPad) / LaneGroups>{},
                            ck_tile::number<KVector>{},
                            ck_tile::number<1>{}),
-                ck_tile::number<IBuf * GetSingleKElementSpaceSize<false>()>{},
+                ck_tile::number<IBuf * BufferSize>{},
                 ck_tile::number<KVector>{},
                 ck_tile::number<1>{});
 
@@ -393,13 +395,13 @@ public:
             // in LDS the real layout is (bufs, N0, N2, N1*K0*K1)
             constexpr auto k_lds_block_desc_issues_warps_lanes = ck_tile::transform_tensor_descriptor(
                 k_lds_block_desc_0,
-                ck_tile::make_tuple(make_pass_through_transform(ck_tile::number<NumIssues>{}),
-                           ck_tile::make_pass_through_transform(ck_tile::number<NumWarps>{}),
-                           ck_tile::make_merge_transform(ck_tile::make_tuple(
-                               ck_tile::number<LaneGroups>{},
-                               ck_tile::number<kRepeatK>{},
-                               ck_tile::number<LanesPerK>{}, 
-                               ck_tile::number<KVector>{}))),
+                ck_tile::make_tuple(ck_tile::make_pass_through_transform(ck_tile::number<NumIssues>{}),
+                                    ck_tile::make_pass_through_transform(ck_tile::number<NumWarps>{}),
+                                    ck_tile::make_merge_transform(ck_tile::make_tuple(
+                                        ck_tile::number<LaneGroups>{},
+                                        ck_tile::number<kRepeatK>{},
+                                        ck_tile::number<LanesPerK>{}, 
+                                        ck_tile::number<KVector>{}))),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<2>{}, ck_tile::sequence<1, 3, 4, 5>{}),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}, ck_tile::sequence<2>{}));
 
@@ -407,57 +409,54 @@ public:
         }
     }
 
-    template <bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock, int32_t RepeatK>
     CK_TILE_HOST_DEVICE static constexpr auto MakeKLdsLoadBlockDescriptor()
     {
         // K is always k-major, we use async-copy to load into LDS
-        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
-        constexpr ck_tile::index_t kRepeatK = IsLoadOnceRope ? 1 : Traits::kKNopeLdsRepeat;
-        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
-        constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
-        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+        constexpr int32_t kNPerBlock = Traits::kBlockN0;
+        constexpr int32_t kKPerBlock = KPerBlock;
+        constexpr int32_t kRepeatK   = RepeatK;
+        constexpr int32_t kBlockSize = Traits::kNumThreads;
+        constexpr int32_t NumWarps   = Traits::kNumWarps;
+        constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr ck_tile::index_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr ck_tile::index_t KVector = 4 / sizeof(scalar_t);
-        constexpr ck_tile::index_t kPad    = kKPack; // for async-copy, this pad is between warps
+        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
+        constexpr int32_t KVector = 4 / sizeof(scalar_t);
+        constexpr int32_t kPad    = kKPack; // for async-copy, this pad is between warps
 
         static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
-        constexpr ck_tile::index_t LanesPerK  = kKPerBlock / KVector; // within a wave
-        constexpr ck_tile::index_t LaneGroups = warpSize / LanesPerK; // within a wave
-        constexpr ck_tile::index_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps);
+        constexpr int32_t LanesPerK  = kKPerBlock / KVector; // within a wave
+        constexpr int32_t LaneGroups = warpSize / LanesPerK; // within a wave
+        constexpr int32_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps);
         static_assert(NumIssues == kNPerBlock * kKPerBlock / (kBlockSize * KVector));
-        // constexpr ck_tile::index_t SingleKSize = NumIssues * NumWarps * (warpSize * KVector + kPad);
-        // constexpr ck_tile::index_t SingleVSize =
-        // MakeVLdsBlockDescriptor<Problem>().get_element_space_size();
-        constexpr ck_tile::index_t BufferSize =
-            GetSingleKElementSpaceSize<IsLoadOnceRope>();
 
-        if constexpr(IsLoadOnceRope)
+        constexpr int32_t BufferSize = GetSingleKElementSpaceSize<KPerBlock, kRepeatK>();
+
+        if constexpr (KPerBlock == Traits::kSizeRope)
         {
             constexpr auto k_lds_block_desc_0 =
                 ck_tile::make_naive_tensor_descriptor(ck_tile::make_tuple(ck_tile::number<Traits::kNumPrefetchK>{},    // num_buffers
-                                                        ck_tile::number<NumIssues>{},          // n0
-                                                        ck_tile::number<NumWarps>{},           // n2
-                                                        ck_tile::number<LaneGroups>{},         // n1
-                                                        ck_tile::number<kKPerBlock / kKPack>{}, // k0
-                                                        ck_tile::number<kKPack>{}),             // k1
-                                             ck_tile::make_tuple(ck_tile::number<BufferSize>{},
-                                                        ck_tile::number<NumWarps*(warpSize * KVector + kPad)>{},
-                                                        ck_tile::number<(warpSize * KVector + kPad)>{},
-                                                        ck_tile::number<kKPerBlock>{},
-                                                        ck_tile::number<kKPack>{},
-                                                        ck_tile::number<1>{}),
-                                             ck_tile::number<kKPack>{},
-                                             ck_tile::number<1>{});
+                                                                          ck_tile::number<NumIssues>{},           // n0
+                                                                          ck_tile::number<NumWarps>{},            // n2
+                                                                          ck_tile::number<LaneGroups>{},          // n1
+                                                                          ck_tile::number<kKPerBlock / kKPack>{}, // k0
+                                                                          ck_tile::number<kKPack>{}),             // k1
+                                                      ck_tile::make_tuple(ck_tile::number<BufferSize>{},
+                                                                          ck_tile::number<NumWarps*(warpSize * KVector + kPad)>{},
+                                                                          ck_tile::number<(warpSize * KVector + kPad)>{},
+                                                                          ck_tile::number<kKPerBlock>{},
+                                                                          ck_tile::number<kKPack>{},
+                                                                          ck_tile::number<1>{}),
+                                                      ck_tile::number<kKPack>{},
+                                                      ck_tile::number<1>{});
 
             constexpr auto k_lds_block_desc = ck_tile::transform_tensor_descriptor(
                 k_lds_block_desc_0,
                 ck_tile::make_tuple(
                     ck_tile::make_merge_transform(ck_tile::make_tuple(ck_tile::number<Traits::kNumPrefetchK>{},
-                                                    ck_tile::number<NumIssues>{},
-                                                    ck_tile::number<LaneGroups>{},
-                                                    ck_tile::number<NumWarps>{})),
+                                                  ck_tile::number<NumIssues>{},
+                                                  ck_tile::number<LaneGroups>{},
+                                                  ck_tile::number<NumWarps>{})),
                     ck_tile::make_merge_transform(ck_tile::make_tuple(
                                                   ck_tile::number<kKPerBlock / kKPack>{}, 
                                                   ck_tile::number<kKPack>{}))),
@@ -469,30 +468,29 @@ public:
         {
             constexpr auto k_lds_block_desc_0 =
                 ck_tile::make_naive_tensor_descriptor(ck_tile::make_tuple(ck_tile::number<Traits::kNumPrefetchK>{},    // num_buffers
-                                                        ck_tile::number<NumIssues>{},          // n0
-                                                        ck_tile::number<NumWarps>{},           // n2
-                                                        ck_tile::number<LaneGroups>{},         // n1
-                                                        ck_tile::number<kRepeatK>{}, 
-                                                        ck_tile::number<kKPerBlock / kKPack>{}, // k0
-                                                        ck_tile::number<kKPack>{}),             // k1
-                                                     ck_tile::make_tuple(ck_tile::number<BufferSize>{},
-                                                        ck_tile::number<NumWarps*(warpSize * KVector + kPad) * kRepeatK>{},
-                                                        ck_tile::number<(warpSize * KVector + kPad) * kRepeatK>{},
-                                                        ck_tile::number<(warpSize * KVector + kPad) / LaneGroups>{},
-                                                        // ck_tile::number<Traits::kSizeD>{}, 
-                                                        ck_tile::number<(warpSize * KVector + kPad) / LaneGroups>{},
-                                                        ck_tile::number<kKPack>{},
-                                                        ck_tile::number<1>{}),
-                                             ck_tile::number<kKPack>{},
-                                             ck_tile::number<1>{});
+                                                                          ck_tile::number<NumIssues>{},          // n0
+                                                                          ck_tile::number<NumWarps>{},           // n2
+                                                                          ck_tile::number<LaneGroups>{},         // n1
+                                                                          ck_tile::number<kRepeatK>{},
+                                                                          ck_tile::number<kKPerBlock / kKPack>{}, // k0
+                                                                          ck_tile::number<kKPack>{}),             // k1
+                                                      ck_tile::make_tuple(ck_tile::number<BufferSize>{},
+                                                                          ck_tile::number<NumWarps*(warpSize * KVector + kPad) * kRepeatK>{},
+                                                                          ck_tile::number<(warpSize * KVector + kPad) * kRepeatK>{},
+                                                                          ck_tile::number<(warpSize * KVector + kPad) * kRepeatK / LaneGroups>{},
+                                                                          ck_tile::number<(warpSize * KVector + kPad) / LaneGroups>{},
+                                                                          ck_tile::number<kKPack>{},
+                                                                          ck_tile::number<1>{}),
+                                                      ck_tile::number<kKPack>{},
+                                                      ck_tile::number<1>{});
 
             constexpr auto k_lds_block_desc = ck_tile::transform_tensor_descriptor(
                 k_lds_block_desc_0,
                 ck_tile::make_tuple(
                     ck_tile::make_merge_transform(ck_tile::make_tuple(ck_tile::number<Traits::kNumPrefetchK>{},
-                                                    ck_tile::number<NumIssues>{},
-                                                    ck_tile::number<LaneGroups>{},
-                                                    ck_tile::number<NumWarps>{})),
+                                                  ck_tile::number<NumIssues>{},
+                                                  ck_tile::number<LaneGroups>{},
+                                                  ck_tile::number<NumWarps>{})),
                     ck_tile::make_merge_transform(ck_tile::make_tuple(
                                                   ck_tile::number<kRepeatK>{}, 
                                                   ck_tile::number<kKPerBlock / kKPack>{}, 
@@ -518,15 +516,15 @@ public:
 
         constexpr auto v_lds_block_desc_0 = ck_tile::make_naive_tensor_descriptor(
             ck_tile::make_tuple(ck_tile::number<Traits::kNumPrefetchV>{},
-                       ck_tile::number<kKPerBlock / kKPack>{},
-                       ck_tile::number<kNPerBlock / NPerRow>{},
-                       ck_tile::number<NPerRow>{},
-                       ck_tile::number<kKPack>{}),
+                                ck_tile::number<kKPerBlock / kKPack>{},
+                                ck_tile::number<kNPerBlock / NPerRow>{},
+                                ck_tile::number<NPerRow>{},
+                                ck_tile::number<kKPack>{}),
             ck_tile::make_tuple(ck_tile::number<BufferSize>{},
-                       ck_tile::number<(kNPerBlock / NPerRow) * (PixelsPerRow + kKPack)>{},
-                       ck_tile::number<PixelsPerRow + kKPack>{},
-                       ck_tile::number<kKPack>{},
-                       ck_tile::number<1>{}),
+                                ck_tile::number<(kNPerBlock / NPerRow) * (PixelsPerRow + kKPack)>{},
+                                ck_tile::number<PixelsPerRow + kKPack>{},
+                                ck_tile::number<kKPack>{},
+                                ck_tile::number<1>{}),
             ck_tile::number<kKPack>{},
             ck_tile::number<1>{});
 
@@ -544,10 +542,10 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVLdsStoreBlockDescriptor()
     {
-        constexpr ck_tile::index_t kNPerBlock = Traits::kSizeDV;
-        constexpr ck_tile::index_t kKPerBlock = Traits::kBlockK1;
+        constexpr int32_t kNPerBlock = Traits::kSizeDV;
+        constexpr int32_t kKPerBlock = Traits::kBlockK1;
 
-        constexpr ck_tile::index_t kKPack  = 16 / sizeof(scalar_t);
+        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
 
         constexpr auto v_lds_block_desc_0 = make_naive_tensor_descriptor(
             ck_tile::make_tuple(ck_tile::number<kKPerBlock / kKPack>{}, ck_tile::number<kNPerBlock>{}, ck_tile::number<kKPack>{}),
@@ -568,20 +566,20 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVLdsLoadBlockDescriptor()
     {
-        constexpr ck_tile::index_t kNPerBlock = Traits::kSizeDV;
-        constexpr ck_tile::index_t kKPerBlock = Traits::kBlockK1;
-        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
-        constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
-        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+        constexpr int32_t kNPerBlock = Traits::kSizeDV;
+        constexpr int32_t kKPerBlock = Traits::kBlockK1;
+        constexpr int32_t kBlockSize = Traits::kNumThreads;
+        constexpr int32_t NumWarps   = Traits::kNumWarps;
+        constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr ck_tile::index_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr ck_tile::index_t KVector = 8 / sizeof(scalar_t); // 4
-        constexpr ck_tile::index_t kPad    = kKPack; // for async-copy, this pad is between warps
+        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
+        constexpr int32_t KVector = 8 / sizeof(scalar_t); // 4
+        constexpr int32_t kPad    = kKPack; // for async-copy, this pad is between warps
 
         static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
-        constexpr ck_tile::index_t LanesPerK  = kKPerBlock / KVector; // 16 / 4 = 4
-        constexpr ck_tile::index_t LaneGroups = warpSize / LanesPerK; // 64 / 4 = 16
-        constexpr ck_tile::index_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps); // 1
+        constexpr int32_t LanesPerK  = kKPerBlock / KVector; // 16 / 4 = 4
+        constexpr int32_t LaneGroups = warpSize / LanesPerK; // 64 / 4 = 16
+        constexpr int32_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps); // 1
         static_assert(NumIssues == kNPerBlock * kKPerBlock / (kBlockSize * KVector));
 
         constexpr auto v_lds_block_desc_0 =
@@ -681,7 +679,8 @@ public:
     CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeK()
     {
         return Traits::kKVLoadOnce ?  
-            (GetSingleKElementSpaceSize<true>() + GetSingleKElementSpaceSize<false>()) * sizeof(scalar_t) :
+            (GetSingleKElementSpaceSize<Traits::kKIterations, Traits::kKNopeLdsRepeat>() +
+             GetSingleKElementSpaceSize<Traits::kSizeRope, 1>()) * sizeof(scalar_t) :
             Traits::kNumPrefetchKV * GetSmemSizeSingleKV();
     }
 
@@ -698,22 +697,21 @@ public:
     }
 
 
-    template<bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock = Traits::kBlockK0>
     CK_TILE_HOST_DEVICE static constexpr auto MakeQRegTileDistribution()
     {
-        using BlockGemm = ck_tile::remove_cvref_t<decltype(GetQKBlockGemm<IsLoadOnceRope>())>;
+        using BlockGemm = ck_tile::remove_cvref_t<decltype(GetQKBlockGemm<KPerBlock>())>;
 
-        constexpr int32_t BlockTileK = !Traits::kKVLoadOnce ? Traits::kBlockK0 :
-                                       IsLoadOnceRope ? Traits::kSizeRope : Traits::kSizeNope;
+        constexpr int32_t BlockTileK = (Traits::kKVLoadOnce == false) ? Traits::kBlockK0 : KPerBlock;
         return BlockGemm::template MakeABlockTileDistribution<
             Traits::kBlockM,
             BlockTileK>();
     }
 
-    template<bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock = Traits::kBlockK0>
     CK_TILE_HOST_DEVICE static constexpr auto MakeKDramTileDistribution()
     {
-        if constexpr (!Traits::kKVLoadOnce)
+        if constexpr (Traits::kKVLoadOnce == false)
         {
             constexpr int32_t kBlockSize = Traits::kNumThreadsGemm0;
             constexpr int32_t kNPerBlock = Traits::kBlockN0;
@@ -737,25 +735,25 @@ public:
         }
         else
         {
-            constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
-            constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-            constexpr ck_tile::index_t kKPerBlock = IsLoadOnceRope ? Traits::kSizeRope : Traits::kKIterations;
-            constexpr ck_tile::index_t NumWarps   = Traits::kNumWarps;
-            constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+            constexpr int32_t kBlockSize = Traits::kNumThreads;
+            constexpr int32_t kNPerBlock = Traits::kBlockN0;
+            constexpr int32_t kKPerBlock = KPerBlock;
+            constexpr int32_t NumWarps   = Traits::kNumWarps;
+            constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-            constexpr ck_tile::index_t KVector = 4 / sizeof(scalar_t);
+            constexpr int32_t KVector = 4 / sizeof(scalar_t);
 
             static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
-            constexpr ck_tile::index_t LanesPerK  = kKPerBlock / KVector; // within a wave
-            constexpr ck_tile::index_t LaneGroups = warpSize / LanesPerK; // within a wave
-            constexpr ck_tile::index_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps);
+            constexpr int32_t LanesPerK  = kKPerBlock / KVector; // within a wave
+            constexpr int32_t LaneGroups = warpSize / LanesPerK; // within a wave
+            constexpr int32_t NumIssues  = kNPerBlock / (LaneGroups * NumWarps);
             static_assert(NumIssues == kNPerBlock * kKPerBlock / (kBlockSize * KVector));
 
-            constexpr ck_tile::index_t N0 = NumIssues;
-            constexpr ck_tile::index_t N1 = LaneGroups;
-            constexpr ck_tile::index_t N2 = NumWarps;
-            constexpr ck_tile::index_t K0 = LanesPerK;
-            constexpr ck_tile::index_t K1 = KVector;
+            constexpr int32_t N0 = NumIssues;
+            constexpr int32_t N1 = LaneGroups;
+            constexpr int32_t N2 = NumWarps;
+            constexpr int32_t K0 = LanesPerK;
+            constexpr int32_t K1 = KVector;
 
             return ck_tile::make_static_tile_distribution(
                 ck_tile::tile_distribution_encoding<ck_tile::sequence<1>,
@@ -767,10 +765,10 @@ public:
         }
     }
 
-    template<bool IsLoadOnceRope = false>
+    template<int32_t KPerBlock = Traits::kBlockK0>
     CK_TILE_HOST_DEVICE static constexpr auto GetNumRepeatOfKDramTileDistribution()
     {
-        using KDstrEncode = typename decltype(MakeKDramTileDistribution<IsLoadOnceRope>())::DstrEncode;
+        using KDstrEncode = typename decltype(MakeKDramTileDistribution<KPerBlock>())::DstrEncode;
         return KDstrEncode::hs_lengthss_[ck_tile::number<0>{}][ck_tile::number<0>{}];
     }
 
@@ -778,29 +776,29 @@ public:
     {
         using VDstrEncode = typename decltype(MakeVTileDistribution())::DstrEncode;
 
-        constexpr ck_tile::index_t VKVectors = VDstrEncode::hs_lengthss_[ck_tile::number<0>{}][ck_tile::number<3>{}];
-        constexpr ck_tile::index_t VKRepeats = VKVectors / 2;
+        constexpr int32_t VKVectors = VDstrEncode::hs_lengthss_[ck_tile::number<0>{}][ck_tile::number<3>{}];
+        constexpr int32_t VKRepeats = VKVectors / 2;
         return VKRepeats;
     }
 
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVTileDistribution()
     {
-        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
-        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = Traits::kKIterations;
-        constexpr ck_tile::index_t kKNumWarps = Traits::kNumWarps;
-        constexpr ck_tile::index_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
-        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+        constexpr int32_t kBlockSize = Traits::kNumThreads;
+        constexpr int32_t kNPerBlock = Traits::kBlockN0;
+        constexpr int32_t kKPerBlock = Traits::kKIterations;
+        constexpr int32_t kKNumWarps = Traits::kNumWarps;
+        constexpr int32_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
+        constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr ck_tile::index_t kKVector = 4 / sizeof(scalar_t);
-        constexpr ck_tile::index_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
+        constexpr int32_t kKVector = 4 / sizeof(scalar_t);
+        constexpr int32_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
 
-        constexpr ck_tile::index_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
-        constexpr ck_tile::index_t kLaneGroups  = warpSize / kKLanes;
+        constexpr int32_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
+        constexpr int32_t kLaneGroups  = warpSize / kKLanes;
 
-        constexpr ck_tile::index_t kNRepeart = kNPerBlock / (kLaneGroups * kNVector);
-        constexpr ck_tile::index_t kKRepeart = kKPerBlock / (kKNumWarps * kKLanes * kKVector);
+        constexpr int32_t kNRepeart = kNPerBlock / (kLaneGroups * kNVector);
+        constexpr int32_t kKRepeart = kKPerBlock / (kKNumWarps * kKLanes * kKVector);
 
         return ck_tile::make_static_tile_distribution(
             ck_tile::tile_distribution_encoding<
@@ -816,21 +814,21 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto MakeVTTileDistribution()
     {
-        constexpr ck_tile::index_t kBlockSize = Traits::kNumThreads;
-        constexpr ck_tile::index_t kNPerBlock = Traits::kBlockN0;
-        constexpr ck_tile::index_t kKPerBlock = Traits::kKIterations;
-        constexpr ck_tile::index_t kKNumWarps = Traits::kNumWarps;
-        constexpr ck_tile::index_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
-        constexpr ck_tile::index_t warpSize   = ck_tile::get_warp_size();
+        constexpr int32_t kBlockSize = Traits::kNumThreads;
+        constexpr int32_t kNPerBlock = Traits::kBlockN0;
+        constexpr int32_t kKPerBlock = Traits::kKIterations;
+        constexpr int32_t kKNumWarps = Traits::kNumWarps;
+        constexpr int32_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
+        constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr ck_tile::index_t kKVector = 4 / sizeof(scalar_t);
-        constexpr ck_tile::index_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
+        constexpr int32_t kKVector = 4 / sizeof(scalar_t);
+        constexpr int32_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
 
-        constexpr ck_tile::index_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
-        constexpr ck_tile::index_t kLaneGroups  = warpSize / kKLanes;
+        constexpr int32_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
+        constexpr int32_t kLaneGroups  = warpSize / kKLanes;
 
-        constexpr ck_tile::index_t kNRepeart = kNPerBlock / (kLaneGroups * kNVector);
-        constexpr ck_tile::index_t kKRepeart = kKPerBlock / (kKNumWarps * kKLanes * kKVector);
+        constexpr int32_t kNRepeart = kNPerBlock / (kLaneGroups * kNVector);
+        constexpr int32_t kKRepeart = kKPerBlock / (kKNumWarps * kKLanes * kKVector);
 
         return ck_tile::make_static_tile_distribution(
             ck_tile::tile_distribution_encoding<
