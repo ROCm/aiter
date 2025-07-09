@@ -40,7 +40,7 @@ def moe_sorting(
     sorted_expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=dtypes.i32, device=device
     )
-    num_valid_ids = torch.empty((1), dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(
@@ -257,8 +257,6 @@ def fused_moe_1stage(
             w2_scale = w2_scale.view(E, -1)
 
         if quant_type == QuantType.per_1x128:
-            a1 = a1.view_as(hidden_states)
-            a1_scale = a1_scale.view(hidden_states.shape[0], -1).t().contiguous()
             fmoe_func = functools.partial(
                 aiter.fmoe_fp8_blockscale_g1u1,
                 fc_scale_blkn=128,

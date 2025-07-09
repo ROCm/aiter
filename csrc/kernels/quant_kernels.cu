@@ -36,8 +36,8 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int32_t scaleN_pad = (std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> && shuffle_scale)
                              ? (((scaleN + 7) / 8) * 8)
                              : scaleN;
-    int32_t x          = groupId / scaleN_pad;
-    int32_t y          = groupId % scaleN_pad;
+    int64_t x                = groupId / scaleN_pad;
+    int32_t y                = groupId % scaleN_pad;
     if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
     {
         if(x >= ori_rows || y >= scaleN)
