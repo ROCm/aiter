@@ -1,0 +1,21 @@
+{
+  "small_batch": {
+    "BLOCK_M": 64,
+    "BLOCK_N": 32,
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "kpack": 2
+  },
+
+  "large_batch": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 32,
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "kpack": 2
+  }
+}
