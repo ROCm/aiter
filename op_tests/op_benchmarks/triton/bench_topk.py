@@ -14,10 +14,6 @@ import torch
 import triton
 from triton.testing import runtime
 from aiter.ops.triton.topk import topk as triton_topk
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    get_available_models,
-)
 
 DEVICE = "cuda"
 CACHE_DIR = Path.home() / ".triton" / "cache"
@@ -227,6 +223,24 @@ def bench_memory(batch, provider, *, dim2: int, k: int):
     return (peak_mb,) * 3
 
 
+def parse_args():
+    p = argparse.ArgumentParser("Triton Top-K benchmark & Roofline")
+    p.add_argument(
+        "--save-dir", type=Path, default=Path("./figs"), help="Directory for PNG output"
+    )
+    p.add_argument(
+        "--purge-cache",
+        action="store_true",
+        help="Clear Triton cache before each sweep",
+    )
+    p.add_argument(
+        "--roofline",
+        action="store_true",
+        help="Generate Roofline plots instead of latency/memory",
+    )
+    return p.parse_args()
+
+
 def run_roofline(args):
     for M, K in itertools.product(DIM2S, KS):
         if args.purge_cache:
@@ -258,128 +272,12 @@ def run_latency_memory(args):
                 print(f"?  {path.name} missing")
 
 
-def run_benchmark(args, x_vals_list):
-    """
-    Runs benchmark given the --model argument.
-    """
-    x_names = ["M", "N", "topk"]
-
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "memory":
-        ylabel = "Memory (MB)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-    line_names = ["Triton"]
-    line_vals = line_names
-    benchmark = triton.testing.Benchmark(
-        x_names=x_names,
-        x_vals=x_vals_list,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=[("green", "-")],  # match line names to colors
-        ylabel=ylabel,
-        plot_name="Benchmark Routing Layer",
-        args={"metric": args.metric},
-    )
-
-    @triton.testing.perf_report([benchmark])
-    def bench_topk(M, N, topk, **kwargs):
-        x = torch.rand(M, N, device=DEVICE, dtype=torch.float32)
-        ms = triton.testing.do_bench(lambda: triton_topk(x, topk), warmup=25, rep=100)
-        if args.metric == "time":
-            return ms
-        else:
-            raise ValueError("Unknown metric: " + args.metric)
-
-    bench_topk.run(save_path=".", print_data=True)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Top-K",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
-    parser.add_argument(
-        "--shape",
-        type=int,
-        nargs=2,
-        metavar=("M", "N"),
-        help="user-defined shape to benchmark (M, N), with M being the batch size and N being the vocab size.",
-    )
-    parser.add_argument(
-        "--topk", type=int, default=1, help="Number of elements to select by top-K"
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time"],
-        default="time",
-        help="metric to plot",
-    )
-    parser.add_argument(
-        "--save-dir", type=Path, default=Path("./figs"), help="Directory for PNG output"
-    )
-    parser.add_argument(
-        "--purge-cache",
-        action="store_true",
-        help="Clear Triton cache before each sweep",
-    )
-    parser.add_argument(
-        "--roofline",
-        action="store_true",
-        help="Generate Roofline plots instead of latency/memory",
-    )
-    parser.add_argument(
-        "--run_latency_memory",
-        action="store_true",
-        help="Run latency and memory benchmarks",
-    )
-    return parser.parse_args()
-
-
 def main():
     args = parse_args()
-    assert (
-        args.model is None or args.shape is None
-    ), "Specify one of --model or --shape, not both."
-    if args.model is not None:
-        config_file = args.model_configs
-        configs = get_model_configs(config_path=config_file, models=args.model)
-        x_vals = []
-        for _, config in configs.items():
-            # layer takes (batch_size, vocab_size) as input and selects (batch_size, topk)
-            N = config["vocab_size"]
-            for M in [2**i for i in range(15)]:
-                x_vals.append((M, N, args.topk))
-        run_benchmark(args, x_vals)
-    elif args.shape is not None:
-        M, N = args.shape
-        run_benchmark(args, [(M, N, args.topk)])
-    else:
-        # Default
-        M, N, K = 1024, 128256, 16
-        run_benchmark(args, [(M, N, K)])
-
     args.save_dir.mkdir(parents=True, exist_ok=True)
     if args.roofline:
         run_roofline(args)
-    if args.run_latency_memory:
+    else:
         run_latency_memory(args)
 
 

@@ -2,12 +2,7 @@ from aiter.ops.triton import extend_attention, prefill_attention
 
 import triton
 
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    get_available_models,
-    print_vgpr,
-)
-
+from utils.benchmark_utils import get_model_configs, get_available_models, print_vgpr
 import torch
 import argparse
 
@@ -429,7 +424,7 @@ def parse_args():
         allow_abbrev=False,
     )
     parser.add_argument(
-        "--model_configs",
+        "-model_configs",
         type=str,
         default="utils/model_configs.json",
         help="Model config json file.",
@@ -440,26 +435,26 @@ def parse_args():
     model_help = (
         "Model name to benchmark. Select from: ["
         + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as --model \"llama3,mistral_7B\""
+        + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as -model \"llama3,mistral_7B\""
     )
     parser.add_argument(
-        "--plot_name",
+        "-plot_name",
         type=str,
         default="MLA-prefill",
         help="Name for the results plot|table",
     )
-    parser.add_argument("--model", type=str, default="", help=model_help)
+    parser.add_argument("-model", type=str, default="", help=model_help)
     parser.add_argument("-b", type=int, default=0, help="Batch size")
-    parser.add_argument("--prefix", type=int, default=0, help="Prefix length")
-    parser.add_argument("--extend", type=int, default=0, help="Extend length")
+    parser.add_argument("-prefix", type=int, default=0, help="Prefix length")
+    parser.add_argument("-extend", type=int, default=0, help="Extend length")
     parser.add_argument(
-        "--attn_impl",
+        "-attn_impl",
         type=str,
         default="non-absorb",
         help="Whether to use absorbed or non-absorbed attention. Options: absorb, non-absorb",
     )
-    parser.add_argument("--dtype", default="bf16")
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("-dtype", default="bf16")
+    parser.add_argument("-device", default="cuda")
     parser.add_argument(
         "-print_vgpr",
         action="store_true",
@@ -474,7 +469,7 @@ def parse_args():
         help="Equal sequence lengths, i.e. total (prefix|extend) tokens = B * (prefix|extend). Otherwise we have randint(1, (prefix|extend), (B,)) as sequence lengths.",
     )
     parser.add_argument(
-        "--mode",
+        "-mode",
         type=str,
         default="extend",
         help="Mode of the benchmark. Options: extend, prefill",

@@ -1,10 +1,10 @@
 import triton
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+import triton.language as tl
+from utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     get_dtype_bytes,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_pa_prefill import (
     seed_everything,
     STR_DTYPE_TO_TORCH_DTYPE,
@@ -340,16 +340,31 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = get_parser(kernel_name="Paged Attention Decode")
-
+    parser = argparse.ArgumentParser(
+        prog="Benchmark Paged Attention decode",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "-model_configs",
+        type=str,
+        default="utils/model_configs.json",
+        help="Model config json file.",
+    )
+    available_models = get_available_models()  # Dynamically load model names
+    model_help = (
+        "Model name to benchmark. Select from: ["
+        + ", ".join(available_models)
+        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
+    )
+    parser.add_argument("-model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sq", type=int, default=0)
     parser.add_argument("-use_alibi_slope", action="store_true", default=False)
-    parser.add_argument("--dtype", default="fp16")
-    parser.add_argument("--kv_cache_dtype", default="auto")
-    parser.add_argument("--compute_type", default="fp16")
+    parser.add_argument("-dtype", default="fp16")
+    parser.add_argument("-kv_cache_dtype", default="auto")
+    parser.add_argument("-compute_type", default="fp16")
 
     args = parser.parse_args()
     return args

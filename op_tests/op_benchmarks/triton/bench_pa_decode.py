@@ -4,7 +4,7 @@ import torch
 import argparse
 import triton
 from aiter.ops.triton.pa_decode import paged_attention_decode
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+from utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     get_dtype_bytes,

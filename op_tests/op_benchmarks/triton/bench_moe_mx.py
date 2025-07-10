@@ -9,10 +9,7 @@ from op_tests.triton_tests.test_moe_mx import (
     alloc_rand,
     torch_dynamic_mxfp4_quant,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
-    get_model_configs,
-)
+from utils.benchmark_utils import get_available_models, get_model_configs
 
 
 def model_benchmark_configs(args):
