@@ -11,6 +11,7 @@ from typing import Optional
 this_dir = os.path.abspath(__file__)
 sys.path.insert(0, str(Path(this_dir).parents[2] / "aiter/"))
 from jit.core import get_asm_dir
+from jit.utils.chip_info import get_gfx, get_device_name
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -66,6 +67,8 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p3 _p14;
     unsigned int opt;
     p3 _p15;
+    unsigned int s_lse;
+    p3 _p16;
 }};
 
 struct fmha_fwd_v3_traits
@@ -84,7 +87,8 @@ template <typename DataType_,
           ck_tile::index_t HDim_,
           ck_tile::index_t MaskType_,
           bool kIsSEQPad_,
-          bool kIsHDPad_>
+          bool kIsHDPad_,
+          int kStoreLSE_>
 struct fmha_fwd_kernel_selector
 {{
     using DataType                              = ck_tile::remove_cvref_t<DataType_>;
@@ -92,30 +96,41 @@ struct fmha_fwd_kernel_selector
     static constexpr ck_tile::index_t MaskType  = MaskType_;
     static constexpr bool kIsSEQPad             = kIsSEQPad_;
     static constexpr bool kIsHDPad              = kIsHDPad_;
+    static constexpr int kStoreLSE              = kStoreLSE_; // kStoreLSE_ won't affect kernel selection, but will pass in kernel args
 }};
 
-
 template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Name;
-// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16"; }};
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal"; }};
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16"; }};
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16_causal"; }};
+// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16"; }};
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16"; }};
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal"; }};
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal"; }};
+// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     0>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16"; }};
+// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     1>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16"; }};
+// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16_causal"; }};
+// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16_causal"; }};
 
 template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Buf;
-// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; }};
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; }};
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16.co"; }};
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16_causal.co"; }};
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; }};
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; }};
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; }};
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; }};
+// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     0>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16.co"; }};
+// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     1>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16.co"; }};
+// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16_causal.co"; }};
+// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16_causal.co"; }};
 
 template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Ts;
-// ####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; }};
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; }};
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; }};
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; }};
-
+// ####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     0>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     1>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
+// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; }};
 
 class fmha_fwd_v3_kernel
 {{
@@ -125,7 +140,7 @@ class fmha_fwd_v3_kernel
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
         std::string AITER_ASM_DIR = "{F_AITER_ASM_DIR}";
-        HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + "fmha_v3_fwd/" + hsaco).c_str()));
+        HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }}
 
@@ -169,6 +184,10 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
 {{
     if(s.log_level_ > 0)
         std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
+
+    int tune_opt = 5;
+    {F_tune_knob}
+
     fmha_fwd_v3_args args;
     args.ptr_o   = a.o_ptr;
     args.ptr_q   = a.q_ptr;
@@ -186,7 +205,8 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
     args.Seqs_kv  = a.stride_k * 2;
     args.Hs_kv    = a.nhead_stride_k * 2;
     args.BAs_kv   = a.batch_stride_k * 2;
-    args.opt      = 5;
+    args.opt      = tune_opt;
+    args.s_lse    = fmha_fwd_kernel_selector::kStoreLSE;
 
     auto traits = fmha_fwd_v3_traits{{a.batch,
                                      a.nhead_q,
@@ -207,17 +227,10 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
     if (t.use_ext_asm == true) {{
         if (t.data_type.compare("bf16") == 0) {{
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dropout == false) &&
-                        (t.has_lse == true) && (a.seqlen_q == a.seqlen_k) && (a.seqlen_q >= 384) &&
+                        (a.seqlen_q == a.seqlen_k) && (a.seqlen_q >= 384) &&
                         (a.batch_stride_lse >= a.nhead_stride_lse) && (a.hdim_q == a.hdim_v) &&
                         (a.hdim_q == 128)) {{
-                if (t.mask_type == mask_enum::no_mask) {{
-                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false>;
-                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
-                }}
-                else if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {{
-                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false>;
-                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
-                }}
+                        {F_dispatch}
             }}
         }}
     }}
@@ -226,8 +239,59 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
 }} // namespace aiter
 """
 
+# GFX950 support list:
+# lse: must
+# mask: option
+GFX950_DISPATCH = """if (t.has_lse == true) {{
+                    if (t.mask_type == mask_enum::no_mask) {{
+                        using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1>;
+                        r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                    }}
+                    else if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {{
+                        using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1>;
+                        r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                    }}
+                }}
+"""
+
+# GFX942 support list:
+# lse: option
+# mask: must be causal
+GFX942_DISPATCH = """if ((t.mask_type == mask_enum::mask_top_left) || (t.mask_type == mask_enum::mask_bottom_right)) {{
+                    if (t.has_lse == false) {{
+                        using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0>;
+                        r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                    }}
+                    else {{
+                        using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1>;
+                        r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                    }}
+                }}
+                else if (t.mask_type == mask_enum::no_mask) {{
+                    if (t.has_lse == false) {{
+                        using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0>;
+                        r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                    }}
+                    else {{
+                        using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1>;
+                        r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a);
+                    }}
+                }}
+"""
+
+TUNE_KNOB = """if (a.mask_type != 0 && ((a.nhead_q % 8 != 0) || (a.seqlen_q > 16384))) //if num_head is not 8N, or seqlen is bigger than 16K, downgrade to 2and3
+    {{
+        tune_opt -= 2;
+    }}
+"""
+
 
 def write_blobs(output_dir: Optional[str]) -> None:
+    gfx = get_gfx()
+    ts_kv = 32 if gfx == "gfx942" else 64
+    arch_dispatch = GFX942_DISPATCH if gfx == "gfx942" else GFX950_DISPATCH
+    asm_sub_dir = get_device_name() + "/" if gfx == "gfx942" else ""
+
     if output_dir is None:
         output_dir = Path(__file__).parent
     else:
@@ -235,9 +299,14 @@ def write_blobs(output_dir: Optional[str]) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    (output_dir / FMHA_FWD_API_FILENAME).write_text(
-        FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API.format(F_AITER_ASM_DIR=get_asm_dir())
+    forward_kernel = FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API.format(
+        F_AITER_ASM_DIR=get_asm_dir() + "fmha_v3_fwd/" + asm_sub_dir,
+        F_tile_size_kv=ts_kv,
+        F_dispatch=arch_dispatch,
+        F_tune_knob=TUNE_KNOB if gfx == "gfx950" else "",
     )
+
+    (output_dir / FMHA_FWD_API_FILENAME).write_text(forward_kernel)
 
 
 if __name__ == "__main__":

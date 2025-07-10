@@ -127,8 +127,8 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -227,16 +227,15 @@ def gemm_a8w8_blockscale(
     *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
+    M, K = x.shape
+    N, K = w.shape
+
+    # Check constraints.
+    assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
     # Transpose w and w_scale
     w = w.T
     w_scale = w_scale.T
-
-    M, K = x.shape
-    K, N = w.shape
-
-    # Check constraints.
-    assert x.shape[1] == w.shape[0], "Incompatible dimensions!!!"
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)

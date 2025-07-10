@@ -337,7 +337,7 @@ def batched_gemm_afp4wfp4_pre_quant(
 
     Key parameters:
     - X: Matrix X with shape (B, M, K).
-    - W: Matrix W with shape (B, K, N).
+    - W: Matrix W with shape (B, N, K).
     - X_scales: Matrix with shape (B, M, K // 32)
     - W_scales: Matrix with shape (B, N, K // 32)
 
@@ -346,10 +346,11 @@ def batched_gemm_afp4wfp4_pre_quant(
     """
 
     Bx, M, K = x.shape
-    Bw, K, N = w.shape
+    Bw, N, K = w.shape
     By, _, _ = y.shape
     assert Bx == Bw == By
     Batch = Bx
+    w = w.transpose(1, 2)
 
     if config is None:
         config = _get_config(M, N, K)

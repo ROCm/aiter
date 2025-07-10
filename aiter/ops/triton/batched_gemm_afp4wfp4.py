@@ -349,16 +349,17 @@ def batched_gemm_afp4wfp4(
 
     Key parameters:
     - X: Matrix X with shape (B, M, K).
-    - W: Matrix W with shape (B, K, N).
+    - W: Matrix W with shape (B, N, K).
     - X_scales: Matrix with shape (B, M, K // 32)
     - W_scales: Matrix with shape (B, N, K // 32)
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+    - Y: The output matrix with shape (B, M, N).
     """
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
+    w = w.transpose(1, 2)
     Bx, M, K = x.shape
     Bw, K, N = w.shape
     By, _, _ = y.shape
