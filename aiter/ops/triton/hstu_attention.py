@@ -364,18 +364,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
-@triton.autotune(
-    configs=_get_fw_configs(),
-    key=[
-        "AUTOTUNE_Z",
-        "H",
-        "AUTOTUNE_MAX_SEQ_LEN",
-        "DimQ",
-        "DimV",
-        "DeltaSize",
-        "IS_DELTA_Q",
-    ],
-)
 @triton.jit
 def _hstu_attn_fwd(  # noqa C901
     Q,
@@ -962,7 +950,12 @@ def _get_config(
             config = json.load(file)
         _get_config._config_dict = config
 
-    batch_key = "small_batch" if AUTOTUNE_Z < 512 else "large_batch"
+    if AUTOTUNE_Z < 512:
+        batch_key = "small_batch" 
+    elif AUTOTUNE_Z == 512: 
+        batch_key = "batch_512"
+    else:
+        batch_key = "large_batch"
 
     return _get_config._config_dict[batch_key]
 
@@ -1041,9 +1034,8 @@ def triton_hstu_attention_fwd(
         HAS_CONTEXTUAL_SEQ_LEN=has_contextual_seq_len,
         HAS_MAX_ATTN_LEN=has_max_attn_len,
         HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
+        **config,
     )
-
-    # print(f"_hstu_attn_fwd.best_config = {_hstu_attn_fwd.best_config}")
 
     return out
 
