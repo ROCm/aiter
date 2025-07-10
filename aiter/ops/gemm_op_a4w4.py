@@ -52,11 +52,11 @@ def gemm_a4w4(
     n = B.shape[0]
     k = A.shape[-1] * 2
 
-    if m >= 256:
-        ck_config = get_CKGEMM_config(m, n, k)
-        splitK = 0
-        if ck_config is not None:
-            splitK = ck_config["splitK"]
+    ck_config = get_CKGEMM_config(m, n, k)
+    splitK = 0
+    if ck_config is not None:
+        splitK = ck_config["splitK"]
+    if m < 256 or ck_config is not None or bias is None:
         return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
     return gemm_a4w4_asm(A, B, A_scale, B_scale, out, bias, alpha, beta, bpreshuffle)
 

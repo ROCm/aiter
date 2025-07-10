@@ -105,7 +105,7 @@ def tune_gemm_list(
 ):
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
-    cu_num = device_properties.multi_processor_coun
+    cu_num = device_properties.multi_processor_count
     task = []
     tasks_data = []
     for i in range(len(untunedf)):
@@ -143,7 +143,7 @@ def tune_gemm_list(
                             ),
                             {},
                             run_torch,
-                            (None, dtypes.fp16),
+                            (None, dtypes.bf16),
                             {},
                             None,
                             1e-2,
@@ -235,4 +235,4 @@ if __name__ == "__main__":
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
     tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
-    tunedf.to_csv(args.tune_file, index=False)
+    tunedf.to_csv(args.tune_file, index=False, na_rep="Nan")
