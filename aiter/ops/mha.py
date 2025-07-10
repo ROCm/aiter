@@ -4,7 +4,7 @@
 from torch import Tensor, Generator
 from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..utility import dtypes
 import torch
 
@@ -259,6 +259,7 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
+        gfx = get_gfx()
         ret = alibi_slopes is None
         ret &= bias is None
         ret &= dropout_p == 0.0
@@ -267,9 +268,9 @@ def _flash_attn_forward(
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
-        ret &= mask or nmask
-        ret &= return_lse
-        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= (return_lse and gfx == "gfx950") or (
+            gfx == "gfx942" and get_cu_num() == 80
+        )
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
