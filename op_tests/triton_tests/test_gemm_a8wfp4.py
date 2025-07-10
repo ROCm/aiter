@@ -193,6 +193,7 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
+    x_vals += [(1, 1, 1)]  # minimal case
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
@@ -382,7 +383,7 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True
         triton_out = torch.empty(
             x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
         )
-    gemm_a8wfp4(x, w.T, triton_out, x_scales, w_scales, out_dtype)
+    gemm_a8wfp4(x, w, triton_out, x_scales, w_scales, out_dtype)
     if DEBUG:
         print("triton_out:", triton_out, triton_out.shape)
 
