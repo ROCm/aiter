@@ -40,8 +40,10 @@ def perftest(
                 (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
             ] + [(args, kwargs)]
 
+            print(f"num_warmup={num_warmup}")
             run_iters(num_warmup, func, *args, **kwargs)
             if int(os.environ.get("AITER_LOG_MORE", 0)):
+                print(f"BBBBBBBBBBBBBBBB=AITER_LOG_MORE")
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -55,6 +57,7 @@ def perftest(
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
 
             if testGraph:
+                print(f"BBBBBBBBBBBBBBBB=testGraph")
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
@@ -79,6 +82,8 @@ def perftest(
                     else None
                 ),
             ) as prof:
+                print(f"BBBBBBBBBBBBBBBB=tpf")
+                print(f"num_iters={num_iters}")
                 data = run_iters_rotate(num_iters, func, rotate_args)
 
             avg = get_trace_perf(prof, num_iters)
