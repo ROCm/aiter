@@ -46,13 +46,25 @@ CK_TILE_DEVICE fp32x2_v amd_assembly_pk_mul_f32(fp32x2_v a, fp32x2_t b)
 CK_TILE_DEVICE fp8x2_v amd_assembly_cvt_pk_fp8_f32(fp32_t a, fp32_t b)
 {
     int16x2_t c;
-    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+    const float d = 240.0f;
+    const float e = -240.0f;
+    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
+                 "v_med3_f32 %2, %2, %3, %4\n"
+                 "v_cvt_pk_fp8_f32 %0, %1, %2"
+                 : "=v"(c)
+                 : "v"(a), "v"(b), "v"(d), "v"(e));
     return bit_cast<fp8x2_v>(c[0]);
 }
 CK_TILE_DEVICE fp8x2_v amd_assembly_cvt_pk_bf8_f32(fp32_t a, fp32_t b)
 {
     int16x2_t c;
-    asm volatile("v_cvt_pk_bf8_f32 %0, %1, %2" : "=v"(c) : "v"(a), "v"(b));
+    const float d = 448.0f;
+    const float e = -448.0f;
+    asm volatile("v_med3_f32 %1, %1, %3, %4\n"
+                 "v_med3_f32 %2, %2, %3, %4\n"
+                 "v_cvt_pk_bf8_f32 %0, %1, %2"
+                 : "=v"(c)
+                 : "v"(a), "v"(b), "v"(d), "v"(e));
     return bit_cast<fp8x2_v>(c[0]);
 }
 CK_TILE_DEVICE fp4x2_t amd_assembly_cvt_scalef32_pk_fp4_f32(fp32_t a, fp32_t b, fp32_t scale)

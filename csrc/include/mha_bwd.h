@@ -44,6 +44,7 @@ struct mha_bwd_traits : public fmha_bwd_traits
 
 using mha_bwd_args = fmha_bwd_args;
 
+__attribute__((visibility("default")))
 float mha_bwd(mha_bwd_args args,
               const ck_tile::stream_config& stream_config,
               std::string q_dtype_str,

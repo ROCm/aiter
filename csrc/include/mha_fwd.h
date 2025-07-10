@@ -51,15 +51,18 @@ using mha_fwd_args = fmha_fwd_args;
 using mha_fwd_splitkv_args = fmha_fwd_splitkv_args;
 using mha_batch_prefill_args = fmha_batch_prefill_args;
 
+__attribute__((visibility("default")))
 float mha_fwd(mha_fwd_args args, const ck_tile::stream_config &stream_config,
               std::string q_dtype_str, bool is_group_mode, mask_enum mask_type,
               bias_enum bias_type, bool has_lse, bool use_ext_asm);
 
+__attribute__((visibility("default")))
 float mha_fwd_splitkv(mha_fwd_splitkv_args args,
                       const ck_tile::stream_config &stream_config,
                       std::string q_dtype_str, bool is_group_mode,
                       mask_enum mask_type, bias_enum bias_type, bool has_lse);
 
+__attribute__((visibility("default")))
 float mha_batch_prefill(mha_batch_prefill_args args,
                         const ck_tile::stream_config &stream_config,
                         std::string q_dtype_str, bool is_group_mode,
