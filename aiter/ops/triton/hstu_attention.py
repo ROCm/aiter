@@ -23,6 +23,11 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+import functools
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+import json
+import os
 
 try:
     from triton.language.extra.libdevice import fast_dividef, fast_expf  # @manual=//triton:triton
@@ -940,6 +945,28 @@ def _hstu_attn_bwd(  # noqa C901
             )
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    AUTOTUNE_Z: int,
+    H: int,
+    AUTOTUNE_MAX_SEQ_LEN: int,
+    DimQ: int,
+    DimV: int,
+    DeltaSize: int,
+    IS_DELTA_Q: bool,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    batch_key = "small_batch" if AUTOTUNE_Z < 512 else "large_batch"
+
+    return _get_config._config_dict[batch_key]
+
+
 def triton_hstu_attention_fwd(
     N: int,
     alpha: float,
@@ -952,6 +979,7 @@ def triton_hstu_attention_fwd(
     max_attn_len: int,
     contextual_seq_len: int,
     sort_by_length_indices: Optional[torch.Tensor],
+    config: Optional[dict] = None,
 ) -> torch.Tensor:
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
@@ -964,6 +992,13 @@ def triton_hstu_attention_fwd(
     has_sort_by_length_indices = sort_by_length_indices is not None
     if L == 0:
         return out
+
+    max_seq_len = autotune_max_seq_len(N)
+    DeltaSize = 0
+    IS_DELTA_Q = False
+
+    if config is None:
+        config = _get_config(AUTOTUNE_Z, H, max_seq_len, DimQ, DimV, DeltaSize, IS_DELTA_Q)
 
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_M"]),
@@ -994,12 +1029,12 @@ def triton_hstu_attention_fwd(
         AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(N),
         DimQ=DimQ,
         DimV=DimV,
-        DeltaSize=0,
+        DeltaSize=DeltaSize,
         contextual_seq_len=contextual_seq_len,
         max_attn_len=max_attn_len,
         CAUSAL=causal,
         HAS_MULTIPLE_TARGETS=has_multiple_targets,
-        IS_DELTA_Q=False,
+        IS_DELTA_Q=IS_DELTA_Q,
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         BLOCK_D_Q=DimQ,
         BLOCK_D_V=DimV,
@@ -1007,6 +1042,9 @@ def triton_hstu_attention_fwd(
         HAS_MAX_ATTN_LEN=has_max_attn_len,
         HAS_SORT_BY_LENGTH_INDICES=has_sort_by_length_indices,
     )
+
+    # print(f"_hstu_attn_fwd.best_config = {_hstu_attn_fwd.best_config}")
+
     return out
 
 
