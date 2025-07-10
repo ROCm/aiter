@@ -24,7 +24,7 @@ def mha_set_use_fused_bwd_kernel(value: bool):
     _USE_FUSED_BWD_KERNEL = value
 
 
-_USE_INT64_STRIDES = False
+_USE_INT64_STRIDES = True
 
 
 def mha_set_use_int64_strides(value: bool):

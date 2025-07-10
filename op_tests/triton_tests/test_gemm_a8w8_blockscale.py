@@ -74,6 +74,7 @@ def get_x_vals():
         (159, 17389, 597),
         (16, 576, 7168),
     ]
+    x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
 

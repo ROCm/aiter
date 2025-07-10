@@ -497,7 +497,7 @@ def gemm_afp4wfp4(
 
     Key parameters:
     - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (K, N).
+    - W: Matrix W with shape (N, K).
     - X_scales: Matrix with shape (M, K // 32)
     - W_scales: Matrix with shape (N, K // 32)
 
@@ -506,7 +506,10 @@ def gemm_afp4wfp4(
     """
 
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+
+    # Transpose w
+    w = w.T
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -615,7 +618,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     Key parameters:
     - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (K, N).
+    - W: Matrix W with shape (N, K).
     - X_scales: Matrix with shape (M // 32, K)
     - W_scales: Matrix with shape (N // 32, K)
 
@@ -626,7 +629,10 @@ def gemm_afp4wfp4_preshuffled_scales(
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+
+    # Transpose w
+    w = w.T
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
