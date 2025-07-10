@@ -69,7 +69,7 @@ d_quant = {
     "fp8_token": (aiter.QuantType.per_Token, dtypes.fp8),
     "fp8_1x128": (aiter.QuantType.per_1x128, dtypes.fp8),
     "i8_token": (aiter.QuantType.per_Token, dtypes.i8),
-    # 'fp4x2-1x32': (aiter.QuantType.per_1x32, dtypes.fp4x2),  # ?????
+    # 'fp4x2-1x32': (aiter.QuantType.per_1x32, dtypes.fp4x2),  # 注释的选项
 }
 list_dtype = ["fp16", "bf16"]
 l_n = [4096, 8192]
