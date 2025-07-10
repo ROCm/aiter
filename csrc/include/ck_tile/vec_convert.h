@@ -47,7 +47,7 @@ CK_TILE_DEVICE fp8x2_v amd_assembly_cvt_pk_fp8_f32(fp32_t a, fp32_t b)
 {
     int16x2_t c;
     static constexpr bool is_e4m3_fnuz =
-        constexpr(numeric_traits<fp8_t>::f8_interpret == fp8_interpretation::E4M3_FNUZ);
+        (numeric_traits<fp8_t>::f8_interpret == fp8_interpretation::E4M3_FNUZ);
     static constexpr float d = is_e4m3_fnuz ? 240.0f : 448.0f;
     static constexpr float e = is_e4m3_fnuz ? -240.0f : -448.0f;
     asm volatile("v_med3_f32 %1, %1, %3, %4\n"
