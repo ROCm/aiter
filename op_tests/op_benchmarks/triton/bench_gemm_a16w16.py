@@ -98,7 +98,7 @@ def run_benchmark(args):
         mem = mem_read + mem_write
 
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, c_dtype, y), warmup=25, rep=100  # noqa: E731
+            lambda: gemm_a16w16(x, w, c_dtype, y, use_origami=True), warmup=25, rep=100  # noqa: E731
         )
 
         # Return exactly one scalar depending on which metric is active

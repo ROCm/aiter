@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+import tritonblas
 
 
 @triton.heuristics(
@@ -189,6 +190,12 @@ def _get_config(
 
     return _get_config._config_dict["any"]
 
+# Function will behave like an LRU-Cache of heuristic results
+# Saves several microseconds for previously seen problems by not rerunning the heuristic unnecessarily
+@functools.lru_cache(maxsize=1024)
+def _make_matmul_selector(M: int, N: int, K: int, bitsA: int, bitsB: int, bitsC: int):
+    # Run Heuristic Results (Only if key has not been seen before)
+    return tritonblas.MatmulHeuristicResult(M, N, K, bitsA, bitsB, bitsC)
 
 def gemm_a8w8(
     x: torch.Tensor,
@@ -199,6 +206,7 @@ def gemm_a8w8(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    use_origami: Optional[bool] = None
 ):
     """
     Computes the 8 bit matmul Y = X x WT, applies a conversion scale and optionally adds a bias
@@ -232,6 +240,25 @@ def gemm_a8w8(
 
     if config is None:
         config = _get_config(M, N, K)
+        if use_origami:
+            bitsx = torch.finfo(x.dtype).bits
+            bitsw = torch.finfo(w.dtype).bits
+            bitsy = torch.finfo(y.dtype).bits
+            selector = _make_matmul_selector(M, N, K, bitsx, bitsw, bitsy)
+
+            BLK_M, BLK_N, BLK_K, gsize_m = selector.get_config()
+
+            #print(f"config={config}")
+            #print(f"BLK_M={BLK_M},BLK_N={BLK_N},BLK_K={BLK_K},gsize_m={gsize_m}")
+            config["BLOCK_SIZE_M"] = BLK_M
+            config["BLOCK_SIZE_N"] = BLK_N
+            config["BLOCK_SIZE_K"] = BLK_K
+            config["GROUP_SIZE_M"] = gsize_m 
+            config["num_stages"] = 2
+            config["num_warps"] = 8
+            config["waves_per_eu"] = 0
+            config["matrix_instr_nonkdim"] = 16
+            config["kpack"] = 1
 
     grid = (
         triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),

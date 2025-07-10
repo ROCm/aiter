@@ -95,7 +95,7 @@ def run_benchmark(args):
 
         ms = triton.testing.do_bench(
             lambda: gemm_a8w8(
-                x, weight, x_scale, w_scale, bias, c_dtype, y
+                x, weight, x_scale, w_scale, bias, c_dtype, y, use_origami=True
             ),  # noqa: E731
             warmup=25,
             rep=100,
