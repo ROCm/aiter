@@ -29,7 +29,7 @@ from aiter import ActivationType as ActivationType
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
-import time
+
 torch.set_default_device("cuda")
 torch.int4 = getattr(torch, "int4", torch.uint32)
 

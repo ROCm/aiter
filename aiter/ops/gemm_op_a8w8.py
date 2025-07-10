@@ -95,14 +95,22 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         ).to_dict("index")
     cu_num = get_cu_num()
     config = get_CKGEMM_config.ckgemm_dict.get((cu_num, M, N, K), None)
-    if config != None:
+    if config is not None:
         print(
             f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
         )
     return config
 
+
 @functools.lru_cache(maxsize=1024)
-def get_ASMGEMM_config(M: int, N: int, K: int, bias: bool, dtype: torch.dtype, tuned_file = "asm_a8w8_gemm.csv"):
+def get_ASMGEMM_config(
+    M: int,
+    N: int,
+    K: int,
+    bias: bool,
+    dtype: torch.dtype,
+    tuned_file="asm_a8w8_gemm.csv",
+):
     if not hasattr(get_ASMGEMM_config, "asmgemm_dict"):
         asmGemmDictDf = pd.read_csv(
             f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file}"
@@ -118,6 +126,7 @@ def get_ASMGEMM_config(M: int, N: int, K: int, bias: bool, dtype: torch.dtype, t
         print(f"shape M:{M}, N:{N}, K:{K} is tuned, in ASMGEMM !")
     return config
 
+
 def gemm_a8w8(
     XQ: Tensor,
     WQ: Tensor,
@@ -126,7 +135,7 @@ def gemm_a8w8(
     bias: Optional[Tensor] = None,
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
-    check=False
+    check=False,
 ):
     assert dtype in [
         dtypes.bf16,
@@ -136,12 +145,13 @@ def gemm_a8w8(
     n = WQ.shape[0]
     k = XQ.shape[-1]
     ck_config = get_CKGEMM_config(m, n, k)
-    if ck_config == None and dtype == dtypes.bf16 and bias is not None:
-        res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype)
+    if ck_config is None and dtype == dtypes.bf16 and bias is not None:
+        res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
         if res is not None:
             return res
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+
 
 def gemm_a8w8_ASM(
     XQ: Tensor,
@@ -183,6 +193,7 @@ def gemm_a8w8_ASM(
         return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, bias, splitK=splitK)
     return None
 
+
 def gemm_a8w8_CK(
     XQ: Tensor,
     WQ: Tensor,
@@ -200,8 +211,8 @@ def gemm_a8w8_CK(
     n = WQ.shape[0]
     k = XQ.shape[-1]
     ck_config = get_CKGEMM_config(m, n, k)
-    if splitK == None:
-        if ck_config != None:
+    if splitK is None:
+        if ck_config is not None:
             splitK = ck_config["splitK"]
         else:
             splitK = 0

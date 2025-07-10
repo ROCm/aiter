@@ -47,10 +47,6 @@ def gemm_a4w4(
     This function is a wrapper for the A4W4 GEMM kernel.
     It is used to perform matrix multiplication with 4-bit quantization.
     """
-
-    # Get the number of compute units
-    cu_num = get_cu_num()
-
     # Load the A4W4 GEMM kernel
     m = A.shape[0]
     n = B.shape[0]
@@ -87,7 +83,8 @@ def gemm_a4w4_blockscale(
     w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
     splitK: Optional[int] = 0,
-) -> torch.Tensor:...
+) -> torch.Tensor: ...
+
 
 @compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
 def gemm_a4w4_blockscale_tune(
