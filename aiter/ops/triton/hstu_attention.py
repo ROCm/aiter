@@ -976,7 +976,7 @@ def triton_hstu_attention_fwd(
 
     Returns:
     - Y: output with the shape (L, H, D).
-    """    
+    """
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
     L, H, DimQ = q.shape
@@ -1109,7 +1109,7 @@ def triton_hstu_attention_bwd(
 
     Returns:
     - dq, dk, dv: gradients of q, k, and v
-    """    
+    """
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
