@@ -55,6 +55,8 @@ struct __attribute__((packed)) KernelArgs
     p3 _p21;
     unsigned int stride_ScaleB1;
     p3 _p22;
+    unsigned int log2_k_split;
+    // p3 _p23;
 };
 
 // A4W4 asm gemm kernel
@@ -65,9 +67,11 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                             torch::Tensor& B_scale, // B_scale:[N, K/32] e8m0 paded
                             torch::Tensor& out,     // Out:[M, N] bf16
                             torch::Tensor& bias,    // bias:[M, N] f32
-                            std::optional<float> alpha      = 1.0,
-                            std::optional<float> beta       = 0.0,
-                            std::optional<bool> bpreshuffle = true)
+                            std::optional<float> alpha               = 1.0,
+                            std::optional<float> beta                = 0.0,
+                            std::optional<bool> bpreshuffle          = true,
+                            std::optional<unsigned int> log2_k_split = 0)
+
 {
     TORCH_CHECK(
         out.dtype() == torch::ScalarType::BFloat16, __func__, " only support BFloat16 output now!");
@@ -81,15 +85,15 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     args.ptr_A      = (void*)A.data_ptr();
     args.ptr_B      = (void*)B.data_ptr();
 
-    args.alpha     = alpha.value();
-    args.beta      = beta.value();
-    args.stride_C0 = out.stride(0);
-    args.stride_A0 = A.stride(0) * 2; // always fp4_x2
-    args.stride_B0 = B.stride(0) * 2; // always fp4_x2
-    args.M         = Mdim;
-    args.N         = Ndim;
-    args.K         = Kdim;
-
+    args.alpha          = alpha.value();
+    args.beta           = beta.value();
+    args.stride_C0      = out.stride(0);
+    args.stride_A0      = A.stride(0) * 2; // always fp4_x2
+    args.stride_B0      = B.stride(0) * 2; // always fp4_x2
+    args.M              = Mdim;
+    args.N              = Ndim;
+    args.K              = Kdim;
+    args.log2_k_split   = log2_k_split.value();
     args.ptr_ScaleA     = (void*)A_scale.data_ptr();
     args.ptr_ScaleB     = (void*)B_scale.data_ptr();
     args.stride_ScaleA0 = A_scale.stride(0);
@@ -100,23 +104,52 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
     // TODO should get from kernel
     int tg_group_size = 32;
-    int SUBM          = 256;
-    int SUBN          = 256;
+    int SUBM          = 128; // 256;
+    int SUBN          = 512; // 256;
     int gdx           = (Ndim + SUBN - 1) / SUBN;
     int gdy           = (Mdim + SUBM - 1) / SUBM;
     int gdz           = 1;
+
+    if(log2_k_split.value() == 1)
+    {
+        int k_num = 1 << log2_k_split.value();
+        assert(Kdim % k_num == 0);
+        int k_per_tg = Kdim / k_num;
+        k_per_tg     = ((k_per_tg + 256 - 1) / 256) * 256;
+        gdz          = (Kdim + k_per_tg - 1) / k_per_tg;
+        // printf("Debug: Kdim %d, log2_k_split %d, k_per_tg %d, global_tg_z %d\n",
+        //        Kdim,
+        //        log2_k_split.value(),
+        //        k_per_tg,
+        //        gdz);
+        // printf("gdx:%d, gdy:%d, gdz:%d\n", gdx, gdy, gdz);
+        // printf("argsize: %zu\n", arg_size);
+    }
+
+    static AiterAsmKernel pro_noSplitK_impl("_ZN5aiter38f4gemm_outBF16_128x512_scale_B_ShuffleE",
+                                            "f4gemm/f4gemm_outBF16_128x512_scale_B_Shuffle.co");
+    static AiterAsmKernel pro_SplitK_impl(
+        "_ZN5aiter45f4gemm_outBF16_128x512_scale_B_Shuffle_KSplitE",
+        "f4gemm/f4gemm_outBF16_128x512_scale_B_Shuffle_KSplit.co");
 
     static AiterAsmKernel noSplitK_impl("_ZN5aiter33f4gemm_bf16_per1x32Fp4_tn_256x256E",
                                         "f4gemm/f4gemm_bf16_per1x32Fp4_tn_256x256.co");
     static AiterAsmKernel noSplitK_bpreshuffle_impl(
         "_ZN5aiter45f4gemm_bf16_per1x32Fp4_tn_bpreshuffle_256x256E",
         "f4gemm/f4gemm_bf16_per1x32Fp4_tn_bpreshuffle_256x256.co");
-    AiterAsmKernel* impl_ptr = &noSplitK_bpreshuffle_impl;
+    // AiterAsmKernel* impl_ptr = &noSplitK_bpreshuffle_impl;
+    AiterAsmKernel* impl_ptr = &pro_noSplitK_impl;
+
     // if (ks > 0)
     //     impl_ptr = &splitK_impl;
-    if(bpreshuffle == false)
+    // if(bpreshuffle == false)
+    // {
+    //     impl_ptr = &noSplitK_impl;
+    // }
+
+    if(log2_k_split.value() == 1)
     {
-        impl_ptr = &noSplitK_impl;
+        impl_ptr = &pro_SplitK_impl;
     }
 
     impl_ptr->launch_kernel({&args,

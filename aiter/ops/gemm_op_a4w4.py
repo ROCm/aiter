@@ -8,7 +8,7 @@ from ..jit.core import (
     compile_ops,
 )
 from ..jit.utils.chip_info import get_cu_num
-
+import numpy as np
 
 def gemm_a4w4(
     A: Tensor,  # A:[M, K/2] f4x2
@@ -46,6 +46,7 @@ def gemm_a4w4_asm(
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
+    log2_k_split: Optional[np.uint32] = 0,
 ) -> torch.Tensor: ...
 
 

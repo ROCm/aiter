@@ -11,4 +11,5 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                             torch::Tensor& bias,    // bias:[M, N] f32
                             std::optional<float> alpha      = 1.0,
                             std::optional<float> beta       = 0.0,
-                            std::optional<bool> bpreshuffle = true);
+                            std::optional<bool> bpreshuffle = true,
+                            std::optional<unsigned int> log2_k_split = 0);
