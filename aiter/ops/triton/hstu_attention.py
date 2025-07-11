@@ -1160,8 +1160,6 @@ def triton_hstu_attention_bwd(
         **config,
     )
 
-    # print(f"_hstu_attn_bwd.best_config = {_hstu_attn_bwd.best_config}")
-
     return dq, dk, dv
 
 

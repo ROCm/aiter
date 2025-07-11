@@ -74,17 +74,14 @@ def run_benchmark(args):
                 line_names=line_names,
                 styles=[("green", "-")],
                 ylabel=ylabel,
-                plot_name=f"HSTU attention Benchmark, {ylabel}",
+                plot_name=f"HSTU attention Benchmark ({mode}), {ylabel}",
                 args={"metric": metric, "mode": mode},
             ))
 
     @triton.testing.perf_report(configs)
     def bench_hstu_attn(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim, metric, mode, provider):
-
-        # print(f"batch_size = {batch_size}, max_seq_len = {max_seq_len}, sparsity = {sparsity}, heads = {heads}, attn_dim = {attn_dim}, hidden_dim = {hidden_dim}")        
         type_str = args.dtype
         assert type_str in ['fp16', 'bf16'], "only fp16 or bf16 data types are supported!"
-        # metric = args.metric
         dropout_pr = 0.0
         target_size: int = 20
         sl_alpha: float = 2.0
@@ -126,8 +123,6 @@ def run_benchmark(args):
         q = switch_to_contiguous_if_needed(q)
         k = switch_to_contiguous_if_needed(k)
         v = switch_to_contiguous_if_needed(v)
-
-        # print(f"q_shape = {q.shape}")
 
         sanity_check_attention(
             max_seq_len=max_seq_len,
