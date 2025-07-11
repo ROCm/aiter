@@ -475,7 +475,7 @@ def test_mha_varlen(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
+@pytest.mark.parametrize("FUSED", [False, True]) 
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward(
     BATCH: int,
@@ -590,13 +590,13 @@ def test_mha_backward(
         )
     else:
         torch.testing.assert_close(
-            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
         )
         torch.testing.assert_close(
             triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
         )
         torch.testing.assert_close(
-            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
         )
 
 
@@ -612,7 +612,7 @@ def test_mha_backward(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("FP8", [False])
-@pytest.mark.parametrize("FUSED", [False, True])
+@pytest.mark.parametrize("FUSED", [False, True]) 
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward_varlen(
     BATCH: int,
@@ -629,6 +629,7 @@ def test_mha_backward_varlen(
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
+
     mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
     k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -766,11 +767,11 @@ def test_mha_backward_varlen(
         print(f"torch_dv.shape={torch_dv.shape} torch_dv={torch_dv}")
 
     torch.testing.assert_close(
-        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(
         triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
     torch.testing.assert_close(
-        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
