@@ -209,36 +209,38 @@ def test_hstu_attention(
         contextual_seq_len=0,
     )
 
-    fn = lambda: _AttentionFunction.apply(
-        max_seq_len,
-        alpha,
-        q,
-        k,
-        v,
-        seq_offsets,
-        causal,
-        num_targets,
-        0,  # max_attn_len,
-        0,  # contextual_seq_len
-        True,  # sort_by_length,
-    )
+    def triton_attn():
+        return _AttentionFunction.apply(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            num_targets,
+            0,  # max_attn_len,
+            0,  # contextual_seq_len
+            True,  # sort_by_length,
+        )
 
-    fn_ref = lambda: torch_hstu_attention(
-        max_seq_len,
-        alpha,
-        q,
-        k,
-        v,
-        seq_offsets,
-        causal,
-        dropout_pr=0.0,
-        training=False,
-        num_targets=num_targets,
-        max_attn_len=0,
-        contextual_seq_len=0,
-        min_full_attn_seq_len=0,
-    )
+    def torch_attn():
+        return torch_hstu_attention(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            dropout_pr=0.0,
+            training=False,
+            num_targets=num_targets,
+            max_attn_len=0,
+            contextual_seq_len=0,
+            min_full_attn_seq_len=0,
+        )
 
-    out = fn() * max_seq_len
-    out_ref = fn_ref() * max_seq_len
+    out = triton_attn() * max_seq_len
+    out_ref = torch_attn() * max_seq_len
     torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=0)
