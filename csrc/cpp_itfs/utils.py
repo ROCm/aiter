@@ -131,7 +131,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             sources = []
         if cxxflags is None:
             cxxflags = []
-        
+
         for include in includes + [f"{CK_DIR}/include"]:
             if os.path.isdir(include):
                 shutil.copytree(include, include_dir, dirs_exist_ok=True)
@@ -144,6 +144,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
                 shutil.copy(source, sub_build_dir)
         with open(f"{sub_build_dir}/{folder}.cpp", "w") as f:
             f.write(src_file)
+
         sources += [f"{folder}.cpp"]
         cxxflags += [
             "-DUSE_ROCM",
@@ -193,13 +194,15 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         subprocess.run(
             f"cd {sub_build_dir} && make build -j{len(sources)}", shell=True, check=True
         )
-    
+
     def final_func():
         logger.info(
             f"finish build {sub_build_dir}, cost {time.perf_counter()-start_ts:.8f}s"
         )
-    
-    main_func = partial(main_func, includes=includes, sources=sources, cxxflags=cxxflags)
+
+    main_func = partial(
+        main_func, includes=includes, sources=sources, cxxflags=cxxflags
+    )
 
     mp_lock(lock_path=lock_path, main_func=main_func, final_func=final_func)
 
