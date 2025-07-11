@@ -1,5 +1,4 @@
 import pytest
-import os
 import torch
 from typing import Optional
 
@@ -78,7 +77,6 @@ def sanity_check_attention(
     max_attn_len: Optional[int] = None,
     contextual_seq_len: int = 0,
 ) -> None:
-    Z = seq_offsets.numel() - 1
     _, H, _ = q.shape
     torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
     torch._assert(q.dim() == 3, "q must be 3-D")

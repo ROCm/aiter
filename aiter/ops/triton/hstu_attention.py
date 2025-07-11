@@ -32,7 +32,6 @@ from aiter.ops.triton.utils.common_utils import (
 )
 
 import json
-import os
 
 try:
     from triton.language.extra.libdevice import (

@@ -93,7 +93,6 @@ def qkv_to_padded_dense(
     N: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     L, H, D = q.shape
-    V = v.shape[2]
     padded_q = (
         pad_sequence(q.reshape(L, H * D), seq_offsets, N, 0.0)
         .view(-1, N, H, D)
