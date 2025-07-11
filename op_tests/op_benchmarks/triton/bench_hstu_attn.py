@@ -166,34 +166,43 @@ def run_benchmark(args):
             contextual_seq_len=0,
         )
 
-        fn = lambda: _AttentionFunction.apply(
-            max_seq_len,
-            alpha,
-            q,
-            k,
-            v,
-            seq_offsets,
-            causal,
-            num_targets,
-            0,  # max_attn_len,
-            0,  # contextual_seq_len
-            True,  # sort_by_length,
-        )
+        def attn_fwd():
+            return _AttentionFunction.apply(
+                max_seq_len,
+                alpha,
+                q,
+                k,
+                v,
+                seq_offsets,
+                causal,
+                num_targets,
+                0,  # max_attn_len,
+                0,  # contextual_seq_len
+                True,  # sort_by_length,
+            )
 
-        if mode == "bwd":
+        if mode == "fwd":
+            ms = triton.testing.do_bench(
+                attn_fwd,
+                warmup=25,
+                rep=100,
+            )
+        else:
             q.requires_grad_(True)
             k.requires_grad_(True)
             v.requires_grad_(True)
 
-            o = fn()
+            o = attn_fwd()
             do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
 
-        ms = triton.testing.do_bench(
-            fn,
-            warmup=25,
-            rep=100,
-        )
+            def attn_bwd():
+                return o.backward(do, retain_graph=True)
+
+            ms = triton.testing.do_bench(
+                attn_bwd,
+                warmup=25,
+                rep=100,
+            )
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
