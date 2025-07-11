@@ -53,21 +53,33 @@ def run_benchmark(args):
 
     line_names = ['Triton']
     line_vals = ['triton']
+    modes = [args.mode]
+    if args.mode == "both":
+        modes = ['fwd', 'bwd']
 
-    benchmark = triton.testing.Benchmark(
-        x_names=x_names,
-        x_vals=x_val_list,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=[("green", "-")],
-        ylabel=ylabel,
-        plot_name=f"HSTU attention Benchmark, {ylabel}",
-        args={"metric": args.metric},
-    )
+    configs = []
+    for mode in modes:
+        metric = args.metric
+        # backward only support time metric
+        if mode == "bwd":
+            metric = "time"
+            ylabel = 'Time (ms)'
 
-    @triton.testing.perf_report([benchmark])
-    def bench_hstu_attn(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim, metric, provider):
+        configs.append(
+            triton.testing.Benchmark(
+                x_names=x_names,
+                x_vals=x_val_list,
+                line_arg="provider",
+                line_vals=line_vals,
+                line_names=line_names,
+                styles=[("green", "-")],
+                ylabel=ylabel,
+                plot_name=f"HSTU attention Benchmark, {ylabel}",
+                args={"metric": metric, "mode": mode},
+            ))
+
+    @triton.testing.perf_report(configs)
+    def bench_hstu_attn(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim, metric, mode, provider):
 
         # print(f"batch_size = {batch_size}, max_seq_len = {max_seq_len}, sparsity = {sparsity}, heads = {heads}, attn_dim = {attn_dim}, hidden_dim = {hidden_dim}")        
         type_str = args.dtype
@@ -144,6 +156,15 @@ def run_benchmark(args):
             True,  # sort_by_length,
         )
 
+        if mode == "bwd":
+            q.requires_grad_(True)
+            k.requires_grad_(True)
+            v.requires_grad_(True)
+
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+
         ms = triton.testing.do_bench(fn, warmup=25, rep=100,)
 
         # Return exactly one scalar depending on which metric is active
@@ -219,6 +240,14 @@ def parse_args():
         choices=["time", "throughput", "bandwidth"],
         default="throughput",
         help="metric to plot",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="fwd",
+        choices=["fwd", "bwd", "both"],
+        help="indicate run forward, backward, or both",
     )
 
     parser.add_argument(

@@ -510,7 +510,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
         pos_offs_m_minus_n = tl.where(
             pos_offs_m_minus_n > 0, pos_offs_m_minus_n, -pos_offs_m_minus_n
         )
-    invalid_mask_trans = invalid_mask_trans or (pos_offs_m_minus_n > 0)
+    invalid_mask_trans = invalid_mask_trans | (pos_offs_m_minus_n > 0)
     if HAS_MAX_ATTN_LEN:
         invalid_mask_trans = invalid_mask_trans and pos_offs_m_minus_n <= max_attn_len
     if HAS_CONTEXTUAL_SEQ_LEN:
@@ -774,16 +774,16 @@ def _get_bw_configs() -> List[triton.Config]:
     return configs
 
 
-@triton.autotune(
-    configs=_get_bw_configs(),
-    key=[
-        "AUTOTUNE_Z",
-        "H",
-        "AUTOTUNE_MAX_SEQ_LEN",
-        "DimQ",
-        "DimV",
-    ],
-)
+# @triton.autotune(
+#     configs=_get_bw_configs(),
+#     key=[
+#         "AUTOTUNE_Z",
+#         "H",
+#         "AUTOTUNE_MAX_SEQ_LEN",
+#         "DimQ",
+#         "DimV",
+#     ],
+# )
 @triton.jit
 def _hstu_attn_bwd(  # noqa C901
     Q,
@@ -934,7 +934,7 @@ def _hstu_attn_bwd(  # noqa C901
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config(
+def _get_fwd_config(
     AUTOTUNE_Z: int,
     H: int,
     AUTOTUNE_MAX_SEQ_LEN: int,
@@ -943,12 +943,12 @@ def _get_config(
     DeltaSize: int,
     IS_DELTA_Q: bool,
 ):
-    if not hasattr(_get_config, "_config_dict"):
+    if not hasattr(_get_fwd_config, "_config_dict"):
         dev = arch_info.get_device()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_FWD.json"
         with open(fpath, "r") as file:
             config = json.load(file)
-        _get_config._config_dict = config
+        _get_fwd_config._config_dict = config
 
     if AUTOTUNE_Z < 512:
         batch_key = "small_batch" 
@@ -957,7 +957,7 @@ def _get_config(
     else:
         batch_key = "large_batch"
 
-    return _get_config._config_dict[batch_key]
+    return _get_fwd_config._config_dict[batch_key]
 
 
 def triton_hstu_attention_fwd(
@@ -991,7 +991,7 @@ def triton_hstu_attention_fwd(
     IS_DELTA_Q = False
 
     if config is None:
-        config = _get_config(AUTOTUNE_Z, H, max_seq_len, DimQ, DimV, DeltaSize, IS_DELTA_Q)
+        config = _get_fwd_config(AUTOTUNE_Z, H, max_seq_len, DimQ, DimV, DeltaSize, IS_DELTA_Q)
 
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_M"]),
@@ -1040,6 +1040,29 @@ def triton_hstu_attention_fwd(
     return out
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_bwd_config(
+    AUTOTUNE_Z: int,
+    H: int,
+    AUTOTUNE_MAX_SEQ_LEN: int,
+    DimQ: int,
+    DimV: int,
+):
+    if not hasattr(_get_bwd_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/hstu_attn/{dev}-HSTU_ATTN_BWD.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_bwd_config._config_dict = config
+
+    if AUTOTUNE_Z < 512:
+        batch_key = "small_batch" 
+    else:
+        batch_key = "large_batch"
+
+    return _get_bwd_config._config_dict[batch_key]
+
+
 def triton_hstu_attention_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -1056,6 +1079,7 @@ def triton_hstu_attention_bwd(
     causal: float,
     contextual_seq_len: int,
     sort_by_length_indices: Optional[torch.Tensor],
+    config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
@@ -1066,6 +1090,12 @@ def triton_hstu_attention_bwd(
     Z = seq_offsets.numel() - 1
     _, H, DimQ = q.shape
     _, _, DimV = v.shape
+
+    max_seq_len = autotune_max_seq_len(N)
+    AUTOTUNE_Z = prev_power_of_2(Z)
+    if config is None:
+        config = _get_bwd_config(AUTOTUNE_Z, H, max_seq_len, DimQ, DimV)
+
     grid = lambda meta: (  # noqa E731
         Z * H,
         (triton.cdiv(N, meta["BLOCK_N"]) if meta["SEQUENCE_PARALLEL"] else 1),
@@ -1078,7 +1108,11 @@ def triton_hstu_attention_bwd(
         dtype=torch.int32,
         device=q.device,
     )
-    AUTOTUNE_Z = prev_power_of_2(Z)
+
+    dq.zero_()
+    if config["SEQUENCE_PARALLEL"] == 1:
+        lock.zero_()
+
     _hstu_attn_bwd[grid](
         Q=q,
         K=k,
@@ -1123,7 +1157,10 @@ def triton_hstu_attention_bwd(
         BLOCK_D_Q=DimQ,
         BLOCK_D_V=DimV,
         HAS_SORT_BY_LENGTH_INDICES=sort_by_length_indices is not None,
+        **config,
     )
+
+    # print(f"_hstu_attn_bwd.best_config = {_hstu_attn_bwd.best_config}")
 
     return dq, dk, dv
 
