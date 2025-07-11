@@ -22,7 +22,7 @@ def get_gfx():
                 if "gfx" in line.lower():
                     return line.split(":")[-1].strip()
         except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rcominfo failed {str(e)}")
+            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
     return gfx
@@ -46,7 +46,7 @@ def get_cu_num():
                         gpu_compute_units.append(int(match.group(1)))
                     break
     except Exception as e:
-        raise RuntimeError(f"Get GPU Compute Unit from rcominfo failed {str(e)}")
+        raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
     assert len(set(gpu_compute_units)) == 1
     return gpu_compute_units[0]
 

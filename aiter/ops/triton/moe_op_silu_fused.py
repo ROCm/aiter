@@ -45,8 +45,7 @@ def moe_set_quant_func(func):
 
 @triton.heuristics(
     {
-        "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
 @triton.jit
@@ -90,13 +89,13 @@ def _fused_moe_silu_kernel_gptq_awq(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
-    GRID_MN: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -128,11 +127,17 @@ def _fused_moe_silu_kernel_gptq_awq(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     NUM_XCDS: tl.constexpr = 8
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+
+    GRID_MN = num_pid_n * num_pid_m
+    if pid < GRID_MN:
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    else:
+        return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
@@ -141,9 +146,6 @@ def _fused_moe_silu_kernel_gptq_awq(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
@@ -223,12 +225,17 @@ def _fused_moe_silu_kernel_gptq_awq(
             k_mask = None
             k_other = None
 
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs)
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+
         if use_int4_w4a16:
             b = (b >> b_shifter) & 0xF
 
@@ -298,6 +305,11 @@ def _fused_moe_silu_kernel_gptq_awq(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
+@triton.heuristics(
+    {
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
+    }
+)
 @triton.jit
 def _fused_moe_persistent_silu_kernel_gptq_awq(
     # Pointers to matrices
@@ -339,6 +351,7 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     NUM_SMS: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
@@ -378,8 +391,6 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
     # This is done in a grouped ordering to promote L2 data reuse.
     start_pid = tl.program_id(axis=0)
     NUM_XCDS: tl.constexpr = 8
-    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
-    # The new pid logic has better affinity with the xcd remapping
     # Load tile-invariant runtime constant
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -458,12 +469,17 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
                 k_mask = None
                 k_other = None
 
-            a = tl.load(
-                a_ptrs,
-                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-                other=0.0,
-            )
-            b = tl.load(b_ptrs)
+            if EVEN_K:
+                a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+                b = tl.load(b_ptrs)
+            else:
+                a = tl.load(
+                    a_ptrs,
+                    mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                    other=0.0,
+                )
+                b = tl.load(b_ptrs)
+
             if use_int4_w4a16:
                 b = (b >> b_shifter) & 0xF
 
@@ -538,8 +554,7 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
 
 @triton.heuristics(
     {
-        "GRID_MN": lambda args: triton.cdiv(args["EM"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"])
+        "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
     }
 )
 @triton.jit
@@ -583,12 +598,12 @@ def _fused_moe_silu_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
-    GRID_MN: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -620,11 +635,17 @@ def _fused_moe_silu_kernel(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
+    num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     NUM_XCDS: tl.constexpr = 8
-    pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+
+    GRID_MN = num_pid_n * num_pid_m
+    if pid < GRID_MN:
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS)
+    else:
+        return  # rest of the tiles are dummy paddings
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
     # ----------------------------------------------------------
@@ -633,9 +654,6 @@ def _fused_moe_silu_kernel(
     # and accumulate
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
@@ -706,12 +724,16 @@ def _fused_moe_silu_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if EVEN_K:
+            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -846,9 +868,6 @@ def _fused_moe_persistent_silu_kernel(
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
     NUM_XCDS: tl.constexpr = 8
-    # TODO the xcd remapping didn't seem to boost the perf. tianxing/xcd_remapping_persistent_new_logic has experiments on the new pid logic
-    # The new pid logic has better affinity with the xcd remapping
-
     # Load tile-invariant runtime constant
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -868,10 +887,10 @@ def _fused_moe_persistent_silu_kernel(
         pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
         # Compute the mask
-        offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
         token_mask = offs_token < num_valid_tokens
-        off_experts = tl.load(expert_ids_ptr + pid_m)
+        off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
 
         # silu ptrs
         BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
