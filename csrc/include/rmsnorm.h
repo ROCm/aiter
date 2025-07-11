@@ -25,26 +25,29 @@ void fused_add_rms_norm(torch::Tensor& input,
                         double epsilon);
 
 // ck
-torch::Tensor rmsnorm2d(torch::Tensor& input,
-                        torch::Tensor& weight,
-                        double epsilon,
-                        int use_model_sensitive_rmsnorm); // 0: for default; 1: for T5 liked
+torch::Tensor
+rmsnorm2d(torch::Tensor& input,
+          torch::Tensor& weight,
+          double epsilon,
+          int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
 
-void rmsnorm2d_with_add(torch::Tensor& out,          // [m ,n]
-                        torch::Tensor& input,        // [m ,n]
-                        torch::Tensor& residual_in,  // [m ,n]
-                        torch::Tensor& residual_out, // [m ,n]
-                        torch::Tensor& weight,       // [1 ,n]
-                        double epsilon,
-                        int use_model_sensitive_rmsnorm); // 0: for default; 1: for T5 liked
+void rmsnorm2d_with_add(
+    torch::Tensor& out,          // [m ,n]
+    torch::Tensor& input,        // [m ,n]
+    torch::Tensor& residual_in,  // [m ,n]
+    torch::Tensor& residual_out, // [m ,n]
+    torch::Tensor& weight,       // [1 ,n]
+    double epsilon,
+    int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
 
-void rmsnorm2d_with_smoothquant(torch::Tensor& out,    // [m ,n]
-                                torch::Tensor& input,  // [m ,n]
-                                torch::Tensor& xscale, // [1 ,n]
-                                torch::Tensor& yscale, // [m ,1]
-                                torch::Tensor& weight, // [1 ,n]
-                                double epsilon,
-                                int use_model_sensitive_rmsnorm); // 0: for default; 1: for T5 liked
+void rmsnorm2d_with_smoothquant(
+    torch::Tensor& out,    // [m ,n]
+    torch::Tensor& input,  // [m ,n]
+    torch::Tensor& xscale, // [1 ,n]
+    torch::Tensor& yscale, // [m ,1]
+    torch::Tensor& weight, // [1 ,n]
+    double epsilon,
+    int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
 
 void rmsnorm2d_with_add_smoothquant(
     torch::Tensor& out,          // [m ,n]
@@ -56,7 +59,7 @@ void rmsnorm2d_with_add_smoothquant(
     torch::Tensor& weight,       // [1 ,n]
     double epsilon,
     std::optional<torch::Tensor> out_before_quant,
-    int use_model_sensitive_rmsnorm); // 0: for default; 1: for T5 liked
+    int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
 
 void rmsnorm2d_with_dynamicquant(
     torch::Tensor& out,    // [m ,n]
@@ -64,7 +67,7 @@ void rmsnorm2d_with_dynamicquant(
     torch::Tensor& yscale, // [m ,1]
     torch::Tensor& weight, // [1 ,n]
     double epsilon,
-    int use_model_sensitive_rmsnorm); // 0: for default; 1: for T5 liked
+    int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
 
 void rmsnorm2d_with_add_dynamicquant(
     torch::Tensor& out,          // [m ,n]
@@ -74,4 +77,4 @@ void rmsnorm2d_with_add_dynamicquant(
     torch::Tensor& yscale,       // [m ,1]
     torch::Tensor& weight,       // [1 ,n]
     double epsilon,
-    int use_model_sensitive_rmsnorm); // 0: for default; 1: for T5 liked
+    int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
