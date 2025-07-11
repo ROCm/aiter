@@ -34,7 +34,7 @@ def test_moe_sorting_naive(
     sorted_expert_ids = torch.full(
         (max_num_m_blocks,), -1, dtype=dtypes.i32, device=device
     )
-    num_tokens_post_pad = torch.empty((1), dtype=dtypes.i32, device=device)
+    num_tokens_post_pad = torch.empty((2), dtype=dtypes.i32, device=device)
 
     sorted_ids_begin = 0
     sorted_expert_ids_begin = 0
@@ -60,6 +60,7 @@ def test_moe_sorting_naive(
         sorted_expert_ids_begin = sorted_expert_ids_begin + sorted_expert_ids_num
 
     num_tokens_post_pad[0] = sorted_ids_begin
+    num_tokens_post_pad[1] = topk_ids.shape[0]
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
@@ -121,7 +122,7 @@ def test_moe_sorting(
         msg="num_tokens_post_padded",
     )
     mask = sorted_ids_a != (topk << 24 | token)
-    num_tokens_post_pad = num_tokens_post_padded_a.item()
+    num_tokens_post_pad = num_tokens_post_padded_a[0].item()
     checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],

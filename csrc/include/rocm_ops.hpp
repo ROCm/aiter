@@ -848,7 +848,12 @@
           py::arg("group_size")    = 32,                                   \
           py::arg("shuffle_scale") = true,                                 \
           py::arg("num_rows")        = std::nullopt,                       \
-          py::arg("num_rows_factor") = 1);
+          py::arg("num_rows_factor") = 1);                                 \
+    m.def("partial_transpose",                                             \
+          &aiter::partial_transpose,                                       \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("num_rows"));
 
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \

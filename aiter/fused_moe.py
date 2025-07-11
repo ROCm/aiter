@@ -250,6 +250,10 @@ def fused_moe_1stage(
                 a1_scale is not None or quant_type == QuantType.No
             ), "a1_scale must be provided for quantized input for fused_moe"
             a1 = hidden_states
+            if quant_type == QuantType.per_1x128:
+                scale_t = torch.empty_like(a1_scale)
+                aiter.partial_transpose(scale_t, a1_scale, num_rows=num_local_tokens)
+                a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
         E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)

@@ -385,3 +385,11 @@ def dynamic_per_group_scaled_quant_fp4(
     Only support group_size in [32, 64, 128]
     """
     ...
+
+
+@compile_ops("module_quant")
+def partial_transpose(
+    out: Tensor,
+    input: Tensor,
+    num_rows: Tensor,
+): ...

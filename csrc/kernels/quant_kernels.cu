@@ -3,6 +3,7 @@
 
 #include "dispatch_utils.h"
 #include "hip_reduce.h"
+#include "aiter_hip_common.h"
 #include "quant_common.cuh"
 #include "rocprim/rocprim.hpp"
 #include "vec_convert.h"
@@ -767,5 +768,135 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
 #else
     TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
 #endif
+}
+
+template <typename DTYPE, int BLOCK_SIZE = 256, int thread_data_size = 4, int MAX_ITERS = 10000>
+__global__ void partial_transpose_kernel(DTYPE* __restrict__ out,
+                                         DTYPE* __restrict__ input,
+                                         const int* __restrict__ num_rows,
+                                         const int cols)
+{
+    using vec_i = ck_tile::vec_t<DTYPE, thread_data_size>;
+    int GRID_SIZE = gridDim.x;
+    int ori_rows = *num_rows;
+    int thread_per_row = (cols + thread_data_size - 1) / thread_data_size;
+    auto const* ptr_i = reinterpret_cast<DTYPE const*>(input);
+    static constexpr int32_t ooba_i = 4 / sizeof(DTYPE);
+    const int32_t oob_i             = (ori_rows * cols + ooba_i - 1) / ooba_i * ooba_i;
+    auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
+    buffer_i.init_raw();
+    for(int i = 0; i < MAX_ITERS; i++)
+    {
+        int64_t y = i * GRID_SIZE * BLOCK_SIZE + blockIdx.x * BLOCK_SIZE + threadIdx.x;
+        int x = y % thread_per_row * thread_data_size; 
+        y = y / thread_per_row;
+        if(y >= ori_rows)
+            return;
+        vec_i input_vecs = buffer_i.template get<vec_i>(y * cols + x, 0, true);
+        int64_t out_offset = x * ori_rows + y;
+        // printf("blockIdx: %d, threadIdx:%d, y: %d, x: %d, ori_rows: %d, cols: %d, val:%f\n", blockIdx.x, threadIdx.x, y, x, ori_rows, cols, ck_tile::type_convert<float>(input_vecs[0]));
+        for (int j = 0; j < thread_data_size; j++)
+        {
+            if((x + j) < cols)
+            {
+                out[out_offset + j * ori_rows] = input_vecs[j];
+            }
+        }
+    }
+}
+
+
+void partial_transpose(torch::Tensor& out,         // [rows, d]
+                       torch::Tensor const& input, // [rows, d]
+                       torch::Tensor const& num_rows)
+{
+    TORCH_CHECK(out.is_contiguous());
+    TORCH_CHECK(input.is_contiguous());
+
+    uint32_t num_cu = get_num_cu_func();
+    int const cols = input.size(-1);
+    int const rows = input.numel() / cols;
+    int32_t* num_rows_ptr = num_rows.data_ptr<int32_t>();
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    if (cols <= 1024)
+    {
+        const int BlockSize = 256;
+        const int GridSize = num_cu * 8; // Adjust as needed
+        const int thread_data_size = 1024 / BlockSize;
+
+        dim3 grid(GridSize);
+        dim3 block(BlockSize);
+
+        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size><<<grid, block, 0, stream>>>(
+                reinterpret_cast<input_dtype*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                num_rows_ptr,
+                cols);
+        });
+    }
+    else if (cols <= 2048)
+    {
+        const int BlockSize = 256; 
+        const int GridSize = num_cu * 4;
+        const int thread_data_size = 2048 / BlockSize;
+        
+        dim3 grid(GridSize);
+        dim3 block(BlockSize);
+
+        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size><<<grid, block, 0, stream>>>(
+                reinterpret_cast<input_dtype*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                num_rows_ptr,
+                cols);
+        });
+    }
+    else if (cols <= 4096)
+    {
+        const int BlockSize = 256; 
+        const int GridSize = num_cu * 2;
+        const int thread_data_size = 4096 / BlockSize;
+        
+        dim3 grid(GridSize);
+        dim3 block(BlockSize);
+
+        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size><<<grid, block, 0, stream>>>(
+                reinterpret_cast<input_dtype*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                num_rows_ptr,
+                cols);
+        });
+    }
+    else if (cols <= 8192)
+    {
+        const int BlockSize = 512; 
+        const int GridSize = num_cu;
+        const int thread_data_size = 8192 / BlockSize;
+
+        dim3 grid(GridSize);
+        dim3 block(BlockSize);
+
+        VLLM_DISPATCH_FLOATING_TYPES(input.scalar_type(), "partial_transpose_kernel", [&] {
+            using input_dtype = typename t2ck<scalar_t>::type;
+            aiter::partial_transpose_kernel<input_dtype, BlockSize, thread_data_size><<<grid, block, 0, stream>>>(
+                reinterpret_cast<input_dtype*>(out.data_ptr()),
+                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                num_rows_ptr,
+                cols);
+        });
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, " cols is not supported: ", cols);
+    }
+
 }
 } // namespace aiter

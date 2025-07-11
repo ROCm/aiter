@@ -238,11 +238,7 @@ class FMoeKernel
 int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& available_tiles)
 {
     // int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu   = dev_prop.multiProcessorCount;
+    uint32_t num_cu   = get_num_cu_func();
     uint32_t empty_cu = num_cu;
     uint32_t tg_num   = 0;
     uint32_t round    = 0xffffffff;
@@ -985,6 +981,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
                               ActivationType activation)
 {
     FMoeKernel* impl_ptr = nullptr;
+    uint32_t num_cu      = get_num_cu_func();
     int inter_dim        = down.size(2);
     int sub_X_cnt        = sorted_expert_ids.size(0);
     // int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
@@ -1005,9 +1002,9 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
             // static FMoeKernel impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256E",
             //                                 "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256.co",
             //                                 256);
-            static FMoeKernel impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256_psE",
+            static FMoeKernel impl_256_novs("_ZN5aiter42fmoe_fp8_blockscale_g1u1_novs_subGU_256_psE",
                                             "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256_ps.co",
-                                            256, 80);
+                                            256, num_cu);
             impl_ptr = &impl_256_novs;
         }
     }

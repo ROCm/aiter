@@ -62,6 +62,7 @@ void moe_sorting_fwd(torch::Tensor& topk_ids,          // [m, topk]
          unit_size,
          num_experts,
          topk,
-         static_cast<int64_t>(moe_buf.nbytes())},
+         static_cast<int>(moe_buf.size(-1)),
+         static_cast<int>(moe_buf.itemsize())},
         {stream});
 }

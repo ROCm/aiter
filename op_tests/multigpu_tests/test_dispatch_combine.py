@@ -12,9 +12,7 @@ import mori
 import multiprocessing as mp
 import functools
 from aiter import get_hip_quant
-from aiter.test_common import (
-    checkAllclose,
-)
+from aiter.test_common import checkAllclose, run_perftest
 
 
 def run_ref(
@@ -50,10 +48,9 @@ def run_ref(
             if quant_type != aiter.QuantType.per_128x128
             else aiter.QuantType.per_1x128
         )
-        if quant_type == aiter.QuantType.per_128x128:
-            quant_func = functools.partial(quant_func, transpose_scale=True)
         tokens_ep_qt, scale = quant_func(tokens_ep, quant_dtype=dtypes.fp8)
-        out = fused_moe(
+        out, us = run_perftest(
+            fused_moe,
             tokens_ep_qt,
             w1_ep[i],
             w2_ep[i],
@@ -67,6 +64,7 @@ def run_ref(
             a1_scale=scale,
             dtype=dtypes.bf16,
         )
+        print(f"rank {i} us={us:.4f}")
         # out_list.append(out)
         # return out_list
         ref[mask.any(1)] += out
@@ -106,10 +104,8 @@ def run_mori(
         if quant_type != aiter.QuantType.per_128x128
         else aiter.QuantType.per_1x128
     )
-    # tokens_qt, scale = quant_func(tokens, quant_dtype=dtypes.fp8)
-    tokens_qt, scale = (tokens, None)
+    tokens_qt, scale = quant_func(tokens, quant_dtype=dtypes.fp8)
 
-    # print(f"before init mori {scale.shape=} {tokens_qt.dtype=}")
     # init dist
     world_group = torch.distributed.group.WORLD
     assert world_group is not None
@@ -123,7 +119,12 @@ def run_mori(
         scale_dim=scale.shape[-1] if scale is not None else 0,
         scale_type_size=scale.dtype.itemsize if scale is not None else 0,
         max_token_type_size=dtype.itemsize,
-        max_num_inp_token_per_rank=128,
+        max_num_inp_token_per_rank=2
+        * 8192
+        * 1024
+        // tokens_qt.dtype.itemsize
+        // hdim
+        * 2,
         num_experts_per_rank=E // world_size,
         num_experts_per_token=topk,
     )
@@ -150,7 +151,8 @@ def run_mori(
 
     expert_mask = torch.zeros((E,), dtype=dtypes.i32, device=device)
     expert_mask[E // world_size * rankID : E // world_size * (rankID + 1)] = 1
-    out = fused_moe(
+    out, us = run_perftest(
+        fused_moe,
         dispatch_output,
         w1,
         w2,
@@ -164,6 +166,7 @@ def run_mori(
         quant_type=quant_type,
         dtype=dtype,
     )
+    print(f"rank {rankID} us={us:.4f}")
 
     # aiter.destroy_dist_env()
     # return out[:src_token_num].cpu()
