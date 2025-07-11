@@ -31,7 +31,7 @@ def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
 
 @perftest()
 def run_gemm_ck_bpreshuffle(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+    return aiter.gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, None, dtype)
 
 
 @perftest()
@@ -76,7 +76,15 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
 
     avg_d = None
     err_d = None
-    if dtype == dtypes.bf16 and quantDtype == dtypes.i8 and bias is not None:
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    if (
+        dtype == dtypes.bf16
+        and quantDtype == dtypes.i8
+        and bias is not None
+        and cu_num == 80
+    ):
         weightshuffle_asm = shuffle_weight(weight, layout=(32, 16))
         bias_f32 = bias.to(dtypes.fp32)
         d, avg_d = run_gemm_asm(x, weightshuffle_asm, x_scale, w_scale, bias_f32, dtype)

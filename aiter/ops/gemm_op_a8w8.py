@@ -6,6 +6,8 @@ from torch import Tensor
 from typing import Optional
 import functools
 import pandas as pd
+import aiter
+from aiter import logger
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
@@ -96,7 +98,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     cu_num = get_cu_num()
     config = get_CKGEMM_config.ckgemm_dict.get((cu_num, M, N, K), None)
     if config is not None:
-        print(
+        logger.info(
             f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
         )
     return config
@@ -123,7 +125,7 @@ def get_ASMGEMM_config(
         ).to_dict("index")
     config = get_ASMGEMM_config.asmgemm_dict.get((M, N, K, bias, str(dtype)), None)
     if config is not None:
-        print(f"shape M:{M}, N:{N}, K:{K} is tuned, in ASMGEMM !")
+        logger.info(f"shape M:{M}, N:{N}, K:{K} is tuned, in ASMGEMM !")
     return config
 
 
@@ -135,22 +137,12 @@ def gemm_a8w8(
     bias: Optional[Tensor] = None,
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
-    check=False,
 ):
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    m = XQ.shape[0]
-    n = WQ.shape[0]
-    k = XQ.shape[-1]
-    ck_config = get_CKGEMM_config(m, n, k)
-    if ck_config is None and dtype == dtypes.bf16 and bias is not None:
-        res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
-        if res is not None:
-            return res
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias, dtype, splitK)
 
 
 def gemm_a8w8_ASM(
@@ -206,7 +198,7 @@ def gemm_a8w8_CK(
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -221,7 +213,13 @@ def gemm_a8w8_CK(
 
 
 def gemm_a8w8_bpreshuffle(
-    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=torch.float16
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    bias: Optional[Tensor] = None,
+    dtype=torch.float16,
+    check=False,
 ):
     assert dtype in [
         torch.bfloat16,
@@ -230,7 +228,17 @@ def gemm_a8w8_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
-    get_CKGEMM_config(m, n, k, "a8w8_bpreshuffle_tuned_gemm.csv")
+
+    ck_config = get_CKGEMM_config(m, n, k, "a8w8_bpreshuffle_tuned_gemm.csv")
+    if (
+        ck_config is None
+        and dtype == dtypes.bf16
+        and bias is not None
+        and WQ.dtype != dtypes.i8
+    ):
+        res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
+        if res is not None:
+            return res
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 

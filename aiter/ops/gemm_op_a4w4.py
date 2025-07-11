@@ -4,6 +4,8 @@
 import torch
 from torch import Tensor
 from typing import Optional
+import aiter
+from aiter import logger
 from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
@@ -25,7 +27,7 @@ def get_CKGEMM_config(M: int, N: int, K: int):
     cu_num = get_cu_num()
     config = get_CKGEMM_config.ckgemm_dict.get((cu_num, M, N, K), None)
     if config is not None:
-        print(
+        logger.info(
             f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
         )
     return config
@@ -37,7 +39,7 @@ def gemm_a4w4(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
@@ -93,6 +95,6 @@ def gemm_a4w4_blockscale_tune(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    kernelId: int = 0,
+    kernelId: int,
     splitK: int = 0,
 ) -> torch.Tensor: ...
