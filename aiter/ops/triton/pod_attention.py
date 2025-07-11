@@ -1,7 +1,5 @@
 import torch
 import triton
-import random
-import triton
 import triton.language as tl
 
 import importlib.util

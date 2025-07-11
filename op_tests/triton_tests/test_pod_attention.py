@@ -1,9 +1,6 @@
 import sys
-import numpy as np
 import pytest
 import torch
-import triton
-import triton.profiler as proton
 
 from aiter.ops.triton.pod_attention import pod_attention
 
