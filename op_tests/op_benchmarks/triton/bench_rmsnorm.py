@@ -4,7 +4,10 @@ import torch
 import triton
 from aiter.ops.triton.rmsnorm import rms_norm
 from op_tests.triton_tests.test_rmsnorm import generate_rmsnorm_inputs
-from utils.benchmark_utils import get_model_configs, get_available_models
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+)
 
 
 def model_benchmark_shapes(args):
@@ -85,7 +88,8 @@ def run_benchmark(args):
         mem_write = M * N * x.element_size()  # output
         mem = mem_read + mem_write
 
-        ms = triton.testing.do_bench(lambda: rms_norm(x, w), warmup=25, rep=100)
+        eps = 1e-6
+        ms = triton.testing.do_bench(lambda: rms_norm(x, w, eps), warmup=25, rep=100)
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
