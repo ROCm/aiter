@@ -25,6 +25,12 @@ import triton.language as tl
 import functools
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.common_utils import (
+    prev_power_of_2,
+    autotune_max_seq_len,
+    switch_to_contiguous_if_needed,
+)
+
 import json
 import os
 
@@ -43,34 +49,6 @@ except ImportError:
             fast_dividef,
             fast_expf,
         )  # @manual=//triton:triton
-
-STATIC_MAX_SEQ_LENS: List[int] = []
-USE_RUNTIME_MAX_SEQ_LEN: bool = False
-
-
-def prev_power_of_2(x: int) -> int:
-    out = triton.next_power_of_2(x)
-    return out // 2 if out > x else out
-
-
-def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
-    global USE_RUNTIME_MAX_SEQ_LEN
-
-    if USE_RUNTIME_MAX_SEQ_LEN:
-        return prev_power_of_2(runtime_max_seq_len)
-    else:
-        if STATIC_MAX_SEQ_LENS == []:
-            return 1
-        for max_len in STATIC_MAX_SEQ_LENS:
-            if max_len >= runtime_max_seq_len:
-                return max_len
-        return STATIC_MAX_SEQ_LENS[-1]
-
-
-def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
-    if x.stride(-1) == 1:
-        return x
-    return x.contiguous()
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -980,6 +958,25 @@ def triton_hstu_attention_fwd(
     sort_by_length_indices: Optional[torch.Tensor],
     config: Optional[dict] = None,
 ) -> torch.Tensor:
+    """
+    Computes HSTU attention fwd pass, compute the math dot(silu(dot(q * trans(k))) * v). inputs q, kv are of the jagged formats
+
+    Key parameters:
+    - N: max sequence length
+    - alpha: scale parameter to multiply output of first dot
+    - q: tensor with shape (L, H, D), L are sum of lengths of all sequences
+    - k: tensor with shape (L, H, D), L are sum of lengths of all sequences
+    - v: tensor with shape (L, H, D), L are sum of lengths of all sequences
+    - seq_offsets: tensor with shape (B + 1), indicates lengths of each sequences.
+    - causal: whether use causal mask.
+    - num_targets: number of targets.
+    - contextual_seq_len: contexual sequence length.
+    - sort_by_length_indices: indices of sequences sorted by lengths
+    - config: Optional, tuning configs to run the kernel
+
+    Returns:
+    - Y: output with the shape (L, H, D).
+    """    
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
     L, H, DimQ = q.shape
@@ -1089,6 +1086,30 @@ def triton_hstu_attention_bwd(
     sort_by_length_indices: Optional[torch.Tensor],
     config: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Computes HSTU attention bwd pass.
+
+    Key parameters:
+    - dout: tensor with shape (L, H, D)
+    - q: tensor with shape (L, H, D), L are sum of lengths of all sequences
+    - k: tensor with shape (L, H, D), L are sum of lengths of all sequences
+    - v: tensor with shape (L, H, D), L are sum of lengths of all sequences
+    - dq: tensor with shape (L, H, D), gradients of q
+    - dk: tensor with shape (L, H, D), gradients of k
+    - dv: tensor with shape (L, H, D), gradients of v
+    - seq_offsets: tensor with shape (B + 1), indicates lengths of each sequences.
+    - num_targets: number of targets.
+    - N: max sequence length
+    - alpha: scale parameter to multiply output of first dot
+    - max_attn_len: max attn length
+    - causal: whether use causal mask.
+    - contextual_seq_len: contexual sequence length.
+    - sort_by_length_indices: indices of sequences sorted by lengths
+    - config: Optional, tuning configs to run the kernel
+
+    Returns:
+    - dq, dk, dv: gradients of q, k, and v
+    """    
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
