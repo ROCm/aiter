@@ -1,4 +1,3 @@
-
 # Copyright © Advanced Micro Devices, Inc. All rights reserved.
 # Copyright (c) 2024, The vLLM team.
 #
@@ -30,14 +29,20 @@ import json
 import os
 
 try:
-    from triton.language.extra.libdevice import fast_dividef, fast_expf  # @manual=//triton:triton
+    from triton.language.extra.libdevice import (
+        fast_dividef,
+        fast_expf,
+    )  # @manual=//triton:triton
 except ImportError:
     try:
         # @manual=//triton:triton
         from triton.language.extra.hip.libdevice import fast_dividef, fast_expf
     except ImportError:
         # pyre-ignore[21]
-        from triton.language.math import fast_dividef, fast_expf  # @manual=//triton:triton
+        from triton.language.math import (
+            fast_dividef,
+            fast_expf,
+        )  # @manual=//triton:triton
 
 STATIC_MAX_SEQ_LENS: List[int] = []
 USE_RUNTIME_MAX_SEQ_LEN: bool = False
@@ -444,6 +449,7 @@ def _hstu_attn_fwd(  # noqa C901
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
     )
+
 
 @triton.jit
 def _hstu_attn_bwd_one_block(  # noqa C901
@@ -951,8 +957,8 @@ def _get_fwd_config(
         _get_fwd_config._config_dict = config
 
     if AUTOTUNE_Z < 512:
-        batch_key = "small_batch" 
-    elif AUTOTUNE_Z == 512: 
+        batch_key = "small_batch"
+    elif AUTOTUNE_Z == 512:
         batch_key = "batch_512"
     else:
         batch_key = "large_batch"
@@ -991,7 +997,9 @@ def triton_hstu_attention_fwd(
     IS_DELTA_Q = False
 
     if config is None:
-        config = _get_fwd_config(AUTOTUNE_Z, H, max_seq_len, DimQ, DimV, DeltaSize, IS_DELTA_Q)
+        config = _get_fwd_config(
+            AUTOTUNE_Z, H, max_seq_len, DimQ, DimV, DeltaSize, IS_DELTA_Q
+        )
 
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_M"]),
@@ -1056,7 +1064,7 @@ def _get_bwd_config(
         _get_bwd_config._config_dict = config
 
     if AUTOTUNE_Z < 512:
-        batch_key = "small_batch" 
+        batch_key = "small_batch"
     else:
         batch_key = "large_batch"
 
@@ -1215,9 +1223,7 @@ class _AttentionFunction(torch.autograd.Function):
 
     @staticmethod
     # pyre-ignore[14]
-    def backward(
-        ctx, dout: torch.Tensor
-    ) -> Tuple[
+    def backward(ctx, dout: torch.Tensor) -> Tuple[
         None,
         None,
         torch.Tensor,
