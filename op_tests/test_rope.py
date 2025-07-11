@@ -475,10 +475,16 @@ def rotate_half_gptj(x):
 
 
 def ref_rope_sbhd_fwd(
-    x_, freqs_, rotate_style, reuse_freqs_front_part, nope_first, simulate_cached=False
+    x_,
+    freqs_,
+    rotate_style,
+    reuse_freqs_front_part,
+    nope_first,
+    simulate_cached=False,
+    comp_with_fp32=False,
 ):
-    x = x_.to(dtype=torch.float32)
-    freqs = freqs_.to(dtype=torch.float32)
+    x = x_.to(dtype=torch.float32) if comp_with_fp32 else x_
+    freqs = freqs_.to(dtype=torch.float32) if comp_with_fp32 else freqs_
     rotate_half = (
         rotate_half_neox if rotate_style == RotateStyle.NEOX else rotate_half_gptj
     )
@@ -495,12 +501,12 @@ def ref_rope_sbhd_fwd(
             freqs = freqs.repeat_interleave(2, dim=-1)
     cos = (
         torch.cos(freqs).to(dtype=freqs_.dtype).to(dtype=torch.float32)
-        if simulate_cached
+        if simulate_cached and comp_with_fp32
         else torch.cos(freqs)
     )
     sin = (
         torch.sin(freqs).to(dtype=freqs_.dtype).to(dtype=torch.float32)
-        if simulate_cached
+        if simulate_cached and comp_with_fp32
         else torch.sin(freqs)
     )
     x_embed = (x * cos) + (rotate_half(x) * sin)
@@ -521,6 +527,7 @@ def ref_rope_thd_fwd(
     reuse_freqs_front_part,
     nope_first,
     simulate_cached=False,
+    comp_with_fp32=False,
 ):
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
     x_embed = torch.cat(
@@ -532,6 +539,7 @@ def ref_rope_thd_fwd(
                 reuse_freqs_front_part,
                 nope_first,
                 simulate_cached,
+                comp_with_fp32,
             )
             for xi in torch.split(x, seqlens)
         ]
@@ -583,10 +591,16 @@ transpose_output: {transpose_output}
     input_cached = input.clone().detach().requires_grad_(True)
 
     ref = ref_rope_sbhd_fwd(
-        input, freqs, rotate_style, reuse_freqs_front_part, nope_first, False
+        input, freqs, rotate_style, reuse_freqs_front_part, nope_first, False, True
     )
     ref_cached = ref_rope_sbhd_fwd(
-        input_cached, freqs, rotate_style, reuse_freqs_front_part, nope_first, True
+        input_cached,
+        freqs,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope_first,
+        True,
+        True,
     )
     ref.backward(grad)
     ref_cached.backward(grad)
@@ -681,16 +695,28 @@ transpose_output: {transpose_output}
     input_y_cached = input_y.clone().detach().requires_grad_(True)
 
     ref_x = ref_rope_sbhd_fwd(
-        input_x, freqs, rotate_style, reuse_freqs_front_part, nope_first, False
+        input_x, freqs, rotate_style, reuse_freqs_front_part, nope_first, False, True
     )
     ref_y = ref_rope_sbhd_fwd(
-        input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first, False
+        input_y, freqs, rotate_style, reuse_freqs_front_part, nope_first, False, True
     )
     ref_x_cached = ref_rope_sbhd_fwd(
-        input_x_cached, freqs, rotate_style, reuse_freqs_front_part, nope_first, True
+        input_x_cached,
+        freqs,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope_first,
+        True,
+        True,
     )
     ref_y_cached = ref_rope_sbhd_fwd(
-        input_y_cached, freqs, rotate_style, reuse_freqs_front_part, nope_first, True
+        input_y_cached,
+        freqs,
+        rotate_style,
+        reuse_freqs_front_part,
+        nope_first,
+        True,
+        True,
     )
     ref_x.backward(grad_x)
     ref_y.backward(grad_y)
@@ -830,6 +856,7 @@ transpose_output: {transpose_output}
         reuse_freqs_front_part,
         nope_first,
         True,
+        True,
     )
 
     cos = torch.cos(freqs)
@@ -903,6 +930,7 @@ transpose_output: {transpose_output}
         reuse_freqs_front_part,
         nope_first,
         True,
+        True,
     )
     ref_y = ref_rope_sbhd_fwd(
         input_y,
@@ -912,6 +940,7 @@ transpose_output: {transpose_output}
         rotate_style,
         reuse_freqs_front_part,
         nope_first,
+        True,
         True,
     )
 
@@ -1000,6 +1029,7 @@ nope_first: {nope_first}
             True,
             nope_first,
             True,
+            True,
         )
         ref_y = ref_rope_sbhd_fwd(
             input_y,
@@ -1009,6 +1039,7 @@ nope_first: {nope_first}
             rotate_style,
             True,
             nope_first,
+            True,
             True,
         )
         h_y = input_y.shape[2]
@@ -1166,6 +1197,7 @@ cu_seqlens: {cu_seqlens}
         reuse_freqs_front_part,
         nope_first,
         False,
+        True,
     )
     ref.backward(grad)
 
