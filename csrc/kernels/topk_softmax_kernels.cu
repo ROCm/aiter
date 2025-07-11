@@ -582,7 +582,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
                                      const bool need_renorm,
                                      cudaStream_t stream)
 {
-    static constexpr int WARPS_PER_TB = 4;
+    static constexpr int WARPS_PER_TB = 8;
     switch(num_experts)
     {
     case 1: LAUNCH_SOFTMAX(1, WARPS_PER_TB); break;
@@ -594,7 +594,7 @@ void topkGatingSoftmaxKernelLauncher(const DTYPE* gating_output,
     case 64: LAUNCH_SOFTMAX(64, WARPS_PER_TB); break;
     case 128: LAUNCH_SOFTMAX(128, WARPS_PER_TB); break;
     case 256: LAUNCH_SOFTMAX(256, WARPS_PER_TB); break;
-    case 512: LAUNCH_SOFTMAX(512, 1); break;
+    case 512: LAUNCH_SOFTMAX(512, 2); break;
     default: {
         TORCH_CHECK(
             softmax_workspace != nullptr,
