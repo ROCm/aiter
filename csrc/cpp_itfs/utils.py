@@ -85,13 +85,6 @@ def validate_and_update_archs():
     return archs
 
 
-def init_build_dir(dir):
-    if not os.path.exists(dir):
-        os.makedirs(dir)
-    else:
-        subprocess.run(f"rm -rf {dir}/*", shell=True)
-
-
 def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     if includes is None:
         includes = []
@@ -100,7 +93,6 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
     if cxxflags is None:
         cxxflags = []
     sub_build_dir = os.path.join(BUILD_DIR, folder)
-    init_build_dir(sub_build_dir)
     include_dir = f"{sub_build_dir}/include"
     os.makedirs(include_dir, exist_ok=True)
     for include in includes + [f"{CK_DIR}/include"]:
@@ -139,19 +131,19 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
 
     # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
     hip_version = get_hip_version()
+    if hip_version > Version("5.5.00000"):
+        cxxflags += ["-mllvm --lsr-drop-solution=1"]
     if hip_version > Version("5.7.23302"):
         cxxflags += ["-fno-offload-uniform-block"]
     if hip_version > Version("6.1.40090"):
-        cxxflags += ["-mllvm", "-enable-post-misched=0"]
+        cxxflags += ["-mllvm -enable-post-misched=0"]
     if hip_version > Version("6.2.41132"):
         cxxflags += [
-            "-mllvm",
-            "-amdgpu-early-inline-all=true",
-            "-mllvm",
-            "-amdgpu-function-calls=false",
+            "-mllvm -amdgpu-early-inline-all=true",
+            "-mllvm -amdgpu-function-calls=false",
         ]
-    if hip_version > Version("6.2.41133") and hip_version < Version("6.3.00000"):
-        cxxflags += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
+    if hip_version > Version("6.2.41133"):
+        cxxflags += ["-mllvm -amdgpu-coerce-illegal-types=1"]
     archs = validate_and_update_archs()
     cxxflags += [f"--offload-arch={arch}" for arch in archs]
     makefile_file = makefile_template.render(
