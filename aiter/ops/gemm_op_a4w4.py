@@ -4,7 +4,6 @@
 import torch
 from torch import Tensor
 from typing import Optional
-import aiter
 from aiter import logger
 from ..jit.core import (
     compile_ops,

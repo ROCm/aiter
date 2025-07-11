@@ -6,7 +6,6 @@ from torch import Tensor
 from typing import Optional
 import functools
 import pandas as pd
-import aiter
 from aiter import logger
 from ..jit.core import (
     compile_ops,
