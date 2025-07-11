@@ -17,27 +17,18 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
 
 
 from aiter.ops.triton.prefill_attention import context_attention_fwd
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-_is_cuda = False
-
-_is_hip = is_hip()
-
-
-@triton.jit
-def tanh(x):
-    # Tanh is just a scaled sigmoid
-    return 2 * tl.sigmoid(2 * x) - 1
+from aiter.ops.triton.activation import _tanh
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.jit
@@ -163,7 +154,7 @@ def _fwd_kernel(
         qk *= sm_scale
 
         if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            qk = logit_cap * _tanh(qk / logit_cap)
 
         if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             custom_mask = tl.load(
@@ -236,7 +227,7 @@ def _fwd_kernel(
         qk *= sm_scale
 
         if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            qk = logit_cap * _tanh(qk / logit_cap)
 
         if USE_CUSTOM_MASK:
             custom_mask = tl.load(
@@ -299,6 +290,19 @@ def _fwd_kernel(
         )
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-EXTEND_ATTENTION.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict["default"]
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -316,6 +320,7 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    config: Optional[dict[str, any]] = None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -341,8 +346,8 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    BLOCK_M, BLOCK_N = (64, 64)
-    num_warps = 4
+    # BLOCK_M, BLOCK_N = (64, 64)
+    # num_warps = 4
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -352,12 +357,15 @@ def extend_attention_fwd(
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    if config is None:
+        config = _get_config()
 
-    extra_kargs = {}
+    grid = (batch_size, head_num, triton.cdiv(max_len_extend, config["BLOCK_M"]))
+    # num_stages = 1
 
-    extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    # extra_kargs = {}
+
+    # extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
 
     _fwd_kernel[grid](
         q_extend,
@@ -389,17 +397,17 @@ def extend_attention_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        # BLOCK_M=BLOCK_M,
+        # BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
+        STORE_TRANSPOSE=True,
+        # num_warps=num_warps,
+        # num_stages=num_stages,
+        **config,
     )
 
 
