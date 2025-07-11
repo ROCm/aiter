@@ -1,4 +1,3 @@
-
 import pytest
 import os
 import torch
@@ -65,6 +64,7 @@ def apply_SL(
     lengths = torch.where(users_to_sample, threshold, lengths)
     return lengths
 
+
 def sanity_check_attention(
     max_seq_len: int,
     q: torch.Tensor,
@@ -113,12 +113,9 @@ def sanity_check_attention(
 
 
 # calculate flops of the hstu attention
-# lower trigualar mask, so no need to multiple by 2 
+# lower trigualar mask, so no need to multiple by 2
 # for flops calculation
-def get_flops(seq_offsets: torch.Tensor, 
-              heads: int,
-              attn_dim: int,
-              hidden_dim: int):
+def get_flops(seq_offsets: torch.Tensor, heads: int, attn_dim: int, hidden_dim: int):
     total_flops = 0.0
     seq_num = seq_offsets.shape[0] - 1
     for i in range(seq_num):
@@ -129,11 +126,13 @@ def get_flops(seq_offsets: torch.Tensor,
     return total_flops
 
 
-def get_bytes(seq_offsets: torch.Tensor, 
-                   heads: int,
-                   attn_dim: int,
-                   hidden_dim: int,
-                   elem_size: int):
+def get_bytes(
+    seq_offsets: torch.Tensor,
+    heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+    elem_size: int,
+):
 
     seq_num = seq_offsets.shape[0] - 1
     total_bytes = 0
@@ -145,9 +144,9 @@ def get_bytes(seq_offsets: torch.Tensor,
     return total_bytes
 
 
-@pytest.mark.parametrize("batch_size, max_seq_len, sparsity",
-                         [(512, 3072, 0.366),
-                          (512, 512, 0.97)])
+@pytest.mark.parametrize(
+    "batch_size, max_seq_len, sparsity", [(512, 3072, 0.366), (512, 512, 0.97)]
+)
 def test_hstu_attention(
     batch_size: int,
     max_seq_len: int,  # for repro
@@ -237,7 +236,7 @@ def test_hstu_attention(
         dropout_pr=0.0,
         training=False,
         num_targets=num_targets,
-        max_attn_len = 0,
+        max_attn_len=0,
         contextual_seq_len=0,
         min_full_attn_seq_len=0,
     )

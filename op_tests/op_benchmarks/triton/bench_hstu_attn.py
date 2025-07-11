@@ -24,7 +24,6 @@ def get_x_values():
         (512, 512, 0.97, 4, 128, 128),
         (512, 3072, 0.366, 4, 128, 128),
         (1024, 1024, 0.768, 4, 128, 128),
-
         # (256, 4096, 0.5, 4, 128, 128),
         # (320, 4096, 0.5, 4, 128, 128),
         # (384, 4096, 0.5, 4, 128, 128),
@@ -36,9 +35,25 @@ def get_x_values():
 
 def run_benchmark(args):
 
-    x_names = ['batch_size', 'max_seq_len', 'sparsity', 'heads', 'attn_dim', 'hidden_dim']
+    x_names = [
+        "batch_size",
+        "max_seq_len",
+        "sparsity",
+        "heads",
+        "attn_dim",
+        "hidden_dim",
+    ]
     if args.user_input:
-        x_val_list = [(args.b, args.max_seq_len, args.sparsity, args.heads, args.head_dim, args.hidden_dim)]
+        x_val_list = [
+            (
+                args.b,
+                args.max_seq_len,
+                args.sparsity,
+                args.heads,
+                args.head_dim,
+                args.hidden_dim,
+            )
+        ]
     else:
         x_val_list = get_x_values()
 
@@ -51,11 +66,11 @@ def run_benchmark(args):
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    line_names = ['Triton']
-    line_vals = ['triton']
+    line_names = ["Triton"]
+    line_vals = ["triton"]
     modes = [args.mode]
     if args.mode == "both":
-        modes = ['fwd', 'bwd']
+        modes = ["fwd", "bwd"]
 
     configs = []
     for mode in modes:
@@ -63,7 +78,7 @@ def run_benchmark(args):
         # backward only support time metric
         if mode == "bwd":
             metric = "time"
-            ylabel = 'Time (ms)'
+            ylabel = "Time (ms)"
 
         configs.append(
             triton.testing.Benchmark(
@@ -76,12 +91,26 @@ def run_benchmark(args):
                 ylabel=ylabel,
                 plot_name=f"HSTU attention Benchmark ({mode}), {ylabel}",
                 args={"metric": metric, "mode": mode},
-            ))
+            )
+        )
 
     @triton.testing.perf_report(configs)
-    def bench_hstu_attn(batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim, metric, mode, provider):
+    def bench_hstu_attn(
+        batch_size,
+        max_seq_len,
+        sparsity,
+        heads,
+        attn_dim,
+        hidden_dim,
+        metric,
+        mode,
+        provider,
+    ):
         type_str = args.dtype
-        assert type_str in ['fp16', 'bf16'], "only fp16 or bf16 data types are supported!"
+        assert type_str in [
+            "fp16",
+            "bf16",
+        ], "only fp16 or bf16 data types are supported!"
         dropout_pr = 0.0
         target_size: int = 20
         sl_alpha: float = 2.0
@@ -160,7 +189,11 @@ def run_benchmark(args):
             do = torch.randn_like(o)
             fn = lambda: o.backward(do, retain_graph=True)
 
-        ms = triton.testing.do_bench(fn, warmup=25, rep=100,)
+        ms = triton.testing.do_bench(
+            fn,
+            warmup=25,
+            rep=100,
+        )
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
@@ -171,7 +204,9 @@ def run_benchmark(args):
             return tflops
         elif metric == "bandwidth":
             elem_size = q.element_size()
-            bytes = get_bytes(seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size)
+            bytes = get_bytes(
+                seq_offsets.cpu().numpy(), heads, attn_dim, hidden_dim, elem_size
+            )
             bandwidth = bytes / (ms * 1e-3) * 1e-9  # GB/s
             return bandwidth
         else:
@@ -225,7 +260,7 @@ def parse_args():
     parser.add_argument(
         "--dtype",
         type=str,
-        default='bf16',
+        default="bf16",
         help="data type, default (bfloat16)",
     )
 
@@ -247,7 +282,7 @@ def parse_args():
 
     parser.add_argument(
         "--user_input",
-        action='store_true',
+        action="store_true",
         default=False,
         help="Run user input info",
     )
