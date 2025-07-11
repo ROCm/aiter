@@ -757,16 +757,6 @@ def _get_bw_configs() -> List[triton.Config]:
     return configs
 
 
-# @triton.autotune(
-#     configs=_get_bw_configs(),
-#     key=[
-#         "AUTOTUNE_Z",
-#         "H",
-#         "AUTOTUNE_MAX_SEQ_LEN",
-#         "DimQ",
-#         "DimV",
-#     ],
-# )
 @triton.jit
 def _hstu_attn_bwd(  # noqa C901
     Q,
