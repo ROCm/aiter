@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024 - 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List, Optional, Tuple
+from typing import List
 
 import torch
 import triton
