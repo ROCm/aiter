@@ -56,6 +56,8 @@
       "num_attention_heads": 128,
       "num_key_value_heads": 128,
       "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
       "num_expert": 256,
       "top_k": 4
     }
