@@ -8,6 +8,13 @@ SCALE_GROUP_SIZE = 32
 
 
 def generate_batched_gemm_afp4wfp4_inputs(B, M, N, K):
+    """
+    Returns:
+        - x: shape (B, M, K // 2)
+        - w: shape (B, N, K // 2)
+        - x_scales: shape (B, M, K // SCALE_GROUP_SIZE)
+        - w_scales: shape (B, N, K // SCALE_GROUP_SIZE)
+    """
     torch.manual_seed(5)
     # 34 is two packed e2m1 values 0010 which is 1.0.
     x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
@@ -17,7 +24,6 @@ def generate_batched_gemm_afp4wfp4_inputs(B, M, N, K):
     w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
     w_high = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
     w = w_low | w_high << 4
-    w = w.transpose(1, 2)
     # Scale of 1.0 in e8m0, bias 127.
     x_scales = torch.randint(
         124, 128, (B, K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device="cuda"
@@ -66,7 +72,8 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals = [(256, 3584, 2112)]
+    x_vals += [(256, 3584, 2112)]
+    x_vals += [(1, 1, 32)]
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]
     num_batch_sizes = len(batch_sizes)
@@ -85,6 +92,11 @@ def get_x_vals():
 
 
 def mxfp4_to_f32(x):
+    """
+    Converts a tensor of uint8 dtype (in mxfp4 format) to fp32.
+    Args:
+        - x: shape (..., D) where D is the packed dimension (K // 2)
+    """
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
     x[..., ::2] = x[..., ::2] & 0xF
@@ -119,17 +131,21 @@ def e8m0_to_f32(x):
 
 def run_torch(x, w, x_scales, w_scales, dtype):
     # First convert the x and w inputs to f32.
-    x_f32 = mxfp4_to_f32(x)
-    w_f32 = mxfp4_to_f32(w.transpose(-2, -1))
-    w_f32 = w_f32.transpose(-2, -1)
+    x_f32 = mxfp4_to_f32(x)  # -> (B, M, K)
+    w_f32 = mxfp4_to_f32(w)  # -> (B, N, K)
     # Next convert the e8m0 scales to f32.
-    x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(torch.float32)
+    x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(
+        torch.float32
+    )  # -> (B, M, K)
     x_scales_f32 = e8m0_to_f32(x_scales)
     x_f32 = x_f32 * x_scales_f32
-    w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(torch.float32)
+    w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(
+        torch.float32
+    )  # -> (B, N, K)
     w_scales_f32 = e8m0_to_f32(w_scales)
-    w_f32 = w_f32 * w_scales_f32.transpose(-2, -1)
-    return torch.bmm(x_f32, w_f32).to(dtype)
+    assert w_scales_f32.shape == w_scales.shape
+    w_f32 = w_f32 * w_scales_f32
+    return torch.bmm(x_f32, w_f32.transpose(1, 2)).to(dtype)
 
 
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
@@ -139,9 +155,10 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype):
         pytest.skip("MXFP4 not supported on this architecture")
 
     x, w, x_scales, w_scales = generate_batched_gemm_afp4wfp4_inputs(B, M, N, K)
-    out = torch.empty(B, x.shape[1], w.shape[2], device=x.device, dtype=dtype)
+    out = torch.empty(B, M, N, device=x.device, dtype=dtype)
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    assert torch_out.shape == (B, M, N)
 
     batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
 
