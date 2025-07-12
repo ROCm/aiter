@@ -7,7 +7,9 @@ import aiter.ops.triton.utils.arch_info as arch_info
 SCALE_GROUP_SIZE = 32
 
 
-def generate_batched_gemm_afp4wfp4_inputs(B, M, N, K):
+def generate_batched_gemm_afp4wfp4_inputs(
+    B: int, M: int, N: int, K: int, layout: str = "TN"
+):
     """
     Returns:
         - x: shape (B, M, K // 2)
@@ -16,13 +18,29 @@ def generate_batched_gemm_afp4wfp4_inputs(B, M, N, K):
         - w_scales: shape (B, N, K // SCALE_GROUP_SIZE)
     """
     torch.manual_seed(5)
-    # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
-    x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
+    if layout[0] == "T":
+        # 34 is two packed e2m1 values 0010 which is 1.0.
+        x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
+        x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
+    else:
+        # 34 is two packed e2m1 values 0010 which is 1.0.
+        x_low = torch.randint(0, 16, (B, K // 2, M), dtype=torch.uint8).permute(0, 2, 1)
+        x_high = torch.randint(0, 16, (B, K // 2, M), dtype=torch.uint8).permute(
+            0, 2, 1
+        )
     x = x_low | x_high << 4  # Doing this computation with GPU tensors results in NaN
     x = x.to(device="cuda")
-    w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
-    w_high = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+
+    if layout[1] == "N":
+        w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+        w_high = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        w_low = torch.randint(
+            0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda"
+        ).permute(0, 2, 1)
+        w_high = torch.randint(
+            0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda"
+        ).permute(0, 2, 1)
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
     x_scales = torch.randint(

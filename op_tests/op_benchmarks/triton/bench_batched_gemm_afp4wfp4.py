@@ -37,9 +37,11 @@ def model_benchmark_shapes(args):
     return shapes
 
 
-def bench_gemm_fn(batch, M, N, K, metric):
+def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale = generate_batched_gemm_afp4wfp4_inputs(batch, M, N, K)
+    x, w, x_scale, w_scale = generate_batched_gemm_afp4wfp4_inputs(
+        batch, M, N, K, layout=layout
+    )
     # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
     # flops
     flops = 2.0 * M * N * K * batch
@@ -99,7 +101,7 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 
     bench_batched_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
@@ -113,7 +115,7 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(M, N, K, batch, metric, provider):
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 
     bench_batched_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
@@ -124,9 +126,7 @@ def run_benchmark(args, defaults):
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(

@@ -17,11 +17,11 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
     x, w, out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, c_dtype, layout="TN", output=True
+        M, N, K, c_dtype, layout=layout, output=True
     )
     # flops
     flops = 2.0 * M * N * K
@@ -79,7 +79,7 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
     bench_gemm_a16w16.run(save_path=".", print_data=True)
 
@@ -94,7 +94,7 @@ def run_shape_benchmark(args):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
     bench_gemm_a16w16.run(save_path=".", print_data=True)
 

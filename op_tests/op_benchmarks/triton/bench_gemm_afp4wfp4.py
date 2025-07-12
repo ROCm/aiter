@@ -24,9 +24,11 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
 )
 
 
-def bench_gemm_fn(M, N, K, metric):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
-    x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(M, N, K, c_dtype)
+    x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(
+        M, N, K, c_dtype, layout=layout
+    )
     # flops
     flops = 2.0 * M * N * K
     # memory transfer
@@ -53,7 +55,6 @@ def bench_gemm_fn(M, N, K, metric):
             warmup=25,
             rep=100,
         )
-
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
@@ -72,9 +73,7 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(
@@ -112,7 +111,7 @@ def run_model_benchmark(args):
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
 
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
     bench_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
@@ -122,7 +121,7 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(M, N, K, metric, **kwargs):
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
     bench_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
@@ -143,7 +142,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
         print_vgpr(fun, "GEMM")
         return 0
     run_benchmark(args, defaults)

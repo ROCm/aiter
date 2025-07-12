@@ -90,7 +90,7 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "-M",
         type=int,
-        default=4096,
+        default=None,
         help="M dim of model benchmark if only one model is under test",
     )
     parser.add_argument(
