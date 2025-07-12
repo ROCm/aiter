@@ -129,9 +129,12 @@ def test_persistent_lean_attention(
     )
 
     # LeanAttention Specific Parameters
-    Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
+    # Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
+    # Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
+    # Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
+    Mp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
+    Lp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
+    Op = torch.empty((total_programs, BLOCK_M, d), device=q.device, dtype=torch.float32)
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
