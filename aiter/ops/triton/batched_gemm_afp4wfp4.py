@@ -392,6 +392,10 @@ def batched_gemm_afp4wfp4(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        
     grid = lambda META: (  # noqa: E731
         Batch,
         (

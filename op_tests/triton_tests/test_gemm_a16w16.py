@@ -94,7 +94,8 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
 
-    torch_out = torch.matmul(x, w)
+    torch_out = F.linear(x, w, bias=None)
+
     # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
     if output:
         y = y.to(torch.float32).zero_()

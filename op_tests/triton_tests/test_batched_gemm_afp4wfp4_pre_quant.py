@@ -81,7 +81,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(1, 1, 1)]  # minimal case
+    x_vals += [(1, 1, 32)]  # minimal case
 
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]

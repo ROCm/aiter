@@ -2,6 +2,7 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
+from triton.testing import runtime
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -71,7 +72,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(32, 512, 7168)]
-    x_vals += [(1, 1, 1)]  # minimal case
+    x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
 
@@ -130,7 +131,7 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
     # TODO resolve this compilation error
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
-
+    
     x, w, _, w_scales = generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K)
 
     if output:

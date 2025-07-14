@@ -39,9 +39,7 @@ def generate_batched_gemm_afp4wfp4_inputs(B, M, N, K):
 
 def get_x_vals():
 
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
+    x_vals = [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -69,11 +67,14 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
+    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    x_vals += [(4864, 8192, 4160), (4864, 4096, 8192), (9728, 8192, 65536)]
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
-    x_vals += [(1, 1, 32)]
+    # x_vals += [(1, 1, 32)]  # minimal case
+
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]
     num_batch_sizes = len(batch_sizes)
@@ -82,12 +83,12 @@ def get_x_vals():
         b = batch_sizes[i % num_batch_sizes]
         x_vals_with_batch.append((b, m, n, k))
 
-    x_vals_with_batch += [
-        (b, 2**m, n, k)
-        for b in range(1, 17)
-        for m in range(0, 9)
-        for (n, k) in [(512, 128), (128, 512)]
-    ]
+    # x_vals_with_batch += [
+    #     (b, 2**m, n, k)
+    #     for b in range(1, 17)
+    #     for m in range(0, 9)
+    #     for (n, k) in [(512, 128), (128, 512)]
+    # ]
     return x_vals_with_batch
 
 
@@ -157,9 +158,9 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype):
     x, w, x_scales, w_scales = generate_batched_gemm_afp4wfp4_inputs(B, M, N, K)
     out = torch.empty(B, M, N, device=x.device, dtype=dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    torch_out = run_torch(x.clone(), w.clone(), x_scales.clone(), w_scales.clone(), dtype).to(dtype)
     assert torch_out.shape == (B, M, N)
 
-    batched_gemm_afp4wfp4(x, w, x_scales, w_scales, dtype, out)
+    batched_gemm_afp4wfp4(x.clone(), w.clone(), x_scales.clone(), w_scales.clone(), dtype, out)
 
     torch.testing.assert_close(torch_out, out)

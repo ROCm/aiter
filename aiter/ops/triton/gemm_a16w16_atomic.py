@@ -189,6 +189,7 @@ def gemm_a16w16_atomic(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+    w = w.T
 
     M, K = x.shape
     K, N = w.shape

@@ -275,13 +275,17 @@ def gemm_afp4wfp4_pre_quant(
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE  
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
 
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+        
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
