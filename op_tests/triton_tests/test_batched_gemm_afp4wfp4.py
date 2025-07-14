@@ -39,7 +39,9 @@ def generate_batched_gemm_afp4wfp4_inputs(B, M, N, K):
 
 def get_x_vals():
 
-    x_vals = [
+    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    x_vals += [(4864, 8192, 4160), (4864, 4096, 8192), (9728, 8192, 65536)]
+    x_vals += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -67,13 +69,11 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 8192, 4160), (4864, 4096, 8192), (9728, 8192, 65536)]
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
-    # x_vals += [(1, 1, 32)]  # minimal case
+    x_vals += [(1, 1, 32)]  # minimal case
 
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]
