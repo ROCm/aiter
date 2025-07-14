@@ -27,7 +27,7 @@ struct FlashMlaPrefillKernelTrait
 {
     static constexpr int32_t kSizeD                     = kSizeD_;    // hidden dimension size of query and key
     static constexpr int32_t kSizeDV                    = kSizeDV_;   // hidden dimension size of value
-    static constexpr int32_t kSizeNope                  = 512;  //tmp force 512
+    static constexpr int32_t kSizeNope                  = kSizeDV;
     static constexpr int32_t kSizeRope                  = kSizeD - kSizeNope;
     static constexpr int32_t kNumWarps                  = kNumWarps_;
     static constexpr int32_t kNumThreads                = kNumWarps * ck_tile::get_warp_size();
