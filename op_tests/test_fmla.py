@@ -210,19 +210,19 @@ if __name__ == "__main__":
     h_kv = 1
     d, dv = 576, 512
 
-for (dtype, b, s, h_q, s_q, page_block_size, varlen, causal, nope_rope_separate) in itertools.product(
-        (torch.float16, torch.bfloat16)[1:],
-        [1, 3, 5, 16, 32, 64, 128, 256][3:4],
-        [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
-        (1, 16, 64, 128)[:],
-        # (1, 2), # s_q for decode
-        (64,),  # s_q for prefill
-        (1, 16, 64)[:],
-        (False, True)[:],
-        (False, True)[:],
-        (False, True)[:]
-    ):
-        test_flash_mla(dtype, b, s_q, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, nope_rope_separate, True, False)
+    for (dtype, b, s, h_q, s_q, page_block_size, varlen, causal, nope_rope_separate) in itertools.product(
+            (torch.float16, torch.bfloat16)[1:],
+            [1, 3, 5, 16, 32, 64, 128, 256][3:4],
+            [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
+            (1, 16, 64, 128)[:],
+            # (1, 2), # s_q for decode
+            (64,),  # s_q for prefill
+            (1, 16, 64)[:],
+            (False, True)[:],
+            (False, True)[:],
+            (False, True)[:]
+        ):
+            test_flash_mla(dtype, b, s_q, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, nope_rope_separate, True, False)
 
     # for (dtype, b, s, h_q, page_block_size, varlen, causal) in itertools.product(
     #     (torch.float16, torch.bfloat16)[1:],

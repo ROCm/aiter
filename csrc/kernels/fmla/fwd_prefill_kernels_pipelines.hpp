@@ -761,10 +761,10 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
             ck_tile::move_tile_window(k_dram_window_nope_origin, {Traits::kBlockN0, 0});
             k_dram_window_nope.set_window_origin(k_dram_window_nope_origin.get_window_origin() + next_qk_origin_nope);
             // Recalculate offsets
-            ck_tile::static_for<0, kKIterations, 1>{}([&](auto rid)
+            ck_tile::static_for<0, kKNumRepeat, 1>{}([&](auto rid)
             {
                 const int32_t seqlen_idx = seqlen_k_base_idx + (loop_idx + 1) * Traits::kBlockN0 +
-                                           Traits::kBlockN0 / kKIterations * rid.value;
+                                           Traits::kBlockN0 / kKNumRepeat * rid.value;
                 const int32_t page_idx   = seqlen_idx / page_block_size;
                 const int32_t inside_idx = seqlen_idx % page_block_size;
                 const int32_t total_idx = p_block_table[page_idx] * page_block_size + inside_idx;

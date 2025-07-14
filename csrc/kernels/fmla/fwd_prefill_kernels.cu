@@ -484,12 +484,12 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
             kn_fmla_fwd_splitkv_prefill_load_once_tile<Traits, scalar_t, acc_t, out_t>(
                 q_nope_dram_window,
                 q_rope_dram_window,
-                k_dram,
+                k_dram_nope,
                 lse_acc_dram_window,
                 out_acc_dram_window,
                 p_block_table,
                 __builtin_amdgcn_readfirstlane(params.page_block_size),
-                __builtin_amdgcn_readfirstlane(params.stride_s_k),
+                __builtin_amdgcn_readfirstlane(params.stride_s_k_nope),
                 __builtin_amdgcn_readfirstlane(params.stride_s_v),
                 seqlen_k,
                 params.num_splits,
@@ -560,22 +560,22 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         else
         {
             const auto q_nope_dram_window = ck_tile::make_tile_window(
-                q_dram,
+                q_dram_nope,
                 q_nope_dram_window_lengths,
                 {mid, 0});
             const auto q_rope_dram_window = ck_tile::make_tile_window(
-                q_dram,
+                q_dram_nope,
                 q_rope_dram_window_lengths,
                 {mid, Traits::kSizeNope});
             kn_fmla_fwd_splitkv_prefill_load_once_tile<Traits, scalar_t, acc_t, out_t>(
                 q_nope_dram_window,
                 q_rope_dram_window,
-                k_dram,
+                k_dram_nope,
                 lse_dram_window,
                 out_dram_window,
                 p_block_table,
                 __builtin_amdgcn_readfirstlane(params.page_block_size),
-                __builtin_amdgcn_readfirstlane(params.stride_s_k),
+                __builtin_amdgcn_readfirstlane(params.stride_s_k_nope),
                 __builtin_amdgcn_readfirstlane(params.stride_s_v),
                 seqlen_k,
                 1, // num_splits
