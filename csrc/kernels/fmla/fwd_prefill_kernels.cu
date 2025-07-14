@@ -345,14 +345,21 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         }
     }();
 
-    constexpr auto q_dram_window_lengths =
-        ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kBlockK0>{});
+    constexpr auto dram_nope_window_length_k = Traits::kKVLoadOnce
+                                                   ? ck_tile::number<Traits::kSizeNope>{}
+                                                   : ck_tile::number<Traits::kBlockK0>{};
+    constexpr auto dram_rope_window_length_k = Traits::kKVLoadOnce
+                                                   ? ck_tile::number<Traits::kSizeRope>{}
+                                                   : ck_tile::number<Traits::kBlockK0>{};
+
     constexpr auto q_nope_dram_window_lengths =
-        ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kSizeNope>{});
+        ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, dram_nope_window_length_k);
     constexpr auto q_rope_dram_window_lengths =
-        ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, ck_tile::number<Traits::kSizeRope>{});
-    constexpr auto k_dram_window_lengths =
-        ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{}, ck_tile::number<Traits::kBlockK0>{});
+        ck_tile::make_tuple(ck_tile::number<Traits::kBlockM>{}, dram_rope_window_length_k);
+    constexpr auto k_nope_dram_window_lengths =
+        ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{}, dram_nope_window_length_k);
+    constexpr auto k_rope_dram_window_lengths =
+        ck_tile::make_tuple(ck_tile::number<Traits::kBlockN0>{}, dram_rope_window_length_k);
     constexpr auto v_dram_window_lengths =
         ck_tile::make_tuple(ck_tile::number<Traits::kBlockN1>{}, ck_tile::number<Traits::kBlockK1>{});
 
@@ -374,7 +381,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     const auto k_dram_nope = MakeKDram<Policy, HiddenDimSize>(p_key_nope,   kv_cache_width, params.stride_s_k_nope);
     const auto v_dram = MakeVDram<Policy>(p_value, kv_cache_width, params.stride_s_v);    
 
-    auto q_dram_window_nope = ck_tile::make_tile_window(q_dram_nope, q_dram_window_lengths, {mid, 0});
+    auto q_dram_window_nope = ck_tile::make_tile_window(q_dram_nope, q_nope_dram_window_lengths, {mid, 0});
     auto q_dram_window_rope = [&] {
         if constexpr(kIsRopeSeparate)
         {
@@ -387,15 +394,15 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                                                                           params.stride_s_q_rope,
                                                                           params.hq_hk_ratio,
                                                                           params.stride_h_q_rope);
-            return ck_tile::make_tile_window(q_dram_rope, q_dram_window_lengths, {mid, 0});
+            return ck_tile::make_tile_window(q_dram_rope, q_rope_dram_window_lengths, {mid, 0});
         }
         else
         {
-            return q_dram_window_nope; // dummy object
+            return ck_tile::make_tile_window(q_dram_nope, q_rope_dram_window_lengths, {mid, Traits::kSizeNope});
         }
     }();
 
-    auto k_dram_window_nope = ck_tile::make_tile_window(k_dram_nope, k_dram_window_lengths, {0, 0});
+    auto k_dram_window_nope = ck_tile::make_tile_window(k_dram_nope, k_nope_dram_window_lengths, {0, 0});
     auto k_dram_window_rope = [&] {
         if constexpr(kIsRopeSeparate)
         {
@@ -403,16 +410,17 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                                          int64_t(hkid) * params.stride_h_k_rope; // head offset
             const auto k_dram_rope = MakeKDram<Policy, Traits::kSizeRope>(
                 p_key_rope, kv_cache_width, params.stride_s_k_rope);
-            return ck_tile::make_tile_window(k_dram_rope, k_dram_window_lengths, {0, 0});
+            return ck_tile::make_tile_window(k_dram_rope, k_rope_dram_window_lengths, {0, 0});
         }
         else
         {
-            return k_dram_window_nope; // dummy object
+            return ck_tile::make_tile_window(k_dram_nope, k_rope_dram_window_lengths, {0, Traits::kSizeNope});
         }
     }();
 
     auto v_dram_window = ck_tile::make_tile_window(v_dram, v_dram_window_lengths, {0, 0});
 
+    const auto real_stride_s_k_rope = kIsRopeSeparate ? params.stride_s_k_rope : params.stride_s_k_nope;
     if constexpr (kDoSplit)
     {
         acc_t* p_lse_acc = reinterpret_cast<acc_t*>(params.p_softmax_lseaccum) +
@@ -458,7 +466,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                 p_block_table,
                 __builtin_amdgcn_readfirstlane(params.page_block_size),
                 __builtin_amdgcn_readfirstlane(params.stride_s_k_nope),
-                __builtin_amdgcn_readfirstlane(params.stride_s_k_rope),
+                __builtin_amdgcn_readfirstlane(real_stride_s_k_rope),
                 __builtin_amdgcn_readfirstlane(params.stride_s_v),
                 seqlen_k,
                 params.num_splits,
@@ -473,23 +481,17 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         }
         else
         {
-            const auto q_nope_dram_window = ck_tile::make_tile_window(
-                q_dram_nope,
-                q_nope_dram_window_lengths,
-                {mid, 0});
-            const auto q_rope_dram_window = ck_tile::make_tile_window(
-                q_dram_nope,
-                q_rope_dram_window_lengths,
-                {mid, Traits::kSizeNope});
             kn_fmla_fwd_splitkv_prefill_load_once_tile<Traits, scalar_t, acc_t, out_t>(
-                q_nope_dram_window,
-                q_rope_dram_window,
-                k_dram_nope,
+                q_dram_window_nope,
+                q_dram_window_rope,
+                k_dram_window_nope,
+                k_dram_window_rope,
                 lse_acc_dram_window,
                 out_acc_dram_window,
                 p_block_table,
                 __builtin_amdgcn_readfirstlane(params.page_block_size),
                 __builtin_amdgcn_readfirstlane(params.stride_s_k_nope),
+                __builtin_amdgcn_readfirstlane(real_stride_s_k_rope),
                 __builtin_amdgcn_readfirstlane(params.stride_s_v),
                 seqlen_k,
                 params.num_splits,
@@ -544,7 +546,7 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
                 p_block_table,
                 __builtin_amdgcn_readfirstlane(params.page_block_size),
                 __builtin_amdgcn_readfirstlane(params.stride_s_k_nope),
-                __builtin_amdgcn_readfirstlane(params.stride_s_k_rope),
+                __builtin_amdgcn_readfirstlane(real_stride_s_k_rope),
                 __builtin_amdgcn_readfirstlane(params.stride_s_v),
                 seqlen_k,
                 1, // num_splits
@@ -559,23 +561,17 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
         }
         else
         {
-            const auto q_nope_dram_window = ck_tile::make_tile_window(
-                q_dram_nope,
-                q_nope_dram_window_lengths,
-                {mid, 0});
-            const auto q_rope_dram_window = ck_tile::make_tile_window(
-                q_dram_nope,
-                q_rope_dram_window_lengths,
-                {mid, Traits::kSizeNope});
             kn_fmla_fwd_splitkv_prefill_load_once_tile<Traits, scalar_t, acc_t, out_t>(
-                q_nope_dram_window,
-                q_rope_dram_window,
-                k_dram_nope,
+                q_dram_window_nope,
+                q_dram_window_rope,
+                k_dram_window_nope,
+                k_dram_window_rope,
                 lse_dram_window,
                 out_dram_window,
                 p_block_table,
                 __builtin_amdgcn_readfirstlane(params.page_block_size),
                 __builtin_amdgcn_readfirstlane(params.stride_s_k_nope),
+                __builtin_amdgcn_readfirstlane(real_stride_s_k_rope),
                 __builtin_amdgcn_readfirstlane(params.stride_s_v),
                 seqlen_k,
                 1, // num_splits
