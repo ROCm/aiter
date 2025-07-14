@@ -93,6 +93,14 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
+    # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
+    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
+    # See https://github.com/ROCm/aiter/pull/597 for rationale
+    stride_ab = tl.cast(stride_ab, tl.int64)
+    stride_bb = tl.cast(stride_bb, tl.int64)
+    stride_cb = tl.cast(stride_cb, tl.int64)
+    pid_batch = tl.cast(pid_batch, tl.int64)
+
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
 
@@ -327,7 +335,8 @@ def batched_gemm_afp4wfp4_pre_quant(
 
     Key parameters:
     - X: Matrix X with shape (B, M, K).
-    - W: Matrix W with shape (B, K, N).
+    - W: Matrix W with shape (B, N, K).
+    - X_scales: Matrix with shape (B, M, K // 32)
     - W_scales: Matrix with shape (B, N, K // 32)
 
     Returns:
@@ -335,15 +344,11 @@ def batched_gemm_afp4wfp4_pre_quant(
     """
 
     Bx, M, K = x.shape
-    Bw, K, N = w.shape
-    if y is not None:
-        By, _, _ = y.shape
-        assert Bx == Bw == By
-    else:
-        assert Bx == Bw
-        y = torch.empty((Bx, M, N), dtype=dtype, device=x.device)
-
+    Bw, N, K = w.shape
+    By, _, _ = y.shape
+    assert Bx == Bw == By
     Batch = Bx
+    w = w.transpose(1, 2)
 
     if config is None:
         config = _get_config(M, N, K)

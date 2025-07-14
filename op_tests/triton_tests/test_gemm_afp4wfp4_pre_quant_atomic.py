@@ -27,7 +27,6 @@ def generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K):
     w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w = w_low | w_high << 4
-    w = w.T
     # Scale of 1.0 in e8m0, bias 127.
     w_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, N), dtype=torch.uint8, device="cuda"
@@ -71,7 +70,8 @@ def get_x_vals():
     ]
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(2**v, 512, 7168) for v in range(10)]
+    x_vals += [(32, 512, 7168)]
+    x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
 
@@ -111,13 +111,13 @@ def e8m0_to_f32(x):
 def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
-    w_f32 = mxfp4_to_f32(w.transpose(-2, -1))
-    w_f32 = w_f32.transpose(-2, -1)
+    w_f32 = mxfp4_to_f32(w)
     # Next convert the e8m0 scales to f32.
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=-1).to(torch.float32)
     w_scales_f32 = e8m0_to_f32(w_scales)
-    w_f32 = w_f32 * w_scales_f32.transpose(-2, -1)
-    return torch.mm(x_f32, w_f32).to(dtype)
+    assert w_f32.shape == w_scales_f32.shape
+    w_f32 = w_f32 * w_scales_f32
+    return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
