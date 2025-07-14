@@ -151,7 +151,7 @@ public:
     CK_TILE_HOST_DEVICE static constexpr auto GetAlignmentLse()
     {
         return GetVectorSizeForTile<Traits::kNumWarps,
-                                    Traits::kKIterations,
+                                    Traits::kKNopeLdsBlkSize,
                                     Traits::kBlockM,
                                     AccType>();
     }
@@ -279,7 +279,7 @@ public:
     CK_TILE_HOST_DEVICE static constexpr auto GetKNopeSingleRepeatSize()
     {
         constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
-        return (Traits::kKIterations + kKPack) * sizeof(scalar_t);
+        return (Traits::kKNopeLdsBlkSize + kKPack) * sizeof(scalar_t);
     }
 
     template<int32_t KPerBlock, int32_t RepeatK>
@@ -679,7 +679,7 @@ public:
     CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeK()
     {
         return Traits::kKVLoadOnce ?  
-            (GetSingleKElementSpaceSize<Traits::kKIterations, Traits::kKNopeLdsRepeat>() +
+            (GetSingleKElementSpaceSize<Traits::kKNopeLdsBlkSize, Traits::kKNopeLdsIterations>() +
              GetSingleKElementSpaceSize<Traits::kSizeRope, 1>()) * sizeof(scalar_t) :
             Traits::kNumPrefetchKV * GetSmemSizeSingleKV();
     }
@@ -786,13 +786,15 @@ public:
     {
         constexpr int32_t kBlockSize = Traits::kNumThreads;
         constexpr int32_t kNPerBlock = Traits::kBlockN0;
-        constexpr int32_t kKPerBlock = Traits::kKIterations;
+        constexpr int32_t kKPerBlock = Traits::kKNopeLdsBlkSize;
         constexpr int32_t kKNumWarps = Traits::kNumWarps;
         constexpr int32_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
         constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
+        // 4 for dram -> lds max vector size in gfx942
+        constexpr int32_t kMaxWarps = 8;
         constexpr int32_t kKVector = 4 / sizeof(scalar_t);
-        constexpr int32_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
+        constexpr int32_t kNVector = 4 * kMaxWarps / Traits::kNumWarps / sizeof(scalar_t);
 
         constexpr int32_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
         constexpr int32_t kLaneGroups  = warpSize / kKLanes;
@@ -816,13 +818,15 @@ public:
     {
         constexpr int32_t kBlockSize = Traits::kNumThreads;
         constexpr int32_t kNPerBlock = Traits::kBlockN0;
-        constexpr int32_t kKPerBlock = Traits::kKIterations;
+        constexpr int32_t kKPerBlock = Traits::kKNopeLdsBlkSize;
         constexpr int32_t kKNumWarps = Traits::kNumWarps;
         constexpr int32_t kNNumWarps = Traits::kNumWarps / kKNumWarps;
         constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
+        // 4 for dram -> lds max vector size in gfx942
+        constexpr int32_t kMaxWarps = 8;
         constexpr int32_t kKVector = 4 / sizeof(scalar_t);
-        constexpr int32_t kNVector = 4 * Traits::kWaveOccupancy / sizeof(scalar_t);
+        constexpr int32_t kNVector = 4 * kMaxWarps / Traits::kNumWarps / sizeof(scalar_t);
 
         constexpr int32_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
         constexpr int32_t kLaneGroups  = warpSize / kKLanes;
