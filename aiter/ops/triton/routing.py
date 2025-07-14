@@ -41,6 +41,12 @@ def get_config_heuristic(M, K, N):
             "large": (16, 256, 8, 1, 2, 2),
             "very_large": (32, 128, 8, 2, 2, 2),
         },
+        256: {
+            "small": (16, 64, 8, 1, 0, 1),
+            "medium": (16, 64, 8, 1, 0, 2),
+            "large": (16, 64, 8, 1, 2, 2),
+            "very_large": (16, 64, 8, 2, 2, 2),
+        },
     }
 
     # Get configuration parameters

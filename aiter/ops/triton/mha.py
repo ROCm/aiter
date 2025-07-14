@@ -28,6 +28,7 @@ _USE_INT64_STRIDES = True
 
 
 def mha_set_use_int64_strides(value: bool):
+    """Use 64-bit integer strides to prevent integer overflows with very large tensors."""
     global _USE_INT64_STRIDES
     _USE_INT64_STRIDES = value
 
@@ -37,7 +38,15 @@ def _cast_to_fp8(
     fp8_dtype,
     layout,
     clamp_val=1e-9,
-):
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor to FP8 format, returning an FP8 tensor and a descale factor.
+    Args:
+        - x (torch.Tensor): shape [batch, seq_len, heads, dim]
+    Returns:
+        - x_fp8 (torch.Tensor): FP8 tensor with the same shape as x
+        - descale_factor (torch.Tensor): tensor of shape [batch, 1, heads, 1]
+    """
     if len(x.shape) != 4:
         raise ValueError(
             f"'bshd' tensor should have shape [batch, seqlen, heads, dim], got {x.shape}"
@@ -70,6 +79,14 @@ def _cast_varlen_to_fp8(
     cu_seqlens,
     clamp_val: float = 1e-9,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Convert a tensor of sequences with variable seq_len into fp8.
+    Args:
+        - x (torch.Tensor): shape [total_seq_len, heads, dim]
+    Returns:
+        - x_fp8 (torch.Tensor): shape [total_seq_len, heads, dim]
+        - descale_factors (torch.Tensor): shape [batch, heads]
+    """
     # validate tensor shape
     if len(x.shape) != 3:
         raise ValueError(
