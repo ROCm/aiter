@@ -44,12 +44,14 @@ Second, link the `.so` into your executable and compile. You need specify the co
 
 ## fwd_v3 supported arguments comfiguration
 - gfx942 restrictions:
+    - `prec` must be `bf16`
     - `bias` must be `False`
     - `dropout` must be `False`
     - `head_dim_q` must equal to `head_dim_v` and must equal to `128`
     - `seqlen_q` must be greater than `384` and equal to `seqlen_k`
 
 - gfx950 restrictions:
+    - `prec` must be `bf16`
     - `bias` must be `False`
     - `dropout` must be `False`
     - `head_dim_q` must equal to `head_dim_v` and must equal to `128`
