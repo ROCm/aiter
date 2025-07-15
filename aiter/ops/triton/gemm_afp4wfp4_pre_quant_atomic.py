@@ -219,19 +219,38 @@ def _get_config(
             key = "default"  # fall back to default config
 
     if M < 32:
-        return _get_config._config_dict[key]["small"]
+        config = _get_config._config_dict[key]["small"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
-            return _get_config._config_dict[key]["medium_M32"]
+            config = _get_config._config_dict[key]["medium_M32"]
         elif BLK_M == 64:
-            return _get_config._config_dict[key]["medium_M64"]
+            config = _get_config._config_dict[key]["medium_M64"]
         elif BLK_M == 128:
-            return _get_config._config_dict[key]["medium_M128"]
+            config = _get_config._config_dict[key]["medium_M128"]
     elif M <= 256:
-        return _get_config._config_dict[key]["large"]
+        config = _get_config._config_dict[key]["large"]
     else:
-        return _get_config._config_dict[key]["xlarge"]
+        config = _get_config._config_dict[key]["xlarge"]
+
+    config = config.copy()
+
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    return config
 
 
 def gemm_afp4wfp4_pre_quant(
@@ -270,22 +289,6 @@ def gemm_afp4wfp4_pre_quant(
 
     if config is None:
         config = _get_config(M, N, K)
-    config = config.copy()  # necessary to avoid inplace edits from updating LRU cache
-
-    if config["NUM_KSPLIT"] > 1:
-        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
-        )
-
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
-        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
-        config["NUM_KSPLIT"] = NUM_KSPLIT
-    else:
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
-
-    if config["BLOCK_SIZE_K"] >= 2 * K:
-        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
-        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (  # noqa: E731
         (
