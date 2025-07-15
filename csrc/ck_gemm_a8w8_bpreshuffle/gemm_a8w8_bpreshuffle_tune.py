@@ -143,6 +143,10 @@ def tune_gemm_list(
                     total_kernel_nums = total_kernel_nums + 1
 
             tasks_data.append((total_kernel_nums, ()))
+        else:
+            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
+            print()
+            print()
     if task:
         ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
         for el in ret:
@@ -166,10 +170,6 @@ def tune_gemm_list(
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-        else:
-            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-        print()
-        print()
     issorted = True
     if issorted:
         tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
