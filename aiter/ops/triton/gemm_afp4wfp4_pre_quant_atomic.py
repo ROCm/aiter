@@ -270,6 +270,7 @@ def gemm_afp4wfp4_pre_quant(
 
     if config is None:
         config = _get_config(M, N, K)
+    config = config.copy() # necessary to avoid inplace edits from updating LRU cache
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
