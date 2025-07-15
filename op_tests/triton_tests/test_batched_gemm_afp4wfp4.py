@@ -78,7 +78,7 @@ def get_x_vals():
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
     x_vals += [(1, 1, 32)]  # minimal case
-    
+
     # x_vals = [(1, 1280, 8192)]
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]

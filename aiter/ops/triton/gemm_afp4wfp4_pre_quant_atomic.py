@@ -270,14 +270,14 @@ def gemm_afp4wfp4_pre_quant(
 
     if config is None:
         config = _get_config(M, N, K)
-    config = config.copy() # necessary to avoid inplace edits from updating LRU cache
+    config = config.copy()  # necessary to avoid inplace edits from updating LRU cache
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
             K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
-        
-        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE  
+
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
         config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
         config["NUM_KSPLIT"] = NUM_KSPLIT
     else:
@@ -286,7 +286,7 @@ def gemm_afp4wfp4_pre_quant(
     if config["BLOCK_SIZE_K"] >= 2 * K:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
         config["SPLITK_BLOCK_SIZE"] = 2 * K
-        
+
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]

@@ -108,16 +108,16 @@ def _batched_gemm_afp4_wfp4_kernel(
     # stride_cb = tl.cast(stride_cb, tl.int64)
     # pid_batch = tl.cast(pid_batch, tl.int64)
 
-    stride_ab  = tl.cast(stride_in_ab, tl.int64)
-    stride_am  = tl.cast(stride_in_am, tl.int64)
-    stride_ak  = tl.cast(stride_in_ak, tl.int64)
-    stride_bb  = tl.cast(stride_in_bb, tl.int64)
-    stride_bk  = tl.cast(stride_in_bk, tl.int64)
-    stride_bn  = tl.cast(stride_in_bn, tl.int64)
-    stride_cb  = tl.cast(stride_in_cb, tl.int64)
-    stride_ck  = tl.cast(stride_in_ck, tl.int64)
-    stride_cm  = tl.cast(stride_in_cm, tl.int64)
-    stride_cn  = tl.cast(stride_in_cn, tl.int64)
+    stride_ab = tl.cast(stride_in_ab, tl.int64)
+    stride_am = tl.cast(stride_in_am, tl.int64)
+    stride_ak = tl.cast(stride_in_ak, tl.int64)
+    stride_bb = tl.cast(stride_in_bb, tl.int64)
+    stride_bk = tl.cast(stride_in_bk, tl.int64)
+    stride_bn = tl.cast(stride_in_bn, tl.int64)
+    stride_cb = tl.cast(stride_in_cb, tl.int64)
+    stride_ck = tl.cast(stride_in_ck, tl.int64)
+    stride_cm = tl.cast(stride_in_cm, tl.int64)
+    stride_cn = tl.cast(stride_in_cn, tl.int64)
     stride_asb = tl.cast(stride_in_asb, tl.int64)
     stride_asm = tl.cast(stride_in_asm, tl.int64)
     stride_ask = tl.cast(stride_in_ask, tl.int64)
@@ -385,7 +385,7 @@ def batched_gemm_afp4wfp4(
 
     if config is None:
         config = _get_config(M, N, K)
-    config = config.copy() # necessary to avoid inplace edits from updating LRU cache
+    config = config.copy()  # necessary to avoid inplace edits from updating LRU cache
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
@@ -413,7 +413,7 @@ def batched_gemm_afp4wfp4(
     if config["BLOCK_SIZE_K"] >= 2 * K:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
         config["SPLITK_BLOCK_SIZE"] = 2 * K
-        
+
     grid = lambda META: (  # noqa: E731
         Batch,
         (
