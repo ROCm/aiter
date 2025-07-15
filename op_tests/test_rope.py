@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import aiter
@@ -1248,7 +1248,7 @@ if __name__ == "__main__":
         type=int,
         nargs="*",
         choices=list(d_rr.keys()),
-        help="""Rotary percentage and reuse front part. Default is all combinations of:
+        help="""Rotary percentage and reuse front part. Default is all combinations of: 
 (1.0, True, False), (1.0, False, False), (0.5, False, False), (0.5, True, False), (0.5, True, True), (0.5, False, True).
     e.g.: -rr 0  # for (1.0, True, False)""",
     )
