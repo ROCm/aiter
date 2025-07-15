@@ -41,22 +41,22 @@ def _batched_gemm_afp4_wfp4_kernel(
     M,
     N,
     K,
-    stride_ab,
-    stride_am,
-    stride_ak,
-    stride_bb,
-    stride_bk,
-    stride_bn,
-    stride_cb,
-    stride_ck,
-    stride_cm,
-    stride_cn,
-    stride_asb,
-    stride_asm,
-    stride_ask,
-    stride_bsb,
-    stride_bsn,
-    stride_bsk,
+    stride_in_ab,
+    stride_in_am,
+    stride_in_ak,
+    stride_in_bb,
+    stride_in_bk,
+    stride_in_bn,
+    stride_in_cb,
+    stride_in_ck,
+    stride_in_cm,
+    stride_in_cn,
+    stride_in_asb,
+    stride_in_asm,
+    stride_in_ask,
+    stride_in_bsb,
+    stride_in_bsn,
+    stride_in_bsk,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -74,21 +74,21 @@ def _batched_gemm_afp4_wfp4_kernel(
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
 
-    tl.assume(stride_ab > 0)
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bb > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_cb > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
-    tl.assume(stride_asb > 0)
-    tl.assume(stride_asm > 0)
-    tl.assume(stride_ask > 0)
-    tl.assume(stride_bsb > 0)
-    tl.assume(stride_bsk > 0)
-    tl.assume(stride_bsn > 0)
+    tl.assume(stride_in_ab > 0)
+    tl.assume(stride_in_am > 0)
+    tl.assume(stride_in_ak > 0)
+    tl.assume(stride_in_bb > 0)
+    tl.assume(stride_in_bk > 0)
+    tl.assume(stride_in_bn > 0)
+    tl.assume(stride_in_cb > 0)
+    tl.assume(stride_in_cm > 0)
+    tl.assume(stride_in_cn > 0)
+    tl.assume(stride_in_asb > 0)
+    tl.assume(stride_in_asm > 0)
+    tl.assume(stride_in_ask > 0)
+    tl.assume(stride_in_bsb > 0)
+    tl.assume(stride_in_bsk > 0)
+    tl.assume(stride_in_bsn > 0)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -103,10 +103,27 @@ def _batched_gemm_afp4_wfp4_kernel(
     # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
     # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
     # See https://github.com/ROCm/aiter/pull/597 for rationale
-    stride_ab = tl.cast(stride_ab, tl.int64)
-    stride_bb = tl.cast(stride_bb, tl.int64)
-    stride_cb = tl.cast(stride_cb, tl.int64)
-    pid_batch = tl.cast(pid_batch, tl.int64)
+    # stride_ab = tl.cast(stride_ab, tl.int64)
+    # stride_bb = tl.cast(stride_bb, tl.int64)
+    # stride_cb = tl.cast(stride_cb, tl.int64)
+    # pid_batch = tl.cast(pid_batch, tl.int64)
+
+    stride_ab  = tl.cast(stride_in_ab, tl.int64)
+    stride_am  = tl.cast(stride_in_am, tl.int64)
+    stride_ak  = tl.cast(stride_in_ak, tl.int64)
+    stride_bb  = tl.cast(stride_in_bb, tl.int64)
+    stride_bk  = tl.cast(stride_in_bk, tl.int64)
+    stride_bn  = tl.cast(stride_in_bn, tl.int64)
+    stride_cb  = tl.cast(stride_in_cb, tl.int64)
+    stride_ck  = tl.cast(stride_in_ck, tl.int64)
+    stride_cm  = tl.cast(stride_in_cm, tl.int64)
+    stride_cn  = tl.cast(stride_in_cn, tl.int64)
+    stride_asb = tl.cast(stride_in_asb, tl.int64)
+    stride_asm = tl.cast(stride_in_asm, tl.int64)
+    stride_ask = tl.cast(stride_in_ask, tl.int64)
+    stride_bsb = tl.cast(stride_in_bsb, tl.int64)
+    stride_bsk = tl.cast(stride_in_bsk, tl.int64)
+    stride_bsn = tl.cast(stride_in_bsn, tl.int64)
 
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
