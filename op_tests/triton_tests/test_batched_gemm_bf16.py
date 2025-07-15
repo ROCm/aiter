@@ -10,6 +10,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 from typing import Union
 
+
 def generate_batched_gemm_a16w16_inputs(
     B: int,
     M: int,
@@ -24,7 +25,7 @@ def generate_batched_gemm_a16w16_inputs(
         x = torch.randint(-20, 20, (B, M, K), dtype=dtype).cuda()
     else:
         x = torch.randint(-20, 20, (B, K, M), dtype=dtype).cuda().permute(0, 2, 1)
-    
+
     if layout[1] == "N":
         weight = torch.randint(-20, 20, (B, N, K), dtype=dtype).cuda()
     else:
@@ -37,6 +38,7 @@ def generate_batched_gemm_a16w16_inputs(
         y = torch.empty((B, M, N), dtype=dtype, device=x.device)
 
     return x, weight, bias, y
+
 
 def run_torch(x, weight, bias=None, dtype=torch.bfloat16):
     B = x.size(0)

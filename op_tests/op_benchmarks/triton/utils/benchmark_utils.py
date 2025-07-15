@@ -28,7 +28,7 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     if args.shape:
         x_vals_list = [args.shape]
     else:
-        x_vals_list = get_x_vals(dims = len(x_names))
+        x_vals_list = get_x_vals(dims=len(x_names))
 
     if args.metric == "time":
         ylabel = "Time (ms)"
@@ -147,7 +147,7 @@ def get_x_vals(dims: int):
         (16384, 1280, 8192),
     ]
     if dims == 4:
-        x_vals = [tuple(list(i) + [16]) for i in x_vals] # (M, N, K, B)
+        x_vals = [tuple(list(i) + [16]) for i in x_vals]  # (M, N, K, B)
     return x_vals
 
 

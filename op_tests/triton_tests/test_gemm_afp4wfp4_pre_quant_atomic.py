@@ -151,7 +151,9 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
-    x, w, x_scales, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K, dtype=dtype, output=output)
+    x, w, x_scales, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(
+        M, N, K, dtype=dtype, output=output
+    )
     if output:
         gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype, y)
     else:

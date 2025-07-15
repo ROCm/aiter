@@ -6,7 +6,9 @@ import math
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
     gemm_afp4wfp4_pre_quant,
 )
-from op_tests.triton_tests.test_gemm_afp4wfp4_pre_quant_atomic import generate_gemm_afp4wfp4_pre_quant_inputs
+from op_tests.triton_tests.test_gemm_afp4wfp4_pre_quant_atomic import (
+    generate_gemm_afp4wfp4_pre_quant_inputs,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
@@ -17,6 +19,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
+
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
@@ -40,9 +43,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: gemm_afp4wfp4_pre_quant(
-            x, w, x_scale, w_scale, c_dtype, y
-        ),
+        lambda: gemm_afp4wfp4_pre_quant(x, w, x_scale, w_scale, c_dtype, y),
         warmup=25,
         rep=100,
     )

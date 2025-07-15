@@ -44,6 +44,7 @@ MXFP4_TABLE = [
     -6.0,  # 1111
 ]
 
+
 def generate_gemm_a8wfp4_inputs(
     M: int,
     N: int,
@@ -64,16 +65,12 @@ def generate_gemm_a8wfp4_inputs(
     y = None
     if output:
         if ZERO_OUTPUT:
-            y = torch.zeros(
-                M, N, device=x.device, dtype=out_dtype
-            )
+            y = torch.zeros(M, N, device=x.device, dtype=out_dtype)
         else:
-            y = torch.empty(
-                M, N, device=x.device, dtype=out_dtype
-            )
+            y = torch.empty(M, N, device=x.device, dtype=out_dtype)
     return x, w, x_scales, w_scales, x_fp32, w_fp32, y
 
-    
+
 def generate_fp32_tensors(M, N, K, debug_type):
     """Generate fp32 tensors based on debug input type"""
     if debug_type == INPUT_TYPE.ONES:
@@ -351,7 +348,9 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(M, N, K, a_dtype, out_dtype, output=True)
+    x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(
+        M, N, K, a_dtype, out_dtype, output=True
+    )
 
     torch_ref_out = torch.mm(x_fp32, w_fp32.T).to(out_dtype)
     if DEBUG:
