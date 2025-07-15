@@ -870,10 +870,8 @@ flash_mla_fwd_prefill_with_kvcache_impl(torch::Tensor& query_nope,
                                         const float softmax_scale,
                                         const bool is_causal,
                                         std::optional<torch::Tensor>& query_rope,
-                                        const std::optional<torch::Tensor>& key_rope_cache,
-                                        std::optional<torch::Tensor>& out)
+                                        const std::optional<torch::Tensor>& key_rope_cache)
 {
-    (void)out; // TODO: need to support out as an input parameter
     const bool is_rope_separate = query_rope.has_value() && key_rope_cache.has_value();
 
     constexpr bool kKVLoadOnce         = false;
@@ -926,18 +924,52 @@ flash_mla_fwd_prefill_with_kvcache_impl(torch::Tensor& query_nope,
         mask_y_ratio = hq_hk_ratio_ori;
         if constexpr(Traits::kXqaStrategy == XqaStrategy::External)
         {
-            // TODO: If you want to support nope/rope separate and xqa external simultaneously, you
-            // must tansform the q rope tensor.
             hq_hk_ratio = 1;
-            if(num_heads_k == 1)
+            if(!is_rope_separate)
             {
-                query_nope = query_nope.reshape({batch_size, seqlen_q, num_heads_q, head_size_nope});
+                if(num_heads_k == 1)
+                {
+                    query_nope = query_nope.reshape({batch_size, seqlen_q, num_heads_q, head_size});
+                }
+                else
+                {
+                    query_nope =
+                        query_nope
+                            .view(
+                                {batch_size, seqlen_q_ori, num_heads_q, hq_hk_ratio_ori, head_size})
+                            .transpose(2, 3)
+                            .reshape({batch_size, seqlen_q, num_heads_q, head_size});
+                }
             }
             else
             {
-                query_nope = query_nope.view({batch_size, seqlen_q_ori, num_heads_q, hq_hk_ratio_ori, head_size_nope})
+                if(num_heads_k == 1)
+                {
+                    query_nope =
+                        query_nope.reshape({batch_size, seqlen_q, num_heads_q, head_size_nope});
+                    query_rope.value() = query_rope.value().reshape(
+                        {batch_size, seqlen_q, num_heads_q, head_size_rope});
+                }
+                else
+                {
+                    query_nope = query_nope
+                                     .view({batch_size,
+                                            seqlen_q_ori,
+                                            num_heads_q,
+                                            hq_hk_ratio_ori,
+                                            head_size_nope})
+                                     .transpose(2, 3)
+                                     .reshape({batch_size, seqlen_q, num_heads_q, head_size_nope});
+                    query_rope.value() =
+                        query_rope.value()
+                            .view({batch_size,
+                                   seqlen_q_ori,
+                                   num_heads_q,
+                                   hq_hk_ratio_ori,
+                                   head_size_rope})
                             .transpose(2, 3)
-                            .reshape({batch_size, seqlen_q, num_heads_q, head_size_nope});
+                            .reshape({batch_size, seqlen_q, num_heads_q, head_size_rope});
+                }
             }
         }
     }
@@ -959,11 +991,11 @@ flash_mla_fwd_prefill_with_kvcache_impl(torch::Tensor& query_nope,
     params.p_seqlens_k   = cache_seqlens.data_ptr<int32_t>();
     params.p_block_table = block_table.data_ptr<int32_t>();
 
-    params.p_query_nope            = query_nope.data_ptr();
-    params.p_key_nope              = key_nope_cache.data_ptr();
-    params.p_value            = vcache.data_ptr();
-    params.p_output           = output.data_ptr();
-    params.p_softmax_lse      = softmax_lse.data_ptr();
+    params.p_query_nope  = query_nope.data_ptr();
+    params.p_key_nope    = key_nope_cache.data_ptr();
+    params.p_value       = vcache.data_ptr();
+    params.p_output      = output.data_ptr();
+    params.p_softmax_lse = softmax_lse.data_ptr();
 
     params.size_b                   = batch_size;
     params.size_s_pk                = seqlen_q;

@@ -209,7 +209,6 @@ CK_TILE_DEVICE static void kn_fmla_fwd_splitkv_prefill_tile(
 {
     using Policy = FlashMlaPrefillPolicy<Traits, scalar_t, acc_t>;
 
-    static_assert(!(kIsRopeSeparate && Traits::kXqaStrategy == XqaStrategy::External));
     // 1. Allocate LDS
     //
     auto k_lds = ck_tile::make_tensor_view<ck_tile::address_space_enum::lds>(
