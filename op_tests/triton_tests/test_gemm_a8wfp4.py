@@ -65,16 +65,15 @@ def generate_gemm_a8wfp4_inputs(
     if output:
         if ZERO_OUTPUT:
             y = torch.zeros(
-                x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
+                M, N, device=x.device, dtype=out_dtype
             )
         else:
             y = torch.empty(
-                x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
+                M, N, device=x.device, dtype=out_dtype
             )
     return x, w, x_scales, w_scales, x_fp32, w_fp32, y
 
     
-
 def generate_fp32_tensors(M, N, K, debug_type):
     """Generate fp32 tensors based on debug input type"""
     if debug_type == INPUT_TYPE.ONES:
