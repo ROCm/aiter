@@ -6,6 +6,7 @@ import pytest
 from enum import Enum
 from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
 import aiter.ops.triton.utils.arch_info as arch_info
+from typing import Union
 
 # Debug
 DEBUG = False
@@ -43,6 +44,36 @@ MXFP4_TABLE = [
     -6.0,  # 1111
 ]
 
+def generate_gemm_a8wfp4_inputs(
+    M: int,
+    N: int,
+    K: int,
+    a_dtype: Union[torch.dtype, str],
+    out_dtype: Union[torch.dtype, str],
+    output: bool = False,
+    layout: str = "TN",
+):
+    # generate fp32 tensors first
+    x_fp32, w_fp32 = generate_fp32_tensors(M, N, K, INPUT_TYPE)
+
+    # quantize to 8-bit and fp4
+    x, x_scales = quantize_to_8bit(x_fp32, a_dtype)
+    w, w_scales = quantize_to_fp4(w_fp32)  # generate_random_fp4_inputs(N, K)
+    assert x.shape[1] == w.shape[1] * 2
+
+    y = None
+    if output:
+        if ZERO_OUTPUT:
+            y = torch.zeros(
+                x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
+            )
+        else:
+            y = torch.empty(
+                x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
+            )
+    return x, w, x_scales, w_scales, x_fp32, w_fp32, y
+
+    
 
 def generate_fp32_tensors(M, N, K, debug_type):
     """Generate fp32 tensors based on debug input type"""
@@ -321,19 +352,14 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
-    # generate fp32 tensors first
-    x_fp32, w_fp32 = generate_fp32_tensors(M, N, K, INPUT_TYPE)
+    x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(M, N, K, a_dtype, out_dtype, output=True)
+
     torch_ref_out = torch.mm(x_fp32, w_fp32.T).to(out_dtype)
     if DEBUG:
         print()
         print("x_fp32:", x_fp32, x_fp32.shape)
         print("w_fp32:", w_fp32, w_fp32.shape)
         print("torch_ref_out:", torch_ref_out, torch_ref_out.shape)
-
-    # quantize to 8-bit and fp4
-    x, x_scales = quantize_to_8bit(x_fp32, a_dtype)
-    w, w_scales = quantize_to_fp4(w_fp32)  # generate_random_fp4_inputs(N, K)
-    assert x.shape[1] == w.shape[1] * 2
 
     if DEBUG:
         print()
@@ -375,18 +401,10 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True
     if DEBUG:
         print("torch_emulated_out", torch_emulated_out, torch_emulated_out.shape)
 
-    if ZERO_OUTPUT:
-        triton_out = torch.zeros(
-            x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
-        )
-    else:
-        triton_out = torch.empty(
-            x.shape[0], w.shape[0], device=x.device, dtype=out_dtype
-        )
-    gemm_a8wfp4(x, w, triton_out, x_scales, w_scales, out_dtype)
+    gemm_a8wfp4(x, w, y, x_scales, w_scales, out_dtype)
     if DEBUG:
-        print("triton_out:", triton_out, triton_out.shape)
+        print("triton_out:", y, y.shape)
 
     torch.testing.assert_close(
-        torch_emulated_out, triton_out, atol=0.01, rtol=1e-2, equal_nan=True
+        torch_emulated_out, y, atol=0.01, rtol=1e-2, equal_nan=True
     )
