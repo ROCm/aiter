@@ -16,7 +16,7 @@ def generate_batched_gemm_a16w16_inputs(
     N: int,
     K: int,
     dtype: Union[torch.dtype, str],
-    output=bool,
+    output: bool,
     layout: str = "TN",
 ):
     dtype = str_to_torch_dtype[dtype]
