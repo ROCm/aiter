@@ -3,10 +3,11 @@
 
 import math
 import random
-import time
 import pytest
 import torch
+import triton
 from aiter.ops.triton.pa_prefill import context_attention_fwd
+
 
 STR_DTYPE_TO_TORCH_DTYPE = {
     "half": torch.half,
@@ -18,11 +19,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 }
 
 
-def seed_everything(seed):
-    random.seed(seed)
-    torch.manual_seed(seed)
-
-
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 8, 64]
 HEAD_SIZES = [128, 96, 24]
@@ -30,6 +26,129 @@ DTYPES = [torch.float16]
 CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
 SLIDING_WINDOW = [0, 16, 64, 128, 256, 512, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8", "fp8_e5m2"]
+
+
+def context_attention_fwd_torch(
+    query,  # [num_tokens, H, D]
+    k,  # [num_tokens, Hkv, D]
+    v,  # [num_tokens, Hkv, D]
+    output,  # [num_tokens, H, D]
+    k_cache,  # [B, Hkv, D/8, Blk_sz, 8]
+    v_cache,  # [B, Hkv, D, Blk_sz]
+    b_start_loc,  # [B+1]
+    b_seq_len,  # [B]
+    k_scale,
+    v_scale,
+    alibi_slopes=None,
+    sliding_window=None,
+    sm_scale=None,
+):
+    # Setup
+    num_blocks = b_seq_len.shape[0]
+    head_dim = query.shape[-1]
+    num_heads = query.shape[1]
+    num_kv_heads = k.shape[1]
+    num_queries_per_kv = num_heads // num_kv_heads
+    device = query.device
+
+    # Softmax scale fallback
+    if sm_scale is None:
+        sm_scale = 1.0 / (head_dim**0.5)
+
+    is_kv_cache_fp8 = k_cache.dtype == torch.uint8
+
+    # Cast all inputs to float32
+    query = query.to(torch.float32)
+    k = k.to(torch.float32)
+    v = v.to(torch.float32)
+    k_cache = k_cache.to(torch.float32)
+    v_cache = v_cache.to(torch.float32)
+
+    for b in range(num_blocks):
+        q_start = b_start_loc[b]
+        q_end = b_start_loc[b + 1]
+        q_len = q_end - q_start
+        ctx_len = b_seq_len[b] - q_len
+
+        q = query[q_start:q_end]  # [q_len, H, D]
+        k_local = k[q_start:q_end]  # [q_len, Hkv, D]
+        v_local = v[q_start:q_end]  # [q_len, Hkv, D]
+
+        for h in range(num_heads):
+            kv_h = h // num_queries_per_kv
+
+            qh = q[:, h]  # [q_len, D]
+
+            kc = k_cache[:, kv_h]  # [B, D//8, Blk_sz, 8]
+            kc = kc.permute(0, 2, 1, 3).reshape(-1, head_dim)  # [B * Blk_sz, D]
+            kc = kc[:ctx_len]  # [ctx_len, D]
+
+            vc = v_cache[:, kv_h]  # [B, D, Blk_sz]
+            vc = vc.permute(0, 2, 1).reshape(-1, head_dim)  # [B * Blk_sz, D]
+            vc = vc[:ctx_len]  # [ctx_len, D]
+
+            if is_kv_cache_fp8:
+                kc = kc * k_scale
+                vc = vc * v_scale
+
+            # Compute query against context
+            qk_ctx = torch.matmul(qh, kc.T)
+            qk_ctx *= sm_scale
+
+            if sliding_window and sliding_window > 0:
+                q_pos = torch.arange(ctx_len, ctx_len + q_len, device=device)
+                k_pos = torch.arange(ctx_len, device=device)
+                rel_dist = q_pos[:, None] - k_pos[None, :]
+                qk_ctx = qk_ctx.masked_fill(rel_dist >= sliding_window, -1e4)
+
+            if alibi_slopes is not None:
+                alibi_slope = alibi_slopes[h]
+                q_pos = torch.arange(ctx_len, ctx_len + q_len, device=device)[:, None]
+                k_pos = torch.arange(ctx_len, device=device)[None, :]
+                rel_pos = k_pos - q_pos
+                alibi_bias = rel_pos.to(torch.float32) * alibi_slope
+                mask = (rel_pos <= 0) & (q_pos < b_seq_len[b])
+                alibi_bias = torch.where(mask, alibi_bias, float("-inf"))
+                qk_ctx += alibi_bias
+
+            p_ctx = torch.softmax(qk_ctx, dim=-1)
+            acc = torch.matmul(p_ctx, vc)
+
+            # Compute query against itself (with causal mask)
+            kh = k_local[:, kv_h]  # [q_len, D]
+            vh = v_local[:, kv_h]  # [q_len, D]
+
+            qk_self = torch.matmul(qh, kh.T)
+            qk_self *= sm_scale
+
+            causal_mask = torch.triu(
+                torch.ones(q_len, q_len, dtype=torch.bool, device=device), 1
+            )
+            qk_self = qk_self.masked_fill(causal_mask, float("-inf"))
+
+            if sliding_window and sliding_window > 0:
+                q_pos = torch.arange(q_len, device=device)
+                k_pos = torch.arange(q_len, device=device)
+                rel_dist = q_pos[:, None] - k_pos[None, :]
+                qk_self = qk_self.masked_fill(rel_dist >= sliding_window, -10000)
+
+            if alibi_slopes is not None:
+                alibi_slope = alibi_slopes[h]
+                q_pos = torch.arange(q_len, device=device)[:, None]
+                k_pos = torch.arange(q_len, device=device)[None, :]
+                rel_pos = k_pos - q_pos
+                alibi_bias = rel_pos.to(torch.float32) * alibi_slope
+                mask = (rel_pos <= 0) & (q_pos < q_len)
+                alibi_bias = torch.where(mask, alibi_bias, float("-inf"))
+                qk_self += alibi_bias
+
+            p_self = torch.softmax(qk_self, dim=-1)
+            acc_self = torch.matmul(p_self, vh)
+
+            # Output
+            acc_total = acc + acc_self
+            output[q_start:q_end, h] = acc_total.to(output.dtype)
+    return
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -54,6 +173,11 @@ def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
         )
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def input_helper(
@@ -192,7 +316,6 @@ def input_helper(
         )
 
 
-# TODO: Implement a test reference and compare it to the Triton output
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("num_queries_per_kv", NUM_QUERIES_PER_KV)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -239,14 +362,15 @@ def test_contexted_kv_attention(
         device=device,
         use_alibi_slope=False,
     )
+    output_torch = torch.empty_like(output)
+    output_triton = output
 
-    # Warm up the Triton kernel by calling it once before actually measuring
-    # generation time
+    # Run Triton
     context_attention_fwd(
         query,
         k,
         v,
-        output,
+        output_triton,
         kv_cache_dtype,
         k_cache,
         v_cache,
@@ -258,30 +382,24 @@ def test_contexted_kv_attention(
         v_scale,
         sliding_window=sliding_window,
     )
-    torch.cuda.synchronize()
-    start_time = time.time()
-    context_attention_fwd(
+    # Run Torch
+    context_attention_fwd_torch(
         query,
         k,
         v,
-        output,
-        kv_cache_dtype,
+        output_torch,
         k_cache,
         v_cache,
-        block_table,
         b_start_loc,
         b_seq_len,
-        max_input_len,
         k_scale,
         v_scale,
         sliding_window=sliding_window,
     )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    print(f"triton Time: {(end_time - start_time)*1000:.2f} ms")
+
+    triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
 
 
-# TODO: Implement a test reference and compare it to the Triton output
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("num_queries_per_kv", NUM_QUERIES_PER_KV)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -326,14 +444,15 @@ def test_contexted_kv_attention_alibi(
         device=device,
         use_alibi_slope=True,
     )
+    output_torch = torch.empty_like(output)
+    output_triton = output
 
-    # Warm up the Triton kernel by calling it once before actually measuring
-    # generation time
+    # Run Triton
     context_attention_fwd(
         query,
         k,
         v,
-        output,
+        output_triton,
         kv_cache_dtype,
         k_cache,
         v_cache,
@@ -345,24 +464,19 @@ def test_contexted_kv_attention_alibi(
         v_scale,
         alibi_slopes=alibi_slopes,
     )
-    torch.cuda.synchronize()
-    start_time = time.time()
-    context_attention_fwd(
+    # Run Torch
+    context_attention_fwd_torch(
         query,
         k,
         v,
-        output,
-        kv_cache_dtype,
+        output_torch,
         k_cache,
         v_cache,
-        block_table,
         b_start_loc,
         b_seq_len,
-        max_input_len,
         k_scale,
         v_scale,
         alibi_slopes=alibi_slopes,
     )
-    torch.cuda.synchronize()
-    end_time = time.time()
-    print(f"triton Time: {(end_time - start_time)*1000:.2f} ms")
+
+    triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
