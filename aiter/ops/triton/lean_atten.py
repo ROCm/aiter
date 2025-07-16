@@ -497,7 +497,7 @@ def la_persistent(
         if host_block:  # and finishing_block:
             # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
             # in a single CTA and so can directly store its results from LeanTile() in global memory without any reduction
-            acc_reshaped = tl.reshape(acc, (BLOCK_M, 2, HEAD_DIM// 2))
+            acc_reshaped = tl.reshape(acc, (BLOCK_M, 2, HEAD_DIM // 2))
             acc_permuted = tl.permute(acc_reshaped, (0, 2, 1))
             acc0, acc1 = tl.split(acc_permuted)
 
@@ -550,7 +550,8 @@ def la_persistent(
                         Op
                         + cta * stride_oph
                         + offs_m[:, None] * stride_opm
-                        + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_opn
+                        + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
+                        * stride_opn
                     )
 
                     m_cta = tl.load(mp_ptrs)
