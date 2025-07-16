@@ -9,7 +9,7 @@ from setuptools import setup
 
 # !!!!!!!!!!!!!!!! never import aiter
 # from aiter.jit import core
-this_dir = os.path.dirname(os.path.abspath(__file__))
+this_dir =os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/aiter/")
 from jit import core
 from jit.utils.cpp_extension import (
