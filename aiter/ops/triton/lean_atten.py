@@ -81,7 +81,6 @@ def persistent_lean_attention(
         N_CTX_K,
         H,
         H,
-        HEAD_DIM_Q,
         BLOCK_M,
         BLOCK_N,
         total_programs,
@@ -99,6 +98,8 @@ def persistent_lean_attention(
     o = torch.empty_like(q, dtype=v.dtype)
 
     la_kernel = la_persistent[grid](
+        False,
+        0,
         q,
         k,
         v,
@@ -155,7 +156,6 @@ def get_num_splits_and_buffer_sizes(
     max_seqlen_k,
     num_heads,
     num_heads_k,
-    head_size,
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -244,6 +244,8 @@ def find_group(x, MASKED_BLOCKS):
 
 @triton.jit
 def la_persistent(
+    is_pod,
+    pod_pid,
     Q,
     K,
     V,
@@ -283,7 +285,10 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
 ):
-    current_pid = tl.program_id(0)
+    if is_pod:
+        current_pid = pod_pid
+    else:
+        current_pid = tl.program_id(0)
 
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
