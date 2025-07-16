@@ -175,7 +175,9 @@ l_dtype = ["bf16"]
 l_m = [1, 7, 31, 64, 128, 256, 163840]
 l_expert = [32, 256]
 l_topk = [5, 8]
-padding_token = 1000
+l_padding_token = [0, 1000]
+l_expert_mask = [False, True]
+l_dispatch_policy = [0, 1]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -228,6 +230,24 @@ parser.add_argument(
     help="""Number of padding token.
     e.g.: -t 0""",
 )
+parser.add_argument(
+    "-dp",
+    "--dispatch_policy",
+    type=int,
+    choices=[0, 1, 2],
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Number of padding token.
+    e.g.: -t 0""",
+)
+parser.add_argument(
+    "-em",
+    "--epert_mask",
+    action="store_true",
+    default=None,
+    help="""Add expert mask to the test.""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -241,75 +261,35 @@ if args.expert is not None:
 if args.topk is not None:
     l_topk = [args.topk]
 if args.padding is not None:
-    padding_token = args.padding
+    l_padding_token = [args.padding]
+if args.dispatch_policy is not None:
+    l_dispatch_policy = [args.dispatch_policy]
+if args.epert_mask is not None:
+    l_expert_mask = [args.epert_mask]
 
-df = []
-print("test test_moe_sorting, no expert mask, no padding_token, dispatch_policy=0")
-for dtype in l_dtype:
-    for m in l_m:
-        for E in l_expert:
-            for top in l_topk:
-                ret = test_moe_sorting(dtype, m, 7168, 4096, E, top)
-                df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+l_expert_topk = [(l_expert[i], l_topk[i]) for i in range(len(l_expert))]
 
-
-df = []
-print("test test_moe_sorting, with expert mask, no padding_token, dispatch_policy=0")
-for dtype in l_dtype:
-    for m in l_m:
-        for E in l_expert:
-            for top in l_topk:
-                ret = test_moe_sorting(
-                    dtype, m, 4096, 4096, E, top, has_expert_mask=True
-                )
-                df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
-
-
-df = []
-print("test test_moe_sorting, with expert mask, with padding_token, dispatch_policy=0")
-for dtype in l_dtype:
-    for m in l_m:
-        for E in l_expert:
-            for top in l_topk:
-                ret = test_moe_sorting(
-                    dtype,
-                    m,
-                    4096,
-                    4096,
-                    E,
-                    top,
-                    has_expert_mask=True,
-                    padding_token=padding_token,
-                    dispatch_policy=0,
-                )
-                df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
-
-
-df = []
-print(
-    "test test_moe_sorting, with expert mask, with padding_token, dispatch_policy=1 (use single kernel)"
-)
-for dtype in l_dtype:
-    for m in l_m:
-        for E in l_expert:
-            for top in l_topk:
-                ret = test_moe_sorting(
-                    dtype,
-                    m,
-                    4096,
-                    4096,
-                    E,
-                    top,
-                    has_expert_mask=True,
-                    padding_token=padding_token,
-                    dispatch_policy=1,
-                )
-                df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+for padding_token in l_padding_token:
+    for expert_mask in l_expert_mask:
+        for dispatch_policy in l_dispatch_policy:
+            df = []
+            print(
+                f"test test_moe_sorting, expert mask:{expert_mask}, padding_token:{padding_token}, dispatch_policy={dispatch_policy}"
+            )
+            for dtype in l_dtype:
+                for m in l_m:
+                    for E, top in l_expert_topk:
+                        ret = test_moe_sorting(
+                            dtype,
+                            m,
+                            4096,
+                            4096,
+                            E,
+                            top,
+                            has_expert_mask=expert_mask,
+                            padding_token=padding_token,
+                            dispatch_policy=dispatch_policy,
+                        )
+                        df.append(ret)
+            df = pd.DataFrame(df)
+            aiter.logger.info(f"summary:\n{df}")
