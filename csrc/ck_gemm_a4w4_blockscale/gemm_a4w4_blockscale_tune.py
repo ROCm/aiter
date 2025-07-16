@@ -81,6 +81,34 @@ def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK
     return out[:m]
 
 
+def run_gemm_a4w4_blockscale_asm(
+    x,
+    weight_shuffle,
+    x_scale,
+    w_scale,
+    out,
+    bias,
+    dtype=dtypes.bf16,
+    bpreshuffle=True,
+    splitK=None,
+):
+    m, k = x.shape
+    out_reset = torch.zeros(
+        (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtype
+    )
+    aiter.gemm_a4w4_asm(
+        x,
+        weight_shuffle,
+        x_scale,
+        w_scale,
+        out_reset,
+        bias,
+        bpreshuffle=bpreshuffle,
+        log2_k_split=splitK,
+    )
+    return out[:m]
+
+
 def generate_data(m, n, k, useSplitK=False, dtype=dtypes.fp16):
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((m, k), dtype=dtype)
@@ -93,6 +121,7 @@ def generate_data(m, n, k, useSplitK=False, dtype=dtypes.fp16):
     out_ck = torch.empty((m + 255) // 256 * 256, n, dtype=dtype)
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
+    bias_f32 = torch.zeros(m, n, dtype=dtype)
     return (
         x,
         w,
@@ -102,11 +131,18 @@ def generate_data(m, n, k, useSplitK=False, dtype=dtypes.fp16):
         x_scales_shuffle,
         w_scales_shuffle,
         out_ck,
+        bias_f32,
     )
 
 
 def tune_gemm_list(
-    untunedf, tunedf, issorted=False, useSplitK=False, mp_num=1, shape_grouped=False
+    untunedf,
+    tunedf,
+    issorted=False,
+    useSplitK=False,
+    mp_num=1,
+    shape_grouped=False,
+    errRatio=0.05,
 ):
     from aiter.jit.utils.chip_info import get_gfx
 
@@ -118,7 +154,7 @@ def tune_gemm_list(
     cu_num = device_properties.multi_processor_count
     task = []
     tasks_in_data = []
-    kernels_num = len(kernels_list)
+    ck_kernels_num = len(kernels_list)
     for i in range(len(untunedf)):
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
@@ -132,7 +168,7 @@ def tune_gemm_list(
         ].empty:
             input_data = generate_data(M, N, K)
             total_kernel_nums = 0
-            for i in range(kernels_num):
+            for i in range(ck_kernels_num):
                 kernel = kernels_list[i]
                 maxsplitK = (
                     aiter.compute_gemm_SplitK(
@@ -141,6 +177,7 @@ def tune_gemm_list(
                     if useSplitK
                     else 0
                 )
+                print("ck splitK=", maxsplitK)
                 for splitK in range(maxsplitK + 1):
                     info = ((cu_num, M, N, K), i, splitK)
                     task.append(
@@ -168,25 +205,73 @@ def tune_gemm_list(
                             {},
                             None,
                             1e-2,
-                            0.1,
+                            0.01,
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1
-
+            ### asm kernels
+            asm_kernels_num = 1
+            for i in range(asm_kernels_num):
+                maxsplitK = (
+                    aiter.compute_gemm_SplitK(M, N, K, 128, 512, 256)
+                    if useSplitK
+                    else 0
+                )
+                print("asm maxSplitK=", maxsplitK)
+                for splitK in range(maxsplitK + 1):
+                    info = ((cu_num, M, N, K), ck_kernels_num + 1, splitK)
+                    task.append(
+                        (
+                            info,
+                            run_gemm_a4w4_blockscale_asm,
+                            (
+                                input_data[0],
+                                input_data[4],
+                                input_data[5],
+                                input_data[6],
+                                input_data[7],
+                                input_data[8],
+                                dtypes.bf16,
+                                True,
+                                splitK,
+                            ),
+                            {},
+                            run_torch,
+                            (
+                                input_data[0],
+                                input_data[1],
+                                input_data[2],
+                                input_data[3],
+                                dtypes.fp16,
+                            ),
+                            {},
+                            None,
+                            1e-2,
+                            0.01,
+                        )
+                    )
+                    total_kernel_nums = total_kernel_nums + 1
             tasks_in_data.append((total_kernel_nums, ()))
     if task:
         ret = mp_tuner(task, tasks_in_data, mp_num, False, shape_grouped)
         for el in ret:
             info, time, err_ratio = el
             (cu_num, M, N, K), kernelId, splitK = info
-            kernelName = (
-                "None"
-                if kernelId == -1 or time == "nan"
-                else kernels_list[kernelId].name
-            )
-            print(
-                f"Tuning result for M:{M}, N:{N}, K:{K}, cu_num:{cu_num} is kernelId={kernelId} {kernels_list[kernelId].name} {splitK=}, {time}us"
-            )
+            if kernelId < ck_kernels_num:
+                kernelName = (
+                    "None"
+                    if kernelId == -1 or time == "nan" or kernelId > ck_kernels_num
+                    else kernels_list[kernelId].name
+                )
+
+                print(
+                    f"Tuning result for M:{M}, N:{N}, K:{K}, cu_num:{cu_num} is kernelId={kernelId} {kernels_list[kernelId].name} {splitK=}, {time}us"
+                )
+            else:
+                kernelName = "_asm_bpreshuffle_128x512x256"
+                print(
+                    f"Tuning result for M:{M}, N:{N}, K:{K}, cu_num:{cu_num} is {kernelName} {splitK=}, {time}us"
+                )
             temp = pd.DataFrame(
                 {
                     "M": [M],
@@ -245,16 +330,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "-k", "--splitK", action="store_true", required=False, help="Use splitK kernels"
     )
-
+    # parser.add_argument("-inst", "--instance", type=int, default = 0, help="kernel instance to be tuned: 0 means all instance, 1 means ck instance, 2 means asm instance")
     parser.add_argument(
         "--sort",
         action="store_true",
         required=False,
         help="Arranged according to the M N K size",
     )
+    parser.add_argument(
+        "-err",
+        "--errRatio",
+        type=float,
+        default=0.05,
+        help="tolerable error ratio, default 0.05.",
+    )
 
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
-    tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
+    tunedf = tune_gemm_list(
+        untunedf, tunedf, args.sort, args.splitK, args.mp, args.errRatio
+    )
     tunedf.to_csv(args.tune_file, index=False)

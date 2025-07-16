@@ -51,6 +51,7 @@ def worker(
                 )
                 for el in ref
             ]
+            tol_err_ratio = 0.05
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
@@ -63,7 +64,8 @@ def worker(
                         res[i],
                         atol=atol,
                         rtol=rtol,
-                        printLog=printLog,
+                        tol_err_ratio=tol_err_ratio,
+                        printLog=True,
                         msg=f"info:{info} res[{i}] ",
                     )
                     max_err_ratio = max(max_err_ratio, err_ratio)
@@ -90,12 +92,13 @@ def post_process(rets, fast_mode=False):
     from operator import itemgetter
 
     sorted_rets = tuple(sorted(rets, key=itemgetter(0)))
-
+    tol_err_ratio = 0.01
     cur_info = sorted_rets[0][0]
     bestConfigs = []
     best_config = list(sorted_rets[0])
     for info, us, max_err_ratio in sorted_rets:
-        if max_err_ratio > 0.01:
+        print(f"{info=}, {us=}, {max_err_ratio=}")
+        if max_err_ratio > tol_err_ratio:
             continue
         if info[0] == cur_info[0]:
             if best_time < 0 or us < best_time:
@@ -113,7 +116,7 @@ def post_process(rets, fast_mode=False):
     if (
         best_config[0][1] == -1
         or best_config[1] == float("inf")
-        or best_config[2] > 0.01
+        or best_config[2] > tol_err_ratio
     ):
         print(f"No kernel can be used for {info}")
         best_config[1] = "nan"
