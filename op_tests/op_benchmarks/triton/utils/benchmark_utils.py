@@ -120,8 +120,8 @@ def model_benchmark_shapes(args):
         M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
-            shapes.append((M, config["hidden_size"], config["intermediate_size"]))
+        for model_name, config in configs.items():
+            shapes.append((model_name,M, config["hidden_size"], config["intermediate_size"]))
 
     return shapes
 

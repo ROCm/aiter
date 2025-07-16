@@ -412,7 +412,7 @@ def benchmark(args):
 
         return ms
 
-    bench_MLA.run(save_path=None, print_data=True, show_plots=False)
+    bench_MLA.run(save_path="." if args.o else None, print_data=True, show_plots=False)
     return x_vals_list, x_names, line_vals
 
 
@@ -478,6 +478,12 @@ def parse_args():
         type=str,
         default="extend",
         help="Mode of the benchmark. Options: extend, prefill",
+    )
+    parser.add_argument(
+        "-o",
+        action="store_true",
+        default=False,
+        help="Write performance results to CSV file"
     )
     return parser.parse_args()
 

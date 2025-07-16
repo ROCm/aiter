@@ -18,6 +18,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from aiter.ops.triton.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
 )
+import aiter.ops.triton.utils.arch_info as arch_info
 
 
 def model_benchmark_shapes(args):
@@ -89,7 +90,7 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
+        M, hidden_dim, intermediate_dim, batch, metric, layer,  model_name=None, **kwargs
     ):
         if layer == "fc1":
             if args.no_glu:
@@ -106,7 +107,7 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 
-    bench_batched_gemm_afp4wfp4.run(save_path=".", print_data=True)
+    bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -117,10 +118,10 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4(M, N, K, batch, metric, provider):
+    def bench_batched_gemm_afp4wfp4(M, N, K, batch, metric, provider, model_name=None):
         return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 
-    bench_batched_gemm_afp4wfp4.run(save_path=".", print_data=True)
+    bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -157,6 +158,10 @@ def parse_args():
 
 
 def main():
+    if not (arch_info.is_fp4_avail()):
+        print("MXFP4 is not available on this architecture")
+        sys.exit()
+
     args, defaults = parse_args()
     run_benchmark(args, defaults)
 
