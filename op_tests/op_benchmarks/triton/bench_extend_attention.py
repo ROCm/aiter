@@ -483,7 +483,7 @@ def parse_args():
         "-o",
         action="store_true",
         default=False,
-        help="Write performance results to CSV file"
+        help="Write performance results to CSV file",
     )
     return parser.parse_args()
 

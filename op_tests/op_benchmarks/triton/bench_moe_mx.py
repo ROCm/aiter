@@ -189,10 +189,8 @@ def parse_args():
         choices=["bf16", "fp16", "fp8_e5m2", "mxfp4_e2m1"],
         default="mxfp4_e2m1",
     )
-    parser.add_argument(    
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args

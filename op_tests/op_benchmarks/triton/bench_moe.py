@@ -285,10 +285,8 @@ def parse_args():
     parser.add_argument("-no_bench_stage2", action="store_false", default=True)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-fp8_type", default="e5m2fnuz")
-    parser.add_argument(    
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args

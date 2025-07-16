@@ -101,8 +101,6 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for supporting kernels.",
     )
     parser.add_argument(
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser

@@ -121,7 +121,9 @@ def model_benchmark_shapes(args):
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
-            shapes.append((model_name,M, config["hidden_size"], config["intermediate_size"]))
+            shapes.append(
+                (model_name, M, config["hidden_size"], config["intermediate_size"])
+            )
 
     return shapes
 

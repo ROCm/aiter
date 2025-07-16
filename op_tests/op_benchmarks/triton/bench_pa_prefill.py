@@ -350,10 +350,8 @@ def parse_args():
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("--kv_cache_dtype", default="auto")
     parser.add_argument("--compute_type", default="fp16")
-    parser.add_argument(    
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args

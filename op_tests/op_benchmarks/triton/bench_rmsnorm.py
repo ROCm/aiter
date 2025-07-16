@@ -12,7 +12,9 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 def model_benchmark_shapes(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="llama3" if args.model is None else args.model)
+    configs = get_model_configs(
+        config_path=config_file, models="llama3" if args.model is None else args.model
+    )
     M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
@@ -135,10 +137,8 @@ def parse_args():
         default="bandwidth",
         help="metric to plot",
     )
-    parser.add_argument(    
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args

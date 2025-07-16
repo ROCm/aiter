@@ -90,7 +90,7 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, batch, metric, layer,  model_name=None, **kwargs
+        M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
     ):
         if layer == "fc1":
             if args.no_glu:

@@ -537,9 +537,7 @@ def parse_args():
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
     )
     parser.add_argument(
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser.parse_args()
 
@@ -611,7 +609,6 @@ def main():
 
         print_vgpr(fun, "fused-attention")
         return 0
-
 
     run_benchmark(custom_config, args)
 

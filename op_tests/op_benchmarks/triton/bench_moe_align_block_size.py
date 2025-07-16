@@ -123,10 +123,8 @@ def parse_args():
     parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="M dimension")
     parser.add_argument("-block_size", type=int, default=128)
-    parser.add_argument(    
-        "-o",
-        action="store_true",
-        help="Write performance results to CSV file"
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args

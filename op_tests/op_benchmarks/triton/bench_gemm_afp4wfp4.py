@@ -103,7 +103,9 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs):
+    def bench_gemm_afp4wfp4(
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+    ):
         if layer == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
@@ -125,7 +127,7 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(M, N, K, metric,model_name=None, **kwargs):
+    def bench_gemm_afp4wfp4(M, N, K, metric, model_name=None, **kwargs):
         return bench_gemm_fn(M, N, K, metric, args.layout)
 
     bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)

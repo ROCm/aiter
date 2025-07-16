@@ -83,7 +83,7 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4_pre_quant(
-        M, hidden_dim, intermediate_dim, batch, metric, layer,  model_name=None, **kwargs
+        M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
     ):
         if layer == "fc1":
             if args.no_glu:
@@ -100,7 +100,9 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(save_path="." if args.o else None, print_data=True)
+    bench_batched_gemm_afp4wfp4_pre_quant.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def run_shape_benchmark(args):
@@ -111,10 +113,14 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(M, N, K, batch, metric, provider, model_name=None):
+    def bench_batched_gemm_afp4wfp4_pre_quant(
+        M, N, K, batch, metric, provider, model_name=None
+    ):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(save_path="." if args.o else None, print_data=True)
+    bench_batched_gemm_afp4wfp4_pre_quant.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def run_benchmark(args, defaults):
