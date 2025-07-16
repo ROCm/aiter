@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional, Dict
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
 
-from typing import Optional
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
@@ -1005,6 +1009,19 @@ def _bwd_kernel_dkdvdq_noncausal(
     tl.store(DK + adj_dkdv, dk, mask=mask_kv)
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHA-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict["bkwd_fused"]
+
+
 def flash_attn_fused_backward(
     do: torch.Tensor,
     q: torch.Tensor,
@@ -1031,6 +1048,7 @@ def flash_attn_fused_backward(
     descale_v: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
+    config: Optional[Dict[str, any]] = None,
 ):
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
@@ -1104,8 +1122,14 @@ def flash_attn_fused_backward(
 
     # preprocess
     # compute D(delta) = rowsum(dO*O). Note, multiplication is element-wise.
-    PRE_BLOCK = 128
-    pre_grid = (triton.cdiv(max_seqlen_q, PRE_BLOCK), batch, num_q_heads)
+    if config is None:
+        config = _get_config()
+
+    pre_grid = (
+        triton.cdiv(max_seqlen_q, config["preprocess_kernel"]["PRE_BLOCK"]),
+        batch,
+        num_q_heads,
+    )
 
     _bwd_preprocess[pre_grid](
         o,
@@ -1117,7 +1141,7 @@ def flash_attn_fused_backward(
         cu_seqlens_q,
         max_seqlen_q,
         descale_do,
-        BLOCK_M=PRE_BLOCK,
+        BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
         BLOCK_D_MODEL=head_sz,
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
@@ -1137,20 +1161,14 @@ def flash_attn_fused_backward(
         dropout_strides = (0, 0, 0, 0)
 
     # Fuses dk,dv and dq computations into one kernel using atomics
-    BLOCK_N = (
-        64 if ((BLOCK_D_MODEL_POW2 > 160) or (q.dtype == torch.float32)) else 128
-    )  # larger head sizes lead to oom
-    config = {
-        "BLOCK_M": 16,
-        "BLOCK_N": BLOCK_N,
-        "num_warps": 8,
-        "num_stages": 1,
-        "waves_per_eu": 2,
-        "BLK_SLICE_FACTOR": 1,
-        "matrix_instr_nonkdim": 16,
-    }
+    if BLOCK_D_MODEL_POW2 > 160 or q.dtype == torch.float32:
+        config_dkdvdq = config["dkdvdq_kernel_N64"]
+    else:
+        config_dkdvdq = config["dkdvdq_kernel_N128"]
 
-    num_k_pids = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
+    num_k_pids = (max_seqlen_k + config_dkdvdq["BLOCK_N"] - 1) // config_dkdvdq[
+        "BLOCK_N"
+    ]
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
     if causal:
         grid_dkdvdq = (batch * num_q_heads * num_k_pids,)
@@ -1199,7 +1217,7 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             NUM_SMS=NUM_SMS,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **config,
+            **config_dkdvdq,
         )
     else:
         # in non causal inner loop over grouped q heads
@@ -1248,7 +1266,7 @@ def flash_attn_fused_backward(
             FP8_MAX=FP8_MAX,
             NUM_SMS=NUM_SMS,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
-            **config,
+            **config_dkdvdq,
         )
 
     return delta
