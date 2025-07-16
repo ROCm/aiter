@@ -8,6 +8,7 @@ import json
 import functools
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+import warnings
 
 M_THRESHOLD_SMALL = 256
 M_THRESHOLD_MEDIUM = 1024
@@ -35,12 +36,6 @@ def get_config_dtype_str(
     return None
 
 
-def get_config_file_name(dtype: Optional[str]) -> str:
-    device_name = torch.cuda.get_device_name(0).replace(" ", "_")
-    dtype_selector = "" if not dtype else f",dtype={dtype}"
-    return f"device_name={device_name}{dtype_selector}.json"
-
-
 @functools.lru_cache
 def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     """
@@ -53,12 +48,9 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
     """
     # First look up if an optimized configuration is available in the configs
     # directory
-    json_file_name = get_config_file_name(dtype)
-
+    dtype_str = "DEFAULT" if dtype is None else dtype
     dev = arch_info.get_device()
-    config_file_path = (
-        f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{json_file_name}.json"
-    )
+    config_file_path = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE-{dtype_str}.json"
 
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
@@ -67,6 +59,9 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
 
     # If no optimized configuration is available, we will use the default
     # configuration
+    warnings.warn(
+        f"No MoE configuration found for device '{dev}' with dtype '{dtype_str}'. Using default configuration."
+    )
     return None
 
 
