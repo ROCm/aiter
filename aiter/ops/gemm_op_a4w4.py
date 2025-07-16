@@ -15,6 +15,19 @@ import pandas as pd
 
 
 @functools.lru_cache(maxsize=1024)
+def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
+    cu_num = get_cu_num()
+    tile_num = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
+    cusPerTile = cu_num / tile_num
+    splitK = 0
+    while cusPerTile >= pow(2, splitK + 1) and (pow(2, splitK + 1) * tile_k) < 2 * K:
+        splitK += 1
+    ## to make sure the precision is not lost, max is 4
+    # return min(splitK, 4)
+    return splitK
+
+
+@functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int):
     if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
         ckgemm_dict = pd.read_csv(

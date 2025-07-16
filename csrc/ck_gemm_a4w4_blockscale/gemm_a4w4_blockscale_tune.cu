@@ -9,7 +9,7 @@
 using BlockwiseKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &)>;
+                  torch::Tensor &, int)>;
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -76,11 +76,11 @@ torch::Tensor gemm_a4w4_blockscale_tune(
 
   if (Y.dtype() == at::ScalarType::Half)
   {
-    blockwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+    blockwise_dispatch<F16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK);
   }
   else if (Y.dtype() == at::ScalarType::BFloat16)
   {
-    blockwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y);
+    blockwise_dispatch<B16>(kernelId)(XQ, WQ, x_scale, w_scale, Y, splitK);
   }
   else
   {
