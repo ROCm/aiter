@@ -759,7 +759,8 @@
           py::arg("num_experts"),                      \
           py::arg("unit_size"),                        \
           py::arg("local_expert_mask") = std::nullopt, \
-          py::arg("num_local_tokens")  = std::nullopt);
+          py::arg("num_local_tokens")  = std::nullopt, \
+          py::arg("dispatch_policy") = 0);
 
 #define NORM_PYBIND                                               \
     m.def("layernorm2d_fwd",                                      \
