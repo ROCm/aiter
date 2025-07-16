@@ -2,14 +2,143 @@ import os
 import json
 import torch
 import triton.language as tl
+import triton
+import warnings
 import sys
 import time
 import tempfile
 import re
-
+import matplotlib.pyplot as plt
 
 # Base directory where configs are located
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
+
+
+def get_shape_benchmark_object(plot_name, args, x_names=None):
+    """
+    Utility function for returning a triton.testing.Benchmark object to populate.
+
+    Note: This is for benchmarking without the --model flag. The distinction
+    comes in the x_names and x_vals: For models, we use hidden_dim and intermediate_dim
+    as args, but if we're just given a shape, we use M, N, K.
+    """
+    if x_names is None:
+        x_names = ["M", "N", "K"]
+
+    if args.shape:
+        x_vals_list = [args.shape]
+    else:
+        x_vals_list = get_x_vals()
+
+    if args.metric == "time":
+        ylabel = "Time (ms)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput (TFLOPS)"
+    elif args.metric == "bandwidth":
+        ylabel = "Bandwidth (GB/s)"
+    else:
+        raise NotImplementedError(f"{args.metric} is not supported")
+
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="provider",
+        line_vals=["Triton"],
+        line_names=["Triton"],
+        styles=[("green", "-")],
+        ylabel=ylabel,
+        plot_name=plot_name,
+        args={"metric": args.metric},
+    )
+    return benchmark
+
+
+def get_model_benchmark_object(
+    plot_name, args, x_names=None, model_benchmark_shapes_fn=None
+):
+    """
+    Utility function for returning a triton.testing.Benchmark object to populate.
+
+    Note: This is for benchmarking models (e.g with the --model arg).
+    """
+    if x_names is None:
+        x_names = ["M", "hidden_dim", "intermediate_dim"]
+    if model_benchmark_shapes_fn is None:
+        model_benchmark_shapes_fn = model_benchmark_shapes
+    if not args.fc1 and not args.fc2:
+        # by default, benchmark both
+        warnings.warn(
+            "No specific layer selected for benchmarking, defaulting to both. To specify a layer, use -fc1 or -fc2."
+        )
+        args.fc1 = True
+        args.fc2 = True
+    x_vals_list = model_benchmark_shapes_fn(args)
+
+    if args.metric == "time":
+        ylabel = "Time (ms)"
+    elif args.metric == "throughput":
+        ylabel = "Throughput (TFLOPS)"
+    elif args.metric == "bandwidth":
+        ylabel = "Bandwidth (GB/s)"
+    else:
+        raise NotImplementedError(f"{args.metric} is not supported")
+
+    line_names = []
+    if args.fc1:
+        line_names.append("fc1")
+    if args.fc2:
+        line_names.append("fc2")
+    line_vals = line_names
+
+    mpl_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    benchmark = triton.testing.Benchmark(
+        x_names=x_names,
+        x_vals=x_vals_list,
+        line_arg="layer",
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=[
+            (mpl_colors[i], "-") for i in range(len(line_names))
+        ],  # match line names to colors
+        ylabel=ylabel,
+        plot_name=plot_name,
+        args={"metric": args.metric},
+    )
+    return benchmark
+
+
+def model_benchmark_shapes(args):
+    config_file = args.model_configs
+    configs = get_model_configs(config_path=config_file, models=args.model)
+    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    shapes = []
+    for M in M_list:
+        for _, config in configs.items():
+            shapes.append((M, config["hidden_size"], config["intermediate_size"]))
+
+    return shapes
+
+
+def get_x_vals():
+    """
+    Get a default set of benchmarking values (M, N, K).
+    """
+    x_vals = [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+    ]
+    return x_vals
 
 
 def get_model_configs(

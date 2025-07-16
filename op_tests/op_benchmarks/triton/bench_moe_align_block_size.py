@@ -1,6 +1,8 @@
 import triton
-import triton.language as tl
-from utils.benchmark_utils import get_model_configs, get_available_models
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+)
 from op_tests.triton_tests.test_moe_align_block_size import input_helper
 import torch
 import argparse

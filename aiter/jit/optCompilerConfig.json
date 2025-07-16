@@ -525,7 +525,8 @@
     "module_rope_general_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_general_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/rope_general_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -537,7 +538,8 @@
     "module_rope_general_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_general_bwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/rope_general_bwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_bwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -549,7 +551,8 @@
     "module_rope_pos_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_pos_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/rope_pos_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/pos_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
