@@ -38,7 +38,9 @@ def model_benchmark_shapes(args):
     return shapes
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str,  model_name=None):
+def bench_gemm_fn(
+    batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
+):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
         batch,
@@ -103,7 +105,7 @@ def run_model_benchmark(args):
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
-        #print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
+        # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 
