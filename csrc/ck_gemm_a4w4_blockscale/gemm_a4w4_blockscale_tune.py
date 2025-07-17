@@ -55,7 +55,9 @@ def get_untuned_gemm_list(untuned_gemm_file):
         untuned_gemm_file
     ), f"Not exist a4w4_untuned_gemm.csv file: {untuned_gemm_file}"
     untunedf = pd.read_csv(untuned_gemm_file)
-    return untunedf
+    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+    return filtered_df
+
 
 
 def get_tuned_gemm_list(tuned_gemm_file):
@@ -96,7 +98,7 @@ def run_gemm_a4w4_blockscale_asm(
     out_reset = torch.zeros(
         (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtype
     )
-    aiter.gemm_a4w4_asm(
+    res = aiter.gemm_a4w4_asm(
         x,
         weight_shuffle,
         x_scale,
@@ -104,12 +106,11 @@ def run_gemm_a4w4_blockscale_asm(
         out_reset,
         bias,
         bpreshuffle=bpreshuffle,
-        log2_k_split=splitK,
     )
-    return out[:m]
+    return res[:m]
 
 
-def generate_data(m, n, k, useSplitK=False, dtype=dtypes.fp16):
+def generate_data(m, n, k, useSplitK=False, dtype=dtypes.bf16):
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((m, k), dtype=dtype)
     w = torch.randn((n, k), dtype=dtype)
@@ -200,7 +201,7 @@ def tune_gemm_list(
                                 input_data[1],
                                 input_data[2],
                                 input_data[3],
-                                dtypes.fp16,
+                                dtypes.bf16,
                             ),
                             {},
                             None,
@@ -217,6 +218,7 @@ def tune_gemm_list(
                     if useSplitK
                     else 0
                 )
+                maxsplitK = 0
                 print("asm maxSplitK=", maxsplitK)
                 for splitK in range(maxsplitK + 1):
                     info = ((cu_num, M, N, K), ck_kernels_num + 1, splitK)
@@ -242,7 +244,7 @@ def tune_gemm_list(
                                 input_data[1],
                                 input_data[2],
                                 input_data[3],
-                                dtypes.fp16,
+                                dtypes.bf16,
                             ),
                             {},
                             None,

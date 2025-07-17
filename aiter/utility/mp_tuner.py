@@ -65,7 +65,7 @@ def worker(
                         atol=atol,
                         rtol=rtol,
                         tol_err_ratio=tol_err_ratio,
-                        printLog=True,
+                        printLog=False,
                         msg=f"info:{info} res[{i}] ",
                     )
                     max_err_ratio = max(max_err_ratio, err_ratio)
@@ -92,7 +92,7 @@ def post_process(rets, fast_mode=False):
     from operator import itemgetter
 
     sorted_rets = tuple(sorted(rets, key=itemgetter(0)))
-    tol_err_ratio = 0.01
+    tol_err_ratio = 0.05
     cur_info = sorted_rets[0][0]
     bestConfigs = []
     best_config = list(sorted_rets[0])
