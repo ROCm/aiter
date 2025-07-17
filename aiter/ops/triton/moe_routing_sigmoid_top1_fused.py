@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.jit
@@ -108,9 +113,28 @@ def _routing_sigmoid_top1_kernel(
     tl.store(topk_weights_ptrs, topk_weights_buffer)
 
 
-def routing_sigmoid_top1(x, w, topk, fused_shared_experts=False):
-    # assert x.dtype == torch.bfloat16
-    # assert w.dtype == torch.bfloat16
+@functools.lru_cache(maxsize=1024)
+def _get_config(M, N, K):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{dev}-MOE_ROUTING_SIGMOID_TOPK1.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    n_key = "N16" if N <= 16 else "N128"
+    m_key = (
+        "xlarge"
+        if M >= 8192
+        else "large" if M >= 4096 else "medium" if M >= 2048 else "small"
+    )
+    return _get_config._config_dict[n_key][m_key]
+
+
+def routing_sigmoid_top1(
+    x, w, topk, fused_shared_experts=False, config: Optional[dict[str, any]] = None
+):
     x = x.view(-1, x.shape[-1])
 
     assert topk == 1
@@ -128,7 +152,7 @@ def routing_sigmoid_top1(x, w, topk, fused_shared_experts=False):
     topk_ids = torch.empty((M, _topk), device=x.device, dtype=torch.int32)
     topk_weights = torch.empty((M, _topk), device=x.device, dtype=torch.float32)
 
-    heuristc_config = get_config_heuristic(M, K, N)
+    config = _get_config(M, N, K)
 
     # Grid size
     def grid(META):
@@ -150,43 +174,10 @@ def routing_sigmoid_top1(x, w, topk, fused_shared_experts=False):
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
-        BLOCK_N=N,  # Set BLOCK_N to N (16)
+        BLOCK_N=N,  # Set BLOCK_N to N
         TOPK=topk,
         FUSED_SHARED_EXPERTS=fused_shared_experts,
-        num_warps=heuristc_config.num_warps,
-        num_stages=heuristc_config.num_stages,
-        num_ctas=heuristc_config.num_ctas,
-        **heuristc_config.kwargs,
+        **config,
     )
-
-    return topk_ids, topk_weights
-
-
-def torch_routing_sigmoid_top1(
-    x, w, topk, fused_shared_experts=False, dummy_ids=None, dummy_weights=None
-):
-    scores = torch.matmul(x, w)  # [M, N]
-
-    scores = torch.sigmoid(scores.to(torch.float32))  # [M, N]
-
-    assert topk == 1
-
-    topk_weights, topk_ids = torch.topk(scores, topk, dim=1)  # [M, topk]
-
-    topk_ids = topk_ids.to(torch.int32)
-    topk_weights = topk_weights.to(torch.float32)
-
-    if fused_shared_experts:
-        topk_ids = torch.cat(
-            [
-                topk_ids,
-                dummy_ids,
-            ],
-            dim=1,
-        )
-        topk_weights = torch.cat(
-            [topk_weights, dummy_weights],
-            dim=1,
-        )
 
     return topk_ids, topk_weights

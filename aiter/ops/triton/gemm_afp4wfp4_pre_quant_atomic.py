@@ -218,14 +218,44 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    # TODO enable and optimize for all configs
-    return _get_config._config_dict[key]["small"]
+    if M < 32:
+        config = _get_config._config_dict[key]["small"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32:
+            config = _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64:
+            config = _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128:
+            config = _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256:
+        config = _get_config._config_dict[key]["large"]
+    else:
+        config = _get_config._config_dict[key]["xlarge"]
+
+    config = config.copy()
+
+    if config["NUM_KSPLIT"] > 1:
+        SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
+            K, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+        )
+
+        config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
+        config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+        config["NUM_KSPLIT"] = NUM_KSPLIT
+    else:
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
+    return config
 
 
 def gemm_afp4wfp4_pre_quant(
     x,
     w,
-    x_scales,
     w_scales,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
@@ -233,9 +263,9 @@ def gemm_afp4wfp4_pre_quant(
 ):
     """
     Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
+    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
     Every 32 elements in the K dimension share one e8m0 scale.
+    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
 
 
     Key parameters:
@@ -259,9 +289,6 @@ def gemm_afp4wfp4_pre_quant(
 
     if config is None:
         config = _get_config(M, N, K)
-
-    config["NUM_KSPLIT"] = 1  # there should be no splik whatsoever
-    config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (  # noqa: E731
         (

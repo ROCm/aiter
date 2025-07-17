@@ -9,6 +9,12 @@ export CK_REPEAT=1
 
 COMMON_ARGS='-v=1'
 
+show_help() {
+    echo "Usage: $0 -a architecture"
+    echo "Current supoorted architecure: gfx942, gfx950"
+    exit 0
+}
+
 run_gfx950_fwd_v3() {
     echo "Start smoke test for gfx 950"
     for perm in 0 1 ; do
@@ -41,10 +47,13 @@ run_gfx942_fwd_v3() {
     done
 }
 
-while getopts ":a:" opt; do
+while getopts ":a:h" opt; do
     case "${opt}" in
         a)
             mode="${OPTARG}"
+            ;;
+        h )
+            show_help
             ;;
         *)
             echo "Invalid option: -$OPTARG" >&2
@@ -54,19 +63,21 @@ while getopts ":a:" opt; do
 done
 
 if [[ -z "$mode" ]]; then
-    echo "Please specify device name by `-a` option" >&2
+    echo "Please specify Device Architecture!" >&2
+    show_help
     exit 1
 fi
 
 case "$mode" in
-    "942")
+    "gfx942")
         run_gfx942_fwd_v3
         ;;
-    "950")
+    "gfx950")
         run_gfx950_fwd_v3
         ;;
     *)
         echo "Unrecognized arch name: '$mode'" >&2
+        echo "Current supoorted architecure: gfx942, gfx950"
         exit 1
         ;;
 esac
