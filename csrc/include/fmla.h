@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
@@ -10,7 +10,7 @@
 //   [1] num_splits:              [batch size + 1]
 // clang-format off
 std::vector<torch::Tensor> get_mla_metadata(
-    const torch::Tensor& p_seqlens_k,               // [batch size]
+    const torch::Tensor& p_seqlens_kv,              // [batch size]
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k
 );
@@ -23,7 +23,8 @@ std::vector<torch::Tensor> flash_mla_fwd_with_kvcache_impl(
     const torch::Tensor&                key_nope_cache,            // [block count, block size,  head count of kv, head dim of qk]
     const torch::Tensor&                value_cache,               // [block count, block size,  head count of kv, head dim of v ]
     const int32_t                       head_size_v,
-    const torch::Tensor&                seqlens_k,                 // [batch size]
+    const torch::Tensor&                seqlens_qo,                // [batch size]
+    const torch::Tensor&                seqlens_kv,                // [batch size]
     const torch::Tensor&                block_table,               // [batch size, max blocks per seq]
     const float                         softmax_scale,
     const bool                          is_causal,
@@ -52,7 +53,8 @@ flash_mla_fwd_prefill_with_kvcache_impl(
     const torch::Tensor&                key_nope_cache,
     const torch::Tensor&                value_cache,
     const int32_t                       head_size_v,
-    const torch::Tensor&                cache_seqlens,
+    const torch::Tensor&                seqlens_qo,
+    const torch::Tensor&                seqlens_kv,
     const torch::Tensor&                block_table,
     const float                         softmax_scale,
     const bool                          is_causal,

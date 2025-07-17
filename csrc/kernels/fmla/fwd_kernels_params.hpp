@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
 // =====================================================================================================================
-// Kernel Params and Strutions 
+// Kernel Params and Strutions
 //
 union TileSchedulerMetaData
 {
@@ -23,9 +23,10 @@ constexpr size_t TileSchedulerMetaDataSizeInDw = sizeof(TileSchedulerMetaData) /
 
 struct FlashMlaPrefillFwdParams
 {
-    int32_t* __restrict__ p_seqlens_k;      // [b]
+    int32_t* __restrict__ p_seqlens_qo;     // [b]
+    int32_t* __restrict__ p_seqlens_kv;     // [b]
     int32_t* __restrict__ p_block_table;    // [b, max_seqlen_pad // block_size]
-    
+
     void* __restrict__ p_query_nope;
     void* __restrict__ p_key_nope;
     void* __restrict__ p_value;
@@ -36,14 +37,14 @@ struct FlashMlaPrefillFwdParams
     void* __restrict__ p_softmax_lseaccum;
     void* __restrict__ p_output_accum;
 
-    int32_t size_b;      // batch count
-    int32_t size_s_pk;   // seqlen of q after XQA pack
-    int32_t size_s_ori;  // seqlen of q original
-    int32_t size_s_tr;   // seqlen of q for tensor
-    int32_t size_h_pk;   // head count of q after XQA pack
-    int32_t size_h_ori;  // head count of q original
-    int32_t size_h_tr;   // head count of q for tensor
-    int32_t hq_hk_ratio; // head count of q / head count of kv
+    int32_t size_b;         // batch count
+    int32_t max_size_s_pk;  // max seqlen of q after XQA pack
+    int32_t max_size_s_ori; // max seqlen of q original
+    int32_t max_size_s_tr;  // max seqlen of q for tensor
+    int32_t size_h_pk;      // head count of q after XQA pack
+    int32_t size_h_ori;     // head count of q original
+    int32_t size_h_tr;      // head count of q for tensor
+    int32_t hq_hk_ratio;    // head count of q / head count of kv
     int32_t num_splits;
     int64_t block_table_batch_stride;
     int32_t num_page_blocks;
@@ -89,7 +90,7 @@ struct FlashMlaDecodeFwdParams
     int32_t* __restrict__ p_block_table;
     int32_t* __restrict__ p_tile_scheduler_metadata;
     int32_t* __restrict__ p_num_splits;
-    
+
     void* __restrict__ p_query;
     void* __restrict__ p_key;
     void* __restrict__ p_value;

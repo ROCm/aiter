@@ -4,13 +4,13 @@
 
 // clang-format off
 std::vector<torch::Tensor> get_mla_metadata(
-    const torch::Tensor& p_seqlens_k,               // [batch size]
+    const torch::Tensor& p_seqlens_kv,          // [batch size]
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k)
 {
     assert(false);
 
-    auto opts = p_seqlens_k.options();
+    auto opts = p_seqlens_kv.options();
     auto ret  = torch::empty({4}, opts);
     return {ret};
 }
@@ -20,7 +20,8 @@ std::vector<torch::Tensor> flash_mla_fwd_with_kvcache_impl(
     const torch::Tensor&                key_nope_cache,           // [block count, block size,  head count of kv, head dim of qk]
     const torch::Tensor&                value_cache,              // [block count, block size,  head count of kv, head dim of v ]
     const int32_t                       head_size_v,
-    const torch::Tensor&                seqlens_k,                // [batch size]
+    const torch::Tensor&                seqlens_qo,
+    const torch::Tensor&                seqlens_kv,               // [batch size]
     const torch::Tensor&                block_table,              // [batch size, max blocks per seq]
     const float                         softmax_scale,
     const bool                          is_causal,
@@ -38,7 +39,7 @@ std::vector<torch::Tensor> flash_mla_fwd_with_kvcache_impl(
             key_nope_cache,
             value_cache,
             head_size_v,
-            seqlens_k,
+            seqlens_kv,
             block_table,
             softmax_scale,
             is_causal,
@@ -53,7 +54,8 @@ std::vector<torch::Tensor> flash_mla_fwd_with_kvcache_impl(
             key_nope_cache,
             value_cache,
             head_size_v,
-            seqlens_k,
+            seqlens_qo,
+            seqlens_kv,
             block_table,
             softmax_scale,
             is_causal,
