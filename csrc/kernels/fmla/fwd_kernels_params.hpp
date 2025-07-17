@@ -38,12 +38,10 @@ struct FlashMlaPrefillFwdParams
     void* __restrict__ p_output_accum;
 
     int32_t size_b;         // batch count
-    int32_t max_size_s_pk;  // max seqlen of q after XQA pack
+    int32_t max_size_s_pk;  // max seqlen of q after XQA pack, equal to max_size_s_ori * hq_hk_ratio
     int32_t max_size_s_ori; // max seqlen of q original
-    int32_t max_size_s_tr;  // max seqlen of q for tensor
-    int32_t size_h_pk;      // head count of q after XQA pack
+    int32_t size_h_pk;      // head count of q after XQA pack, equal to size_h_ori / hq_hk_ratio
     int32_t size_h_ori;     // head count of q original
-    int32_t size_h_tr;      // head count of q for tensor
     int32_t hq_hk_ratio;    // head count of q / head count of kv
     int32_t num_splits;
     int64_t block_table_batch_stride;

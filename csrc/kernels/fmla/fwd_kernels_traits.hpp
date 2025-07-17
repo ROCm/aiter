@@ -6,13 +6,6 @@
 // =====================================================================================================================
 // Kernel traits
 //
-enum class XqaStrategy
-{
-    Disable,  // disable xqa
-    External, // enable xqa by torch.Tensor transform
-    Internal  // enable xqa by tensor view transform
-};
-
 /// TODO: combine it with decode trait.
 template <int32_t kSizeD_,
           int32_t kSizeDV_,
@@ -22,7 +15,7 @@ template <int32_t kSizeD_,
           int32_t kNumWarps_,
           int32_t kWaveOccupancy_,
           bool    kKVLoadOnce_      = false,
-          XqaStrategy kXqaStrategy_ = XqaStrategy::Internal>
+          bool kEnableXqa_ = true>
 struct FlashMlaPrefillKernelTrait
 {
     static constexpr int32_t kSizeD                     = kSizeD_;    // hidden dimension size of query and key
@@ -52,7 +45,7 @@ struct FlashMlaPrefillKernelTrait
     static constexpr bool    kPadSeqLenQ                = true;
     static constexpr bool    kPadSeqLenK                = true;
     static constexpr bool    kKVLoadOnce                = kKVLoadOnce_;
-    static constexpr XqaStrategy   kXqaStrategy         = kXqaStrategy_;
+    static constexpr bool    kEnableXqa                 = kEnableXqa_;
 
     static constexpr int32_t kNumPrefetchK  = kKVLoadOnce_ ? 2 : 1;
     static constexpr int32_t kNumPrefetchV  = 1;
