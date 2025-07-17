@@ -23,6 +23,7 @@ from op_tests.triton_tests.test_mla_decode_rope import (
     ref_preprocess
 )
 
+        
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
@@ -34,20 +35,6 @@ def nonvarlen_benchmark_configs():
         for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
-
-
-def varlen_benchmark_configs():
-    batch_sizes = [1, 4, 8]
-    N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
-    seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
-    configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
-    ]
-    return configs
-
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
@@ -76,37 +63,6 @@ def model_benchmark_configs(args):
             )
 
     return fa_configs
-
-
-def pad_rearrange_dropout_mask(
-    S_dmask,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_seqlen_q,
-    max_seqlen_k,
-    seqlen_q,
-    seqlen_k,
-    num_q_heads,
-):
-    batch_size = cu_seqlens_q.numel() - 1
-
-    padded_dropout_mask = torch.ones(
-        (batch_size, num_q_heads, seqlen_q, seqlen_k), device="cuda"
-    )
-    for b in range(batch_size):
-        start_q = cu_seqlens_q[b].item()
-        end_q = cu_seqlens_q[b + 1].item()
-        start_k = cu_seqlens_k[b].item()
-        end_k = cu_seqlens_k[b + 1].item()
-
-        seqlen_q = end_q - start_q
-        seqlen_k = end_k - start_k
-        for h in range(S_dmask.shape[1]):
-            padded_dropout_mask[b, h, :max_seqlen_q, :max_seqlen_k] = S_dmask[
-                b, h, :, :
-            ]
-
-    return padded_dropout_mask
 
 
 def create_benchmark_configs(custom, args):
@@ -183,7 +139,7 @@ def run_benchmark(custom, args):
     torch.manual_seed(20)
 
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
-    def bench_mha(
+    def bench_mla(
         BATCH: int,
         H: int,
         S: int,
@@ -192,14 +148,21 @@ def run_benchmark(custom, args):
         rotary_dim: int,
         dtype: torch.dtype,
         use_rope: bool,
+        is_neox_style: bool=False,
         num_kv_splits: int=2,
         sm_scale: float=1.0,
         logit_cap: float=0.0,
         device="cuda",
+        metric: str = "throughput",
     ):
         """
-        Benchmark or test function for multi-head attention backward pass.
-        In test_mode, verifies output matching with non-varlen inputs.
+        Benchmarks our multi-head latent attention decode kernel.
+
+        Todo:
+        - Support variable length sequences (by writing new data generation fns that
+        generate the appropriate paged kv cache).
+        - Support GQA benchmarking (e.g generate inputs where q_heads = kv_heads * N.
+        Right now q_heads == kv_heads).
         """
 
         kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
@@ -217,210 +180,99 @@ def run_benchmark(custom, args):
         )
 
         k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
+
+        tri_o = torch.empty(BATCH, H, kv_lora_rank, dtype=kv_cache.dtype, device=device)
         # we need to return the rope'd k_pe_tokens to be saved in cache
-        k_pe_tokens = (
-            torch.empty(BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device)
-            if use_rope
-            else None
+        k_pe_tokens = torch.empty(BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device)
+
+        # FLOPS calculation
+        num_q_heads = H
+        num_kv_heads = k_input.shape[1]
+        assert num_q_heads >= num_kv_heads
+
+        # Note: As far as I understand it, rotary_dim <= qk_rope_head_dim,
+        # with the latter being the portion of the query/key dim reserved for RoPE
+        # and the former being the number of dims that RoPE is actually applied to.
+        # Please correct the following calculations if the above is incorrect.
+
+        # per batch:
+        attn_nope_flops = num_q_heads * kv_lora_rank * S * 2
+        attn_rope_flops = num_q_heads * qk_rope_head_dim * S * 2
+        av_flops = num_q_heads * kv_lora_rank * S * 2 # multiplying attention map with v
+        
+        # flops to apply RoPE (per batch)
+        rope_q_flops = 2 * num_q_heads * rotary_dim
+        rope_k_flops = 2 * num_kv_heads * rotary_dim # only one token, since prev. rotated ks are cached
+
+        total_flops = BATCH * (attn_nope_flops + attn_rope_flops + av_flops + rope_q_flops + rope_k_flops)
+
+        # Memory transfer calculations (per batch)
+        # bytes read:
+        q_elems_read = num_q_heads * (kv_lora_rank + qk_rope_head_dim)
+        k_rope_elems_read = num_kv_heads * qk_rope_head_dim * S
+        kv_nope_elems_read = num_kv_heads * kv_lora_rank * S
+        cos_sine_cache_read = (num_q_heads + num_kv_heads) * rotary_dim
+
+        # total indices read (across the full batch)
+        kv_indptrs_read = (BATCH + 1)
+        kv_indices_read = (BATCH * S)
+
+        bytes_read = (
+            BATCH * q_elems_read * q.element_size()
+            + BATCH * k_rope_elems_read * k_input.element_size()
+            + BATCH * kv_nope_elems_read * k_input.element_size()
+            + BATCH * cos_sine_cache_read * rotary_emb.cos_sin_cache.element_size()
+            + kv_indptrs_read
+            + kv_indices_read
         )
 
-        _decode_grouped_att_m_fwd_rope(
+        # bytes written:
+        out_elems = num_q_heads * kv_lora_rank
+        new_k_pe_elems = qk_rope_head_dim # to add to kv cache
+
+        bytes_written = (
+            BATCH * out_elems * tri_o.element_size()
+            + BATCH * new_k_pe_elems * k_pe_tokens.element_size()
+        )
+
+        mem = bytes_read + bytes_written
+        
+        ms = triton.testing.do_bench(lambda: decode_attention_fwd_grouped_rope(
             q,
             k_input,
             v_input,
-            attn_logits,
-            k_pe_tokens,
-            kv_lora_rank,
-            rotary_emb.cos_sin_cache,
-            positions,
-            rotary_dim,
+            tri_o,
             kv_indptr,
             kv_indices,
+            k_pe_tokens if use_rope else None,
+            kv_lora_rank,
+            rotary_dim if use_rope else None,
+            rotary_emb.cos_sin_cache if use_rope else None,
+            positions if use_rope else None,
+            attn_logits,
             num_kv_splits,
             sm_scale,
             logit_cap,
             use_rope,
+            is_neox_style,
+        ),
+            warmup=25,
+            rep=100,
         )
 
-        tri_logits = attn_logits
-
-        # FLOPS calculation variables
-        flops_per_matmul = 0
-
-        # Input preparation
-        if varlen:
-            query_padding_mask = generate_random_padding_mask(
-                N_CTX_Q, BATCH, device, mode="full" if args.equal_seqlens else "random"
-            )
-            key_padding_mask = generate_random_padding_mask(
-                N_CTX_K, BATCH, device, mode="full" if args.equal_seqlens else "random"
-            )
-            (
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
-                q,
-                k,
-                v,
-                _,
-                _,
-                _,
-            ) = generate_qkv(
-                q, k, v, query_padding_mask, key_padding_mask, kvpacked=False
-            )
-            q_unpad.requires_grad = True
-            k_unpad.requires_grad = True
-            v_unpad.requires_grad = True
-
-            q_input, k_input, v_input = q_unpad, k_unpad, v_unpad
-
-            num_contexts = len(cu_seqlens_q) - 1
-            for i in range(num_contexts):
-                seqlen_q = (cu_seqlens_q[i + 1] - cu_seqlens_q[i]).item()
-                seqlen_k = (cu_seqlens_k[i + 1] - cu_seqlens_k[i]).item()
-                if causal:
-                    valid_out_elements = (
-                        ((seqlen_k**2 + seqlen_k) / 2)
-                        if seqlen_q > seqlen_k
-                        else (seqlen_q * seqlen_k - ((seqlen_q**2 - seqlen_q) / 2))
-                    )
-                    flops_per_matmul += valid_out_elements * HQ * D_HEAD * 2
-                else:
-                    flops_per_matmul += seqlen_q * seqlen_k * HQ * D_HEAD * 2
-        else:
-            q_input, k_input, v_input = q, k, v
-
-            if causal:
-                valid_out_elements = (
-                    ((N_CTX_K**2 + N_CTX_K) / 2)
-                    if N_CTX_Q > N_CTX_K
-                    else (N_CTX_Q * N_CTX_K - ((N_CTX_Q**2 - N_CTX_Q) / 2))
-                )
-                flops_per_matmul = 2.0 * BATCH * HQ * valid_out_elements * D_HEAD
-            else:
-                flops_per_matmul = 2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * D_HEAD
-
-        # Benchmark mode
-        if varlen:
-            if args.fp8:
-
-                def fn():
-                    return flash_attn_varlen_fp8_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                    )
-
-            else:
-
-                def fn():
-                    return flash_attn_varlen_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        cu_seqlens_q,
-                        cu_seqlens_k,
-                        max_seqlen_q,
-                        max_seqlen_k,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                    )
-
-        else:
-            if args.fp8:
-
-                def fn():
-                    return flash_attn_fp8_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                    )
-
-            else:
-
-                def fn():
-                    return flash_attn_func(
-                        q_input,
-                        k_input,
-                        v_input,
-                        dropout_p=dropout,
-                        softmax_scale=sm_scale,
-                        causal=causal,
-                        return_lse=return_lse,
-                        return_attn_probs=return_attn_probs,
-                    )
-
-        if mode == "bwd":
-            with torch.enable_grad():
-                triton_out = fn()[0]
-                d_out = torch.randn_like(triton_out)
-
-                def fn():
-                    grads = torch.autograd.grad(
-                        triton_out,
-                        (q_input, k_input, v_input),
-                        d_out,
-                        retain_graph=True,
-                    )
-                    return grads
-
-        ms = triton.testing.do_bench(fn)
-
-        total_flops = 2 * flops_per_matmul
-        if mode == "bwd":
-            total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
-
-        input_bytes = q.element_size()
-        output_bytes = q.element_size()
-        if varlen:
-            total_num_tokens_q = cu_seqlens_q[-1].item()
-            total_num_tokens_k = cu_seqlens_k[-1].item()
-        else:
-            total_num_tokens_q = BATCH * N_CTX_Q
-            total_num_tokens_k = BATCH * N_CTX_K
-        mem = (
-            total_num_tokens_q * HQ * D_HEAD * input_bytes
-            + 2 * total_num_tokens_k * HK * D_HEAD * input_bytes
-            + total_num_tokens_q * HQ * D_HEAD * output_bytes
-        )
-        # return ms
-        if "ms" in provider:
+        # Return exactly one scalar depending on which metric is active
+        if metric == "time":
             return ms
-        elif "TFLOPS" in provider:
-            return total_flops / ms * 1e-9
-        else:  # GB/s
-            return mem / ms * 1e-3
+        elif metric == "throughput":
+            tflops = total_flops / ms * 1e-9
+            return tflops
+        elif metric == "bandwidth":
+            bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+            return bandwidth
+        else:
+            raise ValueError("Unknown metric: " + metric)
 
-    bench_mha.run(save_path=".", print_data=True, show_plots=False)
-
-
-def supported_layouts():
-    layouts = (
-        "bshd: Q, K, V are individual tensors of [batch, seqlen_q/k, num_heads, head_size]. "
-        "thd: Q, K, V are individual tensors of [total_q/k, num_heads, head_size]. "
-    )
-    return layouts
+    bench_mla.run(save_path=".", print_data=True, show_plots=False)
 
 
 # argparse lacks support for boolean argument type (sigh...)
@@ -436,10 +288,7 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = get_parser(kernel_name="FlashAttention")
-    parser.add_argument(
-        "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
-    )
+    parser = get_parser(kernel_name="MLA Decode with RoPE")
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -465,23 +314,6 @@ def parse_args():
         default=False,
         help="Prints TFLOPS, walltime, bandwidth.",
     )
-    parser.add_argument(
-        "-test_mode",
-        action="store_true",
-        default=False,
-        help="Tests correctness of the Triton provider comparing the output to the Torch sdpa.",
-    )
-
-    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
-
-    parser.add_argument(
-        "-persistent",
-        nargs="?",
-        const="fixed",
-        choices=["fixed", "dynamic"],
-        default=None,
-        help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
-    )
     return parser.parse_args()
 
 
@@ -494,21 +326,6 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
-
-    if args.model:
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = True
-        if args.layout is None:  # User didn't specify -layout
-            args.layout = "thd"
-        print(
-            f"Note: using -model config defaults: causal={True}, layout={'thd'}. This is the most common real life scenario, but can be overridden with -causal and -layout flags."
-        )
-    else:
-        # the defaults for causal and varlen when not using the -model
-        if args.causal is None:  # User didn't specify -causal
-            args.causal = False
-        if args.layout is None:  # User didn't specify -layout
-            args.layout = "bshd"
 
     custom_config = False
 
@@ -531,17 +348,6 @@ def main():
     assert (
         args.dtype in arg_to_torch_dtype
     ), "Only fp16, bf16 and f32 types currently supported."
-
-    assert (
-        args.layout in supported_layouts()
-    ), f"{args.layout} is not in supported layouts: {supported_layouts()}."
-
-    if args.layout == "thd" and args.equal_seqlens:
-        warnings.warn(
-            "Using 'thd' layout with equal_seqlen=True incurs an extra sequence length lookup cost "
-            "compared to 'bshd' layout. Consider using 'bshd' for better performance.",
-            category=RuntimeWarning,
-        )
 
     if args.print_vgpr:
         assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
