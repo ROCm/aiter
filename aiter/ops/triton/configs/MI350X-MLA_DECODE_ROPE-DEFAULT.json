@@ -5,12 +5,12 @@
         "num_stages": 1,
         "waves_per_eu": 1, 
         "matrix_instr_nonkdim": 16, 
-        "kpack": 2
+        "kpack": 1
     },
     "fwd_kernel_stage2": {
         "num_stages": 2,
         "waves_per_eu": 4, 
         "matrix_instr_nonkdim": 16, 
-        "kpack": 2
+        "kpack": 1
     }
 }
