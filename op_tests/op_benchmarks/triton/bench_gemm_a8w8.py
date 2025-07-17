@@ -58,7 +58,9 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object("GEMM A8W8 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
+    def bench_gemm_a8w8(
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+    ):
         """
         Fc1:
              M      K                  K           N          M       N
@@ -85,7 +87,7 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -95,12 +97,12 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("GEMM A8W8 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8(M, N, K, metric, **kwargs):
+    def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
         return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):

@@ -18,20 +18,21 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_afp4wfp4_pre_quant,
 )
+import aiter.ops.triton.utils.arch_info as arch_info
 
 
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+    M_list = [4096] if args.M is not None else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
+        for model_name, config in configs.items():
             N = config["intermediate_size"]
             K = config["hidden_size"]
 
             shapes.append(
-                (M, N, K, 16)
+                (model_name, M, N, K, 16)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes
@@ -76,13 +77,13 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name="GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
         args=args,
-        x_names=["M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
         model_benchmark_shapes_fn=model_benchmark_shapes,
     )
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4_pre_quant(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
+        M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
     ):
         if layer == "fc1":
             if args.no_glu:
@@ -99,21 +100,27 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(save_path=".", print_data=True)
+    bench_batched_gemm_afp4wfp4_pre_quant.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
         args=args,
-        x_names=["M", "N", "K", "batch"],
+        x_names=["model_name", "M", "N", "K", "batch"],
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(M, N, K, batch, metric, provider):
+    def bench_batched_gemm_afp4wfp4_pre_quant(
+        M, N, K, batch, metric, provider, model_name=None
+    ):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(save_path=".", print_data=True)
+    bench_batched_gemm_afp4wfp4_pre_quant.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def run_benchmark(args, defaults):
@@ -150,6 +157,10 @@ def parse_args():
 
 
 def main():
+    if not (arch_info.is_fp4_avail()):
+        print("MXFP4 is not available on this architecture")
+        sys.exit()
+
     args, defaults = parse_args()
     run_benchmark(args, defaults)
 

@@ -28,6 +28,7 @@ def moe_sorting(
     block_size=BLOCK_SIZE_M,
     expert_mask=None,
     num_local_tokens=None,
+    dispatch_policy=0,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -40,7 +41,7 @@ def moe_sorting(
     sorted_expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=dtypes.i32, device=device
     )
-    num_valid_ids = torch.empty((1), dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(
@@ -55,6 +56,7 @@ def moe_sorting(
         block_size,
         expert_mask,
         num_local_tokens,
+        dispatch_policy,
     )
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
@@ -87,6 +89,7 @@ def fused_moe(
     # following for tuning
     block_size_M=None,
     num_local_tokens: Optional[torch.tensor] = None,
+    moe_sorting_dispatch_policy=0,
     dtype=None,
 ):
     """user API"""
@@ -140,6 +143,7 @@ def fused_moe(
         block_size_M,
         expert_mask,
         num_local_tokens,
+        moe_sorting_dispatch_policy,
     )
 
     if run_1stage:
@@ -911,7 +915,7 @@ def fused_topk(
         topk_weights,
         topk_ids,
         token_expert_indicies,
-        gating_output.float(),  # TODO(woosuk): Optimize this.
+        gating_output,
         renormalize,
     )
     del token_expert_indicies  # Not used. Will be used in the future.

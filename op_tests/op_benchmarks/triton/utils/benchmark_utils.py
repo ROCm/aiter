@@ -64,7 +64,7 @@ def get_model_benchmark_object(
     Note: This is for benchmarking models (e.g with the --model arg).
     """
     if x_names is None:
-        x_names = ["M", "hidden_dim", "intermediate_dim"]
+        x_names = ["model_name", "M", "hidden_dim", "intermediate_dim"]
     if model_benchmark_shapes_fn is None:
         model_benchmark_shapes_fn = model_benchmark_shapes
     if not args.fc1 and not args.fc2:
@@ -120,8 +120,10 @@ def model_benchmark_shapes(args):
         M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
-            shapes.append((M, config["hidden_size"], config["intermediate_size"]))
+        for model_name, config in configs.items():
+            shapes.append(
+                (model_name, M, config["hidden_size"], config["intermediate_size"])
+            )
 
     return shapes
 

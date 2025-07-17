@@ -91,7 +91,8 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(32, 512, 7168)]
-    x_vals += [(1, 1, 1)]  # minimal case
+    x_vals += [(1, 1, 32)]  # minimal case
+    x_vals += [(1, 1280, 8192)]
     return x_vals
 
 
@@ -128,7 +129,7 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
     w_f32 = mxfp4_to_f32(w)
@@ -159,6 +160,6 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
     else:
         y = gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype)
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
     torch.testing.assert_close(torch_out, y)
