@@ -81,7 +81,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(1, 1, 1)]  # minimal case
+    x_vals += [(1, 1, 32)]  # minimal case
 
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]
@@ -133,7 +133,7 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
     w_f32 = mxfp4_to_f32(w)  # -> (B, N, K)
@@ -158,8 +158,8 @@ def test_batched_gemm_afp4_wfp4_pre_quant(B: int, M: int, N: int, K: int, dtype)
     )
     out = torch.empty(B, M, N, device=x.device, dtype=dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    batched_gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype, out)
+    batched_gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)
