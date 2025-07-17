@@ -21,13 +21,17 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
 }
 
+
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
     seq_len_k = [163, 8192]
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    rotary_dim = qk_rope_head_dim
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_k))
     configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_k)
+        (batch_size, N_HEAD, seq_len_k, kv_lora_rank, qk_rope_head_dim, rotary_dim)
         for batch_size, N_HEAD, seq_len_k in configs
     ]
     return configs
@@ -46,17 +50,16 @@ def model_benchmark_configs(args):
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        N_CTX_Q = args.sq if args.sq else [2**i for i in range(1, 14)]
-        N_CTX_K = args.sk if args.sk else N_CTX_Q
+        N_CTX_K = args.sk if args.sk else [2**i for i in range(1, 14)]
         HEAD_DIM = config["hidden_size"] // HQ
-        if isinstance(N_CTX_Q, list):
-            for seq_len in N_CTX_Q:
+        if isinstance(N_CTX_K, list):
+            for seq_len in N_CTX_K:
                 fa_configs.append(
                     (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
+                (model_name, batch_size, HQ, HK, N_CTX_K, N_CTX_K, HEAD_DIM)
             )
 
     return fa_configs
@@ -64,26 +67,30 @@ def model_benchmark_configs(args):
 
 def create_benchmark_configs(custom: bool, args: argparse.Namespace):
     dtype = arg_to_torch_dtype[args.dtype]
-    hk = args.hq if not args.hk else args.hk
-    sk = args.sq if not args.sk else args.sk
+    sk = args.sk
     head_size = 128 if not args.d else args.d
-    x_names = ["BATCH", "HQ", "HK", "N_CTX_K"]
+    x_names = ["BATCH", "H", "S", "kv_lora_rank", "qk_rope_head_dim", "rotary_dim"]
 
     configs = []
     plot_name = f"MLA-decode-RoPE-Latent-Dim-{head_size}"
     extra_args = {
-        "D_HEAD": head_size,
         "dtype": dtype,
+        "use_rope": args.use_rope,
+        "is_neox_style": args.use_neox_style_rope,
     }
 
     if custom:
-        x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
+        x_vals_list = [(args.b, args.hq, sk, head_size)]
     else:
         if args.model:
             x_vals_list = model_benchmark_configs(args)
             x_names = ["BATCH", "HQ", "HK", "N_CTX_K", "D_HEAD"]
             plot_name += f"-{args.model}"
-            extra_args = {"dtype": dtype}
+            extra_args = {
+                "dtype": dtype,
+                "use_rope": args.use_rope,
+                "is_neox_style": args.use_neox_style_rope,
+            }
         else:
             x_vals_list = nonvarlen_benchmark_configs()
 
@@ -119,7 +126,7 @@ def run_benchmark(custom: bool, args: argparse.Namespace):
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
     def bench_mla(
         BATCH: int,
-        H: int,
+        H: int,  # number of query heads, equal to the number of k/v heads
         S: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
@@ -132,6 +139,7 @@ def run_benchmark(custom: bool, args: argparse.Namespace):
         logit_cap: float = 0.0,
         device="cuda",
         metric: str = "throughput",
+        **kwargs,
     ):
         """
         Benchmarks our multi-head latent attention decode kernel.
@@ -280,8 +288,18 @@ def parse_args():
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
     parser.add_argument("-sk", type=int, default=0)
-    parser.add_argument("-use-rope", action="store_true", default=False,
-                        help="Enable rotary positional embeddings.")
+    parser.add_argument(
+        "-use-rope",
+        action="store_true",
+        default=False,
+        help="Enable rotary positional embeddings.",
+    )
+    parser.add_argument(
+        "-use-neox-style-rope",
+        action="store_true",
+        default=False,
+        help="Use Neox style rotary positional embeddings over vanilla RoPE. The -use-rope flag should also be enabled.",
+    )
     parser.add_argument("-d", type=int, default=0)
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-print_vgpr", action="store_true", default=False)
@@ -324,7 +342,7 @@ def main():
 
         print_vgpr(fun, "fused-attention")
         return 0
-    
+
     print(args)
 
     run_benchmark(custom_config, args)
