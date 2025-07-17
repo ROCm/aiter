@@ -24,21 +24,21 @@ import aiter.ops.triton.utils.arch_info as arch_info
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [4096] if args.model == "all" else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
+        for model_name, config in configs.items():
             N = config["intermediate_size"]
             K = config["hidden_size"]
 
             shapes.append(
-                (M, N, K, 16)
+                (model_name, M, N, K, 16)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
+def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str,  model_name=None):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
         batch,
@@ -84,7 +84,7 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
-        x_names=["M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
         model_benchmark_shapes_fn=model_benchmark_shapes,
     )
 
@@ -103,7 +103,7 @@ def run_model_benchmark(args):
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
-        # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
+        #print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 

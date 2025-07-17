@@ -24,7 +24,7 @@ import aiter.ops.triton.utils.arch_info as arch_info
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+    M_list = [4096] if args.M is not None else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -77,7 +77,7 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name="GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
         args=args,
-        x_names=["M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
         model_benchmark_shapes_fn=model_benchmark_shapes,
     )
 
