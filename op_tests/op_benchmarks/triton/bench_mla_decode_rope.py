@@ -10,31 +10,28 @@ import argparse
 import itertools
 
 from aiter.ops.triton.mla_decode_rope import (
-    _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
 )
-from op_tests.triton_tests.utils.mla_decode_ref import (
-    _decode_grouped_att_m_fwd,
-    decode_attention_fwd_grouped,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.test_mla_decode_rope import (
-    input_helper,
-    ref_preprocess
-)
+from op_tests.triton_tests.test_mla_decode_rope import input_helper, ref_preprocess
 
-        
+arg_to_torch_dtype = {
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
+}
+
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
-    seq_len_q = [1, 1024, 4096]
     seq_len_k = [163, 8192]
-    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
+    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_k))
     configs = [
-        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
-        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
+        (batch_size, N_HEAD, N_HEAD, seq_len_k)
+        for batch_size, N_HEAD, seq_len_k in configs
     ]
     return configs
+
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
@@ -65,33 +62,30 @@ def model_benchmark_configs(args):
     return fa_configs
 
 
-def create_benchmark_configs(custom, args):
+def create_benchmark_configs(custom: bool, args: argparse.Namespace):
     dtype = arg_to_torch_dtype[args.dtype]
     hk = args.hq if not args.hk else args.hk
     sk = args.sq if not args.sk else args.sk
     head_size = 128 if not args.d else args.d
-    mode = args.mode
-    x_names = ["BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K"]
-    causal = args.causal
-    varlen = args.layout == "thd"
+    x_names = ["BATCH", "HQ", "HK", "N_CTX_K"]
 
     configs = []
-    plot_name = f"fused-attention-{mode}-D_HEAD-{head_size}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
-    extra_args = {"D_HEAD": head_size, "dtype": dtype, "causal": causal, "mode": mode}
+    plot_name = f"MLA-decode-RoPE-Latent-Dim-{head_size}"
+    extra_args = {
+        "D_HEAD": head_size,
+        "dtype": dtype,
+    }
 
     if custom:
         x_vals_list = [(args.b, args.hq, hk, args.sq, sk)]
     else:
-        if varlen:
-            x_vals_list = varlen_benchmark_configs()  # Assume this exists
-        else:
-            x_vals_list = nonvarlen_benchmark_configs()  # Assume this exists
-
         if args.model:
             x_vals_list = model_benchmark_configs(args)
-            x_names = ["model", "BATCH", "HQ", "HK", "N_CTX_Q", "N_CTX_K", "D_HEAD"]
-            plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
-            extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
+            x_names = ["BATCH", "HQ", "HK", "N_CTX_K", "D_HEAD"]
+            plot_name += f"-{args.model}"
+            extra_args = {"dtype": dtype}
+        else:
+            x_vals_list = nonvarlen_benchmark_configs()
 
     if args.metric == "time":
         unit = "ms"
@@ -102,23 +96,7 @@ def create_benchmark_configs(custom, args):
     else:
         raise ValueError("Unknown metric: " + args.metric)
 
-    if mode == "bwd":
-        if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
-        else:
-            line_vals = [f"fused-bwd({unit})", f"bwd({unit})"]
-    else:
-        line_vals = [f"fwd({unit})"]
-
-    if args.bench_torch:
-        line_vals = [f"Triton({unit})", f"Torch({unit})"]
-
-    if args.test_mode:
-        if args.fused_bwd:
-            line_vals = [f"fused-bwd({unit})"]
-        else:
-            line_vals = [f"bwd({unit})"]
-
+    line_vals = [f"{unit}"]
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
@@ -135,7 +113,7 @@ def create_benchmark_configs(custom, args):
     return configs
 
 
-def run_benchmark(custom, args):
+def run_benchmark(custom: bool, args: argparse.Namespace):
     torch.manual_seed(20)
 
     @triton.testing.perf_report(create_benchmark_configs(custom, args))
@@ -148,10 +126,10 @@ def run_benchmark(custom, args):
         rotary_dim: int,
         dtype: torch.dtype,
         use_rope: bool,
-        is_neox_style: bool=False,
-        num_kv_splits: int=2,
-        sm_scale: float=1.0,
-        logit_cap: float=0.0,
+        is_neox_style: bool = False,
+        num_kv_splits: int = 2,
+        sm_scale: float = 1.0,
+        logit_cap: float = 0.0,
         device="cuda",
         metric: str = "throughput",
     ):
@@ -159,8 +137,8 @@ def run_benchmark(custom, args):
         Benchmarks our multi-head latent attention decode kernel.
 
         Todo:
-        - Support variable length sequences (by writing new data generation fns that
-        generate the appropriate paged kv cache).
+        - Support variable length sequences (by writing new data generation fns that generate the
+        appropriate paged kv cache).
         - Support GQA benchmarking (e.g generate inputs where q_heads = kv_heads * N.
         Right now q_heads == kv_heads).
         """
@@ -183,7 +161,9 @@ def run_benchmark(custom, args):
 
         tri_o = torch.empty(BATCH, H, kv_lora_rank, dtype=kv_cache.dtype, device=device)
         # we need to return the rope'd k_pe_tokens to be saved in cache
-        k_pe_tokens = torch.empty(BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device)
+        k_pe_tokens = torch.empty(
+            BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device
+        )
 
         # FLOPS calculation
         num_q_heads = H
@@ -198,13 +178,19 @@ def run_benchmark(custom, args):
         # per batch:
         attn_nope_flops = num_q_heads * kv_lora_rank * S * 2
         attn_rope_flops = num_q_heads * qk_rope_head_dim * S * 2
-        av_flops = num_q_heads * kv_lora_rank * S * 2 # multiplying attention map with v
-        
+        av_flops = (
+            num_q_heads * kv_lora_rank * S * 2
+        )  # multiplying attention map with v
+
         # flops to apply RoPE (per batch)
         rope_q_flops = 2 * num_q_heads * rotary_dim
-        rope_k_flops = 2 * num_kv_heads * rotary_dim # only one token, since prev. rotated ks are cached
+        rope_k_flops = (
+            2 * num_kv_heads * rotary_dim
+        )  # only one token, since prev. rotated ks are cached
 
-        total_flops = BATCH * (attn_nope_flops + attn_rope_flops + av_flops + rope_q_flops + rope_k_flops)
+        total_flops = BATCH * (
+            attn_nope_flops + attn_rope_flops + av_flops + rope_q_flops + rope_k_flops
+        )
 
         # Memory transfer calculations (per batch)
         # bytes read:
@@ -214,8 +200,8 @@ def run_benchmark(custom, args):
         cos_sine_cache_read = (num_q_heads + num_kv_heads) * rotary_dim
 
         # total indices read (across the full batch)
-        kv_indptrs_read = (BATCH + 1)
-        kv_indices_read = (BATCH * S)
+        kv_indptrs_read = BATCH + 1
+        kv_indices_read = BATCH * S
 
         bytes_read = (
             BATCH * q_elems_read * q.element_size()
@@ -228,7 +214,7 @@ def run_benchmark(custom, args):
 
         # bytes written:
         out_elems = num_q_heads * kv_lora_rank
-        new_k_pe_elems = qk_rope_head_dim # to add to kv cache
+        new_k_pe_elems = qk_rope_head_dim  # to add to kv cache
 
         bytes_written = (
             BATCH * out_elems * tri_o.element_size()
@@ -236,26 +222,27 @@ def run_benchmark(custom, args):
         )
 
         mem = bytes_read + bytes_written
-        
-        ms = triton.testing.do_bench(lambda: decode_attention_fwd_grouped_rope(
-            q,
-            k_input,
-            v_input,
-            tri_o,
-            kv_indptr,
-            kv_indices,
-            k_pe_tokens if use_rope else None,
-            kv_lora_rank,
-            rotary_dim if use_rope else None,
-            rotary_emb.cos_sin_cache if use_rope else None,
-            positions if use_rope else None,
-            attn_logits,
-            num_kv_splits,
-            sm_scale,
-            logit_cap,
-            use_rope,
-            is_neox_style,
-        ),
+
+        ms = triton.testing.do_bench(
+            lambda: decode_attention_fwd_grouped_rope(
+                q,
+                k_input,
+                v_input,
+                tri_o,
+                kv_indptr,
+                kv_indices,
+                k_pe_tokens if use_rope else None,
+                kv_lora_rank,
+                rotary_dim if use_rope else None,
+                rotary_emb.cos_sin_cache if use_rope else None,
+                positions if use_rope else None,
+                attn_logits,
+                num_kv_splits,
+                sm_scale,
+                logit_cap,
+                use_rope,
+                is_neox_style,
+            ),
             warmup=25,
             rep=100,
         )
@@ -292,21 +279,11 @@ def parse_args():
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
-    parser.add_argument("-sq", type=int, default=0)
     parser.add_argument("-sk", type=int, default=0)
-    parser.add_argument(
-        "-equal_seqlens",
-        action="store_true",
-        default=False,
-        help="If specified, uses equal sequence lengths with thd layout, i.e t = b * sq",
-    )
+    parser.add_argument("-use-rope", action="store_true", default=False,
+                        help="Enable rotary positional embeddings.")
     parser.add_argument("-d", type=int, default=0)
-    parser.add_argument("-causal", type=str2bool, default=None)
-    parser.add_argument("-fp8", action="store_true", default=False)
-    parser.add_argument("-quantize_p", action="store_true", default=False)
     parser.add_argument("--dtype", default="fp16")
-    parser.add_argument("-bench_torch", action="store_true", default=False)
-    parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
     parser.add_argument(
         "-return_all",
@@ -317,28 +294,17 @@ def parse_args():
     return parser.parse_args()
 
 
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
-
-
 def main():
     args = parse_args()
 
     custom_config = False
 
-    assert (
-        args.layout == "thd" or not args.equal_seqlens or args.model
-    ), "Equal sequence lengths arg must be used with the thd layout or a model config."
-    if args.hq or args.hk or args.d:
+    if args.hq or args.hk or args.sk or args.d:
         custom_config = True
         assert (
-            args.b and args.hq and args.sq and args.d
+            args.b and args.hq and args.sk and args.d
         ), "If custom config is specified, please provide \
-                all of batch, number of Q heads, Q sequence length \
-                and head size."
+                all of batch, number of Q heads, sequence length, and head size."
 
     if args.model:
         assert not (
@@ -358,6 +324,8 @@ def main():
 
         print_vgpr(fun, "fused-attention")
         return 0
+    
+    print(args)
 
     run_benchmark(custom_config, args)
 
