@@ -198,7 +198,7 @@ def parse_args():
 
 def main():
     if not (arch_info.is_fp4_avail()):
-        print(f"MXFP4 not supported on this architecture")
+        print("MXFP4 not supported on this architecture")
         sys.exit(0)
 
     args = parse_args()
