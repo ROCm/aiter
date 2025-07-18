@@ -155,7 +155,7 @@ def tune_gemm_list(
 
             tasks_data.append((total_kernel_nums, input_datas))
     if task:
-        ret = mp_tuner(task, tasks_data, mp_num, False, True)
+        ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
         for el in ret:
             info, time, err_ratio = el
             (cu_num, M, N, K), kernelId, splitK = info
