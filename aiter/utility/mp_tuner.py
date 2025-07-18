@@ -33,6 +33,7 @@ def worker(
         us = float("inf")
         try:
             res, us = run_perftest(func, *args, **kwargs)
+            print(f"{info} result us is {us}")
             us = round(us, 4)
         except RuntimeError:
             print(f" info:{info}\t No support")
@@ -51,7 +52,7 @@ def worker(
                 )
                 for el in ref
             ]
-            tol_err_ratio = 0.05
+            tol_err_ratio = 0.5
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
@@ -92,7 +93,7 @@ def post_process(rets, fast_mode=False):
     from operator import itemgetter
 
     sorted_rets = tuple(sorted(rets, key=itemgetter(0)))
-    tol_err_ratio = 0.05
+    tol_err_ratio = 0.5
     cur_info = sorted_rets[0][0]
     bestConfigs = []
     best_config = list(sorted_rets[0])

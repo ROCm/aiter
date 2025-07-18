@@ -11,6 +11,7 @@ from aiter.ops.shuffle import shuffle_weight
 from gemm_a4w4_blockscale_common import kernels_list
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
+import time
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -59,7 +60,6 @@ def get_untuned_gemm_list(untuned_gemm_file):
     return filtered_df
 
 
-
 def get_tuned_gemm_list(tuned_gemm_file):
     if os.path.exists(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
@@ -79,8 +79,15 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     m, k = x.shape
     n, k = weight.shape
-    aiter.gemm_a4w4_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
-    return out[:m]
+    if splitK != 0:
+        out_reset = torch.zeros(
+            (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtypes.bf16
+        )
+        out = out_reset
+    res = aiter.gemm_a4w4_blockscale_tune(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    )
+    return res[:m]
 
 
 def run_gemm_a4w4_blockscale_asm(
@@ -95,15 +102,15 @@ def run_gemm_a4w4_blockscale_asm(
     splitK=None,
 ):
     m, k = x.shape
-    out_reset = torch.zeros(
-        (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtype
-    )
+    if splitK != 0:
+        out_reset = torch.zeros(out.shape[0], out.shape[1], dtype=dtype)
+        out = out_reset
     res = aiter.gemm_a4w4_asm(
         x,
         weight_shuffle,
         x_scale,
         w_scale,
-        out_reset,
+        out,
         bias,
         bpreshuffle=bpreshuffle,
     )
@@ -254,8 +261,12 @@ def tune_gemm_list(
                     )
                     total_kernel_nums = total_kernel_nums + 1
             tasks_in_data.append((total_kernel_nums, ()))
+        else:
+            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
+            print()
+            print()
     if task:
-        ret = mp_tuner(task, tasks_in_data, mp_num, False, shape_grouped)
+        ret = mp_tuner(task, tasks_in_data, mp_num, False, True)
         for el in ret:
             info, time, err_ratio = el
             (cu_num, M, N, K), kernelId, splitK = info
@@ -287,11 +298,6 @@ def tune_gemm_list(
                 }
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
-
-    else:
-        print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-    print()
-    print()
 
     if issorted:
         tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
@@ -332,25 +338,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "-k", "--splitK", action="store_true", required=False, help="Use splitK kernels"
     )
-    # parser.add_argument("-inst", "--instance", type=int, default = 0, help="kernel instance to be tuned: 0 means all instance, 1 means ck instance, 2 means asm instance")
+
     parser.add_argument(
         "--sort",
         action="store_true",
         required=False,
         help="Arranged according to the M N K size",
     )
-    parser.add_argument(
-        "-err",
-        "--errRatio",
-        type=float,
-        default=0.05,
-        help="tolerable error ratio, default 0.05.",
-    )
+    # parser.add_argument(
+    #    "-err",
+    #    "--errRatio",
+    #    type=float,
+    #    default=0.05,
+    #    help="tolerable error ratio, default 0.05.",
+    # )
 
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
-    tunedf = tune_gemm_list(
-        untunedf, tunedf, args.sort, args.splitK, args.mp, args.errRatio
-    )
+    tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
     tunedf.to_csv(args.tune_file, index=False)

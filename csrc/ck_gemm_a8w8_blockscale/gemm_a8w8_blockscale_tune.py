@@ -63,7 +63,8 @@ def get_untuned_gemm_list(untuned_gemm_file):
         untuned_gemm_file
     ), f"Not exist a8w8_untuned_gemm.csv file: {untuned_gemm_file}"
     untunedf = pd.read_csv(untuned_gemm_file)
-    return untunedf
+    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+    return filtered_df
 
 
 def get_tuned_gemm_list(tuned_gemm_file):
@@ -154,7 +155,7 @@ def tune_gemm_list(
 
             tasks_data.append((total_kernel_nums, input_datas))
     if task:
-        ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
+        ret = mp_tuner(task, tasks_data, mp_num, False, True)
         for el in ret:
             info, time, err_ratio = el
             (cu_num, M, N, K), kernelId, splitK = info

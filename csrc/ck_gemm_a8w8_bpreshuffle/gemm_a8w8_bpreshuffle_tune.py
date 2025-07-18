@@ -40,7 +40,8 @@ def get_untuned_gemm_list(untuned_gemm_file):
         untuned_gemm_file
     ), f"Not exist a8w8_bpreshuffle_untuned_gemm.csv file: {untuned_gemm_file}"
     untunedf = pd.read_csv(untuned_gemm_file)
-    return untunedf
+    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+    return filtered_df
 
 
 def get_tuned_gemm_list(tuned_gemm_file):
