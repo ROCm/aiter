@@ -52,21 +52,38 @@ def model_benchmark_configs(args: argparse.Namespace):
     for model_name, config in configs.items():
         num_q_heads = config["num_attention_heads"]
         num_kv_heads = config["num_key_value_heads"]
-        assert num_q_heads == num_kv_heads, (
-            """Grouped Query Attention benchmarking not yet supported - try using a model
-            with the same number of query and key/value heads (e.g Deepseek-V3)""")
+        assert (
+            num_q_heads == num_kv_heads
+        ), """Grouped Query Attention benchmarking not yet supported - try using a model
+            with the same number of query and key/value heads (e.g Deepseek-V3)"""
         qk_rope_head_dim = config.get("qk_rope_head_dim", 64)
         kv_lora_rank = config.get("kv_lora_rank", 512)
-        rotary_dim = qk_rope_head_dim // 2 if args.use_neox_style_rope else qk_rope_head_dim
+        rotary_dim = (
+            qk_rope_head_dim // 2 if args.use_neox_style_rope else qk_rope_head_dim
+        )
         N_CTX_K = args.sk if args.sk else [2**i for i in range(1, 14)]
         if isinstance(N_CTX_K, list):
             for seq_len in N_CTX_K:
                 fa_configs.append(
-                    (batch_size, num_q_heads, seq_len, kv_lora_rank, qk_rope_head_dim, rotary_dim)
+                    (
+                        batch_size,
+                        num_q_heads,
+                        seq_len,
+                        kv_lora_rank,
+                        qk_rope_head_dim,
+                        rotary_dim,
+                    )
                 )
         else:
             fa_configs.append(
-                (batch_size, num_q_heads, N_CTX_K, kv_lora_rank, qk_rope_head_dim, rotary_dim)
+                (
+                    batch_size,
+                    num_q_heads,
+                    N_CTX_K,
+                    kv_lora_rank,
+                    qk_rope_head_dim,
+                    rotary_dim,
+                )
             )
 
     return fa_configs
@@ -281,8 +298,18 @@ def str2bool(v):
 def parse_args():
     parser = get_parser(kernel_name="MLA Decode with RoPE")
     parser.add_argument("-b", type=int, default=0)
-    parser.add_argument("-hq", type=int, default=0, help = "Number of query heads (equal to number of key/value heads)")
-    parser.add_argument("-sk", type=int, default=0, help = "Sequence length (since this is decode, this is the length of the key/value sequence)")
+    parser.add_argument(
+        "-hq",
+        type=int,
+        default=0,
+        help="Number of query heads (equal to number of key/value heads)",
+    )
+    parser.add_argument(
+        "-sk",
+        type=int,
+        default=0,
+        help="Sequence length (since this is decode, this is the length of the key/value sequence)",
+    )
     parser.add_argument(
         "--no-rope",
         action="store_true",
@@ -305,15 +332,13 @@ def main():
     args = parse_args()
 
     # if args.b or args.hq or args.hk or args.sk:
-        # assert (
-        #     args.b and args.hq and args.sk and args.d
-        # ), "If custom config is specified, please provide \
-        #         all of batch, number of Q heads, sequence length, and head size."
+    # assert (
+    #     args.b and args.hq and args.sk and args.d
+    # ), "If custom config is specified, please provide \
+    #         all of batch, number of Q heads, sequence length, and head size."
 
     if args.model:
-        assert not (
-            args.hq
-        ), "Specifying model fixes hq already. Do not provide it!"
+        assert not (args.hq), "Specifying model fixes hq already. Do not provide it!"
 
     assert (
         args.dtype in arg_to_torch_dtype
@@ -324,6 +349,7 @@ def main():
 
         def fun():
             return run_benchmark(args)
+
         plot_name = "MLA-decode-RoPE"
         if args.model:
             plot_name += f"-{args.model}"
