@@ -94,6 +94,7 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
+CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 
 
 @functools.lru_cache(maxsize=1)
@@ -233,6 +234,7 @@ def recopy_ck():
     if os.path.exists(CK_DIR):
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
+    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{CK_DIR}/include/ck/config.h")
 
 
 def clear_build(md_name):
