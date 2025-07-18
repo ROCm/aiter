@@ -216,7 +216,7 @@ struct __attribute__((packed)) fmha_bwd_v3_group_args
     p1 _p1;
     unsigned int ratio;
     p1 _p2;
-    unsigned int seqlen_q; //total length of q sequences
+    unsigned int Hs_lsed;
     p1 _p3;
     unsigned int seqlen_k; //total length of k sequences
     p1 _p4;
@@ -449,6 +449,14 @@ template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,  
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,     true,   false,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd128_bf16_causal_a32_rtne_pssk_group"; }};
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      1,     true,   false,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd128_bf16_causal_a32_rtna_pssk_group"; }};
 template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      2,     true,   false,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd128_bf16_causal_a32_rtz_pssk_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_bf16_a32_rtne_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      1,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_bf16_a32_rtna_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      2,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_bf16_a32_rtz_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_bf16_causal_a32_rtne_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      1,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_bf16_causal_a32_rtna_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      2,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_bf16_causal_a32_rtz_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_fp16_a32_psskddv_group"; }};
+template<> struct FmhaBwdV3Name<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_name = "fmha_bwd_hd192_fp16_causal_a32_psskddv_group"; }};
 
 template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Buf;
 // #######################################################|HDim|    DataType| MaskType|kIsAtomic32|BF16Cvt|kIsSEQPad|kIsHDPad|
@@ -537,6 +545,14 @@ template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,   
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      0,     true,   false,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd128_bf16_causal_a32_rtne_pssk_group.co"; }};
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      1,     true,   false,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd128_bf16_causal_a32_rtna_pssk_group.co"; }};
 template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      2,     true,   false,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd128_bf16_causal_a32_rtz_pssk_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_bf16_a32_rtne_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      1,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_bf16_a32_rtna_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      2,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_bf16_a32_rtz_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_bf16_causal_a32_rtne_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      1,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_bf16_causal_a32_rtna_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      2,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_bf16_causal_a32_rtz_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_fp16_a32_psskddv_group.co"; }};
+template<> struct FmhaBwdV3Buf<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,        true>> {{ static constexpr const char * bwd_v3_buf = "bwd_hd192_fp16_causal_a32_psskddv_group.co"; }};
 
 template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Ts;
 // ######################################################|HDim|    DataType| MaskType|kIsAtomic32|BF16Cvt|kIsSEQPad|kIsHDPad|
@@ -625,6 +641,14 @@ template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,    
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        1,       true,      2,     true,   false,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      2,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdBf16,        0,       true,      2,     true,   false,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 192; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      0,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      1,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        0,       true,      2,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      0,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      1,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      2,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
 
 class fmha_dq_shuffle_kernel
 {{
@@ -1080,7 +1104,6 @@ float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a)
         std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
 
     fmha_bwd_v3_group_args args;
-    auto seqstart_q = reinterpret_cast<const int32_t*>(a.seqstart_q_ptr);
     auto seqstart_k = reinterpret_cast<const int32_t*>(a.seqstart_k_ptr);
     args.ptr_dq   = a.dq_acc_ptr;
     args.ptr_dk   = a.dk_ptr;
@@ -1095,7 +1118,7 @@ float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a)
     args.scalar   = a.scale;
     args.log2e    = ck_tile::log2e_v<float>;
     args.ratio    = a.nhead_q / a.nhead_k;
-    args.seqlen_q = seqstart_q[a.batch];
+    args.Hs_lsed = a.nhead_stride_lsed * 4;
     args.seqlen_k = seqstart_k[a.batch];
     args.Hs_q     = a.nhead_stride_q * 2;
     args.Seqs_q   = a.stride_q * 2;
