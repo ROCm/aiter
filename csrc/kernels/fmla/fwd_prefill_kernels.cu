@@ -309,12 +309,12 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
 
     const auto [tile_m_id, split_id, hqid, bid] =
         kDoSplit ? GetTileIndex<Traits>(params.num_splits) : GetTileIndex<Traits>(1);
-    const auto hqid_xqa = (Traits::kEnableXqa) ? hqid * params.hq_hk_ratio : hqid;
-    const auto hkid   = hqid_xqa / params.hq_hk_ratio;
-    const int32_t mid = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
+    const auto    hqid_xqa = Traits::kEnableXqa ? hqid * params.hq_hk_ratio : hqid;
+    const auto    hkid     = hqid_xqa / params.hq_hk_ratio;
+    const int32_t mid      = __builtin_amdgcn_readfirstlane(tile_m_id * Traits::kBlockM);
 
     const int32_t seqlen_qo    = params.p_seqlens_qo[bid];
-    const int32_t seqlen_qo_pk = (Traits::kEnableXqa) ? seqlen_qo * params.hq_hk_ratio : seqlen_qo;
+    const int32_t seqlen_qo_pk = Traits::kEnableXqa ? seqlen_qo * params.hq_hk_ratio : seqlen_qo;
     const int32_t seqlen_kv    = params.p_seqlens_kv[bid];
 
     if (mid >= seqlen_qo_pk)
@@ -323,14 +323,13 @@ __global__ void kn_fmla_fwd_splictkv_prefill(
     }
 
     // Define causal mask
-    constexpr bool enableXqa = (Traits::kEnableXqa);
-    using Mask = std::conditional_t<enableXqa,
+    using Mask = std::conditional_t<Traits::kEnableXqa,
                                     ck_tile::SimplifiedRatioAttentionMask<kIsCausal>,
                                     ck_tile::SimplifiedGenericAttentionMask<kIsCausal>>;
     Mask mask = [&] {
         if constexpr(kIsCausal)
         {
-            if constexpr(enableXqa)
+            if constexpr(Traits::kEnableXqa)
             {
                 return Mask{seqlen_qo,
                             seqlen_kv - seqlen_qo + 1,
@@ -956,10 +955,8 @@ flash_mla_fwd_prefill_with_kvcache_impl(torch::Tensor& query_nope,
     params.size_b                   = batch_size;
     params.max_size_s_pk            = max_seqlen_qo;
     params.max_size_s_ori           = max_seqlen_qo_ori;
-    // params.max_size_s_tr            = max_seqlen_qo_tr;
     params.size_h_pk                = num_heads_q;
     params.size_h_ori               = num_heads_q_ori;
-    // params.size_h_tr                = num_heads_q_tr;
     params.hq_hk_ratio              = hq_hk_ratio;
     params.block_table_batch_stride = block_table.stride(0);
     params.num_page_blocks          = num_blocks;

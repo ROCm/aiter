@@ -277,13 +277,13 @@ if __name__ == "__main__":
         (torch.float16, torch.bfloat16)[1:],
         [1, 3, 5, 16, 32, 64, 128, 256][3:4],
         [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
-        (1, 16, 64, 128)[1:],
+        (1, 16, 64, 128)[:],
         # (1, 2), # s_q for decode
         (64,),  # s_q for prefill
         (1, 16, 64)[:],
         (False, True)[:],
-        (False, True)[1:],
-        (False, True)[1:],
+        (False, True)[:],
+        (False, True)[:],
     ):
         test_flash_mla(
             dtype,
