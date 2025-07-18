@@ -22,13 +22,19 @@ arg_to_torch_dtype = {
 }
 
 
-def nonvarlen_benchmark_configs():
-    batch_sizes = [1, 4, 16]
-    N_HEADS = [16, 48]
-    seq_len_k = [163, 8192]
+def nonvarlen_benchmark_configs(args: argparse.Namespace):
+    batch_sizes = [1, 4, 16] if args.b == 0 else [args.b]
+    N_HEADS = [16, 48] if args.hq == 0 else [args.hq]
+    seq_len_k = [163, 8192] if args.sk == 0 else [args.sk]
+
     kv_lora_rank = 512
     qk_rope_head_dim = 64
-    rotary_dim = qk_rope_head_dim
+
+    if args.use_neox_style_rope:
+        rotary_dim = qk_rope_head_dim // 2
+    else:
+        rotary_dim = qk_rope_head_dim
+
     configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_k))
     configs = [
         (batch_size, N_HEAD, seq_len_k, kv_lora_rank, qk_rope_head_dim, rotary_dim)
@@ -37,62 +43,52 @@ def nonvarlen_benchmark_configs():
     return configs
 
 
-def model_benchmark_configs(args):
+def model_benchmark_configs(args: argparse.Namespace):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
     fa_configs = []
-    batch_size = args.b if args.b else 1
+    batch_size = args.b if args.b else 4
 
     for model_name, config in configs.items():
-        HQ = config["num_attention_heads"]
-        HK = (
-            HQ
-            if config["num_key_value_heads"] is None
-            else config["num_key_value_heads"]
-        )
+        num_q_heads = config["num_attention_heads"]
+        num_kv_heads = config["num_key_value_heads"]
+        assert num_q_heads == num_kv_heads, (
+            """Grouped Query Attention benchmarking not yet supported - try using a model
+            with the same number of query and key/value heads (e.g Deepseek-V3)""")
+        qk_rope_head_dim = config.get("qk_rope_head_dim", 64)
+        kv_lora_rank = config.get("kv_lora_rank", 512)
+        rotary_dim = qk_rope_head_dim // 2 if args.use_neox_style_rope else qk_rope_head_dim
         N_CTX_K = args.sk if args.sk else [2**i for i in range(1, 14)]
-        HEAD_DIM = config["hidden_size"] // HQ
         if isinstance(N_CTX_K, list):
             for seq_len in N_CTX_K:
                 fa_configs.append(
-                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
+                    (batch_size, num_q_heads, seq_len, kv_lora_rank, qk_rope_head_dim, rotary_dim)
                 )
         else:
             fa_configs.append(
-                (model_name, batch_size, HQ, HK, N_CTX_K, N_CTX_K, HEAD_DIM)
+                (batch_size, num_q_heads, N_CTX_K, kv_lora_rank, qk_rope_head_dim, rotary_dim)
             )
 
     return fa_configs
 
 
-def create_benchmark_configs(custom: bool, args: argparse.Namespace):
+def create_benchmark_configs(args: argparse.Namespace):
     dtype = arg_to_torch_dtype[args.dtype]
-    sk = args.sk
-    head_size = 128 if not args.d else args.d
     x_names = ["BATCH", "H", "S", "kv_lora_rank", "qk_rope_head_dim", "rotary_dim"]
 
     configs = []
-    plot_name = f"MLA-decode-RoPE-Latent-Dim-{head_size}"
+    plot_name = "MLA-decode-RoPE"
     extra_args = {
         "dtype": dtype,
-        "use_rope": args.use_rope,
+        "use_rope": not args.no_rope,
         "is_neox_style": args.use_neox_style_rope,
     }
 
-    if custom:
-        x_vals_list = [(args.b, args.hq, sk, head_size)]
+    if args.model:
+        x_vals_list = model_benchmark_configs(args)
+        plot_name += f"-{args.model}"
     else:
-        if args.model:
-            x_vals_list = model_benchmark_configs(args)
-            x_names = ["BATCH", "HQ", "HK", "N_CTX_K", "D_HEAD"]
-            plot_name += f"-{args.model}"
-            extra_args = {
-                "dtype": dtype,
-                "use_rope": args.use_rope,
-                "is_neox_style": args.use_neox_style_rope,
-            }
-        else:
-            x_vals_list = nonvarlen_benchmark_configs()
+        x_vals_list = nonvarlen_benchmark_configs(args)
 
     if args.metric == "time":
         unit = "ms"
@@ -120,10 +116,10 @@ def create_benchmark_configs(custom: bool, args: argparse.Namespace):
     return configs
 
 
-def run_benchmark(custom: bool, args: argparse.Namespace):
+def run_benchmark(args: argparse.Namespace):
     torch.manual_seed(20)
 
-    @triton.testing.perf_report(create_benchmark_configs(custom, args))
+    @triton.testing.perf_report(create_benchmark_configs(args))
     def bench_mla(
         BATCH: int,
         H: int,  # number of query heads, equal to the number of k/v heads
@@ -285,67 +281,58 @@ def str2bool(v):
 def parse_args():
     parser = get_parser(kernel_name="MLA Decode with RoPE")
     parser.add_argument("-b", type=int, default=0)
-    parser.add_argument("-hq", type=int, default=0)
-    parser.add_argument("-hk", type=int, default=0)
-    parser.add_argument("-sk", type=int, default=0)
+    parser.add_argument("-hq", type=int, default=0, help = "Number of query heads (equal to number of key/value heads)")
+    parser.add_argument("-sk", type=int, default=0, help = "Sequence length (since this is decode, this is the length of the key/value sequence)")
     parser.add_argument(
-        "-use-rope",
+        "--no-rope",
         action="store_true",
         default=False,
-        help="Enable rotary positional embeddings.",
+        help="Disable rotary positional embeddings.",
     )
     parser.add_argument(
-        "-use-neox-style-rope",
+        "--use-neox-style-rope",
         action="store_true",
         default=False,
-        help="Use Neox style rotary positional embeddings over vanilla RoPE. The -use-rope flag should also be enabled.",
+        help="Use Neox style rotary positional embeddings over vanilla RoPE. This is incompatible with the --no-rope flag.",
     )
-    parser.add_argument("-d", type=int, default=0)
     parser.add_argument("--dtype", default="fp16")
-    parser.add_argument("-print_vgpr", action="store_true", default=False)
-    parser.add_argument(
-        "-return_all",
-        action="store_true",
-        default=False,
-        help="Prints TFLOPS, walltime, bandwidth.",
-    )
+    parser.add_argument("--print_vgpr", action="store_true", default=False)
+
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    custom_config = False
-
-    if args.hq or args.hk or args.sk or args.d:
-        custom_config = True
-        assert (
-            args.b and args.hq and args.sk and args.d
-        ), "If custom config is specified, please provide \
-                all of batch, number of Q heads, sequence length, and head size."
+    # if args.b or args.hq or args.hk or args.sk:
+        # assert (
+        #     args.b and args.hq and args.sk and args.d
+        # ), "If custom config is specified, please provide \
+        #         all of batch, number of Q heads, sequence length, and head size."
 
     if args.model:
         assert not (
-            args.hq or args.hk or args.d
-        ), "Specifying model fixes hq, hk and d already. Do not provide them!"
+            args.hq
+        ), "Specifying model fixes hq already. Do not provide it!"
 
     assert (
         args.dtype in arg_to_torch_dtype
     ), "Only fp16, bf16 and f32 types currently supported."
 
     if args.print_vgpr:
-        assert not args.bench_torch, "Do not use -bench_torch with -print_vgpr."
         print("Retrieving VGPR usage for Triton kernels...")
 
         def fun():
-            return run_benchmark(custom_config, args)
-
-        print_vgpr(fun, "fused-attention")
+            return run_benchmark(args)
+        plot_name = "MLA-decode-RoPE"
+        if args.model:
+            plot_name += f"-{args.model}"
+        print_vgpr(fun, plot_name)
         return 0
 
     print(args)
 
-    run_benchmark(custom_config, args)
+    run_benchmark(args)
 
 
 if __name__ == "__main__":
