@@ -1,0 +1,68 @@
+{
+  "llama3": {
+    "8B": {
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "hidden_size": 4096,
+      "intermediate_size": 14336,
+      "vocab_size": 128256,
+      "num_expert": 8,
+      "top_k": 2
+    },
+    "70B": {
+      "num_attention_heads": 64,
+      "num_key_value_heads": 8,
+      "hidden_size": 8192,
+      "intermediate_size": 28672,
+      "vocab_size": 128256,
+      "num_expert": 8,
+      "top_k": 2
+    },
+    "405B": {
+      "num_attention_heads": 128,
+      "num_key_value_heads": 8,
+      "hidden_size": 16384,
+      "intermediate_size": 53248,
+      "vocab_size": 128256,
+      "num_expert": 8,
+      "top_k": 2
+    }
+  },
+  "mistral": {
+    "7B": {
+      "hidden_size": 4096,
+      "intermediate_size": 14336,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "vocab_size": 32000,
+      "num_expert": 8,
+      "top_k": 2
+    },
+    "22B": {
+      "hidden_size": 6144,
+      "intermediate_size": 16384,
+      "num_attention_heads": 48,
+      "num_key_value_heads": 8,
+      "vocab_size": 32000,
+      "num_expert": 8,
+      "top_k": 2
+    }
+
+  },
+  "deepseek": {
+    "V3": {
+      "hidden_size": 7168,
+      "intermediate_size": 18432,
+      "num_attention_heads": 128,
+      "num_key_value_heads": 128,
+      "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "num_expert": 256,
+      "top_k": 4
+    }
+  }
+}
+    
+    
+  
