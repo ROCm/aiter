@@ -4,6 +4,7 @@ import pytest
 from .test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 from .test_gemm_afp4wfp4 import shuffle_scales
 from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 DEBUG_MODE = False
 
@@ -36,10 +37,8 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch
         out = F.gelu(x, approximate="tanh") * y
     return torch_dynamic_mxfp4_quant(out)
 
-
-@pytest.mark.parametrize(
-    "M, N",
-    [
+def get_test_params():
+    full_shape_set = [
         (1, 4),
         (1, 28),
         (1, 32),
@@ -61,17 +60,42 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch
         (160, 40),
         (280, 20),
         (32, 128),
-    ],
-)
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("activation", ["silu", "gelu", "gelu_tanh"])
-@pytest.mark.parametrize("shuffle", [False, True])
+    ] 
+    full_set = [
+        pytest.param(*shape, dtype, activation, shuffle, marks=pytest.mark.slow)
+        for shape in full_shape_set
+        for dtype in ["bfloat16", "float16"]
+        for activation in ["silu", "gelu", "gelu_tanh"]
+        for shuffle in [True, False]
+    ]
+
+    fast_shape_set = [
+        (1, 4),
+        (1, 64),
+        (2, 28),
+        (2, 32),
+        (2, 68),
+        (128, 28),
+        (128, 68),
+        (256, 1024),
+        (160, 40),
+    ] 
+    fast_set = [
+        (*shape, dtype, activation, shuffle)
+        for shape in fast_shape_set
+        for dtype in ["bfloat16"]
+        for activation in ["silu", "gelu", "gelu_tanh"]
+        for shuffle in [True, False]
+    ]
+    return full_set + fast_set
+
+@pytest.mark.parametrize("M, N, dtype, activation, shuffle", get_test_params())
 def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle: bool):
     # TODO: extend tests to different shapes with proper padding
     if shuffle and (M % 256 != 0 or N % 512 != 0):
         pytest.skip()
     torch.manual_seed(20)
-    x = torch.randn((M, N), dtype=dtype, device="cuda")
+    x = torch.randn((M, N), dtype=str_to_torch_dtype[dtype], device="cuda")
 
     if DEBUG_MODE:
         print(f"x.shape={x.shape} x={x}")

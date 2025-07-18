@@ -35,12 +35,12 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     return x, weight, out_dtype, y
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]
-    x_vals += [
+def get_test_params():
+    #Full set
+    full_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    full_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    full_shape_set += [(2**i, 256, 7168) for i in range(5, 9)]
+    full_shape_set += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -68,15 +68,29 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(1, 1, 1)]  # minimal case
-    return x_vals
+    full_shape_set += [(1, 1, 1)]  # minimal case
+    full_set = [
+        pytest.param(*shape, dtype, output, marks=pytest.mark.slow)
+        for shape in full_shape_set
+        for dtype in ["bfloat16", "float16"]
+        for output in [True, False]
+    ]
+
+    #Fast set
+    fast_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 6)]
+    fast_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)] 
+    fast_shape_set = [
+        (*shape, dtype, output)
+        for shape in fast_shape_set
+        for dtype in ["bfloat16"]
+        for output in [True, False]
+    ]
+    return full_set  + fast_shape_set
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+@pytest.mark.parametrize("M, N, K, dtype_str, output", get_test_params())
+def test_gemm_a16_w16(M: int, N: int, K: int, dtype_str, output):
+    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, str_to_torch_dtype[dtype_str], output=output)
 
     torch_out = F.linear(x, w, bias=None)
 
@@ -88,10 +102,9 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
+@pytest.mark.parametrize("M, N, K, dtype_str, output", get_test_params())
+def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype_str, output):
+    dtype = str_to_torch_dtype[dtype_str]
     x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
 
     torch_out = F.linear(x, w, bias=None)
