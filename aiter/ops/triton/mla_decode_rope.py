@@ -23,23 +23,15 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+from typing import Optional
+import functools
+import json
 import triton
 import triton.language as tl
 import torch
-from typing import Optional
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-is_hip_ = is_hip()
-
-
-@triton.jit
-def tanh(x):
-    # Tanh is just a scaled sigmoid
-    return 2 * tl.sigmoid(2 * x) - 1
+from aiter.ops.triton.activation import _tanh
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.jit
@@ -78,10 +70,6 @@ def _fwd_grouped_kernel_stage1_rope(
     USE_ROPE: tl.constexpr,
     IS_NEOX_STYLE: tl.constexpr,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
     split_kv_id = tl.program_id(2)
@@ -253,7 +241,7 @@ def _fwd_grouped_kernel_stage1_rope(
             qk *= sm_scale
 
             if logit_cap > 0:
-                qk = logit_cap * tanh(qk / logit_cap)
+                qk = logit_cap * _tanh(qk / logit_cap)
 
             qk = tl.where(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
@@ -329,45 +317,27 @@ def _decode_grouped_att_m_fwd_rope(
     sm_scale,
     logit_cap,
     use_rope,
-    is_neox_style=True,
+    is_neox_style,
+    config,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     if use_rope:
         assert (
             k_pe_tokens_out is not None
         ), "We must output the k_pe tokens with rope applied if rope fusion enabled."
 
-    BLOCK = 32
-
-    # # [TODO] work around shmem limit on MI3xx
-    # if is_hip_ and kv_lora_rank >= 576:
-    #     BLOCK = 16
-
     qk_rope_head_dim = k_buffer.shape[-1] - kv_lora_rank
     batch, head_num = kv_indptr.shape[0] - 1, q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_C = triton.next_power_of_2(kv_lora_rank)
-    BLOCK_R = triton.next_power_of_2(qk_rope_head_dim)
+    config["BLOCK_C"] = triton.next_power_of_2(kv_lora_rank)
+    config["BLOCK_R"] = triton.next_power_of_2(qk_rope_head_dim)
 
-    BLOCK_H = 16
-    NUM_KV_SPLITS = num_kv_splits
+    config["NUM_KV_SPLITS"] = num_kv_splits
     grid = (
         batch,
-        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
-        NUM_KV_SPLITS,
+        triton.cdiv(head_num, min(config["BLOCK_H"], kv_group_num)),
+        config["NUM_KV_SPLITS"],
     )
-
-    extra_kargs = {}
-    num_stages = 2
-    if is_hip_:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
 
     _fwd_grouped_kernel_stage1_rope[grid](
         q,
@@ -395,17 +365,10 @@ def _decode_grouped_att_m_fwd_rope(
         qk_rope_head_dim,
         kv_group_num=kv_group_num,
         q_head_num=head_num,
-        BLOCK_C=BLOCK_C,
-        BLOCK_R=BLOCK_R,
-        BLOCK_N=BLOCK,
-        BLOCK_H=BLOCK_H,
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
         logit_cap=logit_cap,
         USE_ROPE=use_rope,
         IS_NEOX_STYLE=is_neox_style,
-        num_warps=4,
-        num_stages=num_stages,
-        **extra_kargs,
+        **config,
     )
 
 
@@ -423,10 +386,6 @@ def _fwd_kernel_stage2(
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
@@ -478,22 +437,13 @@ def _decode_softmax_reducev_fwd(
     v_buffer,
     kv_indptr,
     num_kv_splits,
+    config,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
-    BLOCK_DV = triton.next_power_of_2(Lv)
+    config["BLOCK_DV"] = triton.next_power_of_2(Lv)
 
-    NUM_KV_SPLITS = num_kv_splits
-
-    extra_kargs = {}
-    if is_hip_:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+    config["NUM_KV_SPLITS"] = num_kv_splits
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
@@ -505,13 +455,22 @@ def _decode_softmax_reducev_fwd(
         logits.stride(2),
         o.stride(0),
         o.stride(1),
-        NUM_KV_SPLITS=NUM_KV_SPLITS,
-        BLOCK_DV=BLOCK_DV,
         Lv=Lv,
-        num_warps=4,
-        num_stages=2,
-        **extra_kargs,
+        **config,
     )
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config():
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MLA_DECODE_ROPE-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict
 
 
 def decode_attention_fwd_grouped_rope(
@@ -532,10 +491,36 @@ def decode_attention_fwd_grouped_rope(
     logit_cap: Optional[float] = 0.0,
     use_rope: Optional[bool] = False,
     is_neox_style: Optional[bool] = False,
+    config: Optional[dict[str, any]] = None,
 ):
     """
-    #TODO: Add Doc
+    Implements deepseek decode attention with grouped query attention and rotary positional encoding
+
+    parameters:
+    q: Query Tensor
+    k_buffer: Key Cache Tensor
+    v_buffer: Value Cache Tensor
+    o: Output tensor containing the result of decode. Allocated by the caller
+    kv_indptr:
+    kv_indices:
+    k_pe_tokens:
+    kv_lora_rank:
+    rotary_dim
+    cos_sin_cache:
+    positions:
+    attn_logits:
+    num_kv_splits:
+    sm_scale
+    logit_cap:
+    use_rope
+    is_neox_style
+
+    Returns:
+    o: output Tensor
+
     """
+    if config is None:
+        config = _get_config()
 
     _decode_grouped_att_m_fwd_rope(
         q,
@@ -554,5 +539,14 @@ def decode_attention_fwd_grouped_rope(
         logit_cap,
         use_rope,
         is_neox_style,
+        config["fwd_grouped_kernel_stage1_rope"],
     )
-    _decode_softmax_reducev_fwd(attn_logits, q, o, v_buffer, kv_indptr, num_kv_splits)
+    _decode_softmax_reducev_fwd(
+        attn_logits,
+        q,
+        o,
+        v_buffer,
+        kv_indptr,
+        num_kv_splits,
+        config["fwd_kernel_stage2"],
+    )

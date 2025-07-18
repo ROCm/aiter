@@ -9,7 +9,9 @@ import aiter.ops.triton.utils.arch_info as arch_info
 SCALE_GROUP_SIZE = 32
 
 
-def generate_batched_gemm_afp4wfp4_pre_quant_inputs(B, M, N, K):
+def generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+    B, M, N, K, dtype, layout="TN", output=False
+):
     """
     Returns:
         - x: (B, M, K)
@@ -18,9 +20,16 @@ def generate_batched_gemm_afp4wfp4_pre_quant_inputs(B, M, N, K):
         - w_scales: (B, N, K // SCALE_GROUP_SIZE)
     """
     torch.manual_seed(5)
-    # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
-    x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
+    if layout[0] == "T":
+        # 34 is two packed e2m1 values 0010 which is 1.0.
+        x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        x_low = torch.randint(0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(
+            0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda"
+        ).T
+
     x = x_low | x_high << 4
     x_scales = torch.randint(
         124, 128, (B, K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device="cuda"
@@ -34,8 +43,16 @@ def generate_batched_gemm_afp4wfp4_pre_quant_inputs(B, M, N, K):
     x = x_f32.to(torch.bfloat16)
 
     # x = torch.rand((B, M, K), dtype=torch.bfloat16, device="cuda")
-    w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
-    w_high = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+
+    if layout[1] == "N":
+        w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+        w_high = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        w_low = torch.randint(0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda").T
+        w_high = torch.randint(
+            0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda"
+        ).T
+
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
     w_scales = torch.randint(
@@ -43,7 +60,11 @@ def generate_batched_gemm_afp4wfp4_pre_quant_inputs(B, M, N, K):
     )
     w_scales = w_scales.transpose(1, 2)
 
-    return x, w, x_scales, w_scales
+    y = None
+    if output:
+        y = torch.empty(B, M, N, device=x.device, dtype=dtype)
+
+    return x, w, x_scales, w_scales, y
 
 
 def get_x_vals():
@@ -81,7 +102,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(1, 1, 1)]  # minimal case
+    x_vals += [(1, 1, 32)]  # minimal case
 
     # add batch dim
     batch_sizes = [1, 2, 3, 5, 7, 8]
@@ -133,7 +154,7 @@ def e8m0_to_f32(x):
     return x_f32
 
 
-def run_torch(x, w, x_scales, w_scales, dtype):
+def run_torch(x, w, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = x.to(torch.float32)
     w_f32 = mxfp4_to_f32(w)  # -> (B, N, K)
@@ -153,13 +174,12 @@ def test_batched_gemm_afp4_wfp4_pre_quant(B: int, M: int, N: int, K: int, dtype)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
-    x, w, x_scales, w_scales = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
-        B, M, N, K
+    x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+        B, M, N, K, dtype, output=True
     )
-    out = torch.empty(B, M, N, device=x.device, dtype=dtype)
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    batched_gemm_afp4wfp4_pre_quant(x, w, x_scales, w_scales, dtype, out)
+    batched_gemm_afp4wfp4_pre_quant(x, w, w_scales, dtype, out)
 
     torch.testing.assert_close(torch_out, out)

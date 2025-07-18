@@ -90,7 +90,7 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument(
         "-M",
         type=int,
-        default=4096,
+        default=None,
         help="M dim of model benchmark if only one model is under test",
     )
     parser.add_argument(
@@ -99,5 +99,8 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         nargs="+",
         metavar=("DIM"),
         help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for supporting kernels.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser

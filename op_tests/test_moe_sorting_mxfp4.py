@@ -56,6 +56,7 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
         model_dim,
         dtype,
     )
+    num_valid_ids = num_valid_ids[0]
     if stage == "stage1":
         scale = torch.arange(token_num * model_dim // 32, dtype=torch.uint8)
         scale = scale.view(token_num, model_dim // 32)
