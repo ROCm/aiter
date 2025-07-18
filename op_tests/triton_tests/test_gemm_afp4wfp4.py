@@ -122,7 +122,7 @@ def get_x_vals():
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
-    x_vals += [(1, 1, 32)]  # minimal case -> K must be at least split_scale_size
+    x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
 
