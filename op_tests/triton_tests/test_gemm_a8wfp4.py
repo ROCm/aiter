@@ -19,7 +19,7 @@ class INPUT_TYPE(Enum):
     INCREMENTAL = "incremental"  # generate incremental pattern: row i contains value i
 
 
-INPUT_TYPE = INPUT_TYPE.RANDOM
+INPUT_TYPE = INPUT_TYPE.ONES
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -55,7 +55,7 @@ def generate_gemm_a8wfp4_inputs(
     layout: str = "TN",
 ):
     # generate fp32 tensors first
-    x_fp32, w_fp32 = generate_fp32_tensors(M, N, K, INPUT_TYPE)
+    x_fp32, w_fp32 = generate_fp32_tensors(M, N, K, INPUT_TYPE, layout)
 
     # quantize to 8-bit and fp4
     x, x_scales = quantize_to_8bit(x_fp32, a_dtype)
@@ -71,27 +71,53 @@ def generate_gemm_a8wfp4_inputs(
     return x, w, x_scales, w_scales, x_fp32, w_fp32, y
 
 
-def generate_fp32_tensors(M, N, K, debug_type):
+def generate_fp32_tensors(M: int, N: int, K: int, debug_type: INPUT_TYPE, layout: str = "TN"):
     """Generate fp32 tensors based on debug input type"""
     if debug_type == INPUT_TYPE.ONES:
-        x_fp32 = torch.ones((M, K), dtype=torch.float32, device="cuda")
-        w_fp32 = torch.ones((N, K), dtype=torch.float32, device="cuda")
+        if layout[0] == "T":
+            x_fp32 = torch.ones((M, K), dtype=torch.float32, device="cuda")
+        else:
+            x_fp32 = torch.ones((K, M), dtype=torch.float32, device="cuda").T
+        if layout[1] == "N":
+            w_fp32 = torch.ones((N, K), dtype=torch.float32, device="cuda")
+        else:
+            w_fp32 = torch.ones((K, N), dtype=torch.float32, device="cuda").T
     elif debug_type == INPUT_TYPE.RANDOM:
         # default to random
-        x_fp32 = torch.randn((M, K), dtype=torch.float32, device="cuda")
-        w_fp32 = torch.randn((N, K), dtype=torch.float32, device="cuda")
+        if layout[0] == "T":
+            x_fp32 = torch.randn((M, K), dtype=torch.float32, device="cuda")
+        else:
+            x_fp32 = torch.randn((K, M), dtype=torch.float32, device="cuda").T
+        if layout[1] == "N":
+            w_fp32 = torch.randn((N, K), dtype=torch.float32, device="cuda")
+        else:
+            w_fp32 = torch.randn((K, N), dtype=torch.float32, device="cuda").T
     elif debug_type == INPUT_TYPE.INCREMENTAL:
         # generate incremental pattern: row i contains value i
-        x_fp32 = (
-            torch.arange(M, dtype=torch.float32, device="cuda")
-            .unsqueeze(1)
-            .expand(M, K)
-        )
-        w_fp32 = (
-            torch.arange(N, dtype=torch.float32, device="cuda")
-            .unsqueeze(1)
-            .expand(N, K)
-        )
+        if layout[0] == "T":
+            x_fp32 = (
+                torch.arange(M, dtype=torch.float32, device="cuda")
+                .unsqueeze(1)
+                .expand(M, K)
+            )
+        else:
+            x_fp32 = (
+                torch.arange(K, dtype=torch.float32, device="cuda")
+                .unsqueeze(0)
+                .expand(K, M)
+            ).T
+        if layout[1] == "N":
+            w_fp32 = (
+                torch.arange(N, dtype=torch.float32, device="cuda")
+                .unsqueeze(1)
+                .expand(N, K)
+            )
+        else:
+            w_fp32 = (
+                torch.arange(K, dtype=torch.float32, device="cuda")
+                .unsqueeze(0)
+                .expand(K, N)
+            ).T
     else:
         raise ValueError("Unknown Input Type")
 
@@ -220,7 +246,7 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(1, 1, 1)]  # minimal case
+    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
@@ -338,7 +364,8 @@ e5m2_type, e4m3_type = arch_info.get_fp8_dtypes()
 # ])
 @pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
-def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True):
+@pytest.mark.parametrize("layout", ["TN", "NT", "TT", "TN"])
+def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True):
     torch.manual_seed(42)  # for reproducibility
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
@@ -349,7 +376,7 @@ def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, CLEAR_GPUS=True
         torch.cuda.synchronize()
 
     x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(
-        M, N, K, a_dtype, out_dtype, output=True
+        M, N, K, a_dtype, out_dtype, layout=layout, output=True
     )
 
     torch_ref_out = torch.mm(x_fp32, w_fp32.T).to(out_dtype)
