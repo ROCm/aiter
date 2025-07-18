@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #pragma once
 
@@ -278,8 +278,8 @@ public:
 
     CK_TILE_HOST_DEVICE static constexpr auto GetKNopeSingleRepeatSize()
     {
-        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
-        return (Traits::kKNopeLdsBlkSize + kKPack) * sizeof(scalar_t);
+        constexpr int32_t kKPack  = 16 / sizeof(InOutType);
+        return (Traits::kKNopeLdsBlkSize + kKPack) * sizeof(InOutType);
     }
 
     template<int32_t KPerBlock, int32_t RepeatK>
@@ -293,8 +293,8 @@ public:
 
         // 16 means max load elemtments number in an instrution: b128->16bytes
         // 4  means max load elemtments number to lds in gfx942: b32 ->4bytes
-        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr int32_t KVector = 4  / sizeof(scalar_t);
+        constexpr int32_t kKPack  = 16 / sizeof(InOutType);
+        constexpr int32_t KVector = 4  / sizeof(InOutType);
         constexpr int32_t kPad    = kKPack;
 
         static_assert((warpSize * KVector >= kKPerBlock) &&
@@ -309,7 +309,7 @@ public:
     template<int32_t KPerBlock, int32_t RepeatK>
     CK_TILE_HOST_DEVICE static constexpr auto GetSingleKSpaceSize()
     {
-        return GetSingleKElementSpaceSize<KPerBlock, RepeatK>() * sizeof(scalar_t);
+        return GetSingleKElementSpaceSize<KPerBlock, RepeatK>() * sizeof(InOutType);
     }
 
     template <int32_t KPerBlock,
@@ -326,14 +326,14 @@ public:
         constexpr int32_t NumWarps   = Traits::kNumWarps;
         constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr int32_t KVector = 4  / sizeof(scalar_t);
-        constexpr int32_t kPad = 
+        constexpr int32_t kKPack  = 16 / sizeof(InOutType);
+        constexpr int32_t KVector = 4  / sizeof(InOutType);
+        constexpr int32_t kPad =
             kKPack; // for async-copy, this pad is between warps. Optimize this for lds_read speed
 
         static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
         constexpr int32_t LanesPerK =
-            kKPerBlock / KVector; // 
+            kKPerBlock / KVector; //
         constexpr int32_t LaneGroups =
             warpSize /
             LanesPerK; // how many groups (within a wave), they may load different N, but same K
@@ -365,7 +365,7 @@ public:
                                     ck_tile::make_pass_through_transform(ck_tile::number<NumWarps>{}),
                                     ck_tile::make_merge_transform(ck_tile::make_tuple(
                                         ck_tile::number<LaneGroups>{},
-                                        ck_tile::number<LanesPerK>{}, 
+                                        ck_tile::number<LanesPerK>{},
                                         ck_tile::number<KVector>{}))),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<2>{}, ck_tile::sequence<1, 3, 4>{}),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}, ck_tile::sequence<2>{}));
@@ -400,7 +400,7 @@ public:
                                     ck_tile::make_merge_transform(ck_tile::make_tuple(
                                         ck_tile::number<LaneGroups>{},
                                         ck_tile::number<kRepeatK>{},
-                                        ck_tile::number<LanesPerK>{}, 
+                                        ck_tile::number<LanesPerK>{},
                                         ck_tile::number<KVector>{}))),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<2>{}, ck_tile::sequence<1, 3, 4, 5>{}),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}, ck_tile::sequence<2>{}));
@@ -420,8 +420,8 @@ public:
         constexpr int32_t NumWarps   = Traits::kNumWarps;
         constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr int32_t KVector = 4 / sizeof(scalar_t);
+        constexpr int32_t kKPack  = 16 / sizeof(InOutType);
+        constexpr int32_t KVector = 4 / sizeof(InOutType);
         constexpr int32_t kPad    = kKPack; // for async-copy, this pad is between warps
 
         static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
@@ -458,7 +458,7 @@ public:
                                                   ck_tile::number<LaneGroups>{},
                                                   ck_tile::number<NumWarps>{})),
                     ck_tile::make_merge_transform(ck_tile::make_tuple(
-                                                  ck_tile::number<kKPerBlock / kKPack>{}, 
+                                                  ck_tile::number<kKPerBlock / kKPack>{},
                                                   ck_tile::number<kKPack>{}))),
                 ck_tile::make_tuple(ck_tile::sequence<0, 1, 3, 2>{}, ck_tile::sequence<4, 5>{}),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
@@ -492,8 +492,8 @@ public:
                                                   ck_tile::number<LaneGroups>{},
                                                   ck_tile::number<NumWarps>{})),
                     ck_tile::make_merge_transform(ck_tile::make_tuple(
-                                                  ck_tile::number<kRepeatK>{}, 
-                                                  ck_tile::number<kKPerBlock / kKPack>{}, 
+                                                  ck_tile::number<kRepeatK>{},
+                                                  ck_tile::number<kKPerBlock / kKPack>{},
                                                   ck_tile::number<kKPack>{}))),
                 ck_tile::make_tuple(ck_tile::sequence<0, 1, 3, 2>{}, ck_tile::sequence<4, 5, 6>{}),
                 ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
@@ -545,7 +545,7 @@ public:
         constexpr int32_t kNPerBlock = Traits::kSizeDV;
         constexpr int32_t kKPerBlock = Traits::kBlockK1;
 
-        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
+        constexpr int32_t kKPack  = 16 / sizeof(InOutType);
 
         constexpr auto v_lds_block_desc_0 = make_naive_tensor_descriptor(
             ck_tile::make_tuple(ck_tile::number<kKPerBlock / kKPack>{}, ck_tile::number<kNPerBlock>{}, ck_tile::number<kKPack>{}),
@@ -572,8 +572,8 @@ public:
         constexpr int32_t NumWarps   = Traits::kNumWarps;
         constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-        constexpr int32_t kKPack  = 16 / sizeof(scalar_t);
-        constexpr int32_t KVector = 8 / sizeof(scalar_t); // 4
+        constexpr int32_t kKPack  = 16 / sizeof(InOutType);
+        constexpr int32_t KVector = 8 / sizeof(InOutType); // 4
         constexpr int32_t kPad    = kKPack; // for async-copy, this pad is between warps
 
         static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
@@ -605,7 +605,7 @@ public:
                                         ck_tile::number<LaneGroups>{},
                                         ck_tile::number<NumWarps>{})),
                 ck_tile::make_merge_transform(
-                    ck_tile::make_tuple(ck_tile::number<kKPerBlock / kKPack>{}, 
+                    ck_tile::make_tuple(ck_tile::number<kKPerBlock / kKPack>{},
                                         ck_tile::number<kKPack>{}))),
             ck_tile::make_tuple(ck_tile::sequence<0, 2, 1>{}, ck_tile::sequence<3, 4>{}),
             ck_tile::make_tuple(ck_tile::sequence<0>{}, ck_tile::sequence<1>{}));
@@ -664,8 +664,8 @@ public:
     CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeSingleV()
     {
         constexpr int32_t Banks        = 32; /// TODO: need change based on arch
-        constexpr int32_t PixelsPerRow = Banks * 4 / sizeof(scalar_t);
-        constexpr int32_t kKPack       = 16 / sizeof(scalar_t);
+        constexpr int32_t PixelsPerRow = Banks * 4 / sizeof(InOutType);
+        constexpr int32_t kKPack       = 16 / sizeof(InOutType);
         static_assert(PixelsPerRow % kKPack == 0);
         constexpr int32_t NPerRow    = PixelsPerRow / kKPack;
         constexpr int32_t kNPerBlock = Traits::kBlockN1;
@@ -673,20 +673,20 @@ public:
         static_assert(kNPerBlock % NPerRow == 0);
         static_assert(kKPerBlock % kKPack == 0);
 
-        return (kKPerBlock / kKPack) * (kNPerBlock / NPerRow) * (PixelsPerRow + kKPack) * sizeof(scalar_t);
+        return (kKPerBlock / kKPack) * (kNPerBlock / NPerRow) * (PixelsPerRow + kKPack) * sizeof(InOutType);
     }
 
     CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSizeK()
     {
-        return Traits::kKVLoadOnce ?  
+        return Traits::kKVLoadOnce ?
             (GetSingleKElementSpaceSize<Traits::kKNopeLdsBlkSize, Traits::kKNopeLdsIterations>() +
-             GetSingleKElementSpaceSize<Traits::kSizeRope, 1>()) * sizeof(scalar_t) :
+             GetSingleKElementSpaceSize<Traits::kSizeRope, 1>()) * sizeof(InOutType) :
             Traits::kNumPrefetchKV * GetSmemSizeSingleKV();
     }
 
     CK_TILE_HOST_DEVICE static constexpr int32_t GetPSmemStart()
     {
-        return Traits::kKVLoadOnce ?  
+        return Traits::kKVLoadOnce ?
             Traits::kNumPrefetchK * GetSmemSizeK() + Traits::kNumPrefetchV * GetSmemSizeSingleV() :
             Traits::kNumPrefetchKV * GetSmemSizeSingleKV();
     }
@@ -741,7 +741,7 @@ public:
             constexpr int32_t NumWarps   = Traits::kNumWarps;
             constexpr int32_t warpSize   = ck_tile::get_warp_size();
 
-            constexpr int32_t KVector = 4 / sizeof(scalar_t);
+            constexpr int32_t KVector = 4 / sizeof(InOutType);
 
             static_assert(warpSize * KVector >= kKPerBlock && warpSize * KVector % kKPerBlock == 0);
             constexpr int32_t LanesPerK  = kKPerBlock / KVector; // within a wave
@@ -793,8 +793,8 @@ public:
 
         // 4 for dram -> lds max vector size in gfx942
         constexpr int32_t kMaxWarps = 8;
-        constexpr int32_t kKVector = 4 / sizeof(scalar_t);
-        constexpr int32_t kNVector = 4 * kMaxWarps / Traits::kNumWarps / sizeof(scalar_t);
+        constexpr int32_t kKVector = 4 / sizeof(InOutType);
+        constexpr int32_t kNVector = 4 * kMaxWarps / Traits::kNumWarps / sizeof(InOutType);
 
         constexpr int32_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
         constexpr int32_t kLaneGroups  = warpSize / kKLanes;
@@ -825,8 +825,8 @@ public:
 
         // 4 for dram -> lds max vector size in gfx942
         constexpr int32_t kMaxWarps = 8;
-        constexpr int32_t kKVector = 4 / sizeof(scalar_t);
-        constexpr int32_t kNVector = 4 * kMaxWarps / Traits::kNumWarps / sizeof(scalar_t);
+        constexpr int32_t kKVector = 4 / sizeof(InOutType);
+        constexpr int32_t kNVector = 4 * kMaxWarps / Traits::kNumWarps / sizeof(InOutType);
 
         constexpr int32_t kKLanes      = kKPerBlock / (kKNumWarps * kKVector);
         constexpr int32_t kLaneGroups  = warpSize / kKLanes;
