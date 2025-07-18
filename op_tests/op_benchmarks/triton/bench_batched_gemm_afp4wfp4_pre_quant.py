@@ -42,8 +42,8 @@ def bench_gemm_fn(
     batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
 ):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
-        batch, M, N, K
+    x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+        batch, M, N, K, c_dtype, layout=layout, output=True
     )
     # flops
     flops = 2.0 * M * N * K * batch
@@ -111,7 +111,7 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
         args=args,
-        x_names=["model_name", "M", "N", "K", "batch"],
+        x_names=["M", "N", "K", "batch"],
     )
 
     @triton.testing.perf_report([benchmark])
