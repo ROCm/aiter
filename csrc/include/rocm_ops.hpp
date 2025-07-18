@@ -957,3 +957,5 @@
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
         .export_values();
+
+#define MLA_METADATA_PYBIND m.def("get_mla_metadata_v0", &get_mla_metadata_v0);

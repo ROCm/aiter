@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import Optional
+from typing import Tuple, Optional
 from ..jit.core import (
     compile_ops,
 )
@@ -269,3 +269,21 @@ def mla_prefill_asm_fwd(
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
 ): ...
+
+
+@compile_ops("module_mla_metadata")
+def get_mla_metadata_v0(
+    seqlens: torch.Tensor,
+    num_heads_per_head_k: int,
+    num_heads_k: int,
+) -> Tuple[torch.Tensor, int]:
+    """
+    Arguments:
+        cumulated seqlens: (batch_size + 1), dtype torch.int32.
+        num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
+        num_heads_k: num_heads_k.
+    Returns:
+        cumulated num_kv_splits: (batch_size + 1), dtype torch.int32.
+        max_num_splits: (1), dtype torch.int32.
+    """
+    ...
