@@ -65,6 +65,11 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         scaleB = torch.tensor(scaleB, dtype=dtypes.fp32, device="cuda")
     (a, *_), avg_a = run_torch(x, weight, bias, otype, scaleA, scaleB)
     (b, *_), avg_b = run_gemm_b(x, weight, bias, otype, scaleA, scaleB)
+    
+    assert a.dtype == b.dtype, f"Expected a.dtype == b.dtype, but a={a.dtype}, b={b.dtype}, input dtype={dtype}"
+    if otype is not None:
+        assert a.dtype == otype, f"a={a.dtype}, expected output dtype={otype}, input dtype={dtype}"
+        assert b.dtype == otype, f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
@@ -274,7 +279,8 @@ def test_normal_gemm():
     )
     test_gemm(dtypes.bf16, 128, 32, 8192)
     for dtype in [dtypes.fp16, dtypes.bf16]:
-        test_gemm(dtype, 128, 32, 8192)
+        for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
+            test_gemm(dtype, 128, 32, 8192, otype=otype)
         # # qkv_proj
         # for (m, n, k) in [(4096, 1280, 8192),
         #                   (128, 1280, 8192),
@@ -337,7 +343,8 @@ def test_skinny_gemm():
         for mnk in test_mnk_list:
             m, n, k = mnk
             for dtype in [dtypes.fp16, dtypes.bf16]:
-                test_gemm(dtype, m, n, k)
+                for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
+                    test_gemm(dtype, m, n, k, otype=otype)
 
 
 # test_normal_gemm()

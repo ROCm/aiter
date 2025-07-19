@@ -300,6 +300,8 @@ class TunedGemm:
         )
         if batched:
             out = out.view(*inp.shape[:-1], weights.shape[0])
+        if otype is not None:
+            out = out.to(otype)
         return out
 
 
