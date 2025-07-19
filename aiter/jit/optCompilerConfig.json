@@ -262,7 +262,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{get_asm_dir()}/f4gemm/codegen.py --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
