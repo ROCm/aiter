@@ -49,7 +49,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 namespace aiter
 {
 
-  constexpr int kMaxBlocks = 64;
+  constexpr int kMaxBlocks = 80;
   // note: we don't want to use atomics for signals because peer atomics are no
   // supported on PCIe links
   struct Signal
@@ -612,6 +612,84 @@ namespace aiter
     return packDowncast<T, pack_size>(ret_val);
   }
 
+  // small pack
+  template <typename T, int ngpus, int pack_size>
+  __global__ void __launch_bounds__(512, 1)
+      cross_device_reduce_1stage_small_pack(RankData *_dp, RankSignals sg,
+#ifndef USE_ROCM
+                                 volatile
+#endif
+                                 Signal *self_sg,
+                                 T *__restrict__ result, int rank, int size)
+  {
+    using P = array_t<T, pack_size>;
+    // note: we don't reorder the address so the accumulation order is the same
+    // for all ranks, ensuring bitwise identical results
+    auto dp = *_dp;
+    start_sync<ngpus>(sg, self_sg, rank);
+    // do the actual reduction
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+         idx += gridDim.x * blockDim.x)
+    {
+      ((P*)result)[idx] = multiGPUPackReduce<T, pack_size, ngpus>((const P**)&dp.ptrs[0], idx);
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+  }
+
+  template <typename T, int ngpus, int pack_size>
+  __global__ void __launch_bounds__(512, 1)
+      cross_device_reduce_2stage_small_pack(RankData *_dp, RankSignals sg,
+#ifndef USE_ROCM
+                                 volatile
+#endif
+                                 Signal *self_sg,
+                                 T *__restrict__ result, int rank, int size)
+  {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    using P = array_t<T, pack_size>;
+    int part = size / ngpus;
+    int start = rank * part;
+    int end = rank == ngpus - 1 ? size : start + part;
+    int largest_part = part + size % ngpus;
+    const P *ptrs[ngpus];
+    P *tmps[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; i++)
+    {
+      int target = (rank + i) % ngpus;
+      ptrs[i] = (const P *)_dp->ptrs[target];
+      tmps[i] = get_tmp_buf<P>(sg.signals[target]);
+    }
+    auto tmp_out = tmps[0];
+    start_sync<ngpus>(sg, self_sg, rank);
+    // stage 1: reduce scatter
+    for (int idx = start + tid; idx < end; idx += stride)
+    {
+      tmp_out[idx - start] = multiGPUPackReduce<T, pack_size, ngpus>(ptrs, idx);
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+
+    // stage 2: allgather. Note: it's important to match the tid between
+    // the two stages, because visibility across devices is only guaranteed
+    // between threads that have the same tid. If thread i computes the sum of
+    // start + i in the first stage, then thread i also gathers start + i from all
+    // ranks.
+    for (int idx = tid; idx < largest_part; idx += stride)
+    {
+#pragma unroll
+      for (int i = 0; i < ngpus; i++)
+      {
+        int gather_from_rank = ((rank + i) % ngpus);
+        if (gather_from_rank == ngpus - 1 || idx < part)
+        {
+          int dst_idx = gather_from_rank * part + idx;
+          ((P *)result)[dst_idx] = tmps[i][idx];
+        }
+      }
+    }
+  }
+
   // bf16 quant fp8 kernel function
   // too slow need to be optimized
   // fp16
@@ -976,31 +1054,121 @@ namespace aiter
                                std::to_string(block_limit));
 
     RankData *ptrs = get_buffer_RD(stream, input);
+    int blocks = kMaxBlocks;
 
-    size /= d;
-    auto bytes = size * sizeof(typename packed_t<T>::P);
-    int blocks = std::min(block_limit, (size + threads - 1) / threads);
-#define KL(ngpus, name)                                                       \
-  name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
+    auto bytes = size * sizeof(T);
+    auto cal_block_num = [=](int sz)
+    {
+      return std::min(blocks, (sz + threads - 1) / threads);
+    };
+
+    enum class KernelType {vec2, vec4, vec8};
+    /*
+     * case:
+     * call_1stage = 0, call_2stage = 0
+     * call_1stage = 1, call_2stage = 0
+     * call_1stage = 0, call_2stage = 1
+     * */
+    bool call_1stage = false;
+    bool call_2stage = false;
+    // call 1stage or 2stage?
+    if (world_size_ == 2)
+    {
+      call_1stage = true;
+      call_2stage = false;
+    }
+    else if (full_nvlink_)
+    {
+      if ((world_size_ <= 4 && bytes < 512 * 1024) || (world_size_ <= 8 && bytes < 256 * 1024))
+      {
+        call_1stage = true;
+      }
+      call_2stage = !call_1stage;
+    }
+    // get kernel vectorization size and grid size
+    KernelType ktype = KernelType::vec8;
+    if (call_1stage)
+    {
+      if (bytes < 128 * 1024)
+      {
+        ktype = KernelType::vec2;
+        size /= 2;
+      }
+      else
+      {
+        ktype = KernelType::vec4;
+        size /= 4;
+      }
+      blocks = cal_block_num(size);
+    }
+    if (call_2stage)
+    {
+      // small pack
+      if (bytes < 62 * 1024 * world_size_)
+      {
+        // vec 2
+        if (bytes < 46 * 1024 * world_size_)
+        {
+          ktype = KernelType::vec2;
+          blocks = cal_block_num(size / (2 * world_size_));
+        }
+        // vec 4
+        else
+        {
+          ktype = KernelType::vec4;
+          blocks = cal_block_num(size / (4 * world_size_));
+        }
+      }
+      // vec8
+      else
+      {
+        ktype = KernelType::vec8;
+        // with tile effect
+        if (bytes < 96 * 1024 * world_size_)
+        {
+          blocks = cal_block_num(size / (8 * world_size_));
+        }
+        // data size big enough
+        else
+        {
+          blocks = 16;
+        }
+      }
+    }
+#define KL(ngpus, name)                                                          \
+  name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output,    \
                                                  rank_, size);
+#define KL_SMALL(ngpus, name, pack_size)                                         \
+  name<T, ngpus, pack_size><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, \
+                                                            output, rank_, size);
+
+#define dispatch(ngpus, name)                                                    \
+    do                                                                           \
+    {                                                                            \
+      switch (ktype)                                                             \
+      {                                                                          \
+        case KernelType::vec2:                                                   \
+          KL_SMALL(ngpus, name##_small_pack, 2)                                  \
+          break;                                                                 \
+        case KernelType::vec4:                                                   \
+          KL_SMALL(ngpus, name##_small_pack, 4)                                  \
+          break;                                                                 \
+        case KernelType::vec8:                                                   \
+          KL(ngpus, name)                                                        \
+          break;                                                                 \
+      }                                                                          \
+    } while(0)
+
 #define REDUCE_CASE(ngpus)                            \
   case ngpus:                                         \
   {                                                   \
-    if (world_size_ == 2)                             \
+    if (call_1stage)                                  \
     {                                                 \
-      KL(ngpus, cross_device_reduce_1stage);          \
+      dispatch(ngpus, cross_device_reduce_1stage);    \
     }                                                 \
-    else if (full_nvlink_)                            \
+    else if (call_2stage)                             \
     {                                                 \
-      if ((world_size_ <= 4 && bytes < 512 * 1024) || \
-          (world_size_ <= 8 && bytes < 256 * 1024))   \
-      {                                               \
-        KL(ngpus, cross_device_reduce_1stage);        \
-      }                                               \
-      else                                            \
-      {                                               \
-        KL(ngpus, cross_device_reduce_2stage);        \
-      }                                               \
+      dispatch(ngpus, cross_device_reduce_2stage);    \
     }                                                 \
     break;                                            \
   }
