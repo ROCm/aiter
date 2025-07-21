@@ -4,9 +4,57 @@
 import sys
 import pytest
 import torch
-
+from typing import Union, List
 from aiter.ops.triton.lean_atten import persistent_lean_attention
 
+def get_lean_attn_inputs(batch: int, 
+                         n_ctx_q: int, 
+                         n_ctx: List[int], 
+                         block_n: int,
+                         h: int, 
+                         d: int, 
+                         total_programs: int, 
+                         init_dtype: Union[torch.dtype, str],):
+    assert batch == len(n_ctx)
+    try:
+        sum_n_ctx = sum(int(n) for n in n_ctx)
+    except ValueError:
+        print(f"N_CTX contains non-numeric values: {n_ctx}")
+    # Allocate Tensors
+    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
+        mean=0.0, std=0.5
+    )
+    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+        mean=0.0, std=0.5
+    )
+    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
+        mean=0.0, std=0.5
+    )
+
+    # LeanAttention Specific Parameters
+    Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
+    Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
+    Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
+
+    locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
+
+    # N_CTX is a list of context lengthes for all the req in a batch
+    # First, calculate #BLOCK_N for each context length "list_num_block_n"
+    # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
+    # Third, convert list to a tensor "batch_num_block_n"
+    for s in n_ctx:
+        # print(f"s={s}")
+        list_num_block_n = [
+            (int(str(s).strip()) + block_n - 1) // block_n for s in n_ctx
+        ]
+    len_sum = 0
+    list_sum_block_n = []
+    for i in range(batch):
+        len_sum += list_num_block_n[i]
+        list_sum_block_n.append(len_sum)
+    batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
+
+    return q, k, v, Mp, Lp, Op, locks, batch_num_block_n
 
 @pytest.mark.parametrize(
     "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
@@ -93,50 +141,18 @@ def test_persistent_lean_attention(
         BLOCK_N = 256
         d = 16
 
-    assert batch == len(n_ctx)
-    try:
-        sum_n_ctx = sum(int(n) for n in n_ctx)
-    except ValueError:
-        print(f"N_CTX contains non-numeric values: {n_ctx}")
-
-    # N_CTX is a list of context lengthes for all the req in a batch
-    # First, calculate #BLOCK_N for each context length "list_num_block_n"
-    # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
-    # Third, convert list to a tensor "batch_num_block_n"
-    for s in n_ctx:
-        # print(f"s={s}")
-        list_num_block_n = [
-            (int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx
-        ]
-    len_sum = 0
-    list_sum_block_n = []
-    for i in range(batch):
-        len_sum += list_num_block_n[i]
-        list_sum_block_n.append(len_sum)
-    batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
-
     sm_scale = 0.5
 
-    # Allocate Tensors
-    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
-        mean=0.0, std=0.5
+    q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
+        batch,
+        n_ctx_q,
+        n_ctx,
+        BLOCK_N,
+        h,
+        d,
+        total_programs,
+        init_dtype,
     )
-    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
-        mean=0.0, std=0.5
-    )
-    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
-        mean=0.0, std=0.5
-    )
-
-    # LeanAttention Specific Parameters
-    # Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    # Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    # Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
-    Mp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
-    Lp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
-    Op = torch.empty((total_programs, BLOCK_M, d), device=q.device, dtype=torch.float32)
-
-    locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
     # Triton LeanAttention output
     la_out = persistent_lean_attention(
@@ -201,48 +217,21 @@ def main():
     BLOCK_N = 64
     waves_per_eu = 1
     num_warps = 1
-    assert batch == len(n_ctx)
-
-    try:
-        sum_n_ctx = sum(int(n) for n in n_ctx)
-    except ValueError:
-        print(f"N_CTX contains non-numeric values: {n_ctx}")
 
     print(f"causal={causal}, batch={batch}")
-    # N_CTX is a list of context lengthes for all the req in a batch
-    # First, calculate #BLOCK_N for each context length "list_num_block_n"
-    # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
-    # Third, convert list to a tensor "batch_num_block_n"
-    for s in n_ctx:
-        list_num_block_n = [
-            (int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx
-        ]
-    len_sum = 0
-    list_sum_block_n = []
-    for i in range(batch):
-        len_sum += list_num_block_n[i]
-        list_sum_block_n.append(len_sum)
-    batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
     sm_scale = 0.5
 
-    # Allocate Tensors
-    q = torch.empty((n_ctx_q * batch, h, d), dtype=init_dtype, device="cuda").normal_(
-        mean=0.0, std=0.5
+    q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
+        batch,
+        n_ctx_q,
+        n_ctx,
+        BLOCK_N,
+        h,
+        d,
+        total_programs,
+        init_dtype,
     )
-    k = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
-        mean=0.0, std=0.5
-    )
-    v = torch.empty((sum_n_ctx, h, d), dtype=init_dtype, device="cuda").normal_(
-        mean=0.0, std=0.5
-    )
-
-    # LeanAttention Specific Parameters
-    Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
-
-    locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
     # Triton LeanAttention output
     la_out = persistent_lean_attention(

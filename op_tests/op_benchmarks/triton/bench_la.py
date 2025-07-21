@@ -8,17 +8,10 @@ import sys
 import argparse
 import itertools
 
-from aiter.ops.triton.mla_decode_rope import (
-    decode_attention_fwd_grouped_rope,
-)
+from aiter.ops.triton.lean_atten import persistent_lean_attention
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
-from op_tests.triton_tests.test_mla_decode_rope import input_helper, ref_preprocess
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
+from op_tests.triton_tests.test_la import get_lean_attn_inputs
+from typing import List
 
 
 def nonvarlen_benchmark_configs(args: argparse.Namespace):
@@ -140,15 +133,18 @@ def run_benchmark(args: argparse.Namespace):
         BATCH: int,
         H: int,  # number of query heads, equal to the number of k/v heads
         S: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        rotary_dim: int,
+        head_dim: int,
+        n_ctx: int,
+        n_ctx_q: List[int],
+        block_n: int,
+        block_m: int,
         dtype: torch.dtype,
         use_rope: bool,
-        is_neox_style: bool = False,
+        causal: bool = True,
         num_kv_splits: int = 2,
         sm_scale: float = 1.0,
         logit_cap: float = 0.0,
+        total_programs: int = 304,
         device="cuda",
         metric: str = "throughput",
         **kwargs,
@@ -163,26 +159,35 @@ def run_benchmark(args: argparse.Namespace):
         Right now q_heads == kv_heads).
         """
 
-        kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
-            input_helper(
-                BATCH,
-                H,
-                S,
-                kv_lora_rank,
-                rotary_dim,
-                qk_rope_head_dim,
-                num_kv_splits,
-                dtype,
-                device,
-            )
+        q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
+            BATCH,
+            n_ctx_q,
+            n_ctx,
+            block_n,
+            H,
+            head_dim,
+            total_programs,
+            dtype,
         )
 
-        k_input, v_input = ref_preprocess(kv_cache, kv_lora_rank)
-
-        tri_o = torch.empty(BATCH, H, kv_lora_rank, dtype=kv_cache.dtype, device=device)
-        # we need to return the rope'd k_pe_tokens to be saved in cache
-        k_pe_tokens = torch.empty(
-            BATCH, qk_rope_head_dim, dtype=kv_cache.dtype, device=device
+        # Triton LeanAttention output
+        la_out = persistent_lean_attention(
+            q,
+            k,
+            v,
+            Mp,
+            Lp,
+            Op,
+            locks,
+            batch_num_block_n,
+            total_programs,
+            block_m,
+            block_n,
+            causal,
+            BATCH,
+            sm_scale,
+            num_warps,
+            waves_per_eu,
         )
 
         # FLOPS calculation
