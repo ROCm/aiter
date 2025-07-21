@@ -466,7 +466,7 @@ def run_benchmark(custom, args):
         else:  # GB/s
             return mem / ms * 1e-3
 
-    bench_mha.run(save_path=".", print_data=True, show_plots=False)
+    bench_mha.run(save_path="." if args.o else None, print_data=True)
 
 
 def supported_layouts():
@@ -535,6 +535,9 @@ def parse_args():
         choices=["fixed", "dynamic"],
         default=None,
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser.parse_args()
 

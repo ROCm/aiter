@@ -238,7 +238,6 @@ def run_benchmark(args):
         flops = (2.0 * BS * HQ * SEQ_LEN * HEAD_DIM) * 2
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active
@@ -251,7 +250,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -271,7 +270,7 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -280,6 +279,9 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
