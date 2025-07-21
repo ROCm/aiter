@@ -2,7 +2,6 @@
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import sys
-import pytest
 import torch
 import triton
 
