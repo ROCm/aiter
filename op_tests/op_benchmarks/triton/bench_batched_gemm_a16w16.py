@@ -107,11 +107,11 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
-        x_names=["M", "N", "K", "batch"],
+        x_names=["batch", "M", "N", "K"],
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_a8w8(M, N, K, batch, metric, provider):
+    def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider):
         return bench_gemm_fn(batch, M, N, K, metric)
 
     bench_batched_gemm_a8w8.run(save_path=".", print_data=True)
@@ -123,9 +123,7 @@ def run_benchmark(args, defaults):
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(
@@ -137,6 +135,8 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
+            "layout",
+            "tp",
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):

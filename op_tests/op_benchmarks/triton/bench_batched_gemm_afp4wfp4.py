@@ -116,11 +116,11 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
-        x_names=["M", "N", "K", "batch"],
+        x_names=["batch", "M", "N", "K"],
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4(M, N, K, batch, metric, provider, model_name=None):
+    def bench_batched_gemm_afp4wfp4(batch, M, N, K, metric, **kwargs):
         return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
 
     bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
@@ -144,6 +144,8 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
+            "layout",
+            "tp",
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):

@@ -98,7 +98,7 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         nargs="+",
         metavar=("DIM"),
-        help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for supporting kernels.",
+        help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for batched kernels.",
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"

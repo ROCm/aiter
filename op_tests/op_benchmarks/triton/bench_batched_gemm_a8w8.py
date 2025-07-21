@@ -23,7 +23,8 @@ from aiter.ops.triton.batched_gemm_a8w8 import (
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+    batch_size = args.B if args.B is not None else 16
     shapes = []
     for M in M_list:
         for _, config in configs.items():
@@ -31,7 +32,7 @@ def model_benchmark_shapes(args):
             K = config["hidden_size"]
 
             shapes.append(
-                (M, N, K, 16)
+                (M, N, K, batch_size)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes
@@ -107,11 +108,11 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
-        x_names=["M", "N", "K", "batch"],
+        x_names=["batch", "M", "N", "K"],
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_a8w8(M, N, K, batch, metric, provider):
+    def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider):
         return bench_gemm_fn(batch, M, N, K, metric)
 
     bench_batched_gemm_a8w8.run(save_path=".", print_data=True)
@@ -123,9 +124,7 @@ def run_benchmark(args, defaults):
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(
@@ -137,6 +136,8 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
+            "layout",
+            "tp",
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
@@ -149,6 +150,12 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser("Batched Int8 x Int8 GEMM")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "-B",
+        type=int,
+        required=False,
+        help="Batch size to be used when using --model flag.",
+    )
     return get_ff_args(parser)
 
 

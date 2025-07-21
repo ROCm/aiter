@@ -18,7 +18,7 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     """
     Utility function for returning a triton.testing.Benchmark object to populate.
 
-    Note: This is for benchmarking without the --model flag. The distinction
+    Note: This is for benchmarking GEMM kernels without the --model flag. The distinction
     comes in the x_names and x_vals: For models, we use hidden_dim and intermediate_dim
     as args, but if we're just given a shape, we use M, N, K.
     """
@@ -26,9 +26,20 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
         x_names = ["M", "N", "K"]
 
     if args.shape:
-        x_vals_list = [args.shape]
+        if len(x_names) == len(args.shape):
+            x_vals_list = [args.shape]
+        elif len(x_names) == 4 and len(args.shape) == 3:  # for batched GEMM kernels
+            if hasattr(args, "B") and args.B is not None:
+                x_vals_list = [[args.B] + args.shape]
+            else:
+                warnings.warn("Batch size not specified in --shape, using default.")
+                x_vals_list = [[16] + args.shape]
+        else:
+            raise ValueError(
+                f"Incompatible --shape provided: {args.shape}. Expected a shape that matches {x_names}."
+            )
     else:
-        x_vals_list = get_x_vals(dims=len(x_names))
+        x_vals_list = get_x_vals(dims=len(x_names), args=args)
 
     if args.metric == "time":
         ylabel = "Time (ms)"
@@ -128,7 +139,7 @@ def model_benchmark_shapes(args):
     return shapes
 
 
-def get_x_vals(dims: int):
+def get_x_vals(dims: int, args=None):
     """
     Get a default set of benchmarking values (M, N, K).
     """
@@ -149,7 +160,14 @@ def get_x_vals(dims: int):
         (16384, 1280, 8192),
     ]
     if dims == 4:
-        x_vals = [tuple(list(i) + [16]) for i in x_vals]  # (M, N, K, B)
+        if hasattr(args, "B") and args.B is not None:
+            batch_size = args.B
+        else:
+            batch_size = 16  # by default
+            warnings.warn(
+                f"Batch size not specified in --shape, using default: {batch_size}"
+            )
+        x_vals = [tuple([batch_size] + list(i)) for i in x_vals]  # (B, M, N, K)
     return x_vals
 
 
