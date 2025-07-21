@@ -97,12 +97,17 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const _B16x8& inpA,
     }
 }
 
-
 template <typename T, int absz, int cbid, int blgp>
-__device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
-                                                          const long& inpB,
-                                                          const floatx4& inpC) {
-    static_assert(false, "unsupported 8b dtype");
+__device__ __forceinline__ floatx4 gcn_mfma16x16x128_instr(const long& inpA,
+                                                           const long& inpB,
+                                                           const floatx4& inpC) {
+    if constexpr (std::is_same<T, __hip_fp8_e4m3>::value) {
+        return __builtin_amdgcn_smfmac_f32_16x16x128_fp8_fp8(inpA, inpB, inpC, absz, cbid, blgp);
+    } else if constexpr (std::is_same<T, __hip_fp8_e5m2>::value) {
+        return __builtin_amdgcn_smfmac_f32_16x16x128_bf8_bf8(inpA, inpB, inpC, absz, cbid, blgp);
+    } else {
+        static_assert(false, "unsupported 8b dtype");
+    }
 }
 #else
 template <typename T, int absz, int cbid, int blgp>

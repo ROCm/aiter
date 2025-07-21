@@ -33,6 +33,7 @@ __inline__ __device__ void _paged_attention_kernel(
                                     // head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
+    const float* q_scale_ptr,
     const float* k_scale_ptr,
     const float* v_scale_ptr,
     const AttentionVariant* variant)
@@ -160,7 +161,7 @@ __inline__ __device__ void _paged_attention_kernel(
         }
     }
     __syncthreads();
-    float q_max = 0;
+
     for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
         for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
             for (int i = 0; i < 2; i++) {
@@ -170,13 +171,6 @@ __inline__ __device__ void _paged_attention_kernel(
                             Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i] =
                                 shared_logits[gqa_ratio_loop][head_loop][mtp][qkhe_depth][rowid][lane16id % GQA_RATIO_MTP_PARALLEL]
                                             [2 * qkratio + i];
-                            if constexpr(std::is_same<scalar_t, bit8_t>::value)
-                            {
-                                scalar_t* qptr = reinterpret_cast<scalar_t*>(&Qlocal[gqa_ratio_loop][head_loop][mtp][qkhe_depth][qkratio].xy[i]);
-                                for(int k = 0; k< 2; k++){
-                                    q_max = fmax(to_float<scalar_t>(qptr[k]), q_max);
-                                }
-                            }
                         }
                     }
                 }
@@ -298,9 +292,8 @@ __inline__ __device__ void _paged_attention_kernel(
 
     // calculate post qk mfma scale
     float scale2 = scale;
-    q_max = warpReduceMax(q_max);
-    float q_scale = q_max > 0 ? 240.0 / q_max : 1.0;
-
+    float q_scale = q_scale_ptr ? *q_scale_ptr : 1.0;
+    
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         // multiply by k_scale if fp8 kv cache
