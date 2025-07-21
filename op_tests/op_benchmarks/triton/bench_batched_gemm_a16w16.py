@@ -3,7 +3,7 @@ import torch
 import triton
 import math
 from op_tests.triton_tests.test_batched_gemm_bf16 import (
-    generate_batched_gemm_a8w8_inputs,
+    generate_batched_gemm_a16w16_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -15,9 +15,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     get_model_configs,
 )
-from aiter.ops.triton.batched_gemm_a8w8 import (
-    batched_gemm_a8w8 as batched_gemm_a8w8,
-)
+from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
 
 
 def model_benchmark_shapes(args):
@@ -37,25 +35,21 @@ def model_benchmark_shapes(args):
     return shapes
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str):
+def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, _, y = generate_batched_gemm_a8w8_inputs(
-        batch, M, N, K, dtype=c_dtype, output=True
+    x, w, bias, y = generate_batched_gemm_a16w16_inputs(
+        batch, M, N, K, dtype=c_dtype, layout=layout, output=True
     )
     # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
     # flops
     flops = 2.0 * M * N * K * batch
     # memory transfer
     mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
-    )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_a8w8(x, w, x_scale, w_scale, c_dtype, YQ=y),
+        lambda: batched_gemm_bf16(x, w, bias, c_dtype, YQ=y),
         warmup=25,
         rep=100,
     )
@@ -98,9 +92,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -112,9 +106,9 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider):
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -135,7 +129,6 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
-            "layout",
             "tp",
         ]
         for arg in unsupported_args:
@@ -149,6 +142,12 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser("Batched Int8 x Int8 GEMM")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "-B",
+        type=int,
+        required=False,
+        help="Batch size to be used when using --model flag.",
+    )
     return get_ff_args(parser)
 
 

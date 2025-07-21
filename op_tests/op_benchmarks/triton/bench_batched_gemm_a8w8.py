@@ -38,10 +38,10 @@ def model_benchmark_shapes(args):
     return shapes
 
 
-def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str):
+def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
     x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
-        batch, M, N, K, dtype=c_dtype, output=True
+        batch, M, N, K, dtype=c_dtype, layout=layout, output=True
     )
     # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
     # flops
@@ -99,9 +99,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -113,9 +113,9 @@ def run_shape_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider):
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -136,7 +136,6 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
-            "layout",
             "tp",
         ]
         for arg in unsupported_args:

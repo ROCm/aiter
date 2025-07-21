@@ -143,7 +143,6 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
-            "layout",
             "tp",
         ]
         for arg in unsupported_args:
@@ -157,6 +156,12 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser("Batched MXFP4 x MXFP4 GEMM, Pre Quant")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "-B",
+        type=int,
+        required=False,
+        help="Batch size to be used when using --model flag.",
+    )
     return get_ff_args(parser)
 
 
