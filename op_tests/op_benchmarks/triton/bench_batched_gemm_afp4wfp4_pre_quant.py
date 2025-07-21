@@ -24,15 +24,16 @@ import aiter.ops.triton.utils.arch_info as arch_info
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [4096] if args.M is not None else [2**i for i in range(0, 15)]
+    M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+    batch_size = args.B if args.B is not None else 16
     shapes = []
     for M in M_list:
-        for model_name, config in configs.items():
+        for _, config in configs.items():
             N = config["intermediate_size"]
             K = config["hidden_size"]
 
             shapes.append(
-                (model_name, M, N, K, 16)
+                (M, N, K, batch_size)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes

@@ -121,6 +121,7 @@ def get_x_vals():
     ],
 )
 def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
+    dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
         b, m, n, k, dtype, output
     )
