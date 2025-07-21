@@ -18,11 +18,11 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def bench_gemm_fn(M, N, K, metric):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
-        M, N, K, str_to_torch_dtype["fp8e4m3"], c_dtype, output=True
+        M, N, K, str_to_torch_dtype["fp8e4m3"], c_dtype, layout=layout, output=True
     )
 
     # flops
@@ -58,7 +58,9 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object("GEMM A8W8 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
+    def bench_gemm_a8w8(
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+    ):
         """
         Fc1:
              M      K                  K           N          M       N
@@ -83,9 +85,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -95,12 +97,12 @@ def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("GEMM A8W8 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8(M, N, K, metric, **kwargs):
+    def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_a8w8.run(save_path=".", print_data=True)
+    bench_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -108,9 +110,7 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(

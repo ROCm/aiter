@@ -1,4 +1,3 @@
-import argparse
 import sys
 import torch
 import triton
@@ -19,29 +18,32 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_afp4wfp4_pre_quant,
 )
+import aiter.ops.triton.utils.arch_info as arch_info
 
 
 def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [4096] if args.M is not None else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
+        for model_name, config in configs.items():
             N = config["intermediate_size"]
             K = config["hidden_size"]
 
             shapes.append(
-                (M, N, K, 16)
+                (model_name, M, N, K, 16)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes
 
 
-def bench_gemm_fn(batch, M, N, K, metric):
+def bench_gemm_fn(
+    batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
+):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
-        batch, M, N, K
+    x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_pre_quant_inputs(
+        batch, M, N, K, c_dtype, layout=layout, output=True
     )
     # flops
     flops = 2.0 * M * N * K * batch
@@ -53,12 +55,9 @@ def bench_gemm_fn(batch, M, N, K, metric):
     )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
-    out = torch.empty(
-        x.shape[0], x.shape[1], w.shape[2], device=x.device, dtype=c_dtype
-    )
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4_pre_quant(x, w, x_scale, w_scale, c_dtype, out),
+        lambda: batched_gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
         warmup=25,
         rep=100,
     )
@@ -80,13 +79,13 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name="GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
         args=args,
-        x_names=["M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
         model_benchmark_shapes_fn=model_benchmark_shapes,
     )
 
     @triton.testing.perf_report([benchmark])
     def bench_batched_gemm_afp4wfp4_pre_quant(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
+        M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
     ):
         if layer == "fc1":
             if args.no_glu:
@@ -101,9 +100,11 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(save_path=".", print_data=True)
+    bench_batched_gemm_afp4wfp4_pre_quant.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def run_shape_benchmark(args):
@@ -114,10 +115,14 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(M, N, K, batch, metric, provider):
-        return bench_gemm_fn(batch, M, N, K, metric)
+    def bench_batched_gemm_afp4wfp4_pre_quant(
+        M, N, K, batch, metric, provider, model_name=None
+    ):
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(save_path=".", print_data=True)
+    bench_batched_gemm_afp4wfp4_pre_quant.run(
+        save_path="." if args.o else None, print_data=True
+    )
 
 
 def run_benchmark(args, defaults):
@@ -126,9 +131,7 @@ def run_benchmark(args, defaults):
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(
@@ -156,6 +159,10 @@ def parse_args():
 
 
 def main():
+    if not (arch_info.is_fp4_avail()):
+        print("MXFP4 is not available on this architecture")
+        sys.exit()
+
     args, defaults = parse_args()
     run_benchmark(args, defaults)
 

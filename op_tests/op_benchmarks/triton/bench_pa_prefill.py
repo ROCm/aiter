@@ -336,7 +336,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -350,7 +350,9 @@ def parse_args():
     parser.add_argument("--dtype", default="fp16")
     parser.add_argument("--kv_cache_dtype", default="auto")
     parser.add_argument("--compute_type", default="fp16")
-
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
