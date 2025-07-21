@@ -71,7 +71,9 @@ def generate_gemm_a8wfp4_inputs(
     return x, w, x_scales, w_scales, x_fp32, w_fp32, y
 
 
-def generate_fp32_tensors(M: int, N: int, K: int, debug_type: INPUT_TYPE, layout: str = "TN"):
+def generate_fp32_tensors(
+    M: int, N: int, K: int, debug_type: INPUT_TYPE, layout: str = "TN"
+):
     """Generate fp32 tensors based on debug input type"""
     if debug_type == INPUT_TYPE.ONES:
         if layout[0] == "T":
@@ -365,7 +367,9 @@ e5m2_type, e4m3_type = arch_info.get_fp8_dtypes()
 @pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
 @pytest.mark.parametrize("out_dtype", [torch.float16])
 @pytest.mark.parametrize("layout", ["TN", "NT", "TT", "TN"])
-def test_gemm_a8wfp4(M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True):
+def test_gemm_a8wfp4(
+    M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True
+):
     torch.manual_seed(42)  # for reproducibility
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")

@@ -45,7 +45,9 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: gemm_a8wfp4(x=x, w=w, y=y, x_scales=x_scales, w_scales=w_scales, dtype=out_dtype),
+        lambda: gemm_a8wfp4(
+            x=x, w=w, y=y, x_scales=x_scales, w_scales=w_scales, dtype=out_dtype
+        ),
         warmup=25,
         rep=100,
     )
