@@ -472,7 +472,6 @@ def la_persistent(
         # initialize pointer to m and l
         m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_cta = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        acc_cta = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
         # lean output tile epilogue
         if not host_block:
@@ -498,6 +497,9 @@ def la_persistent(
         if host_block:  # and finishing_block:
             # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
             # in a single CTA and so can directly store its results from LeanTile() in global memory without any reduction
+            acc_reshaped = tl.reshape(acc, (BLOCK_M, 2, HEAD_DIM // 2))
+            acc_permuted = tl.permute(acc_reshaped, (0, 2, 1))
+            acc0, acc1 = tl.split(acc_permuted)
 
             o_h_offs = (
                 q_idx * BLOCK_M * stride_om
@@ -538,29 +540,55 @@ def la_persistent(
                     offs_mplp = cta * BLOCK_M + offs_m
                     mp_ptrs = Mp + offs_mplp
                     lp_ptrs = Lp + offs_mplp
-                    op_h_offs = (
-                        cta * stride_oph
+                    op_ptrs0 = (
+                        Op
+                        + cta * stride_oph
                         + offs_m[:, None] * stride_opm
-                        + offs_k[None, :] * stride_opn
+                        + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_opn
                     )
-                    op_ptrs = Op + op_h_offs
+                    op_ptrs1 = (
+                        Op
+                        + cta * stride_oph
+                        + offs_m[:, None] * stride_opm
+                        + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
+                        * stride_opn
+                    )
 
                     m_cta = tl.load(mp_ptrs)
                     l_cta = tl.load(lp_ptrs)
-                    acc_cta = tl.load(op_ptrs)
+                    acc_cta0 = tl.load(op_ptrs0)
+                    acc_cta1 = tl.load(op_ptrs1)
 
                     # m_i is the host CTA's m, m_cta is other nonHost CTA's m
                     m_new = tl.maximum(m_cta, m_i)
                     alpha = tl.math.exp2(m_cta - m_new)
                     alpha1 = tl.math.exp2(m_i - m_new)
                     l_new = alpha * l_cta + alpha1 * l_i
-                    acc = acc_cta * alpha[:, None] + acc * alpha1[:, None]
+                    acc0 = acc_cta0 * alpha[:, None] + acc0 * alpha1[:, None]
+                    acc1 = acc_cta1 * alpha[:, None] + acc1 * alpha1[:, None]
                     # update m, l
                     m_i = m_new
                     l_i = l_new
             # host CTA write final result to memory
-            acc = acc / l_i[:, None]
-            tl.store(o_ptrs, acc.to(Out.type.element_ty))
+            o_ptrs0 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx * stride_oh
+                + offs_m[:, None] * stride_om
+                + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_on
+            )
+            o_ptrs1 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx * stride_oh
+                + offs_m[:, None] * stride_om
+                + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on
+            )
+
+            acc0 = acc0 / l_i[:, None]
+            acc1 = acc1 / l_i[:, None]
+            tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
+            tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
 
         # update iter
         iter = iter + (local_iter_end - local_iter)

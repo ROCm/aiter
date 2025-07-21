@@ -19,12 +19,12 @@ import math
 block_shape = (128, 128)
 
 
-def bench_gemm_fn(M, N, K, metric):
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     block_shape_n, block_shape_k = block_shape
     c_dtype = torch.bfloat16
 
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M, N, K, block_shape_n, block_shape_k, output=True
+        M, N, K, block_shape_n, block_shape_k, layout=layout, output=True
     )
     # flops
     flops = 2.0 * M * N * K
@@ -62,7 +62,7 @@ def run_model_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(
-        M, hidden_dim, intermediate_dim, metric, layer, **kwargs
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
     ):
         """
         Fc1:
@@ -88,21 +88,21 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_a8w8_blockscale.run(save_path=".", print_data=True)
+    bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("Blockscale GEMM A8W8 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a8w8_blockscale(M, N, K, metric, **kwargs):
+    def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_a8w8_blockscale.run(save_path=".", print_data=True)
+    bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -110,9 +110,7 @@ def run_benchmark(args, defaults):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
     if args.model:
-        unsupported_args = [
-            "layout",
-        ]
+        unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
                 raise Exception(

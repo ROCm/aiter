@@ -3,15 +3,17 @@ from functools import partial
 import torch
 import triton
 
-from aiter.ops.triton.routing import (
+from aiter.ops.triton.moe_routing_sigmoid_top1_fused import (
     _routing_sigmoid_top1_kernel,
     routing_sigmoid_top1,
-    torch_routing_sigmoid_top1,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_model_configs
+from op_tests.triton_tests.test_moe_routing_sigmoid_top1_fused import (
+    torch_routing_sigmoid_top1,
+)
 
 
 def _get_compiled(fn):

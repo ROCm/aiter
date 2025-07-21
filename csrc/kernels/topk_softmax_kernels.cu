@@ -318,10 +318,16 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     // First, we perform a max reduce within the thread. We can do the max in fp16 safely (I think)
     // and just convert to float afterwards for the exp + sum reduction.
     float thread_max = row_chunk[0];
+    int first_topk_expert = first_elt_read_by_thread;
 #pragma unroll
     for(int ii = 1; ii < VPT; ++ii)
     {
-        thread_max = max(thread_max, row_chunk[ii]);
+        if (thread_max < row_chunk[ii])
+        {
+            thread_max = row_chunk[ii];
+            first_topk_expert = first_elt_read_by_thread + ii;
+        }
+        // thread_max = max(thread_max, row_chunk[ii]);
     }
 
     // Now, we find the max within the thread group and distribute among the threads. We use a
@@ -331,8 +337,19 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     //         thread_max = max(thread_max, VLLM_SHFL_XOR_SYNC_WIDTH(thread_max, mask,
     //         THREADS_PER_ROW));
     //     }
-    thread_max =
-        multithread_reduce(thread_max, [](float a, float b) { return max(a, b); }, THREADS_PER_ROW);
+    // thread_max =
+    //     multithread_reduce(thread_max, [](float a, float b) { return max(a, b); }, THREADS_PER_ROW);
+    auto arg_max = [](const kvp& a, const kvp& b) {
+        if(a.value > b.value || (a.value == b.value && a.key < b.key))
+        {
+            return a;
+        }
+        return b;
+    };
+    kvp thread_kvp = {first_topk_expert, thread_max};
+    thread_kvp     = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
+    thread_max        = thread_kvp.value;
+    first_topk_expert = thread_kvp.key;
 
     // From this point, thread max in all the threads have the max within the row.
     // Now, we subtract the max from each element in the thread and take the exp. We also compute
@@ -375,56 +392,58 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     float renorm_value = 0.0f;
     for(int k_idx = 0; k_idx < k; ++k_idx)
     {
-        // First, each thread does the local argmax
-        float max_val = row_chunk[0];
-        int expert    = start_col;
-#pragma unroll
-        for(int ldg = 0, col = start_col; ldg < LDG_PER_THREAD; ++ldg, col += COLS_PER_GROUP_LDG)
+        float max_val;
+        int expert;
+        if (k_idx == 0)
         {
+            max_val  = reciprocal_row_sum;
+            expert   = first_topk_expert;
+        }
+        else
+        {
+            // First, each thread does the local argmax
+            max_val = row_chunk[0];
+            expert    = start_col;
 #pragma unroll
-            for(int ii = 0; ii < ELTS_PER_LDG; ++ii)
+            for(int ldg = 0, col = start_col; ldg < LDG_PER_THREAD; ++ldg, col += COLS_PER_GROUP_LDG)
             {
-                float val = row_chunk[ldg * ELTS_PER_LDG + ii];
-
-                // No check on the experts here since columns with the smallest index are processed
-                // first and only updated if > (not >=)
-                if(val > max_val)
+#pragma unroll
+                for(int ii = 0; ii < ELTS_PER_LDG; ++ii)
                 {
-                    max_val = val;
-                    expert  = col + ii;
+                    float val = row_chunk[ldg * ELTS_PER_LDG + ii];
+
+                    // No check on the experts here since columns with the smallest index are processed
+                    // first and only updated if > (not >=)
+                    if(val > max_val)
+                    {
+                        max_val = val;
+                        expert  = col + ii;
+                    }
                 }
             }
+
+            // Now, we perform the argmax reduce. We use the butterfly pattern so threads reach
+            // consensus about the max. This will be useful for K > 1 so that the threads can agree on
+            // "who" had the max value. That thread can then blank out their max with -inf and the warp
+            // can run more iterations... #pragma unroll
+            //         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
+            //         {
+            //             float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
+            //             int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
+
+            //             // We want lower indices to "win" in every thread so we break ties this way
+            //             if (other_max > max_val || (other_max == max_val && other_expert < expert))
+            //             {
+            //                 max_val = other_max;
+            //                 expert = other_expert;
+            //             }
+            //         }
+
+            kvp thread_kvp = {expert, max_val};
+            thread_kvp     = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
+            max_val        = thread_kvp.value;
+            expert         = thread_kvp.key;
         }
-
-        // Now, we perform the argmax reduce. We use the butterfly pattern so threads reach
-        // consensus about the max. This will be useful for K > 1 so that the threads can agree on
-        // "who" had the max value. That thread can then blank out their max with -inf and the warp
-        // can run more iterations... #pragma unroll
-        //         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-        //         {
-        //             float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
-        //             int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
-
-        //             // We want lower indices to "win" in every thread so we break ties this way
-        //             if (other_max > max_val || (other_max == max_val && other_expert < expert))
-        //             {
-        //                 max_val = other_max;
-        //                 expert = other_expert;
-        //             }
-        //         }
-
-        auto arg_max = [](const kvp& a, const kvp& b) {
-            if(a.value > b.value || (a.value == b.value && a.key < b.key))
-            {
-                return a;
-            }
-            return b;
-        };
-        kvp thread_kvp = {expert, max_val};
-        thread_kvp     = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
-        max_val        = thread_kvp.value;
-        expert         = thread_kvp.key;
-
         // Write the max for this k iteration to global memory.
         if(thread_group_idx == 0)
         {
