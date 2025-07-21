@@ -157,7 +157,7 @@ def bench_lean_attention(
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
     # Triton LeanAttention output
-    fn = lambda: persistent_lean_attention( # noqa: E731 
+    fn = lambda: persistent_lean_attention(  # noqa: E731
         q,
         k,
         v,
