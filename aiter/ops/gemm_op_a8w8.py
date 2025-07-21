@@ -29,12 +29,12 @@ def gemm_a8w8_ck(
 
 @compile_ops("module_gemm_a8w8_bpreshuffle", fc_name="gemm_a8w8_bpreshuffle")
 def gemm_a8w8_bpreshuffle_ck(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-): ...
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_gemm_a8w8_asm", fc_name="gemm_a8w8_asm")
@@ -228,16 +228,16 @@ def gemm_a8w8_bpreshuffle(
     n = WQ.shape[0]
     k = XQ.shape[-1]
 
-    ck_config = get_CKGEMM_config(m, n, k, "a8w8_bpreshuffle_tuned_gemm.csv")
-    if (
-        ck_config is None
-        and dtype == dtypes.bf16
-        and bias is not None
-        and WQ.dtype != dtypes.i8
-    ):
-        res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
-        if res is not None:
-            return res
+    get_CKGEMM_config(m, n, k, "a8w8_bpreshuffle_tuned_gemm.csv")
+    # if (
+    #     ck_config is None
+    #     and dtype == dtypes.bf16
+    #     and bias is not None
+    #     and WQ.dtype != dtypes.i8
+    # ):
+    #     res = gemm_a8w8_ASM(XQ, WQ, x_scale, w_scale, bias, dtype=dtype, check=check)
+    #     if res is not None:
+    #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
