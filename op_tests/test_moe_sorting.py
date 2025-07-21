@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import torch
 from typing import Tuple
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.test_common import checkAllclose, run_perftest, benchmark
 from aiter.fused_moe import moe_sorting, fused_topk
 from aiter import dtypes
 import argparse
@@ -9,15 +11,14 @@ import argparse
 BLOCK_SIZE_M = 32
 
 
-@perftest(num_iters=3, num_warmup=0)
-def test_moe_sorting_naive(
+def moe_sorting_native(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
+    block_size=BLOCK_SIZE_M,
     expert_mask=None,
+    num_local_tokens=None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    block_size = BLOCK_SIZE_M
 
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -35,6 +36,9 @@ def test_moe_sorting_naive(
         (max_num_m_blocks,), -1, dtype=dtypes.i32, device=device
     )
     num_tokens_post_pad = torch.empty((2), dtype=dtypes.i32, device=device)
+
+    if num_local_tokens is not None:
+        topk_ids = topk_ids[: num_local_tokens.item()]
 
     sorted_ids_begin = 0
     sorted_expert_ids_begin = 0
@@ -65,23 +69,17 @@ def test_moe_sorting_naive(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_tokens_post_pad
 
 
-@perftest()
-def test_moe_sorting_ck(
-    topk_ids, topk_weights, num_experts, model_dim, moebuf_dtype, expert_mask=None
-):
-    return moe_sorting(
-        topk_ids,
-        topk_weights,
-        num_experts,
-        model_dim,
-        moebuf_dtype,
-        expert_mask=expert_mask,
-    )
-
-
 @benchmark()
 def test_moe_sorting(
-    dtype, token, model_dim, inter_dim, E, topk, has_expert_mask=False
+    dtype,
+    token,
+    model_dim,
+    inter_dim,
+    E,
+    topk,
+    has_expert_mask=False,
+    padding_token=False,
+    dispatch_policy=0,
 ):
     dim = (token, model_dim, inter_dim)
     input = torch.randn((token, model_dim), dtype=dtype, device="cuda")
@@ -94,13 +92,32 @@ def test_moe_sorting(
         if has_expert_mask
         else None
     )
+    if padding_token:
+        num_local_tokens = torch.tensor([token], dtype=topk_ids.dtype, device="cuda")
+        topk_ids_pad = torch.empty(
+            [token + 1000, topk], dtype=topk_ids.dtype, device="cuda"
+        )
+        topk_ids_pad[:token, :] = topk_ids
+        topk_ids = topk_ids_pad
+    else:
+        num_local_tokens = None
 
     (
         sorted_ids_a,
         sorted_weights_a,
         sorted_expert_ids_a,
         num_tokens_post_padded_a,
-    ), avg_a = test_moe_sorting_naive(topk_ids, topk_weights, E, expert_mask)
+    ), avg_a = run_perftest(
+        moe_sorting_native,
+        topk_ids,
+        topk_weights,
+        E,
+        BLOCK_SIZE_M,
+        expert_mask,
+        num_local_tokens,
+        num_warmup=1,
+        num_iters=2,
+    )
 
     (
         sorted_ids_b,
@@ -108,8 +125,17 @@ def test_moe_sorting(
         sorted_expert_ids_b,
         num_tokens_post_padded_b,
         moe_buf,
-    ), avg_b = test_moe_sorting_ck(
-        topk_ids, topk_weights, E, model_dim, dtype, expert_mask
+    ), avg_b = run_perftest(
+        moe_sorting,
+        topk_ids,
+        topk_weights,
+        E,
+        model_dim,
+        dtype,
+        BLOCK_SIZE_M,
+        expert_mask,
+        num_local_tokens,
+        dispatch_policy,
     )
 
     print(
@@ -121,14 +147,18 @@ def test_moe_sorting(
         atol=0,
         msg="num_tokens_post_padded",
     )
-    mask = sorted_ids_a != (topk << 24 | token)
+    mask = sorted_ids_a != (topk << 24 | topk_ids.shape[0])
     num_tokens_post_pad = num_tokens_post_padded_a[0].item()
     checkAllclose(
         sorted_ids_a[:num_tokens_post_pad],
         sorted_ids_b[:num_tokens_post_pad],
         msg="sorted_ids",
     )
-    checkAllclose(sorted_weights_a[mask], sorted_weights_b[mask], msg="sorted_weights")
+    checkAllclose(
+        sorted_weights_a[mask],
+        sorted_weights_b[mask],
+        msg="sorted_weights",
+    )
 
     expert_mask = sorted_expert_ids_a != -1
     checkAllclose(
@@ -145,6 +175,9 @@ l_dtype = ["bf16"]
 l_m = [1, 7, 31, 64, 128, 256, 163840]
 l_expert = [32, 256]
 l_topk = [5, 8]
+l_padding_token = [0, 1000]
+l_expert_mask = [False, True]
+l_dispatch_policy = [0, 1]
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -164,7 +197,7 @@ parser.add_argument(
     "-m",
     type=int,
     default=None,
-    help="""M of mnk.
+    help="""number of token.
     e.g.: -m 64""",
 )
 parser.add_argument(
@@ -189,6 +222,32 @@ parser.add_argument(
     help="""Number of top experts.
     e.g.: -t 5""",
 )
+parser.add_argument(
+    "-p",
+    "--padding",
+    type=int,
+    default=None,
+    help="""Number of padding token.
+    e.g.: -t 0""",
+)
+parser.add_argument(
+    "-dp",
+    "--dispatch_policy",
+    type=int,
+    choices=[0, 1, 2],
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Number of padding token.
+    e.g.: -t 0""",
+)
+parser.add_argument(
+    "-em",
+    "--epert_mask",
+    action="store_true",
+    default=None,
+    help="""Add expert mask to the test.""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -201,28 +260,36 @@ if args.expert is not None:
     l_expert = [args.expert]
 if args.topk is not None:
     l_topk = [args.topk]
+if args.padding is not None:
+    l_padding_token = [args.padding]
+if args.dispatch_policy is not None:
+    l_dispatch_policy = [args.dispatch_policy]
+if args.epert_mask is not None:
+    l_expert_mask = [args.epert_mask]
 
-df = []
-print("test test_moe_sorting, no expert mask")
-for dtype in l_dtype:
-    for m in l_m:
-        for E in l_expert:
-            for top in l_topk:
-                ret = test_moe_sorting(dtype, m, 7168, 4096, E, top)
-                df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+l_expert_topk = [(l_expert[i], l_topk[i]) for i in range(len(l_expert))]
 
-
-df = []
-print("test test_moe_sorting, with expert mask")
-for dtype in l_dtype:
-    for m in l_m:
-        for E in l_expert:
-            for top in l_topk:
-                ret = test_moe_sorting(
-                    dtype, m, 4096, 4096, E, top, has_expert_mask=True
-                )
-                df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+for padding_token in l_padding_token:
+    for expert_mask in l_expert_mask:
+        for dispatch_policy in l_dispatch_policy:
+            df = []
+            print(
+                f"test test_moe_sorting, expert mask:{expert_mask}, padding_token:{padding_token}, dispatch_policy={dispatch_policy}"
+            )
+            for dtype in l_dtype:
+                for m in l_m:
+                    for E, top in l_expert_topk:
+                        ret = test_moe_sorting(
+                            dtype,
+                            m,
+                            4096,
+                            4096,
+                            E,
+                            top,
+                            has_expert_mask=expert_mask,
+                            padding_token=padding_token,
+                            dispatch_policy=dispatch_policy,
+                        )
+                        df.append(ret)
+            df = pd.DataFrame(df)
+            aiter.logger.info(f"summary:\n{df}")

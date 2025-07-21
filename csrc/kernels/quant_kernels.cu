@@ -14,28 +14,6 @@ const int32_t BlockSize           = 256;
 const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
-template <typename T, typename F>
-__device__ constexpr T multithread_reduce(T data, F reduce_op, int stage)
-{
-    if(stage == 1)
-    {
-        return data;
-    }
-    if(stage >= 2)
-    {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-    }
-    if(stage >= 4)
-    {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-    }
-    if(stage == 8)
-    {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
-    }
-    return data;
-}
-
 template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32>
 __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                                       float* __restrict__ scale,
@@ -60,10 +38,10 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     int num_thread_per_group = group_size / thread_data_size;
     int64_t row_offset       = blockIdx.x * groupQuantBlockSize;
     int64_t groupId          = (row_offset + threadIdx.x) / num_thread_per_group;
-    int32_t scaleN     = ori_cols / group_size;
-    int32_t scaleN_pad = (std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> && shuffle_scale)
-                             ? (((scaleN + 7) / 8) * 8)
-                             : scaleN;
+    int32_t scaleN           = ori_cols / group_size;
+    int32_t scaleN_pad       = (std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> && shuffle_scale)
+                                   ? (((scaleN + 7) / 8) * 8)
+                                   : scaleN;
     int64_t x                = groupId / scaleN_pad;
     int32_t y                = groupId % scaleN_pad;
     if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
@@ -105,7 +83,7 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     auto const* input_vecs = reinterpret_cast<vec_i const*>(input + row_offset);
     // vec_i thread_data      = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
     vec_i thread_data = input_vecs[threadIdx.x % num_thread_per_group];
-    float absMax      = 0.f;
+    float absMax      = 1e-10f;
     for(size_t j = 0; j < thread_data_size; j++)
     {
         absMax = max(absMax, abs(ck_tile::type_convert<float>(thread_data[j])));
@@ -126,10 +104,9 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     float inverted_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
                                ? fp4_scale(absMax) * inverted_DTYPE_MAX
                                : absMax * inverted_DTYPE_MAX;
-    row_offset =
-        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
-            ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
-            : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
+    row_offset           = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+                               ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
+                               : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
     if(threadIdx.x % num_thread_per_group == 0)
     {
         if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
@@ -156,7 +133,9 @@ __global__ void dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     using DTYPE_STORE = typename ck_tile::vector_traits<DTYPE_O>::scalar_type;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o = ck_tile::make_buffer_view<ck_tile::address_space_enum::global, ck_tile::amd_buffer_coherence_enum::glc>(out_ptr, oob_o);
+    auto buffer_o =
+        ck_tile::make_buffer_view<ck_tile::address_space_enum::global,
+                                  ck_tile::amd_buffer_coherence_enum::glc>(out_ptr, oob_o);
     buffer_o.init_raw();
 
     auto out_s =

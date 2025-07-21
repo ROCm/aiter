@@ -2,173 +2,140 @@ import argparse
 import sys
 import torch
 import triton
+import math
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
-from utils.benchmark_utils import get_model_configs, get_available_models
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    add_argparse_ff,
+    get_ff_args,
+)
+
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+)
 
 
-def model_benchmark_shapes(args):
-    config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
-    shapes = []
-    for M in M_list:
-        for _, config in configs.items():
-            N = config["intermediate_size"]
-            K = config["hidden_size"]
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, model_name=None):
+    # NOTE: Assume bias and output has the same dtype
+    c_dtype = torch.bfloat16
+    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, c_dtype, layout=layout, output=True
+    )
+    # flops
+    flops = 2.0 * M * N * K
+    # memory transfer
+    mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
+    mem_write = (M * N) * x.element_size()
+    mem = mem_read + mem_write
 
-            shapes.append((M, N, K, "TN"))
+    ms = triton.testing.do_bench(
+        lambda: gemm_a16w16(x, w, c_dtype, y), warmup=25, rep=100  # noqa: E731
+    )
 
-    return shapes
-
-
-def get_x_vals():
-    x_vals = [
-        (1, 1280, 8192, "TN"),
-        (32, 1280, 8192, "TN"),
-        (64, 1280, 8192, "TN"),
-        (128, 1280, 8192, "TN"),
-        (192, 1280, 8192, "TN"),
-        (256, 1280, 8192, "TN"),
-        (320, 1280, 8192, "TN"),
-        (512, 1280, 8192, "TN"),
-        (1024, 1280, 8192, "TN"),
-        (2048, 1280, 8192, "TN"),
-        (4096, 1280, 8192, "TN"),
-        (8192, 1280, 8192, "TN"),
-        (16384, 1280, 8192, "TN"),
-        (8192, 7168, 20480, "NT"),
-        (1024, 20480, 8192, "NT"),
-        (1024, 8192, 20480, "NT"),
-        (8192, 7168, 20480, "TN"),
-        (1024, 20480, 8192, "TN"),
-        (1024, 8192, 20480, "TN"),
-    ]
-    return x_vals
+    # Return exactly one scalar depending on which metric is active
+    if metric == "time":
+        return ms
+    elif metric == "throughput":
+        tflops = flops / ms * 1e-9
+        return tflops
+    elif metric == "bandwidth":
+        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+        return bandwidth
+    else:
+        raise ValueError("Unknown metric: " + metric)
 
 
-def run_benchmark(args):
+def run_model_benchmark(args):
+    """
+    Runs benchmark given a --model argument.
+    """
+    benchmark = get_model_benchmark_object("GEMM A16W16 Benchmark", args)
+
+    @triton.testing.perf_report([benchmark])
+    def bench_gemm_a16w16(
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+    ):
+        """
+        Fc1:
+             M      K                  K           N          M       N
+        A = (B, hidden_dim) @ W = (hidden_dim, 2*int_dim) -> (B, 2*int_dim) -> gating -> (B, int_dim)
+
+        Fc2:
+             M     K               K          N          M       N
+        A = (B, int_dim) @ W = (int_dim, hidden_dim) -> (B, hidden_dim)
+
+        Tensor parallel splits across int_dim (N for fc1, K for fc2)
+        """
+        if layer == "fc1":
+            if args.no_glu:
+                N, K = intermediate_dim, hidden_dim
+            else:
+                N, K = intermediate_dim * 2, hidden_dim
+            # Divide N by tensor parallel
+            N = math.ceil(N / args.tp)
+        elif layer == "fc2":
+            N, K = hidden_dim, intermediate_dim
+            # Divide K by tensor parallel
+            K = math.ceil(K / args.tp)
+        # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
+
+        return bench_gemm_fn(M, N, K, metric, args.layout)
+
+    bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
+
+
+def run_shape_benchmark(args):
+    """
+    Runs a benchmark with given tensor shapes.
+    """
+    benchmark = get_shape_benchmark_object("GEMM A16W16 Benchmark", args)
+
+    @triton.testing.perf_report([benchmark])
+    def bench_gemm_a16w16(M, N, K, metric, model_name=None, **kwargs):
+        # Divide N by tensor parallel
+        N = math.ceil(N / args.tp)
+        return bench_gemm_fn(M, N, K, metric, args.layout)
+
+    bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
+
+
+def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-
-    x_names = ["M", "N", "K", "layout"]
     if args.model:
-        x_vals_list = model_benchmark_shapes(args)
-    elif args.shape:
-        x_vals_list = [args.shape + [args.layout]]
+        unsupported_args = []
+        for arg in unsupported_args:
+            if getattr(args, arg, None) != getattr(defaults, arg, None):
+                raise Exception(
+                    f"Argument '{arg}' is not supported for benchmarking with the --model flag."
+                )
+        run_model_benchmark(args)
     else:
-        x_vals_list = get_x_vals()
-
-    if args.metric == "time":
-        ylabel = "Time (ms)"
-    elif args.metric == "throughput":
-        ylabel = "Throughput (TFLOPS)"
-    elif args.metric == "bandwidth":
-        ylabel = "Bandwidth (GB/s)"
-    else:
-        raise NotImplementedError(f"{args.metric} is not supported")
-
-    line_names = ["Triton"]
-    line_vals = ["triton"]
-    benchmark = triton.testing.Benchmark(
-        x_names=x_names,
-        x_vals=x_vals_list,
-        line_arg="provider",
-        line_vals=line_vals,
-        line_names=line_names,
-        styles=[("green", "-")],
-        ylabel=ylabel,
-        plot_name="GEMM A16W16 Benchmark",
-        args={"metric": args.metric},
-    )
-
-    @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, N, K, layout, metric, provider):
-        # NOTE: Assume bias and output has the same dtype
-        c_dtype = torch.bfloat16
-        x, w, out_dtype, y = generate_gemm_a16w16_inputs(
-            M, N, K, c_dtype, layout, output=True
-        )
-        # flops
-        flops = 2.0 * M * N * K
-        # memory transfer
-        mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
-        mem_write = (M * N) * x.element_size()
-        mem = mem_read + mem_write
-
-        ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, c_dtype, y), warmup=25, rep=100  # noqa: E731
-        )
-
-        # Return exactly one scalar depending on which metric is active
-        if metric == "time":
-            return ms
-        elif metric == "throughput":
-            tflops = flops / ms * 1e-9
-            return tflops
-        elif metric == "bandwidth":
-            bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-            return bandwidth
-        else:
-            raise ValueError("Unknown metric: " + metric)
-
-    bench_gemm_a16w16.run(save_path=".", print_data=True)
+        unsupported_args = [
+            "fc1",
+            "fc2",
+            "no_glu",
+        ]
+        for arg in unsupported_args:
+            if getattr(args, arg, None) != getattr(defaults, arg, None):
+                raise Exception(
+                    f"Argument '{arg}' is not supported for benchmarking without the --model flag."
+                )
+        run_shape_benchmark(args)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark A16W16 GEMM",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
-    parser.add_argument(
-        "-M",
-        type=int,
-        default=4096,
-        help="M dim of model benchmark if only one model is under test",
-    )
-    parser.add_argument(
-        "--shape",
-        type=int,
-        nargs=3,
-        metavar=("M", "N", "K"),
-        help="user-defined shape to benchmark",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "throughput", "bandwidth"],
-        default="throughput",
-        help="metric to plot",
-    )
-    parser.add_argument(
-        "--layout",
-        type=str,
-        choices=["TT", "TN", "NT", "NN"],
-        default="TN",
-        help="Layout of input and weight matrix",
-    )
-    args = parser.parse_args()
-    return args
+    parser = get_parser(kernel_name="A16W16 GEMM")
+    parser = add_argparse_ff(parser)
+    return get_ff_args(parser)
 
 
 def main():
-    args = parse_args()
-    run_benchmark(args)
+    args, defaults = parse_args()
+    run_benchmark(args, defaults)
 
 
 if __name__ == "__main__":

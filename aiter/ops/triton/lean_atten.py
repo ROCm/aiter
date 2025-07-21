@@ -50,6 +50,15 @@ def persistent_lean_attention(
     ), "Incompatible Q/K/V Hidden Dimensions"
     assert HEAD_DIM_K in {16, 32, 64, 128, 256}
 
+    # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
+    # For MI300, BLOCK_M=128, BLOCK_N=64 is better for performance
+    MASKED_BLOCKS = BLOCK_M // BLOCK_N
+
+    if causal:
+        # Only support BLOCK_M is multiple of BLOCK_N
+        # TODO: add other scenarios
+        assert BLOCK_M % BLOCK_N == 0
+
     N_CTX_Q = q.shape[0] // batch_size
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
     H = q.shape[1]
@@ -72,24 +81,25 @@ def persistent_lean_attention(
         N_CTX_K,
         H,
         H,
-        HEAD_DIM_Q,
         BLOCK_M,
         BLOCK_N,
         total_programs,
     )
-    print(
-        f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
-    )
-    print(
-        f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
-    )
-    print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
+    # print(
+    #    f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
+    # )
+    # print(
+    #    f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
+    # )
+    # print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
 
     grid = (total_programs, 1, 1)
 
     o = torch.empty_like(q, dtype=v.dtype)
 
     la_kernel = la_persistent[grid](
+        False,
+        0,
         q,
         k,
         v,
@@ -118,6 +128,7 @@ def persistent_lean_attention(
         HEAD_DIM=HEAD_DIM_K,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        MASKED_BLOCKS=MASKED_BLOCKS,
         batch_size=batch_size,
         causal=causal,
         num_m_blocks=num_m_blocks,
@@ -128,7 +139,9 @@ def persistent_lean_attention(
         tiles_per_head=tiles_per_head,
         num_splits=num_splits,
         waves_per_eu=waves_per_eu,
-        num_warps=waves_per_eu,
+        num_warps=num_warps,
+        num_stages=1,
+        num_ctas=1,
     )
 
     print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
@@ -143,7 +156,6 @@ def get_num_splits_and_buffer_sizes(
     max_seqlen_k,
     num_heads,
     num_heads_k,
-    head_size,
     BLOCK_M,
     BLOCK_N,
     num_SMs,
@@ -220,18 +232,20 @@ def get_num_splits_and_buffer_sizes(
 
 
 @triton.jit
-def find_group(x):
+def find_group(x, MASKED_BLOCKS):
     group_id = 0
     total_blocks = 0
-    while total_blocks + (group_id + 1) <= x:
-        total_blocks += group_id + 1
+    while total_blocks + (group_id + 1) * MASKED_BLOCKS <= x:
+        total_blocks += (group_id + 1) * MASKED_BLOCKS
         group_id += 1
-    group_size = group_id + 1
+    group_size = (group_id + 1) * MASKED_BLOCKS
     return group_id, group_size, total_blocks
 
 
 @triton.jit
 def la_persistent(
+    is_pod,
+    pod_pid,
     Q,
     K,
     V,
@@ -260,6 +274,7 @@ def la_persistent(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    MASKED_BLOCKS: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
     num_m_blocks: tl.constexpr,
@@ -270,7 +285,10 @@ def la_persistent(
     tiles_per_head: tl.constexpr,
     num_splits: tl.constexpr,
 ):
-    current_pid = tl.program_id(0)
+    if is_pod:
+        current_pid = pod_pid
+    else:
+        current_pid = tl.program_id(0)
 
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
@@ -297,7 +315,8 @@ def la_persistent(
             per_head_tile_idx, per_head_tile_size, total_blocks = find_group(
                 iter
                 - (tile_head_idx * tiles_per_head)
-                - (tile_batch_idx * (tiles_per_head // batch_size))
+                - (tile_batch_idx * (tiles_per_head // batch_size)),
+                MASKED_BLOCKS,
             )
             tile_iter = (
                 tile_head_idx * tiles_per_head
@@ -307,7 +326,7 @@ def la_persistent(
             tile_iter_end = tile_iter + (per_head_tile_size)
             tile_idx = (
                 tile_head_idx * batch_size + tile_batch_idx
-            ) * num_n_blocks + per_head_tile_idx
+            ) * num_m_blocks + per_head_tile_idx
         else:
             tile_idx = (
                 tile_head_idx * batch_size
@@ -368,7 +387,9 @@ def la_persistent(
         )
 
         k_ptrs = K + k_offs
+        k_ptrs = tl.multiple_of(k_ptrs, (16, 1))
         v_ptrs = V + v_offs
+        v_ptrs = tl.multiple_of(v_ptrs, (1, 16))
 
         if causal:
             q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
@@ -381,6 +402,7 @@ def la_persistent(
             + offs_k[None, :] * stride_qk
         )
         q_ptrs = Q + q_offs
+        q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
         m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
@@ -390,14 +412,31 @@ def la_persistent(
 
         for l_iter in range(local_iter, local_iter_end):
             # -- compute qk ----
-            k = tl.load(k_ptrs, cache_modifier=".cg")
+            # k = tl.load(k_ptrs, cache_modifier=".cg")
+            k = tl.load(k_ptrs)
             qk = tl.dot(q, k)
             qk = qk * qk_scale
 
-            if ((iter + (l_iter - local_iter)) == (tile_iter_end - 1)) and causal:
-                mask = offs_m[:, None] >= offs_n[None, :]
-                # Apply the causal mask
-                qk = tl.where(mask, qk, float("-inf"))
+            # if ((iter + (l_iter - local_iter)) == (tile_iter_end - 1)) and causal:
+            #    mask = offs_m[:, None] >= offs_n[None, :]
+            # Apply the causal mask
+            #    qk = tl.where(mask, qk, float("-inf"))
+            if causal and (MASKED_BLOCKS > 1):
+                if l_iter == (tile_iter_end - tile_iter) - 2:
+                    mask = offs_m[:, None] >= offs_n[None, :]
+                    qk = tl.where(mask, qk, float("-inf"))
+                if l_iter == (tile_iter_end - tile_iter) - 1:
+                    mask = (offs_m[:, None] >= BLOCK_N) & (
+                        offs_n[None, :] <= (offs_m[:, None] - BLOCK_N)
+                    )
+                    qk = tl.where(mask, qk, float("-inf"))
+
+            if causal and (MASKED_BLOCKS == 1):
+                # if (l_iter == (tile_iter_end - tile_iter) - 1):
+                if (iter + (l_iter - local_iter)) == (tile_iter_end - 1):
+                    mask = offs_m[:, None] >= offs_n[None, :]
+                    qk = tl.where(mask, qk, float("-inf"))
+
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk = qk - m_ij[:, None]
             p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
@@ -406,13 +445,26 @@ def la_persistent(
             acc = (
                 acc * alpha[:, None]
             )  # Scale each row of acc by the corresponding elements in alpha
-            v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+            # v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+            v = tl.load(v_ptrs)
             acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
             # -- update l_i
             l_ij = tl.sum(p, 1)  # rowsum(p)
             l_i = l_i * alpha + l_ij
             # update m_i
             m_i = m_ij.to(m_i.dtype)
+
+            if (
+                (l_iter == (tile_iter_end - tile_iter) - 1)
+                and (iter == tile_iter_end - 1)
+                and (MASKED_BLOCKS == 2)
+            ):
+                mask1 = offs_m >= BLOCK_N
+                m_i = tl.where(mask1, m_i, float("-inf"))
+                l_i = tl.where(mask1, l_i, 1.0)
+                mask1 = mask1[:, None]
+                acc = tl.where(mask1, acc, 0.0)
+
             # update k/v pointer
             v_ptrs += BLOCK_N * stride_vn
             k_ptrs += BLOCK_N * stride_kn
@@ -420,7 +472,6 @@ def la_persistent(
         # initialize pointer to m and l
         m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_cta = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        acc_cta = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
         # lean output tile epilogue
         if not host_block:
@@ -446,6 +497,9 @@ def la_persistent(
         if host_block:  # and finishing_block:
             # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
             # in a single CTA and so can directly store its results from LeanTile() in global memory without any reduction
+            acc_reshaped = tl.reshape(acc, (BLOCK_M, 2, HEAD_DIM // 2))
+            acc_permuted = tl.permute(acc_reshaped, (0, 2, 1))
+            acc0, acc1 = tl.split(acc_permuted)
 
             o_h_offs = (
                 q_idx * BLOCK_M * stride_om
@@ -457,18 +511,6 @@ def la_persistent(
 
             if not finishing_block:
                 # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
-                if causal:
-                    q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
-                else:
-                    q_idx = tile_batch_idx
-
-                o_h_offs = (
-                    q_idx * BLOCK_M * stride_om
-                    + tile_head_idx * stride_oh
-                    + offs_m[:, None] * stride_om
-                    + offs_k[None, :] * stride_on
-                )
-                o_ptrs = Out + o_h_offs
 
                 last_cta = current_pid + 1
                 temp_end_gid = cta_end_tile_gid
@@ -495,32 +537,58 @@ def la_persistent(
                         pass
 
                     # Partial results are stored in [nonHost, Host-nonFinishing] layout
-                    offs_mplp = cta * BLOCK_M + tl.arange(0, BLOCK_M)
+                    offs_mplp = cta * BLOCK_M + offs_m
                     mp_ptrs = Mp + offs_mplp
                     lp_ptrs = Lp + offs_mplp
-                    op_h_offs = (
-                        cta * stride_oph
+                    op_ptrs0 = (
+                        Op
+                        + cta * stride_oph
                         + offs_m[:, None] * stride_opm
-                        + offs_k[None, :] * stride_opn
+                        + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_opn
                     )
-                    op_ptrs = Op + op_h_offs
+                    op_ptrs1 = (
+                        Op
+                        + cta * stride_oph
+                        + offs_m[:, None] * stride_opm
+                        + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
+                        * stride_opn
+                    )
 
                     m_cta = tl.load(mp_ptrs)
                     l_cta = tl.load(lp_ptrs)
-                    acc_cta = tl.load(op_ptrs)
+                    acc_cta0 = tl.load(op_ptrs0)
+                    acc_cta1 = tl.load(op_ptrs1)
 
                     # m_i is the host CTA's m, m_cta is other nonHost CTA's m
                     m_new = tl.maximum(m_cta, m_i)
                     alpha = tl.math.exp2(m_cta - m_new)
                     alpha1 = tl.math.exp2(m_i - m_new)
                     l_new = alpha * l_cta + alpha1 * l_i
-                    acc = acc_cta * alpha[:, None] + acc * alpha1[:, None]
+                    acc0 = acc_cta0 * alpha[:, None] + acc0 * alpha1[:, None]
+                    acc1 = acc_cta1 * alpha[:, None] + acc1 * alpha1[:, None]
                     # update m, l
                     m_i = m_new
                     l_i = l_new
             # host CTA write final result to memory
-            acc = acc / l_i[:, None]
-            tl.store(o_ptrs, acc.to(Out.type.element_ty))
+            o_ptrs0 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx * stride_oh
+                + offs_m[:, None] * stride_om
+                + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_on
+            )
+            o_ptrs1 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx * stride_oh
+                + offs_m[:, None] * stride_om
+                + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on
+            )
+
+            acc0 = acc0 / l_i[:, None]
+            acc1 = acc1 / l_i[:, None]
+            tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
+            tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
 
         # update iter
         iter = iter + (local_iter_end - local_iter)

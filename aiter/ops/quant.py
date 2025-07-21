@@ -122,7 +122,7 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
             m, n = x.shape
             x = x.view(-1, blk_n)
             y, scale = per_token_quant_func(x, scale=scale, quant_dtype=quant_dtype)
-            return y.view(m, -1), scale.view(m, -1)
+            return y.view(m, n), scale.view(m, n // blk_n)
 
         return wrapper
 

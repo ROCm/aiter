@@ -65,8 +65,8 @@ def _gemm_a16_w16_kernel(
 
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -126,7 +126,7 @@ def _get_config(
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-N={N}-K={2*K}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A16W16-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)
@@ -161,7 +161,8 @@ def gemm_a16w16(
     """
 
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+    w = w.T
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)

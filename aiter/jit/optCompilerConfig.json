@@ -288,7 +288,9 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'"
+        ],
         "verbose": "False",
         "blob_gen_cmd": "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'"
     },
@@ -297,6 +299,7 @@
             "f'{AITER_CSRC_DIR}/pybind/moe_ck_2stages_pybind.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common.cuh'",
+            "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common_mxfp4.cuh'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages_common_blockscale.cuh'",
             "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_ck2stages.h'"
         ],
@@ -305,11 +308,15 @@
             "f'-DMOE_STAGE2_ASM_DIR=\\\\\"{CK_DIR}/example/65_gemm_multiply_multiply/hsa/{get_gfx()}/\\\\\"'"
         ],
         "flags_extra_hip": [
-            "'-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1'"
+            "'-mllvm -greedy-reverse-local-assignment=1'",
+            "'-mllvm --amdgpu-use-amdgpu-trackers=1'",
+            "'-mllvm --slp-threshold=-32'",
+            "'-mllvm --misched-bottomup=1'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
+        "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
         "blob_gen_cmd": "''"
     },
     "module_moe_sorting": {
@@ -518,7 +525,8 @@
     "module_rope_general_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_general_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/rope_general_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -530,7 +538,8 @@
     "module_rope_general_bwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_general_bwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/rope_general_bwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/general_bwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],
@@ -542,7 +551,8 @@
     "module_rope_pos_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/rope_pos_fwd_pybind.cu'",
-            "f'{AITER_CSRC_DIR}/kernels/rope_pos_fwd_kernels.cu'"
+            "f'{AITER_CSRC_DIR}/kernels/rope/rope_common.h'",
+            "f'{AITER_CSRC_DIR}/kernels/rope/pos_fwd_kernels.cu'"
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [],

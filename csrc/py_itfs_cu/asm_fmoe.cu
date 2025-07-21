@@ -912,13 +912,24 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
 
     if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
     {
-        TORCH_CHECK(inter_dim % 320 == 0,
-                    __func__,
-                    "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
-                        ", which should be divisible by 320");
-        static FMoeKernel impl_int8_320(
-            "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
-        impl_ptr = &impl_int8_320;
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {320, 256});
+        if(selectedTile == 320)
+        {
+            static FMoeKernel impl_int8_320(
+                "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
+            impl_ptr = &impl_int8_320;
+        }
+        else if(selectedTile == 256)
+        {
+            static FMoeKernel impl_int8_256(
+                "fmoe_int8_g1u1_smf_subGU_256", "fmoe_int8_g1u1_smf_subGU_256.co", 256);
+            impl_ptr = &impl_int8_256;
+        }
+        else
+            TORCH_CHECK(false,
+                        __func__,
+                        "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
+                            ", which should be divisible by 320 or 256");
     }
     else if(gate.dtype() == torch_fp8)
     {

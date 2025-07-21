@@ -129,7 +129,7 @@ def paged_attention_ragged(
         kv_cache_dtype,
         out_dtype,
         block_size,
-        bool(alibi_slopes),
+        alibi_slopes is not None,
         partition_size,
         mtp,
         bool(logits_soft_cap),
@@ -137,7 +137,7 @@ def paged_attention_ragged(
 
     alibi_slopes_ptr = (
         ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        if alibi_slopes
+        if alibi_slopes is not None
         else ctypes.POINTER(ctypes.c_int)()
     )
     kv_indptr_ptr = ctypes.cast(kv_indptr.data_ptr(), ctypes.POINTER(ctypes.c_int))

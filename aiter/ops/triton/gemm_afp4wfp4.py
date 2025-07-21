@@ -149,7 +149,10 @@ def _gemm_afp4_wfp4_kernel(
                     a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0
                 )
                 b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
+                    b_ptrs,
+                    mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2),
+                    other=0,
+                    cache_modifier=cache_modifier,
                 )
 
             accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
@@ -497,7 +500,7 @@ def gemm_afp4wfp4(
 
     Key parameters:
     - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (K, N).
+    - W: Matrix W with shape (N, K).
     - X_scales: Matrix with shape (M, K // 32)
     - W_scales: Matrix with shape (N, K // 32)
 
@@ -506,7 +509,10 @@ def gemm_afp4wfp4(
     """
 
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+
+    # Transpose w
+    w = w.T
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -615,7 +621,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     Key parameters:
     - X: Matrix X with shape (M, K).
-    - W: Matrix W with shape (K, N).
+    - W: Matrix W with shape (N, K).
     - X_scales: Matrix with shape (M // 32, K)
     - W_scales: Matrix with shape (N // 32, K)
 
@@ -626,7 +632,10 @@ def gemm_afp4wfp4_preshuffled_scales(
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
-    K, N = w.shape
+    N, K = w.shape
+
+    # Transpose w
+    w = w.T
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -654,6 +663,10 @@ def gemm_afp4wfp4_preshuffled_scales(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 

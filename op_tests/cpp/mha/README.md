@@ -29,13 +29,11 @@ you can also call this python script from different directory, the generated `.s
 
 Second, link the `.so` into your executable and compile. You need specify the correct path through `-L` inorder to link to the device lib. You also need to specify the include directory through `-I`, for this example you need set `$TOP_DIR/csrc/include` for the `aiter` API header, and the dependent ck header `$TOP_DIR/3rdparty/composable_kernel/include` and `$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/`. Please refer to `build_mha.sh` for detailed command
 
-## v3_bwd supported arguments comfiguration
+## bwd_v3 supported arguments configuration
 - common restrictions:
-    - Only `gfx942` is supported
-    - `bias` and `dbias` must be set to `False`, both `alibi` and `elementwise` are not supported
-    - `dropout` must be set to `False`
-    - `mask` must be `causal` or `False`
-    - `deterministic` must be set to `False`
+    - `bias` and `dbias` must be `False`
+    - `dropout` must be `False`
+    - `deterministic` must be `False`
     - `head_dim_q` must equal to `head_dim_v` and must be divisible by `8`
 
 - batch mode restrictions:
@@ -44,4 +42,18 @@ Second, link the `.so` into your executable and compile. You need specify the co
 - group mode restrictions:
     - `head_dim_q` must in range `[64, 128]`
 
-More features like Sliding Window Attention is coming soon.
+## fwd_v3 supported arguments configuration
+- gfx942 restrictions:
+    - `prec` must be `bf16`
+    - `bias` must be `False`
+    - `dropout` must be `False`
+    - `head_dim_q` must equal to `head_dim_v` and must equal to `128`
+    - `seqlen_q` must be greater than `384` and equal to `seqlen_k`
+
+- gfx950 restrictions:
+    - `prec` must be `bf16`
+    - `bias` must be `False`
+    - `dropout` must be `False`
+    - `head_dim_q` must equal to `head_dim_v` and must equal to `128`
+    - `seqlen_q` must be greater than `384` and equal to `seqlen_k`
+    - `lse` must be `true`

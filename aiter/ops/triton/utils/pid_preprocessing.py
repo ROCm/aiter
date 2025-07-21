@@ -55,7 +55,16 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
 
 
 @triton.jit
-def pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M: tl.constexpr = 1):
+def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: tl.constexpr = 1):
+    """
+    Maps 1D pid to 2D grid coords (pid_m, pid_n).
+
+    Args:
+        - pid: 1D pid
+        - num_pid_m: grid m size
+        - num_pid_n: grid n size
+        - GROUP_SIZE_M: tl.constexpr: default is 1
+    """
     if GROUP_SIZE_M == 1:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n

@@ -28,23 +28,32 @@ def shuffle_scales(scales: torch.Tensor):
 SCALE_GROUP_SIZE = 32
 
 
-def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=True):
+def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True):
     torch.manual_seed(5)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 
-    # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
-    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+    if layout[0] == "T":
+        # 34 is two packed e2m1 values 0010 which is 1.0.
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8)
+    else:
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8).T
+
+    if layout[1] == "N":
+        w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+        w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
+        w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
+
     x = (
         x_high << 4 | x_low
     )  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
     x = x.to(device="cuda")
 
-    w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
-    w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
     w = w_low | w_high << 4
-    w = w.T
     # Scale of 1.0 in e8m0, bias 127.
     if M >= 32 and TRITON_HIP_PRESHUFFLE_SCALES:
         M_pad = (M + 255) // 256 * 256
@@ -123,6 +132,7 @@ def get_x_vals():
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
+    x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
 
@@ -162,16 +172,15 @@ def e8m0_to_f32(x):
 def run_torch(x, w, x_scales, w_scales, dtype):
     # First convert the x and w inputs to f32.
     x_f32 = mxfp4_to_f32(x)
-    w_f32 = mxfp4_to_f32(w.T)
-    w_f32 = w_f32.T
+    w_f32 = mxfp4_to_f32(w)
     # Next convert the e8m0 scales to f32.
     x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
     x_scales_f32 = e8m0_to_f32(x_scales)
     x_f32 = x_f32 * x_scales_f32
     w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
     w_scales_f32 = e8m0_to_f32(w_scales)
-    w_f32 = w_f32 * w_scales_f32.T
-    return torch.mm(x_f32, w_f32).to(dtype)
+    w_f32 = w_f32 * w_scales_f32
+    return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
@@ -192,7 +201,7 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
             )
 
     x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
-        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output)
+        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output)
     )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)

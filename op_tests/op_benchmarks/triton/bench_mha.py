@@ -1,13 +1,13 @@
 import triton
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
-    get_available_models,
     print_vgpr,
 )
 import torch
 import sys
 import warnings
 import argparse
+import itertools
 
 from aiter.ops.triton.mha import (
     flash_attn_func,
@@ -20,50 +20,31 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     generate_qkv,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def nonvarlen_benchmark_configs():
+    batch_sizes = [1, 4, 16]
+    N_HEADS = [16, 48]
+    seq_len_q = [1, 1024, 4096]
+    seq_len_k = [163, 8192]
+    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
-        (16, 16, 16, 1024, 1024),
-        (8, 16, 16, 2048, 2048),
-        (4, 16, 16, 4096, 4096),
-        (2, 16, 16, 8192, 8192),
-        (8, 16, 16, 1024, 4096),
-        (1, 16, 16, 4096, 16384),
-        (2, 48, 48, 1024, 1024),
-        (2, 48, 48, 2048, 1024),
-        (2, 48, 48, 4096, 8192),
-        (2, 48, 48, 8192, 4096),
-        (2, 48, 48, 16384, 8192),
-        (8, 16, 16, 1989, 15344),
-        (4, 16, 16, 4097, 163),
-        (2, 16, 16, 8122, 2159),
-        (1, 16, 16, 16281, 7),
-        (2, 48, 48, 1021, 1020),
-        (2, 48, 48, 2001, 2048),
-        (2, 48, 48, 3996, 9639),
-        (2, 48, 48, 8181, 1021),
+        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
+        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
 
 
 def varlen_benchmark_configs():
+    batch_sizes = [1, 4, 8]
+    N_HEADS = [16, 48]
+    seq_len_q = [1, 1024, 4096]
+    seq_len_k = [163, 8192]
+    configs = list(itertools.product(batch_sizes, N_HEADS, seq_len_q, seq_len_k))
     configs = [
-        (2, 16, 4, 1024, 1024),
-        (8, 16, 2, 2048, 2048),
-        (4, 16, 8, 4096, 4096),
-        (2, 16, 4, 8192, 8192),
-        (2, 16, 8, 16384, 16384),
-        (2, 48, 12, 1024, 1024),
-        (2, 48, 24, 2048, 2048),
-        (2, 48, 8, 4096, 4096),
-        (2, 48, 4, 8192, 8192),
-        (2, 48, 2, 16384, 16384),
-        (2, 64, 32, 1024, 1024),
-        (4, 64, 16, 2048, 2048),
-        (4, 64, 8, 4096, 4096),
-        (4, 64, 32, 8192, 8192),
-        (4, 128, 16, 16384, 16384),
+        (batch_size, N_HEAD, N_HEAD, seq_len_q, seq_len_k)
+        for batch_size, N_HEAD, seq_len_q, seq_len_k in configs
     ]
     return configs
 
@@ -81,10 +62,18 @@ def model_benchmark_configs(args):
             if config["num_key_value_heads"] is None
             else config["num_key_value_heads"]
         )
-        N_CTX_Q = args.sq if args.sq else 8192
+        N_CTX_Q = args.sq if args.sq else [2**i for i in range(1, 14)]
         N_CTX_K = args.sk if args.sk else N_CTX_Q
         HEAD_DIM = config["hidden_size"] // HQ
-        fa_configs.append((model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM))
+        if isinstance(N_CTX_Q, list):
+            for seq_len in N_CTX_Q:
+                fa_configs.append(
+                    (model_name, batch_size, HQ, HK, seq_len, seq_len, HEAD_DIM)
+                )
+        else:
+            fa_configs.append(
+                (model_name, batch_size, HQ, HK, N_CTX_Q, N_CTX_K, HEAD_DIM)
+            )
 
     return fa_configs
 
@@ -148,12 +137,14 @@ def create_benchmark_configs(custom, args):
             plot_name = f"fused-attention-{mode}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
             extra_args = {"dtype": dtype, "causal": causal, "mode": mode}
 
-    unit = "TFLOPS"
-    if args.return_time:
+    if args.metric == "time":
         unit = "ms"
-    if args.return_bandwidth:
+    elif args.metric == "throughput":
+        unit = "TFLOPS"
+    elif args.metric == "bandwidth":
         unit = "GB/s"
-    # unit = "ms"
+    else:
+        raise ValueError("Unknown metric: " + args.metric)
 
     if mode == "bwd":
         if args.fused_bwd:
@@ -475,7 +466,7 @@ def run_benchmark(custom, args):
         else:  # GB/s
             return mem / ms * 1e-3
 
-    bench_mha.run(save_path=None, print_data=True, show_plots=False)
+    bench_mha.run(save_path="." if args.o else None, print_data=True)
 
 
 def supported_layouts():
@@ -499,24 +490,7 @@ def str2bool(v):
 
 
 def parse_args():
-
-    parser = argparse.ArgumentParser(
-        prog="Benchmark FlashAttention",
-        allow_abbrev=False,
-    )
-    parser.add_argument(
-        "-model_configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as -model \"llama3,mistral_7B\""
-    )
-    parser.add_argument("-model", type=str, default="", help=model_help)
+    parser = get_parser(kernel_name="FlashAttention")
     parser.add_argument(
         "-mode", type=str, default="fwd", help="fwd:forward kernel, bwd:backward kernel"
     )
@@ -535,7 +509,7 @@ def parse_args():
     parser.add_argument("-causal", type=str2bool, default=None)
     parser.add_argument("-fp8", action="store_true", default=False)
     parser.add_argument("-quantize_p", action="store_true", default=False)
-    parser.add_argument("-dtype", default="fp16")
+    parser.add_argument("--dtype", default="fp16")
     parser.add_argument("-bench_torch", action="store_true", default=False)
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
@@ -551,18 +525,8 @@ def parse_args():
         default=False,
         help="Tests correctness of the Triton provider comparing the output to the Torch sdpa.",
     )
-    # prints TFLOPS without setting the following
-    parser.add_argument(
-        "-return_time", action="store_true", default=False, help="Prints only walltime."
-    )
-    parser.add_argument(
-        "-return_bandwidth",
-        action="store_true",
-        default=False,
-        help="Prints only memory bandwidth.",
-    )
 
-    parser.add_argument("-layout", type=str, default=None, help=supported_layouts())
+    parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
 
     parser.add_argument(
         "-persistent",
@@ -571,6 +535,9 @@ def parse_args():
         choices=["fixed", "dynamic"],
         default=None,
         help="Enable persistent kernels. Use '-persistent dynamic' for dynamic scheduling of the tiles.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser.parse_args()
 

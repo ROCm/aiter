@@ -93,6 +93,14 @@ def _batched_gemm_afp4_wfp4_pre_quant_kernel(
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
+    # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
+    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
+    # See https://github.com/ROCm/aiter/pull/597 for rationale
+    stride_ab = tl.cast(stride_ab, tl.int64)
+    stride_bb = tl.cast(stride_bb, tl.int64)
+    stride_cb = tl.cast(stride_cb, tl.int64)
+    pid_batch = tl.cast(pid_batch, tl.int64)
+
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
 
@@ -314,7 +322,6 @@ def _get_config(
 def batched_gemm_afp4wfp4_pre_quant(
     x,
     w,
-    x_scales,
     w_scales,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
@@ -322,14 +329,13 @@ def batched_gemm_afp4wfp4_pre_quant(
 ):
     """
     Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
+    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
     Every 32 elements in the K dimension share one e8m0 scale.
-
+    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
 
     Key parameters:
     - X: Matrix X with shape (B, M, K).
-    - W: Matrix W with shape (B, K, N).
+    - W: Matrix W with shape (B, N, K).
     - X_scales: Matrix with shape (B, M, K // 32)
     - W_scales: Matrix with shape (B, N, K // 32)
 
@@ -338,10 +344,11 @@ def batched_gemm_afp4wfp4_pre_quant(
     """
 
     Bx, M, K = x.shape
-    Bw, K, N = w.shape
+    Bw, N, K = w.shape
     By, _, _ = y.shape
     assert Bx == Bw == By
     Batch = Bx
+    w = w.transpose(1, 2)
 
     if config is None:
         config = _get_config(M, N, K)
@@ -368,6 +375,10 @@ def batched_gemm_afp4wfp4_pre_quant(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (  # noqa: E731
         Batch,
@@ -431,3 +442,4 @@ def batched_gemm_afp4wfp4_pre_quant(
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
         )
+    return y
