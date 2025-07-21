@@ -37,8 +37,28 @@ def torch_act_mul_and_mxfp4_quant(input: torch.Tensor, activation: str) -> torch
         out = F.gelu(x, approximate="tanh") * y
     return torch_dynamic_mxfp4_quant(out)
 
-def get_test_params():
-    full_shape_set = [
+
+class TestActivation:
+    basic_shape_set = [
+        (1, 4),
+        (1, 64),
+        (2, 28),
+        (2, 32),
+        (2, 68),
+        (128, 28),
+        (128, 68),
+        (256, 1024),
+        (160, 40),
+    ] 
+    basic_set = [
+        (*shape, dtype, activation, shuffle)
+        for shape in basic_shape_set
+        for dtype in ["bfloat16"]
+        for activation in ["silu", "gelu", "gelu_tanh"]
+        for shuffle in [True, False]
+    ]
+
+    extended_shape_set = [
         (1, 4),
         (1, 28),
         (1, 32),
@@ -61,59 +81,42 @@ def get_test_params():
         (280, 20),
         (32, 128),
     ] 
-    full_set = [
-        pytest.param(*shape, dtype, activation, shuffle, marks=pytest.mark.slow)
-        for shape in full_shape_set
+    extended_set = [
+        pytest.param(*shape, dtype, activation, shuffle, marks=pytest.mark.extended)
+        for shape in extended_shape_set
         for dtype in ["bfloat16", "float16"]
         for activation in ["silu", "gelu", "gelu_tanh"]
         for shuffle in [True, False]
     ]
 
-    fast_shape_set = [
-        (1, 4),
-        (1, 64),
-        (2, 28),
-        (2, 32),
-        (2, 68),
-        (128, 28),
-        (128, 68),
-        (256, 1024),
-        (160, 40),
-    ] 
-    fast_set = [
-        (*shape, dtype, activation, shuffle)
-        for shape in fast_shape_set
-        for dtype in ["bfloat16"]
-        for activation in ["silu", "gelu", "gelu_tanh"]
-        for shuffle in [True, False]
-    ]
-    return full_set + fast_set
 
-@pytest.mark.parametrize("M, N, dtype, activation, shuffle", get_test_params())
-def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle: bool):
-    # TODO: extend tests to different shapes with proper padding
-    if shuffle and (M % 256 != 0 or N % 512 != 0):
-        pytest.skip()
-    torch.manual_seed(20)
-    x = torch.randn((M, N), dtype=str_to_torch_dtype[dtype], device="cuda")
+    test_params = extended_set + basic_set
 
-    if DEBUG_MODE:
-        print(f"x.shape={x.shape} x={x}")
+    @pytest.mark.parametrize("M, N, dtype, activation, shuffle", test_params)
+    def test_act_mul_and_mxfp4_quant(self, M: int, N: int, dtype, activation: str, shuffle: bool):
+        # TODO: extend tests to different shapes with proper padding
+        if shuffle and (M % 256 != 0 or N % 512 != 0):
+            pytest.skip("Shuffle and M%256 !=0 or N % 512 !=0")
+        torch.manual_seed(20)
+        x = torch.randn((M, N), dtype=str_to_torch_dtype[dtype], device="cuda")
 
-    triton_out, triton_scale = act_mul_and_mxfp4_quant(
-        x, activation=activation, shuffle=shuffle
-    )
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
-        print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
+        if DEBUG_MODE:
+            print(f"x.shape={x.shape} x={x}")
 
-    torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation)
-    if shuffle:
-        torch_scale = shuffle_scales(torch_scale)
-        triton_scale = triton_scale.reshape(triton_scale.shape[0] // 32, -1)
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
-        print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
+        triton_out, triton_scale = act_mul_and_mxfp4_quant(
+            x, activation=activation, shuffle=shuffle
+        )
+        if DEBUG_MODE:
+            print(f"triton_out.shape={triton_out.shape} triton_out={triton_out}")
+            print(f"triton_scale.shape={triton_scale.shape} triton_scale={triton_scale}")
 
-    torch.testing.assert_close(triton_out, torch_out)
-    torch.testing.assert_close(triton_scale, torch_scale)
+        torch_out, torch_scale = torch_act_mul_and_mxfp4_quant(x, activation=activation)
+        if shuffle:
+            torch_scale = shuffle_scales(torch_scale)
+            triton_scale = triton_scale.reshape(triton_scale.shape[0] // 32, -1)
+        if DEBUG_MODE:
+            print(f"torch_out.shape={torch_out.shape} torch_out={torch_out}")
+            print(f"torch_scale.shape={torch_scale.shape} torch_scale={torch_scale}")
+
+        torch.testing.assert_close(triton_out, torch_out)
+        torch.testing.assert_close(triton_scale, torch_scale)
