@@ -323,7 +323,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mp",
         type=int,
-        default=torch.cuda.device_count(),
+        default=1,  # torch.cuda.device_count(),
         help="Tuning on multiple GPUs using multiple processes",
     )
 
