@@ -88,14 +88,16 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
+        get_CKGEMM_config.ckgemm_dict = {}
+    if tuned_file not in get_CKGEMM_config.ckgemm_dict:
         ckgemm_dict = pd.read_csv(
             f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file}"
         ).drop_duplicates()
-        get_CKGEMM_config.ckgemm_dict = ckgemm_dict.set_index(
+        get_CKGEMM_config.ckgemm_dict[tuned_file] = ckgemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
     cu_num = get_cu_num()
-    config = get_CKGEMM_config.ckgemm_dict.get((cu_num, M, N, K), None)
+    config = get_CKGEMM_config.ckgemm_dict[tuned_file].get((cu_num, M, N, K), None)
     if config is not None:
         logger.info(
             f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
