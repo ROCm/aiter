@@ -10,7 +10,6 @@ from aiter.fused_moe import fused_topk, fused_moe
 from aiter.ops.shuffle import shuffle_weight
 import mori
 import multiprocessing as mp
-import functools
 from aiter import get_hip_quant
 from aiter.test_common import checkAllclose, run_perftest
 
