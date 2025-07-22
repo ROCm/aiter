@@ -3,7 +3,8 @@
 
 import torch
 import os
-from typing import Optional
+from typing import Optional, Callable
+from dataclasses import dataclass
 import functools
 import aiter
 from aiter import logger
@@ -114,25 +115,22 @@ def fused_moe(
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
     q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
 
-    if block_size_M is None:
-        _, _, block_size_M, *_ = get_2stage_cfgs(
-            min(1024, M),  # consider token_num > 1024 as prefill
-            model_dim,
-            inter_dim,
-            E,
-            topk,
-            dtype,
-            q_dtype_a,
-            q_dtype_w,
-            quant_type,
-            isG1U1,
-            activation,
-            doweight_stage1,
-        )
-    run_1stage = M < 256
-    # run_1stage = quant_type in [QuantType.per_128x128, QuantType.per_1x32]
-    run_1stage = quant_type in [QuantType.per_128x128]
-    block_size_M = 32 if run_1stage else block_size_M
+    metadata = get_2stage_cfgs(
+        min(1024, M),  # consider token_num > 1024 as prefill
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        quant_type,
+        isG1U1,
+        activation,
+        doweight_stage1,
+    )
+
+    block_size_M = metadata.block_m if block_size_M is None else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids,
@@ -146,7 +144,7 @@ def fused_moe(
         moe_sorting_dispatch_policy,
     )
 
-    if run_1stage:
+    if metadata.run_1stage:
         assert (
             doweight_stage1 == False
         ), "doweight_stage1 not support in fused_moe_1stage"
@@ -322,6 +320,15 @@ def get_block_size_M(token, topk, expert, inter_dim):
 cfg_2stages = None
 
 
+@dataclass
+class MOEMetadata:
+    stage1: Callable
+    stage2: Callable
+    block_m: int
+    ksplit: int
+    run_1stage: bool = False
+
+
 @functools.lru_cache(maxsize=1024)
 def get_2stage_cfgs(
     token,
@@ -409,14 +416,18 @@ def get_2stage_cfgs(
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
+        run_1stage = token < 256
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
+        run_1stage = cfg["run_1stage"]
 
     tag = f"({kernelName1=}, {kernelName2=})"
-    logger.info(f"[fused_moe] using {'default' if cfg is None else tag} for {keys} ")
+    logger.info(
+        f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
+    )
 
     if "ck" in kernelName1 or q_dtype_w in [
         dtypes.bf16,
@@ -424,7 +435,7 @@ def get_2stage_cfgs(
         torch.uint32,
         torch.uint8,
     ]:
-        return (
+        return MOEMetadata(
             functools.partial(
                 aiter.ck_moe_stage1_fwd,
                 kernelName=kernelName1,
@@ -439,6 +450,7 @@ def get_2stage_cfgs(
             ),
             block_m,
             ksplit,
+            run_1stage,
         )
 
     # TODO: remove when stage2 support more size
@@ -447,7 +459,7 @@ def get_2stage_cfgs(
         tag = ""
         block_m = ([el for el in tmpList if block_m < el] + [128])[0]
 
-    return (
+    return MOEMetadata(
         functools.partial(
             asm_stage1,
             kernelName=kernelName1,
@@ -462,6 +474,7 @@ def get_2stage_cfgs(
         ),
         block_m,
         ksplit,
+        run_1stage,
     )
 
 
@@ -497,7 +510,7 @@ def fused_moe_2stages(
     dtype = moe_out.dtype
     device = hidden_states.device
 
-    stage1, stage2, block_m, ksplit = get_2stage_cfgs(
+    metadata = get_2stage_cfgs(
         min(1024, token_num),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
@@ -552,7 +565,7 @@ def fused_moe_2stages(
             device=device,
         )
 
-    a2 = stage1(
+    a2 = metadata.stage1(
         a1,
         w1,
         w2,
@@ -604,7 +617,7 @@ def fused_moe_2stages(
         )
         a2 = a2_v
 
-    stage2(
+    metadata.stage2(
         a2,
         w1,
         w2,
