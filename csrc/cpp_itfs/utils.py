@@ -16,8 +16,8 @@ import time
 logger = logging.getLogger("aiter")
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
-if os.path.exists(f"{AITER_CORE_DIR}/aiter_meta"):
-    AITER_CORE_DIR = f"{AITER_CORE_DIR}/aiter_meta"
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
 DEFAULT_GPU_ARCH = (
     subprocess.run(
         "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
