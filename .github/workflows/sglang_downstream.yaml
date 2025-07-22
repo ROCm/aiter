@@ -55,4 +55,6 @@ jobs:
         
       - name: Clean Up
         if: always()
-        run: ./.github/scripts/clean_up_sglang.sh
+        run: |
+          cd $GITHUB_WORKSPACE
+          ./.github/scripts/clean_up_sglang.sh
