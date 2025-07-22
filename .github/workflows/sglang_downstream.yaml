@@ -39,6 +39,10 @@ jobs:
         #env:
         #  GITHUB_WORKSPACE: ${{ github.workspace }}
 
+      # TODO: The replace should be changed in upstream.
+      - name: Replace path in script
+        run: sed -i 's|/sglang-checkout/sgl-kernel|/sglang-checkout/sglang/sgl-kernel|g' sglang/scripts/amd_ci_install_dependency.sh
+
       - name: Install dependencies
         run: bash sglang/scripts/amd_ci_install_dependency.sh
 
