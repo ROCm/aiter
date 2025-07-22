@@ -13,29 +13,11 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
-    get_model_configs,
+    batched_model_benchmark_shapes,
 )
 from aiter.ops.triton.batched_gemm_a8w8 import (
     batched_gemm_a8w8 as batched_gemm_a8w8,
 )
-
-
-def model_benchmark_shapes(args):
-    config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=args.model)
-    M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
-    batch_size = args.B if args.B is not None else 16
-    shapes = []
-    for M in M_list:
-        for model_name, config in configs.items():
-            N = config["intermediate_size"]
-            K = config["hidden_size"]
-
-            shapes.append(
-                (M, N, K, batch_size, model_name)
-            )  # rearrange args so M is graph x-axis
-
-    return shapes
 
 
 def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
@@ -79,7 +61,7 @@ def run_model_benchmark(args):
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
         x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
-        model_benchmark_shapes_fn=model_benchmark_shapes,
+        model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
 
     @triton.testing.perf_report([benchmark])
