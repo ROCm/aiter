@@ -47,22 +47,6 @@ __inline__ std::filesystem::path get_root_dir(){
     return aiter_root_dir;
 }
 
-<<<<<<< HEAD
-template<typename T>
-class NamedArg {
-    const char* name;
-    T value;
-public:
-    NamedArg(const char* n, T v) : name(n), value(v) {}
-
-    std::string toString() const {
-        std::stringstream ss;
-        ss << "--" << name << "=" << value;
-        return ss.str();
-    }
-};
-=======
->>>>>>> origin/main
 
 __inline__ const std::pair<std::string, int> execute_cmd(const std::string& cmd) {
     std::array<char, 128> buffer;
