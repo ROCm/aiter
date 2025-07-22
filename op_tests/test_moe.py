@@ -471,7 +471,7 @@ for test in l_test:
                     [4096, 6144, 8192] if args.inter_dim is None else args.inter_dim
                 ):
                     for hdim in (
-                        [512, 1024, 1280]
+                        [512, 1024, 1280, 1536]
                         if args.hidden_dim is None
                         else args.hidden_dim
                     ):
