@@ -479,6 +479,9 @@ def _get_config(
     elif M <= 256:
         return _get_config._config_dict[key]["large"]
     else:
+        BLK_M = triton.next_power_of_2(M)
+        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
         return _get_config._config_dict[key]["xlarge"]
 
 
