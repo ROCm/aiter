@@ -6,6 +6,24 @@ import triton.language as tl
 
 
 @triton.jit
+def remap_xcd_chunked(
+    pid, GRID_MN, NUM_XCDS: tl.constexpr = 8, CHUNK_SIZE: tl.constexpr = 2
+):
+    # Compute current XCD and local PID
+    xcd = pid % NUM_XCDS
+    # distribute the modulo pids in round robin
+    if pid > (GRID_MN // (NUM_XCDS * CHUNK_SIZE)) * (NUM_XCDS * CHUNK_SIZE):
+        return pid
+    local_pid = pid // NUM_XCDS
+    # Calculate chunk index and position within chunk
+    chunk_idx = local_pid // CHUNK_SIZE
+    pos_in_chunk = local_pid % CHUNK_SIZE
+    # Calculate new PID
+    new_pid = chunk_idx * NUM_XCDS * CHUNK_SIZE + xcd * CHUNK_SIZE + pos_in_chunk
+    return new_pid
+
+
+@triton.jit
 def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
@@ -36,7 +54,16 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
 
 
 @triton.jit
-def pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M: tl.constexpr = 1):
+def pid_grid(pid: int, num_pid_m: int, num_pid_n: int, GROUP_SIZE_M: tl.constexpr = 1):
+    """
+    Maps 1D pid to 2D grid coords (pid_m, pid_n).
+
+    Args:
+        - pid: 1D pid
+        - num_pid_m: grid m size
+        - num_pid_n: grid n size
+        - GROUP_SIZE_M: tl.constexpr: default is 1
+    """
     if GROUP_SIZE_M == 1:
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n

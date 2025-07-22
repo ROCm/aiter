@@ -4,6 +4,7 @@ import aiter
 from aiter.test_common import run_perftest, checkAllclose, benchmark
 from aiter import dtypes
 import pandas as pd
+import argparse
 
 
 def torch_scaled_silu_and_mul(input: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -73,20 +74,67 @@ def test_silu_and_mul(m, n, dtype):
     return {"us_aiter": us_aiter}
 
 
+l_dtype = ["fp16", "bf16"]
+l_m = [1, 32, 64, 128, 256, 512, 1024, 4096, 8192]
+l_n = [1024, 4096, 8192]
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""M of mnk.
+    e.g.: -m 32""",
+)
+parser.add_argument(
+    "-n",
+    type=int,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""N of mnk.
+    e.g.: -n 1024""",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.m is not None:
+    l_m = [args.m]
+if args.n is not None:
+    l_n = [args.n]
+
 df = []
-for dtype in [torch.float16, torch.bfloat16]:
-    for m in [1, 32, 64, 128, 256, 512, 1024, 4096, 8192]:
-        for n in [1024, 4096, 8192]:
+for dtype in l_dtype:
+    for m in l_m:
+        for n in l_n:
             ret = test_scaled_silu_and_mul(m, n, dtype)
             df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"scaled_silu_and_mul summary:\n{df}")
 
-
 df = []
-for dtype in [torch.float16, torch.bfloat16]:
-    for m in [1, 32, 64, 128, 256, 512, 1024, 4096, 8192]:
-        for n in [1024, 4096, 8192]:
+for dtype in l_dtype:
+    for m in l_m:
+        for n in l_n:
             ret = test_silu_and_mul(m, n, dtype)
             df.append(ret)
 df = pd.DataFrame(df)

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "gemm_a8w8_common.cuh"
 #include "gemm_a8w8_manifest.h"
@@ -36,7 +36,11 @@ template <typename ABDataType, typename DDataType, typename EDataType>
 RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
 {
   // Apply shape heuristics to find a suitable kernel implementation.
-  if (M < 64 && N < 2048 && K < 2048)
+  if (K < 512)
+  {
+    return a8w8_rowwise_256x256x128x64_32x32_4x2_4x64x1_4x64x1_1x32x1x8_8x8x1_1x1_interwave_v1<ABDataType, DDataType, EDataType>;
+  }
+  else if (M < 64 && N < 2048 && K < 2048)
   {
     // Kernel that generally works well on small shapes.
     return a8w8_rowwise_64x16x16x128_16x16_1x1_8x8x1_8x8x1_1x16x1x4_4x4x1_1x1_interwave_v2<ABDataType, DDataType, EDataType>;

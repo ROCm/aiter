@@ -4,7 +4,7 @@
 from torch import Tensor, Generator
 from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..utility import dtypes
 import torch
 
@@ -49,11 +49,11 @@ def fmha_v3_fwd(
 
 @compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
 def mha_varlen_fwd(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -66,12 +66,12 @@ def mha_varlen_fwd(
     window_size_right: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> list[Tensor]: ...
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> list[torch.Tensor]: ...
 
 
 @compile_ops("module_mha_bwd", fc_name="mha_bwd")
@@ -256,20 +256,22 @@ def _flash_attn_forward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def can_impl_fmha_v3_fwd():
         # basic
+        gfx = get_gfx()
         ret = alibi_slopes is None
         ret &= bias is None
         ret &= dropout_p == 0.0
         ret &= seqlen_q == seqlen_k
-        ret &= seqlen_q % 256 == 0
+        ret &= seqlen_q >= 384
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
-        ret &= mask or nmask
-        ret &= return_lse
-        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= not swa
+        ret &= q.dtype == dtypes.bf16
+        ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942")
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -426,7 +428,7 @@ def _flash_attn_backward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = not causal and (window_size_left > 0 or window_size_right > 0)
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -562,7 +564,6 @@ def _flash_attn_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= mask or nmask or swa
         ret &= np() or pssk() or pddv() or psskddv()
         return ret
 
@@ -1112,7 +1113,7 @@ def _flash_attn_varlen_backward(
         ret = (
             is_v3_atomic_fp32 == True
         )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q > 64 and hdim_q < 128
+        ret &= hdim_q >= 64 and hdim_q <= 192
         ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret

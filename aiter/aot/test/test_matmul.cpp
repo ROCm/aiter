@@ -7,7 +7,7 @@
 #include <vector>
 #include <cmath>
 #include <random>
-#include "matmul_fp16.53107118_0d1d2d34567c89c10d11c.h"
+#include "matmul_fp16.b3a5a34c_0d1d2d34567c89c10d11c121314.h"
 
 float random_float() {
     return static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
@@ -95,7 +95,7 @@ TEST_F(MatmulFP16Test, CorrectResult) {
                 ASSERT_EQ(hipSuccess, hipStreamCreate(&stream));
 
                 // Call the matrix multiplication function
-                ASSERT_EQ(hipSuccess, matmul_fp16_53107118_0d1d2d34567c89c10d11c(
+                ASSERT_EQ(hipSuccess, matmul_fp16_b3a5a34c_0d1d2d34567c89c10d11c121314(
                     stream, d_C, d_A, d_B, M, N, K, N, K, N));
 
                 // Synchronize and check for errors

@@ -11,7 +11,7 @@ def ceil_div(a, b):
 
 
 @triton.jit
-def moe_align_block_size_stage1(
+def _moe_align_block_size_stage1_kernel(
     topk_ids_ptr,
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
@@ -32,7 +32,7 @@ def moe_align_block_size_stage1(
 
 
 @triton.jit
-def moe_align_block_size_stage2(
+def _moe_align_block_size_stage2_kernel(
     tokens_cnts_ptr,
     num_experts: tl.constexpr,
 ):
@@ -46,7 +46,7 @@ def moe_align_block_size_stage2(
 
 
 @triton.jit
-def moe_align_block_size_stage3(
+def _moe_align_block_size_stage3_kernel(
     total_tokens_post_pad_ptr,
     tokens_cnts_ptr,
     cumsum_ptr,
@@ -63,7 +63,7 @@ def moe_align_block_size_stage3(
 
 
 @triton.jit
-def moe_align_block_size_stage4(
+def _moe_align_block_size_stage4_kernel(
     topk_ids_ptr,
     sorted_token_ids_ptr,
     expert_ids_ptr,
@@ -108,32 +108,28 @@ def moe_align_block_size_triton(
     cumsum = torch.zeros((num_experts + 1,), dtype=torch.int32, device=topk_ids.device)
     tokens_per_thread = ceil_div(numel, num_experts)
 
-    moe_align_block_size_stage1[grid](
+    _moe_align_block_size_stage1_kernel[grid](
         topk_ids,
         tokens_cnts,
         num_experts,
         numel,
         tokens_per_thread,
     )
-    # print(f"Post Stage1: topk_ids={topk_ids}")
-    # print(f"token_cnts={tokens_cnts}")
-    # print(f"num_experts={num_experts}, numel={numel}, tokens_per_thread={tokens_per_thread}")
 
-    moe_align_block_size_stage2[grid](
+    _moe_align_block_size_stage2_kernel[grid](
         tokens_cnts,
         num_experts,
     )
-    # print(f"Post Stage2: token_cnts={tokens_cnts}")
-    moe_align_block_size_stage3[(1,)](
+
+    _moe_align_block_size_stage3_kernel[(1,)](
         num_tokens_post_pad,
         tokens_cnts,
         cumsum,
         num_experts,
         block_size,
     )
-    # print(f"Post Stage3: token_cnts={tokens_cnts}")
-    # print(f"Post Stage3: cumsum={cumsum}")
-    moe_align_block_size_stage4[grid](
+
+    _moe_align_block_size_stage4_kernel[grid](
         topk_ids,
         sorted_token_ids,
         expert_ids,
@@ -144,5 +140,3 @@ def moe_align_block_size_triton(
         numel,
         tokens_per_thread,
     )
-    # print(f"Post Stage4: token_cnts={tokens_cnts}")
-    # print(f"Post Stage4: cumsum={cumsum}")

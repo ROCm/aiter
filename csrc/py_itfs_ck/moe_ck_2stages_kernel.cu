@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -181,7 +181,6 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<int> act_op                    = 0)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
-    at::cuda::getCurrentCUDAStream().stream();
     // TORCH_CHECK(hidden_states.dtype() == w1.dtype(),
     //             "Weights and activations should both be same dtype!");
 
@@ -457,6 +456,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<int> block_m = 32,
                    std::optional<torch::Tensor> sorted_weights = std::nullopt)    // [max_num_tokens_padded])
 {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
     // TORCH_CHECK(inter_states.dtype() == w2.dtype(),
     //             "Weights and activations should both be same dtype!");
     //

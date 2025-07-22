@@ -5,6 +5,7 @@ import torch
 import aiter
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
+import argparse
 
 
 @perftest()
@@ -45,14 +46,50 @@ def test_Smoothquant_instance(dtype, m, n, xscaleType):
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
 
 
-def test_Smoothquant():
+def test_Smoothquant(l_dtype: list, l_m: list, l_n: list):
     print("\nstart layernorm2d fuse Smoothquant test")
     for scaleType in [dtypes.fp32]:
         for dtype in [dtypes.fp16, dtypes.bf16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [10, 4096, 8192]:
+            for m in l_m:
+                for n in l_n:
                     test_Smoothquant_instance(dtype, m, n, xscaleType=scaleType)
 
 
 if __name__ == "__main__":
-    test_Smoothquant()
+    l_dtype = ["bf16", "fp16"]
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Data type.
+    e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-m",
+        type=int,
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        nargs="*",
+        help="""M of mnk.
+    e.g.: -m 32""",
+    )
+    parser.add_argument(
+        "-n",
+        type=int,
+        default=[10, 1024, 2048],
+        nargs="*",
+        help="""N of mnk.
+    e.g.: -n 1024""",
+    )
+    args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    test_Smoothquant(l_dtype, args.m, args.n)

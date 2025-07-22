@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
 import os
 import time
+import logging
+
+logger = logging.getLogger("aiter")
 
 
 class FileBaton:
     """A primitive, file-based synchronization utility."""
 
-    def __init__(self, lock_file_path, wait_seconds=0.1):
+    def __init__(self, lock_file_path, wait_seconds=0.2):
         """
         Create a new :class:`FileBaton`.
 
@@ -42,6 +45,7 @@ class FileBaton:
         The amount of time slept depends on the ``wait_seconds`` parameter
         passed to the constructor.
         """
+        logger.info(f"waiting for baton release at {self.lock_file_path}")
         while os.path.exists(self.lock_file_path):
             time.sleep(self.wait_seconds)
 

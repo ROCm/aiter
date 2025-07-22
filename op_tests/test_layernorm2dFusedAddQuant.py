@@ -307,6 +307,7 @@ def test_layernorm2d_fuseAdd_Dynamicquant():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
         prog="test_layernorm2dFusedSQuant",
         description="Test ck layernorm2d Fused add and SmoothQuant",
     )
@@ -316,7 +317,8 @@ if __name__ == "__main__":
         choices=[1, 2, 3, 4, 5, 6],
         help="1: test_layernorm2d, \n2:test_layernorm2d_fuseAdd, \n"
         + "3:test_layernorm2d_fuseSmoothquant, \n4:test_layernorm2d_fuseAdd_Smoothquant"
-        + "5:test_layernorm2d_fuseDynamicquant, \n6:test_layernorm2d_fuseAdd_Dynamicquant",
+        + "5:test_layernorm2d_fuseDynamicquant, \n6:test_layernorm2d_fuseAdd_Dynamicquant\n"
+        + "    e.g.: --mode 1",
         default=1,
     )
     # parser.add_argument(

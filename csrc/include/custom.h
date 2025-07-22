@@ -3,6 +3,8 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
+namespace aiter {
+
 void wvSpltK(at::Tensor& in_a,
              at::Tensor& in_b,
              at::Tensor& out_c,
@@ -23,3 +25,4 @@ void wvSplitKQ(at::Tensor& in_a,
                at::Tensor& scale_a,
                at::Tensor& scale_b,
                const int64_t CuCount);
+} // namespace aiter

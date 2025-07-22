@@ -5,6 +5,8 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
+from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 
 
@@ -27,22 +29,7 @@ def run_triton(x, weight, bias=None, dtype=torch.bfloat16, y=None):
     return batched_gemm_bf16(x, weight, bias, dtype, YQ=y)
 
 
-def is_cdna4():
-    return triton.runtime.driver.active.get_current_target().arch == "gfx950"
-
-
-e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
-e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
-
-name_to_torch_types = {
-    "int8": torch.int8,
-    "int32": torch.int32,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp8e5": e5m2_type,
-    "fp8e4": e4m3_type,
-}
+e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
@@ -77,6 +64,7 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
+    x_vals += [(1, 1, 1)]  # minimal case
     return x_vals
 
 
@@ -92,7 +80,7 @@ def get_x_vals():
 )
 def test_batched_gemm_bf16(dtype, b, m, n, k, output):
 
-    dtype = name_to_torch_types[dtype]
+    dtype = str_to_torch_dtype[dtype]
     x = torch.randint(-20, 20, (b, m, k), dtype=dtype).cuda()
     weight = torch.randint(-20, 20, (b, n, k), dtype=dtype).cuda()
 

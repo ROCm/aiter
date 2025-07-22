@@ -1,17 +1,19 @@
+import sys
+import argparse
+import torch
 import triton
-from utils.benchmark_utils import (
+from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
+from aiter.ops.triton.moe_op import fused_moe as triton_moe
+from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
-    torch_to_tl_dtype,
+    print_vgpr,
 )
-from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
-import torch
-import argparse
-from aiter.ops.triton.moe_op import fused_moe as triton_moe
-import sys
 
 
 def model_benchmark_configs(args):
+    no_bench_stage2 = args.no_bench_stage2
     config_file = args.model_configs
     configs = get_model_configs(
         config_path=config_file, models="mistral" if args.model is None else args.model
@@ -23,15 +25,16 @@ def model_benchmark_configs(args):
     for model_name, config in configs.items():
         N1 = config["intermediate_size"]
         K1 = config["hidden_size"]
+        if no_bench_stage2:
+            N2 = config["hidden_size"]
+            K2 = config["intermediate_size"] // 2
 
-        N2 = config["hidden_size"]
-        K2 = config["intermediate_size"] // 2
-
-        E = 8
-        top_k = 2
+        E = config["num_expert"]
+        top_k = config["top_k"]
 
         moe_configs.append((model_name, M, N1, K1, E, top_k))
-        moe_configs.append((model_name, M, N2, K2, E, top_k))
+        if no_bench_stage2:
+            moe_configs.append((model_name, M, N2, K2, E, top_k))
 
     return moe_configs
 
@@ -90,12 +93,12 @@ def fused_moe(
             num_tokens_post_padded,
             routed_weight,
             top_k,
-            config,
-            torch_to_tl_dtype[dtype],
+            torch_to_triton_dtype[dtype],
             use_fp8_w8a8=False,
             use_int8_w8a16=False,
             use_int4_w4a16=True,
             block_shape=(0, group_size),
+            config=config,
         )
     else:
         (
@@ -138,11 +141,11 @@ def fused_moe(
             num_tokens_post_padded,
             routed_weight,
             top_k,
-            config,
-            torch_to_tl_dtype[dtype],
+            torch_to_triton_dtype[dtype],
             fp8_w8a8,
             int8_w8a16,
             use_int4_w4a16=False,
+            config=config,
         )
 
 
@@ -153,8 +156,9 @@ def run_benchmark(args):
     int4_w4a16 = args.int4_w4a16
     group_size = args.group_size
     has_zp = args.has_zp
-    dtype = arg_to_torch_dtype[args.dtype]
-    fp8_type = arg_to_torch_dtype[args.fp8_type]
+    print_time = args.print_time
+    dtype = str_to_torch_dtype[args.dtype]
+    fp8_type = str_to_torch_dtype[args.fp8_type]
 
     if int4_w4a16:
         assert group_size != None, "set group_size with -group_size"
@@ -166,8 +170,12 @@ def run_benchmark(args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
-    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
-    line_vals = ["time", "tflops", "bandwidth"]
+    if print_time:
+        line_names = ["Time (ms)"]
+        line_vals = ["time"]
+    else:
+        line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+        line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -200,8 +208,9 @@ def run_benchmark(args):
             a_bytes = b_bytes = c_bytes = torch.tensor([], dtype=dtype).element_size()
         # TODO add the int4 case
 
+        max_expert_loaded = min(E, top_k * M)
         # (M, K) memory load for A (E,  N,  K) for B not (top_k,  N,  K) because we are in total bringing in all expert matrices into the chip from memory. It's just that not all multiply the same A.
-        mem_read = (M * K) * a_bytes + (E * N * K) * b_bytes
+        mem_read = (M * K) * a_bytes + (max_expert_loaded * N * K) * b_bytes
 
         mem_write = (M * top_k * N) * c_bytes
         mem = mem_read + mem_write
@@ -236,7 +245,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_gemm.run(save_path=".", print_data=True)
+    bench_moe_gemm.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -256,7 +265,7 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="M dimension")
     parser.add_argument(
         "-group_size", type=int, default=None, help="group_size for in4"
@@ -266,23 +275,34 @@ def parse_args():
     parser.add_argument("-fp8_w8a8", action="store_true", default=False)
     parser.add_argument("-int4_w4a16", action="store_true", default=False)
     parser.add_argument("-has_zp", action="store_true", default=False)
+    parser.add_argument("-print_time", action="store_true", default=False)
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Print VGPR usage for Triton kernels.",
+    )
+    parser.add_argument("-no_bench_stage2", action="store_false", default=True)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-fp8_type", default="e5m2fnuz")
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
 
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-    "e5m2fnuz": torch.float8_e5m2fnuz,
-    "e4m3fnuz": torch.float8_e4m3fnuz,
-}
-
-
 def main():
     args = parse_args()
+
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+
+        def fun():
+            return run_benchmark(args)
+
+        print_vgpr(fun, "_fused_moe_kernel-benchmark")
+        return 0
     run_benchmark(args)
 
 

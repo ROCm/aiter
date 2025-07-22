@@ -18,7 +18,6 @@
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
-          typename OUTT,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -46,7 +45,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                                     // max_num_partitions]
     scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
                                     // head_size]
-    OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
+
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* k_scale_ptr,
@@ -54,8 +53,12 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     const AttentionVariant* variant)
 {
     const int seq_idx = blockIdx.x;
-    const int query_loc = cu_query_lens[seq_idx];
-    const int query_len = cu_query_lens[seq_idx + 1] - query_loc;
+    int query_loc = seq_idx;
+    int query_len = 1;
+    if (cu_query_lens != nullptr) {
+        query_loc = cu_query_lens[seq_idx];
+        query_len = cu_query_lens[seq_idx + 1] - query_loc;
+    }
     if(query_len > 1) {
         return;
     }
@@ -68,7 +71,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
         return;
     }
     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, OUTT, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, AttentionVariant>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, final_out, logits_soft_cap, logits_soft_cap_rcp, k_scale_ptr, v_scale_ptr, variant);    
+    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, AttentionVariant>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, k_scale_ptr, v_scale_ptr, variant);    
 }
 
 // Grid: (num_heads, num_seqs).
@@ -109,7 +112,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE,
-          typename OUTT,
           int BLOCK_SIZE,
           int HEAD_SIZE,
           int NUM_THREADS,
@@ -137,7 +139,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
                                     // max_num_partitions]
     scalar_t* __restrict__ out,     // [num_seqs, num_heads, max_num_partitions,
                                     // head_size]
-    OUTT* __restrict__ final_out,   // [num_seqs, num_heads, head_size]
     float logits_soft_cap,
     float logits_soft_cap_rcp,
     const float* k_scale_ptr,
@@ -177,7 +178,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     paged_attention_ll4mi_QKV_mfma16_kernel<T,                       \
                                             KVT,                     \
                                             KV_DTYPE,                \
-                                            OUTT,                    \
                                             BLOCK_SIZE,              \
                                             HEAD_SIZE,               \
                                             NTHR,                    \
@@ -199,7 +199,6 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
                                      exp_sums_ptr,                   \
                                      max_logits_ptr,                 \
                                      tmp_out_ptr,                    \
-                                     out_ptr,                        \
                                      logits_soft_cap,                \
                                      logits_soft_cap_rcp,            \
                                      k_scale_ptr,                    \
@@ -234,7 +233,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
                                      torch::Tensor& value_cache,
                                      float scale,
                                      torch::Tensor& block_tables,
-                                     torch::Tensor& cu_query_lens,
+                                     const std::optional<torch::Tensor>& cu_query_lens,
                                      torch::Tensor& context_lens,
                                      int max_num_blocks_per_seq,
                                      int max_num_partitions,
@@ -263,7 +262,7 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     KVT* value_cache_ptr       = reinterpret_cast<KVT*>(value_cache.data_ptr());
     int* context_lens_ptr      = context_lens.data_ptr<int>();
     int* block_tables_ptr      = block_tables.data_ptr<int>();
-    int* cu_query_lens_ptr     = cu_query_lens.data_ptr<int>();
+    int* cu_query_lens_ptr     = cu_query_lens ? cu_query_lens.value().data_ptr<int>() : nullptr;
 
     const float* k_scale_ptr = reinterpret_cast<const float*>(k_scale.data_ptr());
     const float* v_scale_ptr = reinterpret_cast<const float*>(v_scale.data_ptr());
@@ -276,8 +275,6 @@ void paged_attention_custom_launcher(torch::Tensor& out,
     // partition size is fixed at 256 since both mfma4 and mfma16 kernels support it
     // mfma4 kernel also supports partition size 512
     constexpr int PARTITION_SIZE = 256;
-
-
     const int gqa_ratio          = num_heads / num_kv_heads;
     assert(num_heads % num_kv_heads == 0);
     assert(head_size == HEAD_SIZE);
@@ -451,7 +448,7 @@ void paged_attention_v1(
                                 // [num_blocks, block_size, num_heads, head_size]
     double scale,
     torch::Tensor& block_tables,  // [num_seqs, max_num_blocks_per_seq]
-    torch::Tensor& cu_query_lens,  // [num_seqs+1]
+    const std::optional<torch::Tensor>& cu_query_lens,  // [num_seqs+1]
     torch::Tensor& context_lens,  // [num_seqs]
     int64_t max_context_len,
     const std::optional<torch::Tensor>& alibi_slopes,

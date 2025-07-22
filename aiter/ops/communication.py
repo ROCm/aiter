@@ -25,6 +25,7 @@ def init_dist_env(world_size, rankID):
         world_size=world_size,
         rank=rankID,
         distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        backend="cpu:gloo,cuda:nccl",
     )
     ensure_model_parallel_initialized(world_size, 1)
 

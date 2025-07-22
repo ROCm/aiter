@@ -7,9 +7,10 @@ from aiter import dtypes
 from aiter.fused_moe import torch_moe, fused_topk
 from aiter.fused_moe_bf16_asm import asm_moe
 from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant, ck_moe
+from aiter import pertoken_quant
 from aiter.int4_utils import *
 from aiter import ActivationType
+import argparse
 
 BLOCK_SIZE_M = 32
 
@@ -87,32 +88,6 @@ def asm_moe_test(
         None,
         None,
         activation,
-    )
-
-
-@perftest()
-def ck_moe_test(
-    hidden_states,
-    w1,
-    w2,
-    topk_weight,
-    topk_ids,
-    # following for int8 quant
-    fc1_scale=None,  # [expert, inter_dim, 1]
-    fc2_scale=None,  # [expert, model_dim, 1]
-    fc1_smooth_scale=None,  # [expert, 1, model_dim]
-    fc2_smooth_scale=None,  # [expert, 1, inter_dim]
-):
-    return ck_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weight,
-        topk_ids,
-        fc1_scale,
-        fc2_scale,
-        fc1_smooth_scale,
-        fc2_smooth_scale,
     )
 
 
@@ -217,14 +192,8 @@ def test_fmoe(
         else:
             out_b, avg_b = asm_moe_test(input, w1b, w2b, topk_weights, topk_ids)
 
-        # test ck moe
-        out_ck, avg_ck = ck_moe_test(
-            input, w1b, w2b, topk_weights, topk_ids, None, None, None, None
-        )
-
-        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, ck_avg: {avg_ck:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
+        msg = f"[perf] {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us, uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
-        checkAllclose(ref2, out_ck, rtol=0.01, atol=100, msg="ck check")
     else:
         dtypeMax = 7 if use_int4 else None
         w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype, dtypeMax=dtypeMax)
@@ -313,7 +282,7 @@ def test_fmoe(
                 and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
-                (inter_dim % 320 == 0)
+                (inter_dim % 320 == 0 or inter_dim % 256 == 0)
                 and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
@@ -337,109 +306,152 @@ def test_fmoe(
             msg = f"[perf] a8w8 asm: {avg_b:>8.2f} vs a16w8 asm: {avg_b2:>8.2f} ......"
             checkAllclose(ref2, out_b2, atol=100, msg=msg)
 
-        # # test ck moe, not support now
-        # out_ck, avg_ck = ck_moe_test(input, w1b, w2b, topk_weights, topk_ids,
-        #                              fc1_scale, fc2_scale,
-        #                              fc1_smooth_scale, fc2_smooth_scale)
         msg = f"[perf] {use_g1u1=} {token=}, quant={quantstr}, {model_dim=}, {inter_dim=}, {E=}, {shared_E=}, {topk=}, dtype: {dtype}, torch_avg: {avg_c:<8.2f} us, asm_avg: {avg_b:>8.2f} us ...... uplift: {avg_c/avg_b-1:.1%}"
         checkAllclose(ref2, out_b, rtol=0.01, atol=100, msg=msg)
-        # checkAllclose(ref2, avg_ck, rtol=0.01, atol=100)
 
 
-print("test test_fmoe 16 bit")
-print("\ng1u0 no quant")
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                test_fmoe(dtype, m, dim, hdim, 32, 5, quant="No")
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="select test",
+)
+l_test = [
+    "test_fmoe_16_bit",
+    "g1u1_no_quant",
+    "g1u1_int8quant",
+    "g1u1_fp8quant",
+    "g1u0_int8smoothquant",
+    "g1u1_int8smoothquant",
+    "g1u1_fp8smoothquant",
+    "g1u1_int4",
+]
+parser.add_argument(
+    "-t",
+    "--test",
+    type=str,
+    choices=l_test,
+    default=None,
+    help="""Select test to run.
+    e.g.: -t test_fmoe_16_bit""",
+)
+args = parser.parse_args()
+if args.test is not None:
+    l_test = [args.test]
+for test in l_test:
+    print(f"\nRunning test: {test}")
+    if test == "test_fmoe_16_bit":
+        print("test test_fmoe 16 bit")
+        print("\ng1u0 no quant")
+        for dtype in [dtypes.fp16, dtypes.bf16]:
+            for m in [128, 256]:
+                for dim in [4096, 8192]:
+                    for hdim in [1024]:
+                        # test_fmoe(dtype, m, dim, hdim, 32, 5)
+                        test_fmoe(dtype, m, dim, hdim, 32, 5, quant="No")
+    elif test == "g1u1_no_quant":
+        for dtype in [dtypes.fp16, dtypes.bf16]:
+            for m in [128, 256]:
+                for dim in [4096, 8192]:
+                    for hdim in [1024]:
+                        # test_fmoe(dtype, m, dim, hdim, 32, 5)
+                        test_fmoe(dtype, m, dim, hdim, 32, 5, quant="No", use_g1u1=True)
+    elif test == "g1u1_int8quant":
+        for dtype in [dtypes.bf16]:
+            for m in [128, 256]:
+                for dim in [4096, 8192]:
+                    for hdim in [1024]:
+                        test_fmoe(
+                            dtype,
+                            m,
+                            dim,
+                            hdim,
+                            32,
+                            5,
+                            #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
+                            quant="int8quant",
+                            use_g1u1=True,
+                        )
 
-print("\ng1u1 no quant")
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                test_fmoe(dtype, m, dim, hdim, 32, 5, quant="No", use_g1u1=True)
+    elif test == "g1u1_fp8quant":
+        for dtype in [dtypes.bf16]:
+            for m in [128, 256]:
+                for dim in [4096, 8192]:
+                    for hdim in [1024]:
+                        test_fmoe(
+                            dtype,
+                            m,
+                            dim,
+                            hdim,
+                            32,
+                            5,
+                            quant="fp8quant",
+                            use_g1u1=True,
+                            shared_E=0,
+                            activation=ActivationType.Gelu,
+                        )
+                        #   quant='fp8quant', use_g1u1=True)
 
-print("\ng1u1 int8quant")
-for dtype in [dtypes.bf16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                test_fmoe(
-                    dtype,
-                    m,
-                    dim,
-                    hdim,
-                    32,
-                    5,
-                    #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
-                    quant="int8quant",
-                    use_g1u1=True,
-                )
+    elif test == "g1u0_int8smoothquant":
+        for dtype in [dtypes.bf16]:
+            for m in [128]:
+                for dim in [4096, 6144, 8192]:
+                    for hdim in [512, 1024]:
+                        test_fmoe(
+                            dtype,
+                            m,
+                            dim,
+                            hdim,
+                            32,
+                            5,
+                            quant="int8smoothquant",
+                            use_g1u1=False,
+                        )
 
-print("\ng1u1 fp8quant")
-for dtype in [dtypes.bf16]:
-    for m in [128, 256]:
-        for dim in [4096, 8192]:
-            for hdim in [1024]:
-                test_fmoe(
-                    dtype,
-                    m,
-                    dim,
-                    hdim,
-                    32,
-                    5,
-                    quant="fp8quant",
-                    use_g1u1=True,
-                    shared_E=0,
-                    activation=ActivationType.Gelu,
-                )
-                #   quant='fp8quant', use_g1u1=True)
+    elif test == "g1u1_int8smoothquant":
+        for dtype in [dtypes.bf16]:
+            for m in [128]:
+                for dim in [4096, 6144, 8192]:
+                    for hdim in [512, 1024, 1280, 1536]:
+                        test_fmoe(
+                            dtype,
+                            m,
+                            dim,
+                            hdim,
+                            32,
+                            5,
+                            quant="int8smoothquant",
+                            use_g1u1=True,
+                        )
 
-
-print("\ng1u0 int8smoothquant")
-for dtype in [dtypes.bf16]:
-    for m in [128]:
-        for dim in [4096, 6144, 8192]:
-            for hdim in [512, 1024]:
-                test_fmoe(
-                    dtype, m, dim, hdim, 32, 5, quant="int8smoothquant", use_g1u1=False
-                )
-
-print("\ng1u1 int8smoothquant")
-for dtype in [dtypes.bf16]:
-    for m in [128]:
-        for dim in [4096, 6144, 8192]:
-            for hdim in [512, 1024, 1280]:
-                test_fmoe(
-                    dtype, m, dim, hdim, 32, 5, quant="int8smoothquant", use_g1u1=True
-                )
-
-print("\ng1u1 fp8smoothquant")
-for dtype in [dtypes.bf16]:
-    for m in [128]:
-        for dim in [4096, 6144, 8192]:
-            for hdim in [512, 1024, 1280]:
-                test_fmoe(
-                    dtype, m, dim, hdim, 32, 5, quant="fp8smoothquant", use_g1u1=True
-                )
-
-print("\ng1u1 int4")
-for dtype in [dtypes.bf16]:
-    for m in [32, 128]:
-        # for dim in [1024]:
-        for dim in [4096, 6144]:
-            for hdim in [1024, 4096]:
-                test_fmoe(
-                    dtype,
-                    m,
-                    dim,
-                    hdim,
-                    8,
-                    3,
-                    quant="wint4afp8smoothquant",
-                    use_g1u1=True,
-                )
+    elif test == "g1u1_fp8smoothquant":
+        for dtype in [dtypes.bf16]:
+            for m in [128]:
+                for dim in [4096, 6144, 8192]:
+                    for hdim in [512, 1024, 1280]:
+                        test_fmoe(
+                            dtype,
+                            m,
+                            dim,
+                            hdim,
+                            32,
+                            5,
+                            quant="fp8smoothquant",
+                            use_g1u1=True,
+                        )
+    elif test == "g1u1_int4":
+        for dtype in [dtypes.bf16]:
+            for m in [32, 128]:
+                # for dim in [1024]:
+                for dim in [4096, 6144]:
+                    for hdim in [1024, 4096]:
+                        test_fmoe(
+                            dtype,
+                            m,
+                            dim,
+                            hdim,
+                            8,
+                            3,
+                            quant="wint4afp8smoothquant",
+                            use_g1u1=True,
+                        )
+    else:
+        raise ValueError(f"Unknown test: {test}")

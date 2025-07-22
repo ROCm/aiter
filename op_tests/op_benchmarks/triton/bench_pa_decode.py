@@ -1,15 +1,15 @@
+import sys
+import random
+import torch
+import argparse
 import triton
-from utils.benchmark_utils import (
+from aiter.ops.triton.pa_decode import paged_attention_decode
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     get_dtype_bytes,
-    torch_to_tl_dtype,
 )
-import torch
-import argparse
-from aiter.ops.triton.pa_decode import paged_attention_decode
-import sys
-import random
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 
 def input_helper(
@@ -177,7 +177,7 @@ def paged_attn_decode(
 def run_benchmark(args):
     dtype = arg_to_torch_dtype[args.dtype]
     kv_cache_dtype = arg_to_torch_dtype[args.kv_cache_dtype]
-    compute_type = torch_to_tl_dtype[arg_to_torch_dtype[args.compute_type]]
+    compute_type = torch_to_triton_dtype[arg_to_torch_dtype[args.compute_type]]
     output_type = arg_to_torch_dtype[args.output_type]
 
     x_vals_list = model_benchmark_configs(args)
@@ -238,7 +238,6 @@ def run_benchmark(args):
         flops = (2.0 * BS * HQ * SEQ_LEN * HEAD_DIM) * 2
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active
@@ -251,7 +250,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -271,7 +270,7 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -280,6 +279,9 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
