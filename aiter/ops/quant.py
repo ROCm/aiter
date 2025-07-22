@@ -152,7 +152,7 @@ def get_hip_quant(qType):
         QuantType.per_Tensor: per_tensor_quant_hip,
         QuantType.per_Token: per_token_quant_hip,
         QuantType.per_1x32: per_1x32_f4_quant_hip,
-        QuantType.per_1x128: per_block_quant_wrapper((1, 128))(per_token_quant_hip),
+        QuantType.per_1x128: functools.partial(per_group_quant_hip, group_size=128),
     }
 
     def raise_NotImplementedError(*a, **k):
@@ -177,7 +177,13 @@ def get_triton_quant(qType):
     return tmp.get(qType, raise_NotImplementedError)
 
 
-def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
+def per_token_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
     shape = x.shape
     device = x.device
     if scale is None:
@@ -186,8 +192,10 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
         raise ValueError("unsupported: static per token quant")
 
     if 1:
-        y = torch.empty(shape, dtype=quant_dtype, device=device)
-        dynamic_per_token_scaled_quant(y, x, scale)
+        y = torch.zeros(shape, dtype=quant_dtype, device=device)
+        dynamic_per_token_scaled_quant(
+            y, x, scale, num_rows=num_rows, num_rows_factor=num_rows_factor
+        )
     elif quant_dtype == dtypes.i8:
         M, N = x.view(-1, shape[-1]).shape
         y = torch.empty((M, N), dtype=dtypes.i8, device=device)
@@ -197,10 +205,52 @@ def per_token_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
         y = y.view(shape)
     else:
         raise ValueError(f"unsupported: {quant_dtype=}")
+    # print("finished per token quant hip")
     return y, scale
 
 
-def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
+def per_group_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    group_size=128,
+    transpose_scale=False,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
+    shape = x.shape
+    device = x.device
+    if scale is None:
+        scale = torch.empty(
+            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
+        )
+    else:
+        raise ValueError("unsupported: static per token quant")
+    assert group_size in [
+        32,
+        64,
+        128,
+    ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
+    y = torch.empty(shape, dtype=quant_dtype, device=device)
+    dynamic_per_token_scaled_quant(
+        y,
+        x.view(-1, group_size),
+        scale,
+        shuffle_scale=transpose_scale,
+        num_rows=num_rows,
+        num_rows_factor=num_rows_factor,
+    )
+    return y, scale
+
+
+def per_1x32_f4_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
     m, n = x.shape
     assert quant_dtype == dtypes.fp4x2
     assert n % 2 == 0
@@ -232,11 +282,26 @@ def per_1x32_f4_quant_hip(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False
     else:
         raise ValueError("unsupported: static per token quant")
     y = torch.empty(m, n // 2, dtype=quant_dtype, device=device)
-    dynamic_per_group_scaled_quant_fp4(y, x, scale, 32, shuffle_scale=shuffle)
+    dynamic_per_group_scaled_quant_fp4(
+        y,
+        x,
+        scale,
+        32,
+        shuffle_scale=shuffle,
+        num_rows=num_rows,
+        num_rows_factor=num_rows_factor,
+    )
     return y.view(torch.uint8), scale
 
 
-def per_tensor_quant_hip(x, scale=None, quant_dtype=dtypes.i8):
+def per_tensor_quant_hip(
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
+):
+    assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
     if quant_dtype in [dtypes.fp8, dtypes.i8]:
         if scale is None:
@@ -304,7 +369,9 @@ def dynamic_per_token_scaled_quant(
     input: Tensor,
     scales: Tensor,
     scale_ub: Optional[Tensor] = None,
-    shuffle_scale=True,
+    shuffle_scale=False,
+    num_rows: Optional[Tensor] = None,
+    num_rows_factor: int = 1,
 ): ...
 
 
@@ -315,8 +382,18 @@ def dynamic_per_group_scaled_quant_fp4(
     scales: Tensor,
     group_size: Optional[int] = 32,
     shuffle_scale=True,
+    num_rows: Optional[Tensor] = None,
+    num_rows_factor: int = 1,
 ):
     """
     Only support group_size in [32, 64, 128]
     """
     ...
+
+
+@compile_ops("module_quant")
+def partial_transpose(
+    out: Tensor,
+    input: Tensor,
+    num_rows: Tensor,
+): ...
