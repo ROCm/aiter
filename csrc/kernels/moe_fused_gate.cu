@@ -474,6 +474,8 @@ __global__ void moe_fused_gate_kernel_dynamic(
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor& input,
     at::Tensor& bias,
+    at::Tensor& topk_weights,
+    at::Tensor& topk_ids,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
@@ -482,8 +484,8 @@ std::vector<at::Tensor> moe_fused_gate(
   int64_t num_rows = input.size(0);
   int32_t num_experts = input.size(1);
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-  auto output = torch::empty({num_rows, topk}, options);
-  auto indices = torch::empty({num_rows, topk}, options.dtype(torch::kInt32));
+  auto output = topk_weights;
+  auto indices = topk_ids;
 
   // Compute grid dimensions based on runtime value for num_expert_group.
   int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);

@@ -27,6 +27,8 @@ void grouped_topk(
 std::vector<at::Tensor> moe_fused_gate(
     at::Tensor &input,
     at::Tensor &bias,
+    at::Tensor &topk_weights,
+    at::Tensor &topk_ids,
     int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
