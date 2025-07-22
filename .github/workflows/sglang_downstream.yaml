@@ -17,6 +17,13 @@ jobs:
       - name: Clone sglang repo
         run: |
           git clone https://github.com/sgl-project/sglang.git
+        
+      - name: Make authenticated API request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -H "Authorization: token $GITHUB_TOKEN" \
+              -sSfL https://api.github.com/repos/casey/just/releases/latest
 
       - name: Build sglang image
         run: |
