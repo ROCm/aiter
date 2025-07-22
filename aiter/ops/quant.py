@@ -295,7 +295,11 @@ def per_1x32_f4_quant_hip(
 
 
 def per_tensor_quant_hip(
-    x, scale=None, quant_dtype=dtypes.i8, num_rows: Optional[torch.tensor] = None
+    x,
+    scale=None,
+    quant_dtype=dtypes.i8,
+    num_rows: Optional[torch.tensor] = None,
+    num_rows_factor=1,
 ):
     assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
     y = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
