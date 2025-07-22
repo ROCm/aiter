@@ -370,7 +370,6 @@ parser.add_argument(
     e.g.: -hd 1024""",
 )
 
-
 args = parser.parse_args()
 if args.test is not None:
     l_test = [args.test]
