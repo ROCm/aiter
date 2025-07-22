@@ -83,7 +83,7 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Benchmark the down-projection (intermediate dim to hidden dim in the feed-forward layer)",
     )
     parser.add_argument(
-        "-no_glu",
+        "-no-glu",
         action="store_true",
         help="Benchmark the feed-forward layer without GLU activation (default is with GLU)",
     )
