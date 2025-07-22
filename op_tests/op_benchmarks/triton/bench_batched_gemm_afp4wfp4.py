@@ -14,6 +14,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     batched_model_benchmark_shapes,
+    print_vgpr,
 )
 from aiter.ops.triton.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
@@ -155,6 +156,11 @@ def main():
         sys.exit()
 
     args, defaults = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        print_vgpr(fun, "GEMM")
+        return 0
     run_benchmark(args, defaults)
 
 

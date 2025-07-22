@@ -141,6 +141,7 @@ def model_benchmark_shapes(args):
 
     return shapes
 
+
 def batched_model_benchmark_shapes(args):
     """
     Generate benchmark shapes when profiling a batched GEMM with the --model arg.
@@ -163,6 +164,7 @@ def batched_model_benchmark_shapes(args):
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes
+
 
 def get_x_vals(dims: int, args=None):
     """

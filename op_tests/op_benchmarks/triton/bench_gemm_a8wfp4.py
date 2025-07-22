@@ -80,6 +80,7 @@ def run_benchmark(args, defaults):
             "fc1",
             "fc2",
             "no_glu",
+            "tp",
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
@@ -126,12 +127,6 @@ def run_shape_benchmark(args):
 def parse_args():
     parser = get_parser("8-bit x 4-bit GEMM")
     parser = add_argparse_ff(parser)
-
-    parser.add_argument(
-        "--print_vgpr",
-        action="store_true",
-        help="Print VGPR usage for Triton kernels.",
-    )
     return get_ff_args(parser)
 
 
