@@ -829,23 +829,32 @@
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
     m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
-#define QUANT_PYBIND                                                     \
-    m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);   \
-    m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant); \
-    m.def("dynamic_per_token_scaled_quant",                              \
-          &aiter::dynamic_per_token_scaled_quant,                        \
-          py::arg("out"),                                                \
-          py::arg("input"),                                              \
-          py::arg("scales"),                                             \
-          py::arg("scale_ub")      = std::nullopt,                       \
-          py::arg("shuffle_scale") = true);                              \
-    m.def("dynamic_per_group_scaled_quant_fp4",                          \
-          &aiter::dynamic_per_group_scaled_quant_fp4,                    \
-          py::arg("out"),                                                \
-          py::arg("input"),                                              \
-          py::arg("scales"),                                             \
-          py::arg("group_size")    = 32,                                 \
-          py::arg("shuffle_scale") = true);
+#define QUANT_PYBIND                                                       \
+    m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);     \
+    m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant);   \
+    m.def("dynamic_per_token_scaled_quant",                                \
+          &aiter::dynamic_per_token_scaled_quant,                          \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("scales"),                                               \
+          py::arg("scale_ub")        = std::nullopt,                       \
+          py::arg("shuffle_scale")   = false,                              \
+          py::arg("num_rows")        = std::nullopt,                       \
+          py::arg("num_rows_factor") = 1);                                 \
+    m.def("dynamic_per_group_scaled_quant_fp4",                            \
+          &aiter::dynamic_per_group_scaled_quant_fp4,                      \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("scales"),                                               \
+          py::arg("group_size")    = 32,                                   \
+          py::arg("shuffle_scale") = true,                                 \
+          py::arg("num_rows")        = std::nullopt,                       \
+          py::arg("num_rows_factor") = 1);                                 \
+    m.def("partial_transpose",                                             \
+          &aiter::partial_transpose,                                       \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("num_rows"));
 
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \

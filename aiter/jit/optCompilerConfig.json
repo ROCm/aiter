@@ -327,7 +327,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DCK_TILE_WA_ISSUE_2028=0'"
+            "'-DCK_TILE_WA_ISSUE_2028=0'",
+            "'-DMOE_SORTING_FMOE_2D_BUF'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
