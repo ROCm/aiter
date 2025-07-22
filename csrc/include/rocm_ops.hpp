@@ -653,12 +653,18 @@
           py::arg("need_renorm"),                                                             \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
           "Apply biased grouped topk softmax to the gating outputs.");                        \
-      m.def("moe_fused_gate", &moe_fused_gate,                                   \
-            py::arg("input"), py::arg("bias"),                                   \
-            py::arg("num_expert_group"), py::arg("topk_group"),                  \
-            py::arg("topk"), py::arg("n_share_experts_fusion"),                  \
-            py::arg("routed_scaling_factor") = 1.0,                              \
-            "Apply biased grouped topk softmax to the gating outputs.");         \
+    m.def("moe_fused_gate",                                                                   \
+          &moe_fused_gate,                                                                    \
+          py::arg("input"),                                                                   \
+          py::arg("bias"),                                                                    \
+          py::arg("topk_weights"),                                                            \
+          py::arg("topk_ids"),                                                                \
+          py::arg("num_expert_group"),                                                        \
+          py::arg("topk_group"),                                                              \
+          py::arg("topk"),                                                                    \
+          py::arg("n_share_experts_fusion"),                                                  \
+          py::arg("routed_scaling_factor") = 1.0,                                             \
+          "Apply biased grouped topk softmax to the gating outputs.");                        \
     m.def("moe_align_block_size",                                                             \
           &aiter::moe_align_block_size,                                                       \
           "Aligning the number of tokens to be processed by each expert such "                \

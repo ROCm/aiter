@@ -99,7 +99,7 @@ def test_biased_grouped_topk(
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
     _, us_aiter = run_perftest(
-        aiter.biased_grouped_topk,
+        aiter.biased_grouped_topk_hip,
         gating_output,
         correction_bias,
         w_aiter,
@@ -123,13 +123,16 @@ def test_biased_grouped_topk(
         id_aiter,
         msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
-    return {"err": err, "us": us_aiter}
+    # return {"err": err, "us": us_aiter}
 
-    # print(f"{correction_bias=}")
+    w_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.fp32)
+    id_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.i32)
     _, us_sglang = run_perftest(
         aiter.moe_fused_gate,
         gating_output,
         correction_bias,
+        w_sglang,
+        id_sglang,
         group,
         topk_group,
         topk,
