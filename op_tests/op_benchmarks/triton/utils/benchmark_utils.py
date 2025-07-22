@@ -32,8 +32,11 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
             if hasattr(args, "B") and args.B is not None:
                 x_vals_list = [[args.B] + args.shape]
             else:
-                warnings.warn("Batch size not specified in --shape, using default.")
-                x_vals_list = [[16] + args.shape]
+                batch_size = 16
+                warnings.warn(
+                    f"Batch size not specified in --shape or with -B, using default: {batch_size}."
+                )
+                x_vals_list = [[batch_size] + args.shape]
         else:
             raise ValueError(
                 f"Incompatible --shape provided: {args.shape}. Expected a shape that matches {x_names}."
@@ -75,7 +78,7 @@ def get_model_benchmark_object(
     Note: This is for benchmarking models (e.g with the --model arg).
     """
     if x_names is None:
-        x_names = ["model_name", "M", "hidden_dim", "intermediate_dim"]
+        x_names = ["M", "hidden_dim", "intermediate_dim", "model_name"]
     if model_benchmark_shapes_fn is None:
         model_benchmark_shapes_fn = model_benchmark_shapes
     if not args.fc1 and not args.fc2:
@@ -126,14 +129,14 @@ def model_benchmark_shapes(args):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
     if args.model == "all":
-        M_list = [4096]
+        M_list = [args.M if args.M is not None else 4096]
     else:
         M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
             shapes.append(
-                (model_name, M, config["hidden_size"], config["intermediate_size"])
+                (M, config["hidden_size"], config["intermediate_size"], model_name)
             )
 
     return shapes
@@ -165,7 +168,7 @@ def get_x_vals(dims: int, args=None):
         else:
             batch_size = 16  # by default
             warnings.warn(
-                f"Batch size not specified in --shape, using default: {batch_size}"
+                f"Batch size not specified in --shape or with -B, using default: {batch_size}"
             )
         x_vals = [tuple([batch_size] + list(i)) for i in x_vals]  # (B, M, N, K)
     return x_vals

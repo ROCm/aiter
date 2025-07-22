@@ -25,12 +25,12 @@ def model_benchmark_shapes(args):
     batch_size = args.B if args.B is not None else 16
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
+        for model_name, config in configs.items():
             N = config["intermediate_size"]
             K = config["hidden_size"]
 
             shapes.append(
-                (M, N, K, batch_size)
+                (M, N, K, batch_size, model_name)
             )  # rearrange batch to last dim so M is graph x-axis
 
     return shapes
@@ -72,7 +72,7 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
-        x_names=["M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
         model_benchmark_shapes_fn=model_benchmark_shapes,
     )
 
