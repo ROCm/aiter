@@ -7,7 +7,7 @@ on:
 jobs:
   sglang:
     name: sglang integration
-    runs-on: aiter-k8s-build
+    runs-on: [self-hosted, linux, aiter-k8s-build, X64]
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
     steps:
