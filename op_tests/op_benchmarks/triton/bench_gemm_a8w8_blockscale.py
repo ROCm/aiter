@@ -59,7 +59,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("Blockscale GEMM A8W8 Benchmark", args)
+    benchmark = get_model_benchmark_object("GEMM A8W8 Blockscale Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(
@@ -95,7 +95,7 @@ def run_model_benchmark(args):
 
 
 def run_shape_benchmark(args):
-    benchmark = get_shape_benchmark_object("Blockscale GEMM A8W8 Benchmark", args)
+    benchmark = get_shape_benchmark_object("GEMM A8W8 Blockscale Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):

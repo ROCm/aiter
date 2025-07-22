@@ -171,21 +171,24 @@ def get_x_vals(dims: int, args=None):
     Get a default set of benchmarking values (M, N, K).
     """
     assert dims in [3, 4], "Invalid number of dimensions"
-    x_vals = [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-    ]
+    if args.M is not None:
+        x_vals = [(args.M, 1280, 8192)]
+    else:
+        x_vals = [
+            (1, 1280, 8192),
+            (32, 1280, 8192),
+            (64, 1280, 8192),
+            (128, 1280, 8192),
+            (192, 1280, 8192),
+            (256, 1280, 8192),
+            (320, 1280, 8192),
+            (512, 1280, 8192),
+            (1024, 1280, 8192),
+            (2048, 1280, 8192),
+            (4096, 1280, 8192),
+            (8192, 1280, 8192),
+            (16384, 1280, 8192),
+        ]
     if dims == 4:
         if hasattr(args, "B") and args.B is not None:
             batch_size = args.B
@@ -307,7 +310,7 @@ def parse_vgpr_usage(file_path, table_start="result-table-name"):
     # Print extracted information
     print("\n".join(vgpr_info))
     table = PrettyTable()
-    table.field_names = re.split(r" {2,}", table_lines[0].strip())
+    table.field_names = re.split(r" {1,}", table_lines[0].strip())
     [table.add_row(line.split()[1:]) for line in table_lines[1:]]
 
     print(table)
