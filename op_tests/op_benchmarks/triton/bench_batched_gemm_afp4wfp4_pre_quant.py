@@ -66,7 +66,7 @@ def bench_gemm_fn(
 
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
-        plot_name="GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
+        plot_name="Batched GEMM MXFP4 x MXFP4 Pre-quant Benchmark",
         args=args,
         x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
