@@ -59,7 +59,7 @@ def biased_grouped_topk(
     topk_group: int,
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
-): 
+):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
     if token_num >= cu_num * 16:
