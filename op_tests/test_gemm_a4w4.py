@@ -81,7 +81,7 @@ def test_gemm(dtype, M, N, K):
     out1 = torch.empty(M, N, dtype=dtype)
     out2 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
     out3 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
-    bias_f32 = torch.zeros(M, N, dtype=dtype)
+    bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
 

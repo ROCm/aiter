@@ -585,7 +585,18 @@ def layer_norm(
     eps: float = 1e-5,
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Applies Layer Normalization over a mini-batch of inputs.
 
+    Key parameters:
+    - input: The input tensor to be normalized with shape (M, N).
+    - weight: The learnable weights tensor with shape (N, ).
+    - bias: The learnable bias tensor with shape (N, )
+    - eps: A value added to the denominator for numerical stability.
+
+    Returns:
+    - Output: The output tensor with shape (M, N).
+    """
     out = torch.empty_like(input)
     M, N = input.shape
 
@@ -610,7 +621,22 @@ def layernorm2d_fwd_with_add(
     epsilon: float,
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Adds two inputs and then applies Layer Normalization
 
+    Key parameters:
+    - out: The output of layer normalization with shape (M, N). Allocated by the caller
+    - input: The input tensor to be normalized with shape (M, N).
+    - residual_in: Tensor added to the input and same shape as input (M, N)
+    - residual_out: Output tensor that is input + residual_in with shape (M, N). Must be allocated by the caller
+    - weight: The learnable weights tensor with shape (N, ).
+    - bias: Bias added to the result of layer norm with shape (N,)
+    - eps: A value added to the denominator for numerical stability.
+
+    Returns:
+    - out: The output tensor with shape (M, N).
+    - residual_out: Output tensor that is input + residual_in with shape (M, N).
+    """
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -644,7 +670,21 @@ def layernorm2d_fwd_with_dynamicquant(
     epsilon: float = 1e-5,
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Applies Layer Normalization and then quantizes the output
 
+    Key parameters:
+    - out: The output of layer normalization with shape (M, N). Allocated by the caller
+    - input: The input tensor to be normalized with shape (M, N) and dtype in (fp32, fp16 or bf16)
+    - yscale: Output scale tensor with shape (M,) and dtype fp32. Allocated by the caller
+    - weight: The learnable weights tensor with shape (N, ).
+    - bias: Bias added to the result of layer norm with shape (N,)
+    - eps: A value added to the denominator for numerical stability.
+
+    Returns:
+    - out: The output tensor with shape (M, N).
+    - yscale: Output scale tensor with shape (M,). Allocated by the caller
+    """
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -690,7 +730,20 @@ def layernorm2d_fwd_with_smoothquant(
     epsilon: float = 1e-5,
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Applies Layer Normalization and then quantizes the output
 
+    Key parameters:
+    - input: The input tensor to be normalized with shape (M, N).
+    - xscale: Input scale tensor which is multiplied with the output of layer normalization before quantization.
+    - yscale: Output scale tensor with shape (M,) and dtype fp32. Allocated by the caller
+    - weight: The learnable weights tensor with shape (N, ).
+    - bias: Bias added to the result of layer norm with shape (N,)
+    - eps: A value added to the denominator for numerical stability.
+
+    Returns:
+    - Output: The output tensor with shape (M, N).
+    """
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -736,7 +789,23 @@ def layernorm2d_fwd_with_add_dynamicquant(
     epsilon: float = 1e-5,
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Adds two input toegether, then does layer Normalization before quantizing the final output
 
+    Key parameters:
+    - out: The output of layer normalization with shape (M, N). Allocated by the caller
+    - input: The input tensor to be normalized with shape (M, N) and dtype in (fp32, fp16 or bf16)
+    - residual_in: Tensor added to the input and same shape as input (M, N)
+    - residual_out: Output tensor that is input + residual_in with shape (M, N). Must be allocated by the caller
+    - yscale: Output scale tensor with shape (M,) and dtype fp32. Allocated by the caller
+    - weight: The learnable weights tensor with shape (N, ).
+    - bias: Bias added to the result of layer norm with shape (N,)
+    - eps: A value added to the denominator for numerical stability.
+
+    Returns:
+    - out: The output tensor with shape (M, N).
+    - yscale: Output scale tensor with shape (M,). Allocated by the caller
+    """
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -786,6 +855,23 @@ def layernorm2d_fwd_with_add_smoothquant(
     epsilon: float = 1e-5,
     x_bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Applies Layer Normalization and then quantizes the output
+
+    Key parameters:
+    - input: The input tensor to be normalized with shape (M, N).
+    - residual_in: Tensor added to the input and same shape as input (M, N)
+    - residual_out: Output tensor that is input + residual_in with shape (M, N). Must be allocated by the caller
+    - xscale: Input scale tensor which is multiplied with the output of layer normalization before quantization.
+    - yscale: Output scale tensor with shape (M,) and dtype fp32. Allocated by the caller
+    - weight: The learnable weights tensor with shape (N, ).
+    - bias: Bias added to the result of layer norm with shape (N,)
+    - eps: A value added to the denominator for numerical stability.
+
+    Returns:
+    - Output: The output tensor with shape (M, N).
+    - yscale: Output scale tensor with shape (M,). Allocated by the caller
+    """
 
     M, N = input.shape
 

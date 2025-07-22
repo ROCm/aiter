@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from aiter.test_common import checkAllclose, perftest
@@ -282,7 +282,7 @@ def test_fmoe(
                 and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
-                (inter_dim % 320 == 0)
+                (inter_dim % 320 == 0 or inter_dim % 256 == 0)
                 and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
             )
             or (

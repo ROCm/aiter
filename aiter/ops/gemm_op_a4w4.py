@@ -69,7 +69,7 @@ def gemm_a4w4_asm(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
