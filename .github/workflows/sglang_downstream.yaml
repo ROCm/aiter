@@ -52,3 +52,7 @@ jobs:
           bash sglang/scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash sglang/scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
           bash sglang/scripts/amd_ci_exec.sh python3 models/test_qwen_models.py
+        
+      - name: Clean Up
+        if: always()
+        run: ./.github/scripts/clean_up_sglang.sh
