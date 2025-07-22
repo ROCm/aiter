@@ -42,7 +42,19 @@ if IS_ROCM:
     ), 'CK is needed by aiter, please make sure clone by "git clone --recursive https://github.com/ROCm/aiter.git" or "git submodule sync ; git submodule update --init --recursive"'
 
     if PREBUILD_KERNELS == 1:
-        exclude_ops = ["libmha_fwd", "libmha_bwd"]
+        exclude_ops = [
+            "libmha_fwd",
+            "libmha_bwd",
+            "module_moe_ck2stages",
+            "module_fmha_v3_fwd",
+            "module_mha_fwd",
+            "module_mha_varlen_fwd",
+            "module_mha_batch_prefill",
+            "module_fmha_v3_bwd",
+            "module_fmha_v3_varlen_bwd",
+            "module_mha_bwd",
+            "module_mha_varlen_bwd",
+        ]
         all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
@@ -87,7 +99,7 @@ class NinjaBuildExtension(BuildExtension):
                 1024**3
             )  # free memory in GB
             # each JOB peak memory cost is ~8-9GB when threads = 4
-            max_num_jobs_memory = int(free_memory_gb / 9)
+            max_num_jobs_memory = int(free_memory_gb / 0.5)
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
@@ -108,7 +120,7 @@ if PREBUILD_KERNELS == 1:
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
-    packages=["aiter_meta", "aiter"],
+    packages=["aiter_meta", "aiter", "csrc"],
     include_package_data=True,
     package_data={
         "": ["*"],

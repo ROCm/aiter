@@ -1,17 +1,18 @@
 import argparse
 import sys
-
 import torch
 import triton
-from utils.benchmark_utils import get_available_models, get_model_configs
-
+from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
+import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
+from op_tests.triton_tests.test_moe import torch_moe_align_block_size_ref
 from op_tests.triton_tests.test_moe_mx import (
     alloc_rand,
-    str_to_torch_dtype,
-    torch_to_tl_dtype,
-    moe_align_block_size,
     torch_dynamic_mxfp4_quant,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_available_models,
+    get_model_configs,
 )
 
 
@@ -97,8 +98,8 @@ def run_benchmark(args):
         softmax_vals = torch.softmax(values, dim=1)
         topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], E
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
         )
 
         if is_a_mixed_input:
@@ -139,7 +140,7 @@ def run_benchmark(args):
             swizzle_mx,
             swizzle_mx,
             config,
-            torch_to_tl_dtype[c_tri.dtype],
+            torch_to_triton_dtype[c_tri.dtype],
         )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -157,7 +158,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_gemm.run(save_path=".", print_data=True)
+    bench_moe_gemm.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -188,11 +189,18 @@ def parse_args():
         choices=["bf16", "fp16", "fp8_e5m2", "mxfp4_e2m1"],
         default="mxfp4_e2m1",
     )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
 
 def main():
+    if not (arch_info.is_fp4_avail()):
+        print("MXFP4 not supported on this architecture")
+        sys.exit(0)
+
     args = parse_args()
     run_benchmark(args)
 

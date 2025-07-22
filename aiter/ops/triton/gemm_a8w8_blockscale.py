@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
-
-
-# TODO Move this to a common folder. Will need to add future arch list
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(
@@ -131,8 +127,8 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -189,6 +185,23 @@ def _gemm_a8w8_blockscale_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM_BLOCKSCALE-A8W8.json"
+        print(f"fpath={fpath}")
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    return _get_config._config_dict["any"]
+
+
 def gemm_a8w8_blockscale(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -196,6 +209,7 @@ def gemm_a8w8_blockscale(
     w_scale: torch.Tensor,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -213,36 +227,33 @@ def gemm_a8w8_blockscale(
     *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
+    M, K = x.shape
+    N, K = w.shape
+
+    # Check constraints.
+    assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
     # Transpose w and w_scale
     w = w.T
     w_scale = w_scale.T
 
-    M, K = x.shape
-    K, N = w.shape
-
-    # Scale block sizes
-    # TODO: need a better way to pass scale block sizes around
-    GROUP_K = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
-    GROUP_N = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
-
-    # Check constraints.
-    assert x.shape[1] == w.shape[0], "Incompatible dimensions!!!"
-
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    BLOCK_SIZE_M = 128
-    BLOCK_SIZE_N = 128
-    BLOCK_SIZE_K = 128
-    GROUP_SIZE_M = 4
-    waves_per_eu = 2
-    kpack = 1 if get_arch() in ("gfx950") else 2
-    matrix_instr_nonkdim = 16
-    num_warps = 4
-    num_stages = 2
+    if config is None:
+        config = _get_config(M, N, K)
 
-    grid = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    # Scale block sizes
+    # TODO: need a better way to pass scale block sizes around
+    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
+    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
+
+    grid = lambda META: (  # noqa: E731
+        (
+            triton.cdiv(M, config["BLOCK_SIZE_M"])
+            * triton.cdiv(N, config["BLOCK_SIZE_N"]),
+        )
+    )
     _gemm_a8w8_blockscale_kernel[grid](
         x,
         w,
@@ -262,17 +273,7 @@ def gemm_a8w8_blockscale(
         x_scale.stride(1),
         w_scale.stride(0),
         w_scale.stride(1),
-        GROUP_K,
-        GROUP_N,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        kpack=kpack,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **config,
     )
 
     return y

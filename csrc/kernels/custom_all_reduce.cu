@@ -48,8 +48,8 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
   {
     std::memcpy(&ipc_handles[i], handles[i].data(), sizeof(cudaIpcMemHandle_t));
   }
-  return (fptr_t) new vllm::CustomAllreduce(
-      reinterpret_cast<vllm::Signal *>(meta.data_ptr()), rank_data.data_ptr(),
+  return (fptr_t) new aiter::CustomAllreduce(
+      reinterpret_cast<aiter::Signal *>(meta.data_ptr()), rank_data.data_ptr(),
       rank_data.numel(), ipc_handles, offsets, rank, full_nvlink);
 }
 
@@ -79,7 +79,7 @@ bool _is_weak_contiguous(torch::Tensor &t)
 void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
                  cudaStream_t stream, bool open_fp8_quant)
 {
-  auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
+  auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   TORCH_CHECK(_is_weak_contiguous(out));
   switch (out.scalar_type())
   {
@@ -92,10 +92,13 @@ void _all_reduce(fptr_t _fa, torch::Tensor &inp, torch::Tensor &out,
   }
   case at::ScalarType::Half:
   {
-    // support case: 512 threads per block, half 8 pack, split into 8 pieces
-    if (open_fp8_quant && inp.numel() % (4096 * 8) == 0)
+    /*
+     * By default, hidden_dim is a multiple of 128
+     * Obvious effects can only be achieved when the data scale reaches a certain level
+     * */
+    if (open_fp8_quant && out.numel() >= 128 * 2048)
     {
-      fa->runFp8QuantKernel(stream, reinterpret_cast<half *>(inp.data_ptr()),
+      fa->runFp8QuantKernel<half>(stream, reinterpret_cast<half *>(inp.data_ptr()),
                           reinterpret_cast<half *>(out.data_ptr()), out.numel());
     }
     else
@@ -147,24 +150,24 @@ void all_reduce_unreg(fptr_t _fa, torch::Tensor &inp, torch::Tensor &reg_buffer,
 
 void dispose(fptr_t _fa)
 {
-  auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
+  auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   delete fa;
 }
 
-int64_t meta_size() { return sizeof(vllm::Signal); }
+int64_t meta_size() { return sizeof(aiter::Signal); }
 
 void register_buffer(fptr_t _fa, torch::Tensor &t,
                      const std::vector<std::string> &handles,
                      const std::vector<int64_t> &offsets)
 {
-  auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
+  auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   fa->register_buffer(handles, offsets, t.data_ptr());
 }
 
 std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(
     fptr_t _fa)
 {
-  auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
+  auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
   auto options =
       torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
@@ -177,7 +180,7 @@ std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(
 void register_graph_buffers(fptr_t _fa, const std::vector<std::string> &handles,
                             const std::vector<std::vector<int64_t>> &offsets)
 {
-  auto fa = reinterpret_cast<vllm::CustomAllreduce *>(_fa);
+  auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   fa->register_graph_buffers(handles, offsets);
 }
 

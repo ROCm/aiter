@@ -8,6 +8,7 @@ from aiter import dtypes
 from aiter.utility import fp4_utils
 import pandas as pd
 import itertools
+import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -55,6 +56,7 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
         model_dim,
         dtype,
     )
+    num_valid_ids = num_valid_ids[0]
     if stage == "stage1":
         scale = torch.arange(token_num * model_dim // 32, dtype=torch.uint8)
         scale = scale.view(token_num, model_dim // 32)
@@ -82,31 +84,96 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
     return {"us_ref": us_ref, "us": us, "err": err}
 
 
+l_dtype = ["bf16"]
+list_dim = [4096, 6144, 8192]
+list_Expert = [32, 256, 257, 512]
+list_topk = [5, 8]
+list_m = [1, 31, 64, 128, 256, 10000, 163840]
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-dim",
+    choices=list_dim,
+    type=int,
+    default=None,
+    help="""Model dimension.
+    e.g.: -dim 4096""",
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    choices=list_Expert,
+    type=int,
+    default=None,
+    help="""Number of experts.
+    e.g.: -e 32""",
+)
+parser.add_argument(
+    "-t",
+    "--topk",
+    choices=list_topk,
+    type=int,
+    default=None,
+    help="""Number of top experts.
+    e.g.: -t 5""",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    default=None,
+    help="""M of mnk.
+    e.g.: -m 64""",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+
+if args.dim is not None:
+    list_dim = [args.dim]
+if args.expert is not None:
+    list_Expert = [args.expert]
+if args.topk is not None:
+    list_topk = [args.topk]
+if args.m is not None:
+    list_m = [args.m]
+
 df = []
-list_dim = [4096, 6144, 8192][:]
-list_E = [32, 256, 257, 512][:]
-list_topk = [5, 8][:]
-list_m = [1, 31, 64, 128, 256, 10000, 163840][:]
-for dtype in [dtypes.bf16]:
+for dtype in l_dtype:
     for (
         dim,
         E,
         topk,
         m,
-    ) in itertools.product(list_dim, list_E, list_topk, list_m):
+    ) in itertools.product(list_dim, list_Expert, list_topk, list_m):
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage1")
         df.append(ret)
 df = pd.DataFrame(df)
 aiter.logger.info(f"summary:\n{df}")
 
 df = []
-for dtype in [dtypes.bf16]:
+for dtype in l_dtype:
     for (
         dim,
         E,
         topk,
         m,
-    ) in itertools.product(list_dim, list_E, list_topk, list_m):
+    ) in itertools.product(list_dim, list_Expert, list_topk, list_m):
         ret = test_moe_mxfp4_sort(dtype, m, dim, E, topk, 32, "stage2")
         df.append(ret)
 df = pd.DataFrame(df)

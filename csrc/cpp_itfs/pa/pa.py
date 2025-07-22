@@ -1,13 +1,12 @@
 from jinja2 import Template
-from cpp.utils import compile_template_op
-from cpp.torch_utils import torch_to_c_types
+from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
 import ctypes
 import math
 
 
 MD_NAME = "pa"
-warpSize = 64
-with open("pa.cpp.jinja", "r") as f:
+
+with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa.cpp.jinja", "r") as f:
     src_template = Template(f.read())
 
 
@@ -21,13 +20,20 @@ def compile(
     out_dtype: str,
     block_size: int,
     alibi_enabled: str,
+    mtp: int = 1,
     folder: str = None,
 ):
     return compile_template_op(
         src_template,
         MD_NAME,
-        ["../utils.h", "pa.cuh", "../../csrc/include"],
-        [],
+        [
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa.cuh",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_common.cuh",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_kernels.cuh",
+            f"{AITER_CORE_DIR}/csrc/include",
+            f"{AITER_CORE_DIR}/csrc/include/ck_tile",
+        ],
         gqa_ratio=gqa_ratio,
         head_size=head_size,
         npar_loops=npar_loops,
@@ -37,6 +43,7 @@ def compile(
         out_dtype=out_dtype,
         block_size=block_size,
         alibi_enabled=alibi_enabled,
+        mtp=mtp,
         folder=folder,
     )
 
@@ -59,17 +66,21 @@ def paged_attention_rocm(
     kv_cache_dtype,
     k_scale,
     v_scale,
-    fp8_out_scale,
+    fp8_out_scale=None,
+    partition_size=256,
+    mtp=1,
 ):
     import torch
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
+    warpSize = torch.cuda.get_device_properties(out.device).warp_size
     if kv_cache_dtype == "auto":
         if query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
             kv_dtype = "__hip_bfloat16"
         elif query.dtype == torch.float16:
-            dtype = "__half"
-            kv_dtype = "__half"
+            dtype = "_Float16"
+            kv_dtype = "_Float16"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
     elif kv_cache_dtype == "fp8" or kv_cache_dtype == "fp8_e4m3":
@@ -77,7 +88,7 @@ def paged_attention_rocm(
             dtype = "__hip_bfloat16"
             kv_dtype = "uint8_t"
         elif query.dtype == torch.float16:
-            dtype = "__half"
+            dtype = "_Float16"
             kv_dtype = "uint8_t"
         else:
             raise ValueError(f"Unsupported data type: {query.dtype}")
@@ -87,18 +98,19 @@ def paged_attention_rocm(
     if out.dtype == torch.bfloat16:
         out_dtype = "__hip_bfloat16"
     elif out.dtype == torch.float16:
-        out_dtype = "__half"
+        out_dtype = "_Float16"
     else:
         raise ValueError(f"Unsupported data type: {out.dtype}")
 
-    num_seqs = query.size(0)
+    num_seqs = block_tables.size(0)
     num_heads = query.size(1)
     head_size = query.size(2)
     q_stride = query.stride(0)
+    max_num_blocks_per_seq = block_tables.size(1)
     kv_block_stride = key_cache.stride(0)
     kv_head_stride = key_cache.stride(1)
     gqa_ratio = int(num_heads / num_kv_heads)
-    max_num_partitions = int(math.ceil(max_context_len / 256))
+    max_num_partitions = int(math.ceil(max_context_len / partition_size))
     npar_loops = int(math.ceil(max_num_partitions / warpSize))
     func = compile(
         gqa_ratio,
@@ -109,12 +121,13 @@ def paged_attention_rocm(
         kv_cache_dtype,
         out_dtype,
         block_size,
-        "true" if alibi_slopes else "false",
+        "true" if alibi_slopes is not None else "false",
+        mtp,
     )
 
     alibi_slopes_ptr = (
         ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        if alibi_slopes
+        if alibi_slopes is not None
         else ctypes.POINTER(ctypes.c_int)()
     )
 
@@ -143,7 +156,7 @@ def paged_attention_rocm(
         num_seqs,
         num_kv_heads,
         num_heads,
-        max_num_partitions,
+        max_num_blocks_per_seq,
         max_context_len,
         q_stride,
         kv_block_stride,
@@ -161,7 +174,7 @@ def paged_attention_rocm(
         num_seqs,
         num_kv_heads,
         num_heads,
-        max_num_partitions,
+        max_num_blocks_per_seq,
         max_context_len,
         q_stride,
         kv_block_stride,
@@ -184,16 +197,17 @@ def paged_attention_rocm(
         num_seqs,
         num_kv_heads,
         num_heads,
-        max_num_partitions,
+        max_num_blocks_per_seq,
         q_stride,
         kv_block_stride,
         kv_head_stride,
         alibi_slopes_ptr,
-        k_scale,
-        v_scale,
+        ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
+        ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
         fp8_out_scale_ptr,
         stream,
     )
+    return out
 
 
 if __name__ == "__main__":
@@ -209,6 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--out_dtype", type=str, required=True)
     parser.add_argument("--block_size", type=int, required=True)
     parser.add_argument("--alibi_enabled", type=str, required=True)
+    parser.add_argument("--mtp", type=int, default=1)
     parser.add_argument("--folder", type=str, default=None)
     args = parser.parse_args()
     compile(**vars(args))

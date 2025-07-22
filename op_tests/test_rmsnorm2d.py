@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
+import argparse
 
 
 @perftest()
@@ -27,14 +28,22 @@ def run_torch(input, weight, eps, residual=None):
 
 
 @perftest()
-def run_ck(input, weight, eps, residual=None):
+def run_ck(input, weight, eps, residual=None, use_model_sensitive_rmsnorm=0):
     if residual is None:
         residual_out = None
-        output = aiter.rms_norm(input, weight, eps)
+        output = aiter.rms_norm(input, weight, eps, use_model_sensitive_rmsnorm)
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
-        aiter.rmsnorm2d_fwd_with_add(output, input, residual, residual_out, weight, eps)
+        aiter.rmsnorm2d_fwd_with_add(
+            output,
+            input,
+            residual,
+            residual_out,
+            weight,
+            eps,
+            use_model_sensitive_rmsnorm,
+        )
     return output, residual_out
 
 
@@ -74,13 +83,19 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, 1e-5, residual=res)
-    (c, res_c, *_), avg_c = run_cu(input, weight, 1e-5, residual=res)
+    (c, res_c, *_), avg_c = run_ck(
+        input, weight, 1e-5, residual=res, use_model_sensitive_rmsnorm=1
+    )
+    (d, res_d, *_), avg_d = run_cu(input, weight, 1e-5, residual=res)
 
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
-    checkAllclose(res_a, res_b, msg="ck res check")
-    # checkAllclose(a, c, atol=0.03, msg='cu')
-    # checkAllclose(res_a, res_c, atol=0.01, msg='cu res check')
+    checkAllclose(res_a, res_b, msg="ck res check (NO_SPECIFIC_MODEL)")
+
+    checkAllclose(a, c, atol=0.03, msg=msg)
+    checkAllclose(res_a, res_c, msg="ck res check (T5_MODEL_LIKE)")
+    # checkAllclose(a, d, atol=0.03, msg='cu')
+    # checkAllclose(res_a, res_d, atol=0.01, msg='cu res check')
 
 
 # for dtype in [dtypes.fp16, dtypes.bf16]:
@@ -88,8 +103,55 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_rmsnorm2d(dtype, m, n)
 
+l_dtype = ["fp16", "bf16"]
+l_m = [1, 2, 4, 8, 16, 32, 64, 128, 256]
+l_n = [4096, 8192, 16384, 32768, 65536]
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-m",
+    "--m",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""M of mnk.
+    e.g.: -m 32""",
+)
+parser.add_argument(
+    "-n",
+    "--n",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""N of mnk.
+    e.g.: -n 1024""",
+)
+
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.m is not None:
+    l_m = [args.m]
+if args.n is not None:
+    l_n = [args.n]
+
 print("\nstart fuse add test")
-for dtype in [dtypes.fp16, dtypes.bf16]:
-    for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-        for n in [4096, 8192, 16384, 32768, 65536]:
+for dtype in l_dtype:
+    for m in l_m:
+        for n in l_n:
             test_rmsnorm2d_fuseAdd(dtype, m, n)

@@ -7,6 +7,7 @@ from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 import random
 import itertools
+import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -377,28 +378,128 @@ qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
-list_dtype = [(dtypes.bf16, dtypes.bf16)]
-list_ctx_len = [21, 64, 256, 512, 1200, 3200, 5200, 8192][:]
-list_batch_size = [1, 3, 5, 16, 32, 64, 128, 256][:]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)][:]
+list_dtype = ["bf16"]
+l_kv_dtype = ["bf16"]
+list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-k",
+    "--kv_lora_rank",
+    type=int,
+    default=512,
+    help="""kv lora rank.
+    e.g.: -k 512""",
+)
+parser.add_argument(
+    "-qn",
+    "--qk_nope_head_dim",
+    type=int,
+    default=128,
+    help="""qk nope head dim.
+    e.g.: -qn 128""",
+)
+parser.add_argument(
+    "-qr",
+    "--qk_rope_head_dim",
+    type=int,
+    default=64,
+    help="""qk rope head dim.
+    e.g.: -qr 64""",
+)
+parser.add_argument(
+    "-vh",
+    "--v_head_dim",
+    type=int,
+    default=128,
+    help="""v head dim.
+    e.g.: -vh 128""",
+)
+parser.add_argument(
+    "-blk",
+    "--block_size",
+    type=int,
+    default=1,
+    help="""Block size.
+    e.g.: -blk 1""",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=["bf16"],
+    nargs="*",
+    default=["bf16"],
+    help="""Data type of Q.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-kvd",
+    "--kv_dtype",
+    type=str,
+    choices=["bf16"],
+    nargs="*",
+    default=["bf16"],
+    help="""Data type of KV.
+    e.g.: -kvd bf16""",
+)
+parser.add_argument(
+    "-c",
+    "--ctxLen",
+    type=int,
+    nargs="*",
+    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+    help="""Context length.
+    e.g.: -c 21""",
+)
+parser.add_argument(
+    "-b",
+    "--batchSize",
+    type=int,
+    nargs="*",
+    default=[1, 3, 5, 16, 32, 64, 128, 256],
+    help="""Batch size.
+    e.g.: -b 16""",
+)
+parser.add_argument(
+    "-n",
+    "--nhead",
+    type=dtypes.str2tuple,
+    choices=list_nhead,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Number of heads.
+    e.g.: -n 16,1""",
+)
+
 import pandas as pd
+
+args = parser.parse_args()
+list_dtype = [dtypes.d_dtypes[key] for key in args.dtype]
+l_kv_dtype = [dtypes.d_dtypes[key] for key in args.kv_dtype]
+if args.nhead is not None:
+    list_nhead = [args.nhead]
 
 for nhead, mtp in list_nhead:
     df = []
-    for (dtype, kvtype), ctx_len, batch_size in itertools.product(
-        list_dtype, list_ctx_len, list_batch_size
+    for dtype, kvtype, ctx_len, batch_size in itertools.product(
+        list_dtype, l_kv_dtype, args.ctxLen, args.batchSize
     ):
         ret = test_mla(
             ctx_len,
             batch_size,
             nhead,
-            kv_lora_rank,
-            qk_nope_head_dim,
-            qk_rope_head_dim,
-            v_head_dim,
+            args.kv_lora_rank,
+            args.qk_nope_head_dim,
+            args.qk_rope_head_dim,
+            args.v_head_dim,
             dtype,
             kvtype,
-            block_size,
+            args.block_size,
             varlen=False,
             mtp=mtp,
         )

@@ -32,6 +32,7 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <vector>
 #include "communication_asm.h"
 #include "hip_float8.h"
+#include "ck_tile/core.hpp"
 
 #define CUDACHECK(cmd)                                              \
   do                                                                \
@@ -45,7 +46,7 @@ typedef __hip_bfloat16 nv_bfloat16;
     }                                                               \
   } while (0)
 
-namespace vllm
+namespace aiter
 {
 
   constexpr int kMaxBlocks = 64;
@@ -402,6 +403,38 @@ namespace vllm
     }
   }
 
+  // fp8 quant all-reduce code start
+  template <typename T>
+  struct Fp16Filter
+  {
+    static const bool value = false;
+  };
+
+  template <>
+  struct Fp16Filter<half>
+  {
+    static const bool value = true;
+  };
+
+  template <typename T>
+  struct Bf16Filter
+  {
+    static const bool value = false;
+  };
+
+  template <>
+  struct Bf16Filter<__hip_bfloat16>
+  {
+    static const bool value = true;
+  };
+
+  // dtypes only support half and bf16 now
+#define FP16_FILTER \
+  typename std::enable_if<Fp16Filter<T>::value, void>::type* = nullptr
+
+#define BF16_FILTER \
+  typename std::enable_if<Bf16Filter<T>::value, void>::type* = nullptr
+
   template <template <typename> class functor, typename T, int size>
   DINLINE T packReduce(array_t<T, size> pack)
   {
@@ -442,7 +475,20 @@ namespace vllm
   {
     DINLINE half operator() (half a, half b)
     {
-      return downcast_s<half>(upcast_s(a) + upcast_s(b));
+      float a_fp32 = ck_tile::type_convert<float>(a);
+      float b_fp32 = ck_tile::type_convert<float>(b);
+      return ck_tile::type_convert<half>(a_fp32 + b_fp32);
+    }
+  };
+
+  template <>
+  struct AddFunctor<__hip_bfloat16>
+  {
+    DINLINE __hip_bfloat16 operator() (__hip_bfloat16 a, __hip_bfloat16 b)
+    {
+      float a_fp32 = ck_tile::type_convert<float>(a);
+      float b_fp32 = ck_tile::type_convert<float>(b);
+      return ck_tile::type_convert<__hip_bfloat16>(a_fp32 + b_fp32);
     }
   };
 
@@ -455,13 +501,21 @@ namespace vllm
     }
   };
 
+  /*
+   * todo:
+   * static_cast may not safe
+   * need a convert dtype template function defined by myself
+   *
+   * done
+   * */
   template <typename T>
   struct AbsMaxFunctor
   {
     DINLINE T operator() (T a, T b)
     {
-      a = a > static_cast<T>(0) ? a : static_cast<T>(0) - a;
-      b = b > static_cast<T>(0) ? b : static_cast<T>(0) - b;
+      T zero_t = ck_tile::type_convert<T>(0.0f);
+      a = a > zero_t ? a : zero_t - a;
+      b = b > zero_t ? b : zero_t - b;
       return max(a, b);
     }
   };
@@ -479,101 +533,152 @@ namespace vllm
     return val;
   }
 
-  DINLINE hip_fp8 quantHalfToFp8(half input, half scale_functor)
+  // the following code only support bf16 and fp16
+  template <typename T>
+  DINLINE hip_fp8 elementQuant(T input, T scale_functor)
   {
-    return hip_fp8(__half2float(input) / __half2float(scale_functor));
+    return hip_fp8(ck_tile::type_convert<float>(input) / ck_tile::type_convert<float>(scale_functor));
   }
 
-  DINLINE half dequantFp8ToHalf(hip_fp8 input, half scale_functor)
+  template <typename T>
+  DINLINE T elementDequant(hip_fp8 input, T scale_functor)
   {
-    return __float2half(float(input) * __half2float(scale_functor));
+    return ck_tile::type_convert<T>(float(input) * ck_tile::type_convert<float>(scale_functor));
   }
 
-  template <typename input_type, typename output_type, int size>
-  DINLINE array_t<output_type, size> packQuant(array_t<input_type, size> inp_pack, input_type scale_functor)
-  {}
-
-  template <>
-  DINLINE array_t<hip_fp8, 8> packQuant<half, hip_fp8, 8>(array_t<half, 8> inp_pack, half scale_functor)
+  template <typename T, int pack_size>
+  DINLINE array_t<hip_fp8, pack_size> packQuant(array_t<T, pack_size> inp_pack, T scale_functor)
   {
-    array_t<hip_fp8, 8> tmp;
+    array_t<hip_fp8, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < pack_size; ++i)
     {
-      tmp.data[i] = quantHalfToFp8(inp_pack.data[i], scale_functor);
+      ret_val.data[i] = elementQuant<T>(inp_pack.data[i], scale_functor);
     }
-   return tmp;
+    return ret_val;
   }
 
-  template <typename input_type, typename output_type, int size>
-  DINLINE array_t<output_type, size> packDequant(array_t<input_type, size> inp_pack, output_type scale_functor)
-  {}
-
-  template <>
-  DINLINE array_t<half, 8> packDequant<hip_fp8, half, 8>(array_t<hip_fp8, 8> inp_pack, half scale_functor)
+  template <typename T, int pack_size>
+  DINLINE array_t<T, pack_size> packDequant(array_t<hip_fp8, pack_size> inp_pack, T scale_functor)
   {
-    array_t<half, 8> tmp;
+    array_t<T, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < pack_size; ++i)
     {
-      tmp.data[i] = dequantFp8ToHalf(inp_pack.data[i], scale_functor);
+      ret_val.data[i] = elementDequant<T>(inp_pack.data[i], scale_functor);
     }
-    return tmp;
+    return ret_val;
   }
 
-  /*
-   * quant half to fp8 in allgather
-   * */
-  #define QUANT_SCALE 128
-  __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceFp8Naive(RankData* _dp, RankSignals sg, Signal* self_sg, half* __restrict__ result, int rank, int size)
+  // convert fp16 pack to fp32 pack
+  template <typename T, int pack_size>
+  DINLINE array_t<float, pack_size> packUpcast(array_t<T, pack_size> inp)
   {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int part_size = size / 8;
-    using half_vec8 = typename packed_t<half>::P;
-    using fp8_vec8 = array_t<hip_fp8, 8>;
-    const half_vec8* ptrs[8];
-    fp8_vec8* tmps[8];
+    array_t<float, pack_size> ret_val;
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < pack_size; ++i)
     {
-      ptrs[i] = (const half_vec8*)_dp->ptrs[i];
-      tmps[i] = get_tmp_buf<fp8_vec8>(sg.signals[i]);
+      ret_val.data[i] = ck_tile::type_convert<float>(inp.data[i]);
     }
-    start_sync<8>(sg, self_sg, rank);
+    return ret_val;
+  }
 
-    // read HBM
-    half_vec8 half8_reg = ptrs[rank][rank * part_size / 8 + index];
+  template <typename T, int pack_size>
+  DINLINE array_t<T, pack_size> packDowncast(array_t<float, pack_size> inp)
+  {
+    array_t<T, pack_size> ret_val;
 #pragma unroll
-    for (int i = 1; i < 8; ++i)
+    for (int i = 0; i < pack_size; ++i)
     {
-      int device_id = (rank + i) % 8;
-      half8_reg = packOp<AddFunctor, half, 8>(half8_reg, ptrs[device_id][rank * part_size / 8 + index]);
+      ret_val.data[i] = ck_tile::type_convert<T>(inp.data[i]);
     }
+    return ret_val;
+  }
 
-    // write HBM
-    *(reinterpret_cast<half_vec8*>(&result[rank * part_size]) + index) = half8_reg;
-
-    // quant
-    half thread_max = packReduce<AbsMaxFunctor, half, 8>(half8_reg);
-    thread_max = warpReduce<MaxFunctor, half, QUANT_SCALE / 8>(thread_max);
-    half scale_factor = __float2half(__half2float(thread_max) / 240.0f);
-
-    // save quant rslt
-    tmps[rank][index] = packQuant<half, hip_fp8, 8>(half8_reg, scale_factor);
-    *(reinterpret_cast<half*>(&tmps[rank][part_size / 8]) + index) = scale_factor;
-    end_sync<8>(sg, self_sg, rank);
-
+  template <typename T, int pack_size, int ngpus>
+  DINLINE array_t<T, pack_size> multiGPUPackReduce(const array_t<T, pack_size> *ptrs[ngpus], int index)
+  {
+    array_t<float, pack_size> ret_val = packUpcast<T, pack_size>(ptrs[0][index]);
 #pragma unroll
-    for (int i = 1; i < 8; ++i)
+    for (int gpu_id = 1; gpu_id < ngpus; ++gpu_id)
     {
-      int device_id = (rank + i) % 8;
+      array_t<float, pack_size> tmp = packUpcast<T, pack_size>(ptrs[gpu_id][index]);
+#pragma unroll
+      for (int i = 0; i < pack_size; ++i)
+      {
+        ret_val.data[i] += tmp.data[i];
+      }
+    }
+    return packDowncast<T, pack_size>(ret_val);
+  }
 
-      // load quant rslt
-      scale_factor = *(reinterpret_cast<half*>(&tmps[device_id][part_size / 8]) + index);
-      half8_reg = packDequant<hip_fp8, half, 8>(tmps[device_id][index], scale_factor);
+  // bf16 quant fp8 kernel function
+  // too slow need to be optimized
+  // fp16
+  template <typename T, int quant_scale, int pack_size, int ngpus, FP16_FILTER>
+  __global__ __forceinline__ void __launch_bounds__(512, 1) allReduceQuantFp8(RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size)
+  {
+    float FP8_UPBOUND = ck_tile::type_convert<float>(ck_tile::numeric<ck_tile::fp8_t>::max());
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    using inp_pack = array_t<T, pack_size>;
+    using fp8_pack = array_t<hip_fp8, pack_size>;
+    int part = size / ngpus;
+    int start = rank * part;
+    int end = rank == ngpus - 1 ? size : start + part;
+    int largest_part = part + size % ngpus;
+    const inp_pack *ptrs[ngpus];
+    fp8_pack *tmps[ngpus];
+#pragma unroll
+    for (int i = 0; i < ngpus; i++)
+    {
+      int target = (rank + i) % ngpus;
+      ptrs[i] = (const inp_pack *)_dp->ptrs[target];
+      tmps[i] = get_tmp_buf<fp8_pack>(sg.signals[target]);
+    }
+    auto tmp_out = tmps[0];
+    start_sync<ngpus>(sg, self_sg, rank);
+    // stage 1: reduce scatter
+    for (int idx = start + tid; idx < end; idx += stride)
+    {
+      inp_pack half8_reg;
+      // half8_reg = packed_reduce<P, ngpus, A>(ptrs, idx);
+      half8_reg = multiGPUPackReduce<T, pack_size, ngpus>(ptrs, idx);
+      ((inp_pack *)result)[idx] = half8_reg;
+      // quant
+      T thread_max = packReduce<AbsMaxFunctor, T, pack_size>(half8_reg);
+      thread_max = warpReduce<MaxFunctor, T, quant_scale / pack_size>(thread_max);
+      T scale_factor = ck_tile::type_convert<T>(ck_tile::type_convert<float>(thread_max) / FP8_UPBOUND);
+      tmp_out[idx - start] = packQuant<T, pack_size>(half8_reg, scale_factor);
+      if (threadIdx.x % (quant_scale / pack_size) == 0)
+      {
+        *(reinterpret_cast<T*>(&tmp_out[part]) + (idx - start) / (quant_scale / pack_size)) = scale_factor;
+      }
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
 
-      // write HBM
-      *(reinterpret_cast<half_vec8*>(&result[device_id * part_size]) + index) = half8_reg;
+    // stage 2: all-gather
+    for (int idx = tid; idx < largest_part; idx += stride)
+    {
+#pragma unroll
+      for (int i = 1; i < ngpus; i++)
+      {
+        int gather_from_rank = ((rank + i) % ngpus);
+        if (gather_from_rank == ngpus - 1 || idx < part)
+        {
+          // dequant
+          T scale_factor;
+          int factor_stride = quant_scale / pack_size;
+          if (threadIdx.x % factor_stride == 0)
+          {
+            scale_factor = *(reinterpret_cast<T*>(&tmps[i][part]) + idx / factor_stride);
+          }
+          scale_factor = __shfl(scale_factor, (threadIdx.x / factor_stride) * factor_stride);
+          inp_pack half8_reg = packDequant<T, pack_size>(tmps[i][idx], scale_factor);
+          int dst_idx = gather_from_rank * part + idx;
+          ((inp_pack *)result)[dst_idx] = half8_reg;
+        }
+      }
     }
   }
 
@@ -783,13 +888,65 @@ namespace vllm
     /*
      * call all reduce fp8 kernel
      * case size in single gpu: (128, 8192)
+     * support 8 gpu only
+     * should make ngpus as template param
+     * should quant scale match hidden_dim when hidden_dim less than 128?
      * */
-    void runFp8QuantKernel(cudaStream_t stream, half* input, half* output, int size)
+    template <typename T>
+    void runFp8QuantKernel(cudaStream_t stream, T* input, T* output, int size)
     {
       RankData *ptrs = get_buffer_RD(stream, input);
-      dim3 block(512);
-      dim3 grid(size / (512 * 8 * 8));
-      allReduceFp8Naive<<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size);
+      // 32 block 512 thread or 64 block 256 thread
+#define DISPATHC_UNIT(pack_size, quant_scale, ngpus)                                                                             \
+  do                                                                                                                             \
+  {                                                                                                                              \
+    case ngpus:                                                                                                                  \
+    {                                                                                                                            \
+      allReduceQuantFp8<T, quant_scale, pack_size, ngpus><<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, size); \
+      return ;                                                                                                                   \
+    }                                                                                                                            \
+  }while(0)
+
+#define DISPATCH_CALL(pack_size, block_size, quant_scale)                                \
+  do                                                                                     \
+  {                                                                                      \
+   block.x = block_size;                                                                 \
+    grid.x = min((16384 / block_size), (single_device_size / (pack_size * block_size))); \
+    size /= pack_size;                                                                   \
+    switch (world_size_)                                                                 \
+    {                                                                                    \
+      DISPATHC_UNIT(pack_size, quant_scale, 2);                                          \
+      DISPATHC_UNIT(pack_size, quant_scale, 4);                                          \
+      DISPATHC_UNIT(pack_size, quant_scale, 6);                                          \
+      DISPATHC_UNIT(pack_size, quant_scale, 8);                                          \
+    }                                                                                    \
+  } while(0)
+
+      int single_device_size = size / world_size_;
+      constexpr int max_thread_num = 512;
+      constexpr int max_pack_size = 8;
+      constexpr int max_elem_perblock = max_thread_num * max_pack_size;
+      dim3 grid, block;
+      if (single_device_size % 128 == 0)
+      {
+        DISPATCH_CALL(8, 256, 128);
+      }
+      else if (single_device_size % 64 == 0)
+      {
+        DISPATCH_CALL(8, 256, 64);
+      }
+      else if (single_device_size % 32 == 0)
+      {
+        DISPATCH_CALL(8, 256, 32);
+      }
+      else if (single_device_size % 16 == 0)
+      {
+        DISPATCH_CALL(8, 256, 16);
+      }
+      else // 512
+      {
+        DISPATCH_CALL(8, 256, 8);
+      }
     }
 
     /**
@@ -871,11 +1028,11 @@ namespace vllm
       CUDACHECK(cudaIpcCloseMemHandle(ptr));
     }
   }
-}; // namespace vllm
+}; // namespace aiter
 /**
  * To inspect PTX/SASS, copy paste this header file to compiler explorer and add
  a template instantiation:
- * template void vllm::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
+ * template void aiter::CustomAllreduce::allreduce<half>(cudaStream_t, half *,
  half *, int, int, int);
 */
-} // namespace vllm
+} // namespace aiter

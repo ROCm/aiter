@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.heuristics(
@@ -95,14 +96,16 @@ def _batched_gemm_bf16_kernel(
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
 
     # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
-    batch_id = batch_id.to(tl.int64)
-    stride_ab = stride_ab.to(tl.int64)
-    stride_bb = stride_bb.to(tl.int64)
-    stride_cb = stride_cb.to(tl.int64)
+    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
+    # See https://github.com/ROCm/aiter/pull/597 for rationale
+    batch_id = tl.cast(batch_id, tl.int64)
+    stride_ab = tl.cast(stride_ab, tl.int64)
+    stride_bb = tl.cast(stride_bb, tl.int64)
+    stride_cb = tl.cast(stride_cb, tl.int64)
 
     # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -160,6 +163,26 @@ def _batched_gemm_bf16_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(
+    M: int,
+    N: int,
+    K: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A16W16.json"
+        print(f"fpath={fpath}")
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    if M + N >= 4096:
+        return _get_config._config_dict["large"]
+    else:
+        return _get_config._config_dict["small"]
+
+
 def batched_gemm_bf16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -167,6 +190,7 @@ def batched_gemm_bf16(
     dtype: Optional[torch.dtype] = torch.bfloat16,
     splitK: Optional[int] = None,
     YQ: Optional[torch.Tensor] = None,
+    config: Optional[dict] = None,
 ):
     """
     Computes the matmul YQ[i] = XQ[i] x WQ[i]T for every i in a given batch and optionally adds a bias to each result.
@@ -206,25 +230,12 @@ def batched_gemm_bf16(
     if YQ is None:
         YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
 
-    if (M + N) >= 4096:
-        BLOCK_SIZE_M = 256
-        BLOCK_SIZE_N = 256
-        BLOCK_SIZE_K = 64
-        GROUP_SIZE_M = 4
-    else:
-        BLOCK_SIZE_M = 128
-        BLOCK_SIZE_N = 128
-        BLOCK_SIZE_K = 32
-        GROUP_SIZE_M = 1
+    if config is None:
+        config = _get_config(M, N, K)
 
-    waves_per_eu = 2
-    matrix_instr_nonkdim = 16
-    num_warps = 8
-    num_stages = 2
-
-    grid = (
+    grid = lambda META: (  # noqa: E731
         B,
-        triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),
+        triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
     _batched_gemm_bf16_kernel[grid](
@@ -246,13 +257,7 @@ def batched_gemm_bf16(
         YQ.stride(2),
         bias.stride(0) if has_bias else 0,
         has_bias,
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
-        BLOCK_SIZE_K,
-        GROUP_SIZE_M,
-        waves_per_eu=waves_per_eu,
-        matrix_instr_nonkdim=matrix_instr_nonkdim,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        **config,
     )
+
     return YQ

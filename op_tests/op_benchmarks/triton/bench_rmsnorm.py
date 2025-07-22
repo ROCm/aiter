@@ -4,20 +4,23 @@ import torch
 import triton
 from aiter.ops.triton.rmsnorm import rms_norm
 from op_tests.triton_tests.test_rmsnorm import generate_rmsnorm_inputs
-from utils.benchmark_utils import get_model_configs, get_available_models
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+)
 
 
 def model_benchmark_shapes(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models=args.model)
+    configs = get_model_configs(
+        config_path=config_file, models="llama3" if args.model is None else args.model
+    )
     M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
     shapes = []
     for M in M_list:
-        for _, config in configs.items():
-            num_heads = config["num_attention_heads"]
+        for model_name, config in configs.items():
             N = config["hidden_size"]
-
-            shapes.append((M, N))
+            shapes.append((model_name, M, N))
 
     return shapes
 
@@ -46,13 +49,8 @@ def run_benchmark(args):
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
 
-    x_names = ["M", "N"]
-    if args.model:
-        x_vals_list = model_benchmark_shapes(args)
-    elif args.shape:
-        x_vals_list = [args.shape]
-    else:
-        x_vals_list = get_x_vals()
+    x_names = ["model_name", "M", "N"]
+    x_vals_list = model_benchmark_shapes(args)
 
     if args.metric == "time":
         ylabel = "Time (ms)"
@@ -76,7 +74,7 @@ def run_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_rmsnorm(M, N, metric, provider):
+    def bench_rmsnorm(M, N, metric, provider, model_name=None):
         c_dtype = torch.bfloat16
         x, w = generate_rmsnorm_inputs(M, N, c_dtype)
 
@@ -85,7 +83,8 @@ def run_benchmark(args):
         mem_write = M * N * x.element_size()  # output
         mem = mem_read + mem_write
 
-        ms = triton.testing.do_bench(lambda: rms_norm(x, w), warmup=25, rep=100)
+        eps = 1e-6
+        ms = triton.testing.do_bench(lambda: rms_norm(x, w, eps), warmup=25, rep=100)
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
@@ -96,7 +95,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_rmsnorm.run(save_path=".", print_data=True)
+    bench_rmsnorm.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -137,6 +136,9 @@ def parse_args():
         choices=["time", "bandwidth"],
         default="bandwidth",
         help="metric to plot",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args

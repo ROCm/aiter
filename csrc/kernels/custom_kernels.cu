@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/all.h>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <stdexcept>
-#include <algorithm>
 #include "hip_compat.h"
+#include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <stdexcept>
+#include <torch/all.h>
 
 #define AT_DISPATCH_FP8_CASE(enum_type, ...) \
     AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, fp8_t, __VA_ARGS__)
@@ -28,6 +28,10 @@
 #define __HIP__MI300__
 #endif
 
+#if defined(__HIPCC__) && (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
+#define __HIP__MI350_MI300_MI250__
+#endif
+
 #if defined(NDEBUG)
 #undef NDEBUG
 #include <assert.h>
@@ -36,6 +40,8 @@
 #else
 #define UNREACHABLE_CODE assert(false);
 #endif
+
+namespace aiter {
 
 template <typename T>
 struct scalar
@@ -423,7 +429,7 @@ void LLGemm1(void* in_a,
     });
 }
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
@@ -660,7 +666,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     }
 }
 
-#else // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wv_splitk_small_fp16_bf16_kernel(const int K,
@@ -674,9 +680,9 @@ __global__ void wv_splitk_small_fp16_bf16_kernel(const int K,
     UNREACHABLE_CODE
 }
 
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
@@ -925,7 +931,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_sml_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_sml_(const int K,
                                  const int M,
@@ -937,9 +943,9 @@ __global__ void wvSplitK_hf_sml_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 // This version targets cases where A[] marginally exceeds LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
@@ -1232,7 +1238,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_(const int K,
     }
 }
 
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_(const int K,
                              const int M,
@@ -1244,9 +1250,9 @@ __global__ void wvSplitK_hf_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 // This version targets big A[] cases, where it is much larger than LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
@@ -1598,7 +1604,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitK_hf_big_(const int K,
         }
     }
 }
-#else  // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_big_(const int K,
                                  const int M,
@@ -1610,7 +1616,7 @@ __global__ void wvSplitK_hf_big_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
 int mindiv(int N, int div1, int div2)
 {
@@ -1765,7 +1771,7 @@ void wvSplitK_(void* in_a,
     });
 }
 
-#if defined(__HIP__MI300__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -1963,7 +1969,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI300__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -1985,9 +1991,9 @@ __global__ void wvSplitKQ_hf_sml_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
-#if defined(__HIP__MI300__) // TODO: Add NAVI support
+#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -2181,7 +2187,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI300__) TODO: Add NAVI support
+#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -2203,7 +2209,7 @@ __global__ void wvSplitKQ_hf_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI300__) TODO: Add NAVI support
+#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
 
 void wvSplitKQ_(void* in_a,
                 void* in_b,
@@ -2473,3 +2479,4 @@ void MMGPUKernel(float* in_a,
     if(cudaSuccess != err)
         throw std::runtime_error("CUDA kernel failed : " + std::to_string(err));
 }
+} // namespace aiter

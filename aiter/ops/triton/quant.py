@@ -7,18 +7,14 @@ import torch
 
 
 @triton.jit
-def _static_per_tensor_fp8_quant_kernel(
-    qx_ptr: torch.Tensor,
-    x_in_ptr: torch.Tensor,
-    scale_in_ptr: torch.Tensor,
+def _static_per_tensor_quant_fp8_i8_kernel(
+    qx_ptr,
+    x_in_ptr,
+    scale_in_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     pid = tl.program_id(axis=0)
     tl.assume(pid > 0)
     tl.assume(x_in_stride_r > 0)
@@ -35,18 +31,26 @@ def _static_per_tensor_fp8_quant_kernel(
     tl.store(qx_ptr + offs, qx, mask=mask)
 
 
-def static_per_tensor_fp8_quant(
+def static_per_tensor_quant_fp8_i8(
     qx: torch.Tensor, x_in: torch.Tensor, scale_in: torch.Tensor
 ):
     """
-    #TODO: Add Doc
+    Quantizes tensor using the provided scale to int8 or fp8
+
+    Parameters:
+    - qx: Output tensor of same shape as x_in. Must be fp8 or int8 dtype and allocated by the caller
+    - x_in: Input tensor of shape (M, N).
+    - scale_in: Input Scale tensor of shape (1,) and dtype fp32
+
+    Returns:
+    - qx: Quantized output values.
     """
     assert scale_in.numel() == 1  # only single scale value
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
-    _static_per_tensor_fp8_quant_kernel[grid](
+    grid = lambda meta: (rows,)  # noqa: E731
+    _static_per_tensor_quant_fp8_i8_kernel[grid](
         qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
 
@@ -54,18 +58,14 @@ def static_per_tensor_fp8_quant(
 
 
 @triton.jit
-def _dynamic_per_tensor_fp8_quant_kernel(
-    x_in_ptr: torch.Tensor,
-    scale_out_ptr: torch.Tensor,
+def _dynamic_per_tensor_quant_fp8_i8_kernel(
+    x_in_ptr,
+    scale_out_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
-    FP8_MAX: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     pid = tl.program_id(axis=0)
     tl.assume(pid > 0)
     tl.assume(x_in_stride_r > 0)
@@ -75,29 +75,43 @@ def _dynamic_per_tensor_fp8_quant_kernel(
     x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
 
     m = tl.max(tl.abs(x))
-    tl.atomic_max(scale_out_ptr, m / FP8_MAX, sem="relaxed")
+    tl.atomic_max(scale_out_ptr, m / DTYPE_MAX, sem="relaxed")
 
 
-def dynamic_per_tensor_fp8_quant(
+def dynamic_per_tensor_quant_fp8_i8(
     qx: torch.Tensor, x_in: torch.Tensor, scale_out: torch.Tensor
 ):
     """
-    #TODO: Add Doc
+    Calculate per tensor scale and then uses the scale to quantize input tensor to fp8 or int8
+
+    Parameters:
+    - x_in: Input tensor of shape (M, N).
+    - qx: Output tensor of same shape as x_in. Must be fp8 or int8 dtype and allocated by the caller
+    - scale_out: Output scale tensor of shape (1,), dtype fp32 and allocated by the caller
+
+    Returns:
+    - qx: Quantized output values of shape (M, N) with dtype fp8 or int8
+    - scale_out: Single scale value of shape (1,)
     """
+
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
-    _dynamic_per_tensor_fp8_quant_kernel[grid](
+    grid = lambda meta: (rows,)  # noqa: E731
+    _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
         x_in,
         scale_out,
         cols,
         x_in.stride(0),
         NUM_COL_POW2=NUM_COL_POW2,
-        FP8_MAX=torch.finfo(qx.dtype).max,
+        DTYPE_MAX=(
+            torch.finfo(qx.dtype).max
+            if torch.is_floating_point(qx)
+            else torch.iinfo(qx.dtype).max
+        ),
     )
 
-    _static_per_tensor_fp8_quant_kernel[grid](
+    _static_per_tensor_quant_fp8_i8_kernel[grid](
         qx, x_in, scale_out, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
 
@@ -105,19 +119,15 @@ def dynamic_per_tensor_fp8_quant(
 
 
 @triton.jit
-def _dynamic_per_token_fp8_quant_kernel(
-    qx_ptr: torch.Tensor,
-    scale_out_ptr: torch.Tensor,
-    x_in_ptr: torch.Tensor,
+def _dynamic_per_token_quant_fp8_i8_kernel(
+    qx_ptr,
+    scale_out_ptr,
+    x_in_ptr,
     cols: int,
     x_in_stride_r: int,
     NUM_COL_POW2: tl.constexpr,
-    FP8_MAX: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
 ):
-    """
-    #TODO: Add Doc
-    """
-
     pid = tl.program_id(axis=0)
     tl.assume(pid > 0)
     tl.assume(x_in_stride_r > 0)
@@ -127,7 +137,7 @@ def _dynamic_per_token_fp8_quant_kernel(
     x = tl.load(x_in_ptr + offs, mask=mask, cache_modifier=".cg")
 
     m = tl.max(tl.abs(x), axis=-1)
-    scale_out = m / FP8_MAX
+    scale_out = m.to(tl.float32) / DTYPE_MAX
     scale_recip = 1 / scale_out
 
     qx = x * scale_recip
@@ -139,31 +149,116 @@ def _dynamic_per_token_fp8_quant_kernel(
     tl.store(qx_ptr + offs, qx, mask=mask, cache_modifier=".cs")
 
 
-def dynamic_per_token_fp8_quant(
+def dynamic_per_token_quant_fp8_i8(
     qx: torch.Tensor,
     x_in: torch.Tensor,
     scale_out: torch.Tensor,
-    quant_dtype=torch.float8_e4m3fnuz,
-    dtypeMax: torch.Tensor = torch.finfo(torch.float8_e4m3fnuz).max,
 ):
     """
-    #TODO: Add doc
+    Quantizes tensor using the provided scale
+
+    Parameters:
+    - x_in: Input tensor of shape (M, N).
+    - dtype_max: Optional parameter which specifies the max value of the dtype of x_in.
+    - qx: Output tensor of same shape as x_in. Must be fp8 dtype and allocated by the caller
+    - scale_out: Output scale tensor of shape (M,) dtype fp32 and allocated by the caller
+
+    Returns:
+    - qx: Quantized output values.
+    - scale_out: Scale tensor of shape (M, )
     """
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)
-    _dynamic_per_token_fp8_quant_kernel[grid](
+    grid = lambda meta: (rows,)  # noqa: E731
+    _dynamic_per_token_quant_fp8_i8_kernel[grid](
         qx,
         scale_out,
         x_in,
         cols,
         x_in.stride(0),
         NUM_COL_POW2=NUM_COL_POW2,
-        FP8_MAX=dtypeMax,
+        DTYPE_MAX=(
+            torch.finfo(qx.dtype).max
+            if torch.is_floating_point(qx)
+            else torch.iinfo(qx.dtype).max
+        ),
     )
 
     return qx, scale_out
+
+
+@triton.jit
+def _mxfp4_quant_op(
+    x,
+    BLOCK_SIZE_N,
+    BLOCK_SIZE_M,
+    MXFP4_QUANT_BLOCK_SIZE,
+):
+    """
+    Converts given x (in fp32) to mxfp4 format.
+    x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
+
+    """
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+
+    # blockscale_e8m0
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
+
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+
+    # Compute quantized x
+    qx = x * quant_scale
+
+    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
+    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
+    #   Zeros: S000 -> +/-0
+    #   Denormal Numbers: S001 -> +/- 0.5
+    #   Normal Numbers:
+    #           S010 -> +/- 1.0
+    #           S011 -> +/- 1.5
+    #           S100 -> +/- 2.0
+    #           S101 -> +/- 3.0
+    #           S110 -> +/- 4.0
+    #           S111 -> +/- 6.0
+    qx = qx.to(tl.uint32, bitcast=True)
+
+    # Extract sign, exponents and mantissa fields from FP32
+    s = qx & 0x80000000
+    e = (qx >> 23) & 0xFF
+    m = qx & 0x7FFFFF
+    E8_BIAS: tl.constexpr = 127
+    E2_BIAS: tl.constexpr = 1
+
+    # Denormal numbers
+    # If exponent is less than 127, then it's a denormal number
+    # See above, for denormal number mantissa is always 1 and we set bit 1 of mantissa
+    adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
+    m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
+    # For normal numbers, bias is changed from 127 to 1, and for subnormals, we keep exponent as 0.
+    # Note: E8_BIAS - E2_BIAS = 126, so for normals we subtract that.
+    e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
+
+    # Combine sign, exponent, and mantissa, while saturating
+    # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
+    e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
+    e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
+    e2m1_value = tl.reshape(
+        e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
+    )
+    evens, odds = tl.split(e2m1_value)
+    x_fp4 = evens | (odds << 4)
+    x_fp4 = x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
+
+    return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
 
 @triton.heuristics(
@@ -203,6 +298,8 @@ def _dynamic_mxfp4_quant_kernel(
     stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
     stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
 
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+
     for pid_n in tl.range(start_n, min(start_n + NUM_ITER, N), num_stages=NUM_STAGES):
         x_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
@@ -216,63 +313,9 @@ def _dynamic_mxfp4_quant_kernel(
                 tl.float32
             )
 
-        NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-        x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
-        # Calculate scale
-        amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-        amax = amax.to(tl.int32, bitcast=True)
-        amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-        amax = amax.to(tl.float32, bitcast=True)
-        scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-        scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
-
-        # blockscale_e8m0
-        bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
-
-        quant_scale = tl.exp2(-scale_e8m0_unbiased)
-
-        # Compute quantized x
-        qx = x * quant_scale
-
-        # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-        # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-        #   Zeros: S000 -> +/-0
-        #   Denormal Numbers: S001 -> +/- 0.5
-        #   Normal Numbers:
-        #           S010 -> +/- 1.0
-        #           S011 -> +/- 1.5
-        #           S100 -> +/- 2.0
-        #           S101 -> +/- 3.0
-        #           S110 -> +/- 4.0
-        #           S111 -> +/- 6.0
-        qx = qx.to(tl.uint32, bitcast=True)
-
-        # Extract sign, exponents and mantissa fields from FP32
-        s = qx & 0x80000000
-        e = (qx >> 23) & 0xFF
-        m = qx & 0x7FFFFF
-        E8_BIAS: tl.constexpr = 127
-        E2_BIAS: tl.constexpr = 1
-
-        # Denormal numbers
-        # If exponent is less than 127, then it's a denormal number
-        # See above, for denormal number mantissa is always 1 and we set bit 1 of mantissa
-        adjusted_exponents = tl.core.sub(E8_BIAS, e + 1, sanitize_overflow=False)
-        m = tl.where(e < E8_BIAS, (0x400000 | (m >> 1)) >> adjusted_exponents, m)
-        # For normal numbers, bias is changed from 127 to 1, and for subnormals, we keep exponent as 0.
-        # Note: E8_BIAS - E2_BIAS = 126, so for normals we subtract that.
-        e = tl.maximum(e, E8_BIAS - E2_BIAS) - (E8_BIAS - E2_BIAS)
-
-        # Combine sign, exponent, and mantissa, while saturating
-        # rounding nearest with tie breaking up by adding +1 to one bit right of the LSB, then shift right
-        e2m1_tmp = tl.minimum((((e << 2) | (m >> 21)) + 1) >> 1, 0x7)
-        e2m1_value = ((s >> 28) | e2m1_tmp).to(tl.uint8)
-        e2m1_value = tl.reshape(
-            e2m1_value, [BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE // 2, 2]
+        out_tensor, bs_e8m0 = _mxfp4_quant_op(
+            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
-        evens, odds = tl.split(e2m1_value)
-        out_tensor = evens | (odds << 4)
-        out_tensor = out_tensor.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
@@ -290,14 +333,14 @@ def _dynamic_mxfp4_quant_kernel(
         bs_offs_n = pid_n * NUM_QUANT_BLOCKS + tl.arange(0, NUM_QUANT_BLOCKS)
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
         if EVEN_M_N:
-            tl.store(bs_ptr + bs_offs, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS))
+            tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
             bs_mask = (bs_offs_m < M)[:, None] & (
                 bs_offs_n < (N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
             )[None, :]
             tl.store(
                 bs_ptr + bs_offs,
-                bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS),
+                bs_e8m0,
                 mask=bs_mask,
             )
 

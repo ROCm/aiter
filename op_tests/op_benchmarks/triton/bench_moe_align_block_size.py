@@ -1,5 +1,8 @@
 import triton
-from utils.benchmark_utils import get_model_configs, get_available_models
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    get_available_models,
+)
 from op_tests.triton_tests.test_moe_align_block_size import input_helper
 import torch
 import argparse
@@ -92,14 +95,12 @@ def run_benchmark(custom, args):
         # Return exactly one scalar depending on which metric is active
         if metric == "time":
             return ms
-        # elif metric == 'tflops':
-        #     return tflops
         elif metric == "bandwidth":
             return bandwidth
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_align_block_size.run(save_path=".", print_data=True)
+    bench_moe_align_block_size.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -119,9 +120,12 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-M", type=int, default=0, help="M dimension")
     parser.add_argument("-block_size", type=int, default=128)
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 

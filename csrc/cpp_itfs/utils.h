@@ -7,13 +7,18 @@
 #include "lru_cache.h"
 #include <memory>
 #include <cstdlib>
-#include <openssl/md5.h>
+#include <openssl/evp.h>
 #include <iomanip>
 #include <fmt/ranges.h>
+#include <fmt/args.h>
 #include <mutex>
+#include <cctype>
+#include <algorithm>
 
 
 namespace aiter{
+
+#define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
 
 static std::once_flag init_libs_lru_cache, init_func_names_lru_cache, init_root_dir_flag;
 
@@ -42,6 +47,7 @@ __inline__ std::filesystem::path get_root_dir(){
     return aiter_root_dir;
 }
 
+<<<<<<< HEAD
 template<typename T>
 class NamedArg {
     const char* name;
@@ -55,18 +61,10 @@ public:
         return ss.str();
     }
 };
+=======
+>>>>>>> origin/main
 
-#define NAMED(x) NamedArg(#x, x)
-
-template<typename... Args>
-__inline__ std::string generate_cmd(std::string& cmd, Args... args) {
-    std::stringstream ss;
-    ss << cmd << " ";
-    ((ss << NAMED(args).toString() << " "), ...);
-    return ss.str();
-}
-
-__inline__ std::pair<std::string, int> execute_cmd(const std::string& cmd) {
+__inline__ const std::pair<std::string, int> execute_cmd(const std::string& cmd) {
     std::array<char, 128> buffer;
     std::string result;
     int exitCode;
@@ -88,6 +86,19 @@ __inline__ std::pair<std::string, int> execute_cmd(const std::string& cmd) {
 
     exitCode = pclose(pipe);
     return {result, exitCode};
+}
+
+
+__inline__ const std::pair<std::string, int> execute_cmd(const std::string& cmd, const std::list<std::string>& args) {
+    fmt::dynamic_format_arg_store<fmt::format_context> store;
+    for (const auto& arg : args) {
+        store.push_back(arg);
+    }
+    std::string cmd_with_args = fmt::vformat(cmd, store);
+    std::cout << cmd_with_args << std::endl;
+    const auto results = execute_cmd(cmd_with_args);
+    std::cout << results.first << std::endl;
+    return results;
 }
 
 
@@ -145,26 +156,28 @@ __inline__ void run_lib(std::string func_name, std::string folder, Args... args)
 
 
 __inline__ std::string hash_signature(const std::string& signature) {
-    unsigned char digest[MD5_DIGEST_LENGTH];
-    MD5_CTX context;
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len;
 
-    // Compute the MD5 hash
-    MD5_Init(&context);
-    MD5_Update(&context, signature.data(), signature.size());
-    MD5_Final(digest, &context);
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_md5(), NULL);
+    EVP_DigestUpdate(ctx, signature.data(), signature.size());
+    EVP_DigestFinal_ex(ctx, digest, &digest_len);
+    EVP_MD_CTX_free(ctx);
 
-    // Convert binary digest to hex string
     std::stringstream ss;
-    for (int i = 0; i < MD5_DIGEST_LENGTH; i++) {
+    for (unsigned int i = 0; i < digest_len; i++) {
         ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(digest[i]);
     }
     return ss.str();
 }
 
 
-__inline__ std::string get_default_func_name(const std::string& md_name, std::vector<std::string>& args) {
+__inline__ std::string get_default_func_name(const std::string& md_name, std::list<std::string>& args) {
     std::call_once(init_func_names_lru_cache, init_lru_cache<std::string, std::string>, func_names);
     std::string args_str = fmt::format("{}", fmt::join(args, "_"));
+    std::transform(args_str.begin(), args_str.end(), args_str.begin(),
+    [](unsigned char c){ return std::tolower(c); });
     auto func_name = func_names->get(args_str);
     if(!func_name){
         func_names->put(args_str, fmt::format("{}_{}", md_name, hash_signature(args_str)));
