@@ -194,7 +194,11 @@ def paged_attention_ragged(
         kv_seq_stride,
         torch.cuda.current_stream(),
     )
-    q_scale_ptr = ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)) if q_scale is not None else ctypes.POINTER(ctypes.c_float)()
+    q_scale_ptr = (
+        ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if q_scale is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
     func(
         out_ptr,
         workspace_buffer_ptr,
