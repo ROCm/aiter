@@ -126,7 +126,7 @@ def input_helper(
         # (8, 16, 0, 16324, 128, 0, 128), # this one fails, numeric precision is likely the issue
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float32])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("ref_attn_impl", ["normal", "absorb"])
 def test_op_fwd(
@@ -214,10 +214,10 @@ def test_op_fwd(
         seq_len = end_q - start_q
 
         # Calculate attention scores for prefix tokens
-        scores_prefix = torch.einsum("qhc,khc->hqk", q, k_prefix)  # .float()
+        scores_prefix = torch.einsum("qhc,khc->hqk", q.float(), k_prefix.float())  # .float()
 
         # Calculate attention scores for extend tokens
-        scores_extend = torch.einsum("qhc,khc->hqk", q, k_ext)  # .float()
+        scores_extend = torch.einsum("qhc,khc->hqk", q.float(), k_ext.float())  # .float()
 
         # Apply causal mask only to the extend part if needed
         if causal:
@@ -241,8 +241,8 @@ def test_op_fwd(
         p_extend = p_combined[:, :, prefix_len:]
 
         # Calculate output separately and combine
-        out_prefix = torch.einsum("hqk,khd->qhd", p_prefix, v_prefix)
-        out_extend = torch.einsum("hqk,khd->qhd", p_extend, v_ext)
+        out_prefix = torch.einsum("hqk,khd->qhd", p_prefix.to(dtype).float(), v_prefix.float())
+        out_extend = torch.einsum("hqk,khd->qhd", p_extend.to(dtype).float(), v_ext.float())
 
         ref_out[start_q:end_q] = out_prefix.to(dtype) + out_extend.to(dtype)
 
@@ -250,5 +250,5 @@ def test_op_fwd(
 
 
 if __name__ == "__main__":
-    test_op_fwd(1, 2, 1024, 1024, 256, 0, 256, torch.float32, "normal", False)
+    test_op_fwd(1, 2, 1024, 1024, 256, 0, 256, torch.bfloat16, "normal", False)
     test_op_fwd(3, 5, 110, 333, 18, 0, 17, torch.float32, "normal", True)
