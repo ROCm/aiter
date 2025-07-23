@@ -1,7 +1,7 @@
-#include <fmt/core.h>
 #include "pa_ragged.h"
-#include <vector>
 #include "../utils.h"
+#include <fmt/core.h>
+#include <vector>
 
 namespace aiter {
 
@@ -38,8 +38,8 @@ void paged_attention_ragged(std::optional<std::string> folder,
                             const std::string out_dtype,
                             const hipStream_t stream)
 {
-    const int gqa_ratio = num_heads / num_kv_heads;
-    const int npar_loops = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
+    const int gqa_ratio             = num_heads / num_kv_heads;
+    const int npar_loops            = DIVIDE_ROUND_UP(max_num_partitions, warpSize);
     const std::string alibi_enabled = alibi_slopes_ptr ? "true" : "false";
     std::list<std::string> args{std::to_string(gqa_ratio),
                                 std::to_string(head_size),
@@ -70,7 +70,8 @@ void paged_attention_ragged(std::optional<std::string> folder,
                                     --out_dtype={} \
                                     --block_size={} \
                                     --alibi_enabled={} \
-                                    --func_name={})", args);
+                                    --func_name={})",
+                    args);
     }
     run_lib(func_name,
             folder.value(),

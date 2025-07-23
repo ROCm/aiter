@@ -4,7 +4,7 @@
 from torch import Tensor, Generator
 from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx, get_cu_num
+from ..jit.utils.chip_info import get_gfx
 from ..utility import dtypes
 import torch
 

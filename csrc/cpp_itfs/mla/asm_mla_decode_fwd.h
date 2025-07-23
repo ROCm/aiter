@@ -1,7 +1,7 @@
 #pragma once
 
-#include <optional>
 #include <hip/hip_runtime.h>
+#include <optional>
 
 namespace aiter {
 /**
@@ -122,4 +122,4 @@ void asm_mla_decode_fwd(std::optional<std::string> folder,
                         const int num_kv_splits,
                         const int v_head_dim,
                         const hipStream_t stream);
-}
+} // namespace aiter

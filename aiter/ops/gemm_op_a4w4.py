@@ -7,7 +7,6 @@ from typing import Optional
 from aiter import logger
 from ..jit.core import (
     compile_ops,
-    AITER_ROOT_DIR,
 )
 from ..jit.utils.chip_info import get_cu_num
 import functools

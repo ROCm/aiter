@@ -1,6 +1,6 @@
-#include <fmt/core.h>
 #include "asm_mla_decode_fwd.h"
 #include "../utils.h"
+#include <fmt/core.h>
 
 namespace aiter {
 
@@ -46,11 +46,11 @@ void asm_mla_decode_fwd(std::optional<std::string> folder,
         throw std::invalid_argument("only support max_seqlen_q==1 when gqa_ratio==16");
     }
     std::list<std::string> args{std::to_string(gqa_ratio),
-                                  std::to_string(page_size),
-                                  q_dtype,
-                                  kv_dtype,
-                                  std::to_string(num_kv_splits),
-                                  std::to_string(v_head_dim)};
+                                std::to_string(page_size),
+                                q_dtype,
+                                kv_dtype,
+                                std::to_string(num_kv_splits),
+                                std::to_string(v_head_dim)};
     std::string func_name = get_default_func_name(MD_NAME, args);
     if(!folder)
     {

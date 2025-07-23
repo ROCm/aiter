@@ -16,7 +16,6 @@
 """
 
 import os
-import random
 from pathlib import Path
 
 import aiter
@@ -24,7 +23,6 @@ import pandas as pd
 from aiter import dtypes
 import torch
 import torch.nn.functional as F
-from aiter.test_common import perftest
 from aiter.utility.mp_tuner import mp_tuner
 from functools import lru_cache
 

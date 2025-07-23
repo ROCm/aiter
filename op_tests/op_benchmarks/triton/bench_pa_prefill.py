@@ -1,7 +1,6 @@
 import triton
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
-    get_available_models,
     get_dtype_bytes,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
@@ -10,7 +9,6 @@ from op_tests.triton_tests.test_pa_prefill import (
     STR_DTYPE_TO_TORCH_DTYPE,
 )
 import torch
-import argparse
 from aiter.ops.triton.pa_prefill import context_attention_fwd
 import sys
 import math

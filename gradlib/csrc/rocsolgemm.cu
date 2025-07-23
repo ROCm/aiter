@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 // #ifdef __gfx908__
 // // Uncomment ifdef and endif only if you need to undef the HIP_HALF ops below just for gfx908 and not for others
 // // below lines enable hip float to half conversion which are disabled by default in hip_fp16.h

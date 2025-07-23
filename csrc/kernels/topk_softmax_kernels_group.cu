@@ -16,28 +16,13 @@
 #include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include "dispatch_utils.h"
 #include "py_itfs_common.h"
+#include "hip_reduce.h"
 #include <hipcub/util_type.hpp>
 #include <hipcub/hipcub.hpp>
 
 #define WARP_SIZE 64
 namespace aiter
 {
-    template <typename T, typename F>
-    __device__ constexpr T wave_reduce(T local, F reduce_f)
-    {
-        constexpr int reduce_stage = 6; // 1<<6=64
-        T v_local = local;
-#pragma unroll
-        for (int i_stage = 0; i_stage < reduce_stage; i_stage++)
-        {
-            int src_lane = __lane_id() ^ (1 << i_stage);
-            int32_t v_remote_tmp =
-                __builtin_amdgcn_ds_bpermute(src_lane << 2, __builtin_bit_cast(int32_t, v_local));
-            T v_remote = __builtin_bit_cast(T, v_remote_tmp);
-            v_local = reduce_f(v_local, v_remote);
-        }
-        return v_local;
-    }
 
     __inline__ __device__ void warpReduceMax(float &val, int &idx)
     {
