@@ -4,7 +4,6 @@
 # user interface
 
 import torch
-from torch import Tensor
 from ..jit.core import (
     compile_ops,
 )
@@ -14,10 +13,10 @@ from ..jit.utils.chip_info import get_cu_num
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
 def biased_grouped_topk_hip(
-    gating_output: Tensor,
-    correction_bias: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_grp: int,
     need_renorm: bool,
@@ -27,9 +26,9 @@ def biased_grouped_topk_hip(
 
 @compile_ops("module_moe_asm")
 def grouped_topk(
-    gating_output: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
@@ -40,10 +39,10 @@ def grouped_topk(
 
 @compile_ops("module_moe_asm")
 def moe_fused_gate(
-    input: Tensor,
-    bias: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     topk: int,
@@ -53,10 +52,10 @@ def moe_fused_gate(
 
 
 def biased_grouped_topk(
-    gating_output: Tensor,
-    correction_bias: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
