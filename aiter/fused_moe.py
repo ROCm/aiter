@@ -10,6 +10,7 @@ import aiter
 from aiter import logger
 from aiter import ActivationType, QuantType, dtypes
 from aiter.utility import fp4_utils
+from aiter.jit.utils.chip_info import get_gfx
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
@@ -219,7 +220,7 @@ def fused_moe_1stage(
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
 ):
-    if quant_type == QuantType.No and ActivationType.Silu and not isG1U1:
+    if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
         aiter.fmoe(
             moe_buf,
@@ -318,6 +319,30 @@ def get_block_size_M(token, topk, expert, inter_dim):
 
 
 cfg_2stages = None
+# fmt: off
+fused_moe_1stage_dict = {
+    "gfx942":
+    {
+        # activation,                    quant_type,        dtype,    q_dtype_a,    q_dtype_w,   isG1U1,      API
+        (ActivationType.Silu,          QuantType.No,  dtypes.bf16,   dtypes.bf16,   dtypes.bf16,   False) : aiter.fmoe,
+        (ActivationType.Silu,          QuantType.No,  dtypes.fp16,   dtypes.fp16,   dtypes.fp16,   False) : aiter.fmoe,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,   dtypes.i4x2,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,    QuantType.per_1x32,  dtypes.bf16,  dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_1x128,  dtypes.bf16,    dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,   False) : aiter.fmoe_int8_g1u0,
+        (ActivationType.Gelu,   QuantType.per_Token,  dtypes.bf16,     dtypes.i8,     dtypes.i8,   False) : aiter.fmoe_int8_g1u0,
+    },
+    "gfx950":
+    {
+        (ActivationType.Silu,    QuantType.per_1x32,   dtypes.bf16,   dtypes.fp4x2,  dtypes.fp4x2,    True) : aiter.fmoe_g1u1,
+        (ActivationType.Silu,   QuantType.per_1x128,   dtypes.bf16,     dtypes.fp8,    dtypes.fp8,    True) : aiter.fmoe_fp8_blockscale_g1u1,
+    }
+}
+# fmt: on
 
 
 @dataclass
@@ -412,11 +437,16 @@ def get_2stage_cfgs(
             logger.warning(f"Fmoe tuning not support for {keys}")
 
     if cfg is None:
-        block_m = get_block_size_M(token, topk, expert, inter_dim)
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
-        run_1stage = token < 256
+        run_1stage = (
+            token < 256
+            and (activation, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
+            in fused_moe_1stage_dict[get_gfx()]
+            and not doweight_stage1
+        )
+        block_m = get_block_size_M(token, topk, expert, inter_dim) if not run_1stage else BLOCK_SIZE_M
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
