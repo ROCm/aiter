@@ -292,7 +292,10 @@
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmoe/codegen.py --output_dir {{}}'"
+        ]
     },
     "module_moe_ck2stages": {
         "srcs": [

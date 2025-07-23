@@ -94,6 +94,7 @@ def asm_moe(
             sorted_expert_ids,
             num_valid_ids,
             topk,
+            activation,
         )
     elif a16:
         # a16w8 smooth quant fmoe
