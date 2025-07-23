@@ -322,8 +322,12 @@ def parse_args():
         help="Use Neox style rotary positional embeddings over vanilla RoPE. This is incompatible with the --no-rope flag.",
     )
     parser.add_argument("--dtype", default="fp16")
-    parser.add_argument("--print_vgpr", action="store_true", default=False)
-
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Print VGPR usage for Triton kernels.",
+    )
     return parser.parse_args()
 
 
@@ -355,7 +359,7 @@ def main():
         print_vgpr(fun, plot_name)
         return 0
 
-    print(args)
+    # print(args)
 
     run_benchmark(args)
 

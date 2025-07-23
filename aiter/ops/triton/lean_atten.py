@@ -19,30 +19,100 @@ TO be added features:
 """
 
 import torch
-
+import functools
+import json
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from typing import Optional
 import triton
 import triton.language as tl
 
+LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 
-# Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
-def persistent_lean_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    Mp: torch.Tensor,
-    Lp: torch.Tensor,
-    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
-    locks: torch.Tensor,
-    batch_num_block_n: torch.Tensor,
-    total_programs: int,
-    BLOCK_M: int,
-    BLOCK_N: int,
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
     causal: bool,
     batch_size: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        sm_count = arch_info.get_num_sms()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    config = _get_config._config_dict["any"]
+    config["num_programs"] = config["waves_per_eu"] * sm_count
+    return (
+        config.copy()
+    )  # return a copy to avoid mutation of stored config in LRU cache
+
+
+def persistent_lean_attention(
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N
+    batch_size: int,
     sm_scale: torch.float16,
+    causal: bool = True,  # causal masking
+    config: Optional[dict] = None,
+):
+    """
+    Lean Attention kernel.
+    """
+    if config is None:
+        config = _get_config(causal=causal, batch_size=batch_size)
+    return _persistent_lean_attention(
+        q=q,
+        k=k,
+        v=v,
+        Mp=Mp,
+        Lp=Lp,
+        Op=Op,
+        locks=locks,
+        batch_num_block_n=batch_num_block_n,
+        total_programs=config["num_programs"],
+        BLOCK_M=config["BLOCK_SIZE_M"],
+        BLOCK_N=config["BLOCK_SIZE_N"],
+        causal=causal,
+        batch_size=batch_size,
+        sm_scale=sm_scale,
+        num_warps=config["num_warps"],
+        waves_per_eu=config["waves_per_eu"],
+        config=config,
+    )
+
+
+# Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
+def _persistent_lean_attention(
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d) -> stores partial output values
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N for each item in the batch
+    total_programs: int,  # number of thread blocks (CTAs) to launch -> eq to num SMs
+    BLOCK_M: int,  # seq_q tile size
+    BLOCK_N: int,  # seq_k tile size
+    causal: bool,  # causal masking
+    batch_size: int,
+    sm_scale: torch.float16,  # typically 1 / sqrt(d)
     num_warps: int,
     waves_per_eu: int,
+    config: Optional[dict] = None,
 ):
+    """
+    Inner kernel launching function.
+    """
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
     assert (
@@ -63,7 +133,7 @@ def persistent_lean_attention(
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
     H = q.shape[1]
 
-    qk_scale = sm_scale * 1.44269504
+    qk_scale = sm_scale * LOG_TWO_E
 
     (
         num_m_blocks,
@@ -140,8 +210,8 @@ def persistent_lean_attention(
         num_splits=num_splits,
         waves_per_eu=waves_per_eu,
         num_warps=num_warps,
-        num_stages=1,
         num_ctas=1,
+        **config,
     )
 
     print(f"la kernel {la_kernel.n_regs} registers used, {la_kernel.n_spills} spills")
@@ -160,7 +230,10 @@ def get_num_splits_and_buffer_sizes(
     BLOCK_N,
     num_SMs,
 ):
-    ##### Lean Atteion: Calculate Splits and Tile Sizes #####
+    """
+    Calculates parameters for Lean Attention (num CTAs, num_m_blocks, num_n_blocks, etc.))
+    """
+    ##### Lean Attention: Calculate Splits and Tile Sizes #####
     ## based on onnxruntime/contrib_ops/cuda/bert/lean_attention
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
@@ -472,7 +545,6 @@ def la_persistent(
         # initialize pointer to m and l
         m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
         l_cta = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        acc_cta = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
         # lean output tile epilogue
         if not host_block:
@@ -498,6 +570,9 @@ def la_persistent(
         if host_block:  # and finishing_block:
             # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
             # in a single CTA and so can directly store its results from LeanTile() in global memory without any reduction
+            acc_reshaped = tl.reshape(acc, (BLOCK_M, 2, HEAD_DIM // 2))
+            acc_permuted = tl.permute(acc_reshaped, (0, 2, 1))
+            acc0, acc1 = tl.split(acc_permuted)
 
             o_h_offs = (
                 q_idx * BLOCK_M * stride_om
@@ -538,29 +613,55 @@ def la_persistent(
                     offs_mplp = cta * BLOCK_M + offs_m
                     mp_ptrs = Mp + offs_mplp
                     lp_ptrs = Lp + offs_mplp
-                    op_h_offs = (
-                        cta * stride_oph
+                    op_ptrs0 = (
+                        Op
+                        + cta * stride_oph
                         + offs_m[:, None] * stride_opm
-                        + offs_k[None, :] * stride_opn
+                        + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_opn
                     )
-                    op_ptrs = Op + op_h_offs
+                    op_ptrs1 = (
+                        Op
+                        + cta * stride_oph
+                        + offs_m[:, None] * stride_opm
+                        + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2)
+                        * stride_opn
+                    )
 
                     m_cta = tl.load(mp_ptrs)
                     l_cta = tl.load(lp_ptrs)
-                    acc_cta = tl.load(op_ptrs)
+                    acc_cta0 = tl.load(op_ptrs0)
+                    acc_cta1 = tl.load(op_ptrs1)
 
                     # m_i is the host CTA's m, m_cta is other nonHost CTA's m
                     m_new = tl.maximum(m_cta, m_i)
                     alpha = tl.math.exp2(m_cta - m_new)
                     alpha1 = tl.math.exp2(m_i - m_new)
                     l_new = alpha * l_cta + alpha1 * l_i
-                    acc = acc_cta * alpha[:, None] + acc * alpha1[:, None]
+                    acc0 = acc_cta0 * alpha[:, None] + acc0 * alpha1[:, None]
+                    acc1 = acc_cta1 * alpha[:, None] + acc1 * alpha1[:, None]
                     # update m, l
                     m_i = m_new
                     l_i = l_new
             # host CTA write final result to memory
-            acc = acc / l_i[:, None]
-            tl.store(o_ptrs, acc.to(Out.type.element_ty))
+            o_ptrs0 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx * stride_oh
+                + offs_m[:, None] * stride_om
+                + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_on
+            )
+            o_ptrs1 = (
+                Out
+                + q_idx * BLOCK_M * stride_om
+                + tile_head_idx * stride_oh
+                + offs_m[:, None] * stride_om
+                + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on
+            )
+
+            acc0 = acc0 / l_i[:, None]
+            acc1 = acc1 / l_i[:, None]
+            tl.store(o_ptrs0, acc0.to(Out.type.element_ty))
+            tl.store(o_ptrs1, acc1.to(Out.type.element_ty))
 
         # update iter
         iter = iter + (local_iter_end - local_iter)

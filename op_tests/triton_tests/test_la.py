@@ -5,16 +5,19 @@ import sys
 import pytest
 import torch
 from typing import Union, List
-from aiter.ops.triton.lean_atten import persistent_lean_attention
+from aiter.ops.triton.lean_atten import _persistent_lean_attention
 
-def get_lean_attn_inputs(batch: int, 
-                         n_ctx_q: int, 
-                         n_ctx: List[int], 
-                         block_n: int,
-                         h: int, 
-                         d: int, 
-                         total_programs: int, 
-                         init_dtype: Union[torch.dtype, str],):
+
+def get_lean_attn_inputs(
+    batch: int,
+    n_ctx_q: int,
+    n_ctx: List[int],
+    block_n: int,
+    h: int,
+    d: int,
+    total_programs: int,
+    init_dtype: Union[torch.dtype, str],
+):
     assert batch == len(n_ctx)
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
@@ -55,6 +58,7 @@ def get_lean_attn_inputs(batch: int,
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
     return q, k, v, Mp, Lp, Op, locks, batch_num_block_n
+
 
 @pytest.mark.parametrize(
     "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
@@ -155,7 +159,7 @@ def test_persistent_lean_attention(
     )
 
     # Triton LeanAttention output
-    la_out = persistent_lean_attention(
+    la_out = _persistent_lean_attention(
         q,
         k,
         v,
@@ -234,7 +238,7 @@ def main():
     )
 
     # Triton LeanAttention output
-    la_out = persistent_lean_attention(
+    la_out = _persistent_lean_attention(
         q,
         k,
         v,
