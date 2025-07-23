@@ -49,7 +49,7 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-): ...
+) -> list[torch.Tensor]: ...
 
 
 def biased_grouped_topk(
