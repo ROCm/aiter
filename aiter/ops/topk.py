@@ -34,7 +34,7 @@ def grouped_topk(
     topk_group: int,
     need_renorm: bool,
     scoring_func: str = "softmax",
-    scale_factor: float = 1.0,
+    routed_scaling_factor: float = 1.0,
 ): ...
 
 
@@ -42,11 +42,13 @@ def grouped_topk(
 def moe_fused_gate(
     input: Tensor,
     bias: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
     num_expert_group: int,
     topk_group: int,
     topk: int,
     n_share_experts_fusion: int,
-    scale_factor: float = 1.0,
+    routed_scaling_factor: float = 1.0,
 ): ...
 
 
@@ -62,7 +64,7 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num >= cu_num * 16:
+    if token_num <= cu_num * 16 or not topk_ids.is_contiguous():
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -79,11 +81,13 @@ def biased_grouped_topk(
         return moe_fused_gate(
             gating_output,
             correction_bias,
+            topk_weights,
+            topk_ids,
             num_expert_group,
             topk_group,
             topk,
             n_share_experts_fusion=0,
-            scale_factor=routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
 
