@@ -74,12 +74,15 @@ class FMoeKernel
     private:
     hipModule_t module;
     hipFunction_t kernel_func;
-    uint32_t sub_GU = 512;
-    bool is_int4    = false;
+    uint32_t sub_GU             = 512;
+    bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
 
     public:
-    FMoeKernel(const char* name, const char* hsaco, uint32_t sub_GU = 512, uint32_t num_persistent_tgs = 0)
+    FMoeKernel(const char* name,
+               const char* hsaco,
+               uint32_t sub_GU             = 512,
+               uint32_t num_persistent_tgs = 0)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str()
@@ -87,7 +90,7 @@ class FMoeKernel
         HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
-        this->sub_GU = sub_GU;
+        this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
     };
 
@@ -178,8 +181,8 @@ class FMoeKernel
         args.eDQs      = stride_expert_DDQN;
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
-        args.total_tgs = this->num_persistent_tgs;
-        args.ps_deno   = ((inter_dim+sub_GU-1)/sub_GU);
+        args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
+        args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
 
         void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
                           &args,
@@ -190,18 +193,20 @@ class FMoeKernel
         int gdx;
         int gdy;
         int gdz;
-        if (this->num_persistent_tgs == 0)
+        if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
+           (args.total_tgs % args.ps_deno) == 0) // ps
+        {
+
+            bdx = 256;
+            gdx = this->num_persistent_tgs;
+            gdy = 1;
+            gdz = 1;
+        }
+        else // no-ps
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = sub_X_cnt;
-            gdz = 1;
-        }
-        else
-        {
-            bdx = 256;
-            gdx = this->num_persistent_tgs;
-            gdy = 1;
             gdz = 1;
         }
         // std::cout << "args.dim: " << args.dim << std::endl;
@@ -1010,12 +1015,15 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
         }
         else
         {
-            // static FMoeKernel impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256E",
+            // static FMoeKernel
+            // impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256E",
             //                                 "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256.co",
             //                                 256);
-            static FMoeKernel impl_256_novs("_ZN5aiter42fmoe_fp8_blockscale_g1u1_novs_subGU_256_psE",
-                                            "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256_ps.co",
-                                            256, num_cu);
+            static FMoeKernel impl_256_novs(
+                "_ZN5aiter42fmoe_fp8_blockscale_g1u1_novs_subGU_256_psE",
+                "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256_ps.co",
+                256,
+                num_cu);
             impl_ptr = &impl_256_novs;
         }
     }
