@@ -37,15 +37,18 @@ struct __attribute__((packed)) KernelArgs
     p3 _p17;
     void* ptr_QTP;
     p2 _p18;
+    void* ptr_STP;
+    p2 _p19;
 };
 
 void mla_decode_stage1_asm_fwd(
-    torch::Tensor& Q,                 //   [num_seqs, num_heads, head_size]
-    torch::Tensor& KV,                //   [num_page, page_size, num_kv_heads, head_size]
-    torch::Tensor& qo_indptr,         //   [batch_size+1]
-    torch::Tensor& kv_indptr,         //   [batch_size+1]
-    torch::Tensor& kv_page_indices,   //   [num_page_used]
-    torch::Tensor& kv_last_page_lens, //   [batch_size]
+    torch::Tensor& Q,                    //   [num_seqs, num_heads, head_size]
+    torch::Tensor& KV,                   //   [num_page, page_size, num_kv_heads, head_size]
+    torch::Tensor& qo_indptr,            //   [batch_size+1]
+    torch::Tensor& kv_indptr,            //   [batch_size+1]
+    torch::Tensor& kv_page_indices,      //   [num_page_used]
+    torch::Tensor& kv_last_page_lens,    //   [batch_size]
+    torch::Tensor& num_kv_splits_indptr, //   [batch_size+1]
     int max_seqlen_q,
     float softmax_scale,
     // following are output
@@ -78,6 +81,7 @@ void mla_decode_stage1_asm_fwd(
     args.scalar      = softmax_scale;
     args.s_MQA       = gqa_ratio * max_seqlen_q;
     args.s_kv_split  = kv_split;
+    args.ptr_STP     = num_kv_splits_indptr.data_ptr();
     args.s_Q_Bs      = stride_Q;
     args.s_Bs        = stride_Page;
     args.s_log2_plen = log2_page;
