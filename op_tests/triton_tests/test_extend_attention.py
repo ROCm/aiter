@@ -214,10 +214,14 @@ def test_op_fwd(
         seq_len = end_q - start_q
 
         # Calculate attention scores for prefix tokens
-        scores_prefix = torch.einsum("qhc,khc->hqk", q.float(), k_prefix.float())  # .float()
+        scores_prefix = torch.einsum(
+            "qhc,khc->hqk", q.float(), k_prefix.float()
+        )  # .float()
 
         # Calculate attention scores for extend tokens
-        scores_extend = torch.einsum("qhc,khc->hqk", q.float(), k_ext.float())  # .float()
+        scores_extend = torch.einsum(
+            "qhc,khc->hqk", q.float(), k_ext.float()
+        )  # .float()
 
         # Apply causal mask only to the extend part if needed
         if causal:
@@ -241,8 +245,12 @@ def test_op_fwd(
         p_extend = p_combined[:, :, prefix_len:]
 
         # Calculate output separately and combine
-        out_prefix = torch.einsum("hqk,khd->qhd", p_prefix.to(dtype).float(), v_prefix.float())
-        out_extend = torch.einsum("hqk,khd->qhd", p_extend.to(dtype).float(), v_ext.float())
+        out_prefix = torch.einsum(
+            "hqk,khd->qhd", p_prefix.to(dtype).float(), v_prefix.float()
+        )
+        out_extend = torch.einsum(
+            "hqk,khd->qhd", p_extend.to(dtype).float(), v_ext.float()
+        )
 
         ref_out[start_q:end_q] = out_prefix.to(dtype) + out_extend.to(dtype)
 
