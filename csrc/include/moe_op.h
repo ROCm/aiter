@@ -106,8 +106,8 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
                    torch::Tensor& fc1_scale,         // [expert, 1, hidden_dim]
                    torch::Tensor& fc2_scale,         // [expert, 1, dim]
                    torch::Tensor& fc1_smooth_scale,  // [expert, 1, hidden_dim]
-                   torch::Tensor& fc2_smooth_scale   // [expert, 1, hidden_dim]
-);
+                   torch::Tensor& fc2_smooth_scale,  // [expert, 1, hidden_dim]
+                   ActivationType activation);
 
 void fmoe_fp8_blockscale_g1u1(
     torch::Tensor& out,                                           // [token_cnt, dim]

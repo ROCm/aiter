@@ -1,5 +1,5 @@
 knl_name,knl_file,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n
-_ZN5aiter44fmoe_fp16_blockscaleFp8_g1u1_gelu_1tg_32x256E,fmoe_fp16_blockscaleFp8_g1u1_gelu_1tg_32x256.co,0,1,0,1,0,32,256
+_ZN5aiter50fmoe_fp16_blockscaleFp8_g1u1_vs_gelu_1tg_ps_32x256E,fmoe_fp16_blockscaleFp8_g1u1_vs_gelu_1tg_ps_32x256.co,0,1,0,1,1,32,256
+_ZN5aiter47fmoe_fp16_blockscaleFp8_g1u1_vs_gelu_1tg_32x256E,fmoe_fp16_blockscaleFp8_g1u1_vs_gelu_1tg_32x256.co,0,1,0,1,0,32,256
 _ZN5aiter52fmoe_fp16_blockscaleFp8_g1u1_novs_gelu_1tg_ps_32x256E,fmoe_fp16_blockscaleFp8_g1u1_novs_gelu_1tg_ps_32x256.co,0,0,0,1,1,32,256
-_ZN5aiter47fmoe_fp16_blockscaleFp8_g1u1_gelu_1tg_ps_32x256E,fmoe_fp16_blockscaleFp8_g1u1_gelu_1tg_ps_32x256.co,0,1,0,1,1,32,256
 _ZN5aiter49fmoe_fp16_blockscaleFp8_g1u1_novs_gelu_1tg_32x256E,fmoe_fp16_blockscaleFp8_g1u1_novs_gelu_1tg_32x256.co,0,0,0,1,0,32,256

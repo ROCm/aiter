@@ -143,6 +143,7 @@ def fmoe_g1u1_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
+    activation: ActivationType = ActivationType.Silu,
 ): ...
 
 

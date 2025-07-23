@@ -113,6 +113,7 @@ def asm_moe(
                 fc2_scale,
                 fc1_smooth_scale,
                 fc2_smooth_scale,
+                activation,
             )
         elif w1.dtype == dtypes.i8 and inter_dim == w1.shape[1]:
             aiter.fmoe_int8_g1u0_a16(

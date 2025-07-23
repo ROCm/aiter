@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "aiter_hip_common.h"
+#include "asm_fmoe_configs.hpp"
 #include "moe_op.h"
 #include "py_itfs_common.h"
 #include <ATen/cuda/CUDAContext.h>
@@ -8,6 +9,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <torch/all.h>
+#include <tuple>
 
 struct __attribute__((packed)) KernelArgs
 {
@@ -240,6 +242,79 @@ class FMoeKernel
         }
     };
 };
+
+FMoeKernel* get_heuristic_kernel(int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0)
+{
+    FMoeKernel* impl_ptr        = nullptr;
+    uint32_t num_cu             = get_num_cu_func();
+    uint32_t empty_cu           = num_cu;
+    uint32_t tg_num             = 0;
+    uint32_t num_persistent_tgs = 0;
+    uint32_t round              = 0xffffffff;
+    std::string selectedKl      = "";
+    int vskip                   = 0;
+    static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+
+    const char* vs_env_value = std::getenv("USE_VSKIP");
+    if(vs_env_value != nullptr && std::string(vs_env_value) == "1")
+        vskip = 1;
+
+    for(const auto& el : *cfgs)
+    {
+        const auto& cfg = el.second;
+        if(cfg.vskip == vskip && cfg.smf == smf)
+        {
+            printf("found xxxxxxxxxxxxxxxxxxxxx kl");
+            if((inter_dim % cfg.subGU_n) == 0)
+            {
+                tg_num = inter_dim / cfg.subGU_n *
+                         sub_X_cnt; // hom many thread_groups are needed to handel inter_dim
+                uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
+                if(local_round < round || // fewer round is better
+                   (local_round == round &&
+                    (empty_cu > (local_round * num_cu - tg_num) || // fewer empty_cu is better
+                     (empty_cu == (local_round * num_cu - tg_num) &&
+                      cfg.ps == 1)))) // prefer PS kernel
+                {
+                    round      = local_round;
+                    empty_cu   = local_round * num_cu - tg_num;
+                    selectedKl = el.first;
+                    if(cfg.ps == 1)
+                        num_persistent_tgs = cfg.tg_num_perCU * num_cu;
+                    else
+                        num_persistent_tgs = 0;
+                }
+            }
+        }
+    }
+    TORCH_CHECK(selectedKl != "",
+                __func__,
+                ": No suitable kernel found for inter_dim: ",
+                inter_dim,
+                ", sub_X_cnt: ",
+                sub_X_cnt,
+                ", smf: ",
+                smf,
+                ", vskip: ",
+                vskip);
+    printf("1111111111111111111111111, %s\n", selectedKl.c_str());
+    auto it = cfgs->find(selectedKl);
+    if(it != cfgs->end())
+    {
+        const auto& cfg     = it->second;
+        const char* name    = cfg.name.c_str();
+        const char* co_name = cfg.co_name.c_str();
+        auto result         = impl_ptr_map.emplace(name, nullptr);
+        if(result.second)
+            result.first->second =
+                std::make_unique<FMoeKernel>(name, co_name, cfg.subGU_n, num_persistent_tgs);
+        impl_ptr = result.first->second.get();
+    }
+    else
+        TORCH_CHECK(false, __func__, " not find kernel " + selectedKl);
+    return impl_ptr;
+}
+
 int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& available_tiles)
 {
     // int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
@@ -283,21 +358,32 @@ void fmoe(torch::Tensor& out,               // [token_cnt, dim]
           torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
           torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
           torch::Tensor& num_valid_ids,     // [1]
-          uint32_t topk                     //
-)
+          uint32_t topk,                    //
+          ActivationType activation)
 {
     // g1u0
     FMoeKernel* impl_ptr = nullptr;
-    if(input.dtype() == at::ScalarType::Half)
+    CFG* config_map      = nullptr;
+    if(input.dtype() == at::ScalarType::Half) // fp16
     {
-        static FMoeKernel impl_f16("fmoe_kernel_func", "fmoe_f16.co");
-        impl_ptr = &impl_f16;
+        if(activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_noquant_g1u0_silu;
+        else if(activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_noquant_g1u0_gelu;
+        else
+            TORCH_CHECK(false, __func__, ": unsupport current activation type:");
     }
-    else if(input.dtype() == at::ScalarType::BFloat16)
+    else if(input.dtype() == at::ScalarType::BFloat16) // bf16
     {
-        static FMoeKernel impl_b16("fmoe_kernel_func", "fmoe_b16.co");
-        impl_ptr = &impl_b16;
+        if(activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_noquant_g1u0_silu;
+        else if(activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_noquant_g1u0_gelu;
+        else
+            TORCH_CHECK(false, __func__, ": unsupport current activation type");
     }
+    impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map);
+
     TORCH_CHECK(
         impl_ptr != nullptr, __func__, ": unsupport current input type:", input.scalar_type());
     impl_ptr->launch_kernel<uint16_t, uint16_t>(out,
@@ -908,75 +994,92 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
                    torch::Tensor& fc1_scale,         // [expert, 1, inter_dim]
                    torch::Tensor& fc2_scale,         // [expert, 1, dim]
                    torch::Tensor& fc1_smooth_scale,  // [expert, 1, dim]
-                   torch::Tensor& fc2_smooth_scale   // [expert, 1, inter_dim]
-)
+                   torch::Tensor& fc2_smooth_scale,  // [expert, 1, inter_dim]
+                   ActivationType activation)
 {
     FMoeKernel* impl_ptr = nullptr;
     int inter_dim        = down.size(2);
     int sub_X_cnt        = sorted_expert_ids.size(0);
 
-    if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
+    CFG* config_map = nullptr;
+    if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte) // int8
     {
-        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {320, 256});
-        if(selectedTile == 320)
-        {
-            static FMoeKernel impl_int8_320(
-                "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
-            impl_ptr = &impl_int8_320;
-        }
-        else if(selectedTile == 256)
-        {
-            static FMoeKernel impl_int8_256(
-                "fmoe_int8_g1u1_smf_subGU_256", "fmoe_int8_g1u1_smf_subGU_256.co", 256);
-            impl_ptr = &impl_int8_256;
-        }
+        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_pertokenInt8_g1u1_gelu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
-            TORCH_CHECK(false,
-                        __func__,
-                        "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
-                            ", which should be divisible by 320 or 256");
-    }
-    else if(gate.dtype() == torch_fp8)
-    {
-        int selectedTile =
-            get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface here
-        if(selectedTile == 512)
-        {
-            static FMoeKernel impl_fp8_512(
-                "fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
-            impl_ptr = &impl_fp8_512;
-        }
-        else if(selectedTile == 320)
-        {
-            static FMoeKernel impl_fp8_320(
-                "fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
-            impl_ptr = &impl_fp8_320;
-        }
-        else
-            TORCH_CHECK(false,
-                        __func__,
-                        "fp8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
-                            ", which should be divisible by 320 or 512");
-    }
-    else
-    {
-        TORCH_CHECK(false, __func__, " gate/down weight only supput Int8/Fp8!");
-    }
+            TORCH_CHECK(
+                false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
 
-    impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
-                                                     input,
-                                                     gate,
-                                                     down,
-                                                     sorted_token_ids,
-                                                     sorted_weights,
-                                                     sorted_expert_ids,
-                                                     num_valid_ids,
-                                                     topk,
-                                                     // quant args
-                                                     fc1_smooth_scale,
-                                                     fc1_scale,
-                                                     fc2_scale,
-                                                     fc2_smooth_scale);
+        impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map, 1);
+
+        //     int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {320, 256});
+        //     if(selectedTile == 320)
+        //     {
+        //         static FMoeKernel impl_int8_320(
+        //             "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
+        //         impl_ptr = &impl_int8_320;
+        //     }
+        //     else if(selectedTile == 256)
+        //     {
+        //         static FMoeKernel impl_int8_256(
+        //             "fmoe_int8_g1u1_smf_subGU_256", "fmoe_int8_g1u1_smf_subGU_256.co", 256);
+        //         impl_ptr = &impl_int8_256;
+        //     }
+        //     else
+        //         TORCH_CHECK(false,
+        //                     __func__,
+        //                     "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
+        //                         ", which should be divisible by 320 or 256");
+        // }
+        // else if(gate.dtype() == torch_fp8)
+        // {
+        //     int selectedTile =
+        //         get_heuristic_tile(inter_dim, sub_X_cnt, {512, 320}); // todo,add tune interface
+        //         here
+        //     if(selectedTile == 512)
+        //     {
+        //         static FMoeKernel impl_fp8_512(
+        //             "fmoe_fp8_g1u1_smf_subGU_512", "fmoe_fp8_g1u1_smf_subGU_512.co", 512);
+        //         impl_ptr = &impl_fp8_512;
+        //     }
+        //     else if(selectedTile == 320)
+        //     {
+        //         static FMoeKernel impl_fp8_320(
+        //             "fmoe_fp8_g1u1_smf_subGU_320", "fmoe_fp8_g1u1_smf_subGU_320.co", 320);
+        //         impl_ptr = &impl_fp8_320;
+        //     }
+        //     else
+        //         TORCH_CHECK(false,
+        //                     __func__,
+        //                     "fp8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
+        //                         ", which should be divisible by 320 or 512");
+        // }
+        // else
+        // {
+        //     TORCH_CHECK(false, __func__, " gate/down weight only supput Int8/Fp8!");
+        // }
+
+        impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
+                                                         input,
+                                                         gate,
+                                                         down,
+                                                         sorted_token_ids,
+                                                         sorted_weights,
+                                                         sorted_expert_ids,
+                                                         num_valid_ids,
+                                                         topk,
+                                                         // quant args
+                                                         fc1_smooth_scale,
+                                                         fc1_scale,
+                                                         fc2_scale,
+                                                         fc2_smooth_scale);
+    }
 }
 
 void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, dim]
