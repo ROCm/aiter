@@ -85,7 +85,7 @@ if find_aiter is not None:
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
-
+sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfx = get_gfx()

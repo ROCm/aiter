@@ -21,12 +21,13 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
-    c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_gemm_afp4wfp4_pre_quant_inputs(
+    c_dtype = (
+        torch.float32
+    )  # NOTE: test_gemm_afp4wfp4_pre_quant_atomic occasionally fails when c_dtype is set to bfloat16
+    x, w, _, w_scale, y = generate_gemm_afp4wfp4_pre_quant_inputs(
         M,
         N,
         K,
-        c_dtype,
         layout=layout,
         output=True,
     )
@@ -34,15 +35,12 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     flops = 2.0 * M * N * K
     # memory transfer
     mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
-    )
+    mem_read += w_scale.numel() * w_scale.element_size()
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: gemm_afp4wfp4_pre_quant(x, w, x_scale, w_scale, c_dtype, y),
+        lambda: gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
         warmup=25,
         rep=100,
     )
@@ -121,12 +119,6 @@ def run_shape_benchmark(args):
 def parse_args():
     parser = get_parser("MXFP4 x MXFP4 GEMM")
     parser = add_argparse_ff(parser)
-
-    parser.add_argument(
-        "--print_vgpr",
-        action="store_true",
-        help="Print VGPR usage for Triton kernels.",
-    )
     return get_ff_args(parser)
 
 

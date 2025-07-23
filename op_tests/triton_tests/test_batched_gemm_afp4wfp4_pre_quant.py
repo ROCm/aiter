@@ -25,10 +25,12 @@ def generate_batched_gemm_afp4wfp4_pre_quant_inputs(
         x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
         x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
     else:
-        x_low = torch.randint(0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_low = torch.randint(
+            0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda"
+        ).permute(0, 2, 1)
         x_high = torch.randint(
             0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda"
-        ).T
+        ).permute(0, 2, 1)
 
     x = x_low | x_high << 4
     x_scales = torch.randint(
@@ -48,10 +50,12 @@ def generate_batched_gemm_afp4wfp4_pre_quant_inputs(
         w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
         w_high = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
     else:
-        w_low = torch.randint(0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda").T
+        w_low = torch.randint(
+            0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda"
+        ).permute(0, 2, 1)
         w_high = torch.randint(
             0, 16, (B, K // 2, N), dtype=torch.uint8, device="cuda"
-        ).T
+        ).permute(0, 2, 1)
 
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.

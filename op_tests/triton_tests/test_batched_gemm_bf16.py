@@ -20,7 +20,8 @@ def generate_batched_gemm_a16w16_inputs(
     output: bool,
     layout: str = "TN",
 ):
-    dtype = str_to_torch_dtype[dtype]
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":
         x = torch.randint(-20, 20, (B, M, K), dtype=dtype).cuda()
     else:

@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    print_vgpr,
 )
 
 
@@ -151,6 +152,11 @@ def parse_args():
 
 def main():
     args, defaults = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        print_vgpr(fun, "GEMM")
+        return 0
     run_benchmark(args, defaults)
 
 

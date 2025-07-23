@@ -9,14 +9,15 @@ from ..jit.core import (
     compile_ops,
 )
 from ..utility import dtypes
+from ..jit.utils.chip_info import get_cu_num
 
 
-@compile_ops("module_moe_asm")
-def biased_grouped_topk(
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+@compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
+def biased_grouped_topk_hip(
+    gating_output: Tensor,
+    correction_bias: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
     num_expert_group: int,
     topk_grp: int,
     need_renorm: bool,
@@ -35,6 +36,55 @@ def grouped_topk(
     scoring_func: str = "softmax",
     scale_factor: float = 1.0,
 ): ...
+
+
+@compile_ops("module_moe_asm")
+def moe_fused_gate(
+    input: Tensor,
+    bias: Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    scale_factor: float = 1.0,
+): ...
+
+
+def biased_grouped_topk(
+    gating_output: Tensor,
+    correction_bias: Tensor,
+    topk_weights: Tensor,
+    topk_ids: Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    need_renorm: bool,
+    routed_scaling_factor: float = 1.0,  # mul to topk_weights
+):
+    token_num = gating_output.shape[0]
+    cu_num = get_cu_num()
+    if token_num >= cu_num * 16:
+        return biased_grouped_topk_hip(
+            gating_output,
+            correction_bias,
+            topk_weights,
+            topk_ids,
+            num_expert_group,
+            topk_group,
+            need_renorm,
+            routed_scaling_factor,
+        )
+    else:
+        topk = topk_ids.shape[1]
+        assert need_renorm, "Renormalization is required for moe_fused_gate."
+        return moe_fused_gate(
+            gating_output,
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            n_share_experts_fusion=0,
+            scale_factor=routed_scaling_factor,
+        )
 
 
 # this one copied from sglang

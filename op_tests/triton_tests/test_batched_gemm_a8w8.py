@@ -27,7 +27,8 @@ def generate_batched_gemm_a8w8_inputs(
         - x_scale: shape (B, M, 1)
         - w_scale: shape (B, 1, N)
     """
-
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":
         x = torch.randint(-20, 20, (B, M, K), dtype=torch.int8).cuda()
     else:
@@ -121,7 +122,6 @@ def get_x_vals():
 )
 def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
     dtype = str_to_torch_dtype[dtype]
-
     x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
         b, m, n, k, dtype, output
     )
