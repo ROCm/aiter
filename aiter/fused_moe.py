@@ -446,7 +446,11 @@ def get_2stage_cfgs(
             in fused_moe_1stage_dict[get_gfx()]
             and not doweight_stage1
         )
-        block_m = get_block_size_M(token, topk, expert, inter_dim) if not run_1stage else BLOCK_SIZE_M
+        block_m = (
+            get_block_size_M(token, topk, expert, inter_dim)
+            if not run_1stage
+            else BLOCK_SIZE_M
+        )
     else:
         block_m = cfg["block_m"]
         ksplit = cfg["ksplit"]
