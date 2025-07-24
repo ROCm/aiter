@@ -14,7 +14,7 @@ TO be added features:
 - Add GQA support
 - batch_size > 1 for prefill/causal=1
 - Misc
-    - N_CTX with non-integer number of BLOCK_N (pad zeros or add mask)
+    - N_CTX with non-integer number of BLOCK_SIZE_N (pad zeros or add mask)
     -
 """
 
@@ -29,7 +29,6 @@ import triton.language as tl
 
 LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 
-
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     causal: bool,
@@ -37,14 +36,12 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        sm_count = arch_info.get_num_sms()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
     config = _get_config._config_dict["any"]
-    config["num_programs"] = config["waves_per_eu"] * sm_count
     return (
         config.copy()
     )  # return a copy to avoid mutation of stored config in LRU cache
@@ -62,13 +59,15 @@ def persistent_lean_attention(
     batch_size: int,
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
-    config: Optional[dict] = None,
+    config: Optional[dict] = None, 
 ):
     """
     Lean Attention kernel.
     """
     if config is None:
         config = _get_config(causal=causal, batch_size=batch_size)
+    sm_count = arch_info.get_num_sms()
+
     return _persistent_lean_attention(
         q=q,
         k=k,
@@ -78,7 +77,7 @@ def persistent_lean_attention(
         Op=Op,
         locks=locks,
         batch_num_block_n=batch_num_block_n,
-        total_programs=config["num_programs"],
+        total_programs=sm_count,
         BLOCK_M=config["BLOCK_SIZE_M"],
         BLOCK_N=config["BLOCK_SIZE_N"],
         causal=causal,
@@ -108,7 +107,7 @@ def _persistent_lean_attention(
     sm_scale: torch.float16,  # typically 1 / sqrt(d)
     num_warps: int,
     waves_per_eu: int,
-    config: Optional[dict] = None,
+    config: dict = {},
 ):
     """
     Inner kernel launching function.
@@ -167,6 +166,12 @@ def _persistent_lean_attention(
 
     o = torch.empty_like(q, dtype=v.dtype)
 
+    config["num_splits"] = num_splits
+    config["waves_per_eu"] = waves_per_eu
+    config["num_warps"] = num_warps
+    config["BLOCK_SIZE_N"] = BLOCK_N
+    config["BLOCK_SIZE_M"] = BLOCK_M
+
     la_kernel = la_persistent[grid](
         False,
         0,
@@ -196,8 +201,6 @@ def _persistent_lean_attention(
         Op.stride(1),  # n_ctx_q
         Op.stride(2),  # head_dim
         HEAD_DIM=HEAD_DIM_K,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         MASKED_BLOCKS=MASKED_BLOCKS,
         batch_size=batch_size,
         causal=causal,
@@ -207,9 +210,6 @@ def _persistent_lean_attention(
         high_load_wgs=high_load_wgs,
         max_tiles_per_wg=max_tiles_per_wg,
         tiles_per_head=tiles_per_head,
-        num_splits=num_splits,
-        waves_per_eu=waves_per_eu,
-        num_warps=num_warps,
         num_ctas=1,
         **config,
     )
@@ -345,8 +345,8 @@ def la_persistent(
     stride_opm,  # n_ctx_q
     stride_opn,  # head_dim
     HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
     MASKED_BLOCKS: tl.constexpr,
     batch_size: tl.constexpr,
     causal: tl.constexpr,
@@ -432,8 +432,8 @@ def la_persistent(
         else:
             finishing_block = False
 
-        offs_m = tl.arange(0, BLOCK_M)
-        offs_n = tl.arange(0, BLOCK_N)
+        offs_m = tl.arange(0, BLOCK_SIZE_M)
+        offs_n = tl.arange(0, BLOCK_SIZE_N)
         offs_k = tl.arange(0, HEAD_DIM)
 
         if causal:
@@ -447,13 +447,13 @@ def la_persistent(
                 )  # Previous batch size
 
         k_offs = (
-            (b_seq_size + local_iter) * BLOCK_N * stride_kn
+            (b_seq_size + local_iter) * BLOCK_SIZE_N * stride_kn
             + tile_head_idx * stride_kh
             + offs_n[None, :] * stride_kn
             + offs_k[:, None] * stride_kk
         )
         v_offs = (
-            (b_seq_size + local_iter) * BLOCK_N * stride_vn
+            (b_seq_size + local_iter) * BLOCK_SIZE_N * stride_vn
             + tile_head_idx * stride_vh
             + offs_n[:, None] * stride_vn
             + offs_k[None, :] * stride_vk
@@ -469,7 +469,7 @@ def la_persistent(
         else:
             q_idx = tile_batch_idx
         q_offs = (
-            q_idx * BLOCK_M * stride_qm
+            q_idx * BLOCK_SIZE_M * stride_qm
             + tile_head_idx * stride_qh
             + offs_m[:, None] * stride_qm
             + offs_k[None, :] * stride_qk
@@ -477,9 +477,9 @@ def la_persistent(
         q_ptrs = Q + q_offs
         q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
-        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        m_i = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) + 1.0
+        acc = tl.zeros([BLOCK_SIZE_M, HEAD_DIM], dtype=tl.float32)
 
         q = tl.load(q_ptrs)
 
@@ -499,8 +499,8 @@ def la_persistent(
                     mask = offs_m[:, None] >= offs_n[None, :]
                     qk = tl.where(mask, qk, float("-inf"))
                 if l_iter == (tile_iter_end - tile_iter) - 1:
-                    mask = (offs_m[:, None] >= BLOCK_N) & (
-                        offs_n[None, :] <= (offs_m[:, None] - BLOCK_N)
+                    mask = (offs_m[:, None] >= BLOCK_SIZE_N) & (
+                        offs_n[None, :] <= (offs_m[:, None] - BLOCK_SIZE_N)
                     )
                     qk = tl.where(mask, qk, float("-inf"))
 
@@ -512,15 +512,15 @@ def la_persistent(
 
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk = qk - m_ij[:, None]
-            p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
+            p = tl.math.exp2(qk)  # p.shape = [BLOCK_SIZE_M, BLOCK_SIZE_N]
             # -- update output accumulator --
             alpha = tl.math.exp2(m_i - m_ij)
             acc = (
                 acc * alpha[:, None]
             )  # Scale each row of acc by the corresponding elements in alpha
-            # v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
+            # v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_SIZE_N, HEAD_DIM]
             v = tl.load(v_ptrs)
-            acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
+            acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_SIZE_M, HEAD_DIM]
             # -- update l_i
             l_ij = tl.sum(p, 1)  # rowsum(p)
             l_i = l_i * alpha + l_ij
@@ -528,29 +528,29 @@ def la_persistent(
             m_i = m_ij.to(m_i.dtype)
 
             if (
-                (l_iter == (tile_iter_end - tile_iter) - 1)
-                and (iter == tile_iter_end - 1)
+                ((l_iter == (tile_iter_end - tile_iter) - 1)
+                and (iter == tile_iter_end - 1))
                 and (MASKED_BLOCKS == 2)
             ):
-                mask1 = offs_m >= BLOCK_N
+                mask1 = offs_m >= BLOCK_SIZE_N
                 m_i = tl.where(mask1, m_i, float("-inf"))
                 l_i = tl.where(mask1, l_i, 1.0)
                 mask1 = mask1[:, None]
                 acc = tl.where(mask1, acc, 0.0)
 
             # update k/v pointer
-            v_ptrs += BLOCK_N * stride_vn
-            k_ptrs += BLOCK_N * stride_kn
+            v_ptrs += BLOCK_SIZE_N * stride_vn
+            k_ptrs += BLOCK_SIZE_N * stride_kn
 
         # initialize pointer to m and l
-        m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-        l_cta = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+        m_cta = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) - float("inf")
+        l_cta = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32) + 1.0
 
         # lean output tile epilogue
         if not host_block:
             # Update pointers of partial results Mp[cta], Lp[cta], Op[cta]
-            mp_ptrs = Mp + current_pid * BLOCK_M + offs_m
-            lp_ptrs = Lp + current_pid * BLOCK_M + offs_m
+            mp_ptrs = Mp + current_pid * BLOCK_SIZE_M + offs_m
+            lp_ptrs = Lp + current_pid * BLOCK_SIZE_M + offs_m
             op_ptrs = (
                 Op
                 + current_pid * stride_oph  # stride_oph is total_program dimension
@@ -570,12 +570,12 @@ def la_persistent(
         if host_block:  # and finishing_block:
             # A host block that is also a finishing block completes all the LeanTile iterations for its output tile
             # in a single CTA and so can directly store its results from LeanTile() in global memory without any reduction
-            acc_reshaped = tl.reshape(acc, (BLOCK_M, 2, HEAD_DIM // 2))
+            acc_reshaped = tl.reshape(acc, (BLOCK_SIZE_M, 2, HEAD_DIM // 2))
             acc_permuted = tl.permute(acc_reshaped, (0, 2, 1))
             acc0, acc1 = tl.split(acc_permuted)
 
             o_h_offs = (
-                q_idx * BLOCK_M * stride_om
+                q_idx * BLOCK_SIZE_M * stride_om
                 + tile_head_idx * stride_oh
                 + offs_m[:, None] * stride_om
                 + offs_k[None, :] * stride_on
@@ -610,7 +610,7 @@ def la_persistent(
                         pass
 
                     # Partial results are stored in [nonHost, Host-nonFinishing] layout
-                    offs_mplp = cta * BLOCK_M + offs_m
+                    offs_mplp = cta * BLOCK_SIZE_M + offs_m
                     mp_ptrs = Mp + offs_mplp
                     lp_ptrs = Lp + offs_mplp
                     op_ptrs0 = (
@@ -645,14 +645,14 @@ def la_persistent(
             # host CTA write final result to memory
             o_ptrs0 = (
                 Out
-                + q_idx * BLOCK_M * stride_om
+                + q_idx * BLOCK_SIZE_M * stride_om
                 + tile_head_idx * stride_oh
                 + offs_m[:, None] * stride_om
                 + tl.arange(0, HEAD_DIM // 2)[None, :] * stride_on
             )
             o_ptrs1 = (
                 Out
-                + q_idx * BLOCK_M * stride_om
+                + q_idx * BLOCK_SIZE_M * stride_om
                 + tile_head_idx * stride_oh
                 + offs_m[:, None] * stride_om
                 + (tl.arange(0, HEAD_DIM // 2)[None, :] + HEAD_DIM // 2) * stride_on

@@ -5,8 +5,8 @@ import sys
 import pytest
 import torch
 from typing import Union, List
-from aiter.ops.triton.lean_atten import _persistent_lean_attention
-
+from aiter.ops.triton.lean_atten import _persistent_lean_attention, persistent_lean_attention, _get_config
+import aiter.ops.triton.utils.arch_info as arch_info
 
 def get_lean_attn_inputs(
     batch: int,
@@ -207,6 +207,94 @@ def test_persistent_lean_attention(
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
+# NOTE: Tests where the workload < num_sms currently fail.
+# You can elicit this behavior by decreasing `h` and `n_ctx`.
+@pytest.mark.parametrize("batch", [1])
+@pytest.mark.parametrize("h", [64])
+@pytest.mark.parametrize("n_ctx_q", [32, 64])
+@pytest.mark.parametrize("n_ctx", [[65536]])
+@pytest.mark.parametrize("d", [64, 256])
+@pytest.mark.parametrize("causal", [(True), (False)])
+@pytest.mark.parametrize("init_dtype", [torch.float16])
+def test_persistent_lean_attention_outer(
+    batch,
+    h,
+    n_ctx_q,
+    n_ctx,
+    d,
+    init_dtype,
+    causal,
+):
+    torch.manual_seed(20)
+
+    sm_scale = 0.5
+    config = _get_config(
+        batch_size=batch,
+        causal=causal,
+    )
+    sm_count = arch_info.get_num_sms()
+
+    # Long seqlen (>512K) can hit memory access fault. Suspect compiler issue
+    # WA with shorter d and longer BLOCK_N
+    if any(item > 524288 for item in n_ctx):
+        config["BLOCK_SIZE_N"] = 256
+        d = 16
+
+    q, k, v, Mp, Lp, Op, locks, batch_num_block_n = get_lean_attn_inputs(
+        batch,
+        n_ctx_q,
+        n_ctx,
+        config["BLOCK_SIZE_N"],
+        h,
+        d,
+        sm_count,
+        init_dtype,
+    )
+
+    # Triton LeanAttention output
+    la_out = persistent_lean_attention(
+        q,
+        k,
+        v,
+        Mp,
+        Lp,
+        Op,
+        locks,
+        batch_num_block_n,
+        batch,
+        sm_scale,
+        causal=causal,
+        config=config,
+    )
+
+    # Calculate Pytorch refence output
+    ref_out = torch.empty_like(q, dtype=v.dtype)
+    start = 0
+    start_q = 0
+
+    for b in n_ctx:
+        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
+        qb_reshaped = qb.transpose(0, 1)
+        kb = k[start : (start + int(b)), :, :]
+        kb_reshaped = kb.transpose(0, 1)
+        vb = v[start : (start + int(b)), :, :]
+        vb_reshaped = vb.transpose(0, 1)
+        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
+        if causal:
+            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
+            mask = M == 0
+            p[:, mask] = float("-inf")
+        # print(f"p shape: {p.shape}")
+        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
+        refb = torch.matmul(p, vb_reshaped)
+        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+        start += b
+        start_q += n_ctx_q
+
+    # Compare result
+    atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
+    rtol = 1e-2 if init_dtype == "fp8" else 3e-3
+    torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
 def main():
     batch = 2
