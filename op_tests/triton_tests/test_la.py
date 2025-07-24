@@ -129,9 +129,12 @@ def test_persistent_lean_attention(
     )
 
     # LeanAttention Specific Parameters
-    Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
-    Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
+    # Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
+    # Lp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
+    # Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
+    Mp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
+    Lp = torch.empty((total_programs, BLOCK_M), device=q.device, dtype=torch.float32)
+    Op = torch.empty((total_programs, BLOCK_M, d), device=q.device, dtype=torch.float32)
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
 
@@ -187,14 +190,14 @@ def test_persistent_lean_attention(
 
 def main():
     batch = 2
-    causal = True
+    causal = False
     h = 64
-    n_ctx_q = 512
-    n_ctx = [512, 512]
-    d = 64
-    total_programs = 304
+    n_ctx_q = 128
+    n_ctx = [8192, 8192]
+    d = 128
+    total_programs = 120
     init_dtype = torch.float16
-    BLOCK_M = 64
+    BLOCK_M = 128
     BLOCK_N = 64
     waves_per_eu = 1
     num_warps = 1

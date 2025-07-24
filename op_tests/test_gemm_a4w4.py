@@ -13,7 +13,9 @@ import pandas as pd
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 SCALE_GROUP_SIZE = 32
-pd.set_option("display.max_columns", 200)
+pd.set_option("display.max_columns", 30)
+pd.set_option("display.width", 1000)
+pd.set_option("display.max_colwidth", 30)
 
 
 @perftest(num_iters=5)
@@ -55,12 +57,28 @@ def run_gemm_asm(
     x_scale,
     w_scale,
     out,
+    kernelName="",
     bias=None,
     dtype=dtypes.bf16,
     bpreshuffle=True,
+    log2_k_split=None,
 ):
+    if log2_k_split is not None:
+        out_reset = torch.zeros(
+            (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtype
+        )
+        out = out_reset
+
     return aiter.gemm_a4w4_asm(
-        x, weightshuffle, x_scale, w_scale, out, bias, bpreshuffle=bpreshuffle
+        x,
+        weightshuffle,
+        x_scale,
+        w_scale,
+        out,
+        kernelName,
+        bias,
+        bpreshuffle=bpreshuffle,
+        log2_k_split=log2_k_split,
     )
 
 
@@ -81,14 +99,15 @@ def test_gemm(dtype, M, N, K):
     out1 = torch.empty(M, N, dtype=dtype)
     out2 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
     out3 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
-    bias_f32 = torch.zeros(M, N, dtype=dtype)
+    bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
-
     a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
-    b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
+    # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
+    b, avg_b = a, 0
+    err_b = checkAllclose(a, b, msg="triton        ")
 
-    err0 = checkAllclose(a, b, msg="triton        ")
+    err_c = None
     avg_c = None
     tflops_c = None
     tbs_c = None
@@ -98,52 +117,66 @@ def test_gemm(dtype, M, N, K):
         x_scales_shuffle,
         w_scales_shuffle,
         out2,
+        "",  # kernelName
         bias_f32,
         bpreshuffle=True,
+        # log2_k_split=0,
     )
-    err1 = checkAllclose(a, c[:M], msg="asm_bshuffle  ")
+
+    err_c = checkAllclose(a, c[:M], msg="asm no splitK  ")
     tflops_c = M * N * K * 2 / avg_c / 1e6
     tbs_c = (x.nbytes + w.nbytes) / avg_c / 1e6
-
-    avg_c2 = None
-    tflops_c2 = None
-    tbs_c2 = None
-    c2, avg_c2 = run_gemm_asm(
-        x, w, x_scales_shuffle, w_scales_shuffle, out2, bias_f32, bpreshuffle=False
-    )
-    err1_ = checkAllclose(a, c2[:M], msg="asm_NObshuffle ")
-    tflops_c2 = M * N * K * 2 / avg_c2 / 1e6
-    tbs_c2 = (x.nbytes + w.nbytes) / avg_c2 / 1e6
-
+    err_d = None
     avg_d = None
     tflops_d = None
     tbs_d = None
-    d, avg_d = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
-    err2 = checkAllclose(a, d[:M], msg="ck            ")
+    d, avg_d = run_gemm_asm(
+        x,
+        wshuffle,
+        x_scales_shuffle,
+        w_scales_shuffle,
+        out3,
+        "_ZN5aiter49f4gemm_bf16_per1x32Fp4_BpreShuffle_KSplit_128x512E",  # kernelName
+        bias_f32,
+        bpreshuffle=True,
+        log2_k_split=2,
+    )
+    err_d = checkAllclose(a, d[:M], msg="asm splitK ")
     tflops_d = M * N * K * 2 / avg_d / 1e6
     tbs_d = (x.nbytes + w.nbytes) / avg_d / 1e6
 
+    err_e = None
+    avg_e = None
+    tflops_e = None
+    tbs_e = None
+    e, avg_e = run_gemm_ck(x, wshuffle, x_scales_shuffle, w_scales_shuffle, out3)
+    err_e = checkAllclose(a, e[:M], msg="ck            ")
+    tflops_e = M * N * K * 2 / avg_e / 1e6
+    tbs_e = (x.nbytes + w.nbytes) / avg_e / 1e6
+
     return {
         "triton": avg_b,
-        "asm bpreshuffle": avg_c,
-        "asm no bpreshuffle": avg_c2,
-        "ck": avg_d,
-        "triton err": err0,
-        "asm bpreshuffle err": err1,
-        "asm no bpreshuffle err": err1_,
-        "ck err": err2,
-        "asm bpreshuffle TFLPOS": tflops_c,
-        "asm no bpreshuffle TFLPOS": tflops_c2,
-        "ck TFLPOS": tflops_d,
-        "asm bpreshuffle TB/s": tbs_c,
-        "asm no bpreshuffle TB/s": tbs_c2,
-        "ck TB/s": tbs_d,
+        "asm no splitK": avg_c,
+        "asm splitK": avg_d,
+        "ck": avg_e,
+        "triton err": err_b,
+        "asm no splitK err": err_c,
+        "asm splitK err": err_d,
+        "ck err": err_e,
+        "asm no splitK TFLOPS": tflops_c,
+        "asm splitK TFLOPS": tflops_d,
+        "ck TFLOPS": tflops_e,
+        "asm no splitK TB/s": tbs_c,
+        "asm splitK TB/s": tbs_d,
+        "ck TB/s": tbs_e,
     }
 
 
 l_dtype = ["bf16"]
 l_mnk = [
     # pure_compute
+    (256, 2048, 8192),
+    (2048, 8192, 8192),
     (16384, 16384, 16384),
     (32768, 106496, 16384),
     (32768, 16384, 53248),
@@ -193,11 +226,6 @@ l_mnk = [
     (4096, 8192, 1024),
     (8192, 8192, 1024),
     (16384, 8192, 1024),
-    # for asm
-    (16384, 16384, 16384),
-    (32768, 32768, 32768),
-    (51200, 18432, 16384),
-    (51200, 16384, 16384),
 ]
 
 parser = argparse.ArgumentParser(

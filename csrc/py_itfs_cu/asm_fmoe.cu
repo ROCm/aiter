@@ -63,6 +63,10 @@ struct __attribute__((packed)) KernelArgs
     p3 _p24;
     unsigned int topk;
     p3 _p25;
+    unsigned int total_tgs;
+    p3 _p26;
+    unsigned int ps_deno;
+    p3 _p27;
 };
 
 class FMoeKernel
@@ -70,11 +74,15 @@ class FMoeKernel
     private:
     hipModule_t module;
     hipFunction_t kernel_func;
-    uint32_t sub_GU = 512;
-    bool is_int4    = false;
+    uint32_t sub_GU             = 512;
+    bool is_int4                = false;
+    uint32_t num_persistent_tgs = 0;
 
     public:
-    FMoeKernel(const char* name, const char* hsaco, uint32_t sub_GU = 512)
+    FMoeKernel(const char* name,
+               const char* hsaco,
+               uint32_t sub_GU             = 512,
+               uint32_t num_persistent_tgs = 0)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         std::cout << "[aiter] hipModuleLoad: " << (std::string(AITER_ASM_DIR) + hsaco).c_str()
@@ -82,7 +90,8 @@ class FMoeKernel
         HIP_CALL(hipModuleLoad(&module, (std::string(AITER_ASM_DIR) + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, name));
         std::cout << " Success" << std::endl;
-        this->sub_GU = sub_GU;
+        this->sub_GU             = sub_GU;
+        this->num_persistent_tgs = num_persistent_tgs;
     };
 
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
@@ -172,17 +181,34 @@ class FMoeKernel
         args.eDQs      = stride_expert_DDQN;
         args.eSMQs     = stride_expert_SMTDQN;
         args.topk      = topk;
+        args.ps_deno   = ((inter_dim + sub_GU - 1) / sub_GU);
+        args.total_tgs = this->num_persistent_tgs / args.ps_deno * args.ps_deno;
 
         void* config[] = {HIP_LAUNCH_PARAM_BUFFER_POINTER,
                           &args,
                           HIP_LAUNCH_PARAM_BUFFER_SIZE,
                           &arg_size,
                           HIP_LAUNCH_PARAM_END};
+        int bdx;
+        int gdx;
+        int gdy;
+        int gdz;
+        if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
+           (args.total_tgs % args.ps_deno) == 0) // ps
+        {
 
-        int bdx = 256;
-        int gdx = ((inter_dim + sub_GU - 1) / sub_GU);
-        int gdy = sub_X_cnt;
-        int gdz = 1;
+            bdx = 256;
+            gdx = this->num_persistent_tgs;
+            gdy = 1;
+            gdz = 1;
+        }
+        else // no-ps
+        {
+            bdx = 256;
+            gdx = ((inter_dim + sub_GU - 1) / sub_GU);
+            gdy = sub_X_cnt;
+            gdz = 1;
+        }
         // std::cout << "args.dim: " << args.dim << std::endl;
         // std::cout << "args.inter_dim: " << args.inter_dim << std::endl;
         // std::cout << "args.token_cnt: " << args.token_cnt << std::endl;
@@ -217,11 +243,7 @@ class FMoeKernel
 int get_heuristic_tile(int inter_dim, int sub_X_cnt, const std::vector<int>& available_tiles)
 {
     // int tiles[7] = {512, 448, 384, 320, 256, 192, 128};
-    hipDevice_t dev;
-    hipDeviceProp_t dev_prop;
-    HIP_CALL(hipGetDevice(&dev));
-    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu   = dev_prop.multiProcessorCount;
+    uint32_t num_cu   = get_num_cu_func();
     uint32_t empty_cu = num_cu;
     uint32_t tg_num   = 0;
     uint32_t round    = 0xffffffff;
@@ -895,13 +917,24 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
 
     if(gate.dtype() == at::ScalarType::Char || gate.dtype() == at::ScalarType::Byte)
     {
-        TORCH_CHECK(inter_dim % 320 == 0,
-                    __func__,
-                    "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
-                        ", which should be divisible by 320");
-        static FMoeKernel impl_int8_320(
-            "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
-        impl_ptr = &impl_int8_320;
+        int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt, {320, 256});
+        if(selectedTile == 320)
+        {
+            static FMoeKernel impl_int8_320(
+                "fmoe_int8_g1u1_smf_subGU_320", "fmoe_int8_g1u1_smf_subGU_320.co", 320);
+            impl_ptr = &impl_int8_320;
+        }
+        else if(selectedTile == 256)
+        {
+            static FMoeKernel impl_int8_256(
+                "fmoe_int8_g1u1_smf_subGU_256", "fmoe_int8_g1u1_smf_subGU_256.co", 256);
+            impl_ptr = &impl_int8_256;
+        }
+        else
+            TORCH_CHECK(false,
+                        __func__,
+                        "int8 quant Unsupported inter_dim " + std::to_string(inter_dim) +
+                            ", which should be divisible by 320 or 256");
     }
     else if(gate.dtype() == torch_fp8)
     {
@@ -964,6 +997,7 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
                               ActivationType activation)
 {
     FMoeKernel* impl_ptr = nullptr;
+    uint32_t num_cu      = get_num_cu_func();
     int inter_dim        = down.size(2);
     int sub_X_cnt        = sorted_expert_ids.size(0);
     // int selectedTile = get_heuristic_tile(inter_dim, sub_X_cnt); // todo,add tune interface here
@@ -981,9 +1015,15 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
         }
         else
         {
-            static FMoeKernel impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256E",
-                                            "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256.co",
-                                            256);
+            // static FMoeKernel
+            // impl_256_novs("_ZN5aiter39fmoe_fp8_blockscale_g1u1_novs_subGU_256E",
+            //                                 "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256.co",
+            //                                 256);
+            static FMoeKernel impl_256_novs(
+                "_ZN5aiter42fmoe_fp8_blockscale_g1u1_novs_subGU_256_psE",
+                "/fmoe/fmoe_fp8_blockscale_g1u1_novs_subGU_256_ps.co",
+                256,
+                num_cu);
             impl_ptr = &impl_256_novs;
         }
     }

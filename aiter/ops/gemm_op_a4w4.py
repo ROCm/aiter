@@ -10,6 +10,7 @@ from ..jit.core import (
     AITER_ROOT_DIR,
 )
 from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx
 import functools
 import pandas as pd
 
@@ -52,14 +53,20 @@ def gemm_a4w4(
     m = A.shape[0]
     n = B.shape[0]
     k = A.shape[-1] * 2
-
+    gfx_arch = get_gfx()
+    if gfx_arch in ["gfx942"]:
+        raise RuntimeError(
+            f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
+        )
     ck_config = get_CKGEMM_config(m, n, k)
     splitK = 0
     if ck_config is not None:
         splitK = ck_config["splitK"]
     if m < 256 or ck_config is not None or bias is None:
         return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
-    return gemm_a4w4_asm(A, B, A_scale, B_scale, out, bias, alpha, beta, bpreshuffle)
+    return gemm_a4w4_asm(
+        A, B, A_scale, B_scale, out, "", bias, alpha, beta, bpreshuffle
+    )
 
 
 @compile_ops("module_gemm_a4w4_asm")
@@ -69,10 +76,12 @@ def gemm_a4w4_asm(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
+    kernelName: str,
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
+    log2_k_split: Optional[int] = None,
 ) -> torch.Tensor: ...
 
 

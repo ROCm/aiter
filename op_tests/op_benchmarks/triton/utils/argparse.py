@@ -83,14 +83,14 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Benchmark the down-projection (intermediate dim to hidden dim in the feed-forward layer)",
     )
     parser.add_argument(
-        "-no_glu",
+        "-no-glu",
         action="store_true",
         help="Benchmark the feed-forward layer without GLU activation (default is with GLU)",
     )
     parser.add_argument(
         "-M",
         type=int,
-        default=4096,
+        default=None,
         help="M dim of model benchmark if only one model is under test",
     )
     parser.add_argument(
@@ -98,6 +98,14 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         type=int,
         nargs="+",
         metavar=("DIM"),
-        help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for supporting kernels.",
+        help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for batched kernels.",
+    )
+    parser.add_argument(
+        "--print_vgpr",
+        action="store_true",
+        help="Print VGPR usage for Triton kernels.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     return parser
