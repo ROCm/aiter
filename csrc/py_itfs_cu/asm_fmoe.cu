@@ -610,6 +610,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
+        impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf);
     }
     else if(input.dtype() == torch_fp8) // fp8
     {
@@ -625,8 +626,9 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenFp8_g1u1. ");
+        impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf);
     }
-    impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf);
+
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
                                                input,
                                                gate,
