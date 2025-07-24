@@ -15,6 +15,9 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
     _is_fp8,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 # This function computes delta given output Out and gradient DO
@@ -1050,6 +1053,10 @@ def flash_attn_fused_backward(
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,
 ):
+    _LOGGER.info(
+        f"FLASH_ATTN_FUSED_BKWD: do={tuple(do.shape)} q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} "
+        + f"dq={tuple(dq.shape)}  dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+    )
     if dbias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
 

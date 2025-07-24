@@ -10,6 +10,9 @@ from aiter.ops.triton.activation import _silu_exp2
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -1026,6 +1029,12 @@ def fused_moe_silu(
     """
     #TODO: Add doc
     """
+    _LOGGER.info(
+        f"FUSED_MOE_SILU:  A={tuple(A.shape)}  B={tuple(B.shape)}  C={tuple(C.shape)} "
+        + f"topk_weights={tuple(topk_weights.shape)} sorted_token_ids={tuple(sorted_token_ids.shape)} "
+        + f"expert_ids={tuple(expert_ids.shape)} num_tokens_post_padded={tuple(num_tokens_post_padded.shape)} "
+        + f"top_k={top_k} "
+    )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 

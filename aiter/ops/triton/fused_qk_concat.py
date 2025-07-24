@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -134,6 +137,9 @@ def fused_qk_cat(
     - q_out: The output matrix with shape (B, QH, D1+D2).
     - k_out: The output matrix with shape (B, KH, D1+D2).
     """
+    _LOGGER.info(
+        f"FUSED_QK_CAT: q1={tuple(q1.shape)} q2={tuple(q2.shape)} k1={tuple(k1.shape)} k2={tuple(k2.shape)} "
+    )
     b, qh, d1 = q1.shape
     b2, qh2, d2 = q2.shape
     bk, kh, dk1 = k1.shape
@@ -368,6 +374,10 @@ def fused_qk_rope_cat(
     - q_out: The output matrix with shape (B, QH, D1+D2).
     - k_out: The output matrix with shape (B, KH, D1+D2).
     """
+    _LOGGER.info(
+        f"FUSED_QK_ROPE_CAT: q_nope={tuple(q_nope.shape)} q_pe={tuple(q_pe.shape)} k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
+        + f"pos={tuple(pos.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)}"
+    )
     b, qh, d_nope = q_nope.shape
     b2, qh2, d_pe = q_pe.shape
     bk, kh, dk1 = k_nope.shape
