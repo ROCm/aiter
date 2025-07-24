@@ -73,12 +73,28 @@ def gemm_a4w4(
         )
     ck_config = get_CKGEMM_config(m, n, k)
     splitK = 0
+    kernelName = ""
     if ck_config is not None:
         splitK = ck_config["splitK"]
-    if m < 256 or ck_config is not None or bias is None:
+        kernelName = ck_config["kernelName"]
+    if (
+        m < 256
+        or (ck_config is not None and kernelName.find("_ZN") == -1)
+        # or bias is None
+    ):
         return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
     return gemm_a4w4_asm(
-        A, B, A_scale, B_scale, out, "", bias, alpha, beta, bpreshuffle
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        kernelName,
+        bias,
+        alpha,
+        beta,
+        bpreshuffle,
+        log2_k_split=0,
     )
 
 
