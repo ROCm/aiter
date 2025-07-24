@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -227,6 +230,10 @@ def gemm_a8w8_blockscale(
     *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
     **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
+    _LOGGER.info(
+        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
+    )
+
     M, K = x.shape
     N, K = w.shape
 
