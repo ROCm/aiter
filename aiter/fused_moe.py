@@ -440,12 +440,20 @@ def get_2stage_cfgs(
         ksplit = 0
         kernelName1 = ""
         kernelName2 = ""
-        run_1stage = (
-            token < 256
-            and (activation, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
-            in fused_moe_1stage_dict[get_gfx()]
-            and not doweight_stage1
-        )
+        if q_type == QuantType.per_Token and q_dtype_w in [dtypes.i8, dtypes.fp8]:
+            run_1stage = (
+                token > 32
+                and (activation, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
+                in fused_moe_1stage_dict[get_gfx()]
+                and not doweight_stage1
+            )
+        else:
+            run_1stage = (
+                token < 256
+                and (activation, q_type, dtype, q_dtype_a, q_dtype_w, use_g1u1)
+                in fused_moe_1stage_dict[get_gfx()]
+                and not doweight_stage1
+            )
         block_m = (
             get_block_size_M(token, topk, expert, inter_dim)
             if not run_1stage
