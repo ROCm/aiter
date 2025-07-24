@@ -13,7 +13,7 @@ pd.set_option("display.max_rows", 200)
 
 
 def perftest(
-    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=10, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -82,6 +82,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
 
             avg = get_trace_perf(prof, num_iters)
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25))
 
             return data, avg
 
@@ -165,7 +166,7 @@ def run_perftest(
     func,
     *args,
     num_iters=101,
-    num_warmup=2,
+    num_warmup=20,
     testGraph=False,
     num_rotate_args=0,
     needTrace=False,

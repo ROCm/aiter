@@ -10,8 +10,14 @@ import itertools
 import argparse
 
 torch.set_default_device("cuda")
-torch.set_printoptions(sci_mode=False, threshold=torch.inf)
+# torch.set_printoptions(sci_mode=False, threshold=torch.inf)
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+# setup_seed(1)
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -119,12 +125,15 @@ def test_mla(
     if varlen:
         for i in range(batch_size):
             seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+            # seq_lens_kv[i] = random.uniform(100, ctx_lens)
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
     else:
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
+    seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963], device="cuda")
+    seq_lens_kv = seq_lens_kv[:batch_size]
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -183,8 +192,8 @@ def test_mla(
         return us_aiter
 
     us_aiter = None
-    if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-        us_aiter = test_normal_prefill()
+    # if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+    #     us_aiter = test_normal_prefill()
     torch.cuda.empty_cache()
     # absorb init
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -245,7 +254,7 @@ def test_mla(
         #     msg=f"mla_prefill-absorb    [torch vs    triton]:{us_torch:>8.2f} us vs {us_triton:>8.2f} us......",
         # )
 
-        out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=dtype).fill_(-1)
+        out_asm = torch.zeros((total_qo, nhead, v_head_dim), dtype=dtype).fill_(-1)
         (attn_logits, attn_lse), us_asm = run_perftest(
             aiter.mla.mla_prefill_fwd,
             q,
@@ -267,8 +276,8 @@ def test_mla(
         return us_asm
 
     us_asm = None
-    if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
-        us_asm = test_absorb_prefill()
+    # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+    #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
 
     # ############################## absorb: decode
@@ -332,19 +341,58 @@ def test_mla(
 
     # aiter implementation
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-    out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
-    (attn_logits, attn_lse), us_asm_decode = run_perftest(
-        aiter.mla.mla_decode_fwd,
-        q,
-        kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
-        out_asm,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        max_seqlen_qo,
-        sm_scale,
-    )
+    out_asm = torch.zeros((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+    if varlen == False or mtp == 1:
+
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            q,
+            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            sm_scale,
+        )
+    else:
+        max_cu_num = 400
+        batch_split_table = torch.empty(
+            (max_cu_num), dtype=torch.int32, device="cuda"
+        )
+        split_table = torch.empty(
+            (max_cu_num), dtype=torch.int32, device="cuda"
+        )
+        num_kv_splits_indptr = torch.empty(
+            (batch_size + 1), dtype=torch.int32, device="cuda"
+        )
+
+        aiter.get_mla_metadata_impl(
+            kv_indptr,
+            num_kv_splits_indptr,
+            batch_split_table,
+            split_table,
+        )
+
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd_dispatch,
+            q,
+            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            sm_scale,
+            varlen,
+            0.0,
+            1,
+            num_kv_splits_indptr,
+            batch_split_table,
+            split_table,
+        )
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -374,13 +422,13 @@ def test_mla(
 
 
 kv_lora_rank = 512
-qk_nope_head_dim = 128
+qk_nope_head_dim = 128 
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
+list_nhead = [(16, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -398,9 +446,9 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=128,
+    default=512,
     help="""qk nope head dim.
-    e.g.: -qn 128""",
+    e.g.: -qn 512""",
 )
 parser.add_argument(
     "-qr",
@@ -414,9 +462,9 @@ parser.add_argument(
     "-vh",
     "--v_head_dim",
     type=int,
-    default=128,
+    default=512,
     help="""v head dim.
-    e.g.: -vh 128""",
+    e.g.: -vh 512""",
 )
 parser.add_argument(
     "-blk",
@@ -451,7 +499,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[21, 64, 256, 512, 1200, 3200, 5200, 8192],
+    default=[23000], #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -460,7 +508,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[1, 3, 5, 16, 32, 64, 128, 256],
+    default=[i for i in range(16, 64)],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -499,7 +547,7 @@ for nhead, mtp in list_nhead:
             dtype,
             kvtype,
             args.block_size,
-            varlen=False,
+            varlen=True,
             mtp=mtp,
         )
         df.append(ret)

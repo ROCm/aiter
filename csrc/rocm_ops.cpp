@@ -42,6 +42,7 @@
 // #include "torch/mha_v3_varlen_bwd.h"
 // #include "torch/mha_varlen_bwd.h"
 // #include "torch/mha_varlen_fwd.h"
+#include "fmla.h"
 
 #include "rocm_ops.hpp"
 
@@ -93,5 +94,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     CACHE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
+    FLASH_MLA_FWD_PYBIND;
 }
 #endif

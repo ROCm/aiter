@@ -1,0 +1,197 @@
+[aiter] WARNING: NUMA balancing is enabled, which may cause errors. It is recommended to disable NUMA balancing by running "sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'" for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 16,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+[aiter] hipModuleLoad: /data/zanzhang/code/aiter/hsa/gfx942//mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1.co GetFunction: _ZN5aiter39mla_a16w16_qh16_m16x4_n16x1_coex0_mask1E Success
+[W724 03:33:02.993774769 collection.cpp:1085] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   234.18 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 17,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   247.84 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 18,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+    aiter::mla_a16w16_qh16_m16x4_n16x1_coex0_mask1         0.00%       0.000us         0.00%       0.000us       0.000us      22.425ms        94.81%      22.425ms     222.034us           0 b           0 b           0 b           0 b           101  
+                            _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       1.228ms         5.19%       1.228ms      12.158us           0 b           0 b           0 b           0 b           101  
+                                       aten::empty         0.79%     332.857us         0.79%     332.857us       1.648us       0.000us         0.00%       0.000us       0.000us           0 b           0 b       2.37 Gb       2.37 Gb           202  
+                             hipModuleLaunchKernel         1.84%     777.468us         1.84%     777.468us       3.849us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           202  
+                            hipPointerGetAttribute         0.27%     113.946us         0.27%     113.946us       0.188us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           606  
+                                          [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 b           0 b      -2.35 Gb      -2.35 Gb           200  
+                              hipDeviceSynchronize        97.10%      40.940ms        97.10%      40.940ms      40.940ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 42.164ms
+Self CUDA time total: 23.653ms
+
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+    aiter::mla_a16w16_qh16_m16x4_n16x1_coex0_mask1         0.00%       0.000us         0.00%       0.000us       0.000us      23.228ms        92.78%      23.228ms     229.984us           0 b           0 b           0 b           0 b           101  
+                            _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       1.808ms         7.22%       1.808ms      17.899us           0 b           0 b           0 b           0 b           101  
+                                       aten::empty         0.68%     311.220us         0.68%     311.220us       1.541us       0.000us         0.00%       0.000us       0.000us           0 b           0 b       2.52 Gb       2.52 Gb           202  
+                             hipModuleLaunchKernel         1.68%     765.645us         1.68%     765.645us       3.790us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           202  
+                            hipPointerGetAttribute         0.26%     119.280us         0.26%     119.280us       0.197us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           606  
+                                          [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 b           0 b      -2.50 Gb      -2.50 Gb           200  
+                              hipDeviceSynchronize        97.37%      44.342ms        97.37%      44.342ms      44.342ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 45.538ms
+Self CUDA time total: 25.036ms
+
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+    aiter::mla_a16w16_qh16_m16x4_n16x1_coex0_mask1         0.00%       0.000us         0.00%       0.000us       0.000us      27.751ms        96.23%      27.751ms     274.762us           0 b           0 b           0 b           0 b           101  
+                            _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       1.088ms         3.77%       1.088ms      10.772us           0 b           0 b           0 b           0 b           101  
+                                       aten::empty         0.64%     317.880us         0.64%     317.880us       1.574us       0.000us         0.00%       0.000us       0.000us           0 b           0 b       2.67 Gb       2.67 Gb           202  
+                             hipModuleLaunchKernel         1.52%     753.810us         1.52%     753.810us       3.732us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           202  
+                            hipPointerGetAttribute         0.24%     118.915us         0.24%     118.915us       0.196us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           606  
+                                          [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 b           0 b      -2.64 Gb      -2.64 Gb           200  
+                              hipDeviceSynchronize        97.61%      48.556ms        97.61%      48.556ms      48.556ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 49.747ms
+Self CUDA time total: 28.839ms
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   285.52 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 19,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   284.70 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 20,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   284.96 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 21,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+    aiter::mla_a16w16_qh16_m16x4_n16x1_coex0_mask1         0.00%       0.000us         0.00%       0.000us       0.000us      27.663ms        96.20%      27.663ms     273.888us           0 b           0 b           0 b           0 b           101  
+                            _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       1.094ms         3.80%       1.094ms      10.833us           0 b           0 b           0 b           0 b           101  
+                                       aten::empty         0.62%     311.860us         0.62%     311.860us       1.544us       0.000us         0.00%       0.000us       0.000us           0 b           0 b       2.82 Gb       2.82 Gb           202  
+                             hipModuleLaunchKernel         1.51%     758.347us         1.51%     758.347us       3.754us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           202  
+                            hipPointerGetAttribute         0.23%     114.584us         0.23%     114.584us       0.189us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           606  
+                                          [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 b           0 b      -2.79 Gb      -2.79 Gb           200  
+                              hipDeviceSynchronize        97.64%      48.984ms        97.64%      48.984ms      48.984ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 50.168ms
+Self CUDA time total: 28.757ms
+
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+    aiter::mla_a16w16_qh16_m16x4_n16x1_coex0_mask1         0.00%       0.000us         0.00%       0.000us       0.000us      27.685ms        96.19%      27.685ms     274.111us           0 b           0 b           0 b           0 b           101  
+                            _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       1.096ms         3.81%       1.096ms      10.854us           0 b           0 b           0 b           0 b           101  
+                                       aten::empty         0.61%     312.278us         0.61%     312.278us       1.546us       0.000us         0.00%       0.000us       0.000us           0 b           0 b       2.96 Gb       2.96 Gb           202  
+                             hipModuleLaunchKernel         1.48%     753.592us         1.48%     753.592us       3.731us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           202  
+                            hipPointerGetAttribute         0.22%     113.569us         0.22%     113.569us       0.187us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           606  
+                                          [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 b           0 b      -2.94 Gb      -2.94 Gb           200  
+                              hipDeviceSynchronize        97.69%      49.795ms        97.69%      49.795ms      49.795ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 50.975ms
+Self CUDA time total: 28.781ms
+
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                              Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg       CPU Mem  Self CPU Mem      CUDA Mem  Self CUDA Mem    # of Calls  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+    aiter::mla_a16w16_qh16_m16x4_n16x1_coex0_mask1         0.00%       0.000us         0.00%       0.000us       0.000us      23.608ms        93.38%      23.608ms     233.746us           0 b           0 b           0 b           0 b           101  
+                            _fwd_kernel_stage2_asm         0.00%       0.000us         0.00%       0.000us       0.000us       1.674ms         6.62%       1.674ms      16.574us           0 b           0 b           0 b           0 b           101  
+                                       aten::empty         0.69%     314.615us         0.69%     314.615us       1.558us       0.000us         0.00%       0.000us       0.000us           0 b           0 b       3.11 Gb       3.11 Gb           202  
+                             hipModuleLaunchKernel         1.68%     769.876us         1.68%     769.876us       3.811us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           202  
+                            hipPointerGetAttribute         0.26%     117.596us         0.26%     117.596us       0.194us       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b           606  
+                                          [memory]         0.00%       0.000us         0.00%       0.000us       0.000us       0.000us         0.00%       0.000us       0.000us           0 b           0 b      -3.08 Gb      -3.08 Gb           200  
+                              hipDeviceSynchronize        97.38%      44.711ms        97.38%      44.711ms      44.711ms       0.000us         0.00%       0.000us       0.000us           0 b           0 b           0 b           0 b             1  
+--------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 45.913ms
+Self CUDA time total: 25.282ms
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   250.29 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 22,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
+[aiter] mla_decode-absorb    [golden vs aiter_asm]:   264.24 us......[checkAllclose atol=0.01 rtol=0.01 [32mpassed~[0m]
+[aiter] 
+calling test_mla(ctx_lens                     = 23000,
+                 batch_size                   = 23,
+                 nhead                        = 16,
+                 kv_lora_rank                 = 512,
+                 qk_nope_head_dim             = 512,
+                 qk_rope_head_dim             = 64,
+                 v_head_dim                   = 512,
+                 dtype                        = torch.bfloat16,
+                 kvtype                       = torch.bfloat16,
+                 page_size                    = 1,
+                 varlen                       = False,
+                 mtp                          = 3)
