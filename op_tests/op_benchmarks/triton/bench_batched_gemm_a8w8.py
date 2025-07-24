@@ -2,8 +2,8 @@ import sys
 import torch
 import triton
 import math
-from op_tests.triton_tests.test_batched_gemm_afp4wfp4 import (
-    generate_batched_gemm_afp4wfp4_inputs,
+from op_tests.triton_tests.test_batched_gemm_a8w8 import (
+    generate_batched_gemm_a8w8_inputs,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -16,24 +16,15 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     batched_model_benchmark_shapes,
     print_vgpr,
 )
-from aiter.ops.triton.batched_gemm_afp4wfp4 import (
-    batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
+from aiter.ops.triton.batched_gemm_a8w8 import (
+    batched_gemm_a8w8 as batched_gemm_a8w8,
 )
-import aiter.ops.triton.utils.arch_info as arch_info
 
 
-def bench_gemm_fn(
-    batch: int, M: int, N: int, K: int, metric: str, layout: str, model_name=None
-):
+def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_batched_gemm_afp4wfp4_inputs(
-        batch,
-        M,
-        N,
-        K,
-        c_dtype,
-        layout=layout,
-        output=True,
+    x, w, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
+        batch, M, N, K, dtype=c_dtype, layout=layout, output=True
     )
     # print(f"M: {M}, N: {N}, K: {K}, x.shape: {x.shape}, x.stride(): {x.stride()}, w.shape: {w.shape}, w.stride(): {w.stride()}")
     # flops
@@ -48,7 +39,7 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
+        lambda: batched_gemm_a8w8(x, w, x_scale, w_scale, bias, c_dtype, YQ=y),
         warmup=25,
         rep=100,
     )
@@ -70,13 +61,13 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
         args=args,
-        x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, batch, metric, layer, model_name=None, **kwargs
+    def bench_batched_gemm_a8w8(
+        M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
     ):
         if layer == "fc1":
             if args.no_glu:
@@ -91,9 +82,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, B: {batch}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
+    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -104,10 +95,10 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4(batch, M, N, K, metric, **kwargs):
-        return bench_gemm_fn(batch, M, N, K, metric, layout=args.layout)
+    def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider):
+        return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
+    bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -139,7 +130,7 @@ def run_benchmark(args, defaults):
 
 
 def parse_args():
-    parser = get_parser("MXFP4 x MXFP4 GEMM")
+    parser = get_parser("Batched Int8 x Int8 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
         "-B",
@@ -151,10 +142,6 @@ def parse_args():
 
 
 def main():
-    if not (arch_info.is_fp4_avail()):
-        print("MXFP4 is not available on this architecture")
-        sys.exit()
-
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")

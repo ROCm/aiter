@@ -1,13 +1,13 @@
 import sys
-import os
 import torch
 import triton
 import math
-from aiter.ops.triton.gemm_afp4wfp4 import (
-    gemm_afp4wfp4,
-    gemm_afp4wfp4_preshuffled_scales,
+from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
+    gemm_afp4wfp4_pre_quant,
 )
-from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
+from op_tests.triton_tests.test_gemm_afp4wfp4_pre_quant_atomic import (
+    generate_gemm_afp4wfp4_pre_quant_inputs,
+)
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
     add_argparse_ff,
@@ -18,20 +18,16 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
-import aiter.ops.triton.utils.arch_info as arch_info
-
-TRITON_HIP_PRESHUFFLE_SCALES = (
-    os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
-)
 
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
-    c_dtype = torch.bfloat16
-    x, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
+    c_dtype = (
+        torch.float32
+    )  # NOTE: test_gemm_afp4wfp4_pre_quant_atomic occasionally fails when c_dtype is set to bfloat16
+    x, w, _, w_scale, y = generate_gemm_afp4wfp4_pre_quant_inputs(
         M,
         N,
         K,
-        c_dtype,
         layout=layout,
         output=True,
     )
@@ -39,27 +35,16 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     flops = 2.0 * M * N * K
     # memory transfer
     mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_read += (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
-    )
+    mem_read += w_scale.numel() * w_scale.element_size()
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
 
-    if TRITON_HIP_PRESHUFFLE_SCALES:
-        ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffled_scales(
-                x, w, x_scale, w_scale, c_dtype, y
-            ),
-            warmup=25,
-            rep=100,
-        )
-    else:
-        ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
-            warmup=25,
-            rep=100,
-        )
+    ms = triton.testing.do_bench(
+        lambda: gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
+        warmup=25,
+        rep=100,
+    )
+
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
         return ms
@@ -103,9 +88,7 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(
-        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
-    ):
+    def bench_gemm_afp4wfp4(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
         if layer == "fc1":
             if args.no_glu:
                 N, K = intermediate_dim, hidden_dim
@@ -120,17 +103,17 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
+    bench_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_afp4wfp4(M, N, K, metric, model_name=None, **kwargs):
+    def bench_gemm_afp4wfp4(M, N, K, metric, **kwargs):
         return bench_gemm_fn(M, N, K, metric, args.layout)
 
-    bench_gemm_afp4wfp4.run(save_path="." if args.o else None, print_data=True)
+    bench_gemm_afp4wfp4.run(save_path=".", print_data=True)
 
 
 def parse_args():
@@ -140,10 +123,6 @@ def parse_args():
 
 
 def main():
-    if not (arch_info.is_fp4_avail()):
-        print("MXFP4 is not available on this architecture")
-        sys.exit()
-
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")

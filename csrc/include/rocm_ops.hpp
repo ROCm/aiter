@@ -302,19 +302,21 @@
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
 
-#define GEMM_A4W4_ASM_PYBIND                     \
-    m.def("gemm_a4w4_asm",                       \
-          &gemm_a4w4_asm,                        \
-          "Asm gemm a4w4",                       \
-          py::arg("A"),                          \
-          py::arg("B"),                          \
-          py::arg("A_scale"),                    \
-          py::arg("B_scale"),                    \
-          py::arg("out"),                        \
-          py::arg("bias")        = std::nullopt, \
-          py::arg("alpha")       = 1.0,          \
-          py::arg("beta")        = 0.0,          \
-          py::arg("bpreshuffle") = true);
+#define GEMM_A4W4_ASM_PYBIND                      \
+    m.def("gemm_a4w4_asm",                        \
+          &gemm_a4w4_asm,                         \
+          "Asm gemm a4w4",                        \
+          py::arg("A"),                           \
+          py::arg("B"),                           \
+          py::arg("A_scale"),                     \
+          py::arg("B_scale"),                     \
+          py::arg("out"),                         \
+          py::arg("kernelName"),                  \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alpha")        = 1.0,          \
+          py::arg("beta")         = 0.0,          \
+          py::arg("bpreshuffle")  = true,         \
+          py::arg("log2_k_split") = std::nullopt);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
