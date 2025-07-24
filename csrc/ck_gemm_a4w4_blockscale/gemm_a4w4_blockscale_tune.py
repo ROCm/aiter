@@ -11,7 +11,7 @@ from aiter.ops.shuffle import shuffle_weight
 from gemm_a4w4_blockscale_common import kernels_list
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.jit.core import get_asm_dir, AITER_CSRC_DIR
+from aiter.jit.core import get_asm_dir
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -79,11 +79,6 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     m, k = x.shape
     n, k = weight.shape
-    # if splitK != 0:
-    #    out_reset = torch.zeros(
-    #        (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtypes.bf16
-    #    )
-    #    out = out_reset
     res = aiter.gemm_a4w4_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
@@ -366,7 +361,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-k", "--splitK", action="store_true", required=False, help="Use splitK kernels"
     )
-    # parser.add_argument("-inst", "--instance", type=int, default = 0, help="kernel instance to be tuned: 0 means all instance, 1 means ck instance, 2 means asm instance")
+
     parser.add_argument(
         "--sort",
         action="store_true",

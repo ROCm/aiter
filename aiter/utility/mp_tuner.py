@@ -33,7 +33,6 @@ def worker(
         us = float("inf")
         try:
             res, us = run_perftest(func, *args, **kwargs)
-            print(f"{info} result us is {us}, gpuId is {gpuID}")
             us = round(us, 4)
         except RuntimeError:
             print(f" info:{info}\t No support")
