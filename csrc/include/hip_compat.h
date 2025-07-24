@@ -21,9 +21,9 @@
 #endif
 
 #ifndef USE_ROCM
-#define WARP_SIZE 32
+constexpr int WARP_SIZE = 32;
 #else
-#define WARP_SIZE ck_tile::get_warp_size()
+constexpr int WARP_SIZE = ck_tile::get_warp_size();
 #endif
 
 #ifndef USE_ROCM
