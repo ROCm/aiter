@@ -290,6 +290,7 @@ def la_persistent(
     else:
         current_pid = tl.program_id(0)
 
+    tl.assume(current_pid >=0)
     if current_pid < high_load_wgs:
         iter = max_tiles_per_wg * current_pid
         cta_end_tile_gid = iter + max_tiles_per_wg
@@ -299,11 +300,29 @@ def la_persistent(
         ) + high_load_wgs * max_tiles_per_wg
         cta_end_tile_gid = iter + (max_tiles_per_wg - 1)
 
+    tl.assume(cta_end_tile_gid >= 0)
+    tl.assume(stride_qm>0)  # n_ctx_q
+    tl.assume(stride_qh>0)  # Head
+    tl.assume(stride_qk>0)  # head_dim
+    tl.assume(stride_kn>0)
+    tl.assume(stride_kh>0)
+    tl.assume(stride_kk>0)
+    tl.assume(stride_vn>0)
+    tl.assume(stride_vh>0)
+    tl.assume(stride_vk>0)
+    tl.assume(stride_om>0)  # n_ctx_q
+    tl.assume(stride_oh>0)  # Head
+    tl.assume(stride_on>0)  # head_dim
+    tl.assume(stride_oph>0)  # total_programs
+    tl.assume(stride_opm>0)  # n_ctx_q
+    tl.assume(stride_opn>0)  # head_dim
+
     # Loop context length
     while iter < cta_end_tile_gid:
         # Calculate index of current head output tile
         # The tiles_per_head is the sum of # BLOCK_N in K/V sequence of all batches
         tile_head_idx = iter // tiles_per_head
+        tl.assume(tile_head_idx>=0)
 
         # To generate an otuput tile, a loop over [tile_iter, tile_iter_end) lean tiles is needed
         # [tile_iter, tile_iter_end) are in the form of global tile id
@@ -348,6 +367,7 @@ def la_persistent(
         # Local lean tile ID within a loop of an output tile
         local_iter = iter - tile_iter
         local_iter_end = tl.minimum(tile_iter_end, cta_end_tile_gid) - tile_iter
+        tl.assume(local_iter >=0)
 
         if iter == tile_iter:
             host_block = True
@@ -372,6 +392,7 @@ def la_persistent(
                 b_seq_size = tl.load(
                     batch_num_block_n + tile_batch_idx - 1
                 )  # Previous batch size
+        tl.assume(b_seq_size >= 0)
 
         k_offs = (
             (b_seq_size + local_iter) * BLOCK_N * stride_kn
