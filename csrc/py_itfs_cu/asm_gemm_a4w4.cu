@@ -114,7 +114,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
             {
                 std::vector<int> splitK_list =
                     (log2_k_split.has_value() && cfg.splitK)
-                        ? std::vector<int>{2 ^ log2_k_split.value()}
+                        ? std::vector<int>{1 << log2_k_split.value()}
                         : (cfg.splitK ? std::vector<int>{2, 4, 8, 16} : std::vector<int>{1});
 
                 for(auto& splitK : splitK_list)
@@ -123,30 +123,25 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                     int tg_num_N         = (N + cfg.tile_N - 1) / cfg.tile_N;
                     tg_num               = tg_num_M * tg_num_N * splitK;
                     uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
-                    if(local_round < round)
+
+                    if(local_round < round ||
+                       (local_round == round && empty_cu > (local_round * num_cu - tg_num)))
                     {
                         round              = local_round;
                         empty_cu           = local_round * num_cu - tg_num;
                         selectedKernelName = el.first;
                         selectedsplitK     = splitK;
                     }
-                    else if(local_round == round)
-                    {
-                        if(empty_cu > (local_round * num_cu - tg_num))
-                        {
-                            round              = local_round;
-                            empty_cu           = local_round * num_cu - tg_num;
-                            selectedKernelName = el.first;
-                            selectedsplitK     = splitK;
-                        }
-                    }
                 }
             }
         }
     }
-    TORCH_CHECK(selectedKernelName != "", __func__, ": cannot get heuristic kernel!");
 
-    return std::make_tuple(selectedKernelName, std::log2(selectedsplitK));
+    TORCH_CHECK(selectedKernelName != "", __func__, ": cannot get heuristic kernel!");
+    int log2_result = 0;
+    while(selectedsplitK >>= 1)
+        ++log2_result;
+    return std::make_tuple(selectedKernelName, log2_result);
 }
 
 // A4W4 asm gemm kernel
@@ -219,11 +214,9 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
     int selectedksplit = log2_k_split.has_value() ? log2_k_split.value() : 0;
     if(kernelName.empty())
     {
-        if(heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle)) !=
-           heuristic_kernel_dict.end())
+        auto it = heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
+        if(it != heuristic_kernel_dict.end())
         {
-            auto it =
-                heuristic_kernel_dict.find(DictKey(Mdim, Ndim, Kdim, log2_k_split, bpreshuffle));
             auto res       = it->second;
             kernelName     = std::get<0>(res);
             selectedksplit = std::get<1>(res);
@@ -235,7 +228,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
             kernelName     = std::get<0>(it);
             selectedksplit = std::get<1>(it);
             heuristic_kernel_dict[{Mdim, Ndim, Kdim, log2_k_split, bpreshuffle}] =
-                std::make_tuple(kernelName, std::log2(selectedksplit));
+                std::make_tuple(kernelName, selectedksplit);
         }
     }
 

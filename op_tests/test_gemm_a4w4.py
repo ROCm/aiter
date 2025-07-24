@@ -120,7 +120,7 @@ def test_gemm(dtype, M, N, K):
         "",  # kernelName
         bias_f32,
         bpreshuffle=True,
-        # log2_k_split=0,
+        log2_k_split=0,
     )
 
     err_c = checkAllclose(a, c[:M], msg="asm no splitK  ")
