@@ -363,27 +363,16 @@ void fmoe(torch::Tensor& out,               // [token_cnt, dim]
 {
     // g1u0
     FMoeKernel* impl_ptr = nullptr;
-    CFG* config_map      = nullptr;
-    if(input.dtype() == at::ScalarType::Half) // fp16
+    if(input.dtype() == at::ScalarType::Half)
     {
-        if(activation == ActivationType::Silu)
-            config_map = &cfg_fmoe_fp16_noquant_g1u0_silu;
-        else if(activation == ActivationType::Gelu)
-            config_map = &cfg_fmoe_fp16_noquant_g1u0_gelu;
-        else
-            TORCH_CHECK(false, __func__, ": unsupport current activation type:");
+        static FMoeKernel impl_f16("fmoe_kernel_func", "fmoe_f16.co");
+        impl_ptr = &impl_f16;
     }
-    else if(input.dtype() == at::ScalarType::BFloat16) // bf16
+    else if(input.dtype() == at::ScalarType::BFloat16)
     {
-        if(activation == ActivationType::Silu)
-            config_map = &cfg_fmoe_bf16_noquant_g1u0_silu;
-        else if(activation == ActivationType::Gelu)
-            config_map = &cfg_fmoe_bf16_noquant_g1u0_gelu;
-        else
-            TORCH_CHECK(false, __func__, ": unsupport current activation type");
+        static FMoeKernel impl_b16("fmoe_kernel_func", "fmoe_b16.co");
+        impl_ptr = &impl_b16;
     }
-    impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map);
-
     TORCH_CHECK(
         impl_ptr != nullptr, __func__, ": unsupport current input type:", input.scalar_type());
     impl_ptr->launch_kernel<uint16_t, uint16_t>(out,
