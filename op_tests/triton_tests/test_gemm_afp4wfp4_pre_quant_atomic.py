@@ -7,11 +7,21 @@ from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_qu
 SCALE_GROUP_SIZE = 32
 
 
-def generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K):
+def generate_gemm_afp4wfp4_pre_quant_inputs(
+    M: int,
+    N: int,
+    K: int,
+    output: bool,
+    layout: str = "TN",
+):
     torch.manual_seed(5)
     # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
-    x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+    if layout[0] == "T":
+        x_low = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (M, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        x_low = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
+        x_high = torch.randint(0, 16, (K // 2, M), dtype=torch.uint8, device="cuda").T
     x = x_low | x_high << 4
     x_scales = torch.randint(
         124, 128, (K // SCALE_GROUP_SIZE, M), dtype=torch.uint8, device="cuda"
@@ -24,8 +34,12 @@ def generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K):
     x = x_f32.to(torch.bfloat16)
 
     # x = torch.rand((B, M, K), dtype=torch.bfloat16, device="cuda")
-    w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
-    w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+    if layout[1] == "N":
+        w_low = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+        w_high = torch.randint(0, 16, (N, K // 2), dtype=torch.uint8, device="cuda")
+    else:
+        w_low = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
+        w_high = torch.randint(0, 16, (K // 2, N), dtype=torch.uint8, device="cuda").T
     w = w_low | w_high << 4
     # Scale of 1.0 in e8m0, bias 127.
     w_scales = torch.randint(
@@ -33,7 +47,11 @@ def generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K):
     )
     w_scales = w_scales.T
 
-    return x, w, x_scales, w_scales
+    y = None
+    if output:
+        y = torch.zeros((M, N), device=x.device, dtype=torch.float32)
+
+    return x, w, x_scales, w_scales, y
 
 
 def get_x_vals():
@@ -71,7 +89,7 @@ def get_x_vals():
     x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(32, 512, 7168)]
-    x_vals += [(1, 1, 32)]  # minimal case
+    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
     x_vals += [(1, 1280, 8192)]
     return x_vals
 
@@ -132,14 +150,14 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
     if M == 4864 and N == 8192 and K == 4160:
         pytest.skip("Skipping this config. due to compilation error.")
 
-    x, w, _, w_scales = generate_gemm_afp4wfp4_pre_quant_inputs(M, N, K)
-
+    x, w, _, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(
+        M, N, K, output=output
+    )
     if output:
-        out = torch.zeros((M, N), device=x.device, dtype=torch.float32)
-        out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, out).to(dtype)
+        y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, y).to(dtype)
     else:
-        out = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
+        y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
 
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
-    torch.testing.assert_close(torch_out, out)
+    torch.testing.assert_close(torch_out, y)

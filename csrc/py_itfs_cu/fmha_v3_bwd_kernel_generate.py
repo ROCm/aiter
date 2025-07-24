@@ -1522,7 +1522,7 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
                             }}
                         }}
                     }}
-                    else if(((t.mask_type == mask_enum::mask_top_left || t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left > 0) || (a.window_size_right > 0))) || (t.mask_type == mask_enum::window_generic)){{
+                    else if((t.is_group_mode == false) && ((t.mask_type == mask_enum::mask_top_left || t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left > 0) || (a.window_size_right > 0))) || (t.mask_type == mask_enum::window_generic)){{
                         if((t.is_v3_atomic_fp32 == true) && (a.nhead_stride_dq_acc >= a.stride_dq_acc /*dq_acc only support BHSD*/)){{
                             if((a.seqlen_q % 64 == 0) && (a.hdim_q == 128)){{
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, false>;
@@ -2020,7 +2020,7 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
                             }}
                         }}
                     }}
-                    else if(((t.mask_type == mask_enum::mask_top_left || t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left > 0) || (a.window_size_right > 0))) || (t.mask_type == mask_enum::window_generic)){{
+                    else if((t.is_group_mode == false) && ((t.mask_type == mask_enum::mask_top_left || t.mask_type == mask_enum::mask_bottom_right) && ((a.window_size_left > 0) || (a.window_size_right > 0))) || (t.mask_type == mask_enum::window_generic)){{
                         if((t.is_v3_atomic_fp32 == true) && (a.nhead_stride_dq_acc >= a.stride_dq_acc /*dq_acc only support BHSD*/)){{
                             if(t.how_v3_bf16_cvt == 0){{
                                 if((a.seqlen_q % 64 == 0) && (a.hdim_q == 128)){{

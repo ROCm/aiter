@@ -302,19 +302,21 @@
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
 
-#define GEMM_A4W4_ASM_PYBIND                     \
-    m.def("gemm_a4w4_asm",                       \
-          &gemm_a4w4_asm,                        \
-          "Asm gemm a4w4",                       \
-          py::arg("A"),                          \
-          py::arg("B"),                          \
-          py::arg("A_scale"),                    \
-          py::arg("B_scale"),                    \
-          py::arg("out"),                        \
-          py::arg("bias")        = std::nullopt, \
-          py::arg("alpha")       = 1.0,          \
-          py::arg("beta")        = 0.0,          \
-          py::arg("bpreshuffle") = true);
+#define GEMM_A4W4_ASM_PYBIND                      \
+    m.def("gemm_a4w4_asm",                        \
+          &gemm_a4w4_asm,                         \
+          "Asm gemm a4w4",                        \
+          py::arg("A"),                           \
+          py::arg("B"),                           \
+          py::arg("A_scale"),                     \
+          py::arg("B_scale"),                     \
+          py::arg("out"),                         \
+          py::arg("kernelName"),                  \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alpha")        = 1.0,          \
+          py::arg("beta")         = 0.0,          \
+          py::arg("bpreshuffle")  = true,         \
+          py::arg("log2_k_split") = std::nullopt);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -653,6 +655,18 @@
           py::arg("need_renorm"),                                                             \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
           "Apply biased grouped topk softmax to the gating outputs.");                        \
+    m.def("moe_fused_gate",                                                                   \
+          &moe_fused_gate,                                                                    \
+          py::arg("input"),                                                                   \
+          py::arg("bias"),                                                                    \
+          py::arg("topk_weights"),                                                            \
+          py::arg("topk_ids"),                                                                \
+          py::arg("num_expert_group"),                                                        \
+          py::arg("topk_group"),                                                              \
+          py::arg("topk"),                                                                    \
+          py::arg("n_share_experts_fusion"),                                                  \
+          py::arg("routed_scaling_factor") = 1.0,                                             \
+          "Apply biased grouped topk softmax to the gating outputs.");                        \
     m.def("moe_align_block_size",                                                             \
           &aiter::moe_align_block_size,                                                       \
           "Aligning the number of tokens to be processed by each expert such "                \
@@ -829,23 +843,32 @@
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
     m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
-#define QUANT_PYBIND                                                     \
-    m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);   \
-    m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant); \
-    m.def("dynamic_per_token_scaled_quant",                              \
-          &aiter::dynamic_per_token_scaled_quant,                        \
-          py::arg("out"),                                                \
-          py::arg("input"),                                              \
-          py::arg("scales"),                                             \
-          py::arg("scale_ub")      = std::nullopt,                       \
-          py::arg("shuffle_scale") = true);                              \
-    m.def("dynamic_per_group_scaled_quant_fp4",                          \
-          &aiter::dynamic_per_group_scaled_quant_fp4,                    \
-          py::arg("out"),                                                \
-          py::arg("input"),                                              \
-          py::arg("scales"),                                             \
-          py::arg("group_size")    = 32,                                 \
-          py::arg("shuffle_scale") = true);
+#define QUANT_PYBIND                                                       \
+    m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);     \
+    m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant);   \
+    m.def("dynamic_per_token_scaled_quant",                                \
+          &aiter::dynamic_per_token_scaled_quant,                          \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("scales"),                                               \
+          py::arg("scale_ub")        = std::nullopt,                       \
+          py::arg("shuffle_scale")   = false,                              \
+          py::arg("num_rows")        = std::nullopt,                       \
+          py::arg("num_rows_factor") = 1);                                 \
+    m.def("dynamic_per_group_scaled_quant_fp4",                            \
+          &aiter::dynamic_per_group_scaled_quant_fp4,                      \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("scales"),                                               \
+          py::arg("group_size")    = 32,                                   \
+          py::arg("shuffle_scale") = true,                                 \
+          py::arg("num_rows")        = std::nullopt,                       \
+          py::arg("num_rows_factor") = 1);                                 \
+    m.def("partial_transpose",                                             \
+          &aiter::partial_transpose,                                       \
+          py::arg("out"),                                                  \
+          py::arg("input"),                                                \
+          py::arg("num_rows"));
 
 #define RMSNORM_PYBIND                                                                             \
     m.def("rms_norm_cu",                                                                           \

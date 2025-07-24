@@ -136,12 +136,6 @@ def run_shape_benchmark(args):
 def parse_args():
     parser = get_parser("MXFP4 x MXFP4 GEMM")
     parser = add_argparse_ff(parser)
-
-    parser.add_argument(
-        "--print_vgpr",
-        action="store_true",
-        help="Print VGPR usage for Triton kernels.",
-    )
     return get_ff_args(parser)
 
 

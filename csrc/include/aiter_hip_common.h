@@ -111,3 +111,16 @@ public:
                                        0, kargs.stream, nullptr, (void **)&config));
     };
 };
+
+static const uint32_t get_num_cu_func()
+{
+    auto get_num_cu_local = [](){
+        hipDevice_t dev;
+        hipDeviceProp_t dev_prop;
+        HIP_CALL(hipGetDevice(&dev));
+        HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+        return dev_prop.multiProcessorCount;
+    };
+    static const uint32_t num_cu = get_num_cu_local();
+    return num_cu;
+}
