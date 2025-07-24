@@ -131,7 +131,7 @@ def fused_moe(
         )
     run_1stage = M < 256
     # run_1stage = quant_type in [QuantType.per_128x128, QuantType.per_1x32]
-    run_1stage = quant_type in [QuantType.per_128x128]
+    run_1stage = quant_type in [QuantType.per_128x128,QuantType.per_Token]
     block_size_M = 32 if run_1stage else block_size_M
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
