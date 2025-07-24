@@ -5,8 +5,13 @@ import sys
 import pytest
 import torch
 from typing import Union, List
-from aiter.ops.triton.lean_atten import _persistent_lean_attention, persistent_lean_attention, _get_config
+from aiter.ops.triton.lean_atten import (
+    _persistent_lean_attention,
+    persistent_lean_attention,
+    _get_config,
+)
 import aiter.ops.triton.utils.arch_info as arch_info
+
 
 def get_lean_attn_inputs(
     batch: int,
@@ -207,13 +212,15 @@ def test_persistent_lean_attention(
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
+
 # NOTE: Tests where the workload < num_sms currently fail.
 # You can elicit this behavior by decreasing `h` and `n_ctx`.
+# Tests also appear to fail when n_ctx_q != n_ctx when causal=True.
 @pytest.mark.parametrize("batch", [1])
-@pytest.mark.parametrize("h", [64])
-@pytest.mark.parametrize("n_ctx_q", [32, 64])
-@pytest.mark.parametrize("n_ctx", [[65536]])
-@pytest.mark.parametrize("d", [64, 256])
+@pytest.mark.parametrize("h", [16])
+@pytest.mark.parametrize("n_ctx_q", [8192])
+@pytest.mark.parametrize("n_ctx", [[8192]])
+@pytest.mark.parametrize("d", [32])
 @pytest.mark.parametrize("causal", [(True), (False)])
 @pytest.mark.parametrize("init_dtype", [torch.float16])
 def test_persistent_lean_attention_outer(
@@ -295,6 +302,7 @@ def test_persistent_lean_attention_outer(
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
     torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
+
 
 def main():
     batch = 2

@@ -29,6 +29,7 @@ import triton.language as tl
 
 LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 
+
 @functools.lru_cache(maxsize=1024)
 def _get_config(
     causal: bool,
@@ -59,7 +60,7 @@ def persistent_lean_attention(
     batch_size: int,
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
-    config: Optional[dict] = None, 
+    config: Optional[dict] = None,
 ):
     """
     Lean Attention kernel.
@@ -528,10 +529,9 @@ def la_persistent(
             m_i = m_ij.to(m_i.dtype)
 
             if (
-                ((l_iter == (tile_iter_end - tile_iter) - 1)
-                and (iter == tile_iter_end - 1))
-                and (MASKED_BLOCKS == 2)
-            ):
+                (l_iter == (tile_iter_end - tile_iter) - 1)
+                and (iter == tile_iter_end - 1)
+            ) and (MASKED_BLOCKS == 2):
                 mask1 = offs_m >= BLOCK_SIZE_N
                 m_i = tl.where(mask1, m_i, float("-inf"))
                 l_i = tl.where(mask1, l_i, 1.0)
