@@ -256,6 +256,7 @@ def _flash_attn_forward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def can_impl_fmha_v3_fwd():
         # basic
@@ -268,6 +269,8 @@ def _flash_attn_forward(
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
+        ret &= not swa
+        ret &= q.dtype == dtypes.bf16
         ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942")
         return ret
 
@@ -425,7 +428,7 @@ def _flash_attn_backward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = not causal and (window_size_left > 0 or window_size_right > 0)
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -561,7 +564,6 @@ def _flash_attn_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= mask or nmask or swa
         ret &= np() or pssk() or pddv() or psskddv()
         return ret
 

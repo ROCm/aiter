@@ -262,7 +262,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{get_asm_dir()}/f4gemm/codegen.py --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
@@ -281,6 +281,7 @@
             "f'{AITER_CSRC_DIR}/pybind/moe_op_pybind.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels.cu'",
             "f'{AITER_CSRC_DIR}/kernels/topk_softmax_kernels_group.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/moe_fused_gate.cu'",
             "f'{AITER_CSRC_DIR}/kernels/moe_align_block_size_kernels.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmoe.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_moe_2stage.cu'"
@@ -327,7 +328,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-DCK_TILE_WA_ISSUE_2028=0'"
+            "'-DCK_TILE_WA_ISSUE_2028=0'",
+            "'-DMOE_SORTING_FMOE_2D_BUF'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
