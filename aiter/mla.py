@@ -9,7 +9,6 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
-from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -95,37 +94,13 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache(maxsize=1)
-def get_kv_splits_indptr(num_kv_splits, bs, device):
-    """
-    Returns the kv_splits_indptr tensor for the given number of kv splits.
-    """
-    num_kv_splits = min(16, max(1, num_kv_splits))
-    kv_splits_indptr = torch.arange(
-        0, (bs + 1) * num_kv_splits, num_kv_splits, device=device, dtype=torch.int32
-    )
-    return kv_splits_indptr
-
-
 @functools.lru_cache()
-def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, device):
+def get_meta_param(num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q):
     if num_kv_splits is None:
-        cu_num = get_cu_num()
-        avg_kv = total_kv / bs
-        overhead = 84.1
-        tmp = [
-            (
-                bs
-                * i
-                / ((bs * i + cu_num - 1) // cu_num * cu_num)
-                * avg_kv
-                / (avg_kv + overhead * i),
-                i,
-            )
-            for i in range(1, 17)
-        ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
-        # num_kv_splits = min(16, max(1, cu_num // bs))
+        (kv_splits_indptr, max_splits) = aiter.get_mla_metadata_v0(
+            kv_indptr, nhead // nhead_kv, nhead_kv
+        )
+        num_kv_splits = max_splits.item()
 
     get_mgc = {16: 16, 128: 16}
 
@@ -133,7 +108,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, device):
     mgc = get_mgc[nhead]
     if max_seqlen_q == 1 and nhead == 16:
         mgc = 64
-    return num_kv_splits, get_kv_splits_indptr(num_kv_splits, bs, device), mgc
+    return num_kv_splits, kv_splits_indptr, mgc
 
 
 def mla_decode_fwd(
@@ -160,9 +135,26 @@ def mla_decode_fwd(
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
+    test_v1 = False
+    if test_v1:
+        (
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        ) = aiter.get_mla_metadata_v1(
+            qo_indptr, kv_indptr, nhead // nhead_kv, nhead_kv, True
+        )
+        print(work_indptr)
+        print(work_info_set)
+        print(reduce_indptr)
+        print(reduce_final_map)
+        print(reduce_partial_map)
+
     if num_kv_splits is None:
         num_kv_splits, num_kv_splits_indptr, mgc = get_meta_param(
-            num_kv_splits, bs, total_kv, nhead, max_seqlen_q, device
+            num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q
         )
     else:
         assert (
