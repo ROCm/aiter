@@ -25,6 +25,7 @@ It supports page size = 1.
 
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.arch_info import get_arch
 
 
 def is_hip():
@@ -434,6 +435,8 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        if get_arch() == "gfx950":
+            extra_kargs["kpack"] = 1
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](
@@ -547,6 +550,8 @@ def _decode_softmax_reducev_fwd(
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+        if get_arch() == "gfx950":
+            extra_kargs["kpack"] = 1
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](

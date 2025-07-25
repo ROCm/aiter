@@ -32,6 +32,7 @@ import torch
 from aiter.ops.triton.activation import _tanh
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 
 
 @triton.jit
@@ -61,6 +62,7 @@ def _fwd_grouped_kernel_stage1_rope(
     qk_rope_head_dim: tl.constexpr,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
+    batch: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -70,9 +72,17 @@ def _fwd_grouped_kernel_stage1_rope(
     USE_ROPE: tl.constexpr,
     IS_NEOX_STYLE: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
-    cur_head_id = tl.program_id(1)
-    split_kv_id = tl.program_id(2)
+    pid = tl.program_id(0)
+    # pid = remap_xcd(pid, q_head_num * NUM_KV_SPLITS * batch)
+    num_q_head_blk = tl.cdiv(q_head_num, BLOCK_H)
+
+    pid_head_kv_split = pid % (num_q_head_blk * NUM_KV_SPLITS)
+    pid_head_kv_split = remap_xcd(pid_head_kv_split, (num_q_head_blk * NUM_KV_SPLITS))
+
+    cur_head_id = pid_head_kv_split % num_q_head_blk
+    split_kv_id = (pid_head_kv_split // num_q_head_blk) % NUM_KV_SPLITS
+
+    cur_batch = (pid // (num_q_head_blk * NUM_KV_SPLITS)) % batch
 
     if BLOCK_H < kv_group_num:
         VALID_BLOCK_H: tl.constexpr = BLOCK_H
@@ -334,9 +344,9 @@ def _decode_grouped_att_m_fwd_rope(
 
     config["NUM_KV_SPLITS"] = num_kv_splits
     grid = (
-        batch,
-        triton.cdiv(head_num, min(config["BLOCK_H"], kv_group_num)),
-        config["NUM_KV_SPLITS"],
+        triton.cdiv(head_num, min(config["BLOCK_H"], kv_group_num))
+        * batch
+        * config["NUM_KV_SPLITS"],
     )
 
     _fwd_grouped_kernel_stage1_rope[grid](
@@ -365,6 +375,7 @@ def _decode_grouped_att_m_fwd_rope(
         qk_rope_head_dim,
         kv_group_num=kv_group_num,
         q_head_num=head_num,
+        batch=batch,
         logit_cap=logit_cap,
         USE_ROPE=use_rope,
         IS_NEOX_STYLE=is_neox_style,
@@ -385,9 +396,18 @@ def _fwd_kernel_stage2(
     NUM_KV_SPLITS: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
+    batch: tl.constexpr,
+    head_num: tl.constexpr,
 ):
-    cur_batch = tl.program_id(0)
-    cur_head = tl.program_id(1)
+    pid = tl.program_id(0)
+
+    # cur_head = pid % head_num
+    # # cur_head = remap_xcd(cur_head, head_num)
+    # cur_batch = (pid // head_num) % batch
+
+    pid = remap_xcd(pid, batch * head_num)
+    cur_batch = pid % batch
+    cur_head = (pid // batch) % head_num
 
     cur_batch_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(
         kv_indptr + cur_batch
@@ -445,7 +465,7 @@ def _decode_softmax_reducev_fwd(
 
     config["NUM_KV_SPLITS"] = num_kv_splits
 
-    grid = (batch, head_num)
+    grid = (batch * head_num,)
     _fwd_kernel_stage2[grid](
         logits,
         o,
@@ -456,6 +476,8 @@ def _decode_softmax_reducev_fwd(
         o.stride(0),
         o.stride(1),
         Lv=Lv,
+        head_num=head_num,
+        batch=batch,
         **config,
     )
 

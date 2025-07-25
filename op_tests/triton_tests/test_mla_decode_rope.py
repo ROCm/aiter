@@ -29,16 +29,31 @@ def input_helper(
     rope_base=10,
     rope_max_seq_len=16324,
     rope_scaling=1.0,
+    equal_seqlens=False,
     is_neox_style=True,
 ):
+    if not equal_seqlens:
+        seqlens = torch.randint(1, S + 1, (B,), dtype=torch.int32, device=device)
+    else:
+        seqlens = torch.full((B,), S, dtype=torch.int32, device=device)
+
+    cu_seqlens = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            seqlens.cumsum(dim=0, dtype=torch.int32),
+        ]
+    )
+
+    total_seqlen = cu_seqlens[-1]
+
     q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
     kv_cache = torch.randn(
-        B * S, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+        total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
     )
 
     # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
-    kv_indptr = torch.arange(B + 1, device=device) * S
-    kv_indices = torch.arange(B * S, device=device)
+    kv_indptr = cu_seqlens
+    kv_indices = torch.arange(total_seqlen, device=device)
 
     attn_logits = torch.empty(
         B, H, num_kv_splits, kv_lora_rank + 1, dtype=dtype, device=device
@@ -59,7 +74,9 @@ def input_helper(
         torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1)
     )  # k positions and q position as last
 
-    return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions
+    o = torch.empty(B, H, kv_lora_rank, dtype=dtype, device=device)
+
+    return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, o
 
 
 def ref_preprocess(kv_cache, kv_lora_rank):
@@ -218,7 +235,7 @@ def test_op_fwd_rope(
 ):
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
             B,
             H,
@@ -317,7 +334,7 @@ def test_op_fwd_rope_neox(
 ):
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
             B,
             H,
