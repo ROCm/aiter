@@ -358,8 +358,7 @@ void fmoe(torch::Tensor& out,               // [token_cnt, dim]
           torch::Tensor& sorted_weights,    // [max_num_tokens_padded]
           torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
           torch::Tensor& num_valid_ids,     // [1]
-          uint32_t topk,                    //
-          ActivationType activation)
+          uint32_t topk)
 {
     // g1u0
     FMoeKernel* impl_ptr = nullptr;
