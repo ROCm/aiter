@@ -21,6 +21,10 @@ from csrc.cpp_itfs.sampling.top_k_top_p_sampling_from_probs import (
     top_k_top_p_sampling_from_probs,
 )
 
+from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
+    top_k_renorm_probs,
+)
+
 torch.set_default_device("cuda")
 
 
@@ -29,6 +33,34 @@ def _to_tensor_scalar_tuple(x):
         return (x, 0)
     else:
         return (None, x)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 100, 500])
+def test_top_k_renorm_probs(batch_size, vocab_size, k):
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    pivot = sorted_prob[:, k - 1]
+    mask = (normalized_prob >= pivot.unsqueeze(-1)).int()
+    renorm_prob_ground_truth = normalized_prob.clone()
+    renorm_prob_ground_truth[mask == 0] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    renorm_prob = top_k_renorm_probs(normalized_prob, *_to_tensor_scalar_tuple(k))
+    for i in range(batch_size):
+        torch.testing.assert_close(
+            renorm_prob_ground_truth[i],
+            renorm_prob[i],
+            rtol=1e-3,
+            atol=1e-3,
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -75,4 +107,5 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
 
 if __name__ == "__main__":
-    test_top_k_top_p_joint_sampling_from_probs(1, 111, 0.1)
+    # test_top_k_top_p_joint_sampling_from_probs(1, 111, 0.1)
+    test_top_k_renorm_probs(1, 111, 10)

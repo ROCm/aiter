@@ -299,9 +299,6 @@
      BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
           .SubtractLeft(greater_than_u, greater_than_u_diff, BoolDiffOp{});
 
-    // BlockAdjacentDifference<bool, BLOCK_THREADS>(temp_storage->block_prim.adj_diff)
-    //      .FlagHeads<VEC_SIZE>(greater_than_u_diff, greater_than_u, BoolDiffOp{}, 0);
-
      __syncthreads();
  
  #pragma unroll
@@ -917,32 +914,6 @@
        })});
    return hipSuccess;
  }
-
-//  template <typename T, typename IdType>
-//  hipError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, IdType* output,
-//                                       IdType* indices, uint32_t batch_size, IdType top_k_val,
-//                                       T top_p_val, uint32_t d, bool deterministic,
-//                                       uint64_t philox_seed, uint64_t philox_offset,
-//                                       hipStream_t stream = 0) {
-//     const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
- 
-//     const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-//     dim3 nblks(batch_size);
-//     dim3 nthrs(BLOCK_THREADS);
-//     void* args[] = {&probs,     &top_k_arr, &top_p_arr, &output,      &indices,
-//                     &top_k_val, &top_p_val, &d,         &philox_seed, &philox_offset};
-
-//     DISPATCH_ALIGNED_VEC_SIZE(
-//         vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
-//         auto kernel = TopKTopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
-//                                                     VEC_SIZE, DETERMINISTIC, T, IdType>;
-
-//             hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        
-//             hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
-//         })});
-//     return hipSuccess;
-//  }
  
  template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM>
  struct RenormTempStorage {
@@ -1226,24 +1197,6 @@
      hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
    });
    return hipSuccess;
- }
- 
- template <typename DType, typename IdType>
- hipError_t TopKRenormProb(DType* probs, DType* renormed_prob, IdType* top_k_arr,
-                            uint32_t batch_size, uint32_t top_k_val, uint32_t d,
-                            hipStream_t stream = 0) {
-    const uint32_t vec_size = std::gcd(16 / sizeof(DType), d);
- 
-    const uint32_t smem_size = sizeof(RenormTempStorage<BLOCK_THREADS, REDUCE_ALGO>);
-    dim3 nblks(batch_size);
-    dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs, &renormed_prob, &top_k_arr, &top_k_val, &d};
-    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-        auto kernel = TopKRenormProbKernel<BLOCK_THREADS, REDUCE_ALGO, VEC_SIZE, DType, IdType>;
-        hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
-    });
-    return hipSuccess;
  }
  
  }  // namespace sampling
