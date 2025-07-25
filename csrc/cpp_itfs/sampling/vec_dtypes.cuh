@@ -289,12 +289,8 @@
        for (size_t i = 0; i < vec_size / 2; ++i) {
          uint16_t y;
          uint32_t x = *(uint32_t*)&src[i * 2];
- #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
          __half2 x_h2 = convert_uint32_to_half2(x);
          y = convert_f16x2_to_e4m3x2(x_h2);
- #else
-         asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(y) : "r"(x));
- #endif
          *(uint16_t*)&dst[i * 2] = y;
        }
      }
@@ -315,13 +311,6 @@
    // Extract upper 16 bits
    __half h2 = __ushort_as_half((x >> 16) & 0xFFFF);
  
- #if 0
-   // Alternative with `__uint2half_rn`
-   uint16_t val1 = x & 0xFFFF;  // Lower 16 bits
-   uint16_t val2 = (x >> 16) & 0xFFFF; // Upper 16 bits
-   __half h1 = __uint2half_rn(val1);
-   __half h2 = __uint2half_rn(val2);
- #endif
  
    // Define the range of e5m2
    // Minimum representable value for e5m2
@@ -374,11 +363,7 @@
        for (size_t i = 0; i < vec_size / 2; ++i) {
          uint16_t y;
          uint32_t x = *(uint32_t*)&src[i * 2];
- #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
          y = convert_f16x2_to_e5m2x2(x);
- #else
-         asm volatile("cvt.rn.satfinite.e5m2x2.f16x2 %0, %1;" : "=h"(y) : "r"(x));
- #endif
          *(uint16_t*)&dst[i * 2] = y;
        }
      }
@@ -439,11 +424,7 @@
        for (size_t i = 0; i < vec_size / 2; ++i) {
          uint32_t y;
          uint16_t x = *(uint16_t*)&src[i * 2];
- #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
          y = convert_e4m3x2_to_f16x2(x);
- #else
-         asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(y) : "h"(x));
- #endif
          *(uint32_t*)&dst[i * 2] = y;
        }
      }
@@ -512,11 +493,7 @@
        for (size_t i = 0; i < vec_size / 2; ++i) {
          uint32_t y;
          uint16_t x = *(uint16_t*)&src[i * 2];
- #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
          y = convert_e5m2x2_to_f16x2(x);
- #else
-         asm volatile("cvt.rn.f16x2.e5m2x2 %0, %1;" : "=r"(y) : "h"(x));
- #endif
          *(uint32_t*)&dst[i * 2] = y;
        }
      }
@@ -594,11 +571,7 @@
  template <typename src_float_t, typename tgt_float_t, size_t vec_size>
  inline __attribute__((always_inline)) __device__ void cast_from_impl(vec_t<tgt_float_t, vec_size>& dst,
                                        const vec_t<src_float_t, vec_size>& src) {
- #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
    vec_cast<tgt_float_t, src_float_t>::template cast<vec_size>(
- #else
-   vec_cast<tgt_float_t, src_float_t>::cast<vec_size>(
- #endif
        dst.ptr(), const_cast<vec_t<src_float_t, vec_size>*>(&src)->ptr());
  }
  
