@@ -126,6 +126,8 @@ def get_lean_attn_inputs(
             4,
         ),  # Causal=1,
         (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 1, 4),
+        (True, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
+        (False, 1, 64, 4096, [4096], 128, 304, torch.float16, 128, 16, 3, 4),
     ],
 )
 def test_persistent_lean_attention(

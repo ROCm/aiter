@@ -2,7 +2,6 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
-from typing import Union
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32

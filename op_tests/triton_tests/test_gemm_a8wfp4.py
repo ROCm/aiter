@@ -19,7 +19,7 @@ class INPUT_TYPE(Enum):
     INCREMENTAL = "incremental"  # generate incremental pattern: row i contains value i
 
 
-INPUT_TYPE = INPUT_TYPE.ONES
+INPUT_TYPE = INPUT_TYPE.RANDOM
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
