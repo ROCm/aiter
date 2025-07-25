@@ -153,14 +153,11 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     {
         padded_m = 16;
     }
-    else if(M <= 16384)
+    else if(M <= 65536)
     {
         padded_m = nextPow2(M);
     }
-    else if(M <= 20480)
-    {
-        padded_m = 20480;
-    }
+
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({padded_m, N, K});
     // If we found an optimal kernel, use it.
