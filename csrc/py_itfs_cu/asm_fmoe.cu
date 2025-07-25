@@ -79,6 +79,7 @@ class FMoeKernel
     uint32_t sub_GU             = 512;
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
+    const char* name            = nullptr;
 
     public:
     FMoeKernel(const char* name,
@@ -94,8 +95,12 @@ class FMoeKernel
         std::cout << " Success" << std::endl;
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
+        this->name               = name;
     };
 
+    const char* get_name() const { return name; }
+    int get_num_persistent_tgs() { return num_persistent_tgs; }
+    int get_sub_GU() { return sub_GU; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <typename T, typename T_O, bool switchGxy = false>
@@ -766,23 +771,40 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
         else
             TORCH_CHECK(
                 false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
-
-        impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map, 1);
-        impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
-                                                         input,
-                                                         gate,
-                                                         down,
-                                                         sorted_token_ids,
-                                                         sorted_weights,
-                                                         sorted_expert_ids,
-                                                         num_valid_ids,
-                                                         topk,
-                                                         // quant args
-                                                         fc1_smooth_scale,
-                                                         fc1_scale,
-                                                         fc2_scale,
-                                                         fc2_smooth_scale);
     }
+    else if(gate.dtype() == torch_fp8) // fp8
+    {
+        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_pertokenFp8_g1u1_gelu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
+        else
+            TORCH_CHECK(
+                false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, "Unsupported gate dtype for fmoe_g1u1_a16");
+    }
+    impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map, 1);
+    impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
+                                                     input,
+                                                     gate,
+                                                     down,
+                                                     sorted_token_ids,
+                                                     sorted_weights,
+                                                     sorted_expert_ids,
+                                                     num_valid_ids,
+                                                     topk,
+                                                     // quant args
+                                                     fc1_smooth_scale,
+                                                     fc1_scale,
+                                                     fc2_scale,
+                                                     fc2_smooth_scale);
 }
 
 void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, dim]
