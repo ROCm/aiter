@@ -722,7 +722,7 @@
           py::arg("fc2_scale"),                                                               \
           py::arg("fc1_smooth_scale"),                                                        \
           py::arg("fc2_smooth_scale"),                                                        \
-          py::arg("activation" = ActivationType::Silu));                                      \
+          py::arg("activation") = ActivationType::Silu);                                      \
     m.def("fmoe_fp8_blockscale_g1u1",                                                         \
           &fmoe_fp8_blockscale_g1u1,                                                          \
           py::arg("out"),                                                                     \
