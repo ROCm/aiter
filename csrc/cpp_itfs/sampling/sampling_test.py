@@ -25,6 +25,11 @@ from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
     top_k_renorm_probs,
 )
 
+from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
+    top_p_sampling_from_probs,
+)
+
+
 torch.set_default_device("cuda")
 
 
@@ -33,6 +38,28 @@ def _to_tensor_scalar_tuple(x):
         return (x, 0)
     else:
         return (None, x)
+
+
+@pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
+@pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
+def test_top_p_sampling(batch_size, vocab_size, p):
+    torch.manual_seed(42)
+    eps = 1e-4
+    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    sorted_prob, indices = torch.sort(normalized_prob, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
+    mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
+
+    num_trails = 1000
+    for _ in range(num_trails):
+        samples = top_p_sampling_from_probs(
+            normalized_prob, None, *_to_tensor_scalar_tuple(p), deterministic=True
+        )
+        assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
+        assert torch.all(mask[torch.arange(batch_size), samples] == 1)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
@@ -107,5 +134,6 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
 
 if __name__ == "__main__":
-    # test_top_k_top_p_joint_sampling_from_probs(1, 111, 0.1)
+    test_top_k_top_p_joint_sampling_from_probs(1, 111, 0.1)
     test_top_k_renorm_probs(1, 111, 10)
+    test_top_p_sampling(1, 111, 0.1)

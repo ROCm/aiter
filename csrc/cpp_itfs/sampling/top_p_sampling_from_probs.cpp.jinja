@@ -1,0 +1,30 @@
+#include "sampling.cuh"
+
+
+#define FUNCTION_DEFINE                                      \
+    void {{func_name}}(void* probs_ptr,                      \
+                      void* output_ptr,                      \
+                      void* indices_ptr,                     \
+                      void* top_p_arr_ptr,                   \
+                      int batch_size,                        \
+                      float top_p_val,                       \
+                      int philox_seed,                       \
+                      int philox_offset,                     \
+                      void* stream)
+
+extern "C" {
+FUNCTION_DEFINE;
+}
+                        
+FUNCTION_DEFINE
+{
+    constexpr uint32_t vec_size = std::gcd(16 / sizeof(float), {{d}});
+ 
+    const uint32_t smem_size = sizeof(aiter::sampling::SamplingTempStorage<aiter::sampling::BLOCK_THREADS, aiter::sampling::SCAN_ALGO, aiter::sampling::REDUCE_ALGO>);
+    dim3 nblks(batch_size);
+    dim3 nthrs(aiter::sampling::BLOCK_THREADS);
+    auto kernel = aiter::sampling::TopPSamplingFromProbKernel<aiter::sampling::BLOCK_THREADS, aiter::sampling::SCAN_ALGO, aiter::sampling::REDUCE_ALGO,
+                                                vec_size, {{"true" if deterministic else "false"}}, float, int>;
+    hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    kernel<<<nblks, nthrs, smem_size, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<float*>(probs_ptr), reinterpret_cast<int*>(output_ptr), reinterpret_cast<int*>(indices_ptr), reinterpret_cast<float*>(top_p_arr_ptr), top_p_val, {{d}}, static_cast<uint64_t>(philox_seed), static_cast<uint64_t>(philox_offset));
+}

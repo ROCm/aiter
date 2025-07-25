@@ -51,7 +51,6 @@ def top_k_renorm_probs(
         renorm_probs_ptr,
         top_k_arr_ptr,
         top_k_val,
-        vocab_size,
         batch_size,
         stream,
     ) = torch_to_c_types(
@@ -59,7 +58,6 @@ def top_k_renorm_probs(
         renorm_probs,
         maybe_top_k_arr,
         top_k_val,
-        vocab_size,
         batch_size,
         torch.cuda.current_stream(),
     )

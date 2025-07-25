@@ -889,31 +889,31 @@
     return hipSuccess;
  }
  
- template <typename T, typename IdType>
- hipError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_p_arr,
-                                  uint32_t batch_size, T top_p_val, uint32_t d, bool deterministic,
-                                  uint64_t philox_seed, uint64_t philox_offset,
-                                  hipStream_t stream = 0) {
+//  template <typename T, typename IdType>
+//  hipError_t TopPSamplingFromProb(T* probs, IdType* output, IdType* indices, T* top_p_arr,
+//                                   uint32_t batch_size, T top_p_val, uint32_t d, bool deterministic,
+//                                   uint64_t philox_seed, uint64_t philox_offset,
+//                                   hipStream_t stream = 0) {
 
-   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
+//    const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
  
-   const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
-   dim3 nblks(batch_size);
-   dim3 nthrs(BLOCK_THREADS);
-   void* args[] = {&probs,     &output, &indices,     &top_p_arr,
-                   &top_p_val, &d,      &philox_seed, &philox_offset};
+//    const uint32_t smem_size = sizeof(SamplingTempStorage<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO>);
+//    dim3 nblks(batch_size);
+//    dim3 nthrs(BLOCK_THREADS);
+//    void* args[] = {&probs,     &output, &indices,     &top_p_arr,
+//                    &top_p_val, &d,      &philox_seed, &philox_offset};
  
-   DISPATCH_ALIGNED_VEC_SIZE(
-       vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
-         auto kernel = TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,
-                                                  DETERMINISTIC, T, IdType>;
+//    DISPATCH_ALIGNED_VEC_SIZE(
+//        vec_size, VEC_SIZE, {DISPATCH_DETERMINISTIC(deterministic, DETERMINISTIC, {
+//          auto kernel = TopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO, VEC_SIZE,
+//                                                   DETERMINISTIC, T, IdType>;
          
-             hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+//              hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
          
-             hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
-       })});
-   return hipSuccess;
- }
+//              hipLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
+//        })});
+//    return hipSuccess;
+//  }
  
  template <uint32_t BLOCK_THREADS, BlockReduceAlgorithm REDUCE_ALGORITHM>
  struct RenormTempStorage {
