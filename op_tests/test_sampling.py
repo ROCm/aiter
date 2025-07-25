@@ -17,18 +17,7 @@ limitations under the License.
 import pytest
 import torch
 
-from csrc.cpp_itfs.sampling.top_k_top_p_sampling_from_probs import (
-    top_k_top_p_sampling_from_probs,
-)
-
-from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
-    top_k_renorm_probs,
-)
-
-from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
-    top_p_sampling_from_probs,
-)
-
+from aiter.ops import sampling  # noqa: F401
 
 torch.set_default_device("cuda")
 
@@ -55,7 +44,7 @@ def test_top_p_sampling(batch_size, vocab_size, p):
 
     num_trails = 1000
     for _ in range(num_trails):
-        samples = top_p_sampling_from_probs(
+        samples = torch.ops.aiter.top_p_sampling_from_probs(
             normalized_prob, None, *_to_tensor_scalar_tuple(p), deterministic=True
         )
         assert torch.all(samples < vocab_size) and torch.all(samples >= 0)
@@ -80,7 +69,9 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
         dim=-1, keepdim=True
     )
 
-    renorm_prob = top_k_renorm_probs(normalized_prob, *_to_tensor_scalar_tuple(k))
+    renorm_prob = torch.ops.aiter.top_k_renorm_probs(
+        normalized_prob, *_to_tensor_scalar_tuple(k)
+    )
     for i in range(batch_size):
         torch.testing.assert_close(
             renorm_prob_ground_truth[i],
@@ -120,7 +111,7 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
     num_trails = 1000
     for _ in range(num_trails):
-        samples = top_k_top_p_sampling_from_probs(
+        samples = torch.ops.aiter.top_k_top_p_sampling_from_probs(
             normalized_prob,
             None,
             *_to_tensor_scalar_tuple(top_k_tensor),
