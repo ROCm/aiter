@@ -233,12 +233,16 @@ def _attn_fwd_inner(
     PADDED_HEAD: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    ENABLE_PIPELINING: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
+    num_stages: tl.constexpr = (
+        None if ENABLE_PIPELINING else 1
+    )  # Set num_stages==1 if we want to disable pipelining
 
     # loop over k, v, and update accumulator
 
-    for start_n in range(block_min, block_max, BLOCK_N):
+    for start_n in range(block_min, block_max, BLOCK_N, num_stages=num_stages):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
@@ -285,7 +289,7 @@ def _attn_fwd_inner(
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
-            mask = mask and causal_mask
+            mask = mask & causal_mask
 
         qk = tl.where(mask, qk, float("-inf"))
 
@@ -513,6 +517,37 @@ def _attn_fwd(
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
 
+    tl.assume(stride_qz >= 0)
+    tl.assume(stride_qh >= 0)
+    tl.assume(stride_qm >= 0)
+    tl.assume(stride_qk >= 0)
+    tl.assume(stride_kz >= 0)
+    tl.assume(stride_kh >= 0)
+    tl.assume(stride_kn >= 0)
+    tl.assume(stride_kk >= 0)
+    tl.assume(stride_vz >= 0)
+    tl.assume(stride_vh >= 0)
+    tl.assume(stride_vk >= 0)
+    tl.assume(stride_vn >= 0)
+    if IS_FP8:
+        tl.assume(stride_descale_q_z >= 0)
+        tl.assume(stride_descale_k_z >= 0)
+        tl.assume(stride_descale_v_z >= 0)
+    tl.assume(stride_oz >= 0)
+    tl.assume(stride_oh >= 0)
+    tl.assume(stride_om >= 0)
+    tl.assume(stride_on >= 0)
+    tl.assume(stride_alibi_z >= 0)
+    tl.assume(stride_alibi_h >= 0)
+    tl.assume(philox_offset_base >= 0)
+    tl.assume(stride_sd_z >= 0)
+    tl.assume(stride_sd_h >= 0)
+    tl.assume(stride_sd_m >= 0)
+    tl.assume(stride_sd_n >= 0)
+    tl.assume(stride_lse_z >= 0)
+    tl.assume(stride_lse_h >= 0)
+    tl.assume(stride_lse_m >= 0)
+
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
         cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
@@ -738,6 +773,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=True,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -795,6 +831,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=False,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
