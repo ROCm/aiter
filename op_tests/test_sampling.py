@@ -42,8 +42,8 @@ def test_top_p_sampling(batch_size, vocab_size, p):
     mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32).to(0)
     mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
 
-    num_trails = 1000
-    for _ in range(num_trails):
+    num_trials = 1000
+    for _ in range(num_trials):
         samples = torch.ops.aiter.top_p_sampling_from_probs(
             normalized_prob, None, *_to_tensor_scalar_tuple(p), deterministic=True
         )
@@ -84,14 +84,15 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 500, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5])
-def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
+@pytest.mark.parametrize("k", [10, 50])
+def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p, k):
     torch.manual_seed(42)
-    if p == 0.1:
-        k = int(vocab_size * 0.5)
-    elif p == 0.5:
-        k = int(vocab_size * 0.1)
-    else:
-        raise ValueError("p not recognized")
+    # if p == 0.1:
+    #     k = int(vocab_size * 0.5)
+    # elif p == 0.5:
+    #     k = int(vocab_size * 0.1)
+    # else:
+    #     raise ValueError("p not recognized")
     eps = 1e-4
     pre_norm_prob = torch.rand(batch_size, vocab_size)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
@@ -109,8 +110,8 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
     top_p_tensor = torch.full((batch_size,), p)
     top_k_tensor = torch.full((batch_size,), k)
 
-    num_trails = 1000
-    for _ in range(num_trails):
+    num_trials = 1000
+    for _ in range(num_trials):
         samples = torch.ops.aiter.top_k_top_p_sampling_from_probs(
             normalized_prob,
             None,
@@ -125,6 +126,6 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
 
 
 if __name__ == "__main__":
-    test_top_k_top_p_joint_sampling_from_probs(1, 111, 0.1)
-    test_top_k_renorm_probs(1, 111, 10)
-    test_top_p_sampling(1, 111, 0.1)
+    test_top_k_top_p_joint_sampling_from_probs(40, 129280, 0.6, 20)
+    # test_top_k_renorm_probs(1, 129280, 10)
+    # test_top_p_sampling(1, 129280, 0.1)
