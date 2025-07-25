@@ -49,3 +49,5 @@ __pycache__
 debug
 aiter_logs
 *.log
+.analysis
+scripts
