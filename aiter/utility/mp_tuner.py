@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+import os
 import torch
 import multiprocessing as mp
 import time
@@ -36,6 +37,11 @@ def worker(
             us = round(us, 4)
         except RuntimeError:
             print(f" info:{info}\t No support")
+
+        if us == 0:
+            print("!!!! us = 0, rerun it ")
+            res, us = run_perftest(func, *args, **kwargs)
+            us = round(us, 4)
 
         torch.cuda.synchronize()
         if ref is not None:
@@ -136,11 +142,20 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     rets = []
     shape_grouped = isinstance(tasks, list)
     solutions = 1 if not shape_grouped else kernels_num
+    # print(f"shape_grouped = {shape_grouped}, solutions = {solutions}")
     for i in range(solutions):
         info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref_noused, *rest = (
             group_task[i]
         )
-        work_args = (info, func, input_data + args, kwargs, ref, *rest)
+        ref_func = ref_func if not fast_mode else None
+        work_args = (
+            info,
+            func,
+            input_data + args,
+            kwargs,
+            ref,
+            *rest,
+        )
         ret = worker(gpuIDMap, *work_args, tol_err_ratio=err_ratio)
         rets.append(ret)
 
@@ -153,8 +168,15 @@ def mp_tuner(
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
-    pool = mp.Pool(processes=mp_num)
-    pids = [pool.apply_async(get_pid) for i in range(mp_num)]
+
+    ##if mp_num > 1, gpu 0 do not participate in tuning, as the primary gpu.
+    parallel_num = mp_num - 1 if mp_num > 1 else 1
+    start_idx = 1 if mp_num > 1 else 0
+    if mp_num == 1:
+        shape_grouped = True
+    pool = mp.Pool(processes=parallel_num)
+
+    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     # time.sleep(2)
     task_group = []
     # dispatch per shape to one pid
@@ -168,7 +190,7 @@ def mp_tuner(
             start = end + 1
     else:
         task_group = tasks
-    gpu_map = {el.get(): i for i, el in enumerate(pids)}
+    gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     # to get index of input data for task_group
     import numpy as np
 
@@ -178,7 +200,6 @@ def mp_tuner(
         ref_data_index = np.searchsorted(
             cumulative, np.arange(len(task_group)), side="right"
         )
-        gpu_map = {el.get(): i for i, el in enumerate(pids)}
     rets = [
         pool.apply_async(
             work_group,

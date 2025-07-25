@@ -29,19 +29,19 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 
 @functools.lru_cache(maxsize=1024)
-def get_CKGEMM_config(M: int, N: int, K: int):
-    if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
-        ckgemm_dict = pd.read_csv(
+def get_GEMM_config(M: int, N: int, K: int):
+    if not hasattr(get_GEMM_config, "gemm_dict"):
+        gemm_dict = pd.read_csv(
             f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv"
         ).drop_duplicates()
-        get_CKGEMM_config.ckgemm_dict = ckgemm_dict.set_index(
+        get_GEMM_config.gemm_dict = gemm_dict.set_index(
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
     cu_num = get_cu_num()
-    config = get_CKGEMM_config.ckgemm_dict.get((cu_num, M, N, K), None)
+    config = get_GEMM_config.gemm_dict.get((cu_num, M, N, K), None)
     if config is not None:
         logger.info(
-            f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
+            f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}!"
         )
     return config
 
@@ -71,7 +71,7 @@ def gemm_a4w4(
         raise RuntimeError(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
         )
-    ck_config = get_CKGEMM_config(m, n, k)
+    ck_config = get_GEMM_config(m, n, k)
     splitK = 0
     kernelName = ""
     if ck_config is not None:
@@ -120,8 +120,8 @@ def gemm_a4w4_blockscale(
     WQ: Tensor,  # WQ:[N, K/2] f4x2
     x_scale: Tensor,  # x_scale:[M, K/32] e8m0 paded
     w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
-    out: Tensor,  # Out:[M, N] bf16
-    splitK: Optional[int] = 0,
+    Out: Tensor,  # Out:[M, N] bf16
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 

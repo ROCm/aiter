@@ -12,6 +12,7 @@ from gemm_a4w4_blockscale_common import kernels_list
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
+import time
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -160,7 +161,7 @@ def get_asm_kernels(file):
 def tune_gemm_list(
     untunedf,
     tunedf,
-    issorted=False,
+    issorted=True,
     useSplitK=False,
     mp_num=1,
     shape_grouped=False,
@@ -214,7 +215,10 @@ def tune_gemm_list(
                                 i,
                                 splitK,
                             ),
-                            {},
+                            {
+                                "num_warmup": 10,
+                                "num_iters": 103,
+                            },
                             run_torch,
                             (
                                 input_data[0],
@@ -266,7 +270,10 @@ def tune_gemm_list(
                                 True,
                                 splitK,
                             ),
-                            {},
+                            {
+                                "num_warmup": 10,
+                                "num_iters": 103,
+                            },
                             run_torch,
                             (
                                 input_data[0],
@@ -322,7 +329,9 @@ def tune_gemm_list(
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-    if issorted:
+    # if issorted:
+    if True:
+        print("sorted!!")
         tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
     print("Totall tuning result:")
     print(tunedf)
@@ -346,7 +355,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mp",
         type=int,
-        default=1,  # torch.cuda.device_count(),
+        default=torch.cuda.device_count(),
         help="Tuning on multiple GPUs using multiple processes",
     )
 
@@ -378,7 +387,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
+    start_time = time.time()
     tunedf = tune_gemm_list(
         untunedf, tunedf, args.sort, args.splitK, args.mp, errRatio=args.errRatio
     )
+    print("tuning_time is ", time.time() - start_time)
     tunedf.to_csv(args.tune_file, index=False)
