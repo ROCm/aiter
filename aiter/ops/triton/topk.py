@@ -13,6 +13,9 @@ import triton
 import triton.language as tl
 import triton.language.core as core
 from triton.language.standard import _log2, zeros_like
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 # 1-STAGE KERNEL (tiny rows)
@@ -385,6 +388,7 @@ def topk(
     sorted: bool = True,
     tiny_row_thresh: int = MAX_TINY_ROW,
 ):
+    _LOGGER.info(f"TOPK: x={tuple(x.shape)}, k={k}, largest={largest}, sorted={sorted}")
     if dim < 0:
         dim += x.ndim
     if dim != x.ndim - 1:

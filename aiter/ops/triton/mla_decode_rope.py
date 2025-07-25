@@ -32,6 +32,9 @@ import torch
 from aiter.ops.triton.activation import _tanh
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -519,6 +522,10 @@ def decode_attention_fwd_grouped_rope(
     o: output Tensor
 
     """
+    _LOGGER.info(
+        f"DECODE_ATTENTION_FWD_GROUPED_ROPE:  q={tuple(q.shape)}  k_buffer={tuple(k_buffer.shape)}  v_buffer={tuple(v_buffer.shape)} "
+        + f"k_pe_tokens={tuple(k_pe_tokens.shape) if k_pe_tokens is not None else None} cos_sin_cache={tuple(cos_sin_cache.shape) if cos_sin_cache is not None else None}"
+    )
     if config is None:
         config = _get_config()
 
