@@ -22,7 +22,7 @@ arg_to_torch_dtype = {
 
 
 def nonvarlen_benchmark_configs(args: argparse.Namespace):
-    batch_sizes = [1, 4, 16] if args.b == 0 else [args.b]
+    batch_sizes = [1, 4, 16] if args.B == 0 else [args.B]
     N_HEADS = [16, 48] if args.hq == 0 else [args.hq]
     seq_len_k = [163, 8192] if args.sk == 0 else [args.sk]
 
@@ -46,7 +46,7 @@ def model_benchmark_configs(args: argparse.Namespace):
     config_file = args.model_configs
     configs = get_model_configs(config_path=config_file, models=args.model)
     fa_configs = []
-    batch_size = args.b if args.b else 4
+    batch_size = args.B if args.B else 4
 
     for model_name, config in configs.items():
         num_q_heads = config["num_attention_heads"]
@@ -54,7 +54,7 @@ def model_benchmark_configs(args: argparse.Namespace):
         assert (
             num_q_heads == num_kv_heads
         ), """Grouped Query Attention benchmarking not yet supported - try using a model
-            with the same number of query and key/value heads (e.g Deepseek-V3)"""
+            with the same number of query and key/value heads (e.g deepseek-V3)"""
         qk_rope_head_dim = config.get("qk_rope_head_dim", 64)
         kv_lora_rank = config.get("kv_lora_rank", 512)
         rotary_dim = (
@@ -296,7 +296,7 @@ def str2bool(v):
 
 def parse_args():
     parser = get_parser(kernel_name="MLA Decode with RoPE")
-    parser.add_argument("-b", type=int, default=0)
+    parser.add_argument("-B", type=int, default=0, help="Batch size.")
     parser.add_argument(
         "-hq",
         type=int,
@@ -334,15 +334,10 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # if args.b or args.hq or args.hk or args.sk:
-    # assert (
-    #     args.b and args.hq and args.sk and args.d
-    # ), "If custom config is specified, please provide \
-    #         all of batch, number of Q heads, sequence length, and head size."
-
     if args.model:
-        assert not (args.hq), "Specifying model fixes hq already. Do not provide it!"
-
+        assert not (
+            args.hq
+        ), "The -hq flag is unsupported when using --model (as the model config specifies hq)"
     assert (
         args.dtype in arg_to_torch_dtype
     ), "Only fp16, bf16 and f32 types currently supported."
