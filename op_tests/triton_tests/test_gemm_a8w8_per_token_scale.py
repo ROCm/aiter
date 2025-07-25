@@ -5,6 +5,8 @@ import torch
 import triton
 import pytest
 from aiter.ops.triton.gemm_a8w8_per_token_scale import gemm_a8w8_per_token_scale
+from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 
 
@@ -19,22 +21,7 @@ def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
     return gemm_a8w8_per_token_scale(x, weight, x_scale, w_scale, dtype, y)
 
 
-def is_cdna4():
-    return triton.runtime.driver.active.get_current_target().arch == "gfx950"
-
-
-e5m2_type = torch.float8_e5m2 if is_cdna4() else torch.float8_e5m2fnuz
-e4m3_type = torch.float8_e4m3fn if is_cdna4() else torch.float8_e4m3fnuz
-
-name_to_torch_types = {
-    "int8": torch.int8,
-    "int32": torch.int32,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "bf16": torch.bfloat16,
-    "fp8e5": e5m2_type,
-    "fp8e4": e4m3_type,
-}
+e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
 def get_x_vals():
@@ -83,11 +70,33 @@ def get_x_vals():
 
 
 def generate_gemm_a8w8_per_token_scale_inputs(
-    M, N, K, dtype=torch.bfloat16, output=False
+    M: int,
+    N: int,
+    K: int,
+    dtype=torch.bfloat16,
+    layout: str = "TN",
+    output=False,
 ):
 
-    x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
-    weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
+    if layout[0] == "T":
+        x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
+    else:
+        x = (
+            (torch.rand((K, M), dtype=torch.float16, device="cuda") / 10)
+            .to(e4m3_type)
+            .T
+        )
+
+    if layout[1] == "N":
+        weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
+            e4m3_type
+        )
+    else:
+        weight = (
+            (torch.rand((K, N), dtype=torch.float16, device="cuda") / 10)
+            .to(e4m3_type)
+            .T
+        )
 
     x_scale = torch.rand([M, 1], dtype=torch.float32, device="cuda")
     w_scale = torch.rand([N, 1], dtype=torch.float32, device="cuda")
@@ -110,13 +119,13 @@ def generate_gemm_a8w8_per_token_scale_inputs(
 )
 def test_gemm(dtype, M, N, K, output):
 
-    dtype = name_to_torch_types[dtype]
+    dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
         M,
         N,
         K,
-        dtype,
-        output,
+        dtype=dtype,
+        output=output,
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
