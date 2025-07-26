@@ -144,6 +144,9 @@ def pod_attention(
 
     o_pf = torch.empty_like(q_pf, dtype=v_pf.dtype)
 
+    # TODO: need to tune
+    max_output_tile_cnt = 16
+
     pod_kernel = pod_persistent[grid](
         cu_ctr,
         # Decode positional arguments
@@ -227,6 +230,7 @@ def pod_attention(
         num_splits_pf=num_splits_pf,
         prefill_ratio=prefill_ratio,
         decode_ratio=decode_ratio,
+        max_output_tile_cnt=max_output_tile_cnt,
     )
     # torch.cuda.synchronize()
     print(
@@ -451,6 +455,7 @@ def pod_persistent(
     # Prefill/Decode common
     prefill_ratio: tl.constexpr,
     decode_ratio: tl.constexpr,
+    max_output_tile_cnt: tl.constexpr,
 ):
 
     # cu_id: 4 bits, se_id: 2 bits, xcc_id: 4 bits
@@ -519,6 +524,7 @@ def pod_persistent(
             max_tiles_per_wg,  #: tl.constexpr,
             tiles_per_head,  #: tl.constexpr,
             num_splits,  #: tl.constexpr,
+            max_output_tile_cnt,
         )
         tl.debug_barrier()
         # decode_time = read_realtime() - decode_time
@@ -572,6 +578,7 @@ def pod_persistent(
             max_tiles_per_wg_pf,  #: tl.constexpr,
             tiles_per_head_pf,  #: tl.constexpr,
             num_splits_pf,  #: tl.constexpr,
+            max_output_tile_cnt,
         )
         tl.debug_barrier()
         # prefill_time = read_realtime() - prefill_time
