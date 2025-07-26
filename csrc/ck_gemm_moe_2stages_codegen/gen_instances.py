@@ -441,7 +441,7 @@ class ck_moe_2stage_gemm_codegen:
                 )
                 if os.path.exists(f_instance):
                     os.remove(f_instance)
-                if "per_128x128" in self.quant_type:
+                if self.quant_type in ["per_128x128", "per_1x128"]:
                     quanttype = "_blockscale"
                 elif "FP4" in self.a_dtype:
                     quanttype = "_mxfp4"
@@ -573,7 +573,14 @@ if __name__ == "__main__":
         default="per_tensor",
         required=False,
         type=str,
-        choices=["per_tensor", "per_token", "per_128x128", "per_1x32", "no"],
+        choices=[
+            "per_tensor",
+            "per_token",
+            "per_128x128",
+            "per_1x128",
+            "per_1x32",
+            "no",
+        ],
         help="select quant_type",
     )
 

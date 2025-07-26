@@ -322,7 +322,7 @@ def get_gemm1_kernels_list(
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeight"
+            kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":
@@ -368,7 +368,7 @@ def get_gemm2_kernels_list(
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeight"
+            kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
         elif tag == "a16w16":
