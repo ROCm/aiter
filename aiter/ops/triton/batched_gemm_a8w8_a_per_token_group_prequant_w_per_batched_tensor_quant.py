@@ -139,7 +139,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
-
+    one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
     b_scale = tl.load(b_scale_ptr)
 
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
@@ -154,7 +154,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
-        a_scale = m.to(tl.float32) / DTYPE_MAX
+        a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
         a_scale_recip = 1.0 / a_scale
         a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
 
@@ -210,10 +210,8 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    if M < 16:
+    if M <= 16:
         return _get_config._config_dict[key]["small"]
-    elif M < 32:
-        return _get_config._config_dict[key]["small_M16"]
     elif M <= 128:
         BLK_M = triton.next_power_of_2(M)
         if BLK_M == 32:
@@ -233,6 +231,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     X: torch.Tensor,
     WQ: torch.Tensor,
     w_scale: torch.Tensor,
+    group_size: int = 128,
     bias: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     splitK: Optional[int] = None,
@@ -261,6 +260,9 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     # Check constraints.
     assert X.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
     assert X.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"
+    assert (
+        triton.next_power_of_2(group_size) == group_size
+    ), "group_size mush be power of 2"
     assert dtype in [
         torch.bfloat16,
         torch.float16,
@@ -292,6 +294,7 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
 
     if config is None:
         config = _get_config(M, N, K)
+    config["BLOCK_SIZE_K"] = group_size
 
     grid = lambda META: (  # noqa: E731
         B,
