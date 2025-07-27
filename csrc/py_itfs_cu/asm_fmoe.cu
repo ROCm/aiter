@@ -572,31 +572,17 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
     else if(input.dtype() == gate.dtype() &&
             (input.dtype() == torch::kFloat4_e2m1fn_x2 || input.dtype() == torch::kUInt8))
     {
-        int selectedTile =
-            get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256}); // todo,add tune interface here
-        if(selectedTile == 512)
-        {
-            static FMoeKernel impl_fmoe_mxfp4_g1u1_vs_subGU_512(
-                "_ZN5aiter28fmoe_mxfp4_g1u1_vs_subGU_512E",
-                "fmoe/silu/fmoe_mxfp4_g1u1_vs_subGU_512.co",
-                512);
-            impl_ptr = &impl_fmoe_mxfp4_g1u1_vs_subGU_512;
-        }
-        else if(selectedTile == 256)
-        {
-            static FMoeKernel impl_fmoe_mxfp4_g1u1_vs_subGU_256(
-                "_ZN5aiter28fmoe_mxfp4_g1u1_vs_subGU_256E",
-                "fmoe/silu/fmoe_mxfp4_g1u1_vs_subGU_256.co",
-                256);
-            impl_ptr = &impl_fmoe_mxfp4_g1u1_vs_subGU_256;
-        }
+        if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_gelu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Silu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
+        else if(out.dtype() == at::ScalarType::BFloat16 && activation == ActivationType::Gelu)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
-        {
-            TORCH_CHECK(false,
-                        __func__,
-                        " Unsupported inter_dim " + std::to_string(inter_dim) +
-                            ", which should be divisible by 256 or 512");
-        }
+            TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
+        impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf);
         impl_ptr->set_4bit(true);
     }
 #endif
@@ -859,4 +845,6 @@ void fmoe_fp8_blockscale_g1u1(torch::Tensor& out,               // [token_cnt, d
                                                           fc2_scale,
                                                           fc2_smooth_scale);
     }
+    else
+        TORCH_CHECK(false, __func__, "Unsupported the type for fmoe_fp8_blockscale_g1u1");
 }
