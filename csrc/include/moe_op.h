@@ -22,6 +22,7 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                   std::string scoring_func          = "softmax",
                   const float routed_scaling_factor = 1.);
 
+<<<<<<< HEAD
 void fmoe(torch::Tensor& out,               // [token_cnt, dim]
           torch::Tensor& input,             // [token_cnt, dim] M,K
           torch::Tensor& gate,              // [expert, hidden_dim, dim] N,K
@@ -31,6 +32,35 @@ void fmoe(torch::Tensor& out,               // [token_cnt, dim]
           torch::Tensor& sorted_expert_ids, // [max_num_m_blocks]
           torch::Tensor& num_valid_ids,     // [1]
           uint32_t topk);
+=======
+std::vector<at::Tensor> moe_fused_gate(
+    at::Tensor &input,
+    at::Tensor &bias,
+    at::Tensor &topk_weights,
+    at::Tensor &topk_ids,
+    int64_t num_expert_group,
+    int64_t topk_group,
+    int64_t topk,
+    int64_t n_share_experts_fusion,
+    double routed_scaling_factor);
+
+void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
+                          int64_t block_size, torch::Tensor sorted_token_ids,
+                          torch::Tensor experts_ids,
+                          torch::Tensor token_nums,
+                          torch::Tensor num_tokens_post_pad);
+
+void fmoe(torch::Tensor &out,               // [token_cnt, dim]
+          torch::Tensor &input,             // [token_cnt, dim] M,K
+          torch::Tensor &gate,              // [expert, hidden_dim, dim] N,K
+          torch::Tensor &down,              // [expert, hidden_dim, dim]
+          torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+          torch::Tensor &sorted_weights,    // [max_num_tokens_padded]
+          torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+          torch::Tensor &num_valid_ids,     // [1]
+          uint32_t topk                     //
+);
+>>>>>>> main
 
 void fmoe_int8_g1u0(torch::Tensor& out,               // [token_cnt, dim]
                     torch::Tensor& input,             // [token_cnt, dim] M,K

@@ -8,6 +8,37 @@ from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
+from typing import Union
+
+
+def generate_batched_gemm_a16w16_inputs(
+    B: int,
+    M: int,
+    N: int,
+    K: int,
+    dtype: Union[torch.dtype, str],
+    output: bool,
+    layout: str = "TN",
+):
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
+    if layout[0] == "T":
+        x = torch.randint(-20, 20, (B, M, K), dtype=dtype).cuda()
+    else:
+        x = torch.randint(-20, 20, (B, K, M), dtype=dtype).cuda().permute(0, 2, 1)
+
+    if layout[1] == "N":
+        weight = torch.randint(-20, 20, (B, N, K), dtype=dtype).cuda()
+    else:
+        weight = torch.randint(-20, 20, (B, K, N), dtype=dtype).cuda().permute(0, 2, 1)
+
+    bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+
+    y = None
+    if output:
+        y = torch.empty((B, M, N), dtype=dtype, device=x.device)
+
+    return x, weight, bias, y
 
 
 def run_torch(x, weight, bias=None, dtype=torch.bfloat16):
@@ -80,16 +111,8 @@ def get_x_vals():
 )
 def test_batched_gemm_bf16(dtype, b, m, n, k, output):
 
+    x, weight, bias, y = generate_batched_gemm_a16w16_inputs(b, m, n, k, dtype, output)
     dtype = str_to_torch_dtype[dtype]
-    x = torch.randint(-20, 20, (b, m, k), dtype=dtype).cuda()
-    weight = torch.randint(-20, 20, (b, n, k), dtype=dtype).cuda()
-
-    bias = torch.rand([b, 1, n], dtype=dtype).cuda() * 10
-
-    y = None
-    if output:
-        y = torch.empty((b, m, n), dtype=dtype, device=x.device)
-
     a = run_torch(x, weight, bias, dtype)
     b = run_triton(x, weight, bias, dtype, y)
 

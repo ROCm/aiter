@@ -99,7 +99,7 @@ def test_biased_grouped_topk(
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
     _, us_aiter = run_perftest(
-        aiter.biased_grouped_topk,
+        aiter.biased_grouped_topk_hip,
         gating_output,
         correction_bias,
         w_aiter,
@@ -123,7 +123,41 @@ def test_biased_grouped_topk(
         id_aiter,
         msg=f"topk_ids     [golden vs aiter]:{us_ref:>8.2f} us vs {us_aiter:>8.2f} us......",
     )
-    return {"err": err, "us": us_aiter}
+    # return {"err": err, "us": us_aiter}
+
+    w_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.fp32)
+    id_sglang = torch.empty_strided((token, topk), (topk, 1), dtype=dtypes.i32)
+    _, us_sglang = run_perftest(
+        aiter.moe_fused_gate,
+        gating_output,
+        correction_bias,
+        w_sglang,
+        id_sglang,
+        group,
+        topk_group,
+        topk,
+        0,
+        scale_factor,
+    )
+
+    w_sglang = _[0]
+    id_sglang = _[1]
+
+    id_sglang, _sglang = torch.sort(id_sglang)
+    w_sglang = w_sglang.gather(1, _sglang)
+
+    # print(f"{w_ref=}")
+    # print(f"{w_sglang=}")
+    # print(f"{id_ref=}")
+    # print(f"{id_sglang=}")
+
+    checkAllclose(w_ref, w_sglang, msg="topk_weights [golden vs sglang]")
+    checkAllclose(
+        id_ref,
+        id_sglang,
+        msg=f"topk_ids     [aiter vs sglang]:{us_aiter:>8.2f} us vs {us_sglang:>8.2f} us......",
+    )
+    return {"us_aiter": us_aiter, "us_sglang": us_sglang}
 
 
 @benchmark()

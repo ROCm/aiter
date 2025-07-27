@@ -302,19 +302,21 @@
           py::arg("pad_c")  = 0,                                        \
           py::arg("splitK") = 0);
 
-#define GEMM_A4W4_ASM_PYBIND                     \
-    m.def("gemm_a4w4_asm",                       \
-          &gemm_a4w4_asm,                        \
-          "Asm gemm a4w4",                       \
-          py::arg("A"),                          \
-          py::arg("B"),                          \
-          py::arg("A_scale"),                    \
-          py::arg("B_scale"),                    \
-          py::arg("out"),                        \
-          py::arg("bias")        = std::nullopt, \
-          py::arg("alpha")       = 1.0,          \
-          py::arg("beta")        = 0.0,          \
-          py::arg("bpreshuffle") = true);
+#define GEMM_A4W4_ASM_PYBIND                      \
+    m.def("gemm_a4w4_asm",                        \
+          &gemm_a4w4_asm,                         \
+          "Asm gemm a4w4",                        \
+          py::arg("A"),                           \
+          py::arg("B"),                           \
+          py::arg("A_scale"),                     \
+          py::arg("B_scale"),                     \
+          py::arg("out"),                         \
+          py::arg("kernelName"),                  \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alpha")        = 1.0,          \
+          py::arg("beta")         = 0.0,          \
+          py::arg("bpreshuffle")  = true,         \
+          py::arg("log2_k_split") = std::nullopt);
 
 #define GEMM_A4W4_BLOCKSCALE_PYBIND \
     m.def("gemm_a4w4_blockscale",   \
@@ -652,6 +654,18 @@
           py::arg("topk_grp"),                                                                \
           py::arg("need_renorm"),                                                             \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
+          "Apply biased grouped topk softmax to the gating outputs.");                        \
+    m.def("moe_fused_gate",                                                                   \
+          &moe_fused_gate,                                                                    \
+          py::arg("input"),                                                                   \
+          py::arg("bias"),                                                                    \
+          py::arg("topk_weights"),                                                            \
+          py::arg("topk_ids"),                                                                \
+          py::arg("num_expert_group"),                                                        \
+          py::arg("topk_group"),                                                              \
+          py::arg("topk"),                                                                    \
+          py::arg("n_share_experts_fusion"),                                                  \
+          py::arg("routed_scaling_factor") = 1.0,                                             \
           "Apply biased grouped topk softmax to the gating outputs.");                        \
     m.def("moe_align_block_size",                                                             \
           &aiter::moe_align_block_size,                                                       \
