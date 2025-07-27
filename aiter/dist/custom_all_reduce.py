@@ -28,6 +28,7 @@ import aiter as ops
 import os
 from .custom_all_reduce_utils import gpu_p2p_access_check
 from .parallel_state import in_the_same_node_as
+from .utils import get_cuda_visible_devices
 from aiter import logger
 
 try:
@@ -121,14 +122,7 @@ class CustomAllreduce:
         assert isinstance(device, torch.device)
         self.device = device
 
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "-1")
-        # cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
-        else:
-            from vllm.utils import cuda_device_count_stateless
-
-            device_ids = list(range(cuda_device_count_stateless()))
+        device_ids = get_cuda_visible_devices()
 
         physical_device_id = device_ids[device.index]
         tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
