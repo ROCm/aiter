@@ -773,9 +773,8 @@ void fmoe_g1u1_a16(torch::Tensor& out,               // [token_cnt, dim]
                 false, __func__, "Unsupported output dtype or activation type for fmoe_g1u1_a16");
     }
     else
-    {
         TORCH_CHECK(false, __func__, "Unsupported gate dtype for fmoe_g1u1_a16");
-    }
+
     impl_ptr = get_heuristic_kernel(down.size(2), sorted_expert_ids.size(0), config_map, 1);
     impl_ptr->launch_kernel<uint8_t, uint16_t, true>(out,
                                                      input,
