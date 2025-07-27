@@ -16,6 +16,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 
@@ -101,7 +102,7 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object("GEMM A16W16 Benchmark", args)
+    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
