@@ -12,6 +12,9 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -271,12 +274,17 @@ def gemm_afp4wfp4_pre_quant(
     Key parameters:
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
-    - X_scales: Matrix with shape (M, K // 32)
     - W_scales: Matrix with shape (N, K // 32)
 
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+
+    _LOGGER.info(
+        f"GEMM_AFP4WFP4_PRE_QUANT_ATOMIC: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w_scales.shape)} "
+    )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
     N, K = w.shape
