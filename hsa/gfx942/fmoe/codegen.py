@@ -7,6 +7,7 @@ import glob
 import pandas as pd
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+base_dir = os.path.basename(this_dir)
 
 template = """// SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
@@ -50,10 +51,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfgs = []
-    for el in glob.glob(f"{this_dir}/*.csv"):
+    for el in glob.glob(f"{this_dir}/**/*.csv", recursive=True):
+
         df = pd.read_csv(el)
         cfg = [
-            f'ADD_CFG({atm}, {vskip},{smf:>4}, {tg_num_perCU:>4}, {ps:>4},{subGU_m:>4}, {subGU_n:>4}, "fmoe/", "{Name}", "{Co}"),'
+            f'ADD_CFG({atm}, {vskip},{smf:>4}, {tg_num_perCU:>4}, {ps:>4},{subGU_m:>4}, {subGU_n:>4}, "{base_dir}/{os.path.dirname(os.path.relpath(el, this_dir))}/", "{Name}", "{Co}"),'
             for Name, Co, atm, vskip, smf, tg_num_perCU, ps, subGU_m, subGU_n in df.values
         ]
         filename = os.path.basename(el)
