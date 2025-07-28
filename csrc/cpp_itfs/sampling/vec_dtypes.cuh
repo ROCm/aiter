@@ -13,9 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- #ifndef VEC_DTYPES_CUH_
- #define VEC_DTYPES_CUH_
- 
+#pragma once
 
  #include <hip/hip_bf16.h>
  #include <hip/hip_fp16.h>
@@ -1555,5 +1553,3 @@
  };
  
  }  // namespace flashinfer
- 
- #endif  // VEC_DTYPES_CUH_

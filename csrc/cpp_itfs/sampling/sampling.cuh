@@ -1,6 +1,3 @@
-#pragma once
-
-#include "hip/hip_runtime.h"
 /*
  * Copyright (C) 2024-2025 by FlashInfer team.
  *
@@ -16,6 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+#pragma once
+
+#include "hip/hip_runtime.h"
+
  
  #include <hiprand/hiprand.h>
  #include <hiprand/hiprand_kernel.h>
