@@ -12,7 +12,6 @@ from gemm_a4w4_blockscale_common import kernels_list
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
-import time
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
