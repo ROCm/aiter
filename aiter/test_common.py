@@ -65,13 +65,12 @@ def perftest(
                     run_iters(1, graph.replay)
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
-            # needTrace = True
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
                 with_stack=False,
                 with_modules=True,
-                record_shapes=False,
+                # record_shapes=True,
                 on_trace_ready=(
                     tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")
                     if needTrace
@@ -81,10 +80,8 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                prof.step()
 
             avg = get_trace_perf(prof, num_iters)
-            logger.info(f"get trace perf avg is {avg}")
             return data, avg
 
         return wrapper

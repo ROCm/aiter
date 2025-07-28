@@ -329,8 +329,7 @@ def tune_gemm_list(
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-    # if issorted:
-    if True:
+    if issorted:
         print("sorted!!")
         tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
     print("Totall tuning result:")
@@ -387,9 +386,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
-    start_time = time.time()
     tunedf = tune_gemm_list(
         untunedf, tunedf, args.sort, args.splitK, args.mp, errRatio=args.errRatio
     )
-    print("tuning_time is ", time.time() - start_time)
     tunedf.to_csv(args.tune_file, index=False)

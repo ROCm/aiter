@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
 import torch
 import multiprocessing as mp
 import time
@@ -142,12 +141,11 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     rets = []
     shape_grouped = isinstance(tasks, list)
     solutions = 1 if not shape_grouped else kernels_num
-    # print(f"shape_grouped = {shape_grouped}, solutions = {solutions}")
+
     for i in range(solutions):
         info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref_noused, *rest = (
             group_task[i]
         )
-        ref_func = ref_func if not fast_mode else None
         work_args = (
             info,
             func,
