@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -204,6 +207,7 @@ def batched_gemm_bf16(
     Returns:
     - YQ: The output batch tensor with shape (B, M, N).
     """
+    _LOGGER.info(f"BATCHED_GEMM_BF16: x={tuple(XQ.shape)} w={tuple(WQ.shape)}")
 
     # Make sure XQ and WQ are contiguous in memory
     XQ = XQ.contiguous()
