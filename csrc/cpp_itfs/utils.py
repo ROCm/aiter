@@ -12,7 +12,7 @@ from collections import OrderedDict
 from functools import lru_cache, partial
 import binascii
 import hashlib
-from csrc.cpp_itfs.file_baton import FileBaton
+from aiter.jit.utils.file_baton import FileBaton
 import logging
 import time
 
