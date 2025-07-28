@@ -14,9 +14,9 @@ from typing import List, Optional
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
-    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter") # pip install mode
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter")  # pip install mode
 else:
-    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/aiter") # develop mode
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/aiter")  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
 from jit.core import get_asm_dir
