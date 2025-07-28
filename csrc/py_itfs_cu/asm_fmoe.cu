@@ -537,7 +537,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
     inter_dim *= model_dim / gate.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
-    if(gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
+    if(gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int) // int4
     {
         int selectedTile = get_heuristic_tile(
             inter_dim, sub_X_cnt, {512, 256, 128}); // todo,add tune interface here
@@ -570,8 +570,12 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
     }
 #if defined(__Float4_e2m1fn_x2)
     else if(input.dtype() == gate.dtype() &&
-            (input.dtype() == torch::kFloat4_e2m1fn_x2 || input.dtype() == torch::kUInt8))
+            (input.dtype() == torch::kFloat4_e2m1fn_x2 || input.dtype() == torch::kUInt8)) // fp4
     {
+#if defined(cfg_fmoe_fp16_pertokenMXfp4_g1u1_silu) || \
+    defined(cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu) || \
+    defined(cfg_fmoe_fp16_pertokenMXfp4_g1u1_gelu) || \
+    defined(cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu)
         if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_silu;
         else if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Gelu)
@@ -583,6 +587,33 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
         impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf);
+#else
+        int selectedTile =
+            get_heuristic_tile(inter_dim, sub_X_cnt, {512, 256}); // todo,add tune interface here
+        if(selectedTile == 512)
+        {
+            static FMoeKernel impl_fmoe_mxfp4_g1u1_vs_subGU_512(
+                "_ZN5aiter28fmoe_mxfp4_g1u1_vs_subGU_512E",
+                "fmoe/silu/fmoe_mxfp4_g1u1_vs_subGU_512.co",
+                512);
+            impl_ptr = &impl_fmoe_mxfp4_g1u1_vs_subGU_512;
+        }
+        else if(selectedTile == 256)
+        {
+            static FMoeKernel impl_fmoe_mxfp4_g1u1_vs_subGU_256(
+                "_ZN5aiter28fmoe_mxfp4_g1u1_vs_subGU_256E",
+                "fmoe/silu/fmoe_mxfp4_g1u1_vs_subGU_256.co",
+                256);
+            impl_ptr = &impl_fmoe_mxfp4_g1u1_vs_subGU_256;
+        }
+        else
+        {
+            TORCH_CHECK(false,
+                        __func__,
+                        " Unsupported inter_dim " + std::to_string(inter_dim) +
+                            ", which should be divisible by 256 or 512");
+        }
+#endif
         impl_ptr->set_4bit(true);
     }
 #endif
@@ -617,6 +648,10 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         else
             TORCH_CHECK(false, __func__, " Not find proper cfg in pertokenFp8_g1u1. ");
         impl_ptr = get_heuristic_kernel(down.size(2), sub_X_cnt, config_map, smf);
+    }
+    else
+    {
+        TORCH_CHECK(false, __func__, ": unsupport current input type:", input.scalar_type());
     }
 
     impl_ptr->launch_kernel<uint8_t, uint16_t>(out,
