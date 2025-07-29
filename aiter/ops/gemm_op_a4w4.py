@@ -116,12 +116,12 @@ def gemm_a4w4_asm(
 
 @compile_ops("module_gemm_a4w4_blockscale")
 def gemm_a4w4_blockscale(
-    XQ: Tensor,  # XQ:[M, K/2] f4x2
-    WQ: Tensor,  # WQ:[N, K/2] f4x2
-    x_scale: Tensor,  # x_scale:[M, K/32] e8m0 paded
-    w_scale: Tensor,  # w_scale:[N, K/32] e8m0 paded
-    out: Tensor,  # Out:[M, N] bf16
-    splitK: Optional[int] = 0,
+    XQ: torch.Tensor,
+    WQ: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_scale: torch.Tensor,
+    Out: torch.Tensor,
+    splitK: int = 0,
 ) -> torch.Tensor: ...
 
 
