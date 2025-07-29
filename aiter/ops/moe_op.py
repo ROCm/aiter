@@ -23,7 +23,7 @@ def topk_softmax(
 
 
 @compile_ops("module_moe_asm")
-def moe_sum(input: Tensor, output: Tensor): ...
+def moe_sum(input: Tensor, output: Tensor)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -35,7 +35,7 @@ def moe_align_block_size(
     experts_ids: Tensor,
     token_nums: Tensor,
     num_tokens_post_pad: Tensor,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -49,7 +49,7 @@ def fmoe(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     topk: int,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -68,7 +68,7 @@ def fmoe_int8_g1u0(
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
     activation: Optional[Enum] = ActivationType.Silu,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -87,7 +87,7 @@ def fmoe_g1u1(
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -106,7 +106,7 @@ def fmoe_g1u1_tkw1(
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -124,7 +124,7 @@ def fmoe_int8_g1u0_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -142,7 +142,7 @@ def fmoe_g1u1_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: ActivationType = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu,
 ): ...
 
 
@@ -164,7 +164,7 @@ def fmoe_fp8_blockscale_g1u1(
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: ActivationType = ActivationType.Silu,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -203,7 +203,7 @@ def ck_moe_stage1(
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-): ...
+)-> None: ...
 
 
 @compile_ops("module_moe_ck2stages")
@@ -221,7 +221,7 @@ def ck_moe_stage2(
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-): ...
+)-> None: ...
 
 
 dtype2str_dict = {
@@ -229,7 +229,6 @@ dtype2str_dict = {
     dtypes.bf16: "b16",
     dtypes.fp8: "f8",
     dtypes.i8: "i8",
-    torch.uint8: "fp4x2",
     torch.uint32: "i4",
 }
 

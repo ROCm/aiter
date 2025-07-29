@@ -11,24 +11,24 @@ torch::Tensor initOutput(torch::Tensor &input, torch::Tensor &other)
   return output;
 }
 
-torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
 {
-  torch::Tensor output = initOutput(input, other);
+  output = initOutput(input, other);
   binary_op_dispatch("add", input, other, output);
   return output;
   // return binary_operation<aiter::AddOp, false>(input, other);
 }
 
-torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
 {
-  torch::Tensor output = initOutput(input, other);
+  output = initOutput(input, other);
   binary_op_dispatch("sub", input, other, output);
   return output;
 }
 
-torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
 {
-  torch::Tensor output = initOutput(input, other);
+  output = initOutput(input, other);
   binary_op_dispatch("mul", input, other, output);
   return output;
 }

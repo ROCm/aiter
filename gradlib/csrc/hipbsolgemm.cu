@@ -326,6 +326,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
+                      torch::Tensor &result,
                       std::optional<torch::Tensor> bias,
                       std::optional<py::object> out_dtype,
                       std::optional<torch::Tensor> scaleA,
@@ -350,7 +351,8 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
           ? torch::python::detail::py_object_to_dtype(out_dtype.value())
           : inDtype};
   auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
-  auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+  // auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+  result = torch::empty({mat1_sizes[0], mat2_sizes[1]}, options);
 
   bool transpose_result = true;
   bool transpose_mat1;
@@ -439,7 +441,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
       d_scaleOut, bias_ptr, hipblasInType, hipblasOutType, current_stream,
       solution_index));
 
-  return result;
+  // return result;
 }
 
 // find all hipblas solutions and return them to python land
@@ -600,7 +602,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("hipb_create_extension", &hipb_create_extension, "create_extension");
   m.def("hipb_destroy_extension", &hipb_destroy_extension, "destroy_extension");
   m.def("hipb_mm", &hipb_mm, "hipb_mm", py::arg("mat1"), py::arg("mat2"),
-        py::arg("solution_index"), py::arg("bias") = std::nullopt,
+        py::arg("solution_index"), py::arg("result"), py::arg("bias") = std::nullopt,
         py::arg("out_dtype") = std::nullopt, py::arg("scaleA") = std::nullopt,
         py::arg("scaleB") = std::nullopt, py::arg("scaleOut") = std::nullopt);
   m.def("hipb_findallsols", &hipb_findallsols, "hipb_findallsols",

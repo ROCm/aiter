@@ -380,7 +380,8 @@ std::vector<rocblas_int> RocFindAllSolIdxBlas(
 torch::Tensor RocSolIdxBlas(
     const torch::Tensor &mat1,
     const torch::Tensor &mat2,
-    const int32_t solution_index)
+    const int32_t solution_index,
+    const torch::Tensor &result)
 {
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};
@@ -397,7 +398,7 @@ torch::Tensor RocSolIdxBlas(
 
   auto abcType{mat1.options().dtype()};
   auto options{at::TensorOptions().dtype(abcType).device(at::kCUDA)};
-  auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+  result = {torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
   // std::cout << " | result info: size: " << result.sizes() << " stride: " << result.strides() << std::endl;
 
   bool transpose_result = true;
@@ -519,7 +520,7 @@ torch::Tensor RocSolIdxBlas(
                   rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, solution_index, flags);
   //);
 
-  return result;
+  // return result;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -8,7 +8,7 @@
 
 #include "layernorm2d_fwd.hpp"
 
-void layernorm2d(torch::Tensor &out,    // [m, n]
+void layernorm2d_(torch::Tensor &out,    // [m, n]
                  torch::Tensor &input,  // [m, n]
                  torch::Tensor &weight, // [1, n]
                  torch::Tensor &bias,   // [m, n]
@@ -53,14 +53,15 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
                     {stream});
 }
 
-torch::Tensor layernorm2d(torch::Tensor &input,  // [m, n]
+torch::Tensor layernorm2d(torch::Tensor &out,
+                          torch::Tensor &input,  // [m, n]
                           torch::Tensor &weight, // [1, n]
                           torch::Tensor &bias,   // [m, n]
                           double epsilon,
                           std::optional<torch::Tensor> x_bias)
 {
-    torch::Tensor out = torch::empty_like(input);
-    layernorm2d(out, input, weight, bias, epsilon, x_bias);
+    // torch::Tensor out = torch::empty_like(input);
+    layernorm2d_(out, input, weight, bias, epsilon, x_bias);
 
     return out;
 }

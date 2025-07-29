@@ -7,11 +7,11 @@ from ..jit.core import compile_ops
 
 
 @compile_ops("module_hipbsolgemm")
-def hipb_create_extension(): ...
+def hipb_create_extension()-> None: ...
 
 
 @compile_ops("module_hipbsolgemm")
-def hipb_destroy_extension(): ...
+def hipb_destroy_extension()-> None: ...
 
 
 @compile_ops("module_hipbsolgemm")
@@ -19,12 +19,28 @@ def hipb_mm(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     solution_index: int,
+    result: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[object] = None,
+    out_dtype: str = None,
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
-) -> torch.Tensor: ...
+) -> None: ...
+
+
+# def hipb_mm(
+#     mat1: torch.Tensor,
+#     mat2: torch.Tensor,
+#     solution_index: int,
+#     result: torch.Tensor,
+#     bias: Optional[torch.Tensor] = None,
+#     out_dtype: Optional[object] = None,
+#     scaleA: Optional[torch.Tensor] = None,
+#     scaleB: Optional[torch.Tensor] = None,
+#     scaleOut: Optional[torch.Tensor] = None,
+# ) -> None:
+#     hipb_mm_()
+
 
 
 @compile_ops("module_hipbsolgemm")
@@ -40,19 +56,19 @@ def hipb_findallsols(
 
 
 @compile_ops("module_hipbsolgemm")
-def getHipblasltKernelName(): ...
+def getHipblasltKernelName()-> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_create_extension(): ...
+def rocb_create_extension()-> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_destroy_extension(): ...
+def rocb_destroy_extension()-> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_mm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: int) -> torch.Tensor: ...
+def rocb_mm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: int, out: torch.Tensor) -> None: ...
 
 
 @compile_ops("module_rocsolgemm")

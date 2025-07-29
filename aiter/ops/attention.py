@@ -30,6 +30,7 @@ def pa_fwd_naive(
     context_lens: torch.Tensor,
     k_dequant_scales: torch.Tensor,
     v_dequant_scales: torch.Tensor,
+    output: torch.Tensor,
     max_seq_len: int,
     num_kv_heads: int,
     scale_s: float,
@@ -38,7 +39,7 @@ def pa_fwd_naive(
     block_size: int,
     quant_algo: int,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_attention_asm")
@@ -48,6 +49,7 @@ def pa_fwd_asm(
     value_cache: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
+    output: torch.Tensor,
     max_num_blocks: int,
     max_qlen: int = 1,
     K_QScale: Optional[torch.Tensor] = None,
@@ -58,7 +60,7 @@ def pa_fwd_asm(
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
     kernelName: str = "",
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 def paged_attention_rocm(
@@ -244,7 +246,7 @@ def mla_decode_stage1_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-): ...
+)-> None: ...
 
 
 @compile_ops(MD_NAME)
@@ -267,4 +269,4 @@ def mla_prefill_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-): ...
+)-> None: ...

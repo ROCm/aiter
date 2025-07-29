@@ -6,7 +6,8 @@
 namespace aiter {
 namespace torch_itfs {
 std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
+mha_varlen_fwd(std::vector<at::Tensor> &output,
+               at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
