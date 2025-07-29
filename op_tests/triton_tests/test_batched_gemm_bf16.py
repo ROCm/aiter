@@ -111,6 +111,8 @@ def get_x_vals():
 )
 def test_batched_gemm_bf16(dtype, b, m, n, k, output):
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     x, weight, bias, y = generate_batched_gemm_a16w16_inputs(b, m, n, k, dtype, output)
     dtype = str_to_torch_dtype[dtype]
     a = run_torch(x, weight, bias, dtype)

@@ -148,6 +148,8 @@ def test_op_fwd(
     torch.set_default_device(device)
     torch.set_default_dtype(dtype)
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     (
         q_extend,
         k_extend,

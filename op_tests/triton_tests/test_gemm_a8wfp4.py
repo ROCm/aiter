@@ -374,6 +374,8 @@ e5m2_type, e4m3_type = arch_info.get_fp8_dtypes()
 def test_gemm_a8wfp4(
     M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     torch.manual_seed(42)  # for reproducibility
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")

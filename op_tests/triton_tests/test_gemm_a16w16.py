@@ -76,6 +76,8 @@ def get_x_vals():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
 
     torch_out = F.linear(x, w, bias=None)
@@ -92,6 +94,8 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
 
     torch_out = F.linear(x, w, bias=None)
