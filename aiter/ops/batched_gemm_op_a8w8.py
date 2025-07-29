@@ -22,8 +22,8 @@ def batched_gemm_a8w8(
     w_scale: Tensor,
     out: Tensor,
     bias: Optional[Tensor] = None,
-    splitK: int=0,
-)-> None: ...
+    splitK=0,
+) -> None: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -98,5 +98,5 @@ def batched_gemm_a8w8_tune(
     w_scale: Tensor,
     out: Tensor,
     kernelId: int,
-    splitK: int=0,
-)-> None: ...
+    splitK=0,
+) -> None: ...

@@ -14,7 +14,7 @@ def rms_norm_cu(
     input: Tensor,
     weight: Tensor,
     epsilon: float,
-)-> None:
+) -> None:
     """
     Cuda version of rmsnorm
     """
@@ -27,7 +27,7 @@ def fused_add_rms_norm_cu(
     residual_in: Tensor,  # residual_in/out
     weight: Tensor,
     epsilon: float,
-)-> None:
+) -> None:
     """
     Cuda version of rmsnorm fused add
     """
@@ -39,7 +39,8 @@ def rms_norm(
     input: Tensor,
     weight: Tensor,
     epsilon: float,
-)-> None:
+    use_model_sensitive_rmsnorm: int,
+) -> None:
     """
     CK version of rmsnorm
     """
@@ -48,7 +49,10 @@ def rms_norm(
 
 @compile_ops("module_rmsnorm")
 def rmsnorm2d_fwd(
-    input: torch.Tensor, weight: torch.Tensor, epsilon: float, out: torch.Tensor
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    use_model_sensitive_rmsnorm: int,
 ) -> None: ...
 
 
@@ -60,7 +64,8 @@ def rmsnorm2d_fwd_with_add(
     residual_out: Tensor,
     weight: Tensor,
     epsilon: float,
-)-> None: ...
+    use_model_sensitive_rmsnorm: int,
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -71,7 +76,8 @@ def rmsnorm2d_fwd_with_smoothquant(
     yscale: Tensor,
     weight: Tensor,
     epsilon: float,
-)-> None: ...
+    use_model_sensitive_rmsnorm: int,
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -84,13 +90,19 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     yscale: Tensor,
     weight: Tensor,
     epsilon: float,
-)-> None: ...
+    use_model_sensitive_rmsnorm: int,
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
 def rmsnorm2d_fwd_with_dynamicquant(
-    out: Tensor, input: Tensor, yscale: Tensor, weight: Tensor, epsilon: float
-)-> None: ...
+    out: Tensor,
+    input: Tensor,
+    yscale: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    use_model_sensitive_rmsnorm: int,
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -102,4 +114,5 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     yscale: Tensor,
     weight: Tensor,
     epsilon: float,
-)-> None: ...
+    use_model_sensitive_rmsnorm: int,
+) -> None: ...

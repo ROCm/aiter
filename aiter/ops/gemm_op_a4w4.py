@@ -59,7 +59,7 @@ def gemm_a4w4(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
@@ -69,10 +69,6 @@ def gemm_a4w4(
     This function is a wrapper for the A4W4 GEMM kernel.
     It is used to perform matrix multiplication with 4-bit quantization.
     """
-
-    # Get the number of compute units
-    cu_num = get_cu_num()
-
     # Load the A4W4 GEMM kernel
     m = A.shape[0]
     n = B.shape[0]
@@ -118,10 +114,12 @@ def gemm_a4w4_asm(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    bias: Tensor,  # bias:[1, N] f32
+    kernelName: str,
+    bias: Optional[Tensor] = None,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
+    log2_k_split: Optional[int] = None,
 ) -> None: ...
 
 

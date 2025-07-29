@@ -454,7 +454,6 @@ def run_aiter_asm(
     v_scale=None,
 ):
     output = torch.zeros_like(query)
-    print('run_aiter_asm============')
     aiter.pa_fwd_asm(
         query,
         key_cache,
