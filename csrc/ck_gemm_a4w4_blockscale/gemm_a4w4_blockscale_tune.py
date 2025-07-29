@@ -98,7 +98,7 @@ def run_gemm_a4w4_blockscale_asm(
     splitK=None,
 ):
     m, k = x.shape
-    if splitK != 0:
+    if splitK is not None and splitK > 0:
         out_reset = torch.zeros(out.shape[0], out.shape[1], dtype=dtype)
         out = out_reset
     res = aiter.gemm_a4w4_asm(
@@ -234,7 +234,7 @@ def tune_gemm_list(
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = get_asm_kernels(asm_kernel_list_csv)
-            #asm_tiles = [(256, 256), (128, 512)]
+            # asm_tiles = [(256, 256), (128, 512)]
             asm_tiles = [key for key in asm_kernels.keys()]
             for tile_m, tile_n in asm_tiles:
                 maxsplitK = (
