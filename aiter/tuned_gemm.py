@@ -175,7 +175,10 @@ class TunedGemm:
     ):
         if otype is None:
             otype = inp.dtype
-        return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
+        output = torch.empty(inp.shape[0], weights.shape[1], device=inp.device)
+        hipb_mm(inp, weights.t(), solidx, output, bias, otype, scale_a, scale_b, scale_c)
+        return output
+
 
     def apply_rocb_mm(
         self,
@@ -191,7 +194,8 @@ class TunedGemm:
         assert (
             scale_a is None and scale_b is None and scale_c is None
         ), "scale_a, scale_b, scale_c must be None for rocblas"
-        out = rocb_mm(inp, weights.t(), solidx)
+        out = torch.tensor([])
+        rocb_mm(out, inp, weights.t(), solidx)
         if bias is not None:
             out = out + bias
         return out
@@ -306,3 +310,8 @@ class TunedGemm:
 
 
 tgemm = TunedGemm()
+inp = torch.randn(2, 3, device="cuda")      
+weights = torch.randn(4, 3, device="cuda") 
+solidx = 1
+
+tgemm.apply_hipb_mm(inp, weights, solidx)

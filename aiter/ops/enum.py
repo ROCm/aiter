@@ -1,6 +1,6 @@
 from ..jit.core import compile_ops
-from enum import Enum as Enum
-
+# from enum import Enum as Enum
+Enum = int
 
 @compile_ops("module_aiter_enum", "ActivationType")
 def _ActivationType(dummy): ...
