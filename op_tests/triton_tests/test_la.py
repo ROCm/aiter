@@ -377,15 +377,15 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 
 def main():
-    batch = 8
-    causal = False
+    batch = 1
+    causal = True
     h = 64
-    n_ctx_q = 16
-    n_ctx = [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536]
+    n_ctx_q = 8192
+    n_ctx = [8192]
     d = 128
-    total_programs = 912
+    total_programs = 304
     init_dtype = torch.float16
-    BLOCK_M = 16
+    BLOCK_M = 128
     BLOCK_N = 64
     waves_per_eu = 2
     num_warps = 4
