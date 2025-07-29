@@ -4,7 +4,7 @@
 from torch import Tensor, Generator
 from typing import Optional, Tuple
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..utility import dtypes
 import torch
 
@@ -25,7 +25,7 @@ def mha_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd")
@@ -44,7 +44,7 @@ def fmha_v3_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
@@ -97,7 +97,7 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_fmha_v3_bwd", fc_name="fmha_v3_bwd")
@@ -122,7 +122,7 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
@@ -151,7 +151,7 @@ def mha_varlen_bwd(
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     custom_build_args: Optional[dict] = None,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
@@ -181,7 +181,7 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-)-> None: ...
+) -> None: ...
 
 
 def maybe_contiguous(x):
@@ -257,20 +257,22 @@ def _flash_attn_forward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def can_impl_fmha_v3_fwd():
         # basic
+        gfx = get_gfx()
         ret = alibi_slopes is None
         ret &= bias is None
         ret &= dropout_p == 0.0
         ret &= seqlen_q == seqlen_k
-        ret &= seqlen_q % 256 == 0
+        ret &= seqlen_q >= 384
         ret &= hdim_q == hdim_v
         ret &= hdim_q == 128
         ret &= nhead_q % nhead_k == 0
-        ret &= mask or nmask
-        ret &= return_lse
-        ret &= "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
+        ret &= not swa
+        ret &= q.dtype == dtypes.bf16
+        ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942")
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -427,7 +429,7 @@ def _flash_attn_backward(
     window_size_right = -1 if window_size_right >= seqlen_k else window_size_right
     mask = causal and window_size_left == -1  # causal mask
     nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
-    swa = not causal and (window_size_left > 0 or window_size_right > 0)
+    swa = (window_size_left > 0) or (window_size_right > 0)
 
     def np():
         # bwd_hd128_bf16_a16_rtne
@@ -563,7 +565,6 @@ def _flash_attn_backward(
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
         ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= mask or nmask or swa
         ret &= np() or pssk() or pddv() or psskddv()
         return ret
 
@@ -957,9 +958,7 @@ def _flash_attn_varlen_forward(
         )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    result: list[torch.Tensor] = []
-    mha_varlen_fwd(
-        result,
+    out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
         q,
         k,
         v,
@@ -982,9 +981,9 @@ def _flash_attn_varlen_forward(
         bias,
         alibi_slopes,
         None,
-        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
-    return tuple(result)
+    return out, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_varlen_backward(
@@ -1115,7 +1114,7 @@ def _flash_attn_varlen_backward(
         ret = (
             is_v3_atomic_fp32 == True
         )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q > 64 and hdim_q < 128
+        ret &= hdim_q >= 64 and hdim_q <= 192
         ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
 
         return ret
@@ -1491,7 +1490,7 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-)-> None: ...
+) -> None: ...
 
 
 def _mha_batch_prefill(
