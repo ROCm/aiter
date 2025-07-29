@@ -42,22 +42,27 @@ def init_rocblas():
     aiter.rocb_create_extension()
 
 
-def call_hipb_mm(input, weight, bias, scale_a, scale_b, solidx, out_dtype):
+def call_hipb_mm(input, weight, solidx, bias, out_dtype, scale_a=None, scale_b=None):
     init_hipblas()
-    return aiter.hipb_mm(
+    output = torch.tensor([])
+    aiter.hipb_mm(
         input,
         weight,
         solidx,
+        output,
         bias=bias,
         out_dtype=out_dtype,
         scaleA=scale_a,
         scaleB=scale_b,
     )
+    return output
 
 
 def call_rocb_mm(inp, w, solidx):
     init_rocblas()
-    return aiter.rocb_mm(inp, w, solidx)
+    out = torch.tensor([])
+    aiter.rocb_mm(out, inp, w, solidx)
+    return out
 
 
 rtol = 1e-5
@@ -179,50 +184,30 @@ class Gemm:
 
         gtimes = {}
         for solidx in solutions:
-            info = (
-                (
-                    self.m,
-                    self.n,
-                    self.k,
-                    False,
-                    self.indtype,
-                    self.outdtype,
-                    self.scaleAB,
-                ),
-                solidx,
-            )
             task.append(
                 (
-                    info,
+                    solidx,
                     call_hipb_mm,
-                    (solidx, self.outdtype),
+                    (
+                        self.inp,
+                        self.weights.t(),
+                        solidx,
+                        self.bias if self.bias is not None else None,
+                        self.outdtype,
+                        scaleA,
+                        scaleB,
+                    ),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    None,
-                    (),
-                    {},
                     self.ref if fast_mode == 0 else None,
                     self.rtol,
                     self.atol,
                 )
             )
-        in_data = [
-            (
-                len(solutions),
-                (
-                    self.inp,
-                    self.weights.t(),
-                    self.bias if self.bias is not None else None,
-                    scaleA,
-                    scaleB,
-                ),
-            )
-        ]
-        ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
-        for info, us, err_ratio in ret:
-            solidx = info[1]
+        ret = mp_tuner(task, self.mp)
+        for solidx, us, err_ratio in ret:
             if fast_mode == 0:
                 if err_ratio > self.check_err_ratio:
                     continue
@@ -265,31 +250,23 @@ class Gemm:
         task = []
         gtimes = {}
         for solidx in solutions:
-            info = (
-                (self.m, self.n, self.k, False, self.indtype, self.outdtype, False),
-                solidx,
-            )
             task.append(
                 (
-                    info,
+                    solidx,
                     call_rocb_mm,
-                    (solidx,),
+                    (
+                        self.inp,
+                        self.weights.t(),
+                        solidx,
+                    ),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    None,
-                    (),
-                    {},
-                    self.ref if fast_mode == 0 else None,
-                    self.rtol,
-                    self.atol,
                 )
             )
-        in_data = [(len(solutions), (self.inp, self.weights.t()))]
-        ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
-        for info, us, err_ratio in ret:
-            solidx = info[1]
+        ret = mp_tuner(task, self.mp)
+        for solidx, us, err_ratio in ret:
             if fast_mode == 0:
                 if err_ratio > self.check_err_ratio:
                     continue

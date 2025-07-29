@@ -21,5 +21,4 @@ def moe_sorting_fwd(
     unit_size: int,
     local_expert_mask: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.Tensor] = None,
-    dispatch_policy: int = 0,
-): ...
+)-> None: ...

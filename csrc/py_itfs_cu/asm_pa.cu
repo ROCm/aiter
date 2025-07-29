@@ -81,6 +81,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
                      torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor& context_lens, //   [num_seqs]
+                     torch::Tensor &output,
                      int max_num_blocks,
                      int max_qlen                           = 1,
                      std::optional<torch::Tensor> K_QScale  = std::nullopt,
@@ -90,7 +91,8 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      std::optional<int> high_precision      = 1,
                      std::string kernelName                 = "")
 {
-    torch::Tensor output = out_.value_or(torch::empty_like(Q));
+    output = out_.value_or(torch::empty_like(Q));
+
     int batch            = context_lens.size(0);
     // int max_num_blocks = block_tables.size(1);
     int num_heads       = Q.size(1);
@@ -225,5 +227,5 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                              1,            // bdy
                              1,            // bdz
                              stream});
-    return output;
+    // return output;
 }

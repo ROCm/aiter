@@ -16,6 +16,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
                            torch::Tensor &context_lens,
                            torch::Tensor &k_dequant_scales, // [num_heads, max_kv_tokens]
                            torch::Tensor &v_dequant_scales, // [num_heads, max_kv_tokens]
+                           torch::Tensor &output,
                            const int max_seq_len,
                            const int num_kv_heads,
                            const float scale_s,
@@ -29,7 +30,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(block_tables.dtype() == torch::kInt32, "block_tables must be int32");
     TORCH_CHECK(context_lens.dtype() == torch::kInt32, "context_lens must be int32");
-    torch::Tensor out = out_.value_or(torch::empty_like(Q));
+    output = out_.value_or(torch::empty_like(Q));
     int batch = Q.size(0);
     int nhead = Q.size(1);
     int nhead_k = V.size(1);
@@ -42,7 +43,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
     naive_t.q_type = torchDTypeToStr(Q.dtype());
     naive_t.k_type = torchDTypeToStr(K.dtype());
     naive_t.v_type = torchDTypeToStr(V.dtype());
-    naive_t.o_type = torchDTypeToStr(out.dtype());
+    naive_t.o_type = torchDTypeToStr(output.dtype());
     naive_t.q_layout = "bhsd";
     naive_t.k_layout = "phdsx"; // TODO
     naive_t.v_layout = "phds";  // TODO
@@ -54,7 +55,7 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
     naive_a.q_ptr = Q.data_ptr();
     naive_a.k_ptr = K.data_ptr();
     naive_a.v_ptr = V.data_ptr();
-    naive_a.o_ptr = out.data_ptr();
+    naive_a.o_ptr = output.data_ptr();
     naive_a.scale_s = scale_s;
     naive_a.context_len_ptr = context_lens.data_ptr(); // used when seqlen kv come from a pointer
     naive_a.page_table_ptr = block_tables.data_ptr();  // [batch, num_blocks] seqlen_kv is in different block(paged attn)
@@ -78,5 +79,5 @@ torch::Tensor pa_fwd_naive(torch::Tensor &Q,            //   [num_seqs, num_head
     ck_tile::stream_config naive_s{stream};
 
     naive_attention_fwd(naive_t, naive_a, naive_s);
-    return out;
+    // return out;
 }

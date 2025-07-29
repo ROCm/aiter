@@ -94,7 +94,6 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
-CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 
 
 @functools.lru_cache(maxsize=1)
@@ -233,7 +232,6 @@ def recopy_ck():
     if os.path.exists(CK_DIR):
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
-    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{CK_DIR}/include/ck/config.h")
 
 
 def clear_build(md_name):
@@ -297,8 +295,6 @@ def build_module(
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
-        if hip_version <= Version("6.3.42132"):
-            flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
         if hip_version > Version("5.5.00000"):
             flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
@@ -401,7 +397,6 @@ def build_module(
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
 
-
 def get_args_of_build(ops_name: str, exclude=[]):
     d_opt_build_args = {
         "srcs": [],
@@ -481,14 +476,151 @@ def get_args_of_build(ops_name: str, exclude=[]):
                 "ERROR: pls use dict_format to write 'optCompilerConfig.json'! "
             )
 
+RETURN_NONE_OP = [
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "add_",
+    "sub_",
+    "mul_",
+    "div_",
+    "sigmoid",
+    "tanh",
+    "pa_fwd_naive",
+    "pa_fwd_asm",
+    "all_reduce_asm_",
+    "all_reduce_rmsnorm_",
+    "all_reduce_rmsnorm_quant_",
+    "allocate_meta_buffer",
+    "get_meta_buffer_ipc_handle",
+    "gemm_a4w4_asm",
+    "gemm_a8w8",
+    "gemm_a8w8_asm",
+    "gemm_a8w8_blockscale",
+    "gemm_a8w8_bpreshuffle"
+    "hipb_mm",
+    "rocb_mm",
+    "mha_varlen_fwd",
+    "layer_norm",
+    "layernorm2d_fwd",
+    "rmsnorm2d_fwd",
+    "get_graph_buffer_ipc_meta"
+]
+
+MANUAL_SCHEMA_OPS = [
+    "register_graph_buffers",
+    "fmoe_int8_g1u0",
+    "fmoe_g1u1",
+    "fmoe_g1u1_tkw1",
+    "fmoe_fp8_blockscale_g1u1",
+    "moe_stage1_g1u1",
+    "module_moe_ck2stages",
+    "mha_fwd",
+    "fmha_v3_fwd",
+    "mha_varlen_fwd",
+    "mha_bwd",
+    "fmha_v3_bwd",
+    "mha_varlen_bwd",
+    "fmha_v3_varlen_bwd",
+    "mha_batch_prefill",
+    "hipb_mm",
+    "hipb_findallsols",
+    "rocb_findallsols",
+    "_ActivationType",
+    "_QuantType",
+    "init_custom_ar"
+]
+
+def generate_schema(func) -> str:
+    import inspect
+    import torch
+    from typing import Optional, Union, List, get_origin, get_args
+    sig = inspect.signature(func)
+    parameters = []
+    
+    for name, param in sig.parameters.items():
+        param_type = param.annotation
+        flag = True
+        if param_type is torch.Tensor:
+            type_str = "Tensor"
+        elif param_type == Optional[torch.Tensor]:
+            type_str = "Tensor?"
+        elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
+            type_str = "Tensor?"
+        elif param_type in (torch.SymInt, int):
+            type_str = "SymInt"        
+        elif param_type in (float, bool, str):
+            type_str = param_type.__name__
+        elif param_type == Optional[torch.Generator]:
+            type_str = "Generator?"
+        else:
+            type_str = "*"
+            flag = False
+        if flag:
+            param_str = f"{type_str} {name}"
+            
+            if param.default != inspect.Parameter.empty:
+                if param.default is None:
+                    param_str += "=None"
+                else:
+                    param_str += f"={param.default}"
+        else:
+            param_str = f"{type_str} "
+        
+        parameters.append(param_str)
+    return_annotation = sig.return_annotation
+    return_type = ""
+    if return_annotation is type(None) or return_annotation is None:
+        return_type = "()"
+    elif return_annotation is torch.Tensor:
+        return_type = "Tensor"
+    elif get_origin(return_annotation) is list and get_args(return_annotation)[0] is int:
+        return_type = "int[]"
+    elif return_annotation is int:
+        return_type = "int"
+    elif return_annotation is float:
+        return_type = "float"
+    elif return_annotation is bool:
+        return_type = "bool"
+    elif get_origin(return_annotation) is tuple:
+        return_type = "(" + ", ".join(["Tensor" if t is torch.Tensor else 
+                                     "int" if t is int else 
+                                     str(t.__name__) 
+                                     for t in get_args(return_annotation)]) + ")"
+    
+    schema = f"({', '.join(parameters)}) -> {return_type}"
+
+    # schema = f"({', '.join(parameters)}) -> ()"
+    
+    return schema
+
+
 
 def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
 ):
+    import torch
+    from csrc.cpp_itfs.torch_utils import aiter_lib
+    import torch.library
     def decorator(func):
         func.arg_checked = False
+        import inspect
+        schema = ""
+        if func.__name__ in MANUAL_SCHEMA_OPS:
+            schema = generate_schema(func)
+        else:
+            sig = inspect.signature(func)
+            mutates_args = []
+            for name, param in sig.parameters.items():
+                if param.annotation is torch.Tensor:
+                    mutates_args.append(name)
+            sig = torch.library.infer_schema(func, mutates_args=mutates_args)
+            schema = f"{sig}"
+
+        loadName = func.__name__
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -532,7 +664,6 @@ def compile_ops(
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
                     prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
                     os.environ["HIP_CLANG_PATH"] = hip_clang_path
-
                 build_module(
                     md_name,
                     srcs,
@@ -547,7 +678,6 @@ def compile_ops(
                     torch_exclude,
                     hipify,
                 )
-
                 if hip_clang_path is not None:
                     if prev_hip_clang_path is not None:
                         os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
@@ -570,7 +700,6 @@ def compile_ops(
                 import typing
                 import re
                 import torch
-
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
@@ -585,7 +714,6 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -629,9 +757,46 @@ def compile_ops(
                 from ..test_common import log_args
 
                 log_args(func, *args, **kwargs)
-
+            if loadName in RETURN_NONE_OP:
+                op(*args, **kwargs)
+                return
             return op(*args, **kwargs)
 
-        return wrapper
+        def abstract_impl(*args, custom_build_args = {}, **kwargs):
+            # print('fake tensor.....')
+            sig = inspect.signature(func)
+            return_annotation = sig.return_annotation
+            return func(*args, **kwargs)
+            # gemm: func(*args, **kwargs)= None
+
+            if return_annotation is torch.Tensor:
+                return torch.empty(1, device="cuda")
+            elif return_annotation is int:
+                return 0
+            elif return_annotation is List[int]:
+                return [0]
+            elif return_annotation is Optional[torch.Tensor]:
+                return torch.empty(1, device="cuda")
+            elif return_annotation is tuple[torch.Tensor, list[int]]:
+                return (torch.empty(1, device="cuda"), [0])
+        
+            return func(*args, **kwargs)
+
+        if _md_name == "module_aiter_enum":
+            return wrapper
+
+
+        if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            op_schema = f"wrapper_{loadName}" + schema
+            # torch._running_with_deploy = lambda: False
+            aiter_lib.define(op_schema)
+            aiter_lib.impl(f"wrapper_{loadName}" , wrapper, "CUDA")
+            aiter_lib._register_fake(f"wrapper_{loadName}" , abstract_impl)
+
+
+        def wrapper_return(*args, **kwargs):
+            return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args,**kwargs)
+        return wrapper_return
+
 
     return decorator

@@ -59,7 +59,7 @@ def gemm_a4w4(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    bias: Tensor,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
@@ -69,6 +69,10 @@ def gemm_a4w4(
     This function is a wrapper for the A4W4 GEMM kernel.
     It is used to perform matrix multiplication with 4-bit quantization.
     """
+
+    # Get the number of compute units
+    cu_num = get_cu_num()
+
     # Load the A4W4 GEMM kernel
     m = A.shape[0]
     n = B.shape[0]
@@ -89,8 +93,9 @@ def gemm_a4w4(
         or (ck_config is not None and kernelName.find("_ZN") == -1)
         # or bias is None
     ):
-        return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
-    return gemm_a4w4_asm(
+        gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
+        return out
+    gemm_a4w4_asm(
         A,
         B,
         A_scale,
@@ -103,6 +108,7 @@ def gemm_a4w4(
         bpreshuffle,
         log2_k_split=0,
     )
+    return out
 
 
 @compile_ops("module_gemm_a4w4_asm")
@@ -112,13 +118,11 @@ def gemm_a4w4_asm(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: str,
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    bias: Tensor,  # bias:[1, N] f32
     alpha: Optional[float] = 1.0,
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
-    log2_k_split: Optional[int] = None,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a4w4_blockscale")
@@ -129,7 +133,7 @@ def gemm_a4w4_blockscale(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
@@ -141,4 +145,4 @@ def gemm_a4w4_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...

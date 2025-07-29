@@ -13,6 +13,8 @@ from ..jit.core import (
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
+from torch.library import Library
+aiter_lib = Library("aiter", "FRAGMENT")
 from ..ops.gemm_op_common import get_padded_m
 
 
@@ -25,7 +27,7 @@ def gemm_a8w8_ck(
     Out: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a8w8_bpreshuffle", fc_name="gemm_a8w8_bpreshuffle")
@@ -35,7 +37,7 @@ def gemm_a8w8_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a8w8_asm", fc_name="gemm_a8w8_asm")
@@ -52,7 +54,7 @@ def gemm_a8w8_asm(
     pad_b: Optional[int] = 0,
     pad_c: Optional[int] = 0,
     splitK: Optional[int] = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a8w8_blockscale", fc_name="gemm_a8w8_blockscale")
@@ -62,7 +64,7 @@ def gemm_a8w8_blockscale_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a8w8_blockscale_asm", fc_name="flatmm_a8w8_blockscale_asm")
@@ -72,7 +74,7 @@ def flatmm_a8w8_blockscale_asm(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-): ...
+) -> None: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -84,6 +86,38 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     while cusPerTile >= pow(2, splitK + 1) and (pow(2, splitK + 1) * tile_k) < 2 * K:
         splitK += 1
     return splitK
+
+
+_CKGEMM_CONFIG_CACHE = None
+
+def get_CKGEMM_config_(
+    X: Tensor,
+) -> None:
+    global _CKGEMM_CONFIG_CACHE
+
+    if _CKGEMM_CONFIG_CACHE is None:
+        ckgemm_dict = pd.read_csv(
+            f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv"
+        ).drop_duplicates()
+        _CKGEMM_CONFIG_CACHE = ckgemm_dict.set_index(["M", "N", "K"]).to_dict(
+            "index"
+        )
+    return None
+
+
+def get_CKGEMM_config_fake(
+    X: Tensor,
+) -> None:
+    return None
+
+
+op_name = f"aiter::get_CKGEMM_config_"
+
+schema_str = torch.library.infer_schema(get_CKGEMM_config_, mutates_args=())
+torch.library.define(op_name, schema_str, lib=aiter_lib)
+torch.library.impl(op_name, "cuda", get_CKGEMM_config_, lib=aiter_lib)
+# torch.library.impl(op_name, "CPU", get_CKGEMM_config_, lib=aiter_lib)
+torch.library.register_fake(op_name, get_CKGEMM_config_fake, lib=aiter_lib)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -192,7 +226,8 @@ def gemm_a8w8_ASM(
             bias=torch.zeros(n,dtype=dtypes.fp32,device='cuda')"
         splitK = asm_config["splitK"]
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-        return gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, bias, splitK=splitK)
+        gemm_a8w8_asm(XQ, WQ, x_scale, w_scale, Y, bias, splitK=splitK)
+        return Y
     return None
 
 
@@ -219,7 +254,8 @@ def gemm_a8w8_CK(
         else:
             splitK = 0
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_ck(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    return Y
 
 
 def gemm_a8w8_bpreshuffle(
@@ -252,7 +288,8 @@ def gemm_a8w8_bpreshuffle(
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
+    return Y
 
 
 def gemm_a8w8_blockscale(
@@ -267,7 +304,8 @@ def gemm_a8w8_blockscale(
     k = XQ.shape[1]
     get_CKGEMM_config(m, n, k, "a8w8_blockscale_tuned_gemm.csv")
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+    gemm_a8w8_blockscale_ck(XQ, WQ, x_scale, w_scale, Y)
+    return Y
 
 
 def flatmm_a8w8_blockscale_ASM(
@@ -284,7 +322,8 @@ def flatmm_a8w8_blockscale_ASM(
     n = WQ.shape[0]
     # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+    return Y
 
 
 @compile_ops("module_gemm_a8w8_tune", fc_name="gemm_a8w8_tune")
@@ -296,7 +335,7 @@ def gemm_a8w8_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a8w8_blockscale_tune", fc_name="gemm_a8w8_blockscale_tune")
@@ -308,7 +347,7 @@ def gemm_a8w8_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 @compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune")
 def gemm_a8w8_bpreshuffle_tune(
     XQ: torch.Tensor,
@@ -318,4 +357,4 @@ def gemm_a8w8_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
