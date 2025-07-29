@@ -21,25 +21,11 @@ def hipb_mm(
     solution_index: int,
     result: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    out_dtype: str = None,
+    out_dtype: Optional[torch.dtype] = None,
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
 ) -> None: ...
-
-
-# def hipb_mm(
-#     mat1: torch.Tensor,
-#     mat2: torch.Tensor,
-#     solution_index: int,
-#     result: torch.Tensor,
-#     bias: Optional[torch.Tensor] = None,
-#     out_dtype: Optional[object] = None,
-#     scaleA: Optional[torch.Tensor] = None,
-#     scaleB: Optional[torch.Tensor] = None,
-#     scaleOut: Optional[torch.Tensor] = None,
-# ) -> None:
-#     hipb_mm_()
 
 
 
@@ -48,7 +34,7 @@ def hipb_findallsols(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
-    out_dtype: Optional[object] = None,
+    out_dtype: Optional[torch.dtype] = None,
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleC: Optional[torch.Tensor] = None,

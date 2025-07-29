@@ -67,7 +67,7 @@ def fmoe_int8_g1u0(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[Enum] = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu.value,
 )-> None: ...
 
 
@@ -86,7 +86,7 @@ def fmoe_g1u1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[Enum] = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu.value,
 )-> None: ...
 
 
@@ -105,7 +105,7 @@ def fmoe_g1u1_tkw1(
     fc1_scale: Tensor,
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: Optional[Enum] = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu.value,
 )-> None: ...
 
 
@@ -163,7 +163,7 @@ def fmoe_fp8_blockscale_g1u1(
     fc_scale_blkn: int = 128,
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
-    activation: ActivationType = ActivationType.Silu,
+    activation: Optional[Enum] = ActivationType.Silu.value,
 )-> None: ...
 
 
@@ -180,8 +180,8 @@ def moe_stage1_g1u1(
     kernelName: str,
     block_m: int,
     ksplit: int = 0,
-    activation: ActivationType = ActivationType.Silu,
-    quant_type: QuantType = QuantType.No,
+    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: int = int(QuantType.No),
     a1_scale: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
@@ -287,7 +287,7 @@ def ck_moe_stage1_fwd(
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
-    activation: ActivationType = ActivationType.Silu,
+    activation: ActivationType = ActivationType.Silu.value,
 ):
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
     md_name, blob_gen_cmd = get_moe_stage_module(
@@ -333,7 +333,7 @@ def ck_moe_stage2_fwd(
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
-    activation: ActivationType = ActivationType.Silu,
+    activation: ActivationType = ActivationType.Silu.value,
 ):
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
 

@@ -515,11 +515,11 @@ RETURN_NONE_OP = [
 
 MANUAL_SCHEMA_OPS = [
     "register_graph_buffers",
-    "fmoe_int8_g1u0",
-    "fmoe_g1u1",
-    "fmoe_g1u1_tkw1",
-    "fmoe_fp8_blockscale_g1u1",
-    "moe_stage1_g1u1",
+    # "fmoe_int8_g1u0",
+    # "fmoe_g1u1",
+    # "fmoe_g1u1_tkw1",
+    # "fmoe_fp8_blockscale_g1u1",
+    # "moe_stage1_g1u1",
     "module_moe_ck2stages",
     "mha_fwd",
     "fmha_v3_fwd",
@@ -529,7 +529,7 @@ MANUAL_SCHEMA_OPS = [
     "mha_varlen_bwd",
     "fmha_v3_varlen_bwd",
     "mha_batch_prefill",
-    "hipb_mm",
+    # "hipb_mm",
     "hipb_findallsols",
     "rocb_findallsols",
     "_ActivationType",
@@ -543,7 +543,9 @@ def generate_schema(func) -> str:
     from typing import Optional, Union, List, get_origin, get_args
     sig = inspect.signature(func)
     parameters = []
-    
+    if func.__name__ == "mha_varlen_fwd":
+        print('This is param.annotation', sig.parameters.items())
+
     for name, param in sig.parameters.items():
         param_type = param.annotation
         flag = True
@@ -559,6 +561,8 @@ def generate_schema(func) -> str:
             type_str = param_type.__name__
         elif param_type == Optional[torch.Generator]:
             type_str = "Generator?"
+        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is torch.Tensor:
+            type_str = "Tensor[]"
         else:
             type_str = "*"
             flag = False
@@ -616,6 +620,8 @@ def compile_ops(
         schema = ""
         if func.__name__ in MANUAL_SCHEMA_OPS:
             schema = generate_schema(func)
+            # if func.__name__ == "mha_varlen_fwd":
+            #     print(schema)
         else:
             sig = inspect.signature(func)
             mutates_args = []
@@ -699,7 +705,10 @@ def compile_ops(
                 op = getattr(module, loadName)
             else:
                 return None
-
+            activation_index = 0
+            quant_index = 0
+            activation_list = ["fmoe_g1u1","fmoe_int8_g1u0", "fmoe_g1u1_tkw1", "fmoe_fp8_blockscale_g1u1", "moe_stage1_g1u1"]
+            quant_list = ["moe_stage1_g1u1"]
             def check_args():
                 get_asm_dir()
                 import inspect
@@ -721,7 +730,8 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
+                    if loadName in activation_list or loadName in quant_list:
+                        return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -765,6 +775,25 @@ def compile_ops(
                 from ..test_common import log_args
 
                 log_args(func, *args, **kwargs)
+
+            sig = inspect.signature(func)
+            params = list(sig.parameters.keys())
+            if loadName in activation_list:
+                activation_index = params.index("activation")
+                args_list = list(args)
+                from aiter import ActivationType, Enum, QuantType
+                if len(args_list) > activation_index and isinstance(args_list[activation_index], int):
+                        args_list[activation_index] = ActivationType(args_list[activation_index])
+                        args = tuple(args_list)
+
+            if loadName in quant_list:
+                quant_index = params.index("quant_type")
+                args_list = list(args)
+                from aiter import ActivationType, Enum, QuantType
+                if len(args_list) > quant_index and isinstance(args_list[quant_index], int):
+                        args_list[quant_index] = QuantType(args_list[quant_index])
+                        args = tuple(args_list)
+
             if loadName in RETURN_NONE_OP:
                 op(*args, **kwargs)
                 return

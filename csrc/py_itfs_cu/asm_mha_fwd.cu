@@ -139,6 +139,7 @@ fmha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
 std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     const at::Tensor &k, // [b, sk, hk, d]
                                     const at::Tensor &v, // [b, sk, hk, d_v]
+                                    std::vector<at::Tensor> &result,
                                     float p_dropout,
                                     float softmax_scale,
                                     bool is_causal,
@@ -329,7 +330,11 @@ std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
             softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
         }
     }
-    return {out, softmax_lse, p, rng_state};
+    result.push_back(out);
+    result.push_back(softmax_lse);
+    result.push_back(p);
+    result.push_back(rng_state);
+    // return {out, softmax_lse, p, rng_state};
 }
 
 } // namespace torch_itfs
