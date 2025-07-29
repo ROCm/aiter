@@ -94,6 +94,7 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
+CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 
 
 @functools.lru_cache(maxsize=1)
@@ -232,6 +233,7 @@ def recopy_ck():
     if os.path.exists(CK_DIR):
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
+    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{CK_DIR}/include/ck/config.h")
 
 
 def clear_build(md_name):
@@ -295,6 +297,8 @@ def build_module(
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        if hip_version <= Version("6.3.42132"):
+            flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
         if hip_version > Version("5.5.00000"):
             flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
@@ -396,6 +400,7 @@ def build_module(
         )
 
     mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+
 
 def get_args_of_build(ops_name: str, exclude=[]):
     d_opt_build_args = {
@@ -596,7 +601,6 @@ def generate_schema(func) -> str:
     return schema
 
 
-
 def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
@@ -605,6 +609,7 @@ def compile_ops(
     import torch
     from csrc.cpp_itfs.torch_utils import aiter_lib
     import torch.library
+
     def decorator(func):
         func.arg_checked = False
         import inspect
@@ -619,7 +624,6 @@ def compile_ops(
                     mutates_args.append(name)
             sig = torch.library.infer_schema(func, mutates_args=mutates_args)
             schema = f"{sig}"
-
         loadName = func.__name__
 
         @functools.wraps(func)
@@ -664,6 +668,7 @@ def compile_ops(
                 if hip_clang_path is not None and os.path.exists(hip_clang_path):
                     prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
                     os.environ["HIP_CLANG_PATH"] = hip_clang_path
+
                 build_module(
                     md_name,
                     srcs,
@@ -678,6 +683,7 @@ def compile_ops(
                     torch_exclude,
                     hipify,
                 )
+
                 if hip_clang_path is not None:
                     if prev_hip_clang_path is not None:
                         os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
@@ -700,6 +706,7 @@ def compile_ops(
                 import typing
                 import re
                 import torch
+
                 if not op.__doc__.startswith("Members:"):
                     doc_str = op.__doc__.split("\n")[0]
                     doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
@@ -714,6 +721,7 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
+
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -760,10 +768,10 @@ def compile_ops(
             if loadName in RETURN_NONE_OP:
                 op(*args, **kwargs)
                 return
-            return op(*args, **kwargs)
 
+            return op(*args, **kwargs)
         def abstract_impl(*args, custom_build_args = {}, **kwargs):
-            # print('fake tensor.....')
+            print('fake tensor.....')
             sig = inspect.signature(func)
             return_annotation = sig.return_annotation
             return func(*args, **kwargs)
@@ -784,8 +792,6 @@ def compile_ops(
 
         if _md_name == "module_aiter_enum":
             return wrapper
-
-
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             op_schema = f"wrapper_{loadName}" + schema
             # torch._running_with_deploy = lambda: False
@@ -797,6 +803,5 @@ def compile_ops(
         def wrapper_return(*args, **kwargs):
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args,**kwargs)
         return wrapper_return
-
 
     return decorator
