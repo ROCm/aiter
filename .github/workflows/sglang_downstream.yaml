@@ -9,7 +9,7 @@ on:
 jobs:
   sglang:
     name: sglang integration
-    runs-on: [self-hosted, linux, aiter-k8s-build, X64]
+    runs-on: mi300x-1gpu
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
     steps:
@@ -38,6 +38,9 @@ jobs:
           docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm; bash scripts/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
+      
+      - name: Install wget
+        run: sudo apt-get update && sudo apt-get install -y wget
 
       - name: Install dependencies
         run: |
