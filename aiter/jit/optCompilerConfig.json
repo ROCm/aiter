@@ -318,7 +318,7 @@
         "extra_include": [],
         "verbose": "False",
         "hip_clang_path": "os.environ.get('GEMM_A4W4_BLOCKWISE_HIP_CLANG_PATH')",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py --working_path {{}}'"
     },
     "module_moe_sorting": {
         "srcs": [
@@ -336,7 +336,7 @@
             "f'{CK_DIR}/example/ck_tile/13_moe_sorting/'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py --working_path {{}}'"
     },
     "module_norm": {
         "srcs": [

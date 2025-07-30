@@ -319,17 +319,17 @@ def get_gemm1_kernels_list(
         kernel.ActOP = ActOP
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
-        if tag == "a8w4":
-            kernel.CDEElementOp = "MulABScaleWint4"
-        elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeight"
-        elif tag == "a8w8" or tag == "a4w4":
-            kernel.CDEElementOp = "MulABScale"
-        elif tag == "a16w16":
-            if MulRoutedWeight:
-                kernel.CDEElementOp = "TypeCastExpertWeight"
-            else:
-                kernel.CDEElementOp = "TypeCast"
+        # if tag == "a8w4":
+        #     kernel.CDEElementOp = "MulABScaleWint4"
+        # elif tag == "a8w8blkscale":
+        #     kernel.CDEElementOp = "MulABScaleExpertWeight"
+        # elif tag == "a8w8" or tag == "a4w4":
+        #     kernel.CDEElementOp = "MulABScale"
+        # elif tag == "a16w16":
+        if MulRoutedWeight:
+            kernel.CDEElementOp = "TypeCastExpertWeight"
+        else:
+            kernel.CDEElementOp = "TypeCast"
     return tag, kernels_list
 
 
