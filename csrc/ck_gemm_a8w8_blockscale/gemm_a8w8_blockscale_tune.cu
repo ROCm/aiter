@@ -57,7 +57,7 @@ BlockwiseKernel blockwise_dispatch(int id)
 
 
 
-torch::Tensor gemm_a8w8_blockscale_tune(
+void gemm_a8w8_blockscale_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -84,5 +84,5 @@ torch::Tensor gemm_a8w8_blockscale_tune(
   {
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
-  return Y;
+  // return Y;
 }

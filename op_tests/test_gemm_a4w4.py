@@ -39,7 +39,8 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @perftest()
 def run_gemm_ck(x, weight, x_scale, w_scale, out):
-    return aiter.gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out)
+    aiter.gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out)
+    return out
 
 
 @perftest()

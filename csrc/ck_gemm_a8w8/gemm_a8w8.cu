@@ -144,7 +144,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
   return rowwise_heuristic_dispatch<ABDataType, DDataType, EDataType>(M, N, K);
 }
 
-torch::Tensor gemm_a8w8(
+void gemm_a8w8(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -213,5 +213,5 @@ torch::Tensor gemm_a8w8(
       TORCH_CHECK(false, "Unsupported scales/output dtype!");
     }
   }
-  return Y;
+  // return Y;
 }

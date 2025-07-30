@@ -499,11 +499,11 @@ RETURN_NONE_OP = [
     "all_reduce_rmsnorm_quant_",
     "allocate_meta_buffer",
     "get_meta_buffer_ipc_handle",
-    "gemm_a4w4_asm",
-    "gemm_a8w8",
-    "gemm_a8w8_asm",
-    "gemm_a8w8_blockscale",
-    "gemm_a8w8_bpreshuffle"
+    # "gemm_a4w4_asm",
+    # "gemm_a8w8",
+    # "gemm_a8w8_asm",
+    # "gemm_a8w8_blockscale",
+    # "gemm_a8w8_bpreshuffle"
     "hipb_mm",
     "rocb_mm",
     "mha_varlen_fwd",
