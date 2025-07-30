@@ -155,7 +155,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 
 // A4W4 asm gemm kernel
 // D=A*B*alpha+beta*C
-torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
+void gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                             torch::Tensor& B,       // B:[N, K/2] f4x2
                             torch::Tensor& A_scale, // A_scale:[M, K/32] e8m0 paded
                             torch::Tensor& B_scale, // B_scale:[N, K/32] e8m0 paded
@@ -287,5 +287,5 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                              1,   // bdy
                              1,   // bdz
                              stream});
-    return out;
+    // return out;
 }
