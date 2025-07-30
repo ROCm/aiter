@@ -258,14 +258,19 @@
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
           py::arg("offsets"));                                                                 \
-    m.def("get_graph_buffer_ipc_meta", &aiter::get_graph_buffer_ipc_meta, py::arg("_fa"));     \
+    m.def("get_graph_buffer_ipc_meta",                                                         \
+          &aiter::get_graph_buffer_ipc_meta,                                                   \
+           py::arg("_fa"),                                                                     \
+           py::arg("out_list"),                                                                    \
+           py::arg("out_tensor"));                                                   \
     m.def("register_graph_buffers",                                                            \
           &aiter::register_graph_buffers,                                                      \
           py::arg("_fa"),                                                                      \
           py::arg("handles"),                                                                  \
           py::arg("offsets"));                                                                 \
     m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));              \
-    m.def("get_meta_buffer_ipc_handle", &aiter::get_meta_buffer_ipc_handle, py::arg("inp"));
+    m.def("get_meta_buffer_ipc_handle",                                                        \
+          &aiter::get_meta_buffer_ipc_handle, py::arg("inp"), py::arg("out")); \
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \

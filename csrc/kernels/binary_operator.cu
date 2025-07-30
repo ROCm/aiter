@@ -33,9 +33,9 @@ void aiter_mul(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output
   // return output;
 }
 
-void aiter_div(torch::Tensor &input, torch::Tensor &other)
+void aiter_div(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
 {
-  torch::Tensor output = initOutput(input, other);
+  output = initOutput(input, other);
   binary_op_dispatch("div", input, other, output);
   // return output;
 }

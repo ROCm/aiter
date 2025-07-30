@@ -324,7 +324,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(
   return status;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
+void hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
                       torch::Tensor &result,
                       std::optional<torch::Tensor> bias,

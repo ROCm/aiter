@@ -195,7 +195,7 @@ class TunedGemm:
             scale_a is None and scale_b is None and scale_c is None
         ), "scale_a, scale_b, scale_c must be None for rocblas"
         out = torch.tensor([])
-        rocb_mm(out, inp, weights.t(), solidx)
+        rocb_mm(inp, weights.t(), out, solidx)
         if bias is not None:
             out = out + bias
         return out
@@ -310,8 +310,3 @@ class TunedGemm:
 
 
 tgemm = TunedGemm()
-inp = torch.randn(2, 3, device="cuda")      
-weights = torch.randn(4, 3, device="cuda") 
-solidx = 1
-
-tgemm.apply_hipb_mm(inp, weights, solidx)
