@@ -1,39 +1,24 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import triton
 import pytest
-from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+from aiter.ops.triton.gemm_a8w8_per_token_scale import gemm_a8w8_per_token_scale
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 
 
-block_shape = (128, 128)
-
-
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
-    block_shape_n, block_shape_k = block_shape
-    m, k = x.shape
-    n = weight.shape[0]
-    scale_n = (n + block_shape_n - 1) // block_shape_n
-    scale_k = (k + block_shape_k - 1) // block_shape_k
-    x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
-    x = x.to(x_scale.dtype) * x_scale[:m, :k]
-    x = x.view(m, k)
-    w_scale = w_scale.repeat_interleave(block_shape_k, dim=0)
-    w_scale = w_scale.repeat_interleave(block_shape_n, dim=1)
-    w_scale = w_scale[:n, :k]
+    x = x.to(x_scale.dtype) * x_scale
     weight = weight.to(w_scale.dtype) * w_scale
-
     out = F.linear(x.to(torch.float32), weight.to(torch.float32))
-
     return out.to(dtype)
 
 
 def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
-    return gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y)
+    return gemm_a8w8_per_token_scale(x, weight, x_scale, w_scale, dtype, y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -84,23 +69,14 @@ def get_x_vals():
     return x_vals
 
 
-def generate_gemm_a8w8_blockscale_inputs(
+def generate_gemm_a8w8_per_token_scale_inputs(
     M: int,
     N: int,
     K: int,
-    block_shape_n: int,
-    block_shape_k: int,
     dtype=torch.bfloat16,
     layout: str = "TN",
     output=False,
 ):
-    """
-    The GEMM kernel expects:
-    - x: (M, K) -> row-major format
-    - w: (N, K) -> column-major format
-    """
-    scale_n = (N + block_shape_n - 1) // block_shape_n
-    scale_k = (K + block_shape_k - 1) // block_shape_k
 
     if layout[0] == "T":
         x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
@@ -122,8 +98,8 @@ def generate_gemm_a8w8_blockscale_inputs(
             .T
         )
 
-    x_scale = torch.rand([M, scale_k], dtype=torch.float32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+    x_scale = torch.rand([M, 1], dtype=torch.float32, device="cuda")
+    w_scale = torch.rand([N, 1], dtype=torch.float32, device="cuda")
 
     y = None
     if output:
@@ -142,15 +118,12 @@ def generate_gemm_a8w8_blockscale_inputs(
     ],
 )
 def test_gemm(dtype, M, N, K, output):
-    block_shape_n, block_shape_k = block_shape
 
     dtype = str_to_torch_dtype[dtype]
-    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
         M,
         N,
         K,
-        block_shape_n,
-        block_shape_k,
         dtype=dtype,
         output=output,
     )

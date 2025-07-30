@@ -11,9 +11,6 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -24,7 +21,7 @@ _LOGGER = AiterTritonLogger()
     }
 )
 @triton.jit
-def _gemm_a8w8_blockscale_kernel(
+def _gemm_a8w8_per_token_scale_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -51,8 +48,6 @@ def _gemm_a8w8_blockscale_kernel(
     stride_bscale_k,
     stride_bscale_n,
     # Meta-parameters
-    GROUP_K: tl.constexpr,
-    GROUP_N: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -115,7 +110,6 @@ def _gemm_a8w8_blockscale_kernel(
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
-        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         # Create pointers for first block of A and B input matrices
@@ -131,15 +125,8 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
-        a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_ks * stride_ascale_k
-        )
-        offs_bsn = offs_bn // GROUP_N
-        b_scale_ptrs = (
-            b_scale_ptr + offs_ks * stride_bscale_k + offs_bsn * stride_bscale_n
-        )
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K
+        a_scale = tl.load(a_scale_ptr + offs_am * stride_ascale_m)
+        b_scale = tl.load(b_scale_ptr + offs_bn * stride_bscale_n)
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -158,25 +145,14 @@ def _gemm_a8w8_blockscale_kernel(
                     b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
-
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b, input_precision="ieee")
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * stride_bk
 
-            # k_cur = k * BLOCK_SIZE_K // GROUP_K
-            # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
-            # offs_ks = k_nxt - k_cur
-            a_scale_ptrs += offs_ks_step * stride_ascale_k
-            b_scale_ptrs += offs_ks_step * stride_bscale_k
+        accumulator *= a_scale[:, None] * b_scale[None, :]
 
         c = accumulator.to(c_ptr.type.element_ty)
 
@@ -194,7 +170,7 @@ def _gemm_a8w8_blockscale_kernel(
 
 
 @triton.jit
-def _gemm_a8w8_blockscale_reduce_kernel(
+def _gemm_a8w8_per_token_scale_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
     M,
@@ -258,7 +234,7 @@ def _get_config(
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_BLOCKSCALE.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_PER_TOKEN_SCALE.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
@@ -266,7 +242,7 @@ def _get_config(
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_PER_TOKEN_SCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)
@@ -277,14 +253,14 @@ def _get_config(
     return _get_config._config_dict[key]["any"]
 
 
-def gemm_a8w8_blockscale(
+def gemm_a8w8_per_token_scale(
     x: torch.Tensor,
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    config=None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -292,19 +268,13 @@ def gemm_a8w8_blockscale(
     Key parameters:
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
-    - X_scale: Scale tensor for X with shape (M, *scale_k).
-    - W_scale: Scale tensor for W with shape (**scale_n, *scale_k).
+    - X_scale: Scale tensor for X with shape (M, 1).
+    - W_scale: Scale tensor for W with shape (N, 1).
+    - Y: Output Matrix Y with shape (M, K). If this is none, then it's created by this API and returned as output
 
     Returns:
     - Y: The output matrix with shape (M, N).
-
-    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
-    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
     """
-    _LOGGER.info(
-        f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
-    )
-
     M, K = x.shape
     N, K = w.shape
 
@@ -335,12 +305,6 @@ def gemm_a8w8_blockscale(
             config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
     config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
 
-    # Scale block sizes
-    # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
-    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
-
-    # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
         (
             META["NUM_KSPLIT"]
@@ -348,7 +312,7 @@ def gemm_a8w8_blockscale(
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
         ),
     )
-    _gemm_a8w8_blockscale_kernel[grid](
+    _gemm_a8w8_per_token_scale_kernel[grid](
         x,
         w,
         y if config["NUM_KSPLIT"] == 1 else y_pp,
@@ -380,7 +344,7 @@ def gemm_a8w8_blockscale(
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
-        _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
+        _gemm_a8w8_per_token_scale_reduce_kernel[grid_reduce](
             y_pp,
             y,
             M,
