@@ -3,7 +3,7 @@
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
-torch::Tensor pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_size]
+void pa_fwd_naive(torch::Tensor &Q, //   [num_seqs, num_heads, head_size]
                            torch::Tensor &K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
                                              // or[num_batch, seqlen, num_kv_heads, head_size]
                            torch::Tensor &V, //   [num_blocks, num_kv_heads, head_size, block_size]

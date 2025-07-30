@@ -3,7 +3,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
-torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
+void pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      torch::Tensor& K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
                      torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
                      torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]

@@ -417,7 +417,7 @@ def run_aiter_naive(
     block_size,
     quant_algo=0,
 ):
-    out = None
+    out = torch.empty_like(query)
     aiter.pa_fwd_naive(
         query,
         key_cache,
@@ -426,7 +426,6 @@ def run_aiter_naive(
         seq_lens,
         k_dequant_scales,
         v_dequant_scales,
-        out,
         max_seq_len,
         num_kv_heads,
         scale,
@@ -434,6 +433,7 @@ def run_aiter_naive(
         v_scale,
         block_size,
         quant_algo,
+        out,
     )
     return out
 
@@ -461,11 +461,11 @@ def run_aiter_asm(
         value_cache,
         block_tables,
         seq_lens,
-        out,
         max_num_blocks,
         max_seq_len,
         k_scale,
         v_scale,
+        out,
     )
     return out
 

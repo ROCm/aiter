@@ -243,12 +243,11 @@ def run_aiter_asm(
         v_cache,
         block_tables,
         seq_lens,
-        out,
         max_num_blocks,
         max_qlen,
         k_scale,
         v_scale,
-        None,
+        out,
         qo_indptr,
     )
     return out
