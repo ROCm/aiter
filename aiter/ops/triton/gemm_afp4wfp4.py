@@ -211,6 +211,7 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
     stride_ask,
     stride_bsn,
     stride_bsk,
+    mfma_nonkdim,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -313,15 +314,64 @@ def _gemm_afp4_wfp4_kernel_preshuffled_scales(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            a_scales = tl.load(a_scale_ptrs)
-            b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-            if BLOCK_SIZE_M >= 32:
-                a_scales = tl.reshape(
-                    a_scales, (BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+            # Here we "undo" the shuffle done in global memory (shuffle_scales function).
+            if mfma_nonkdim == 32:
+                a_scales = (
+                    tl.load(a_scale_ptrs)
+                    .reshape(
+                        BLOCK_SIZE_M // 32,
+                        BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
+                        2,
+                        32,
+                        4,
+                        1,
+                    )
+                    .permute(0, 3, 1, 4, 2, 5)
+                    .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
                 )
-            b_scales = tl.reshape(
-                b_scales, (BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
-            )
+                b_scales = (
+                    tl.load(b_scale_ptrs)
+                    .reshape(
+                        BLOCK_SIZE_N // 32,
+                        BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
+                        2,
+                        32,
+                        4,
+                        1,
+                    )
+                    .permute(0, 3, 1, 4, 2, 5)
+                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+            else:
+                # mfma_nonkdim == 16
+                a_scales = (
+                    tl.load(a_scale_ptrs)
+                    .reshape(
+                        BLOCK_SIZE_M // 32,
+                        BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
+                        4,
+                        16,
+                        2,
+                        2,
+                        1,
+                    )
+                    .permute(0, 5, 3, 1, 4, 2, 6)
+                    .reshape(BLOCK_SIZE_M, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+                b_scales = (
+                    tl.load(b_scale_ptrs)
+                    .reshape(
+                        BLOCK_SIZE_N // 32,
+                        BLOCK_SIZE_K // SCALE_GROUP_SIZE // 8,
+                        4,
+                        16,
+                        2,
+                        2,
+                        1,
+                    )
+                    .permute(0, 5, 3, 1, 4, 2, 6)
+                    .reshape(BLOCK_SIZE_N, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -690,6 +740,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         ),
     )
 
+    mfma_nonkdim = config["matrix_instr_nonkdim"]
     _gemm_afp4_wfp4_kernel_preshuffled_scales[grid](
         x,
         w,
@@ -710,6 +761,7 @@ def gemm_afp4wfp4_preshuffled_scales(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
+        mfma_nonkdim,
         **config,
     )
 
