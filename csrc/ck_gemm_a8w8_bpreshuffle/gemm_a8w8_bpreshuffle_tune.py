@@ -174,7 +174,9 @@ def tune_gemm_list(
                     "kernelName": [kernelName],
                 }
             )
-            tunedf = pd.concat([tunedf, temp], ignore_index=True)
+            tunedf = pd.concat([tunedf, temp], ignore_index=True).drop_duplicates(
+                subset=["M", "N", "K", "cu_num"], keep="last"
+            )
 
         else:
             print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
