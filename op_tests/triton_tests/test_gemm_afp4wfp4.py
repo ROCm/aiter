@@ -6,6 +6,7 @@ import torch
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_scales,
+    _get_config,
 )
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -15,11 +16,59 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
 )
 
 
-def shuffle_scales(scales: torch.Tensor):
+# Scales are stored as 8-bit tensors, where each element scales 32 values from the A or B operand tensors.
+# Since MFMA instructions are wave-level instructions, that means that each thread provides a fixed set of operand values to MFMA instructions.
+#
+# For example, in an MFMA instruction with shape 16x16x128:
+# - 4 threads contribute elements along the K dimension.
+# - 16 threads contribute elements along the M or N dimension.
+#
+# From the perspective of the scales tensor, even if the K dimension is stored contiguously in LDS,
+# each thread sees its elements along K dim as strided due to interleaving with other threads.
+# This striding limits the ability to load scale values using vectorized memory access.
+#
+# Our goal is to reorganize the scale tensor so that:
+# 1. Each thread stores the 4 scale values it needs for 4 MFMA ops in contiguous memory.
+# 2. Continuous threads access contiguous memory locations improving global memory coalescing when bypassing LDS,
+#    which is especially beneficial for "skinny" matmuls.
+#
+# We consider two MFMA cases: one with non-K dimension 16, and one with 32.
+# In both, the minimum tile size for preshuffling is 32x32x256.
+# For example, for a 32x256 operand tile, the corresponding scale tensor has shape 32x8,
+# where each scale covers 32 elements along the K dimension.
+#
+# Each thread holds one scale per MFMA operation. We pack the 4 scale values (for 4 different MFMA ops)
+# next to each other in memory.
+#
+# Case 1: mfma_scaled_16x16x128
+#
+# Packing order: mfma_op_0, mfma_op_2, mfma_op_1, mfma_op_3
+#
+#            K = 128       K = 128
+#        +------------+ +------------+
+#    M=16|  MFMA op 0 | |  MFMA op 1 |
+#        +------------+ +------------+
+#    M=16|  MFMA op 2 | |  MFMA op 3 |
+#        +------------+ +------------+
+#
+# Case 2: mfma_scaled_32x32x64
+#
+# Packing order: mfma_op_0, mfma_op_1, mfma_op_2, mfma_op_3
+#
+#            K=64     K=64     K=64     K=64
+#        +--------+ +--------+ +--------+ +--------+
+#    M=32| op 0   | | op 1   | | op 2   | | op 3   |
+#        +--------+ +--------+ +--------+ +--------+
+def shuffle_scales(scales: torch.Tensor, mfma_nonkdim: int):
     scales_shuffled = scales.clone()
     sm, sn = scales_shuffled.shape
-    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+    if mfma_nonkdim == 32:
+        scales_shuffled = scales_shuffled.view(sm // 32, 32, sn // 8, 4, 2, 1)
+        scales_shuffled = scales_shuffled.permute(0, 2, 4, 1, 3, 5).contiguous()
+    elif mfma_nonkdim == 16:
+        scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+        scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
+
     scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
     return scales_shuffled
 
@@ -28,7 +77,9 @@ def shuffle_scales(scales: torch.Tensor):
 SCALE_GROUP_SIZE = 32
 
 
-def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True):
+def generate_gemm_afp4wfp4_inputs(
+    M, N, K, mfma_nonkdim, dtype, layout="TN", output=True
+):
     torch.manual_seed(5)
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
@@ -69,10 +120,10 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True):
     w_scales = w_scales.T
     if TRITON_HIP_PRESHUFFLE_SCALES:
         if M >= 32:
-            x_scales_shuffled = shuffle_scales(x_scales)
+            x_scales_shuffled = shuffle_scales(x_scales, mfma_nonkdim)
         else:
             x_scales_shuffled = x_scales
-        w_scales_shuffled = shuffle_scales(w_scales)
+        w_scales_shuffled = shuffle_scales(w_scales, mfma_nonkdim)
     else:
         x_scales_shuffled = x_scales
         w_scales_shuffled = w_scales
@@ -192,6 +243,9 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
         pytest.skip("MXFP4 not supported on this architecture")
 
     if TRITON_HIP_PRESHUFFLE_SCALES:
+        if M < 32:
+            pytest.skip("Minimal tile size for preshuffling is 32x32x256")
+
         if N % 32 > 0:
             pytest.skip(
                 f"N = {N} is not divisible by 32, skip this test for preshuffled scales tests"
@@ -201,8 +255,10 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
                 f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
             )
 
+    config = _get_config(M, N, K)
+    mfma_nonkdim = config["matrix_instr_nonkdim"]
     x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
-        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output)
+        generate_gemm_afp4wfp4_inputs(M, N, K, mfma_nonkdim, dtype, output=output)
     )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
@@ -210,11 +266,11 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if TRITON_HIP_PRESHUFFLE_SCALES:
         if output:
             triton_out = gemm_afp4wfp4_preshuffled_scales(
-                x, w, x_scales_triton, w_scales_triton, dtype, y
+                x, w, x_scales_triton, w_scales_triton, dtype, y, config
             )
         else:
             triton_out = gemm_afp4wfp4_preshuffled_scales(
-                x, w, x_scales_triton, w_scales_triton, dtype
+                x, w, x_scales_triton, w_scales_triton, dtype, config=config
             )
     else:
         if output:
