@@ -494,23 +494,23 @@ RETURN_NONE_OP = [
     # "tanh",
     # "pa_fwd_naive",
     # "pa_fwd_asm",
-    "all_reduce_asm_",
-    "all_reduce_rmsnorm_",
-    "all_reduce_rmsnorm_quant_",
+    # "all_reduce_asm_",
+    # "all_reduce_rmsnorm_",
+    # "all_reduce_rmsnorm_quant_",
     "allocate_meta_buffer",
-    "get_meta_buffer_ipc_handle",
+    # "get_meta_buffer_ipc_handle",
     # "gemm_a4w4_asm",
     # "gemm_a8w8",
     # "gemm_a8w8_asm",
     # "gemm_a8w8_blockscale",
     # "gemm_a8w8_bpreshuffle"
-    "hipb_mm",
-    "rocb_mm",
+    # "hipb_mm",
+    # "rocb_mm",
     "mha_varlen_fwd",
     "layer_norm",
     "layernorm2d_fwd",
     "rmsnorm2d_fwd",
-    "get_graph_buffer_ipc_meta"
+    # "get_graph_buffer_ipc_meta"
 ]
 
 MANUAL_SCHEMA_OPS = [
@@ -536,6 +536,10 @@ MANUAL_SCHEMA_OPS = [
     "_QuantType",
     "init_custom_ar"
 ]
+
+NONE_WRAPPED_OP = ["hipb_create_extension", "hipb_destroy_extension", 
+                "getHipblasltKernelName", "rocb_create_extension",
+                "rocb_destroy_extension", "_ActivationType", "_QuantType"]
 
 def generate_schema(func) -> str:
     import inspect
@@ -630,6 +634,7 @@ def compile_ops(
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
+            print('This is md:', func.__name__)
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
@@ -726,8 +731,8 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-                    if loadName in activation_list or loadName in quant_list:
-                        return True
+                    # if loadName in activation_list or loadName in quant_list:
+                    #     return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -815,7 +820,7 @@ def compile_ops(
         
             return func(*args, **kwargs)
 
-        if _md_name == "module_aiter_enum":
+        if loadName in NONE_WRAPPED_OP:
             return wrapper
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             op_schema = f"wrapper_{loadName}" + schema

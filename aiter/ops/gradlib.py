@@ -2,8 +2,9 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import Optional
+from typing import Optional, overload
 from ..jit.core import compile_ops
+
 
 
 @compile_ops("module_hipbsolgemm")

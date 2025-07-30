@@ -61,7 +61,7 @@ def call_hipb_mm(input, weight, bias, scale_a, scale_b, solidx, out_dtype):
 def call_rocb_mm(inp, w, solidx):
     init_rocblas()
     out = torch.tensor([])
-    aiter.rocb_mm(out, inp, w, solidx)
+    aiter.rocb_mm(inp, w, out, solidx)
     return out
 
 

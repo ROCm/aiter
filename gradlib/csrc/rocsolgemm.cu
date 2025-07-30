@@ -377,11 +377,11 @@ std::vector<rocblas_int> RocFindAllSolIdxBlas(
   return validSolutions;
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
-torch::Tensor RocSolIdxBlas(
+void RocSolIdxBlas(
     const torch::Tensor &mat1,
     const torch::Tensor &mat2,
-    const int32_t solution_index,
-    const torch::Tensor &result)
+    torch::Tensor &result,
+    const int32_t solution_index)
 {
   auto mat1_strides{mat1.strides()};
   auto mat2_strides{mat2.strides()};

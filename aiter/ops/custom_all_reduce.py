@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import List
+from typing import List, Optional
 from ..jit.core import (
     compile_ops,
 )
@@ -40,7 +40,7 @@ def all_reduce_asm_(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-    out: torch.Tensor
+    output: torch.Tensor
 ) -> None: ...
 
 
@@ -55,7 +55,7 @@ def all_reduce_rmsnorm_(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-    out: List[torch.Tensor],
+    output: List[torch.Tensor],
 ) -> None: ...
 
 
@@ -71,7 +71,7 @@ def all_reduce_rmsnorm_quant_(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-    out: List[torch.Tensor],
+    output: List[torch.Tensor],
 ) -> None: ...
 
 
