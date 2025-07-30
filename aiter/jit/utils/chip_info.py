@@ -30,7 +30,7 @@ def get_gfx():
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
-    cu_num = os.getenv("CU_NUM", 0)
+    cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
             rocminfo = executable_path("rocminfo")
