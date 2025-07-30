@@ -460,10 +460,10 @@ def run_aiter_asm(
         value_cache,
         block_tables,
         seq_lens,
-        output,
         max_num_blocks,
         k_scale,
         v_scale,
+        output,
     )
     return output
 

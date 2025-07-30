@@ -364,7 +364,6 @@ def run_aiter_naive(
         seq_lens,
         k_dequant_scales,
         v_dequant_scales,
-        out,
         max_seq_len,
         num_kv_heads,
         scale,
@@ -372,6 +371,7 @@ def run_aiter_naive(
         v_scale,
         block_size,
         quant_algo,
+        out,
     )
     return out
 

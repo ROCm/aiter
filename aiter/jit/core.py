@@ -482,18 +482,18 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 RETURN_NONE_OP = [
-    "add",
-    "sub",
-    "mul",
-    "div",
-    "add_",
-    "sub_",
-    "mul_",
-    "div_",
-    "sigmoid",
-    "tanh",
-    "pa_fwd_naive",
-    "pa_fwd_asm",
+    # "add",
+    # "sub",
+    # "mul",
+    # "div",
+    # "add_",
+    # "sub_",
+    # "mul_",
+    # "div_",
+    # "sigmoid",
+    # "tanh",
+    # "pa_fwd_naive",
+    # "pa_fwd_asm",
     "all_reduce_asm_",
     "all_reduce_rmsnorm_",
     "all_reduce_rmsnorm_quant_",
@@ -543,8 +543,6 @@ def generate_schema(func) -> str:
     from typing import Optional, Union, List, get_origin, get_args
     sig = inspect.signature(func)
     parameters = []
-    if func.__name__ == "mha_varlen_fwd":
-        print('This is param.annotation', sig.parameters.items())
 
     for name, param in sig.parameters.items():
         param_type = param.annotation
@@ -620,8 +618,6 @@ def compile_ops(
         schema = ""
         if func.__name__ in MANUAL_SCHEMA_OPS:
             schema = generate_schema(func)
-            # if func.__name__ == "mha_varlen_fwd":
-            #     print(schema)
         else:
             sig = inspect.signature(func)
             mutates_args = []

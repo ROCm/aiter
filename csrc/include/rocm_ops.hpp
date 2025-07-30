@@ -59,7 +59,6 @@
           py::arg("V"),                             \
           py::arg("block_tables"),                  \
           py::arg("context_lens"),                  \
-          py::arg("output"),                        \
           py::arg("max_num_blocks"),                \
           py::arg("max_qlen")       = 1,            \
           py::arg("K_QScale")       = std::nullopt, \
@@ -80,7 +79,6 @@
           py::arg("context_lens"),     \
           py::arg("k_dequant_scales"), \
           py::arg("v_dequant_scales"), \
-          py::arg("output"),           \
           py::arg("max_seq_len"),      \
           py::arg("num_kv_heads"),     \
           py::arg("scale_s"),          \
