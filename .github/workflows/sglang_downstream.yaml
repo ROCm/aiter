@@ -2,7 +2,7 @@ name: Sglang Downstream Test
 
 on:
   push:
-    branches: [ "**" ]
+    branches: [main]
   pull_request:
     branches: [main]  # Triggers on PRs targeting `main`
 
