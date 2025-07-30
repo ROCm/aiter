@@ -130,7 +130,13 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                         round              = local_round;
                         empty_cu           = local_round * num_cu - tg_num;
                         selectedKernelName = el.first;
-                        selectedsplitK     = splitK;
+                        // patch for big shape gemm in heuristic
+                        if(cfg.tile_M == 128 && cfg.tile_N == 512)
+                        {
+                            selectedKernelName =
+                                "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E";
+                        }
+                        selectedsplitK = splitK;
                     }
                 }
             }
