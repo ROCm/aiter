@@ -568,6 +568,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         }
         impl_ptr->set_4bit(true);
     }
+
 #if defined(__Float4_e2m1fn_x2)
     else if(input.dtype() == gate.dtype() &&
             (input.dtype() == torch::kFloat4_e2m1fn_x2 || input.dtype() == torch::kUInt8)) // fp4
@@ -617,6 +618,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         impl_ptr->set_4bit(true);
     }
 #endif
+
     else if(input.dtype() == at::ScalarType::Char || input.dtype() == at::ScalarType::Byte) // int8
     {
         if(fc2_smooth_scale.has_value())
