@@ -27,9 +27,10 @@ jobs:
 
       - name: Build sglang_aiter_test image
         run: |
+          COMMIT_SHA=$(git rev-parse HEAD)
           cd sglang
           sed -i 's/ENV AITER_COMMIT="v0.1.4"/ARG AITER_COMMIT="v0.1.4"/g' docker/Dockerfile.rocm
-          docker build --no-cache --build-arg SGL_BRANCH=v0.4.9.post3 --build-arg GPU_ARCH=gfx942 --build-arg AITER_COMMIT="$GITHUB_SHA" -t sglang_aiter_test -f docker/Dockerfile.rocm .
+          docker build --no-cache --build-arg SGL_BRANCH=v0.4.9.post3 --build-arg GPU_ARCH=gfx942 --build-arg AITER_COMMIT="${COMMIT_SHA}" -t sglang_aiter_test -f docker/Dockerfile.rocm .
             
       - name: Start CI container
         run: |
