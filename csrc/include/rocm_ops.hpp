@@ -979,3 +979,10 @@
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
         .export_values();
+
+ #define GEMM_COMMON_PYBIND          \
+ m.def("get_padded_m", &getPaddedM,  \
+      py::arg("M"),                  \
+      py::arg("N"),                  \
+      py::arg("K"),                  \
+      py::arg("gl"));    
