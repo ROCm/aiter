@@ -29,14 +29,6 @@ using BlockwiseKernelMap = std::unordered_map<
     BlockwiseKernel,
     IntTupleHash>;
 
-// Helper function to return the next largest power of 2
-//static constexpr int nextPow2(unsigned int num)
-//{
-//  if (num <= 1)
-//    return 1;
-//  return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
-//}
-
 template <typename CDataType>
 BlockwiseKernel blockscale_dispatch(int M, int N, int K)
 {

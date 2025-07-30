@@ -46,7 +46,7 @@ def get_GEMM_config(M: int, N: int, K: int):
         config = get_GEMM_config.gemm_dict.get((cu_num, padded_M, N, K), None)
         if config is not None:
             logger.info(
-                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}!"
+                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM or asmGEMM, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
             )
             break
 

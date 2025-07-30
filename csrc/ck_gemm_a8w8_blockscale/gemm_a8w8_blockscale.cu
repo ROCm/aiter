@@ -4,6 +4,7 @@
 #include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_manifest.h"
 #include "gemm_a8w8_blockscale_lookup.h"
+#include "gemm_common.h"
 #include <cmath>
 
    
@@ -63,21 +64,19 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-    if (M > 1 && M <= 16)
-    {
-      padded_m = 16;
-    }
-    else if (M <= 16384)
-    {
-      padded_m = nextPow2(M);
-    }
-    else if (M <= 20480)
-    {
-      padded_m = 20480;
-    }
+    // Fine-grained search
+    padded_m = getPaddedM(M, N, K, 0);
+
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({padded_m, N, K});
     // If we found an optimal kernel, use it.
+    if (it != lookup.end())
+    {
+      return it->second;
+    }
+    // Coarse-grained search
+    padded_m = getPaddedM(M, N, K, 1);
+    it = lookup.find({padded_m, N, K});
     if (it != lookup.end())
     {
       return it->second;
