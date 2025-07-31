@@ -299,6 +299,22 @@ def la_persistent(
         ) + high_load_wgs * max_tiles_per_wg
         cta_end_tile_gid = iter + (max_tiles_per_wg - 1)
 
+    tl.assume(stride_qm > 0)  # n_ctx_q
+    tl.assume(stride_qh > 0)  # Head
+    tl.assume(stride_qk > 0)  # head_dim
+    tl.assume(stride_kn > 0)
+    tl.assume(stride_kh > 0)
+    tl.assume(stride_kk > 0)
+    tl.assume(stride_vn > 0)
+    tl.assume(stride_vh > 0)
+    tl.assume(stride_vk > 0)
+    tl.assume(stride_om > 0)  # n_ctx_q
+    tl.assume(stride_oh > 0)  # Head
+    tl.assume(stride_on > 0)  # head_dim
+    tl.assume(stride_oph > 0)  # total_programs
+    tl.assume(stride_opm > 0)  # n_ctx_q
+    tl.assume(stride_opn > 0)  # head_dim
+
     # Loop context length
     while iter < cta_end_tile_gid:
         # Calculate index of current head output tile
