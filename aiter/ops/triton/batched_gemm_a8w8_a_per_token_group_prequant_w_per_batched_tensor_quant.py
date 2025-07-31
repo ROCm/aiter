@@ -4,14 +4,12 @@
 from typing import Optional
 import functools
 import json
+import os
 import torch
 import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -22,12 +20,11 @@ _LOGGER = AiterTritonLogger()
     }
 )
 @triton.jit
-def _batched_gemm_a8w8_kernel(
+def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel(
     # Pointers to matrices
     a_ptr,
     b_ptr,
     c_ptr,
-    a_scale_ptr,
     b_scale_ptr,
     bias_ptr,
     # Matrix dimensions
@@ -38,25 +35,26 @@ def _batched_gemm_a8w8_kernel(
     # moving by 1 element in a particular dimension. E.g. `stride_am` is
     # how much to increase `a_ptr` by to get the element one row down
     # (A has M rows).
-    stride_ab,
-    stride_am,
-    stride_ak,
-    stride_bb,
-    stride_bk,
-    stride_bn,
-    stride_cb,
-    stride_cm,
-    stride_cn,
-    stride_ascaleb,
-    stride_bscaleb,
-    stride_biasb,
+    stride_in_ab,
+    stride_in_am,
+    stride_in_ak,
+    stride_in_bb,
+    stride_in_bk,
+    stride_in_bn,
+    stride_in_cb,
+    stride_in_cm,
+    stride_in_cn,
+    stride_in_biasb,
     # Meta-parameters
     HAS_BIAS: tl.constexpr,
+    DTYPE_MAX: tl.constexpr,
+    DTYPE_MIN: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
+    cache_modifier: tl.constexpr,
     GRID_MN: tl.constexpr,
 ):
     """
@@ -78,6 +76,17 @@ def _batched_gemm_a8w8_kernel(
     - Bias: Bias batch tensor with shape (B, 1, N).
     """
 
+    stride_ab = tl.cast(stride_in_ab, tl.int64)
+    stride_am = tl.cast(stride_in_am, tl.int64)
+    stride_ak = tl.cast(stride_in_ak, tl.int64)
+    stride_bb = tl.cast(stride_in_bb, tl.int64)
+    stride_bk = tl.cast(stride_in_bk, tl.int64)
+    stride_bn = tl.cast(stride_in_bn, tl.int64)
+    stride_cb = tl.cast(stride_in_cb, tl.int64)
+    stride_cm = tl.cast(stride_in_cm, tl.int64)
+    stride_cn = tl.cast(stride_in_cn, tl.int64)
+    stride_biasb = tl.cast(stride_in_biasb, tl.int64)
+
     tl.assume(stride_ab > 0)
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -87,8 +96,6 @@ def _batched_gemm_a8w8_kernel(
     tl.assume(stride_cb > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
-    tl.assume(stride_ascaleb > 0)
-    tl.assume(stride_bscaleb > 0)
     tl.assume(stride_biasb > 0)
 
     # -----------------------------------------------------------
@@ -111,18 +118,14 @@ def _batched_gemm_a8w8_kernel(
         pid_m = first_pid_m + (pid % group_size_m)
         pid_n = (pid % num_pid_in_group) // group_size_m
 
+    batch_id = tl.cast(batch_id, tl.int64)
+    pid_m = tl.cast(pid_m, tl.int64)
+    pid_n = tl.cast(pid_n, tl.int64)
+
     tl.assume(pid_m >= 0)
     tl.assume(pid_n >= 0)
+    tl.assume(batch_id >= 0)
 
-    # Cast batch id and batch dimension strides to int64 to avoid int32 overflow during offset calculation
-    # Note: If you're attempting to cast strides to int64 to prevent integer overflow, use `tl.cast` instead of `.to()`.
-    # See https://github.com/ROCm/aiter/pull/597 for rationale
-    batch_id = tl.cast(batch_id, tl.int64)
-    stride_ab = tl.cast(stride_ab, tl.int64)
-    stride_bb = tl.cast(stride_bb, tl.int64)
-    stride_cb = tl.cast(stride_cb, tl.int64)
-
-    # Create pointers for first block of A and B input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -136,36 +139,32 @@ def _batched_gemm_a8w8_kernel(
         + offs_k[:, None] * stride_bk
         + offs_bn[None, :] * stride_bn
     )
-
-    # Create pointers for the scale tensors and load them
-    offs_a_scale = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) % M
-    offs_b_scale = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) % N
-    a_scale = tl.load(a_scale_ptr + batch_id * stride_ascaleb + offs_a_scale)
-    b_scale = tl.load(b_scale_ptr + batch_id * stride_bscaleb + offs_b_scale)
+    one_over_DTYPE_MAX = 1.0 / DTYPE_MAX
+    b_scale = tl.load(b_scale_ptr)
 
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
         if EVEN_K:
             a = tl.load(a_ptrs)
-            b = tl.load(b_ptrs)
+            b = tl.load(b_ptrs, cache_modifier=cache_modifier)
         else:
             a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
             b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
-        accumulator += tl.dot(a, b, input_precision="ieee")
+        m = tl.maximum(tl.max(tl.abs(a), axis=-1), 1e-10)[:, None]
+        a_scale = m.to(tl.float32) * one_over_DTYPE_MAX
+        a_scale_recip = 1.0 / a_scale
+        a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
 
-        # Advance the ptrs to the next K block.
+        accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
+
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    # Apply scale
-    accumulator *= a_scale[:, None] * b_scale[None, :]
+    accumulator *= b_scale
 
-    # Add bias
     if HAS_BIAS:
         offs_bias = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         bias = tl.load(bias_ptr + batch_id * stride_biasb + offs_bias)
@@ -173,7 +172,6 @@ def _batched_gemm_a8w8_kernel(
 
     c = accumulator.to(c_ptr.type.element_ty)
 
-    # Write back the block of the output matrix C with masks.
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = (
@@ -195,27 +193,50 @@ def _get_config(
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8.json"
-        print(f"fpath={fpath}")
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT.json"
+        # print(f"fpath={fpath}")
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
 
-    if M + N >= 4096:
-        return _get_config._config_dict["large"]
+    key = f"{N}_{K}"
+    if key not in _get_config._config_dict.keys():
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-BATCHED_GEMM-A8W8-A_PER_TOKEN_GROUP_PREQUANT_W_PER_BATCHED_TENSOR_QUANT-N={N}-K={K}.json"
+        if os.path.exists(fpath):
+            with open(fpath, "r") as file:
+                config = json.load(file)
+                _get_config._config_dict[key] = config
+        else:
+            key = "default"  # fall back to default config
+
+    if M <= 16:
+        return _get_config._config_dict[key]["small"]
+    elif M <= 128:
+        BLK_M = triton.next_power_of_2(M)
+        if BLK_M == 32:
+            return _get_config._config_dict[key]["medium_M32"]
+        elif BLK_M == 64:
+            return _get_config._config_dict[key]["medium_M64"]
+        elif BLK_M == 128:
+            return _get_config._config_dict[key]["medium_M128"]
+    elif M <= 256:
+        return _get_config._config_dict[key]["large"]
     else:
-        return _get_config._config_dict["small"]
+        return _get_config._config_dict[key]["xlarge"]
+    return _get_config._config_dict[key]["any"]
 
 
-def batched_gemm_a8w8(
-    XQ: torch.Tensor,
+def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
+    X: torch.Tensor,
     WQ: torch.Tensor,
-    x_scale: torch.Tensor,
     w_scale: torch.Tensor,
+    group_size: int = 128,
     bias: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = torch.bfloat16,
     splitK: Optional[int] = None,
     YQ: Optional[torch.Tensor] = None,
+    transpose_bm: Optional[bool] = False,
     config: Optional[dict] = None,
 ):
     """
@@ -228,74 +249,88 @@ def batched_gemm_a8w8(
     Key parameters:
     - XQ: Batch tensor XQ with shape (B, M, K).
     - WQ: Batch tensor WQ with shape (B, N, K).
-    - X_scale: First scale batch tensor with shape (B, M, 1).
-    - W_scale: Second scale batch tensor with shape (B, 1, N).
+    - W_scale: Second scale batch tensor with shape (1, ).
     - Bias: Bias batch tensor with shape (B, 1, N).
     - YQ: Output Matrix Y with shape (B, M, N). If this is none, then it's created by this API and returned as output
 
     Returns:
     - YQ: The output batch tensor with shape (B, M, N).
     """
-    _LOGGER.info(
-        f"BATCHED_GEMM_A8W8: x={tuple(XQ.shape)} w={tuple(WQ.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
-    )
-
-    # Make sure XQ and WQ are contiguous in memory
-    XQ = XQ.contiguous()
-    WQ = WQ.contiguous()
 
     # Check constraints.
-    assert XQ.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
-    assert XQ.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"
+    assert X.shape[0] == WQ.shape[0], "Incompatible Batch dimensions!!!"
+    assert X.shape[2] == WQ.shape[2], "Incompatible K dimensions!!!"
+    assert (
+        triton.next_power_of_2(group_size) == group_size
+    ), "group_size mush be power of 2"
     assert dtype in [
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
-    # Transpose N and K dimensions of WQ: (B, N, K) -> (B, K, N)
-    WQ = WQ.transpose(1, 2)
+    B = X.shape[0]
+    M = X.shape[1]
+    K = X.shape[2]
+    N = WQ.shape[1]
 
-    B = XQ.shape[0]
-    M = XQ.shape[1]
-    K = XQ.shape[2]
-    N = WQ.shape[2]
+    WQ = WQ.transpose(1, 2)
 
     has_bias = bias is not None
     if YQ is None:
-        YQ = torch.empty((B, M, N), dtype=dtype, device=XQ.device)
+        if transpose_bm:
+            YQ = torch.empty((M, B, N), dtype=dtype, device=X.device)
+        else:
+            YQ = torch.empty((B, M, N), dtype=dtype, device=X.device)
+    else:
+        if transpose_bm:
+            assert (
+                YQ.shape[0] == M and YQ.shape[1] == B and YQ.shape[2] == N
+            ), "Output dimension error"
+        else:
+            assert (
+                YQ.shape[0] == B and YQ.shape[1] == M and YQ.shape[2] == N
+            ), "Output dimension error"
 
     if config is None:
         config = _get_config(M, N, K)
+    config["BLOCK_SIZE_K"] = group_size
 
     grid = lambda META: (  # noqa: E731
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    _batched_gemm_a8w8_kernel[grid](
-        XQ,
+    DTYPE_MAX = (
+        torch.finfo(WQ.dtype).max
+        if torch.is_floating_point(WQ)
+        else torch.iinfo(WQ.dtype).max
+    )
+
+    _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel[
+        grid
+    ](
+        X,
         WQ,
         YQ,
-        x_scale,
         w_scale,
         bias,
         M,
         N,
         K,
-        XQ.stride(0),
-        XQ.stride(1),
-        XQ.stride(2),
+        X.stride(0),
+        X.stride(1),
+        X.stride(2),
         WQ.stride(0),
         WQ.stride(1),
         WQ.stride(2),
-        YQ.stride(0),
-        YQ.stride(1),
+        YQ.stride(0) if not transpose_bm else YQ.stride(1),
+        YQ.stride(1) if not transpose_bm else YQ.stride(0),
         YQ.stride(2),
-        x_scale.stride(0),
-        w_scale.stride(0),
         bias.stride(0) if has_bias else 0,
         has_bias,
+        DTYPE_MAX=DTYPE_MAX,
+        DTYPE_MIN=-DTYPE_MAX,
         **config,
     )
 
