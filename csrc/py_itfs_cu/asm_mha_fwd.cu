@@ -136,7 +136,7 @@ fmha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                          drop_seed_offset};
 }
 
-std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
+void fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     const at::Tensor &k, // [b, sk, hk, d]
                                     const at::Tensor &v, // [b, sk, hk, d_v]
                                     std::vector<at::Tensor> &result,

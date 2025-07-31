@@ -156,7 +156,8 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
 }
 
 std::vector<at::Tensor>
-mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
+mha_batch_prefill(std::vector<at::Tensor> &result,
+                  at::Tensor& q,                  // [total_q, hq, d]
                   const at::Tensor& k,            // [total_k, hk, d]
                   const at::Tensor& v,            // [total_k, hk, d]
                   const at::Tensor& cu_seqlens_q, // [b+1]
@@ -282,7 +283,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     CHECK_SHAPE(kv_indptr, batch_size + 1);
     auto opts = q.options();
 
-    at::Tensor out;
+    // at::Tensor out;
     if(out_.has_value())
     {
         out = out_.value();
@@ -302,7 +303,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     bool has_lse     = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
 
-    at::Tensor softmax_lse;
+    // at::Tensor softmax_lse;
     if(return_softmax_lse)
     {
         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
@@ -312,7 +313,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
         softmax_lse = torch::empty({0}, opts.dtype(torch::kFloat32));
     }
 
-    at::Tensor p;
+    // at::Tensor p;
     if(return_dropout_randval)
     {
         TORCH_CHECK(has_dropout, "return_dropout_randval require p_dropout > 0");
@@ -334,7 +335,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
     }
 
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
-    auto rng_state         = torch::empty({2}, opts.dtype(torch::kInt64));
+    rng_state         = torch::empty({2}, opts.dtype(torch::kInt64));
     auto rng_state_ptr     = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if(p_dropout > 0.0)
@@ -397,7 +398,7 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    return {out, softmax_lse, p, rng_state};
+    // return {out, softmax_lse, p, rng_state};
 }
 
 } // namespace torch_itfs

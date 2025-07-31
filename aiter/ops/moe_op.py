@@ -187,8 +187,40 @@ def moe_stage1_g1u1(
     sorted_weights: Optional[torch.Tensor] = None,
 ) -> None: ...
 
+def cmdGenFunc_ck_moe_stage(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str = "",
+    w1_scale: Optional[Tensor] = None,
+    a1_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+    sorted_weights: Optional[Tensor] = None,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    activation: Optional[Enum] = ActivationType.Silu.value):
+    
+    mul_routed_weight_stage = 1 if sorted_weights is None else 2
+    md_name, blob_gen_cmd = get_moe_stage_module(
+        hidden_states.dtype,
+        w1.dtype,
+        out.dtype,
+        activation,
+        quant_type,
+        mul_routed_weight_stage,
+    )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
 
-@compile_ops("module_moe_ck2stages")
+
+
+@compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
 def ck_moe_stage1(
     hidden_states: Tensor,
     w1: Tensor,
@@ -203,6 +235,8 @@ def ck_moe_stage1(
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    activation: Optional[Enum] = ActivationType.Silu.value,
 )-> None: ...
 
 
@@ -221,6 +255,8 @@ def ck_moe_stage2(
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
+    # quant_type: Optional[Enum] = QuantType.No.value,
+    # activation: Optional[Enum] = ActivationType.Silu.value,
 )-> None: ...
 
 
@@ -290,14 +326,14 @@ def ck_moe_stage1_fwd(
     activation: ActivationType = ActivationType.Silu.value,
 ):
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
-    md_name, blob_gen_cmd = get_moe_stage_module(
-        hidden_states.dtype,
-        w1.dtype,
-        out.dtype,
-        activation,
-        quant_type,
-        mul_routed_weight_stage,
-    )
+    # md_name, blob_gen_cmd = get_moe_stage_module(
+    #     hidden_states.dtype,
+    #     w1.dtype,
+    #     out.dtype,
+    #     activation,
+    #     quant_type,
+    #     mul_routed_weight_stage,
+    # )
 
     ck_moe_stage1(
         hidden_states,
@@ -313,7 +349,9 @@ def ck_moe_stage1_fwd(
         a1_scale,
         block_m,
         sorted_weights,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        quant_type,
+        activation
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out
 
@@ -337,14 +375,14 @@ def ck_moe_stage2_fwd(
 ):
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
 
-    md_name, blob_gen_cmd = get_moe_stage_module(
-        inter_states.dtype,
-        w1.dtype,
-        out.dtype,
-        activation,
-        quant_type,
-        mul_routed_weight_stage,
-    )
+    # md_name, blob_gen_cmd = get_moe_stage_module(
+    #     inter_states.dtype,
+    #     w1.dtype,
+    #     out.dtype,
+    #     activation,
+    #     quant_type,
+    #     mul_routed_weight_stage,
+    # )
 
     ck_moe_stage2(
         inter_states,
@@ -360,6 +398,8 @@ def ck_moe_stage2_fwd(
         a2_scale,
         block_m,
         sorted_weights,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        # quant_type,
+        # activation,
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out

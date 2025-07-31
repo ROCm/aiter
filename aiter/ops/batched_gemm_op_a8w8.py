@@ -87,7 +87,8 @@ def batched_gemm_a8w8_CK(
         else:
             splitK = 0
     Y = torch.empty(b, m, n, dtype=dtype, device=XQ.device)
-    return batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+    return Y
 
 
 @compile_ops("module_batched_gemm_a8w8_tune", fc_name="batched_gemm_a8w8_tune")

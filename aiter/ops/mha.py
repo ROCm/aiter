@@ -34,6 +34,7 @@ def fmha_v3_fwd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
+    result: List[Tensor],
     dropout_p: float,
     softmax_scale: float,
     is_causal: bool,
@@ -126,7 +127,7 @@ def fmha_v3_bwd(
 ) -> None: ...
 
 
-def cmdGenFunc(
+def cmdGenFunc_mha_varlen_bwd(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -203,10 +204,88 @@ def cmdGenFunc(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
-binary_add_build_args = partial(cmdGenFunc, "mha_varlen_bwd")
+def cmdGenFunc_mha_batch_prefill(
+    out_: Tensor,
+    softmax_lse: Tensor,
+    p: Tensor,
+    rng_state: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    kv_indptr: Tensor,
+    kv_page_indices: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+):
+    md_name = "mha_batch_prefill"
+    filter_fwd = "*"  # get_fwd_blobs()
+    if q.dtype == torch.float16:
+        md_name += "_fp16"
+        filter_fwd += "fp16*"
+    elif q.dtype == torch.bfloat16:
+        md_name += "_bf16"
+        filter_fwd += "bf16*"
+    if 0.0 < logits_soft_cap:
+        md_name += "_logits"
+        filter_fwd += "_logits*"
+    else:
+        md_name += "_nlogits"
+        filter_fwd += "_nlogits*"
+    if alibi_slopes is None:
+        md_name += "_nbias"
+        filter_fwd += "_nbias*"
+    else:
+        md_name += "_alibi"
+        filter_fwd += "_alibi*"
+    if not is_causal and window_size_left == -1 and window_size_right == -1:
+        md_name += "_nmask"
+        filter_fwd += "_nmask*"
+    else:
+        md_name += "_mask"
+        filter_fwd += "_mask*"
+    if return_softmax_lse:
+        md_name += "_lse"
+        filter_fwd += "_lse*"
+    else:
+        md_name += "_nlse"
+        filter_fwd += "_nlse*"
+    if dropout_p == 0:
+        md_name += "_ndropout"
+        filter_fwd += "_ndropout*"
+    else:
+        md_name += "_dropout"
+        filter_fwd += "_dropout*"
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
+        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+    ]
+    blob_gen_cmd.append(
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}"
+    )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
 
+    
 
-@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd", gen_func=binary_add_build_args)
+# mha_varlen_bwd_build_args = partial(cmdGenFunc_mha_varlen_bwd, "mha_varlen_bwd")
+# mha_batch_prefill_build_args = partial(cmdGenFunc_mha_batch_prefill, "mha_batch_prefill")
+
+@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
 def mha_varlen_bwd(
     dout: Tensor,
     q: Tensor,
@@ -357,7 +436,7 @@ def _flash_attn_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if can_impl_fmha_v3_fwd():
-        result: List[torch.Tensor] = []
+        result = []
         fmha_v3_fwd(
             q,
             k,
@@ -375,6 +454,7 @@ def _flash_attn_forward(
             alibi_slopes,
             None,
         )
+        print('This is result', result)
         out, softmax_lse, S_dmask, rng_state = tuple(result)
     else:
         out, softmax_lse, S_dmask, rng_state = mha_fwd(
@@ -1553,8 +1633,9 @@ def flash_attn_varlen_func(
     )
 
 
-@compile_ops("module_mha_batch_prefill", fc_name="mha_batch_prefill")
+@compile_ops("module_mha_batch_prefill", fc_name="mha_batch_prefill",  gen_func= cmdGenFunc_mha_batch_prefill)
 def mha_batch_prefill(
+    result: List[Tensor],
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1650,7 +1731,9 @@ def _mha_batch_prefill(
     )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
+    output = []
+    mha_batch_prefill(
+        output,
         q,
         k,
         v,
@@ -1671,8 +1754,9 @@ def _mha_batch_prefill(
         out,
         alibi_slopes,
         None,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
+    (out, softmax_lse, S_dmask, rng_state) = output
     return out, softmax_lse, S_dmask, rng_state
 
 

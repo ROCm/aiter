@@ -545,18 +545,20 @@ def generate_schema(func) -> str:
     import inspect
     import torch
     from typing import Optional, Union, List, get_origin, get_args
+    import string
     sig = inspect.signature(func)
     parameters = []
 
-    for name, param in sig.parameters.items():
+    for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
+
         if param_type is torch.Tensor:
-            type_str = "Tensor"
+            type_str = f"Tensor(a{idx}!)"
         elif param_type == Optional[torch.Tensor]:
-            type_str = "Tensor?"
+            type_str = f"Tensor(a{idx}!)?"
         elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
-            type_str = "Tensor?"
+            type_str = f"Tensor(a{idx}!)?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"        
         elif param_type in (float, bool, str):
@@ -564,7 +566,9 @@ def generate_schema(func) -> str:
         elif param_type == Optional[torch.Generator]:
             type_str = "Generator?"
         elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is torch.Tensor:
-            type_str = "Tensor[]"
+            type_str = f"Tensor(a{idx}!)[]"
+        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
+            type_str = "int[]"
         else:
             type_str = "*"
             flag = False
@@ -631,6 +635,7 @@ def compile_ops(
             sig = torch.library.infer_schema(func, mutates_args=mutates_args)
             schema = f"{sig}"
         loadName = func.__name__
+        
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -731,8 +736,6 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-                    # if loadName in activation_list or loadName in quant_list:
-                    #     return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -822,9 +825,10 @@ def compile_ops(
 
         if loadName in NONE_WRAPPED_OP:
             return wrapper
+        # if _md_name == "module_aiter_operator":
+        #     return wrapper
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
-            op_schema = f"wrapper_{loadName}" + schema
-            # torch._running_with_deploy = lambda: False
+            op_schema = f"aiter::wrapper_{loadName}" + schema
             aiter_lib.define(op_schema)
             aiter_lib.impl(f"wrapper_{loadName}" , wrapper, "CUDA")
             aiter_lib._register_fake(f"wrapper_{loadName}" , abstract_impl)
