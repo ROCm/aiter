@@ -5,7 +5,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 )
 
 
-def get_parser(kernel_name: str) -> argparse.ArgumentParser:
+def get_parser(kernel_name: str):
     """
     Builds an argparser with default flags for Triton kernel benchmarking.
 
@@ -40,7 +40,7 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
     return parser
 
 
-def get_ff_args(parser: argparse.ArgumentParser) -> Tuple[dict, dict]:
+def get_ff_args(parser) -> Tuple[dict, dict]:
     """
     Does additional processing on parser args for feed-forward blocks.
     """
@@ -55,7 +55,7 @@ def get_ff_args(parser: argparse.ArgumentParser) -> Tuple[dict, dict]:
     return args, defaults
 
 
-def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+def add_argparse_ff(parser):
     """
     Adds argparse flags for benchmarking Triton kernels for feed-forward layers.
     """
