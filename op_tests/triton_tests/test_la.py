@@ -554,6 +554,20 @@ def main():
     print(f"max_output_tile_cnt={max_output_tile_cnt}")
     max_output_tile_cnt = max_output_tile_cnt + 4
     print(f"causal={causal}, batch={batch}")
+    # N_CTX is a list of context lengthes for all the req in a batch
+    # First, calculate #BLOCK_N for each context length "list_num_block_n"
+    # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
+    # Third, convert list to a tensor "batch_num_block_n"
+    for s in n_ctx:
+        list_num_block_n = [
+            (int(str(s).strip()) + BLOCK_N - 1) // BLOCK_N for s in n_ctx
+        ]
+    len_sum = 0
+    list_sum_block_n = []
+    for i in range(batch):
+        len_sum += list_num_block_n[i]
+        list_sum_block_n.append(len_sum)
+    batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
     sm_scale = 0.5
 
