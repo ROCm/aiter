@@ -401,11 +401,10 @@ def run_aiter_asm(
         v_cache,
         block_tables,
         seq_lens,
-        out,
         max_num_blocks,
         K_QScale=k_scale,
         V_QScale=v_scale,
-        out_=None,
+        out_=out,
         high_precision=high_precision,
     )
     return out
