@@ -150,6 +150,7 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
+  
     // Fine-grained search
     padded_m = getPaddedM(M, N, K, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
@@ -159,8 +160,10 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     {
         return it->second;
     }
+  
     // Coarse-grained search
     padded_m = getPaddedM(M, N, K, 1);
+    // Third check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({padded_m, N, K});
     // If we found an optimal kernel, use it.
     if(it != lookup.end())
