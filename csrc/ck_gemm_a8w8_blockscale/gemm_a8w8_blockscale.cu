@@ -3,7 +3,9 @@
 
 #include "gemm_a8w8_blockscale_common.cuh"
 #include "gemm_a8w8_blockscale_lookup.h"
+#include "gemm_common.h"
 #include "gemm_a8w8_blockscale_manifest.h"
+
 #include <cmath>
 
 using BlockwiseKernel = std::function<torch::Tensor(
@@ -63,40 +65,9 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-
+  
     // Fine-grained search
-    if(M <= 256)
-    {
-        padded_m = (M + 15) / 16 * 16; // Round up to the next multiple of 16
-    }
-    else if(M <= 1024)
-    {
-        padded_m = (M + 31) / 32 * 32; // Round up to the next multiple of 32
-    }
-    else if(M <= 4096)
-    {
-        padded_m = (M + 63) / 64 * 64; // Round up to the next multiple of 64
-    }
-    else
-    {
-        padded_m = (M + 127) / 128 * 128; // Round up to the next multiple of 128
-    }
-    it = lookup.find({padded_m, N, K});
-    // If we found an optimal kernel, use it.
-    if(it != lookup.end())
-    {
-        return it->second;
-    }
-
-    // Coarse-grained search
-    if(M > 1 && M <= 16)
-    {
-        padded_m = 16;
-    }
-    else
-    {
-        padded_m = nextPow2(M);
-    }
+    padded_m = getPaddedM(M, N, K, 0);
 
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({padded_m, N, K});
@@ -105,6 +76,15 @@ BlockwiseKernel blockscale_dispatch(int M, int N, int K)
     {
         return it->second;
     }
+  
+    // Coarse-grained search
+    padded_m = getPaddedM(M, N, K, 1);
+    it = lookup.find({padded_m, N, K});
+    if (it != lookup.end())
+    {
+      return it->second;
+    }
+  
     // Otherwise, use heuristics.
     return a8w8_blockscale_1x128x128_256x16x128x256_16x16_16x16_16x16x1_16x16x1_1x16x1x16_8_1x2_intrawave_v1<
         DDataType,

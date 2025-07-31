@@ -4,6 +4,7 @@
 #include "gemm_a8w8_bpreshuffle_common.cuh"
 #include "gemm_a8w8_bpreshuffle_lookup.h"
 #include "gemm_a8w8_bpreshuffle_manifest.h"
+#include "gemm_common.h"
 #include <cmath>
 
 using RowwiseKernel = std::function<torch::Tensor(
@@ -149,40 +150,9 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     }
 
     int padded_m = M;
-
+  
     // Fine-grained search
-    if(M <= 256)
-    {
-        padded_m = (M + 15) / 16 * 16; // Round up to the next multiple of 16
-    }
-    else if(M <= 1024)
-    {
-        padded_m = (M + 31) / 32 * 32; // Round up to the next multiple of 32
-    }
-    else if(M <= 4096)
-    {
-        padded_m = (M + 63) / 64 * 64; // Round up to the next multiple of 64
-    }
-    else
-    {
-        padded_m = (M + 127) / 128 * 128; // Round up to the next multiple of 128
-    }
-    it = lookup.find({padded_m, N, K});
-    // If we found an optimal kernel, use it.
-    if(it != lookup.end())
-    {
-        return it->second;
-    }
-
-    // Coarse-grained search
-    if(M > 1 && M <= 16)
-    {
-        padded_m = 16;
-    }
-    else
-    {
-        padded_m = nextPow2(M);
-    }
+    padded_m = getPaddedM(M, N, K, 0);
     // Second check if this shape(padded_m,N,K) is available in the direct lookup.
     it = lookup.find({padded_m, N, K});
     // If we found an optimal kernel, use it.
@@ -190,6 +160,17 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     {
         return it->second;
     }
+  
+    // Coarse-grained search
+    padded_m = getPaddedM(M, N, K, 1);
+    // Third check if this shape(padded_m,N,K) is available in the direct lookup.
+    it = lookup.find({padded_m, N, K});
+    // If we found an optimal kernel, use it.
+    if(it != lookup.end())
+    {
+        return it->second;
+    }
+
     // Otherwise, use heuristics.
     return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
 }
