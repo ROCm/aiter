@@ -99,7 +99,7 @@ class TunedGemm:
             self.apply_skinny,
         ]
 
-    @functools.lru_cache(maxsize=1024)
+    @functools.lru_cache(maxsize=4096)
     def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
         # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
         #     if n > 8 and 0 < m <= 4:

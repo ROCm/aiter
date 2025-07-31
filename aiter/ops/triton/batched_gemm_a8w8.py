@@ -251,7 +251,7 @@ def batched_gemm_a8w8(
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_a8w8"
-    assert splitK == None, "Currently, there isn't any support for splitK on Triton"
+    assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
     # Transpose N and K dimensions of WQ: (B, N, K) -> (B, K, N)
     WQ = WQ.transpose(1, 2)

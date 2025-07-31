@@ -721,7 +721,22 @@
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \
           py::arg("activation")       = ActivationType::Silu);                                      \
     m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                                         \
-    m.def("fmoe_g1u1_a16", &fmoe_g1u1_a16);                                                   \
+    m.def("fmoe_g1u1_a16",                                                                    \
+          &fmoe_g1u1_a16,                                                                     \
+          py::arg("out"),                                                                     \
+          py::arg("input"),                                                                   \
+          py::arg("gate"),                                                                    \
+          py::arg("down"),                                                                    \
+          py::arg("sorted_token_ids"),                                                        \
+          py::arg("sorted_weights"),                                                          \
+          py::arg("sorted_expert_ids"),                                                       \
+          py::arg("num_valid_ids"),                                                           \
+          py::arg("topk"),                                                                    \
+          py::arg("fc1_scale"),                                                               \
+          py::arg("fc2_scale"),                                                               \
+          py::arg("fc1_smooth_scale"),                                                        \
+          py::arg("fc2_smooth_scale"),                                                        \
+          py::arg("activation") = ActivationType::Silu);                                      \
     m.def("fmoe_fp8_blockscale_g1u1",                                                         \
           &fmoe_fp8_blockscale_g1u1,                                                          \
           py::arg("out"),                                                                     \
@@ -843,31 +858,31 @@
     m.def("rotary_embedding_fwd", &rotary_embedding, "rotary_embedding"); \
     m.def("batched_rotary_embedding", &batched_rotary_embedding, "batched_rotary_embedding");
 
-#define QUANT_PYBIND                                                       \
-    m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);     \
-    m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant);   \
-    m.def("dynamic_per_token_scaled_quant",                                \
-          &aiter::dynamic_per_token_scaled_quant,                          \
-          py::arg("out"),                                                  \
-          py::arg("input"),                                                \
-          py::arg("scales"),                                               \
-          py::arg("scale_ub")        = std::nullopt,                       \
-          py::arg("shuffle_scale")   = false,                              \
-          py::arg("num_rows")        = std::nullopt,                       \
-          py::arg("num_rows_factor") = 1);                                 \
-    m.def("dynamic_per_group_scaled_quant_fp4",                            \
-          &aiter::dynamic_per_group_scaled_quant_fp4,                      \
-          py::arg("out"),                                                  \
-          py::arg("input"),                                                \
-          py::arg("scales"),                                               \
-          py::arg("group_size")    = 32,                                   \
-          py::arg("shuffle_scale") = true,                                 \
-          py::arg("num_rows")        = std::nullopt,                       \
-          py::arg("num_rows_factor") = 1);                                 \
-    m.def("partial_transpose",                                             \
-          &aiter::partial_transpose,                                       \
-          py::arg("out"),                                                  \
-          py::arg("input"),                                                \
+#define QUANT_PYBIND                                                     \
+    m.def("static_per_tensor_quant", &aiter::static_per_tensor_quant);   \
+    m.def("dynamic_per_tensor_quant", &aiter::dynamic_per_tensor_quant); \
+    m.def("dynamic_per_token_scaled_quant",                              \
+          &aiter::dynamic_per_token_scaled_quant,                        \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("scale_ub")        = std::nullopt,                     \
+          py::arg("shuffle_scale")   = false,                            \
+          py::arg("num_rows")        = std::nullopt,                     \
+          py::arg("num_rows_factor") = 1);                               \
+    m.def("dynamic_per_group_scaled_quant_fp4",                          \
+          &aiter::dynamic_per_group_scaled_quant_fp4,                    \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("scales"),                                             \
+          py::arg("group_size")      = 32,                               \
+          py::arg("shuffle_scale")   = true,                             \
+          py::arg("num_rows")        = std::nullopt,                     \
+          py::arg("num_rows_factor") = 1);                               \
+    m.def("partial_transpose",                                           \
+          &aiter::partial_transpose,                                     \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
           py::arg("num_rows"));
 
 #define RMSNORM_PYBIND                                                                             \
@@ -979,3 +994,10 @@
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
         .export_values();
+
+ #define GEMM_COMMON_PYBIND          \
+ m.def("get_padded_m", &getPaddedM,  \
+      py::arg("M"),                  \
+      py::arg("N"),                  \
+      py::arg("K"),                  \
+      py::arg("gl"));    
