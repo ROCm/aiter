@@ -6,7 +6,6 @@
 #include "gemm_moe_ck2stages_lookup.h"
 #include "gemm_moe_ck2stages.h"
 #include "gemm_moe_ck2stages_heuristic_dispatch.hpp"
-#include "aiter_enum.h"
 #include <cmath>
 
 using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
@@ -53,9 +52,7 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<torch::Tensor> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32,
-                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
-                   QuantType quantType = QuantType::No,
-                   ActivationType activation = ActivationType::Silu,);
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
     at::cuda::getCurrentCUDAStream().stream();
@@ -110,9 +107,7 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<torch::Tensor> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
                    std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32,
-                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
-                   QuantType quantType = QuantType::No,
-                   ActivationType activation = ActivationType::Silu,);
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt)
 {
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")

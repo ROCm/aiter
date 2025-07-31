@@ -142,8 +142,8 @@ def fmoe_g1u1_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-    activation: Optional[Enum] = ActivationType.Silu,
-): ...
+    activation: Optional[Enum] = ActivationType.Silu.value,
+)-> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -240,7 +240,7 @@ def ck_moe_stage1(
 )-> None: ...
 
 
-@compile_ops("module_moe_ck2stages")
+@compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
 def ck_moe_stage2(
     inter_states: Tensor,
     w1: Tensor,
@@ -255,8 +255,8 @@ def ck_moe_stage2(
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-    # quant_type: Optional[Enum] = QuantType.No.value,
-    # activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    activation: Optional[Enum] = ActivationType.Silu.value
 )-> None: ...
 
 
@@ -279,6 +279,11 @@ def get_moe_stage_module(
     quant_type,
     mul_routed_weight_stage,
 ):
+    if isinstance(activation, int):
+        activation = ActivationType(activation)
+    if isinstance(quant_type, int):
+        quant_type = QuantType(quant_type)
+
     Adtype = dtype2str_dict[input_dtype]
     Bdtype = dtype2str_dict[weight_dtype]
     Cdtype = dtype2str_dict[output_dtype]
@@ -398,8 +403,8 @@ def ck_moe_stage2_fwd(
         a2_scale,
         block_m,
         sorted_weights,
-        # quant_type,
-        # activation,
+        quant_type,
+        activation,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out

@@ -481,37 +481,6 @@ def get_args_of_build(ops_name: str, exclude=[]):
                 "ERROR: pls use dict_format to write 'optCompilerConfig.json'! "
             )
 
-RETURN_NONE_OP = [
-    # "add",
-    # "sub",
-    # "mul",
-    # "div",
-    # "add_",
-    # "sub_",
-    # "mul_",
-    # "div_",
-    # "sigmoid",
-    # "tanh",
-    # "pa_fwd_naive",
-    # "pa_fwd_asm",
-    # "all_reduce_asm_",
-    # "all_reduce_rmsnorm_",
-    # "all_reduce_rmsnorm_quant_",
-    "allocate_meta_buffer",
-    # "get_meta_buffer_ipc_handle",
-    # "gemm_a4w4_asm",
-    # "gemm_a8w8",
-    # "gemm_a8w8_asm",
-    # "gemm_a8w8_blockscale",
-    # "gemm_a8w8_bpreshuffle"
-    # "hipb_mm",
-    # "rocb_mm",
-    "mha_varlen_fwd",
-    "layer_norm",
-    "layernorm2d_fwd",
-    "rmsnorm2d_fwd",
-    # "get_graph_buffer_ipc_meta"
-]
 
 MANUAL_SCHEMA_OPS = [
     "register_graph_buffers",
@@ -797,10 +766,9 @@ def compile_ops(
                 if len(args_list) > quant_index and isinstance(args_list[quant_index], int):
                         args_list[quant_index] = QuantType(args_list[quant_index])
                         args = tuple(args_list)
+            if loadName in ["ck_moe_stage2", "ck_moe_stage1"]:
+                return op(*args[:-2], **kwargs)
 
-            if loadName in RETURN_NONE_OP:
-                op(*args, **kwargs)
-                return
 
             return op(*args, **kwargs)
         def abstract_impl(*args, custom_build_args = {}, **kwargs):
@@ -822,6 +790,8 @@ def compile_ops(
                 return (torch.empty(1, device="cuda"), [0])
         
             return func(*args, **kwargs)
+
+        # return wrapper
 
         if loadName in NONE_WRAPPED_OP:
             return wrapper

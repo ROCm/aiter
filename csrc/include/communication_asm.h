@@ -13,7 +13,7 @@ all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
                    float epsilon,
                    // following are fused_allreduce args
                    int64_t _ca,
-                   torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph, std::vector<torch::Tensor> &output);
+                   torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph, py::list &output);
 
 void // out, residual_out, yscale
 all_reduce_rmsnorm_quant(torch::Tensor &input,          // [m ,n]
@@ -24,4 +24,4 @@ all_reduce_rmsnorm_quant(torch::Tensor &input,          // [m ,n]
                          float epsilon,
                          // following are fused_allreduce args
                          int64_t _ca,
-                         torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph, std::vector<torch::Tensor> &output);
+                         torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph, py::list &output);
