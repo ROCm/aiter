@@ -10,12 +10,89 @@ PARALLEL_JOBS=${2:-1}
 mkdir -p "$OUTPUT_DIR"
 
 # Define your configs here
-declare -a CONFIGS=(
+#declare -a CONFIGS=(
     # Format: "batch,hq,hk,sq,sk,d_head,layout,extra_flags,output_name"
     #"1,32,32,2048,2048,128,bshd,,config_1"
-    "1,8,8,128,128,128,bshd,,config_test_1_8_128"
-    "1,8,8,8192,8192,128,bshd,,config_1_8_8192"
-    "2,8,8,8192,8192,128,bshd,,config_2_8_8192"
+#    "1,8,8,128,128,128,bshd,,config_test_1_8_128"
+#    "1,8,8,8192,8192,128,bshd,,config_1_8_8192"
+#    "2,8,8,8192,8192,128,bshd,,config_2_8_8192"
+#)
+
+# Define your configs here
+declare -a CONFIGS=(
+    # Format: "batch,hq,hk,sq,sk,d_head,layout,extra_flags,output_name"
+
+    # LLaMA3 8B - batch 1
+    "1,32,8,2048,2048,128,bshd,,llama3_8b_seq_2048_batch_1"
+    "1,32,8,4096,4096,128,bshd,,llama3_8b_seq_4096_batch_1"
+    "1,32,8,8192,8192,128,bshd,,llama3_8b_seq_8192_batch_1"
+    "1,32,8,16384,16384,128,bshd,,llama3_8b_seq_16384_batch_1"
+
+    # LLaMA3 8B - batch 32
+    "32,32,8,2048,2048,128,bshd,,llama3_8b_seq_2048_batch_32"
+    "32,32,8,4096,4096,128,bshd,,llama3_8b_seq_4096_batch_32"
+    "32,32,8,8192,8192,128,bshd,,llama3_8b_seq_8192_batch_32"
+    "32,32,8,16384,16384,128,bshd,,llama3_8b_seq_16384_batch_32"
+
+    # LLaMA3 70B - batch 1
+    "1,64,8,2048,2048,128,bshd,,llama3_70b_seq_2048_batch_1"
+    "1,64,8,4096,4096,128,bshd,,llama3_70b_seq_4096_batch_1"
+    "1,64,8,8192,8192,128,bshd,,llama3_70b_seq_8192_batch_1"
+    "1,64,8,16384,16384,128,bshd,,llama3_70b_seq_16384_batch_1"
+
+    # LLaMA3 70B - batch 32
+    "32,64,8,2048,2048,128,bshd,,llama3_70b_seq_2048_batch_32"
+    "32,64,8,4096,4096,128,bshd,,llama3_70b_seq_4096_batch_32"
+    "32,64,8,8192,8192,128,bshd,,llama3_70b_seq_8192_batch_32"
+    "32,64,8,16384,16384,128,bshd,,llama3_70b_seq_16384_batch_32"
+
+    # LLaMA3 405B - batch 1
+    "1,128,8,2048,2048,128,bshd,,llama3_405b_seq_2048_batch_1"
+    "1,128,8,4096,4096,128,bshd,,llama3_405b_seq_4096_batch_1"
+    "1,128,8,8192,8192,128,bshd,,llama3_405b_seq_8192_batch_1"
+    "1,128,8,16384,16384,128,bshd,,llama3_405b_seq_16384_batch_1"
+
+    # LLaMA3 405B - batch 32
+    "32,128,8,2048,2048,128,bshd,,llama3_405b_seq_2048_batch_32"
+    "32,128,8,4096,4096,128,bshd,,llama3_405b_seq_4096_batch_32"
+    "32,128,8,8192,8192,128,bshd,,llama3_405b_seq_8192_batch_32"
+    "32,128,8,16384,16384,128,bshd,,llama3_405b_seq_16384_batch_32"
+
+    # Mistral 7B - batch 1
+    "1,32,8,2048,2048,128,bshd,,mistral_7b_seq_2048_batch_1"
+    "1,32,8,4096,4096,128,bshd,,mistral_7b_seq_4096_batch_1"
+    "1,32,8,8192,8192,128,bshd,,mistral_7b_seq_8192_batch_1"
+    "1,32,8,16384,16384,128,bshd,,mistral_7b_seq_16384_batch_1"
+
+    # Mistral 7B - batch 32
+    "32,32,8,2048,2048,128,bshd,,mistral_7b_seq_2048_batch_32"
+    "32,32,8,4096,4096,128,bshd,,mistral_7b_seq_4096_batch_32"
+    "32,32,8,8192,8192,128,bshd,,mistral_7b_seq_8192_batch_32"
+    "32,32,8,16384,16384,128,bshd,,mistral_7b_seq_16384_batch_32"
+
+    # Mistral 22B - batch 1
+    "1,48,8,2048,2048,128,bshd,,mistral_22b_seq_2048_batch_1"
+    "1,48,8,4096,4096,128,bshd,,mistral_22b_seq_4096_batch_1"
+    "1,48,8,8192,8192,128,bshd,,mistral_22b_seq_8192_batch_1"
+    "1,48,8,16384,16384,128,bshd,,mistral_22b_seq_16384_batch_1"
+
+    # Mistral 22B - batch 32
+    "32,48,8,2048,2048,128,bshd,,mistral_22b_seq_2048_batch_32"
+    "32,48,8,4096,4096,128,bshd,,mistral_22b_seq_4096_batch_32"
+    "32,48,8,8192,8192,128,bshd,,mistral_22b_seq_8192_batch_32"
+    "32,48,8,16384,16384,128,bshd,,mistral_22b_seq_16384_batch_32"
+
+    # DeepSeek V3 - batch 1
+    "1,128,128,2048,2048,56,bshd,,deepseek_v3_seq_2048_batch_1"
+    "1,128,128,4096,4096,56,bshd,,deepseek_v3_seq_4096_batch_1"
+    "1,128,128,8192,8192,56,bshd,,deepseek_v3_seq_8192_batch_1"
+    "1,128,128,16384,16384,56,bshd,,deepseek_v3_seq_16384_batch_1"
+
+    # DeepSeek V3 - batch 32
+    "32,128,128,2048,2048,56,bshd,,deepseek_v3_seq_2048_batch_32"
+    "32,128,128,4096,4096,56,bshd,,deepseek_v3_seq_4096_batch_32"
+    "32,128,128,8192,8192,56,bshd,,deepseek_v3_seq_8192_batch_32"
+    "32,128,128,16384,16384,56,bshd,,deepseek_v3_seq_16384_batch_32"
 )
 
 # Function to run a single benchmark
