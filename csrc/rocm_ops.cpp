@@ -20,6 +20,7 @@
 #include "gemm_a4w4_blockscale.h"
 #include "gemm_a8w8.h"
 #include "gemm_a8w8_blockscale.h"
+#include "ck_tile_gemm_a8w8_blockscale.h"
 #include "gemm_a8w8_bpreshuffle.h"
 #include "hipbsolgemm.cuh"
 #include "moe_ck.h"
@@ -87,6 +88,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     // GEMM_A8W8_BLOCKSCALE_TUNE_PYBIND;
     GEMM_A4W4_BLOCKSCALE_PYBIND;
     GEMM_A8W8_BLOCKSCALE_PYBIND;
+    CK_TILE_GEMM_A8W8_BLOCKSCALE_PYBIND;
     AITER_OPERATOR_PYBIND;
     AITER_UNARY_PYBIND;
     CUSTOM_ALL_REDUCE_PYBIND;
