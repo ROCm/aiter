@@ -102,6 +102,10 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         logger.info(
             f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
         )
+    else:
+        logger.warning(
+            f"shape M:{M}, N:{N}, K:{K} is not tuned, using default config! please check {tuned_file}"
+        )
     return config
 
 

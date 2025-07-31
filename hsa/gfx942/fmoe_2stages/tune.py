@@ -79,6 +79,58 @@ def weight_quant(
     return weight_qt, weight_scale
 
 
+def ck_moe_stage1_fwd_out(
+    a1_qt,
+    w1_qt_shffle_ck,
+    w2_qt_shffle_ck,
+    sorted_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    dtype,
+    topk,
+    kernelName,
+    w1_scale,
+    a1_scale,
+    blockM,
+    sorted_weights,
+    q_type,
+    act_type,
+):
+    inter_dim = w1_qt_shffle_ck.shape[1] // 2
+    token_num = a1_qt.shape[0]
+
+    out = torch.empty(
+        (token_num, topk, inter_dim),
+        dtype=dtype,
+        device=a1_qt.device,
+    )
+    out = ck_moe_stage1_fwd(
+        a1_qt,
+        w1_qt_shffle_ck,
+        w2_qt_shffle_ck,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        w1_scale,
+        a1_scale,
+        blockM,
+        sorted_weights,
+        q_type,
+        act_type,
+    )
+    if q_type == QuantType.per_128x128:
+        quant_func = aiter.get_hip_quant(QuantType.per_1x128)
+        a2, a2_scale = quant_func(
+            out,
+            quant_dtype=a1_qt.dtype,
+        )
+        out = a2
+    return out
+
+
 def ck_moe_stage2_fwd_out(
     a2_qt,
     w1_qt_shffle_ck,
@@ -86,8 +138,8 @@ def ck_moe_stage2_fwd_out(
     sorted_ids,
     sorted_expert_ids,
     num_valid_ids,
-    topk,
     dtype,
+    topk,
     kernelName,
     w2_scale,
     a2_scale,
@@ -209,8 +261,6 @@ def go(
             doweight=doweight_stage1,
         )
 
-        if q_type == QuantType.per_Token:
-            ref1 = ref1.view(token, -1)
         if q_type == QuantType.per_128x128:
             ref1, ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=q_dtype_a
@@ -341,7 +391,7 @@ def go(
                         )
                     )
 
-            if blockM in [32, 64, 128] and q_type != QuantType.per_128x128:
+            if blockM in [32, 64, 128]:
                 if q_dtype_w == torch.int4:
                     w1_qt_shffle_ck = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(
@@ -363,7 +413,7 @@ def go(
                     tasks_ck.append(
                         (
                             ("stage1", kernel.name, blockM),  # tag
-                            ck_moe_stage1_fwd,  # func
+                            ck_moe_stage1_fwd_out,  # func
                             (
                                 a1_qt,
                                 w1_qt_shffle_ck,
@@ -371,7 +421,7 @@ def go(
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                out1,
+                                dtype,
                                 topk,
                                 kernel.name,
                                 w1_scale,
@@ -406,8 +456,8 @@ def go(
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                topk,
                                 dtype,
+                                topk,
                                 kernel.name,
                                 w2_scale,
                                 a2_scale,
