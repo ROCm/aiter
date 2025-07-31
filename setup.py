@@ -55,6 +55,7 @@ if IS_ROCM:
             "module_mha_bwd",
             "module_mha_varlen_bwd",
         ]
+
         all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]

@@ -153,6 +153,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_gemm_common": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gemm_common_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_batched_gemm_bf16": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_batched_gemm_bf16/include'",
@@ -196,6 +208,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/include'",
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_blockscale_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale.cu'"
         ],
         "flags_extra_cc": [],
@@ -212,6 +225,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/include'",
             "f'{AITER_CSRC_DIR}/pybind/gemm_a4w4_blockscale_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_a4w4_blockscale/gemm_a4w4_blockscale.cu'"
         ],
         "flags_extra_cc": [],
@@ -229,6 +243,7 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/include'",
             "f'{AITER_CSRC_DIR}/pybind/gemm_a8w8_bpreshuffle_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/gemm_common.cu'",
             "f'{AITER_CSRC_DIR}/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle.cu'"
         ],
         "flags_extra_cc": [],
@@ -262,7 +277,7 @@
         "extra_ldflags": "None",
         "extra_include": [],
         "verbose": "False",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{get_asm_dir()}/f4gemm/codegen.py --output_dir {{}}'"
     },
     "module_gemm_a8w8_blockscale_asm": {
         "srcs": [
@@ -293,7 +308,10 @@
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
         ],
         "verbose": "False",
-        "blob_gen_cmd": "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'"
+        "blob_gen_cmd": [
+            "f'{get_asm_dir()}/fmoe_2stages/codegen.py --output_dir {{}}'",
+            "f'{get_asm_dir()}/fmoe/codegen.py --output_dir {{}}'"
+        ]
     },
     "module_moe_ck2stages": {
         "srcs": [

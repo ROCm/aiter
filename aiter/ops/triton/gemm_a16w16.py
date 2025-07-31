@@ -11,6 +11,9 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -159,6 +162,8 @@ def gemm_a16w16(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+
+    _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
 
     M, K = x.shape
     N, K = w.shape
