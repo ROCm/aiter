@@ -261,8 +261,8 @@
     m.def("get_graph_buffer_ipc_meta",                                                         \
           &aiter::get_graph_buffer_ipc_meta,                                                   \
            py::arg("_fa"),                                                                     \
-           py::arg("out_list"),                                                                    \
-           py::arg("out_tensor"));                                                   \
+           py::arg("handle"),                                                                   \
+           py::arg("offset_tensor"));                                                          \
     m.def("register_graph_buffers",                                                            \
           &aiter::register_graph_buffers,                                                      \
           py::arg("_fa"),                                                                      \
@@ -553,24 +553,22 @@
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
-#define MOE_CK_2STAGES_PYBIND                         \
-    m.def("ck_moe_stage1",                            \
-          &ck_moe_stage1,                             \
-          py::arg("hidden_states"),                   \
-          py::arg("w1"),                              \
-          py::arg("w2"),                              \
-          py::arg("sorted_token_ids"),                \
-          py::arg("sorted_expert_ids"),               \
-          py::arg("num_valid_ids"),                   \
-          py::arg("out"),                             \
-          py::arg("topk"),                            \
-          py::arg("kernelName"),                      \
-          py::arg("w1_scale")       = std::nullopt,   \
-          py::arg("a1_scale")       = std::nullopt,   \
-          py::arg("block_m")        = 32,             \
-          py::arg("sorted_weights") = std::nullopt,   \
-          py::arg("quantType") = QuantType::No,       \
-          py::arg("activation")=ActivationType::Silu);\
+#define MOE_CK_2STAGES_PYBIND                        \
+    m.def("ck_moe_stage1",                           \
+          &ck_moe_stage1,                            \
+          py::arg("hidden_states"),                  \
+          py::arg("w1"),                             \
+          py::arg("w2"),                             \
+          py::arg("sorted_token_ids"),               \
+          py::arg("sorted_expert_ids"),              \
+          py::arg("num_valid_ids"),                  \
+          py::arg("out"),                            \
+          py::arg("topk"),                           \
+          py::arg("kernelName"),                     \
+          py::arg("w1_scale")       = std::nullopt,  \
+          py::arg("a1_scale")       = std::nullopt,  \
+          py::arg("block_m")        = 32,            \
+          py::arg("sorted_weights") = std::nullopt); \
                                                      \
     m.def("ck_moe_stage2",                           \
           &ck_moe_stage2,                            \
@@ -586,9 +584,7 @@
           py::arg("w2_scale")       = std::nullopt,  \
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt);  \
-      //     py::arg("quantType") = QuantType::No,   
-      //     py::arg("activation") =ActivationType::Silu);
+          py::arg("sorted_weights") = std::nullopt);
 
 
 #define MHA_VARLEN_FWD_PYBIND                     \

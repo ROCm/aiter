@@ -295,8 +295,8 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
 }
 
 
-std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
+void mha_varlen_fwd(py::list &output,
+               at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
@@ -582,8 +582,12 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
+    output.append(py::cast(out));
+    output.append(py::cast(softmax_lse));
+    output.append(py::cast(p));
+    output.append(py::cast(rng_state));
     
-    return {out, softmax_lse, p, rng_state};
+    // return {out, softmax_lse, p, rng_state};
 }
 
 } // namespace torch_itfs

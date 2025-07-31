@@ -117,7 +117,7 @@ void all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
                                                             // following are fused_allreduce args
                                                             int64_t _ca,
                                                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph,
-                                                            std::vector<torch::Tensor> &output)
+                                                            py::list &output)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -249,12 +249,10 @@ void all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
     auto options = torch::TensorOptions()
                        .dtype(input.dtype())
                        .device(input.device());
-    output.clear();
-    output.push_back(torch::from_blob(out_ptr, {input.sizes()}, options));
-    output.push_back(torch::from_blob(res_ptr, {input.sizes()}, options));
 
-    // return {torch::from_blob(out_ptr, {input.sizes()}, options),
-    //         torch::from_blob(res_ptr, {input.sizes()}, options)};
+    output.append(py::cast(torch::from_blob(out_ptr, {input.sizes()}, options)));
+    output.append(py::cast(torch::from_blob(res_ptr, {input.sizes()}, options)));
+
 };
 
 void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
@@ -266,7 +264,7 @@ void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
                                                                                  // following are fused_allreduce args
                                                                                  int64_t _ca,
                                                                                  torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph,
-                                                                                 std::vector<torch::Tensor> &output)
+                                                                                 py::list &output)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -410,19 +408,8 @@ void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
     auto res_tensor = torch::from_blob(res_ptr, {input.sizes()}, opt_res);
     auto ys_tensor = torch::from_blob(ys_ptr, {M, 1}, opt_ys);
 
-    output.clear();
-    output.reserve(3);
-    output.push_back(out_tensor);
-    output.push_back(res_tensor);
-    output.push_back(ys_tensor);
+    output.append(py::cast(out_tensor));
+    output.append(py::cast(res_tensor));
+    output.append(py::cast(ys_tensor));
 
-    // output.push_back(torch::from_blob(out_ptr, input.sizes(), opt_out));
-    // output.push_back(torch::from_blob(res_ptr, input.sizes(), res_ptr));
-    // output.push_back(torch::from_blob(ys_ptr, {M, 1}, opt_ys));
-
-    // return {
-    //     torch::from_blob(out_ptr, {input.sizes()}, opt_out),
-    //     torch::from_blob(res_ptr, {input.sizes()}, opt_res),
-    //     torch::from_blob(ys_ptr, {M, 1}, opt_ys),
-    // };
 };

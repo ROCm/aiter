@@ -165,20 +165,18 @@ void register_buffer(fptr_t _fa, torch::Tensor &t,
   fa->register_buffer(handles, offsets, t.data_ptr());
 }
 
-std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(
-    fptr_t _fa)
+void get_graph_buffer_ipc_meta(
+    fptr_t _fa, torch::Tensor &handle, torch::Tensor &offset_tensor)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
-  out_list = offsets;
   auto options =
       torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-  auto handles =
+  handles =
       torch::empty({static_cast<int64_t>(handle_bytes.size())}, options);
   std::memcpy(handles.data_ptr(), handle_bytes.data(), handle_bytes.size());
 
-  torch::Tensor offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
-  return {handles, offset_tensor};
+  offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
 }
 
 void register_graph_buffers(fptr_t _fa, const std::vector<torch::Tensor> &handles,

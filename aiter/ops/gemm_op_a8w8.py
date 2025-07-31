@@ -92,16 +92,20 @@ _CKGEMM_CONFIG_CACHE = None
 
 def get_CKGEMM_config_(
     X: Tensor,
+    tuned_file: str = "a8w8_tuned_gemm.csv"
 ) -> None:
     global _CKGEMM_CONFIG_CACHE
 
     if _CKGEMM_CONFIG_CACHE is None:
+        _CKGEMM_CONFIG_CACHE = {}
+    if tuned_file not in _CKGEMM_CONFIG_CACHE:
         ckgemm_dict = pd.read_csv(
-            f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv"
+            f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file}"
         ).drop_duplicates()
-        _CKGEMM_CONFIG_CACHE = ckgemm_dict.set_index(["M", "N", "K"]).to_dict(
-            "index"
-        )
+        _CKGEMM_CONFIG_CACHE[tuned_file] = ckgemm_dict.set_index(
+            ["cu_num", "M", "N", "K"]
+        ).to_dict("index")
+
     return None
 
 
@@ -122,22 +126,15 @@ torch.library.register_fake(op_name, get_CKGEMM_config_fake, lib=aiter_lib)
 
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    if not hasattr(get_CKGEMM_config, "ckgemm_dict"):
-        get_CKGEMM_config.ckgemm_dict = {}
-    if tuned_file not in get_CKGEMM_config.ckgemm_dict:
-        ckgemm_dict = pd.read_csv(
-            f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file}"
-        ).drop_duplicates()
-        get_CKGEMM_config.ckgemm_dict[tuned_file] = ckgemm_dict.set_index(
-            ["cu_num", "M", "N", "K"]
-        ).to_dict("index")
+    torch.ops.aiter.get_CKGEMM_config_(torch.empty(1, device="cuda"),tuned_file)
+
     cu_num = get_cu_num()
 
     padded_M = M
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = get_CKGEMM_config.ckgemm_dict[tuned_file].get(
+        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(
             (cu_num, padded_M, N, K), None
         )
         if config is not None:
@@ -182,10 +179,10 @@ def gemm_a8w8(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    # assert dtype in [
+    #     dtypes.bf16,
+    #     dtypes.fp16,
+    # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias, dtype, splitK)
 
 
@@ -240,10 +237,10 @@ def gemm_a8w8_CK(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
+# assert dtype in [
+    #     dtypes.bf16,
+    #     dtypes.fp16,
+    # ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]

@@ -48,8 +48,151 @@ def fmha_v3_fwd(
     gen: Optional[Generator] = None,
 ) -> None: ...
 
+def cmdGenFunc_mha_varlen_fwd(
+    output: list[torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+):
+    md_name = "mha_varlen_fwd"
+    if block_table is None:
+        filter_fwd = "*"  # get_fwd_blobs()
+        if q.dtype == dtypes.fp16:
+            md_name += "_fp16"
+            filter_fwd += "fp16*"
+        elif q.dtype == dtypes.bf16:
+            md_name += "_bf16"
+            filter_fwd += "bf16*"
+        if 0.0 < logits_soft_cap:
+            md_name += "_logits"
+            filter_fwd += "_logits*"
+        else:
+            md_name += "_nlogits"
+            filter_fwd += "_nlogits*"
+        if bias is not None:
+            md_name += "_bias"
+            filter_fwd += "_bias*"
+        elif alibi_slopes is not None:
+            md_name += "_alibi"
+            filter_fwd += "_alibi*"
+        else:
+            md_name += "_nbias"
+            filter_fwd += "_nbias*"
+        if not is_causal and window_size_left == -1 and window_size_right == -1:
+            md_name += "_nmask"
+            filter_fwd += "_nmask*"
+        else:
+            md_name += "_mask"
+            filter_fwd += "_mask*"
+        if return_softmax_lse:
+            md_name += "_lse"
+            filter_fwd += "_lse*"
+        else:
+            md_name += "_nlse"
+            filter_fwd += "_nlse*"
+        if dropout_p == 0:
+            md_name += "_ndropout"
+            filter_fwd += "_ndropout*"
+        else:
+            md_name += "_dropout"
+            filter_fwd += "_dropout*"
+        if min_seqlen_q == 0:
+            md_name += "_nskip"
+            filter_fwd += "_nskip*"
+        else:
+            md_name += "_skip"
+            filter_fwd += "_skip*"
+        blob_gen_cmd = [
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        ]
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            "--receipt 200 --filter {} --output_dir {{}}".format('" @ "')
+        )
+        blob_gen_cmd.append(
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
+        )
+    else:
+        filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
+        filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
+        if q.dtype == dtypes.fp16:
+            md_name += "_fp16"
+            filter_fwd_splitkv1 += "fp16*"
+            filter_fwd_splitkv2 += "fp16*"
+        elif q.dtype == dtypes.bf16:
+            md_name += "_bf16"
+            filter_fwd_splitkv1 += "bf16*"
+            filter_fwd_splitkv2 += "bf16*"
+        if 0.0 < logits_soft_cap:
+            md_name += "_logits"
+            filter_fwd += "_logits*"
+        else:
+            md_name += "_nlogits"
+            filter_fwd += "_nlogits*"
+        if bias is not None:
+            md_name += "_bias"
+            filter_fwd_splitkv2 += "_bias*"
+        elif alibi_slopes is not None:
+            md_name += "_alibi"
+            filter_fwd_splitkv2 += "_alibi*"
+        else:
+            md_name += "_nbias"
+            filter_fwd_splitkv2 += "_nbias*"
+        if not is_causal and window_size_left == -1 and window_size_right == -1:
+            md_name += "_nmask"
+            filter_fwd_splitkv2 += "_nmask*"
+        else:
+            md_name += "_mask"
+            filter_fwd_splitkv2 += "_mask*"
+        if return_softmax_lse:
+            md_name += "_lse"
+            filter_fwd_splitkv1 += "_lse*"
+            filter_fwd_splitkv2 += "_lse*"
+        else:
+            md_name += "_nlse"
+            filter_fwd_splitkv1 += "_nlse*"
+            filter_fwd_splitkv2 += "_nlse*"
+        md_name += "_pagedkv"
+        filter_fwd_splitkv2 += "_pagedkv*"
+        filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
+        blob_gen_cmd = [
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+        ]
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+        )
+        blob_gen_cmd.append(
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
+        )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
 
-@compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
+
+@compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd", gen_func=cmdGenFunc_mha_varlen_fwd)
 def mha_varlen_fwd(
     output: list[torch.Tensor],
     q: torch.Tensor,
@@ -1121,7 +1264,7 @@ def _flash_attn_varlen_forward(
         )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    result: list[torch.Tensor] = []
+    result = []
     mha_varlen_fwd(
         result,
         q,
