@@ -17,6 +17,7 @@ def worker(
     rtol=1e-2,
     atol=1e-2,
     printLog=False,
+    tol_err_ratio=0.05,
 ):
     from aiter.test_common import run_perftest
 
@@ -24,7 +25,6 @@ def worker(
     gpuID = gpuIDMap[pid]
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
-
     args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
     torch.cuda.synchronize()
     max_err_ratio = 0.0
@@ -51,6 +51,7 @@ def worker(
                 )
                 for el in ref
             ]
+
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
@@ -63,6 +64,7 @@ def worker(
                         res[i],
                         atol=atol,
                         rtol=rtol,
+                        tol_err_ratio=tol_err_ratio,
                         printLog=printLog,
                         msg=f"info:{info} res[{i}] ",
                     )
@@ -83,19 +85,19 @@ def get_pid():
     return mp.current_process().pid
 
 
-def post_process(rets, fast_mode=False):
+def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
     if fast_mode:
         return rets
     best_time = -1
     from operator import itemgetter
 
     sorted_rets = tuple(sorted(rets, key=itemgetter(0)))
-
     cur_info = sorted_rets[0][0]
     bestConfigs = []
     best_config = list(sorted_rets[0])
     for info, us, max_err_ratio in sorted_rets:
-        if max_err_ratio > 0.01:
+        # print(f"{info=}, {us=}, {max_err_ratio=}")
+        if max_err_ratio > tol_err_ratio:
             continue
         if info[0] == cur_info[0]:
             if best_time < 0 or us < best_time:
@@ -113,7 +115,7 @@ def post_process(rets, fast_mode=False):
     if (
         best_config[0][1] == -1
         or best_config[1] == float("inf")
-        or best_config[2] > 0.01
+        or best_config[2] > tol_err_ratio
     ):
         print(f"No kernel can be used for {info}")
         best_config[1] = "nan"
@@ -122,7 +124,7 @@ def post_process(rets, fast_mode=False):
     return bestConfigs
 
 
-def work_group(gpuIDMap, fast_mode, in_data, tasks):
+def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
     info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref, *rest = group_task[0]
@@ -139,13 +141,15 @@ def work_group(gpuIDMap, fast_mode, in_data, tasks):
             group_task[i]
         )
         work_args = (info, func, input_data + args, kwargs, ref, *rest)
-        ret = worker(gpuIDMap, *work_args)
+        ret = worker(gpuIDMap, *work_args, tol_err_ratio=err_ratio)
         rets.append(ret)
 
-    return post_process(rets, fast_mode)[0] if shape_grouped else rets[0]
+    return post_process(rets, fast_mode, err_ratio)[0] if shape_grouped else rets[0]
 
 
-def mp_tuner(tasks, in_datas, mp_num=0, fast_mode=False, shape_grouped=False):
+def mp_tuner(
+    tasks, in_datas, mp_num=0, fast_mode=False, shape_grouped=False, err_ratio=0.05
+):
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
@@ -174,10 +178,17 @@ def mp_tuner(tasks, in_datas, mp_num=0, fast_mode=False, shape_grouped=False):
         ref_data_index = np.searchsorted(
             cumulative, np.arange(len(task_group)), side="right"
         )
+        gpu_map = {el.get(): i for i, el in enumerate(pids)}
     rets = [
         pool.apply_async(
             work_group,
-            args=(gpu_map, fast_mode, in_datas[ref_data_index[k]], task_group[k]),
+            args=(
+                gpu_map,
+                fast_mode,
+                err_ratio,
+                in_datas[ref_data_index[k]],
+                task_group[k],
+            ),
         )
         for k in range(len(task_group))
     ]
@@ -187,5 +198,5 @@ def mp_tuner(tasks, in_datas, mp_num=0, fast_mode=False, shape_grouped=False):
     return (
         [el.get() for el in rets]
         if shape_grouped
-        else post_process([el.get() for el in rets], fast_mode)
+        else post_process([el.get() for el in rets], fast_mode, err_ratio)
     )

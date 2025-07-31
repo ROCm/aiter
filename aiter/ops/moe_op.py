@@ -14,12 +14,12 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 
 @compile_ops("module_moe_asm")
 def topk_softmax(
-    topk_weights: Tensor,
-    topk_indices: Tensor,
-    token_expert_indices: Tensor,
-    gating_output: Tensor,
-    need_renorm: bool,
-): ...
+    arg0: torch.Tensor,
+    arg1: torch.Tensor,
+    arg2: torch.Tensor,
+    arg3: torch.Tensor,
+    arg4: bool,
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -142,6 +142,7 @@ def fmoe_g1u1_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
+    activation: ActivationType = ActivationType.Silu,
 ): ...
 
 
@@ -246,6 +247,9 @@ def get_moe_stage_module(
     Bdtype = dtype2str_dict[weight_dtype]
     Cdtype = dtype2str_dict[output_dtype]
 
+    quant_type = (
+        QuantType.per_128x128 if quant_type == QuantType.per_1x128 else quant_type
+    )
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 

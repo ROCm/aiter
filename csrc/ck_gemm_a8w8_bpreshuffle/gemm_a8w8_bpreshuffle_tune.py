@@ -40,7 +40,8 @@ def get_untuned_gemm_list(untuned_gemm_file):
         untuned_gemm_file
     ), f"Not exist a8w8_bpreshuffle_untuned_gemm.csv file: {untuned_gemm_file}"
     untunedf = pd.read_csv(untuned_gemm_file)
-    return untunedf
+    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+    return filtered_df
 
 
 def get_tuned_gemm_list(tuned_gemm_file):
@@ -79,7 +80,13 @@ def generate_data(m, n, k):
 
 
 def tune_gemm_list(
-    untunedf, tunedf, issorted=False, useSplitK=False, mp_num=1, shape_grouped=False
+    untunedf,
+    tunedf,
+    issorted=False,
+    useSplitK=False,
+    mp_num=1,
+    shape_grouped=False,
+    forced=False,
 ):
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
@@ -91,12 +98,15 @@ def tune_gemm_list(
         N = untunedf.loc[i, "N"]
         K = untunedf.loc[i, "K"]
         kernels_num = len(kernels_list)
-        if tunedf[
-            (tunedf["M"] == M)
-            & (tunedf["N"] == N)
-            & (tunedf["K"] == K)
-            & (tunedf["cu_num"] == cu_num)
-        ].empty:
+        if (
+            tunedf[
+                (tunedf["M"] == M)
+                & (tunedf["N"] == N)
+                & (tunedf["K"] == K)
+                & (tunedf["cu_num"] == cu_num)
+            ].empty
+            or forced
+        ):
             input_datas = generate_data(M, N, K)
 
             total_kernel_nums = 0
@@ -164,7 +174,9 @@ def tune_gemm_list(
                     "kernelName": [kernelName],
                 }
             )
-            tunedf = pd.concat([tunedf, temp], ignore_index=True)
+            tunedf = pd.concat([tunedf, temp], ignore_index=True).drop_duplicates(
+                subset=["M", "N", "K", "cu_num"], keep="last"
+            )
 
         else:
             print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
@@ -217,9 +229,17 @@ if __name__ == "__main__":
         required=False,
         help="Arranged according to the M N K size",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        required=False,
+        help="force to tune all kernels, even if they are already tuned",
+    )
 
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
-    tunedf = tune_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
+    tunedf = tune_gemm_list(
+        untunedf, tunedf, args.sort, args.splitK, args.mp, forced=args.force
+    )
     tunedf.to_csv(args.tune_file, index=False)
