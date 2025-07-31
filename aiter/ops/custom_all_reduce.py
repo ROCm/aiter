@@ -14,7 +14,7 @@ MD_NAME = "module_custom_all_reduce"
 def init_custom_ar(
     meta: torch.Tensor,
     rank_data: torch.Tensor,
-    handles: list[str],
+    handles: list[torch.Tensor],
     offsets: list[int],
     rank: int,
     full_nvlink: bool,
@@ -82,16 +82,16 @@ def meta_size() -> int: ...
 
 @compile_ops("module_custom_all_reduce")
 def register_buffer(
-    _fa: int, t: torch.Tensor, handles: list[str], offsets: list[int]
+    _fa: int, t: torch.Tensor, handles: list[torch.Tensor], offsets: list[int]
 ): ...
 
 
 @compile_ops("module_custom_all_reduce")
-def get_graph_buffer_ipc_meta(_fa: int) -> tuple[torch.Tensor, list[int]]: ...
+def get_graph_buffer_ipc_meta(_fa: int) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def register_graph_buffers(_fa: int, handles: list[str], offsets: list[list[int]]): ...
+def register_graph_buffers(_fa: int, handles: list[torch.Tensor], offsets: list[torch.Tensor]): ...
 
 
 @compile_ops("module_custom_all_reduce")
