@@ -93,11 +93,11 @@ def generate_data(m, n, k):
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
-    out = torch.empty(m, n, dtype=dtypes.bf16, device="cuda")
+    x = (torch.rand((m, k), dtype=dtypes.fp16) / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp16) / 10).to(dtypes.fp8)
+    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32)
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32)
+    out = torch.empty(m, n, dtype=dtypes.bf16)
     return (x, weight, x_scale, w_scale, out)
 
 

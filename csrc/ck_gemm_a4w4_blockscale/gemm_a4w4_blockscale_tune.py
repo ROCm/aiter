@@ -237,7 +237,6 @@ def tune_gemm_list(
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = get_asm_kernels(asm_kernel_list_csv)
-            # asm_tiles = [(256, 256), (128, 512)]
             asm_tiles = [key for key in asm_kernels.keys()]
             for tile_m, tile_n in asm_tiles:
                 maxsplitK = (
@@ -289,6 +288,7 @@ def tune_gemm_list(
                         )
                     )
                     asm_kernels_id = asm_kernels_id + 1
+
                     total_kernel_nums = total_kernel_nums + 1
             tasks_in_data.append((total_kernel_nums, ()))
         else:
@@ -330,7 +330,6 @@ def tune_gemm_list(
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
     if issorted:
-        print("sorted!!")
         tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
     print("Totall tuning result:")
     print(tunedf)
@@ -387,6 +386,6 @@ if __name__ == "__main__":
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
     tunedf = tune_gemm_list(
-        untunedf, tunedf, args.sort, args.splitK, args.mp, errRatio=args.errRatio
+        untunedf, tunedf, True, args.splitK, args.mp, errRatio=args.errRatio
     )
     tunedf.to_csv(args.tune_file, index=False)

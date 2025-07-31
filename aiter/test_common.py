@@ -9,7 +9,11 @@ import numpy as np
 import pandas as pd
 from aiter import logger
 
-pd.set_option("display.max_rows", 200)
+# pd.set_option("display.max_rows", 200)
+pd.set_option("display.max_rows", None)  # 显示所有行
+pd.set_option("display.max_columns", None)  # 显示所有列
+pd.set_option("display.width", None)  # 自动调整列宽（避免换行）
+pd.set_option("display.max_colwidth", None)  # 显示完整列内容（不截断字符串）
 
 
 def perftest(
@@ -225,14 +229,23 @@ def post_process_data(df):
         sum_df["self_device_time_total"] += d["self_device_time_total"]
     idx_min = sum_df["self_device_time_total"].idxmin()
     idx_max = sum_df["self_device_time_total"].idxmax()
-    mean = sum_df["self_device_time_total"].mean()
-    out_range_idx = sum_df.index[
-        (sum_df["self_device_time_total"] < 0.5 * mean)
-        | (sum_df["self_device_time_total"] > 1.5 * mean)
-    ].tolist()
-    out_range_idx.extend([idx_min, idx_max])
-    indexs = {d.iloc[i]["original_index"] for d in kernel_dfs for i in out_range_idx}
 
+    k = 1.5
+    Q1 = sum_df["self_device_time_total"].quantile(0.25)
+    Q3 = sum_df["self_device_time_total"].quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - k * IQR
+    upper = Q3 + k * IQR
+
+    out_range_idx = sum_df.index[
+        (sum_df["self_device_time_total"] < lower)
+        & (sum_df["self_device_time_total"] > upper)
+    ].tolist()
+    if len(out_range_idx) > 0:
+        print("out_range_idx is ", out_range_idx)
+    indexs = {d.iloc[i]["original_index"] for d in kernel_dfs for i in out_range_idx}
+    for i in indexs:
+        print(f" i is ,val is {df.iloc[i]['self_device_time_total']}")
     return list(indexs)
 
 
@@ -287,9 +300,15 @@ def get_trace_perf(prof, num_iters):
         "device_time_sum",
     ]
     df = df[cols].sort_values(timerList, ignore_index=True)
+    actual_iters = num_iters
+    if df.empty:
+        logger.info(f"no valida data after post process!")
+    else:
+        actual_iters = df.at[0, "cnt"]
+
     avg_name = "[avg us/iter]"
     for el in timerList:
-        df.at[avg_name, el] = df[el].sum() / df.at[0, "cnt"]
+        df.at[avg_name, el] = df[el].sum() / actual_iters
     if int(os.environ.get("AITER_LOG_MORE", 0)):
         pd.set_option("display.expand_frame_repr", False)
         pd.set_option("display.max_colwidth", 90)

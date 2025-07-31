@@ -21,8 +21,10 @@ def worker(
 ):
     from aiter.test_common import run_perftest
 
+    # pid = mp.current_process().pid
     pid = mp.current_process().pid
-    gpuID = gpuIDMap[pid]
+    # gpuID = gpuIDMap[pid]
+    gpuID = torch.cuda.current_device()
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
     args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -135,8 +137,18 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref, *rest = group_task[0]
 
     updated_ref_args = ref_args if not input_data else input_data[:-1] + ref_args
+    pid = mp.current_process().pid
+    gpuID = gpuIDMap[pid]
+    device = torch.device(f"cuda:{gpuID}")
+    torch.cuda.set_device(device)
+
     if ref is None and not fast_mode:
+        updated_ref_args = [
+            el.to(device) if isinstance(el, torch.Tensor) else el
+            for el in updated_ref_args
+        ]
         ref = ref_func(*updated_ref_args, **ref_kwargs)
+        torch.cuda.synchronize()
 
     rets = []
     shape_grouped = isinstance(tasks, list)
@@ -177,6 +189,8 @@ def mp_tuner(
     pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     # time.sleep(2)
     task_group = []
+    if mp_num == 1:
+        shape_grouped = True
     # dispatch per shape to one pid
     if not tasks:
         return []
