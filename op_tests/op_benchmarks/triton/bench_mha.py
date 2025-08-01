@@ -22,7 +22,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
 
-
 def nonvarlen_benchmark_configs():
     batch_sizes = [1, 4, 16]
     N_HEADS = [16, 48]
@@ -608,7 +607,7 @@ def main():
         def fun():
             return run_benchmark(custom_config, args)
 
-        print_vgpr(fun, "fused-attention")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
 
     run_benchmark(custom_config, args)

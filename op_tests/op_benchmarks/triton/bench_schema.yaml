@@ -36,23 +36,32 @@ benchmarks:
     input_columns: [M, N, K]
     output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   hstu_attn:
-    input_columns: [M, N, K]
-    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+    input_columns: [batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim]
+    output_columns: [TFLOPS]
   la_paged_decode:
     input_columns: [OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM]
     output_columns: [Time_(ms)]
-  moe:
-    input_columns: [model, M, N, K, E, top_k]
-    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   mha:
     input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
-    output_columns: [fwd(TFLOPS)]
-  pa_prefill:
-    input_columns: [model, BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM]
-    output_columns: [Time (ms), TFLOPS, Bandwidth (GB/s)]
+    output_columns: [fwd(TFLOPS), fwd(ms), fwd(GB/s), bwd(TFLOPS), bwd(ms), bwd(GB/s)]
+  moe_align_block_size:
+    input_columns: [model, M, N, K, E, top_k]
+    output_columns: [Time_(ms), Bandwidth_(GB/s)]
+  moe_mx:
+    input_columns: [model, M, N, K, E, top_k]
+    output_columns: [Time_(ms), TFLOPS, Bandwidth_(GB/s)]
+  moe_routing_sigmoid_top1_fused:
+    input_columns: [M, N, K]
+    output_columns: [Time_(ms), TFLOPS, Bandwidth_(GB/s)]
+  moe:
+    input_columns: [model, M, N, K, E, top_k]
+    output_columns: [Time_(ms), TFLOPS, Bandwidth_(GB/s)]
   pa_decode:
     input_columns: [model, BS, HQ, HK, SEQ_LEN, HEAD_DIM]
-    output_columns: [Time (ms), TFLOPS, Bandwidth (GB/s)]
-  hstu_attn:
-    input_columns: [batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim]
-    output_columns: [Triton]
+    output_columns: [Time_(ms), TFLOPS, Bandwidth_(GB/s)]
+  pa_prefill:
+    input_columns: [model, BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM]
+    output_columns: [Time_(ms), TFLOPS, Bandwidth_(GB/s)]
+  rmsnorm:
+    input_columns: [model_name, M, N]
+    output_columns: [Bandwidth_(GB/s)]
