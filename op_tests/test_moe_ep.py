@@ -108,11 +108,11 @@ def test_fmoe_ep(
     # This gpu id in EP, this example use the last id
     ep_id = ep - 1
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
-    expert_mask = torch.randint(
-        0, 2, (E + shared_E + 1,), dtype=dtypes.i32, device="cuda"
-    )
-    # expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
-    # expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    # expert_mask = torch.randint(
+    #     0, 2, (E + shared_E + 1,), dtype=dtypes.i32, device="cuda"
+    # )
+    expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
+    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
     # The last expert
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
