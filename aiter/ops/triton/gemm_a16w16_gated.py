@@ -12,6 +12,9 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.activation import _get_activation_from_str
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -197,6 +200,7 @@ def gemm_a16w16_gated(
     Returns:
     - Y: The output matrix with shape (M, N//2).
     """
+    _LOGGER.info(f"GEMM_A16W16_GATED: x={tuple(x.shape)} w={tuple(w.shape)}")
 
     # Shape checks
     assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
