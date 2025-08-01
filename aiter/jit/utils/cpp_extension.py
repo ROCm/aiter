@@ -229,9 +229,11 @@ COMMON_HIPCC_FLAGS = [
     "-fno-unique-section-names",
     "-ffunction-sections",
     "-fdata-sections",
-    "-fvisibility=hidden",
-    "-fvisibility-inlines-hidden",
 ]
+
+if os.environ.get(AITER_SYMBOL_VISIBILITY, 0):
+    COMMON_HIPCC_FLAGS.append("-fvisibility=hidden")
+    COMMON_HIPCC_FLAGS.append("-fvisibility-inlines-hidden")
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
 

@@ -3,7 +3,7 @@
 #pragma once
 
 #include <torch/extension.h>
-
+__attribute__((visibility("default")))
 void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    torch::Tensor& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
                    torch::Tensor& w2, // [e, n, k], pre-shuffle([e, nr, kr, w])
@@ -17,7 +17,7 @@ void ck_moe_stage1(torch::Tensor& hidden_states, // [m, k], input token
                    std::optional<torch::Tensor> a1_scale, // [m, 1], token scale
                    std::optional<int> block_m,
                    std::optional<torch::Tensor> sorted_weights);
-
+__attribute__((visibility("default")))
 void ck_moe_stage2(torch::Tensor& inter_states, // [m, k], input token
                    torch::Tensor& w1, // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
                    torch::Tensor& w2, // [e, n, k], pre-shuffle([e, nr, kr, w])

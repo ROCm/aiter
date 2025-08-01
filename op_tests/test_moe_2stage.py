@@ -146,7 +146,7 @@ def test_fmoe(
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
 
-    score = torch.randn((token, E), dtype=dtype)
+    score = torch.randn((token, E))
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     M, _ = topk_ids.shape
