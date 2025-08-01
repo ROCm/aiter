@@ -106,6 +106,8 @@ def layernorm2d_with_add_asm(
     epsilon: float,
     x_bias: Optional[Tensor] = None,
 ) -> None: ...
+
+
 @compile_ops("module_norm")
 def layernorm2d_with_add_smoothquant_asm(
     out: Tensor,

@@ -376,7 +376,6 @@ def run_aiter_naive(
     return out
 
 
-
 @perftest()
 def run_aiter_asm(
     query,
@@ -393,7 +392,7 @@ def run_aiter_asm(
     k_scale=None,
     v_scale=None,
     high_precision=0,
-):  
+):
     out = torch.empty_like(query)
     aiter.pa_fwd_asm(
         query,

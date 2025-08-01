@@ -24,9 +24,9 @@ void fmha_v3_bwd(
                                     bool deterministic,
                                     bool is_v3_atomic_fp32,
                                     int how_v3_bf16_cvt,
-                                    std::optional<at::Tensor> dq,                 // [b, sq, hq, d]
-                                    std::optional<at::Tensor> dk,                 // [b, sk, hk, d]
-                                    std::optional<at::Tensor> dv,                 // [b, sk, hk, d]
+                                    std::optional<at::Tensor> dq_,                 // [b, sq, hq, d]
+                                    std::optional<at::Tensor> dk_,                 // [b, sk, hk, d]
+                                    std::optional<at::Tensor> dv_,                 // [b, sk, hk, d]
                                     std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                                     std::optional<const at::Tensor> rng_state,
                                     std::optional<at::Generator> gen);

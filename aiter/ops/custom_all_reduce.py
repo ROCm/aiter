@@ -24,13 +24,13 @@ def init_custom_ar(
 @compile_ops("module_custom_all_reduce")
 def all_reduce_reg(
     _fa: int, inp: torch.Tensor, out: torch.Tensor, open_fp8_quant: bool
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def all_reduce_unreg(
     _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
@@ -40,7 +40,7 @@ def all_reduce_asm_(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-    output: torch.Tensor
+    output: torch.Tensor,
 ) -> None: ...
 
 
@@ -78,7 +78,7 @@ def all_reduce_rmsnorm_quant_(
 
 
 @compile_ops("module_custom_all_reduce")
-def dispose(_fa: int, out: torch.Tensor)-> None: ...
+def dispose(_fa: int, out: torch.Tensor) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
@@ -88,17 +88,19 @@ def meta_size() -> int: ...
 @compile_ops("module_custom_all_reduce")
 def register_buffer(
     _fa: int, t: torch.Tensor, handles: list[torch.Tensor], offsets: list[int]
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
-def get_graph_buffer_ipc_meta(_fa: int, handle: torch.Tensor, offset_tensor: torch.Tensor) -> None: ...
+def get_graph_buffer_ipc_meta(
+    _fa: int, handle: torch.Tensor, offset_tensor: torch.Tensor
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
 def register_graph_buffers(
     _fa: int, handles: list[torch.Tensor], offsets: list[torch.Tensor]
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")

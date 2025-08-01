@@ -432,7 +432,7 @@ def run_aiter_naive(
         k_scale,
         v_scale,
         block_size,
-        quant_algo
+        quant_algo,
     )
     return output
 

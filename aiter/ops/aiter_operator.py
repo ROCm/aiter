@@ -9,7 +9,9 @@ from typing import Any
 MD_NAME = "module_aiter_operator"
 
 
-def cmdGenFunc(op_name: str, input: Tensor, other: Tensor, out: Tensor) -> dict[str, Any]:
+def cmdGenFunc(
+    op_name: str, input: Tensor, other: Tensor, out: Tensor
+) -> dict[str, Any]:
     dtype_str = str(input.dtype).split(".")[1] + "_" + str(other.dtype).split(".")[1]
     blob_gen_cmd = [
         f"{AITER_CSRC_DIR}/kernels/generate_binaryop.py --working_path {{}} --optype {op_name} --dtypes {dtype_str}"

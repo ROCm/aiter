@@ -244,7 +244,7 @@ def mla_decode_stage1_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops(MD_NAME)
@@ -267,4 +267,4 @@ def mla_prefill_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-)-> None: ...
+) -> None: ...

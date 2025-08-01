@@ -22,9 +22,9 @@ void mha_bwd(
                                 int window_size_left,
                                 int window_size_right,
                                 bool deterministic,
-                                std::optional<at::Tensor> dq,                 // [b, sq, hq, d]
-                                std::optional<at::Tensor> dk,                 // [b, sk, hk, d]
-                                std::optional<at::Tensor> dv,                 // [b, sk, hk, d]
+                                std::optional<at::Tensor> dq_,                 // [b, sq, hq, d]
+                                std::optional<at::Tensor> dk_,                 // [b, sk, hk, d]
+                                std::optional<at::Tensor> dv_,                 // [b, sk, hk, d]
                                 std::optional<at::Tensor> dbias_,             // [sq, sk]
                                 std::optional<const at::Tensor> bias_,        // [sq, sk]
                                 std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]

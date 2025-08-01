@@ -14,6 +14,7 @@ from ..jit.core import (
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 from torch.library import Library
+
 aiter_lib = Library("aiter", "FRAGMENT")
 from ..ops.gemm_op_common import get_padded_m
 
@@ -90,10 +91,8 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 _CKGEMM_CONFIG_CACHE = None
 
-def get_CKGEMM_config_(
-    X: Tensor,
-    tuned_file: str = "a8w8_tuned_gemm.csv"
-) -> None:
+
+def get_CKGEMM_config_(X: Tensor, tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
     global _CKGEMM_CONFIG_CACHE
 
     if _CKGEMM_CONFIG_CACHE is None:
@@ -126,7 +125,7 @@ torch.library.register_fake(op_name, get_CKGEMM_config_fake, lib=aiter_lib)
 
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    torch.ops.aiter.get_CKGEMM_config_(torch.empty(1, device="cuda"),tuned_file)
+    torch.ops.aiter.get_CKGEMM_config_(torch.empty(1, device="cuda"), tuned_file)
 
     cu_num = get_cu_num()
 
@@ -134,9 +133,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     config = None
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
-        config = _CKGEMM_CONFIG_CACHE[tuned_file].get(
-            (cu_num, padded_M, N, K), None
-        )
+        config = _CKGEMM_CONFIG_CACHE[tuned_file].get((cu_num, padded_M, N, K), None)
         if config is not None:
             logger.info(
                 f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM , kernel name is {config['kernelName']}!"
@@ -237,7 +234,7 @@ def gemm_a8w8_CK(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-# assert dtype in [
+    # assert dtype in [
     #     dtypes.bf16,
     #     dtypes.fp16,
     # ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"

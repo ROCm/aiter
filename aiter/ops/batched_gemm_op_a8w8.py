@@ -22,7 +22,7 @@ def batched_gemm_a8w8(
     w_scale: Tensor,
     out: Tensor,
     bias: Optional[Tensor] = None,
-    splitK: int=0,
+    splitK: int = 0,
 ) -> None: ...
 
 
@@ -99,5 +99,5 @@ def batched_gemm_a8w8_tune(
     w_scale: Tensor,
     out: Tensor,
     kernelId: int,
-    splitK: int=0,
+    splitK: int = 0,
 ) -> None: ...
