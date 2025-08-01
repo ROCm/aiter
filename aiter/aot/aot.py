@@ -5,8 +5,8 @@ from pathlib import Path
 import json
 from aiter.jit.core import build_module, get_args_of_build, get_user_jit_dir
 
-root_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-print(f"root_dir:{root_dir}")
+root_dir = Path(__file__).resolve().parents[2]
+print(f"root_dir: {root_dir}")
 
 def copy_built_kernels(out_dir: Path, module_names: list) -> None:
     """Copy built kernel files to output directory"""
@@ -89,7 +89,6 @@ def main():
             print(f"srcs: {build_args.get("srcs")}")
 
             filtered_args = {
-                # 'srcs': [el for el in build_args.get('srcs', []) if "pybind.cu" not in el],
                 'srcs': [el for el in build_args.get('srcs', [])], 
                 'flags_extra_cc': build_args.get('flags_extra_cc', []) + ['-DPREBUILD_KERNELS'],
                 'flags_extra_hip': build_args.get('flags_extra_hip', []) + ['-DPREBUILD_KERNELS'],
