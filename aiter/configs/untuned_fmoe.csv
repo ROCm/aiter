@@ -4,4 +4,4 @@ token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,
 512,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.int8,torch.int8,QuantType.per_Tensor,1,0
 4,2304,1536,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,0
 4,2304,1536,8,2,ActivationType.Gelu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,1,1
-56,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_128x128,1,0
+56,6144,4096,8,2,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_1x128,1,0

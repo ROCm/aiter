@@ -613,6 +613,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    args.quant_type = "per_1x128" if args.quant_type == "per_128x128" else args.quant_type
 
     codegen = ck_moe_2stage_gemm_codegen(
         args.working_path,
