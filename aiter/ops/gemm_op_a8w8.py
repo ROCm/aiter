@@ -114,7 +114,7 @@ def get_CKGEMM_config_fake(
     return None
 
 
-op_name = f"aiter::get_CKGEMM_config_"
+op_name = "aiter::get_CKGEMM_config_"
 
 schema_str = torch.library.infer_schema(get_CKGEMM_config_, mutates_args=())
 torch.library.define(op_name, schema_str, lib=aiter_lib)

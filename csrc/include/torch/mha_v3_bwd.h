@@ -6,10 +6,10 @@
 namespace aiter {
 namespace torch_itfs {
 void fmha_v3_bwd(
-                                    const at::Tensor &dq,
-                                    const at::Tensor &dk,
-                                    const at::Tensor &dv,
-                                    const at::Tensor &softmax_d,
+                                    at::Tensor &dq,
+                                    at::Tensor &dk,
+                                    at::Tensor &dv,
+                                    at::Tensor &softmax_d,
                                     const at::Tensor& dout, // [b, sq, hq, d]
                                     const at::Tensor& q,    // [b, sq, hq, d]
                                     const at::Tensor& k,    // [b, sk, hk, d]
