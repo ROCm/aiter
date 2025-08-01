@@ -328,7 +328,7 @@ def ck_moe_stage1_fwd(
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
-    activation: ActivationType = ActivationType.Silu.value,
+    activation: ActivationType = ActivationType.Silu,
 ):
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
     # md_name, blob_gen_cmd = get_moe_stage_module(
@@ -354,8 +354,8 @@ def ck_moe_stage1_fwd(
         a1_scale,
         block_m,
         sorted_weights,
-        quant_type,
-        activation
+        quant_type.value,
+        activation.value
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out
@@ -376,7 +376,7 @@ def ck_moe_stage2_fwd(
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: QuantType = QuantType.No,
-    activation: ActivationType = ActivationType.Silu.value,
+    activation: ActivationType = ActivationType.Silu,
 ):
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
 
@@ -403,8 +403,8 @@ def ck_moe_stage2_fwd(
         a2_scale,
         block_m,
         sorted_weights,
-        quant_type,
-        activation,
+        quant_type.value,
+        activation.value,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out

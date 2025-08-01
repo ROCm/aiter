@@ -5,7 +5,12 @@
 
 namespace aiter {
 namespace torch_itfs {
-void mha_varlen_fwd(py::list &output,
+void mha_varlen_fwd(
+                    // py::list &output,
+                    at::Tensor &output,
+                    at::Tensor &softmax_lse,
+                    at::Tensor &S_dmask,
+                    at::Tensor &rng_state,
                     at::Tensor &q,                  // [total_q, hq, d]
                     const at::Tensor &k,            // [total_k, hk, d]
                     const at::Tensor &v,            // [total_k, hk, d]

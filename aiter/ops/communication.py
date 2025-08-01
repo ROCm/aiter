@@ -91,6 +91,8 @@ def all_reduce_rmsnorm(
         ca._IS_CAPTURING,
         output
     )
+    print('This is result:', output)
+
     return tuple(output)
 
 
@@ -118,5 +120,6 @@ def all_reduce_rmsnorm_quant(
         ca._IS_CAPTURING,
         output
     )
+    print('This is result:', output)
     return tuple(output)
 

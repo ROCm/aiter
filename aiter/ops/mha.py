@@ -31,10 +31,13 @@ def mha_fwd(
 
 @compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd")
 def fmha_v3_fwd(
+    output: Tensor,
+    softmax_lse: Tensor,
+    S_dmask: Tensor,
+    rng_state: Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    result: List[Tensor],
     dropout_p: float,
     softmax_scale: float,
     is_causal: bool,
@@ -49,7 +52,10 @@ def fmha_v3_fwd(
 ) -> None: ...
 
 def cmdGenFunc_mha_varlen_fwd(
-    output: list[torch.Tensor],
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    S_dmask: torch.Tensor,
+    rng_state: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -194,7 +200,11 @@ def cmdGenFunc_mha_varlen_fwd(
 
 @compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd", gen_func=cmdGenFunc_mha_varlen_fwd)
 def mha_varlen_fwd(
-    output: list[torch.Tensor],
+    # output: list[torch.Tensor],
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    S_dmask: torch.Tensor,
+    rng_state: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -579,12 +589,15 @@ def _flash_attn_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if can_impl_fmha_v3_fwd():
-        result = []
+        output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
         fmha_v3_fwd(
+            output,
+            softmax_lse,
+            S_dmask,
+            rng_state,
             q,
             k,
             v,
-            result,
             dropout_p,
             softmax_scale,
             causal,
@@ -597,8 +610,6 @@ def _flash_attn_forward(
             alibi_slopes,
             None,
         )
-        print('This is result', result)
-        out, softmax_lse, S_dmask, rng_state = tuple(result)
     else:
         out, softmax_lse, S_dmask, rng_state = mha_fwd(
             q,
@@ -1264,9 +1275,12 @@ def _flash_attn_varlen_forward(
         )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    result = []
+    output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
     mha_varlen_fwd(
-        result,
+        output,
+        softmax_lse,
+        S_dmask,
+        rng_state,
         q,
         k,
         v,
@@ -1291,7 +1305,7 @@ def _flash_attn_varlen_forward(
         None,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
-    return tuple(result)
+    return output, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_varlen_backward(
@@ -1778,7 +1792,10 @@ def flash_attn_varlen_func(
 
 @compile_ops("module_mha_batch_prefill", fc_name="mha_batch_prefill",  gen_func= cmdGenFunc_mha_batch_prefill)
 def mha_batch_prefill(
-    result: List[Tensor],
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    S_dmask: torch.Tensor,
+    rng_state: torch.Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1874,9 +1891,12 @@ def _mha_batch_prefill(
     )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    output = []
+    output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
     mha_batch_prefill(
         output,
+        softmax_lse,
+        S_dmask,
+        rng_state,
         q,
         k,
         v,
@@ -1899,8 +1919,8 @@ def _mha_batch_prefill(
         None,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
-    (out, softmax_lse, S_dmask, rng_state) = output
-    return out, softmax_lse, S_dmask, rng_state
+    # (out, softmax_lse, S_dmask, rng_state) = output
+    return output, softmax_lse, S_dmask, rng_state
 
 
 def mha_batch_prefill_func(
