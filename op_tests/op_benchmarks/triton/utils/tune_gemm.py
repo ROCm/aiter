@@ -1,8 +1,13 @@
 import sys
+import os
+from pathlib import Path
 import argparse
 import itertools
 import subprocess
 import torch
+import triton
+import time
+from rpdTracerControl import rpdTracerControl
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
 
@@ -13,13 +18,19 @@ def run_bash_command(commandstring, capture=True):
     proc = subprocess.run(commandstring, shell=True, check=True, executable='/bin/bash')
     return None
 
+def get_output_dir():
+    output_dir = Path(__file__) / "tune_output/gemm"
+    if not output_dir.exists():
+        output_dir.mkdir()
+    return output_dir
+
 #configs
 def get_full_tuning_space():
     configs = []
 
     block_mn_range = [16, 32, 64, 128, 256]
     block_k_range = [16, 32, 64, 128, 256]
-    split_k_range = [1, 2, 4, 5, 6, 8, 10, 12, 16, 18, 24]
+    #split_k_range = [1, 2, 4, 5, 6, 8, 10, 12, 16, 18, 24]
     num_warps_range = [1, 2, 4, 8]
     group_m_range = [1, 2, 4, 8, 16, 32]
     # For now we see better perf with num_stages=2 for all gemm configs we care
@@ -51,7 +62,6 @@ def prune_configs(M, N, K, configs, elemBytes_a, elemBytes_b):
     else:
         mfma = 32
 
-    # TODO (zhanglx): figure out the boundary between large and small gemms
     large_gemm = False
     if M >= 2048 and N >= 2048:
         large_gemm = True
@@ -63,15 +73,19 @@ def prune_configs(M, N, K, configs, elemBytes_a, elemBytes_b):
         num_warps = config.get("num_warps")
         num_stages = config.get("num_stages")
         matrix_instr_nonkdim = config.get("matrix_instr_nonkdim")
+        
         if matrix_instr_nonkdim > mfma:
             continue
+        
         if mfma == 4 and BLOCK_SIZE_K < 64:
             continue
+        
         # some layouts could not work properly in case
         # number elemens per thread is less 1
         if BLOCK_SIZE_M * BLOCK_SIZE_N < 64:
             continue
-        SPLIT_K = config.get("SPLIT_K")
+        
+        #SPLIT_K = config.get("SPLIT_K")
         GROUP_M = config.get("GROUP_SIZE_M")
         if BLOCK_SIZE_M < matrix_instr_nonkdim or BLOCK_SIZE_N < matrix_instr_nonkdim:
             continue
@@ -79,25 +93,29 @@ def prune_configs(M, N, K, configs, elemBytes_a, elemBytes_b):
             continue
         if N <= matrix_instr_nonkdim and BLOCK_SIZE_N != matrix_instr_nonkdim:
             continue
+        
         # Skip BLOCK_SIZE that is too large compare to M/N
         # unless BLOCK_SIZE is already small enough
         if BLOCK_SIZE_M > M * 2 and BLOCK_SIZE_M != 16:
             continue
         if BLOCK_SIZE_N > N * 2 and BLOCK_SIZE_N != 16:
             continue
+        
         # skip large split_k when not necessary
-        if SPLIT_K != 1 and not need_split_k(M, N, K):
-            continue
+        #if SPLIT_K != 1 and not need_split_k(M, N, K):
+        #    continue
+        
         # skip split_k that leads to EVEN_K = false
-        leap = SPLIT_K * BLOCK_SIZE_K
-        modv = K % leap
-        if modv != 0 and SPLIT_K != 1:
-            continue
+        #leap = SPLIT_K * BLOCK_SIZE_K
+        #modv = K % leap
+        #if modv != 0 and SPLIT_K != 1:
+        #    continue
+        
         # skip large GROUP_M
         if GROUP_M * BLOCK_SIZE_M > M and GROUP_M != 1:
             continue
+        
         # out of shared memory resource
-        # TODO (zhanglx): This does not consider the LDS usage in the epilogue
         LDSA = BLOCK_SIZE_K * BLOCK_SIZE_M * elemBytes_a
         LDSB = BLOCK_SIZE_K * BLOCK_SIZE_N * elemBytes_b
         if num_stages <= 1:
@@ -110,6 +128,7 @@ def prune_configs(M, N, K, configs, elemBytes_a, elemBytes_b):
         max_shared = driver.utils.get_device_properties(driver.get_current_device())["max_shared_mem"]
         if LDS > max_shared:
             continue
+        
         # Skip small block sizes and num_warps for large gemm
         # For fp16 and f8, we want to only use BLOCK_SIZE >= 64
         if large_gemm:
@@ -150,28 +169,74 @@ def parse_args():
     parser.add_argument("-K", type=int, default=0)
     parser.add_argument("-layout", type=str,choices=["TT", "TN", "NT", "NN"], default='TN')
     parser.add_argument("-op", type=str, default='all')
-    parser.add_argument("-shapes_file", type=str, default="", help='JSON with GEMM shapes to tune')
+    parser.add_argument("-shapes_file", type=str, default="model_configs.json", help='JSON with GEMM shapes to tune')
 
     args = parser.parse_args()
 
     return args
 
+
 def main():
     args = parse_args()
+    op = "gemm_a16w16"
 
     shapes = get_shapes(args)
 
     configs_full = get_full_tuning_space()
-    #print(configs_full[0])
 
     run_bash_command("rm -rf ~/.triton/cache")
 
-
+    parent_path = Path("__file__").parent
+    num_runs = 10
     for (M, N, K, layout) in shapes:
-        for cfg in [configs_full[0]]:
+        configs = prune_configs(M, N, K, configs_full, 2, 2) #Bf16 for now
+        print(len(configs_full))
+        print(len(configs))
+        for cfg in configs[0:9]:
             print(f"cfg={cfg}")
             x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, torch.bfloat16, layout=layout, output=True)
-            gemm_a16w16(x, w, out_dtype, y, cfg)
+
+            #do warmup/compile with try..except. Compilation can fail with a given config
+            try:
+                gemm_a16w16(x, w, out_dtype, y, cfg)
+            except Exception as e:
+                print(f'invalid config(compilation): {cfg}: ', e, flush=True)
+                continue
+
+            #Generate driver file
+            cfgStr = "-".join([f"{k}{v}" for k, v in cfg.items()])
+            print(f"cfgStr={cfgStr}")
+            driver_file_dir = os.path.join(parent_path, f"output/{op}/{M}-{N}-{K}-{layout}")
+            os.makedirs(driver_file_dir, exist_ok=True) 
+            driver_file_name = f"{cfgStr}"
+            driver_file_path = os.path.join(driver_file_dir, driver_file_name)
+            print(f"driver_file_dir={driver_file_dir}")
+            print(f"driver_file_name={driver_file_name}")
+            print(f"driver_file_path={driver_file_path}")
+            
+            driver_file_str = f"""
+import torch
+import triton
+
+from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
+
+x, w, out_dtype, y = generate_gemm_a16w16_inputs({M}, {N}, {K}, torch.bfloat16, layout="{layout}", output=True)
+gemm_a16w16(x, w, out_dtype, y, {cfg})
+"""
+            print(f"driver_file_str={driver_file_str}")
+
+            with open(driver_file_path, "w") as file:
+                file.write(driver_file_str)
+                file.close()
+
+
+        '''
+        #Do profiling phase
+        for cfg in configs[0:9]:
+            for i in range(num_runs):
+                gemm_a16w16(x, w, out_dtype, y, cfg)
+        '''
 #main
 if __name__ == "__main__":
     sys.exit(main())
