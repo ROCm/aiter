@@ -65,7 +65,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("GEMM A16W16 Benchmark", args)
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):

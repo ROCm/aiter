@@ -101,7 +101,7 @@ def run_benchmark(args, defaults):
 
 
 def run_model_benchmark(args):
-    benchmark = get_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(
@@ -149,7 +149,7 @@ def main():
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
-        print_vgpr(fun, "GEMM")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)
 
