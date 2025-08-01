@@ -51,9 +51,13 @@ def main():
     # Use provided modules or default set
     modules_to_build = args.modules or [
         # "module_mha_varlen_fwd",
+        "module_quant",
+        "module_rmsnorm",
+        "module_rocsolgemm",
         "module_rope_general_fwd",
         "module_rope_pos_fwd",
         "module_moe_asm",
+        "module_moe_sorting", 
         "module_fused_moe_bf16_asm",
         "module_gemm_a8w8",
         "module_gemm_a8w8_bpreshuffle",
@@ -85,7 +89,8 @@ def main():
             print(f"srcs: {build_args.get("srcs")}")
 
             filtered_args = {
-                'srcs': [el for el in build_args.get('srcs', []) if "pybind.cu" not in el],
+                # 'srcs': [el for el in build_args.get('srcs', []) if "pybind.cu" not in el],
+                'srcs': [el for el in build_args.get('srcs', [])], 
                 'flags_extra_cc': build_args.get('flags_extra_cc', []) + ['-DPREBUILD_KERNELS'],
                 'flags_extra_hip': build_args.get('flags_extra_hip', []) + ['-DPREBUILD_KERNELS'],
                 'blob_gen_cmd': build_args.get('blob_gen_cmd', ''),
