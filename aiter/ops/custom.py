@@ -8,17 +8,19 @@ MD_NAME = "module_custom"
 
 
 @compile_ops("module_custom")
-def wvSpltK(in_a: Tensor, in_b: Tensor, out_c: Tensor, N_in: int, CuCount: int)-> None: ...
+def wvSpltK(
+    in_a: Tensor, in_b: Tensor, out_c: Tensor, N_in: int, CuCount: int
+) -> None: ...
 
 
 @compile_ops("module_custom")
 def wv_splitk_small_fp16_bf16(
     in_a: Tensor, in_b: Tensor, out_c: Tensor, N_in: int, CuCount: int
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_custom")
-def LLMM1(in_a: Tensor, in_b: Tensor, out_c: Tensor, rows_per_block: int)-> None: ...
+def LLMM1(in_a: Tensor, in_b: Tensor, out_c: Tensor, rows_per_block: int) -> None: ...
 
 
 @compile_ops("module_custom")
@@ -29,4 +31,4 @@ def wvSplitKQ(
     scale_a: Tensor,
     scale_b: Tensor,
     CuCount: int,
-)-> None: ...
+) -> None: ...

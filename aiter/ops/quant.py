@@ -13,7 +13,9 @@ from ..utility import dtypes, fp4_utils
 
 
 @compile_ops("module_smoothquant")
-def smoothquant_fwd(input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor) -> None: ...
+def smoothquant_fwd(
+    input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor
+) -> None: ...
 
 
 @compile_ops("module_smoothquant")
@@ -381,7 +383,7 @@ def dynamic_per_group_scaled_quant_fp4(
     input: Tensor,
     scales: Tensor,
     group_size: Optional[int] = 32,
-    shuffle_scale: bool=True,
+    shuffle_scale: bool = True,
     num_rows: Optional[Tensor] = None,
     num_rows_factor: int = 1,
 ) -> None:

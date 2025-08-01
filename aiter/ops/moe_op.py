@@ -23,7 +23,7 @@ def topk_softmax(
 
 
 @compile_ops("module_moe_asm")
-def moe_sum(input: Tensor, output: Tensor)-> None: ...
+def moe_sum(input: Tensor, output: Tensor) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -35,7 +35,7 @@ def moe_align_block_size(
     experts_ids: Tensor,
     token_nums: Tensor,
     num_tokens_post_pad: Tensor,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -49,7 +49,7 @@ def fmoe(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     topk: int,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -68,7 +68,7 @@ def fmoe_int8_g1u0(
     fc2_scale: Tensor,
     fc2_smooth_scale: Tensor,
     activation: Optional[Enum] = ActivationType.Silu.value,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -87,7 +87,7 @@ def fmoe_g1u1(
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -106,7 +106,7 @@ def fmoe_g1u1_tkw1(
     fc2_scale: Tensor,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -124,7 +124,7 @@ def fmoe_int8_g1u0_a16(
     fc2_scale: Tensor,
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -143,7 +143,7 @@ def fmoe_g1u1_a16(
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
     activation: Optional[Enum] = ActivationType.Silu.value,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -164,7 +164,7 @@ def fmoe_fp8_blockscale_g1u1(
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -187,6 +187,7 @@ def moe_stage1_g1u1(
     sorted_weights: Optional[torch.Tensor] = None,
 ) -> None: ...
 
+
 def cmdGenFunc_ck_moe_stage(
     hidden_states: Tensor,
     w1: Tensor,
@@ -202,8 +203,9 @@ def cmdGenFunc_ck_moe_stage(
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value):
-    
+    activation: Optional[Enum] = ActivationType.Silu.value,
+):
+
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
@@ -217,7 +219,6 @@ def cmdGenFunc_ck_moe_stage(
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
-
 
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
@@ -237,7 +238,7 @@ def ck_moe_stage1(
     sorted_weights: Optional[Tensor] = None,
     quant_type: Optional[Enum] = QuantType.No.value,
     activation: Optional[Enum] = ActivationType.Silu.value,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
@@ -256,8 +257,8 @@ def ck_moe_stage2(
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
     quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value
-)-> None: ...
+    activation: Optional[Enum] = ActivationType.Silu.value,
+) -> None: ...
 
 
 dtype2str_dict = {
@@ -355,7 +356,7 @@ def ck_moe_stage1_fwd(
         block_m,
         sorted_weights,
         quant_type.value,
-        activation.value
+        activation.value,
         # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out

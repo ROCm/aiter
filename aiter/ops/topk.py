@@ -34,7 +34,7 @@ def grouped_topk(
     need_renorm: bool,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
-)-> None: ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")

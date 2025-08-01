@@ -6,13 +6,12 @@ from typing import Optional, overload
 from ..jit.core import compile_ops
 
 
+@compile_ops("module_hipbsolgemm")
+def hipb_create_extension() -> None: ...
+
 
 @compile_ops("module_hipbsolgemm")
-def hipb_create_extension()-> None: ...
-
-
-@compile_ops("module_hipbsolgemm")
-def hipb_destroy_extension()-> None: ...
+def hipb_destroy_extension() -> None: ...
 
 
 @compile_ops("module_hipbsolgemm")
@@ -29,7 +28,6 @@ def hipb_mm(
 ) -> None: ...
 
 
-
 @compile_ops("module_hipbsolgemm")
 def hipb_findallsols(
     mat1: torch.Tensor,
@@ -43,19 +41,21 @@ def hipb_findallsols(
 
 
 @compile_ops("module_hipbsolgemm")
-def getHipblasltKernelName()-> None: ...
+def getHipblasltKernelName() -> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_create_extension()-> None: ...
+def rocb_create_extension() -> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_destroy_extension()-> None: ...
+def rocb_destroy_extension() -> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_mm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: int, out: torch.Tensor) -> None: ...
+def rocb_mm(
+    arg0: torch.Tensor, arg1: torch.Tensor, arg2: int, out: torch.Tensor
+) -> None: ...
 
 
 @compile_ops("module_rocsolgemm")

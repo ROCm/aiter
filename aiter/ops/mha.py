@@ -55,6 +55,7 @@ def fmha_v3_fwd(
     gen: Optional[Generator] = None,
 ) -> None: ...
 
+
 def cmdGenFunc_mha_varlen_fwd(
     output: torch.Tensor,
     softmax_lse: torch.Tensor,
@@ -202,7 +203,11 @@ def cmdGenFunc_mha_varlen_fwd(
     }
 
 
-@compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd", gen_func=cmdGenFunc_mha_varlen_fwd)
+@compile_ops(
+    "module_mha_varlen_fwd",
+    fc_name="mha_varlen_fwd",
+    gen_func=cmdGenFunc_mha_varlen_fwd,
+)
 def mha_varlen_fwd(
     # output: list[torch.Tensor],
     output: torch.Tensor,
@@ -323,7 +328,7 @@ def cmdGenFunc_mha_bwd(
     }
 
 
-@compile_ops("module_mha_bwd", fc_name="mha_bwd", gen_func= cmdGenFunc_mha_bwd)
+@compile_ops("module_mha_bwd", fc_name="mha_bwd", gen_func=cmdGenFunc_mha_bwd)
 def mha_bwd(
     dq_: Tensor,
     dk_: Tensor,
@@ -382,6 +387,10 @@ def fmha_v3_bwd(
 
 
 def cmdGenFunc_mha_varlen_bwd(
+    dq_: Tensor,
+    dk_: Tensor,
+    dv_: Tensor,
+    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -457,6 +466,7 @@ def cmdGenFunc_mha_varlen_bwd(
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
+
 
 def cmdGenFunc_mha_batch_prefill(
     out_: Tensor,
@@ -534,13 +544,17 @@ def cmdGenFunc_mha_batch_prefill(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
-    
 
 # mha_varlen_bwd_build_args = partial(cmdGenFunc_mha_varlen_bwd, "mha_varlen_bwd")
 # mha_batch_prefill_build_args = partial(cmdGenFunc_mha_batch_prefill, "mha_batch_prefill")
 
+
 @compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
 def mha_varlen_bwd(
+    dq_: Tensor,
+    dk_: Tensor,
+    dv_: Tensor,
+    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -567,8 +581,16 @@ def mha_varlen_bwd(
 ) -> None: ...
 
 
-@compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
+@compile_ops(
+    "module_fmha_v3_varlen_bwd",
+    fc_name="fmha_v3_varlen_bwd",
+    gen_func=cmdGenFunc_mha_varlen_bwd,
+)
 def fmha_v3_varlen_bwd(
+    dq_: Tensor,
+    dk_: Tensor,
+    dv_: Tensor,
+    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -690,7 +712,12 @@ def _flash_attn_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if can_impl_fmha_v3_fwd():
-        output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
+        output, softmax_lse, S_dmask, rng_state = (
+            torch.empty_like(q),
+            torch.empty_like(q),
+            torch.empty_like(q),
+            torch.empty_like(q),
+        )
         fmha_v3_fwd(
             output,
             softmax_lse,
@@ -712,7 +739,12 @@ def _flash_attn_forward(
             None,
         )
     else:
-        output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
+        output, softmax_lse, S_dmask, rng_state = (
+            torch.empty_like(q),
+            torch.empty_like(q),
+            torch.empty_like(q),
+            torch.empty_like(q),
+        )
         mha_fwd(
             output,
             softmax_lse,
@@ -993,7 +1025,12 @@ def _flash_attn_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d = torch.empty_like(dout), torch.empty_like(dout), torch.empty_like(dout), torch.empty_like(dout)
+    dq, dk, dv, softmax_d = (
+        torch.empty_like(dout),
+        torch.empty_like(dout),
+        torch.empty_like(dout),
+        torch.empty_like(dout),
+    )
     if can_impl_fmha_v3_bwd():
         fmha_v3_bwd(
             dq,
@@ -1380,7 +1417,12 @@ def _flash_attn_varlen_forward(
         )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
+    output, softmax_lse, S_dmask, rng_state = (
+        torch.empty_like(q),
+        torch.empty_like(q),
+        torch.empty_like(q),
+        torch.empty_like(q),
+    )
     mha_varlen_fwd(
         output,
         softmax_lse,
@@ -1563,13 +1605,18 @@ def _flash_attn_varlen_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dq, dk, dv, softmax_d = (
+        torch.empty_like(dout),
+        torch.empty_like(dout),
+        torch.empty_like(dout),
+        torch.empty_like(dout),
+    )
     if can_impl_fmha_v3_bwd():
-        (
+        fmha_v3_varlen_bwd(
             dq,
             dk,
             dv,
             softmax_d,
-        ) = fmha_v3_varlen_bwd(
             dout,
             q,
             k,
@@ -1589,20 +1636,19 @@ def _flash_attn_varlen_backward(
             deterministic,
             is_v3_atomic_fp32,
             how_v3_bf16_cvt,
-            dq,
-            dk,
-            dv,
+            None,
+            None,
+            None,
             alibi_slopes,
             rng_state,
             None,
         )
     else:
-        (
+        mha_varlen_bwd(
             dq,
             dk,
             dv,
             softmax_d,
-        ) = mha_varlen_bwd(
             dout,
             q,
             k,
@@ -1620,13 +1666,13 @@ def _flash_attn_varlen_backward(
             window_size_left,
             window_size_right,
             deterministic,
-            dq,
-            dk,
-            dv,
+            None,
+            None,
+            None,
             alibi_slopes,
             rng_state,
             None,
-            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
 
@@ -1895,7 +1941,11 @@ def flash_attn_varlen_func(
     )
 
 
-@compile_ops("module_mha_batch_prefill", fc_name="mha_batch_prefill",  gen_func= cmdGenFunc_mha_batch_prefill)
+@compile_ops(
+    "module_mha_batch_prefill",
+    fc_name="mha_batch_prefill",
+    gen_func=cmdGenFunc_mha_batch_prefill,
+)
 def mha_batch_prefill(
     output: torch.Tensor,
     softmax_lse: torch.Tensor,
@@ -1996,7 +2046,12 @@ def _mha_batch_prefill(
     )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
+    output, softmax_lse, S_dmask, rng_state = (
+        torch.empty_like(q),
+        torch.empty_like(q),
+        torch.empty_like(q),
+        torch.empty_like(q),
+    )
     mha_batch_prefill(
         output,
         softmax_lse,

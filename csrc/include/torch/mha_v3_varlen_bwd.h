@@ -5,8 +5,13 @@
 
 namespace aiter {
 namespace torch_itfs {
-std::vector<at::Tensor>
-fmha_v3_varlen_bwd(const at::Tensor& dout,         // [total_q, hq, d_v]
+void
+fmha_v3_varlen_bwd(
+                    const at::Tensor &dq,
+                    const at::Tensor &dk,
+                    const at::Tensor &dv,
+                    const at::Tensor &softmax_d,
+                   const at::Tensor& dout,         // [total_q, hq, d_v]
                    const at::Tensor& q,            // [total_q, hq, d_q]
                    const at::Tensor& k,            // [total_k, hk, d_q]
                    const at::Tensor& v,            // [total_k, hk, d_v]
