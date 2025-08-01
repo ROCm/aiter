@@ -57,7 +57,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("get_caller_name_no_ext()", args)
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(
@@ -96,7 +96,7 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object("GEMM A8W8 Benchmark", args)
+    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(M, N, K, metric, model_name=None, **kwargs):
@@ -144,7 +144,7 @@ def main():
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
-        print_vgpr(fun, "GEMM")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)
 

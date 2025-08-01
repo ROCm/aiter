@@ -1,7 +1,19 @@
 benchmarks:
+  batched_gemm_a8w8:
+    input_columns: [batch, M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  batched_gemm_a16w16:
+    input_columns: [batch, M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  batched_gemm_afp4wfp4:
+    input_columns: [batch, M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  batched_gemm_afp4wfp4_pre_quant:
+    input_columns: [batch, M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   moe:
     input_columns: [model, M, N, K, E, top_k]
-    output_columns: [Time (ms), TFLOPS, Bandwidth (GB/s)]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   gemm_afp4wfp4:
     input_columns: [M, N, K]
     output_columns: [Triton]
