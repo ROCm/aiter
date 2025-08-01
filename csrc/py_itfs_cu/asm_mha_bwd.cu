@@ -179,7 +179,12 @@ fmha_bwd_args get_asm_fmha_bwd_args(const mask_info &mask,
         drop_seed_offset};
 }
 
-std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
+void fmha_v3_bwd(
+                                    const at::Tensor &dq,
+                                    const at::Tensor &dk,
+                                    const at::Tensor &dv,
+                                    const at::Tensor &softmax_d,
+                                    const at::Tensor &dout,         // [b, sq, hq, d_v]
                                     const at::Tensor &q,            // [b, sq, hq, d]
                                     const at::Tensor &k,            // [b, sk, hk, d]
                                     const at::Tensor &v,            // [b, sk, hk, d_v]
@@ -266,7 +271,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
     CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_v);
 
-    at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
         dq = dq_.value();
         TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
@@ -298,7 +302,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
-    auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
 
     if (!deterministic) {
@@ -395,7 +399,6 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size_v}), {3});
     }
 
-    return { dq, dk, dv, softmax_d };
 }
 
 } // namespace torch_itfs

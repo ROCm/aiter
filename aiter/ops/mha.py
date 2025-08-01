@@ -234,8 +234,101 @@ def mha_varlen_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_mha_bwd", fc_name="mha_bwd")
+def cmdGenFunc_mha_bwd(
+    dq_: Tensor,
+    dk_: Tensor,
+    dv_: Tensor,
+    softmax_d: Tensor,
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    dbias: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+):
+    md_name = "mha_bwd"
+    filter1 = "*"  # get_bwd_dot_do_o_blobs()
+    filter2 = "*"  # get_bwd_convert_dq_blobs()
+    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == dtypes.fp16:
+        md_name += "_fp16"
+        filter1 += "fp16*"
+        filter2 += "fp16*"
+        filter3 += "fp16*"
+    elif q.dtype == dtypes.bf16:
+        md_name += "_bf16"
+        filter1 += "bf16*"
+        filter2 += "bf16*"
+        filter3 += "bf16*"
+    if bias is not None:
+        md_name += "_bias"
+        filter3 += "_bias*"
+    elif alibi_slopes is not None:
+        md_name += "_alibi"
+        filter3 += "_alibi*"
+    else:
+        md_name += "_nbias"
+        filter3 += "_nbias*"
+    if dbias is not None:
+        md_name += "_dbias"
+        filter3 += "_dbias*"
+    else:
+        md_name += "_ndbias"
+        filter3 += "_ndbias*"
+    if not is_causal and window_size_left == -1 and window_size_right == -1:
+        md_name += "_nmask"
+        filter3 += "_nmask*"
+    else:
+        md_name += "_mask"
+        filter3 += "_mask*"
+    if dropout_p == 0:
+        md_name += "_ndropout"
+        filter3 += "_ndropout*"
+    else:
+        md_name += "_dropout"
+        filter3 += "_dropout*"
+    if deterministic:
+        md_name += "_deterministic"
+        filter2 += "_deterministic*"
+        filter3 += "_deterministic*"
+    else:
+        md_name += "_ndeterministic"
+        filter2 += "_ndeterministic*"
+        filter3 += "_ndeterministic*"
+
+    filter = f"{filter1}@{filter2}@{filter3}"
+
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+    ]
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+@compile_ops("module_mha_bwd", fc_name="mha_bwd", gen_func= cmdGenFunc_mha_bwd)
 def mha_bwd(
+    dq_: Tensor,
+    dk_: Tensor,
+    dv_: Tensor,
+    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -261,6 +354,10 @@ def mha_bwd(
 
 @compile_ops("module_fmha_v3_bwd", fc_name="fmha_v3_bwd")
 def fmha_v3_bwd(
+    dq_: Tensor,
+    dk_: Tensor,
+    dv_: Tensor,
+    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -896,13 +993,13 @@ def _flash_attn_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dq, dk, dv, softmax_d = torch.empty_like(dout), torch.empty_like(dout), torch.empty_like(dout), torch.empty_like(dout)
     if can_impl_fmha_v3_bwd():
-        (
+        fmha_v3_bwd(
             dq,
             dk,
             dv,
             softmax_d,
-        ) = fmha_v3_bwd(
             dout,
             q,
             k,
@@ -925,12 +1022,11 @@ def _flash_attn_backward(
             None,
         )
     else:
-        (
+        mha_bwd(
             dq,
             dk,
             dv,
             softmax_d,
-        ) = mha_bwd(
             dout,
             q,
             k,
