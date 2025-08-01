@@ -514,6 +514,10 @@
 #define MHA_FWD_PYBIND                            \
     m.def("mha_fwd",                              \
           &aiter::torch_itfs::mha_fwd,            \
+          py::arg("output"),                      \
+          py::arg("softmax_lse"),                 \
+          py::arg("p"),                           \
+          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \

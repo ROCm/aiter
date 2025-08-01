@@ -5,7 +5,12 @@
 
 namespace aiter {
 namespace torch_itfs {
-std::vector<at::Tensor> mha_fwd(at::Tensor& q,       // [b, sq, hq, d]
+void mha_fwd(
+                                at::Tensor &output,
+                                at::Tensor &softmax_lse,
+                                at::Tensor &p,
+                                at::Tensor &rng_state,
+                                at::Tensor& q,       // [b, sq, hq, d]
                                 const at::Tensor& k, // [b, sk, hk, d]
                                 const at::Tensor& v, // [b, sk, hk, d]
                                 float p_dropout,

@@ -398,7 +398,6 @@ void mha_batch_prefill(
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
-    // return {out, softmax_lse, p, rng_state};
 }
 
 } // namespace torch_itfs
