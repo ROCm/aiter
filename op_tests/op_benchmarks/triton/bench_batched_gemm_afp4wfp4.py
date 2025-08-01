@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     batched_model_benchmark_shapes,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 from aiter.ops.triton.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
@@ -68,7 +69,7 @@ def bench_gemm_fn(
 
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
-        plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
+        plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
@@ -98,7 +99,7 @@ def run_model_benchmark(args):
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
-        plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
+        plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["batch", "M", "N", "K"],
     )
@@ -159,7 +160,7 @@ def main():
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
-        print_vgpr(fun, "Batched GEMM")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)
 

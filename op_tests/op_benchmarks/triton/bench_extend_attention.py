@@ -6,6 +6,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 import torch
@@ -301,23 +302,20 @@ def benchmark(args):
         elif args.mode == "prefill":
             x_names, x_vals_list = get_prefill_benchmark_configs()
 
-    line_vals = ["extend_attention_fwd"]
-
-    plot_name = (
-        args.plot_name + f"-causal-{args.causal}-equal_seqlens-{args.equal_seqlens}"
-    )
+    line_vals = ["fwd_Time_(ms)"]
 
     configs.append(
         triton.testing.Benchmark(
             x_names=x_names,
             x_vals=x_vals_list,
-            line_arg="provider",
+            line_arg="metric",
             line_vals=line_vals,
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-")],
             ylabel="ms",
-            plot_name=plot_name,
-            args={"sm_scale": 1.0, "logit_cap": 0.0, "device": args.device},
+            plot_name=get_caller_name_no_ext(),
+            args={"sm_scale": 1.0, "logit_cap": 0.0, "device": args.device,
+                  "provider": "extend_attention_fwd"},
         )
     )
 
@@ -336,6 +334,7 @@ def benchmark(args):
         device,
         provider=None,
         model=None,
+        **kwargs,
     ):
         warmup = 25
         rep = 100
@@ -442,12 +441,6 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as --model \"llama3,mistral_7B\""
     )
-    parser.add_argument(
-        "--plot_name",
-        type=str,
-        default="MLA-prefill",
-        help="Name for the results plot|table",
-    )
     parser.add_argument("--model", type=str, default="", help=model_help)
     parser.add_argument("-b", type=int, default=0, help="Batch size")
     parser.add_argument("--prefix", type=int, default=0, help="Prefix length")
@@ -504,7 +497,7 @@ def run_bench(args):
 def main():
     args = parse_args()
     if args.print_vgpr:  # print the vgpr usage of the kernel
-        print_vgpr(lambda: run_bench(args), table_start=args.plot_name)
+        print_vgpr(lambda: run_bench(args), table_start=get_caller_name_no_ext())
         return 0
     run_bench(args)
 
