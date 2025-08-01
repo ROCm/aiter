@@ -314,8 +314,12 @@ def benchmark(args):
             styles=[("red", "-"), ("green", "-")],
             ylabel="ms",
             plot_name=get_caller_name_no_ext(),
-            args={"sm_scale": 1.0, "logit_cap": 0.0, "device": args.device,
-                  "provider": "extend_attention_fwd"},
+            args={
+                "sm_scale": 1.0,
+                "logit_cap": 0.0,
+                "device": args.device,
+                "provider": "extend_attention_fwd",
+            },
         )
     )
 

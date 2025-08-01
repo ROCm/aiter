@@ -149,5 +149,6 @@ def main():
         return 0
     run_benchmark(args, defaults)
 
+
 if __name__ == "__main__":
     sys.exit(main())
