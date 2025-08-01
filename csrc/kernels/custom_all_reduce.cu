@@ -28,7 +28,7 @@ static_assert(sizeof(void *) == sizeof(fptr_t));
 namespace aiter {
 
 fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
-                      const std::vector<std::string> &handles,
+                      const std::vector<torch::Tensor> &handles,
                       const std::vector<int64_t> &offsets, int64_t rank,
                       bool full_nvlink)
 {
@@ -46,7 +46,8 @@ fptr_t init_custom_ar(torch::Tensor &meta, torch::Tensor &rank_data,
   cudaIpcMemHandle_t ipc_handles[8];
   for (int i = 0; i < world_size; i++)
   {
-    std::memcpy(&ipc_handles[i], handles[i].data(), sizeof(cudaIpcMemHandle_t));
+    cudaIpcMemHandle_t* ipc_handle_ptr = (cudaIpcMemHandle_t*)handles[i].data_ptr();
+    std::memcpy(&ipc_handles[i], ipc_handle_ptr, sizeof(cudaIpcMemHandle_t));
   }
   return (fptr_t) new aiter::CustomAllreduce(
       reinterpret_cast<aiter::Signal *>(meta.data_ptr()), rank_data.data_ptr(),
@@ -157,14 +158,14 @@ void dispose(fptr_t _fa)
 int64_t meta_size() { return sizeof(aiter::Signal); }
 
 void register_buffer(fptr_t _fa, torch::Tensor &t,
-                     const std::vector<std::string> &handles,
+                     const std::vector<torch::Tensor> &handles,
                      const std::vector<int64_t> &offsets)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   fa->register_buffer(handles, offsets, t.data_ptr());
 }
 
-std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(
+std::tuple<torch::Tensor, torch::Tensor> get_graph_buffer_ipc_meta(
     fptr_t _fa)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
@@ -174,11 +175,13 @@ std::tuple<torch::Tensor, std::vector<int64_t>> get_graph_buffer_ipc_meta(
   auto handles =
       torch::empty({static_cast<int64_t>(handle_bytes.size())}, options);
   std::memcpy(handles.data_ptr(), handle_bytes.data(), handle_bytes.size());
-  return {handles, std::move(offsets)};
+
+  torch::Tensor offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
+  return {handles, offset_tensor};
 }
 
-void register_graph_buffers(fptr_t _fa, const std::vector<std::string> &handles,
-                            const std::vector<std::vector<int64_t>> &offsets)
+void register_graph_buffers(fptr_t _fa, const std::vector<torch::Tensor> &handles,
+                            const std::vector<torch::Tensor> &offsets)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   fa->register_graph_buffers(handles, offsets);

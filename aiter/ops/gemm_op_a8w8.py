@@ -13,6 +13,7 @@ from ..jit.core import (
 )
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
+from ..ops.gemm_op_common import get_padded_m
 
 
 @compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8")
@@ -97,11 +98,19 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
             ["cu_num", "M", "N", "K"]
         ).to_dict("index")
     cu_num = get_cu_num()
-    config = get_CKGEMM_config.ckgemm_dict[tuned_file].get((cu_num, M, N, K), None)
-    if config is not None:
-        logger.info(
-            f"shape M:{M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM, kernel name is {config['kernelName']}!"
+
+    padded_M = M
+    config = None
+    for gl in [None, 0, 1]:
+        padded_M = M if gl is None else get_padded_m(M, N, K, gl)
+        config = get_CKGEMM_config.ckgemm_dict[tuned_file].get(
+            (cu_num, padded_M, N, K), None
         )
+        if config is not None:
+            logger.info(
+                f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in CKGEMM , kernel name is {config['kernelName']}!"
+            )
+            break
     return config
 
 
