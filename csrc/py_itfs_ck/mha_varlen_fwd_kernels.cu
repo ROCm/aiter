@@ -295,7 +295,12 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
 }
 
 
-void mha_varlen_fwd(py::list &output,
+void mha_varlen_fwd(
+                    // py::list &output,
+               at::Tensor &output,
+               at::Tensor &softmax_lse,
+               at::Tensor &p,
+               at::Tensor &rng_state,
                at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
@@ -424,16 +429,16 @@ void mha_varlen_fwd(py::list &output,
     }
     auto opts = q.options();
 
-    at::Tensor out;
+    // at::Tensor out;
     if (out_.has_value()) {
-        out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
-        CHECK_DEVICE(out);
-        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
+        output = out_.value();
+        TORCH_CHECK(output.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(output);
+        TORCH_CHECK(output.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(output, total_q, num_heads, head_size_v);
     }
     else {
-        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        output = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -444,7 +449,7 @@ void mha_varlen_fwd(py::list &output,
     if (has_dropout)
         TORCH_CHECK(!paged_KV, "Paged KV does not support dropout");
 
-    at::Tensor softmax_lse;
+    // at::Tensor softmax_lse;
     if (return_softmax_lse) {
         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
     }
@@ -452,7 +457,7 @@ void mha_varlen_fwd(py::list &output,
         softmax_lse = torch::empty({ 0 }, opts.dtype(torch::kFloat32));
     }
 
-    at::Tensor p;
+    // at::Tensor p;
     if (return_dropout_randval) {
         TORCH_CHECK(has_dropout, "return_dropout_randval require p_dropout > 0");
         p = torch::empty({num_heads, total_q, max_seqlen_k}, opts.dtype(torch::kUInt8));
@@ -463,12 +468,12 @@ void mha_varlen_fwd(py::list &output,
 
     if (zero_tensors)
     {
-        out.zero_();
+        output.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         if (return_dropout_randval) {p.zero_();}
     }
 
-    auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (p_dropout > 0.0)  {
@@ -520,7 +525,7 @@ void mha_varlen_fwd(py::list &output,
                     block_table_,
                     bias_,
                     alibi_slopes_,
-                    out,
+                    output,
                     softmax_lse,
                     softmax_lse_accum,
                     out_accum);
@@ -558,7 +563,7 @@ void mha_varlen_fwd(py::list &output,
                     seqlens_k,
                     bias_,
                     alibi_slopes_,
-                    out,
+                    output,
                     softmax_lse,
                     p,
                     softmax_scale,
@@ -579,13 +584,13 @@ void mha_varlen_fwd(py::list &output,
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
-        out.zero_();
+        output.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
-    output.append(py::cast(out));
-    output.append(py::cast(softmax_lse));
-    output.append(py::cast(p));
-    output.append(py::cast(rng_state));
+    // output.append(py::cast(out));
+    // output.append(py::cast(softmax_lse));
+    // output.append(py::cast(p));
+    // output.append(py::cast(rng_state));
     
     // return {out, softmax_lse, p, rng_state};
 }

@@ -595,6 +595,8 @@ def compile_ops(
         schema = ""
         if func.__name__ in MANUAL_SCHEMA_OPS:
             schema = generate_schema(func)
+            if func.__name__ == "mha_varlen_fwd":
+                print(schema)
         else:
             sig = inspect.signature(func)
             mutates_args = []
@@ -604,7 +606,7 @@ def compile_ops(
             sig = torch.library.infer_schema(func, mutates_args=mutates_args)
             schema = f"{sig}"
         loadName = func.__name__
-        
+        print(loadName)
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -706,6 +708,9 @@ def compile_ops(
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
                     callargs = inspect.getcallargs(func, *args, **kwargs)
+                    # if func.__name__ == "mha_varlen_fwd":
+                    #     return True
+
                     for el, arg in callargs.items():
                         expected_type = ann[el]
                         origin = typing.get_origin(expected_type)

@@ -492,6 +492,10 @@
 #define MHA_FWD_ASM_PYBIND                        \
     m.def("fmha_v3_fwd",                          \
           &aiter::torch_itfs::fmha_v3_fwd,        \
+          py::arg("output"),                      \
+          py::arg("softmax_lse"),                 \
+          py::arg("p"),                           \
+          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
@@ -591,6 +595,9 @@
     m.def("mha_varlen_fwd",                       \
           &aiter::torch_itfs::mha_varlen_fwd,     \
           py::arg("output"),                      \
+          py::arg("softmax_lse"),                 \
+          py::arg("p"),                           \
+          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
