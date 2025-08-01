@@ -78,7 +78,7 @@ def all_reduce_rmsnorm(
 ):
     tp_grp = get_tp_group()
     ca = tp_grp.ca_comm
-    output: list[torch.Tensor] = []
+    out_tensor, res_tensor, ys_tensor = torch.empty_like(input), torch.empty_like(input), torch.empty_like(input)
     aiter.all_reduce_rmsnorm_(
         input,
         residual_in,
@@ -89,11 +89,12 @@ def all_reduce_rmsnorm(
         ca.signal,
         ca.buffer,
         ca._IS_CAPTURING,
-        output
+        out_tensor,
+        res_tensor,
+        ys_tensor
     )
-    print('This is result:', output)
 
-    return tuple(output)
+    return out_tensor, res_tensor, ys_tensor
 
 
 def all_reduce_rmsnorm_quant(
@@ -106,7 +107,7 @@ def all_reduce_rmsnorm_quant(
 ):
     tp_grp = get_tp_group()
     ca = tp_grp.ca_comm
-    output: list[torch.Tensor] = []
+    out_tensor, res_tensor, ys_tensor = torch.empty_like(input), torch.empty_like(input), torch.empty_like(input)
     aiter.all_reduce_rmsnorm_quant_(
         input,
         residual_in,
@@ -118,8 +119,10 @@ def all_reduce_rmsnorm_quant(
         ca.signal,
         ca.buffer,
         ca._IS_CAPTURING,
-        output
+        out_tensor,
+        res_tensor,
+        ys_tensor
     )
-    print('This is result:', output)
-    return tuple(output)
+
+    return out_tensor, res_tensor, ys_tensor
 

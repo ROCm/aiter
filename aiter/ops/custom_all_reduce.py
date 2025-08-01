@@ -55,7 +55,9 @@ def all_reduce_rmsnorm_(
     reg_sig: torch.Tensor,
     reg_buffer: torch.Tensor,
     isGraph: bool,
-    output: List[torch.Tensor],
+    out_tensor: torch.Tensor,
+    res_tensor: torch.Tensor,
+    ys_tensor: torch.Tensor,
 ) -> None: ...
 
 

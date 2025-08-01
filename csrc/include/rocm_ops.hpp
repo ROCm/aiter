@@ -499,7 +499,6 @@
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
-          py::arg("result"),                      \
           py::arg("dropout_p"),                   \
           py::arg("softmax_scale"),               \
           py::arg("is_causal"),                   \
