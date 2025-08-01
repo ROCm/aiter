@@ -232,10 +232,7 @@ COMMON_HIPCC_FLAGS = [
 ]
 
 if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
-    COMMON_HIPCC_FLAGS.extend([
-        "-fvisibility=hidden",
-        "-fvisibility-inlines-hidden"
-    ])
+    COMMON_HIPCC_FLAGS.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
 
