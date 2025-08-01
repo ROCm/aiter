@@ -150,10 +150,14 @@ def main():
         custom_config = True
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
+
         def fun():
             return run_benchmark(custom_config, args)
+
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(custom_config, args)
+
+
 if __name__ == "__main__":
     sys.exit(main())

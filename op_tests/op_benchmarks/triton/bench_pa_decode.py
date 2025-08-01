@@ -311,6 +311,7 @@ def main():
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)
-    
+
+
 if __name__ == "__main__":
     sys.exit(main())
