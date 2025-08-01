@@ -96,47 +96,6 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True):
     )
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
-    # x_vals = [(128, 1024, 4096)]
-    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(256, 3584, 2112)]
-    x_vals += [(7, 4608, 7168), (7, 7168, 2304)]
-    x_vals += [(1, 1, 32)]  # minimal case
-    return x_vals
-
-
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=1)
@@ -184,42 +143,99 @@ def run_torch(x, w, x_scales, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output", [True, False])
-def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
-    if not (arch_info.is_fp4_avail()):
-        pytest.skip("MXFP4 not supported on this architecture")
+class TestGemmAfp4Wfp4:
+    basic_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 6)]
+    basic_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    basic_set = [
+        pytest.param(*shape, dtype, output)
+        for shape in basic_shape_set
+        for dtype in [torch.float16, torch.bfloat16, torch.float32]
+        for output in [True, False]
+    ]
 
-    if TRITON_HIP_PRESHUFFLE_SCALES:
-        if N % 32 > 0:
-            pytest.skip(
-                f"N = {N} is not divisible by 32, skip this test for preshuffled scales tests"
-            )
-        elif K % 256 > 0:
-            pytest.skip(
-                f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
-            )
+    extended_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    extended_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    extended_shape_set += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]
+    extended_shape_set += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
+    # extended_shape_set = [(128, 1024, 4096)]
+    extended_shape_set += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    extended_shape_set += [(256, 3584, 2112)]
+    extended_shape_set += [(7, 4608, 7168), (7, 7168, 2304)]
+    extended_shape_set += [(1, 1, 32)]  # minimal case
+    extended_set = [
+        pytest.param(*shape, dtype, output, marks=pytest.mark.extended)
+        for shape in extended_shape_set
+        for dtype in [torch.float16, torch.bfloat16, torch.float32]
+        for output in [True, False]
+    ]
 
-    x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
-        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output)
-    )
+    test_params = extended_set + basic_set
 
-    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+    @pytest.mark.parametrize("M, N, K, dtype, output", test_params)
+    def test_gemm_afp4_wfp4(self, M: int, N: int, K: int, dtype, output):
+        if not (arch_info.is_fp4_avail()):
+            pytest.skip("MXFP4 not supported on this architecture")
 
-    if TRITON_HIP_PRESHUFFLE_SCALES:
-        if output:
-            triton_out = gemm_afp4wfp4_preshuffled_scales(
-                x, w, x_scales_triton, w_scales_triton, dtype, y
-            )
+        if TRITON_HIP_PRESHUFFLE_SCALES:
+            if N % 32 > 0:
+                pytest.skip(
+                    f"N = {N} is not divisible by 32, skip this test for preshuffled scales tests"
+                )
+            elif K % 256 > 0:
+                pytest.skip(
+                    f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
+                )
+
+        x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
+            generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output)
+        )
+
+        torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
+
+        if TRITON_HIP_PRESHUFFLE_SCALES:
+            if output:
+                triton_out = gemm_afp4wfp4_preshuffled_scales(
+                    x, w, x_scales_triton, w_scales_triton, dtype, y
+                )
+            else:
+                triton_out = gemm_afp4wfp4_preshuffled_scales(
+                    x, w, x_scales_triton, w_scales_triton, dtype
+                )
         else:
-            triton_out = gemm_afp4wfp4_preshuffled_scales(
-                x, w, x_scales_triton, w_scales_triton, dtype
-            )
-    else:
-        if output:
-            triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype, y)
-        else:
-            triton_out = gemm_afp4wfp4(x, w, x_scales_triton, w_scales_triton, dtype)
+            if output:
+                triton_out = gemm_afp4wfp4(
+                    x, w, x_scales_triton, w_scales_triton, dtype, y
+                )
+            else:
+                triton_out = gemm_afp4wfp4(
+                    x, w, x_scales_triton, w_scales_triton, dtype
+                )
 
-    torch.testing.assert_close(torch_out, triton_out)
+        torch.testing.assert_close(torch_out, triton_out)

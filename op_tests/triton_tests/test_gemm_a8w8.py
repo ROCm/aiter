@@ -24,24 +24,70 @@ def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=N
     return gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, y)
 
 
-e5m2_type, e4m3_type = get_fp8_dtypes()
+def generate_gemm_a8w8_inputs(
+    M: int,
+    N: int,
+    K: int,
+    in_dtype: Union[torch.dtype, str],
+    out_dtype: Union[torch.dtype, str],
+    layout: str = "TN",
+    output=False,
+):
+    """
+    The GEMM kernel expects:
+    - x: (M, K) -> row-major format
+    - w: (N, K) -> column-major format
+    """
+    if layout[0] == "T":
+        # T (transposed) in Fortran notation equals row-major
+        x = torch.randn((M, K), dtype=torch.float32, device="cuda")
+    else:
+        x = torch.randn((K, M), dtype=torch.float32, device="cuda").T
+
+    if layout[1] == "N":
+        weight = torch.randn((N, K), dtype=torch.float32, device="cuda")
+    else:
+        weight = torch.randn((K, N), dtype=torch.float32, device="cuda").T
+
+    dtype_max = (
+        torch.finfo(in_dtype) if in_dtype.is_floating_point else torch.iinfo(in_dtype)
+    ).max
+
+    max_x = x.abs().float().amax(dim=1, keepdim=True)
+    x_scale = max_x / dtype_max
+    x = x / x_scale
+    x = x.to(in_dtype)
+
+    max_weight = weight.abs().float().amax(dim=1, keepdim=True).T.contiguous()
+    w_scale = max_weight / dtype_max
+    weight = weight / w_scale.T
+    weight = weight.to(in_dtype)
+
+    bias = torch.rand([1, N], dtype=torch.float32).cuda() * 10
+
+    y = None
+    if output:
+        y = torch.empty((M, N), dtype=out_dtype).cuda()
+
+    return x, weight, x_scale, w_scale, bias, y
 
 
-dtype_max = {
-    dtype: (torch.finfo(dtype) if dtype.is_floating_point else torch.iinfo(dtype)).max
-    for dtype in [
-        e5m2_type,
-        e4m3_type,
-        torch.int8,
+class TestGemmA8W8:
+    basic_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    basic_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    basic_set = [
+        pytest.param(*shape, in_dtype, out_dtype, output)
+        for shape in basic_shape_set
+        for in_dtype in [
+            "fp8e4m3",
+        ]
+        for out_dtype in ["bf16"]
+        for output in [True, False]
     ]
-}
 
-
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
+    extended_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    extended_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    extended_shape_set += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -69,72 +115,27 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(1, 1, 1)]
-    return x_vals
+    extended_shape_set += [(1, 1, 1)]
 
-
-def generate_gemm_a8w8_inputs(
-    M: int,
-    N: int,
-    K: int,
-    in_dtype: Union[torch.dtype, str],
-    out_dtype: Union[torch.dtype, str],
-    layout: str = "TN",
-    output=False,
-):
-    """
-    The GEMM kernel expects:
-    - x: (M, K) -> row-major format
-    - w: (N, K) -> column-major format
-    """
-    if layout[0] == "T":
-        # T (transposed) in Fortran notation equals row-major
-        x = torch.randn((M, K), dtype=torch.float32, device="cuda")
-    else:
-        x = torch.randn((K, M), dtype=torch.float32, device="cuda").T
-
-    if layout[1] == "N":
-        weight = torch.randn((N, K), dtype=torch.float32, device="cuda")
-    else:
-        weight = torch.randn((K, N), dtype=torch.float32, device="cuda").T
-
-    max_x = x.abs().float().amax(dim=1, keepdim=True)
-    x_scale = max_x / dtype_max[in_dtype]
-    x = x / x_scale
-    x = x.to(in_dtype)
-
-    max_weight = weight.abs().float().amax(dim=1, keepdim=True).T.contiguous()
-    w_scale = max_weight / dtype_max[in_dtype]
-    weight = weight / w_scale.T
-    weight = weight.to(in_dtype)
-
-    bias = torch.rand([1, N], dtype=torch.float32).cuda() * 10
-
-    y = None
-    if output:
-        y = torch.empty((M, N), dtype=out_dtype).cuda()
-
-    return x, weight, x_scale, w_scale, bias, y
-
-
-@pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k, output",
-    [
-        (in_dtype, out_dtype, *shape, output)
+    extended_set = [
+        pytest.param(*shape, in_dtype, out_dtype, output, marks=pytest.mark.extended)
+        for shape in extended_shape_set
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16"]
-        for shape in get_x_vals()
         for output in [True, False]
-    ],
-)
-def test_gemm(in_dtype, out_dtype, m, n, k, output):
-    in_dtype = str_to_torch_dtype[in_dtype]
-    out_dtype = str_to_torch_dtype[out_dtype]
-    x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
-        M=m, N=n, K=k, in_dtype=in_dtype, out_dtype=out_dtype, output=output
-    )
+    ]
 
-    a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+    test_params = extended_set + basic_set
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    @pytest.mark.parametrize("m,n,k,in_dtype, out_dtype, output", test_params)
+    def test_gemm(self, in_dtype, out_dtype, m, n, k, output):
+        in_dtype = str_to_torch_dtype[in_dtype]
+        out_dtype = str_to_torch_dtype[out_dtype]
+        x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+            M=m, N=n, K=k, in_dtype=in_dtype, out_dtype=out_dtype, output=output
+        )
+
+        a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
+        b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+
+        triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

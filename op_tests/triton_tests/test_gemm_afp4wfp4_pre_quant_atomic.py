@@ -54,46 +54,6 @@ def generate_gemm_afp4wfp4_pre_quant_inputs(
     return x, w, x_scales, w_scales, y
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
-    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    x_vals += [(32, 512, 7168)]
-    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
-    x_vals += [(1, 1280, 8192)]
-    return x_vals
-
-
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=-1)
@@ -139,25 +99,78 @@ def run_torch(x, w, w_scales, dtype):
     return torch.mm(x_f32, w_f32.T).to(dtype)
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("output", [True, False])
-def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
-    if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
-        pytest.skip("MXFP4 not supported on this architecture")
+class TestGemmAFP4WFP4PrequantAtomic:
+    basic_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 6)]
+    basic_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    basic_set = [
+        pytest.param(*shape, dtype, output)
+        for shape in basic_shape_set
+        for dtype in [torch.float16, torch.bfloat16, torch.float32]
+        for output in [True, False]
+    ]
 
-    # TODO resolve this compilation error
-    if M == 4864 and N == 8192 and K == 4160:
-        pytest.skip("Skipping this config. due to compilation error.")
+    extended_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(6, 9)]
+    extended_shape_set += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]
+    extended_shape_set += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
+    extended_shape_set += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    extended_shape_set += [(32, 512, 7168)]
+    extended_shape_set += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
+    extended_shape_set += [(1, 1280, 8192)]
+    extended_set = [
+        pytest.param(*shape, dtype, output, marks=pytest.mark.extended)
+        for shape in extended_shape_set
+        for dtype in [torch.float16, torch.bfloat16, torch.float32]
+        for output in [True, False]
+    ]
 
-    x, w, _, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(
-        M, N, K, output=output
-    )
-    if output:
-        y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, y).to(dtype)
-    else:
-        y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
+    test_params = extended_set + basic_set
 
-    torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+    @pytest.mark.parametrize("M, N, K, dtype, output", test_params)
+    def test_gemm_afp4_wfp4_pre_quant(
+        self, M: int, N: int, K: int, dtype, output: bool
+    ):
+        if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
+            pytest.skip("MXFP4 not supported on this architecture")
 
-    torch.testing.assert_close(torch_out, y)
+        # TODO resolve this compilation error
+        if M == 4864 and N == 8192 and K == 4160:
+            pytest.skip("Skipping this config. due to compilation error.")
+
+        x, w, _, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(
+            M, N, K, output=output
+        )
+        if output:
+            y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, y).to(dtype)
+        else:
+            y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32).to(dtype)
+
+        torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
+
+        torch.testing.assert_close(torch_out, y)

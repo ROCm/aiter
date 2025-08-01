@@ -7,6 +7,8 @@ import pytest
 import torch
 import triton
 from aiter.ops.triton.pa_prefill import context_attention_fwd
+import itertools
+from op_tests.triton_tests.utils.test_utils import flatten
 
 
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -17,15 +19,6 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
 }
-
-
-NUM_HEADS = [64]
-NUM_QUERIES_PER_KV = [1, 8, 64]
-HEAD_SIZES = [128, 96, 24]
-DTYPES = [torch.float16]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
-SLIDING_WINDOW = [0, 16, 64, 128, 256, 512, 2048]
-KV_CACHE_DTYPES = ["auto", "fp8", "fp8_e5m2"]
 
 
 def context_attention_fwd_torch(
@@ -316,167 +309,218 @@ def input_helper(
         )
 
 
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("num_queries_per_kv", NUM_QUERIES_PER_KV)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPES)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@pytest.mark.parametrize("sliding_window", SLIDING_WINDOW)
-@torch.inference_mode()
-def test_contexted_kv_attention(
-    num_heads: int,
-    num_queries_per_kv: int,
-    head_size: int,
-    sliding_window: int,
-    dtype: torch.dtype,
-    kv_cache_dtype: str,
-    device: str,
-) -> None:
-    (
-        query,
-        k,
-        v,
-        output,
-        k_cache,
-        v_cache,
-        block_table,
-        b_start_loc,
-        b_seq_len,
-        max_input_len,
-        k_scale,
-        v_scale,
-        _,
-    ) = input_helper(
-        BS=10,
-        MAX_SEQ_LEN=1024,
-        MAX_CTX_LEN=1024,
-        cache_size=640,
-        block_size=32,
-        max_block_per_request=64,
-        num_heads=num_heads,
-        head_size=head_size,
-        num_queries_per_kv=num_queries_per_kv,
-        dtype=dtype,
-        kv_cache_dtype=kv_cache_dtype,
-        device=device,
-        use_alibi_slope=False,
-    )
-    output_torch = torch.empty_like(output)
-    output_triton = output
+class TestPaPrefill:
+    basic_test_set = {
+        "NUM_HEADS": [64],
+        "NUM_QUERIES_PER_KV": [1, 64],
+        "HEAD_SIZES": [128],
+        "DTYPES": [torch.float16],
+        "CUDA_DEVICES": [
+            f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+        ],
+        "SLIDING_WINDOW": [0, 16, 128],
+        "KV_CACHE_DTYPES": ["auto", "fp8", "fp8_e5m2"],
+    }
 
-    # Run Triton
-    context_attention_fwd(
-        query,
-        k,
-        v,
-        output_triton,
-        kv_cache_dtype,
-        k_cache,
-        v_cache,
-        block_table,
-        b_start_loc,
-        b_seq_len,
-        max_input_len,
-        k_scale,
-        v_scale,
-        sliding_window=sliding_window,
+    basic_test_set = itertools.product(
+        basic_test_set["NUM_HEADS"],
+        basic_test_set["NUM_QUERIES_PER_KV"],
+        basic_test_set["HEAD_SIZES"],
+        basic_test_set["SLIDING_WINDOW"],
+        basic_test_set["DTYPES"],
+        basic_test_set["KV_CACHE_DTYPES"],
+        basic_test_set["CUDA_DEVICES"],
     )
-    # Run Torch
-    context_attention_fwd_torch(
-        query,
-        k,
-        v,
-        output_torch,
-        k_cache,
-        v_cache,
-        b_start_loc,
-        b_seq_len,
-        k_scale,
-        v_scale,
-        sliding_window=sliding_window,
+    basic_set = [pytest.param(*flatten(test)) for test in basic_test_set]
+
+    extended_test_set = {
+        "NUM_HEADS": [64],
+        "NUM_QUERIES_PER_KV": [8],
+        "HEAD_SIZES": [96, 24],
+        "DTYPES": [torch.float16],
+        "CUDA_DEVICES": [
+            f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+        ],
+        "SLIDING_WINDOW": [64, 256, 512, 2048],
+        "KV_CACHE_DTYPES": ["auto", "fp8", "fp8_e5m2"],
+    }
+
+    extended_test_set = itertools.product(
+        extended_test_set["NUM_HEADS"],
+        extended_test_set["NUM_QUERIES_PER_KV"],
+        extended_test_set["HEAD_SIZES"],
+        extended_test_set["SLIDING_WINDOW"],
+        extended_test_set["DTYPES"],
+        extended_test_set["KV_CACHE_DTYPES"],
+        extended_test_set["CUDA_DEVICES"],
     )
+    extended_set = [pytest.param(*flatten(test)) for test in extended_test_set]
 
-    triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
+    extended_set = [
+        pytest.param(*flatten(test), marks=pytest.mark.extended)
+        for test in extended_test_set
+    ]
 
+    test_params = basic_set + extended_set
 
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("num_queries_per_kv", NUM_QUERIES_PER_KV)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("kv_cache_dtype", KV_CACHE_DTYPES)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_contexted_kv_attention_alibi(
-    num_heads: int,
-    num_queries_per_kv: int,
-    head_size: int,
-    dtype: torch.dtype,
-    kv_cache_dtype: str,
-    device: str,
-) -> None:
-    (
-        query,
-        k,
-        v,
-        output,
-        k_cache,
-        v_cache,
-        block_table,
-        b_start_loc,
-        b_seq_len,
-        max_input_len,
-        k_scale,
-        v_scale,
-        alibi_slopes,
-    ) = input_helper(
-        BS=10,
-        MAX_SEQ_LEN=1024,
-        MAX_CTX_LEN=1024,
-        cache_size=640,
-        block_size=32,
-        max_block_per_request=64,
-        num_heads=num_heads,
-        head_size=head_size,
-        num_queries_per_kv=num_queries_per_kv,
-        dtype=dtype,
-        kv_cache_dtype=kv_cache_dtype,
-        device=device,
-        use_alibi_slope=True,
+    @pytest.mark.parametrize(
+        "num_heads, num_queries_per_kv, head_size, sliding_window, dtype, kv_cache_dtype, device",
+        test_params,
     )
-    output_torch = torch.empty_like(output)
-    output_triton = output
+    @torch.inference_mode()
+    def test_contexted_kv_attention(
+        self,
+        num_heads: int,
+        num_queries_per_kv: int,
+        head_size: int,
+        sliding_window: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: str,
+        device: str,
+    ) -> None:
+        (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            _,
+        ) = input_helper(
+            BS=10,
+            MAX_SEQ_LEN=1024,
+            MAX_CTX_LEN=1024,
+            cache_size=640,
+            block_size=32,
+            max_block_per_request=64,
+            num_heads=num_heads,
+            head_size=head_size,
+            num_queries_per_kv=num_queries_per_kv,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            device=device,
+            use_alibi_slope=False,
+        )
+        output_torch = torch.empty_like(output)
+        output_triton = output
 
-    # Run Triton
-    context_attention_fwd(
-        query,
-        k,
-        v,
-        output_triton,
-        kv_cache_dtype,
-        k_cache,
-        v_cache,
-        block_table,
-        b_start_loc,
-        b_seq_len,
-        max_input_len,
-        k_scale,
-        v_scale,
-        alibi_slopes=alibi_slopes,
-    )
-    # Run Torch
-    context_attention_fwd_torch(
-        query,
-        k,
-        v,
-        output_torch,
-        k_cache,
-        v_cache,
-        b_start_loc,
-        b_seq_len,
-        k_scale,
-        v_scale,
-        alibi_slopes=alibi_slopes,
-    )
+        # Run Triton
+        context_attention_fwd(
+            query,
+            k,
+            v,
+            output_triton,
+            kv_cache_dtype,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            sliding_window=sliding_window,
+        )
+        # Run Torch
+        context_attention_fwd_torch(
+            query,
+            k,
+            v,
+            output_torch,
+            k_cache,
+            v_cache,
+            b_start_loc,
+            b_seq_len,
+            k_scale,
+            v_scale,
+            sliding_window=sliding_window,
+        )
 
-    triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
+        triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize(
+        "num_heads, num_queries_per_kv, head_size, sliding_window, dtype, kv_cache_dtype, device",
+        test_params,
+    )
+    @torch.inference_mode()
+    def test_contexted_kv_attention_alibi(
+        self,
+        num_heads: int,
+        num_queries_per_kv: int,
+        head_size: int,
+        sliding_window: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: str,
+        device: str,
+    ) -> None:
+        (
+            query,
+            k,
+            v,
+            output,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            alibi_slopes,
+        ) = input_helper(
+            BS=10,
+            MAX_SEQ_LEN=1024,
+            MAX_CTX_LEN=1024,
+            cache_size=640,
+            block_size=32,
+            max_block_per_request=64,
+            num_heads=num_heads,
+            head_size=head_size,
+            num_queries_per_kv=num_queries_per_kv,
+            dtype=dtype,
+            kv_cache_dtype=kv_cache_dtype,
+            device=device,
+            use_alibi_slope=True,
+        )
+        output_torch = torch.empty_like(output)
+        output_triton = output
+
+        # Run Triton
+        context_attention_fwd(
+            query,
+            k,
+            v,
+            output_triton,
+            kv_cache_dtype,
+            k_cache,
+            v_cache,
+            block_table,
+            b_start_loc,
+            b_seq_len,
+            max_input_len,
+            k_scale,
+            v_scale,
+            alibi_slopes=alibi_slopes,
+        )
+        # Run Torch
+        context_attention_fwd_torch(
+            query,
+            k,
+            v,
+            output_torch,
+            k_cache,
+            v_cache,
+            b_start_loc,
+            b_seq_len,
+            k_scale,
+            v_scale,
+            alibi_slopes=alibi_slopes,
+        )
+
+        triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)

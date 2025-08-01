@@ -6,6 +6,7 @@ import pytest
 from enum import Enum
 from aiter.ops.triton.gemm_a8wfp4 import gemm_a8wfp4
 import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 from typing import Union
 
 # Debug
@@ -218,45 +219,6 @@ def quantize_to_fp4(w_fp32):
     return w_packed, w_scales_e8m0
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
-    x_vals += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
-    # x_vals = [(128, 1024, 4096)]
-    x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
-    return x_vals
-
-
 def mxfp4_to_f32(x):
     # 2 because we pack fp4 in uint8.
     x = x.repeat_interleave(2, dim=1)
@@ -352,92 +314,146 @@ def run_torch_emulation(x, w, x_scales, w_scales, dtype):
 e5m2_type, e4m3_type = arch_info.get_fp8_dtypes()
 
 
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-# @pytest.mark.parametrize("M, N, K", [
-#     (2, 2, 32),
-#     (4, 4, 32),
-#     (8, 8, 32),
-#     (16, 16, 32),
-#     (32, 32, 32),
-#     (48, 48, 32),
-#     (64, 64, 32),
-#     (512, 512, 512),
-#     (1024, 1024, 1024),
-#     (9728,8192,65536),
-#     (1,1280,8192)
-# ])
-@pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
-@pytest.mark.parametrize("out_dtype", [torch.float16])
-@pytest.mark.parametrize(
-    "layout", ["TN"]
-)  # NOTE: Kernel will occasionally crash for layouts other than TN.
-def test_gemm_a8wfp4(
-    M: int, N: int, K: int, a_dtype, out_dtype, layout: str, CLEAR_GPUS=True
-):
-    torch.manual_seed(42)  # for reproducibility
-    if not (arch_info.is_fp4_avail()):
-        pytest.skip("MXFP4 not supported on this architecture")
+class TestGemmA8WFP4:
+    basic_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 6)]
+    basic_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    basic_set = [
+        pytest.param(*shape, in_dtype, out_dtype, layout)
+        for shape in basic_shape_set
+        for in_dtype in [e4m3_type]
+        for out_dtype in ["bf16"]
+        for layout in [
+            "TN"
+        ]  # TODO Kernel will occasionally crash for layouts other than TN.
+    ]
 
-    # clean up to avoid hangs in large tests
-    if CLEAR_GPUS:
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+    extended_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(6, 9)]
+    extended_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    extended_shape_set += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]
+    extended_shape_set += [(1, 1, SCALE_GROUP_SIZE)]  # minimal case
+    extended_shape_set += [(2 ** (v - 1), 4096 * v, 4096 * v) for v in range(1, 6)]
+    extended_shape_set += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    extended_set = [
+        pytest.param(*shape, in_dtype, out_dtype, layout)
+        for shape in extended_shape_set
+        for in_dtype in [e4m3_type]
+        for out_dtype in ["bf16"]
+        for layout in [
+            "TN"
+        ]  # TODO Kernel will occasionally crash for layouts other than TN.
+    ]
 
-    x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(
-        M, N, K, a_dtype, out_dtype, layout=layout, output=True
-    )
+    test_params = extended_set + basic_set
 
-    torch_ref_out = torch.mm(x_fp32, w_fp32.T).to(out_dtype)
-    if DEBUG:
-        print()
-        print("x_fp32:", x_fp32, x_fp32.shape)
-        print("w_fp32:", w_fp32, w_fp32.shape)
-        print("torch_ref_out:", torch_ref_out, torch_ref_out.shape)
+    @pytest.mark.parametrize("M, N, K, a_dtype, out_dtype_str, layout", test_params)
+    # @pytest.mark.parametrize("a_dtype", [e4m3_type])  # [e4m3_type, e5m2_type, torch.int8]
+    # @pytest.mark.parametrize("out_dtype", [torch.float16])
+    # @pytest.mark.parametrize(
+    #    "layout", ["TN"]
+    # )  # NOTE: Kernel will occasionally crash for layouts other than TN.
+    def test_gemm_a8wfp4(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        a_dtype,
+        out_dtype_str,
+        layout: str,
+        CLEAR_GPUS=True,
+    ):
+        torch.manual_seed(42)  # for reproducibility
+        if not (arch_info.is_fp4_avail()):
+            pytest.skip("MXFP4 not supported on this architecture")
 
-    if DEBUG:
-        print()
-        print("x", x, x.shape)
-        print("x_scales", x_scales, x_scales.shape)
-        print("w", w, w.shape)
-        print("w_scales", w_scales, w_scales.shape)
-        print(
-            f"NOTE: we have shape {M}x{K} for A (fp8) and {N}x{K//2} for B (fp4). 2 fp4 values are packed into each uint8 value in the B tensor."
+        out_dtype = str_to_torch_dtype[out_dtype_str]
+
+        # clean up to avoid hangs in large tests
+        if CLEAR_GPUS:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        x, w, x_scales, w_scales, x_fp32, w_fp32, y = generate_gemm_a8wfp4_inputs(
+            M, N, K, a_dtype, out_dtype, layout=layout, output=True
         )
-        print("=== Debug: Matrix Values  ===")
-        x_f32 = dequantize_fp8(x, x_scales)
-        print(x_f32, x_f32.shape)
-        w_f32 = dequantize_fp4(w, w_scales)
-        print(w_f32, w_f32.shape)
-        print(f"Expected result: each element should be {K} (sum of {K} ones)")
 
-        print("=== What Triton Kernel Will See ===")
-        print("A matrix raw bytes (what tl.load will return):")
-        x_uint8 = x.view(torch.uint8)
-        print(f"x as uint8: {x_uint8}")
-        print(
-            f"These are the raw byte values - 448 in fp8_e4m3fn is encoded as byte value {x_uint8[0, 0]}"
+        torch_ref_out = torch.mm(x_fp32, w_fp32.T).to(out_dtype)
+        if DEBUG:
+            print()
+            print("x_fp32:", x_fp32, x_fp32.shape)
+            print("w_fp32:", w_fp32, w_fp32.shape)
+            print("torch_ref_out:", torch_ref_out, torch_ref_out.shape)
+
+        if DEBUG:
+            print()
+            print("x", x, x.shape)
+            print("x_scales", x_scales, x_scales.shape)
+            print("w", w, w.shape)
+            print("w_scales", w_scales, w_scales.shape)
+            print(
+                f"NOTE: we have shape {M}x{K} for A (fp8) and {N}x{K//2} for B (fp4). 2 fp4 values are packed into each uint8 value in the B tensor."
+            )
+            print("=== Debug: Matrix Values  ===")
+            x_f32 = dequantize_fp8(x, x_scales)
+            print(x_f32, x_f32.shape)
+            w_f32 = dequantize_fp4(w, w_scales)
+            print(w_f32, w_f32.shape)
+            print(f"Expected result: each element should be {K} (sum of {K} ones)")
+
+            print("=== What Triton Kernel Will See ===")
+            print("A matrix raw bytes (what tl.load will return):")
+            x_uint8 = x.view(torch.uint8)
+            print(f"x as uint8: {x_uint8}")
+            print(
+                f"These are the raw byte values - 448 in fp8_e4m3fn is encoded as byte value {x_uint8[0, 0]}"
+            )
+
+            print("B matrix raw bytes:")
+            print(f"w as uint8: {w}")
+            print(
+                f"0x22 = {0x22} = two packed fp4 values: lower nibble = 2 (1.0), upper nibble = 2 (1.0)"
+            )
+
+            print("Scale values:")
+            print(f"a_scales (fp32): {x_scales.flatten()}")
+            print(f"b_scales (e8m0 as uint8): {w_scales.flatten()}")
+            print(f"b_scales decoded to fp32: {e8m0_to_f32(w_scales).flatten()}")
+        torch_emulated_out = run_torch_emulation(
+            x, w, x_scales, w_scales, out_dtype
+        ).to(out_dtype)
+        if DEBUG:
+            print("torch_emulated_out", torch_emulated_out, torch_emulated_out.shape)
+
+        gemm_a8wfp4(x, w, y, x_scales, w_scales, out_dtype)
+        if DEBUG:
+            print("triton_out:", y, y.shape)
+
+        torch.testing.assert_close(
+            torch_emulated_out, y, atol=0.01, rtol=1e-2, equal_nan=True
         )
-
-        print("B matrix raw bytes:")
-        print(f"w as uint8: {w}")
-        print(
-            f"0x22 = {0x22} = two packed fp4 values: lower nibble = 2 (1.0), upper nibble = 2 (1.0)"
-        )
-
-        print("Scale values:")
-        print(f"a_scales (fp32): {x_scales.flatten()}")
-        print(f"b_scales (e8m0 as uint8): {w_scales.flatten()}")
-        print(f"b_scales decoded to fp32: {e8m0_to_f32(w_scales).flatten()}")
-    torch_emulated_out = run_torch_emulation(x, w, x_scales, w_scales, out_dtype).to(
-        out_dtype
-    )
-    if DEBUG:
-        print("torch_emulated_out", torch_emulated_out, torch_emulated_out.shape)
-
-    gemm_a8wfp4(x, w, y, x_scales, w_scales, out_dtype)
-    if DEBUG:
-        print("triton_out:", y, y.shape)
-
-    torch.testing.assert_close(
-        torch_emulated_out, y, atol=0.01, rtol=1e-2, equal_nan=True
-    )

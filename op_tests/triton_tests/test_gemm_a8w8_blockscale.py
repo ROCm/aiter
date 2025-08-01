@@ -39,51 +39,6 @@ def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-        (2048, 2048, 2049),
-        (159, 17389, 597),
-        (16, 576, 7168),
-    ]
-    x_vals += [
-        (256, 8192, 1024),
-        (256, 1024, 8192),
-        (256, 32768, 8192),
-        (256, 8192, 32768),
-    ]
-    # x_vals += [(1, 1, 1)]  # minimal case
-    return x_vals
-
-
 def generate_gemm_a8w8_blockscale_inputs(
     M: int,
     N: int,
@@ -132,30 +87,78 @@ def generate_gemm_a8w8_blockscale_inputs(
     return x, weight, x_scale, w_scale, y
 
 
-@pytest.mark.parametrize(
-    "dtype, M, N, K, output",
-    [
-        (dtype, *shape, output)
-        for output in [True, False]
+class TestGemmA8W8Blockscale:
+    basic_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(6, 9)]
+    basic_shape_set += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
+    basic_set = [
+        pytest.param(*shape, dtype, output)
+        for shape in basic_shape_set
         for dtype in ["bf16"]
-        for shape in get_x_vals()
-    ],
-)
-def test_gemm(dtype, M, N, K, output):
-    block_shape_n, block_shape_k = block_shape
+        for output in [True, False]
+    ]
 
-    dtype = str_to_torch_dtype[dtype]
-    x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
-        M,
-        N,
-        K,
-        block_shape_n,
-        block_shape_k,
-        dtype=dtype,
-        output=output,
-    )
+    extended_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(6, 9)]
+    extended_shape_set += [(4864, 8192, 4160)]
+    extended_shape_set += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+        (2048, 2048, 2049),
+        (159, 17389, 597),
+        (16, 576, 7168),
+        (256, 8192, 1024),
+        (256, 1024, 8192),
+        (256, 32768, 8192),
+        (256, 8192, 32768),
+    ]
+    extended_set = [
+        pytest.param(*shape, dtype, output, marks=pytest.mark.extended)
+        for shape in extended_shape_set
+        for dtype in ["bf16"]
+        for output in [True, False]
+    ]
 
-    a = run_torch(x, weight, x_scale, w_scale, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, dtype, y)
+    test_params = basic_set + extended_set
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    @pytest.mark.parametrize("M, N, K, dtype, output", test_params)
+    def test_gemm(self, M, N, K, dtype, output):
+        block_shape_n, block_shape_k = block_shape
+
+        dtype = str_to_torch_dtype[dtype]
+        x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
+            M,
+            N,
+            K,
+            block_shape_n,
+            block_shape_k,
+            dtype=dtype,
+            output=output,
+        )
+
+        a = run_torch(x, weight, x_scale, w_scale, dtype)
+        b = run_triton(x, weight, x_scale, w_scale, dtype, y)
+
+        triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

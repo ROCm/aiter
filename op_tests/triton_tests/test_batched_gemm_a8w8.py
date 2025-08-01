@@ -71,14 +71,24 @@ def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=N
     return batched_gemm_a8w8(x, weight, x_scale, w_scale, bias, dtype, YQ=y)
 
 
-e5m2_type, e4m3_type = get_fp8_dtypes()
+class TestBatchedGemmA8W8:
+    basic_shape_set = [(4, 1024 * v, 1024 * v, 1024 * v) for v in range(1, 6)]
+    basic_shape_set += [
+        (4, 4864, 4096, 8192),
+        (4, 9728, 8192, 65000),
+        (4, 4864, 8192, 4160),
+    ]
 
+    basic_set = [
+        (*shape, dtype, output)
+        for shape in basic_shape_set
+        for dtype in ["bf16"]
+        for output in [True, False]
+    ]
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65000), (4864, 8192, 4160)]
-    x_vals += [
+    extended_shape_set = [(1024 * v, 1024 * v, 1024 * v) for v in range(6, 9)]
+    extended_shape_set += [(4864, 4096, 8192), (9728, 8192, 65000), (4864, 8192, 4160)]
+    extended_shape_set += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -106,26 +116,40 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(1, 1, 1)]  # minimal case
-    return x_vals
+    extended_shape_set += [(1, 1, 1)]  # minimal case
 
+    extended_shape_set_with_batch = []
+    batch_sizes = [1, 5, 8, 16]
+    for b in batch_sizes:
+        for s in extended_shape_set:
+            extended_shape_set_with_batch.append([b, *s])
 
-@pytest.mark.parametrize(
-    "dtype, b, m, n, k, output",
-    [
-        (dtype, b, *shape, output)
-        for output in [True, False]
+    extended_set = [
+        pytest.param(*shape, dtype, output, marks=pytest.mark.extended)
+        for shape in extended_shape_set_with_batch
         for dtype in ["bf16"]
-        for b in [16]
-        for shape in get_x_vals()
-    ],
-)
-def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
-    dtype = str_to_torch_dtype[dtype]
-    x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
-        b, m, n, k, dtype, output
-    )
-    a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
+        for output in [True, False]
+    ]
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    test_params = basic_set + extended_set
+
+    @pytest.mark.parametrize("B, M, N, K, dtype_str, output", test_params)
+    def test_batched_gemm_a8w8(
+        self, B: int, M: int, N: int, K: int, dtype_str, output: bool
+    ):
+
+        dtype = str_to_torch_dtype[dtype_str]
+
+        x = torch.randint(-20, 20, (B, M, K), dtype=torch.int8).cuda()
+        weight = torch.randint(-20, 20, (B, N, K), dtype=torch.int8).cuda()
+        x_scale = torch.rand([B, M, 1], dtype=torch.float32).cuda() + 1e-6
+        w_scale = torch.rand([B, 1, N], dtype=torch.float32).cuda() + 1e-6
+        bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+
+        y = None
+        if output:
+            y = torch.empty((B, M, N), dtype=dtype, device=x.device)
+        a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+        b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
+
+        triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
