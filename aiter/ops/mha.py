@@ -12,6 +12,10 @@ from functools import partial
 
 @compile_ops("module_mha_fwd", fc_name="mha_fwd")
 def mha_fwd(
+    output: Tensor,
+    softmax_lse: Tensor,
+    S_dmask: Tensor,
+    rng_state: Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -611,7 +615,12 @@ def _flash_attn_forward(
             None,
         )
     else:
-        out, softmax_lse, S_dmask, rng_state = mha_fwd(
+        output, softmax_lse, S_dmask, rng_state = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
+        mha_fwd(
+            output,
+            softmax_lse,
+            S_dmask,
+            rng_state,
             q,
             k,
             v,
@@ -628,7 +637,7 @@ def _flash_attn_forward(
             None,
             custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
-    return out, softmax_lse, S_dmask, rng_state
+    return output, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_backward(
