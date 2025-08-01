@@ -480,17 +480,12 @@ def get_2stage_cfgs(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
 
-    if (
-        "ck" in kernelName1
-        or q_dtype_w
-        in [
-            dtypes.bf16,
-            dtypes.fp16,
-            torch.uint32,
-            torch.uint8,
-        ]
-        or (q_dtype_w == dtypes.fp8 and q_type == QuantType.per_1x128)
-    ):
+    if "ck2stages" in kernelName1 or q_dtype_w in [
+        dtypes.bf16,
+        dtypes.fp16,
+        torch.uint32,
+        torch.uint8,
+    ]:
         return MOEMetadata(
             functools.partial(
                 aiter.ck_moe_stage1_fwd,
@@ -596,6 +591,8 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
     elif hidden_states.dtype != q_dtype_a:
+        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+            quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,

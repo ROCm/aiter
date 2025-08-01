@@ -346,12 +346,18 @@ def go(
                     (token, topk, inter_dim),
                     dtype=dtype,
                 )
+                ref1_asm = ref1
             else:
                 ratio = a1_scale.element_size() // a1_qt.element_size()
-                out1 = torch.empty(
+                out1 = torch.zeros(
                     (token + (token * ratio + 127) // 128, topk, inter_dim),
                     dtype=q_dtype_a,
                 )
+                ref1_asm = torch.zeros_like(out1)
+                ref1_asm[:token] = a2_qt
+                ref1_asm[token:, ...].view(-1)[
+                    : token * topk * inter_dim * ratio // 128
+                ] = a2_scale.view(q_dtype_a).view(-1)
 
             if use_g1u1 and q_dtype_w != torch.int4:
                 for el in asm_kernels.get(blockM, []):
@@ -366,7 +372,7 @@ def go(
                                 sorted_ids,
                                 sorted_expert_ids,
                                 num_valid_ids,
-                                out1.view(dtypes.bf16),
+                                out1,
                                 topk,
                                 blockM,
                                 el,
@@ -385,7 +391,7 @@ def go(
                             None,
                             (),
                             {},
-                            (ref1),
+                            (ref1_asm),
                             0.01,
                             0.01,
                             True,
