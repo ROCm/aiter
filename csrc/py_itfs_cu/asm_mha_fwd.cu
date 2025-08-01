@@ -144,8 +144,6 @@ void fmha_v3_fwd(
                                     at::Tensor &q, // [b, sq, hq, d]
                                     const at::Tensor &k, // [b, sk, hk, d]
                                     const at::Tensor &v, // [b, sk, hk, d_v]
-                                    py::list &result,
-                                    // std::vector<at::Tensor> &result,
                                     float p_dropout,
                                     float softmax_scale,
                                     bool is_causal,

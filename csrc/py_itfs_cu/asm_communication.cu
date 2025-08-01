@@ -117,7 +117,9 @@ void all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
                                                             // following are fused_allreduce args
                                                             int64_t _ca,
                                                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph,
-                                                            py::list &output)
+                                                            at::Tensor &out_tensor,
+                                                            at::Tensor &res_tensor,
+                                                            at::Tensor &ys_tensor)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -264,7 +266,9 @@ void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
                                                                                  // following are fused_allreduce args
                                                                                  int64_t _ca,
                                                                                  torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph,
-                                                                                 py::list &output)
+                                                                                at::Tensor &out_tensor,
+                                                                                at::Tensor &res_tensor,
+                                                                                at::Tensor &ys_tensor)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -404,12 +408,8 @@ void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
     auto opt_ys = torch::TensorOptions()
                       .dtype(torch::kFloat32)
                       .device(input.device());
-    auto out_tensor = torch::from_blob(out_ptr, {input.sizes()}, opt_out);
-    auto res_tensor = torch::from_blob(res_ptr, {input.sizes()}, opt_res);
-    auto ys_tensor = torch::from_blob(ys_ptr, {M, 1}, opt_ys);
-
-    output.append(py::cast(out_tensor));
-    output.append(py::cast(res_tensor));
-    output.append(py::cast(ys_tensor));
+    out_tensor = torch::from_blob(out_ptr, {input.sizes()}, opt_out);
+    res_tensor = torch::from_blob(res_ptr, {input.sizes()}, opt_res);
+    ys_tensor = torch::from_blob(ys_ptr, {M, 1}, opt_ys);
 
 };
