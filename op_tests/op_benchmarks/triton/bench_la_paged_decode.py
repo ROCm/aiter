@@ -386,7 +386,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -407,6 +407,9 @@ def parse_args():
         action="store_true",
         default=False,
         help="Prints the VGPR usage of the compiled triton kernel.",
+    )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
     args = parser.parse_args()
     return args
