@@ -515,7 +515,6 @@ def generate_schema(func) -> str:
     import inspect
     import torch
     from typing import Optional, Union, List, get_origin, get_args
-    import string
 
     sig = inspect.signature(func)
     parameters = []
@@ -579,11 +578,11 @@ def generate_schema(func) -> str:
             "("
             + ", ".join(
                 [
-                    "Tensor"
-                    if t is torch.Tensor
-                    else "int"
-                    if t is int
-                    else str(t.__name__)
+                    (
+                        "Tensor"
+                        if t is torch.Tensor
+                        else "int" if t is int else str(t.__name__)
+                    )
                     for t in get_args(return_annotation)
                 ]
             )
@@ -613,8 +612,6 @@ def compile_ops(
         schema = ""
         if func.__name__ in MANUAL_SCHEMA_OPS:
             schema = generate_schema(func)
-            if func.__name__ == "mha_varlen_fwd":
-                print(schema)
         else:
             sig = inspect.signature(func)
             mutates_args = []
@@ -624,11 +621,9 @@ def compile_ops(
             sig = torch.library.infer_schema(func, mutates_args=mutates_args)
             schema = f"{sig}"
         loadName = func.__name__
-        print(loadName)
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
-            print("This is md:", func.__name__)
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
@@ -784,7 +779,7 @@ def compile_ops(
             if loadName in activation_list:
                 activation_index = params.index("activation")
                 args_list = list(args)
-                from aiter import ActivationType, Enum, QuantType
+                from aiter import ActivationType, QuantType
 
                 if len(args_list) > activation_index and isinstance(
                     args_list[activation_index], int
@@ -797,7 +792,7 @@ def compile_ops(
             if loadName in quant_list:
                 quant_index = params.index("quant_type")
                 args_list = list(args)
-                from aiter import ActivationType, Enum, QuantType
+                from aiter import ActivationType, QuantType
 
                 if len(args_list) > quant_index and isinstance(
                     args_list[quant_index], int
@@ -810,26 +805,8 @@ def compile_ops(
             return op(*args, **kwargs)
 
         def abstract_impl(*args, custom_build_args={}, **kwargs):
-            print("fake tensor.....")
-            sig = inspect.signature(func)
-            return_annotation = sig.return_annotation
-            return func(*args, **kwargs)
-            # gemm: func(*args, **kwargs)= None
-
-            if return_annotation is torch.Tensor:
-                return torch.empty(1, device="cuda")
-            elif return_annotation is int:
-                return 0
-            elif return_annotation is List[int]:
-                return [0]
-            elif return_annotation is Optional[torch.Tensor]:
-                return torch.empty(1, device="cuda")
-            elif return_annotation is tuple[torch.Tensor, list[int]]:
-                return (torch.empty(1, device="cuda"), [0])
-
             return func(*args, **kwargs)
 
-        # return wrapper
 
         if loadName in NONE_WRAPPED_OP:
             return wrapper

@@ -79,9 +79,7 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     m, k = x.shape
     n, k = weight.shape
-    aiter.gemm_a4w4_blockscale_tune(
-        x, weight, x_scale, w_scale, out, kernel_id, splitK
-    )
+    aiter.gemm_a4w4_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
     return out[:m]
 
 

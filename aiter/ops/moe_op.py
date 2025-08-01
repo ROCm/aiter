@@ -331,16 +331,6 @@ def ck_moe_stage1_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
 ):
-    mul_routed_weight_stage = 2 if sorted_weights is None else 1
-    # md_name, blob_gen_cmd = get_moe_stage_module(
-    #     hidden_states.dtype,
-    #     w1.dtype,
-    #     out.dtype,
-    #     activation,
-    #     quant_type,
-    #     mul_routed_weight_stage,
-    # )
-
     ck_moe_stage1(
         hidden_states,
         w1,
@@ -357,7 +347,6 @@ def ck_moe_stage1_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out
 
@@ -379,16 +368,6 @@ def ck_moe_stage2_fwd(
     quant_type: QuantType = QuantType.No,
     activation: ActivationType = ActivationType.Silu,
 ):
-    mul_routed_weight_stage = 1 if sorted_weights is None else 2
-
-    # md_name, blob_gen_cmd = get_moe_stage_module(
-    #     inter_states.dtype,
-    #     w1.dtype,
-    #     out.dtype,
-    #     activation,
-    #     quant_type,
-    #     mul_routed_weight_stage,
-    # )
 
     ck_moe_stage2(
         inter_states,
@@ -406,6 +385,5 @@ def ck_moe_stage2_fwd(
         sorted_weights,
         quant_type.value,
         activation.value,
-        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out

@@ -186,10 +186,10 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
 
 void
 mha_varlen_bwd(
-               const at::Tensor &dq,
-               const at::Tensor &dk,
-               const at::Tensor &dv,
-               const at::Tensor &softmax_d,
+               at::Tensor &dq,
+               at::Tensor &dk,
+               at::Tensor &dv,
+               at::Tensor &softmax_d,
                const at::Tensor &dout,         // [total_q, hq, d_v]
                const at::Tensor &q,            // [total_q, hq, d_q]
                const at::Tensor &k,            // [total_k, hk, d_q]
