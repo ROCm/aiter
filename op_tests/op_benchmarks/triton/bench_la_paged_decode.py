@@ -13,6 +13,10 @@ import sys
 import random
 
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    print_vgpr,
+    get_caller_name_no_ext,
+)
 
 
 def input_helper(
@@ -340,9 +344,7 @@ def run_benchmark(args):
 
     x_names = ["OP", "BS", "HQ", "HK", "SEQ_LEN", "HEAD_DIM"]
 
-    model_name = "paged-attn-decode"
-
-    line_names = ["Time (ms)"]
+    line_names = ["Time_(ms)"]
     line_vals = ["time"]
 
     benchmark = triton.testing.Benchmark(
@@ -353,7 +355,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-")],
         ylabel="ms",
-        plot_name=f"{model_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -400,6 +402,12 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Prints the VGPR usage of the compiled triton kernel.",
+    )
     args = parser.parse_args()
     return args
 
@@ -415,6 +423,11 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(args)
 
 

@@ -5,27 +5,45 @@ benchmarks:
   batched_gemm_a16w16:
     input_columns: [batch, M, N, K]
     output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
-  batched_gemm_afp4wfp4:
-    input_columns: [batch, M, N, K]
-    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   batched_gemm_afp4wfp4_pre_quant:
     input_columns: [batch, M, N, K]
     output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
-  moe:
-    input_columns: [model, M, N, K, E, top_k]
+  batched_gemm_afp4wfp4:
+    input_columns: [batch, M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  batch_extend_attention:
+    input_columns: [B, H, prefix, extend, kv_lora_rank, qk_rope_head_dim, v_head_dim, attn_impl]
+    output_columns: [fwd_Time_(ms)]
+  gemm_a8w8_blockscale:
+    input_columns: [M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  gemm_a8w8_per_token_scale:
+    input_columns: [M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  gemm_a8w8:
+    input_columns: [M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  gemm_a8wfp4:
+    input_columns: [M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  gemm_a16w16:
+    input_columns: [M, N, K]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  gemm_afp4wfp4_pre_quant_atomic:
+    input_columns: [M, N, K]
     output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   gemm_afp4wfp4:
     input_columns: [M, N, K]
-    output_columns: [Triton]
-  gemm_a8w8:
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  hstu_attn:
     input_columns: [M, N, K]
-    output_columns: [Triton]
-  batch_gemm_a8w8:
-    input_columns: [batch, M, N, K]
-    output_columns: [Triton]
-  gemm_a16w16:
-    input_columns: [M, N, K]
-    output_columns: [Triton]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
+  la_paged_decode:
+    input_columns: [OP, BS, HQ, HK, SEQ_LEN, HEAD_DIM]
+    output_columns: [Time_(ms)]
+  moe:
+    input_columns: [model, M, N, K, E, top_k]
+    output_columns: [TFLOPS, Time_(ms), Bandwidth_(GB/s)]
   mha:
     input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
     output_columns: [fwd(TFLOPS)]
