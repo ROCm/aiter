@@ -108,9 +108,11 @@ def test_fmoe_ep(
     # This gpu id in EP, this example use the last id
     ep_id = ep - 1
     # total_expert = unshared_expert + shared_expert + fake_expert(only use this fake expert id to mask)
-    # expert_mask = torch.randint(0, 2, (E+shared_E+1,), dtype=dtypes.i32, device="cuda")
-    expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
-    expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    expert_mask = torch.randint(
+        0, 2, (E + shared_E + 1,), dtype=dtypes.i32, device="cuda"
+    )
+    # expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
+    # expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
     # The last expert
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
@@ -118,7 +120,7 @@ def test_fmoe_ep(
     # Ensure shared expert not to be masked
     expert_mask[E:-1] = 1
     # # Get local expert Number in this gpu
-    # local_E = torch.sum(expert_mask).item()
+    local_E = torch.sum(expert_mask).item()
 
     quantAlgoId = quant_algo.index(quant)
     if quantAlgoId not in [0, 3] and not use_g1u1:
@@ -133,7 +135,7 @@ def test_fmoe_ep(
     if use_g1u1:
         w1 = (
             torch.randn(
-                (E // ep + shared_E, inter_dim * 2, model_dim),
+                (local_E + shared_E, inter_dim * 2, model_dim),
                 dtype=dtype,
                 device="cuda",
             )
@@ -142,13 +144,13 @@ def test_fmoe_ep(
     else:
         w1 = (
             torch.randn(
-                (E // ep + shared_E, inter_dim, model_dim), dtype=dtype, device="cuda"
+                (local_E + shared_E, inter_dim, model_dim), dtype=dtype, device="cuda"
             )
             / 10
         )
     w2 = (
         torch.randn(
-            (E // ep + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
+            (local_E + shared_E, model_dim, inter_dim), dtype=dtype, device="cuda"
         )
         / 10
     )
