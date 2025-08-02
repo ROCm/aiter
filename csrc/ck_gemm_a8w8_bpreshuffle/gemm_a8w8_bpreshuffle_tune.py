@@ -70,12 +70,12 @@ def run_gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, out, kernel_id, split
 
 
 def generate_data(m, n, k):
-    x = torch.randn((m, k), dtype=dtypes.fp16, device="cuda")
-    weight = torch.randn((n, k), dtype=dtypes.fp16, device="cuda")
+    x = torch.randn((m, k), dtype=dtypes.fp16)
+    weight = torch.randn((n, k), dtype=dtypes.fp16)
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=dtypes.fp8)
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-    out = torch.empty(m, n, dtype=dtypes.fp16, device="cuda")
+    out = torch.empty(m, n, dtype=dtypes.fp16)
     return x, weight_shuffle, x_scale, w_scale, out, weight
 
 

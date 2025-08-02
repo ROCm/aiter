@@ -54,11 +54,21 @@ def get_tuned_gemm_list(tuned_gemm_file):
 
 
 def generate_data(m, n, k):
-    x = torch.randint(-20, 20, (m, k), dtype=dtypes.i8, device="cuda")
-    weight = torch.randint(-20, 20, (n, k), dtype=dtypes.i8, device="cuda")
-    x_scale = torch.rand([m, 1], dtype=dtypes.bf16, device="cuda")
-    w_scale = torch.rand([1, n], dtype=dtypes.bf16, device="cuda")
-    out = torch.empty(m, n, dtype=dtypes.bf16, device="cuda")
+    x = torch.randint(
+        -20,
+        20,
+        (m, k),
+        dtype=dtypes.i8,
+    )
+    weight = torch.randint(
+        -20,
+        20,
+        (n, k),
+        dtype=dtypes.i8,
+    )
+    x_scale = torch.rand([m, 1], dtype=dtypes.bf16)
+    w_scale = torch.rand([1, n], dtype=dtypes.bf16)
+    out = torch.empty(m, n, dtype=dtypes.bf16)
     # x.share_memory_()
     # weight.share_memory_()
     # x_scale.share_memory_()

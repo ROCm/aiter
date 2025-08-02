@@ -9,18 +9,22 @@ import numpy as np
 import pandas as pd
 from aiter import logger
 
-pd.set_option("display.max_rows", 200)
+# pd.set_option("display.max_rows", 200)
+pd.set_option("display.max_rows", None)  # 显示所有行
+pd.set_option("display.max_columns", None)  # 显示所有列
+pd.set_option("display.width", None)  # 自动调整列宽（避免换行）
+pd.set_option("display.max_colwidth", None)  # 显示完整列内容（不截断字符串）
 
 
 def perftest(
-    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=103, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
             if num < 1:
                 gpu_id = torch.cuda.current_device()
-
+                torch.cuda.set_device(torch.cuda.current_device())
                 iter_used_memory, inputSize, _, _ = device_memory_profiling(
                     func, *args, **kwargs
                 )
@@ -33,14 +37,13 @@ def perftest(
                 )
                 cache_size = max(cache_size, 0)
                 num = int((cache_size + inputSize - 1) // inputSize)
-                # print(f"{iter_used_memory=}, {inputSize=}, {cache_size=}, {free_memory=}, {num=}")
             num = min(num, num_iters)
 
             rotate_args = [
                 (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
             ] + [(args, kwargs)]
-
             run_iters(num_warmup, func, *args, **kwargs)
+            torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", 0)):
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
@@ -53,7 +56,6 @@ def perftest(
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -69,20 +71,21 @@ def perftest(
                 logger.info(f"avg: {avg} us/iter with hipgraph")
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
-                profile_memory=True,
-                with_stack=True,
+                profile_memory=False,
+                with_stack=False,
                 with_modules=True,
-                #  record_shapes=True,
+                # record_shapes=True,
                 on_trace_ready=(
-                    tpf.tensorboard_trace_handler("./aiter_logs/")
+                    tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")
                     if needTrace
                     else None
                 ),
             ) as prof:
                 data = run_iters_rotate(num_iters, func, rotate_args)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
 
             avg = get_trace_perf(prof, num_iters)
-
             return data, avg
 
         return wrapper
@@ -158,13 +161,14 @@ def run_iters_rotate(num_iters, func, rotate_args):
     for _ in range(num_iters):
         args, kwargs = rotate_args[_ % num_rotate_args]
         data = func(*args, **kwargs)
+
     return data
 
 
 def run_perftest(
     func,
     *args,
-    num_iters=101,
+    num_iters=103,
     num_warmup=2,
     testGraph=False,
     num_rotate_args=0,
@@ -211,6 +215,40 @@ def log_args(func, *args, **kwargs):
     return callargs
 
 
+def post_process_data(df):
+    """remove min value and max value and abnormal data"""
+    device_df = df[df["device_type"].astype(str).str.contains("DeviceType.CUDA")]
+    if device_df.empty:
+        return []
+    kernel_dfs = [
+        d.iloc[1:].reset_index(names="original_index")
+        for _, d in device_df.groupby("name", sort=False)
+    ]
+    sum_df = pd.DataFrame(0, index=kernel_dfs[0].index, columns=kernel_dfs[0].columns)
+    for d in kernel_dfs:
+        sum_df["self_device_time_total"] += d["self_device_time_total"]
+    idx_min = sum_df["self_device_time_total"].idxmin()
+    idx_max = sum_df["self_device_time_total"].idxmax()
+
+    k = 1.5
+    Q1 = sum_df["self_device_time_total"].quantile(0.25)
+    Q3 = sum_df["self_device_time_total"].quantile(0.75)
+    IQR = Q3 - Q1
+    lower = Q1 - k * IQR
+    upper = Q3 + k * IQR
+
+    out_range_idx = sum_df.index[
+        (sum_df["self_device_time_total"] < lower)
+        & (sum_df["self_device_time_total"] > upper)
+    ].tolist()
+    if len(out_range_idx) > 0:
+        print("out_range_idx is ", out_range_idx)
+    indexs = {d.iloc[i]["original_index"] for d in kernel_dfs for i in out_range_idx}
+    for i in indexs:
+        print(f" i is ,val is {df.iloc[i]['self_device_time_total']}")
+    return list(indexs)
+
+
 def get_trace_perf(prof, num_iters):
     assert num_iters > 1
     num_iters -= 1
@@ -225,6 +263,9 @@ def get_trace_perf(prof, num_iters):
     for el in prof.events():
         df.append([getattr(el, x, None) for x in cols])
     df = pd.DataFrame(df, columns=cols)
+    ###remove min/max and abnormal data
+    dropped_indexs = post_process_data(df)
+    df = df.drop(dropped_indexs)
     df["cnt"] = 1
     rets = []
     for name, d in df.groupby("name", sort=False):
@@ -243,7 +284,6 @@ def get_trace_perf(prof, num_iters):
 
         rets.append(r)
     df = pd.DataFrame(rets)
-
     cols = [
         "name",
         "cnt",
@@ -260,9 +300,15 @@ def get_trace_perf(prof, num_iters):
         "device_time_sum",
     ]
     df = df[cols].sort_values(timerList, ignore_index=True)
+    actual_iters = num_iters
+    if df.empty:
+        logger.info(f"no valida data after post process!")
+    else:
+        actual_iters = df.at[0, "cnt"]
+
     avg_name = "[avg us/iter]"
     for el in timerList:
-        df.at[avg_name, el] = df[el].sum() / num_iters
+        df.at[avg_name, el] = df[el].sum() / actual_iters
     if int(os.environ.get("AITER_LOG_MORE", 0)):
         pd.set_option("display.expand_frame_repr", False)
         pd.set_option("display.max_colwidth", 90)

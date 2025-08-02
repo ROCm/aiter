@@ -160,7 +160,7 @@ def get_asm_kernels(file):
 def tune_gemm_list(
     untunedf,
     tunedf,
-    issorted=False,
+    issorted=True,
     useSplitK=False,
     mp_num=1,
     shape_grouped=False,
@@ -214,7 +214,10 @@ def tune_gemm_list(
                                 i,
                                 splitK,
                             ),
-                            {},
+                            {
+                                "num_warmup": 10,
+                                "num_iters": 103,
+                            },
                             run_torch,
                             (
                                 input_data[0],
@@ -234,7 +237,6 @@ def tune_gemm_list(
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = get_asm_kernels(asm_kernel_list_csv)
-            # asm_tiles = [(256, 256), (128, 512)]
             asm_tiles = [key for key in asm_kernels.keys()]
             for tile_m, tile_n in asm_tiles:
                 maxsplitK = (
@@ -267,7 +269,10 @@ def tune_gemm_list(
                                 True,
                                 splitK,
                             ),
-                            {},
+                            {
+                                "num_warmup": 10,
+                                "num_iters": 103,
+                            },
                             run_torch,
                             (
                                 input_data[0],
@@ -283,6 +288,7 @@ def tune_gemm_list(
                         )
                     )
                     asm_kernels_id = asm_kernels_id + 1
+
                     total_kernel_nums = total_kernel_nums + 1
             tasks_in_data.append((total_kernel_nums, ()))
         else:
@@ -347,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mp",
         type=int,
-        default=1,  # torch.cuda.device_count(),
+        default=torch.cuda.device_count(),
         help="Tuning on multiple GPUs using multiple processes",
     )
 
@@ -380,6 +386,6 @@ if __name__ == "__main__":
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
     tunedf = tune_gemm_list(
-        untunedf, tunedf, args.sort, args.splitK, args.mp, errRatio=args.errRatio
+        untunedf, tunedf, True, args.splitK, args.mp, errRatio=args.errRatio
     )
     tunedf.to_csv(args.tune_file, index=False)
