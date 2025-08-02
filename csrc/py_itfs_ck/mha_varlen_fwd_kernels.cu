@@ -93,7 +93,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         bias_ptr = alibi_slopes.data_ptr();
         stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
-    
+
     return fmha_fwd_args{q.data_ptr(),
                          k.data_ptr(),
                          v.data_ptr(),
@@ -295,13 +295,8 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
 }
 
 
-void mha_varlen_fwd(
-                    // py::list &output,
-               at::Tensor &output,
-               at::Tensor &softmax_lse,
-               at::Tensor &p,
-               at::Tensor &rng_state,
-               at::Tensor &q,                  // [total_q, hq, d]
+std::vector<at::Tensor>
+mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
@@ -429,16 +424,16 @@ void mha_varlen_fwd(
     }
     auto opts = q.options();
 
-    // at::Tensor out;
+    at::Tensor out;
     if (out_.has_value()) {
-        output = out_.value();
-        TORCH_CHECK(output.dtype() == q_dtype, "Output must have the same dtype as inputs");
-        CHECK_DEVICE(output);
-        TORCH_CHECK(output.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(output, total_q, num_heads, head_size_v);
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else {
-        output = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -449,7 +444,7 @@ void mha_varlen_fwd(
     if (has_dropout)
         TORCH_CHECK(!paged_KV, "Paged KV does not support dropout");
 
-    // at::Tensor softmax_lse;
+    at::Tensor softmax_lse;
     if (return_softmax_lse) {
         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
     }
@@ -457,7 +452,7 @@ void mha_varlen_fwd(
         softmax_lse = torch::empty({ 0 }, opts.dtype(torch::kFloat32));
     }
 
-    // at::Tensor p;
+    at::Tensor p;
     if (return_dropout_randval) {
         TORCH_CHECK(has_dropout, "return_dropout_randval require p_dropout > 0");
         p = torch::empty({num_heads, total_q, max_seqlen_k}, opts.dtype(torch::kUInt8));
@@ -468,16 +463,24 @@ void mha_varlen_fwd(
 
     if (zero_tensors)
     {
-        output.zero_();
+        out.zero_();
         softmax_lse.fill_(-std::numeric_limits<float>::infinity());
         if (return_dropout_randval) {p.zero_();}
     }
 
-    rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    int num_splits = 0;
+    num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
+    TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
+    TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
+
+    auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
+    auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
+
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
+    auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
     auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (p_dropout > 0.0)  {
-        int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
@@ -487,21 +490,12 @@ void mha_varlen_fwd(
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
-    
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
 
         if (paged_KV)
         {
-            int num_splits = 0;
-            num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
-            TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
-            TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
-        
-            auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
-            auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
-
             auto args =
                 get_ck_fmha_varlen_fwd_splitkv_args(
                     has_lse,
@@ -525,7 +519,7 @@ void mha_varlen_fwd(
                     block_table_,
                     bias_,
                     alibi_slopes_,
-                    output,
+                    out,
                     softmax_lse,
                     softmax_lse_accum,
                     out_accum);
@@ -563,7 +557,7 @@ void mha_varlen_fwd(
                     seqlens_k,
                     bias_,
                     alibi_slopes_,
-                    output,
+                    out,
                     softmax_lse,
                     p,
                     softmax_scale,
@@ -584,15 +578,11 @@ void mha_varlen_fwd(
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
-        output.zero_();
+        out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
-    // output.append(py::cast(out));
-    // output.append(py::cast(softmax_lse));
-    // output.append(py::cast(p));
-    // output.append(py::cast(rng_state));
-    
-    // return {out, softmax_lse, p, rng_state};
+
+    return {out, softmax_lse, p, rng_state};
 }
 
 } // namespace torch_itfs

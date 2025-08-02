@@ -195,8 +195,7 @@ class TunedGemm:
         assert (
             scale_a is None and scale_b is None and scale_c is None
         ), "scale_a, scale_b, scale_c must be None for rocblas"
-        out = torch.tensor([])
-        rocb_mm(inp, weights.t(), out, solidx)
+        out = rocb_mm(inp, weights.t(), solidx)
         if bias is not None:
             out = out + bias
         return out

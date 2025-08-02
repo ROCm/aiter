@@ -258,19 +258,14 @@
           py::arg("t"),                                                                        \
           py::arg("handles"),                                                                  \
           py::arg("offsets"));                                                                 \
-    m.def("get_graph_buffer_ipc_meta",                                                         \
-          &aiter::get_graph_buffer_ipc_meta,                                                   \
-           py::arg("_fa"),                                                                     \
-           py::arg("handle"),                                                                   \
-           py::arg("offset_tensor"));                                                          \
+    m.def("get_graph_buffer_ipc_meta", &aiter::get_graph_buffer_ipc_meta, py::arg("_fa"));     \
     m.def("register_graph_buffers",                                                            \
           &aiter::register_graph_buffers,                                                      \
           py::arg("_fa"),                                                                      \
           py::arg("handles"),                                                                  \
           py::arg("offsets"));                                                                 \
     m.def("allocate_meta_buffer", &aiter::allocate_meta_buffer, py::arg("size"));              \
-    m.def("get_meta_buffer_ipc_handle",                                                        \
-          &aiter::get_meta_buffer_ipc_handle, py::arg("inp"), py::arg("out")); \
+    m.def("get_meta_buffer_ipc_handle", &aiter::get_meta_buffer_ipc_handle, py::arg("inp"));
 
 #define CUSTOM_PYBIND                                                                           \
     m.def("wvSpltK",                                                                            \
@@ -415,10 +410,6 @@
 #define MHA_BWD_ASM_PYBIND                        \
     m.def("fmha_v3_bwd",                          \
           &aiter::torch_itfs::fmha_v3_bwd,        \
-          py::arg("dp"),                          \
-          py::arg("dk"),                          \
-          py::arg("dv"),                          \
-          py::arg("softmax_d"),                   \
           py::arg("dout"),                        \
           py::arg("q"),                           \
           py::arg("k"),                           \
@@ -433,9 +424,9 @@
           py::arg("deterministic"),               \
           py::arg("is_v3_atomic_fp32"),           \
           py::arg("how_v3_bf16_cvt"),             \
-          py::arg("dq_")           = std::nullopt, \
-          py::arg("dk_")           = std::nullopt, \
-          py::arg("dv_")           = std::nullopt, \
+          py::arg("dq")           = std::nullopt, \
+          py::arg("dk")           = std::nullopt, \
+          py::arg("dv")           = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
@@ -476,10 +467,6 @@
 #define MHA_BWD_PYBIND                            \
     m.def("mha_bwd",                              \
           &aiter::torch_itfs::mha_bwd,            \
-          py::arg("dp"),                          \
-          py::arg("dk"),                          \
-          py::arg("dv"),                          \
-          py::arg("softmax_d"),                   \
           py::arg("dout"),                        \
           py::arg("q"),                           \
           py::arg("k"),                           \
@@ -492,9 +479,9 @@
           py::arg("window_size_left"),            \
           py::arg("window_size_right"),           \
           py::arg("deterministic"),               \
-          py::arg("dq_")           = std::nullopt, \
-          py::arg("dk_")           = std::nullopt, \
-          py::arg("dv_")           = std::nullopt, \
+          py::arg("dq")           = std::nullopt, \
+          py::arg("dk")           = std::nullopt, \
+          py::arg("dv")           = std::nullopt, \
           py::arg("dbias")        = std::nullopt, \
           py::arg("bias")         = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
@@ -504,10 +491,6 @@
 #define MHA_FWD_ASM_PYBIND                        \
     m.def("fmha_v3_fwd",                          \
           &aiter::torch_itfs::fmha_v3_fwd,        \
-          py::arg("output"),                      \
-          py::arg("softmax_lse"),                 \
-          py::arg("p"),                           \
-          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
@@ -548,10 +531,6 @@
 #define MHA_VARLEN_BWD_PYBIND                     \
     m.def("mha_varlen_bwd",                       \
           &aiter::torch_itfs::mha_varlen_bwd,     \
-          py::arg("dp"),                          \
-          py::arg("dk"),                          \
-          py::arg("dv"),                          \
-          py::arg("softmax_d"),                   \
           py::arg("dout"),                        \
           py::arg("q"),                           \
           py::arg("k"),                           \
@@ -613,10 +592,6 @@
 #define MHA_VARLEN_FWD_PYBIND                     \
     m.def("mha_varlen_fwd",                       \
           &aiter::torch_itfs::mha_varlen_fwd,     \
-          py::arg("output"),                      \
-          py::arg("softmax_lse"),                 \
-          py::arg("p"),                           \
-          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
@@ -643,10 +618,6 @@
 #define MHA_BATCH_PREFILL_PYBIND                  \
     m.def("mha_batch_prefill",                    \
           &aiter::torch_itfs::mha_batch_prefill,  \
-          py::arg("output"),                      \
-          py::arg("softmax_lse"),                 \
-          py::arg("p"),                           \
-          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \

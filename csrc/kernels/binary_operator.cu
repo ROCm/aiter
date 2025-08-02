@@ -11,56 +11,56 @@ torch::Tensor initOutput(torch::Tensor &input, torch::Tensor &other)
   return output;
 }
 
-void aiter_add(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
+torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other)
 {
-  output = initOutput(input, other);
+  torch::Tensor output = initOutput(input, other);
   binary_op_dispatch("add", input, other, output);
-  // return output;
+  return output;
   // return binary_operation<aiter::AddOp, false>(input, other);
 }
 
-void aiter_sub(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
+torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other)
 {
-  output = initOutput(input, other);
+  torch::Tensor output = initOutput(input, other);
   binary_op_dispatch("sub", input, other, output);
-  // return output;
+  return output;
 }
 
-void aiter_mul(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
+torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other)
 {
-  output = initOutput(input, other);
+  torch::Tensor output = initOutput(input, other);
   binary_op_dispatch("mul", input, other, output);
-  // return output;
+  return output;
 }
 
-void aiter_div(torch::Tensor &input, torch::Tensor &other, torch::Tensor &output)
+torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other)
 {
-  output = initOutput(input, other);
+  torch::Tensor output = initOutput(input, other);
   binary_op_dispatch("div", input, other, output);
-  // return output;
+  return output;
 }
 
 // inp interface
-void aiter_add_(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_add_(torch::Tensor &input, torch::Tensor &other)
 {
   binary_op_dispatch("add", input, other, input);
-  // return input;
+  return input;
 }
 
-void aiter_sub_(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_sub_(torch::Tensor &input, torch::Tensor &other)
 {
   binary_op_dispatch("sub", input, other, input);
-  // return input;
+  return input;
 }
 
-void aiter_mul_(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_mul_(torch::Tensor &input, torch::Tensor &other)
 {
   binary_op_dispatch("mul", input, other, input);
-  // return input;
+  return input;
 }
 
-void aiter_div_(torch::Tensor &input, torch::Tensor &other)
+torch::Tensor aiter_div_(torch::Tensor &input, torch::Tensor &other)
 {
   binary_op_dispatch("div", input, other, input);
-  // return input;
+  return input;
 }

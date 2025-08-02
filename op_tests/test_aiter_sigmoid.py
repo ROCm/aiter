@@ -4,6 +4,7 @@
 import torch
 import aiter
 from aiter import dtypes
+from aiter.test_common import checkAllclose
 
 # from ater.test_common import checkAllclose, perftest
 from torch.profiler import profile, ProfilerActivity
@@ -49,10 +50,10 @@ with profile(
 ) as prof:
     for j in range(100):
         # cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=dtypes.fp32).to(dtypes.i32)
-        output = torch.empty_like(tensor0)
-        aiter.sigmoid(tensor0, output)
+        output = aiter.sigmoid(tensor0)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
 print(torch.equal(result, output))
+checkAllclose(result, output, msg="sigmoid")
 print("result:", result)
 print("output:", output)

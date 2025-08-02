@@ -5,11 +5,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-void mha_batch_prefill(
-    at::Tensor &output,
-    at::Tensor &softmax_lse,
-    at::Tensor &p,
-    at::Tensor &rng_state,
+std::vector<at::Tensor> mha_batch_prefill(
     at::Tensor &q,                  // [total_q, hq, d]
     const at::Tensor &k,            // [total_k, hk, d]
     const at::Tensor &v,            // [total_k, hk, d]

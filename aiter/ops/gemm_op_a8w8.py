@@ -119,7 +119,6 @@ op_name = "aiter::get_CKGEMM_config_"
 schema_str = torch.library.infer_schema(get_CKGEMM_config_, mutates_args=())
 torch.library.define(op_name, schema_str, lib=aiter_lib)
 torch.library.impl(op_name, "cuda", get_CKGEMM_config_, lib=aiter_lib)
-# torch.library.impl(op_name, "CPU", get_CKGEMM_config_, lib=aiter_lib)
 torch.library.register_fake(op_name, get_CKGEMM_config_fake, lib=aiter_lib)
 
 
@@ -176,10 +175,10 @@ def gemm_a8w8(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    # assert dtype in [
-    #     dtypes.bf16,
-    #     dtypes.fp16,
-    # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias, dtype, splitK)
 
 
@@ -234,10 +233,10 @@ def gemm_a8w8_CK(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    # assert dtype in [
-    #     dtypes.bf16,
-    #     dtypes.fp16,
-    # ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]

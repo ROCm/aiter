@@ -5,15 +5,9 @@
 
 namespace aiter {
 namespace torch_itfs {
-void fmha_v3_fwd(  
-                                    at::Tensor &output,
-                                    at::Tensor &softmax_lse,
-                                    at::Tensor &p,
-                                    at::Tensor &rng_state,
-                                    at::Tensor &q, // [b, sq, hq, d]
+std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]
                                     const at::Tensor &k, // [b, sk, hk, d]
                                     const at::Tensor &v, // [b, sk, hk, d_v]
-                                    // std::vector<at::Tensor> &result,
                                     float p_dropout,
                                     float softmax_scale,
                                     bool is_causal,
