@@ -76,7 +76,7 @@ std::string get_heuristic_kernel(
 }
 const float f_log2E = log2f(expf(1));
 
-void pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
+torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      torch::Tensor& K, //   [num_blocks, num_kv_heads, head_size/x, block_size, x]
                      torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
                      torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]
@@ -90,9 +90,7 @@ void pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      std::optional<int> high_precision      = 1,
                      std::string kernelName                 = "")
 {
-    out_ = torch::empty_like(Q);
-    // torch::Tensor output = out_.value_or(torch::empty_like(Q));
-
+    torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
     // int max_num_blocks = block_tables.size(1);
     int num_heads       = Q.size(1);
@@ -112,7 +110,7 @@ void pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
-    args.ptr_O      = out_->data_ptr();
+    args.ptr_O      = output.data_ptr();
     args.ptr_Q      = Q.data_ptr();
     args.ptr_K      = K.data_ptr();
     args.ptr_V      = V.data_ptr();
@@ -227,6 +225,5 @@ void pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                              1,            // bdy
                              1,            // bdz
                              stream});
-
-    // return output;
+    return output;
 }

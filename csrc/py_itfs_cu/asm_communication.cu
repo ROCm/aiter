@@ -10,9 +10,9 @@
 #include "aiter_hip_common.h"
 #include "custom_all_reduce.cuh"
 
-void all_reduce_asm(torch::Tensor &input,
+torch::Tensor all_reduce_asm(torch::Tensor &input,
                              int64_t _ca,
-                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph, torch::Tensor &output)
+                             torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = c10::cuda::getCurrentCUDAStream().stream();
@@ -105,21 +105,17 @@ void all_reduce_asm(torch::Tensor &input,
     auto options = torch::TensorOptions()
                        .dtype(input.dtype())
                        .device(input.device());
-    output = torch::from_blob(inp_ptr, {input.sizes()}, options);
-    // return torch::from_blob(inp_ptr, {input.sizes()}, options);
+    return torch::from_blob(inp_ptr, {input.sizes()}, options);
 }
 
-void all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
+std::tuple<torch::Tensor, torch::Tensor> all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
                                                             torch::Tensor &residual_in, // [m ,n]
                                                             torch::Tensor &weight,      // [1 ,n]
                                                             torch::Tensor &bias,        // [1 ,n]
                                                             float epsilon,
                                                             // following are fused_allreduce args
                                                             int64_t _ca,
-                                                            torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph,
-                                                            at::Tensor &out_tensor,
-                                                            at::Tensor &res_tensor,
-                                                            at::Tensor &ys_tensor)
+                                                            torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -251,13 +247,11 @@ void all_reduce_rmsnorm(torch::Tensor &input,       // [m ,n]
     auto options = torch::TensorOptions()
                        .dtype(input.dtype())
                        .device(input.device());
-
-    output.append(py::cast(torch::from_blob(out_ptr, {input.sizes()}, options)));
-    output.append(py::cast(torch::from_blob(res_ptr, {input.sizes()}, options)));
-
+    return {torch::from_blob(out_ptr, {input.sizes()}, options),
+            torch::from_blob(res_ptr, {input.sizes()}, options)};
 };
 
-void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
                                                                                  torch::Tensor &residual_in, // [m ,n]
                                                                                  torch::Tensor &xscale,      // [1 ,n]
                                                                                  torch::Tensor &weight,      // [1 ,n]
@@ -265,10 +259,7 @@ void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
                                                                                  float epsilon,
                                                                                  // following are fused_allreduce args
                                                                                  int64_t _ca,
-                                                                                 torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph,
-                                                                                at::Tensor &out_tensor,
-                                                                                at::Tensor &res_tensor,
-                                                                                at::Tensor &ys_tensor)
+                                                                                 torch::Tensor &reg_sig, torch::Tensor &reg_buffer, bool isGraph)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -408,8 +399,9 @@ void all_reduce_rmsnorm_quant(torch::Tensor &input,       // [m ,n]
     auto opt_ys = torch::TensorOptions()
                       .dtype(torch::kFloat32)
                       .device(input.device());
-    out_tensor = torch::from_blob(out_ptr, {input.sizes()}, opt_out);
-    res_tensor = torch::from_blob(res_ptr, {input.sizes()}, opt_res);
-    ys_tensor = torch::from_blob(ys_ptr, {M, 1}, opt_ys);
-
+    return {
+        torch::from_blob(out_ptr, {input.sizes()}, opt_out),
+        torch::from_blob(res_ptr, {input.sizes()}, opt_res),
+        torch::from_blob(ys_ptr, {M, 1}, opt_ys),
+    };
 };

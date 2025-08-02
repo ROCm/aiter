@@ -155,12 +155,8 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
     return args;
 }
 
-void mha_batch_prefill(
-                  at::Tensor &output,
-                  at::Tensor &softmax_lse,
-                  at::Tensor &p,
-                  at::Tensor &rng_state,
-                  at::Tensor& q,                  // [total_q, hq, d]
+std::vector<at::Tensor>
+mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   const at::Tensor& k,            // [total_k, hk, d]
                   const at::Tensor& v,            // [total_k, hk, d]
                   const at::Tensor& cu_seqlens_q, // [b+1]
@@ -286,17 +282,18 @@ void mha_batch_prefill(
     CHECK_SHAPE(kv_indptr, batch_size + 1);
     auto opts = q.options();
 
+    at::Tensor out;
     if(out_.has_value())
     {
-        output = out_.value();
-        TORCH_CHECK(output.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
         CHECK_DEVICE(out);
-        TORCH_CHECK(output.stride(-1) == 1, "Output tensor must have contiguous last dimension");
-        CHECK_SHAPE(output, total_q, num_heads, head_size_v);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
     }
     else
     {
-        output = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
+        out = torch::empty({total_q, num_heads, head_size_v}, opts.dtype(q_dtype));
     }
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -305,6 +302,7 @@ void mha_batch_prefill(
     bool has_lse     = return_softmax_lse;
     bool has_dropout = p_dropout > 0.0f;
 
+    at::Tensor softmax_lse;
     if(return_softmax_lse)
     {
         softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
@@ -314,6 +312,7 @@ void mha_batch_prefill(
         softmax_lse = torch::empty({0}, opts.dtype(torch::kFloat32));
     }
 
+    at::Tensor p;
     if(return_dropout_randval)
     {
         TORCH_CHECK(has_dropout, "return_dropout_randval require p_dropout > 0");
@@ -335,7 +334,7 @@ void mha_batch_prefill(
     }
 
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
-    rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    auto rng_state         = torch::empty({2}, opts.dtype(torch::kInt64));
     auto rng_state_ptr     = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if(p_dropout > 0.0)
@@ -373,7 +372,7 @@ void mha_batch_prefill(
                                                    kv_page_indices,
                                                    bias_,
                                                    alibi_slopes_,
-                                                   output,
+                                                   out,
                                                    softmax_lse,
                                                    p,
                                                    softmax_scale,
@@ -394,10 +393,11 @@ void mha_batch_prefill(
     else
     {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
-        output.zero_();
+        out.zero_();
         softmax_lse.fill_(std::numeric_limits<float>::infinity());
     }
 
+    return {out, softmax_lse, p, rng_state};
 }
 
 } // namespace torch_itfs

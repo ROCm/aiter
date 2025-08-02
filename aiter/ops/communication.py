@@ -54,10 +54,9 @@ def all_reduce_asm(inp: torch.Tensor):
     output = torch.empty_like(inp)
     if ca._IS_CAPTURING:
         if torch.cuda.is_current_stream_capturing():
-            aiter.all_reduce_asm_(
-                inp, ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING, output
+            return aiter.all_reduce_asm_(
+                inp, ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING
             )
-            return output
         else:
             # if warm up, mimic the allocation pattern
             # since custom allreduce is out-of-place
@@ -67,10 +66,9 @@ def all_reduce_asm(inp: torch.Tensor):
         # custom allreduce incurs a cost of cudaMemcpy, which should
         # be small(<=1% of overall latency) compared to the performance
         # gains of using custom kernels
-        aiter.all_reduce_asm_(
-            inp, ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING, output
+        return aiter.all_reduce_asm_(
+            inp, ca._ptr, ca.signal, ca.buffer, ca._IS_CAPTURING
         )
-        return output
 
 
 def all_reduce_rmsnorm(
@@ -78,12 +76,8 @@ def all_reduce_rmsnorm(
 ):
     tp_grp = get_tp_group()
     ca = tp_grp.ca_comm
-    out_tensor, res_tensor, ys_tensor = (
-        torch.empty_like(input),
-        torch.empty_like(input),
-        torch.empty_like(input),
-    )
-    aiter.all_reduce_rmsnorm_(
+
+    return aiter.all_reduce_rmsnorm_(
         input,
         residual_in,
         weight,
@@ -93,12 +87,7 @@ def all_reduce_rmsnorm(
         ca.signal,
         ca.buffer,
         ca._IS_CAPTURING,
-        out_tensor,
-        res_tensor,
-        ys_tensor,
     )
-
-    return out_tensor, res_tensor, ys_tensor
 
 
 def all_reduce_rmsnorm_quant(
@@ -111,12 +100,8 @@ def all_reduce_rmsnorm_quant(
 ):
     tp_grp = get_tp_group()
     ca = tp_grp.ca_comm
-    out_tensor, res_tensor, ys_tensor = (
-        torch.empty_like(input),
-        torch.empty_like(input),
-        torch.empty_like(input),
-    )
-    aiter.all_reduce_rmsnorm_quant_(
+
+    return aiter.all_reduce_rmsnorm_quant_(
         input,
         residual_in,
         xscale,
@@ -127,9 +112,5 @@ def all_reduce_rmsnorm_quant(
         ca.signal,
         ca.buffer,
         ca._IS_CAPTURING,
-        out_tensor,
-        res_tensor,
-        ys_tensor,
     )
 
-    return out_tensor, res_tensor, ys_tensor

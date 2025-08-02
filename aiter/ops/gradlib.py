@@ -53,9 +53,8 @@ def rocb_destroy_extension() -> None: ...
 
 
 @compile_ops("module_rocsolgemm")
-def rocb_mm(
-    arg0: torch.Tensor, arg1: torch.Tensor, arg2: int, out: torch.Tensor
-) -> None: ...
+def rocb_mm(arg0: torch.Tensor, arg1: torch.Tensor, arg2: int) -> torch.Tensor: ...
+
 
 
 @compile_ops("module_rocsolgemm")

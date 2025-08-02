@@ -5,13 +5,8 @@
 
 namespace aiter {
 namespace torch_itfs {
-void
-mha_varlen_bwd(
-               at::Tensor &dq,
-               at::Tensor &dk,
-               at::Tensor &dv,
-               at::Tensor &softmax_d,
-               const at::Tensor& dout,         // [total_q, hq, d]
+std::vector<at::Tensor>
+mha_varlen_bwd(const at::Tensor& dout,         // [total_q, hq, d]
                const at::Tensor& q,            // [total_q, hq, d]
                const at::Tensor& k,            // [total_k, hk, d]
                const at::Tensor& v,            // [total_k, hk, d]
@@ -28,9 +23,9 @@ mha_varlen_bwd(
                int window_size_left,
                int window_size_right,
                const bool deterministic,
-               std::optional<at::Tensor> dq_,                 // [total_q, hq, d]
-               std::optional<at::Tensor> dk_,                 // [total_k, hk, d]
-               std::optional<at::Tensor> dv_,                 // [total_k, hk, d]
+               std::optional<at::Tensor> dq,                 // [total_q, hq, d]
+               std::optional<at::Tensor> dk,                 // [total_k, hk, d]
+               std::optional<at::Tensor> dv,                 // [total_k, hk, d]
                std::optional<const at::Tensor> alibi_slopes, // [hq] or [b, hq]
                std::optional<const at::Tensor> rng_state,
                std::optional<at::Generator> gen);

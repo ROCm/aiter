@@ -165,8 +165,8 @@ void register_buffer(fptr_t _fa, torch::Tensor &t,
   fa->register_buffer(handles, offsets, t.data_ptr());
 }
 
-void get_graph_buffer_ipc_meta(
-    fptr_t _fa, torch::Tensor &handle, torch::Tensor &offset_tensor)
+std::vector<at::Tensor> get_graph_buffer_ipc_meta(
+    fptr_t _fa)
 {
   auto fa = reinterpret_cast<aiter::CustomAllreduce *>(_fa);
   auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
@@ -177,6 +177,7 @@ void get_graph_buffer_ipc_meta(
   std::memcpy(handles.data_ptr(), handle_bytes.data(), handle_bytes.size());
 
   offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
+  return {handles, offset_tensor};
 }
 
 void register_graph_buffers(fptr_t _fa, const std::vector<torch::Tensor> &handles,
@@ -190,15 +191,15 @@ void register_graph_buffers(fptr_t _fa, const std::vector<torch::Tensor> &handle
 
 void free_meta_buffer(void *buffer) { CUDACHECK(cudaFree(buffer)); }
 
-void get_meta_buffer_ipc_handle(torch::Tensor &inp, torch::Tensor &out)
+torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp)
 {
   auto options =
       torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-  // auto data_handle =
-  out = torch::empty({static_cast<int64_t>(sizeof(cudaIpcMemHandle_t))}, options);
-  CUDACHECK(cudaIpcGetMemHandle((cudaIpcMemHandle_t *)out.data_ptr(),
+  auto data_handle =
+      torch::empty({static_cast<int64_t>(sizeof(cudaIpcMemHandle_t))}, options);
+  CUDACHECK(cudaIpcGetMemHandle((cudaIpcMemHandle_t *)data_handle.data_ptr(),
                                 inp.data_ptr()));
-  // return data_handle;
+  return data_handle;
 }
 
 torch::Tensor allocate_meta_buffer(int64_t size)

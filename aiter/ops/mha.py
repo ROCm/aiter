@@ -2,17 +2,14 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, Generator
-from typing import Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
 from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..utility import dtypes
 import torch
 
+
 def cmdGenFunc_mha_fwd(
-    output: Tensor,
-    softmax_lse: Tensor,
-    S_dmask: Tensor,
-    rng_state: Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -80,14 +77,80 @@ def cmdGenFunc_mha_fwd(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
+def gen_mha_fwd_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+    
+    if out is not None:
+        assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
+        assert out.device == q.device, "Output must be on the same device as inputs"
+        assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
+        assert out.shape == (batch_size, seqlen_q, num_heads, head_size_v), "Output tensor has incorrect shape"
+    else:
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_size_v),
+            dtype=q.dtype,
+            device=q.device,
+            requires_grad=q.requires_grad
+        )
+    
+    if return_softmax_lse:
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device
+        )
+    else:
+        softmax_lse = torch.empty(
+            (0,),
+            dtype=torch.float32,
+            device=q.device
+        )
+    
+    if return_dropout_randval:
+        assert dropout_p > 0, "return_dropout_randval requires p_dropout > 0"
+        p = torch.empty(
+            (batch_size, num_heads, seqlen_q, seqlen_k),
+            dtype=torch.uint8,
+            device=q.device
+        )
+    else:
+        p = torch.empty(
+            (0,),
+            device=q.device
+        )
+    
+    rng_state = torch.empty(
+        (2,),
+        dtype=torch.int64,
+        device=q.device
+    )
+    
+    return out, softmax_lse, p, rng_state
 
 
-@compile_ops("module_mha_fwd", fc_name="mha_fwd")
+@compile_ops("module_mha_fwd", fc_name="mha_fwd", gen_fake=gen_mha_fwd_fake_tensors)
 def mha_fwd(
-    output: Tensor,
-    softmax_lse: Tensor,
-    S_dmask: Tensor,
-    rng_state: Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -102,15 +165,84 @@ def mha_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+) -> List[Tensor]: ...
 
 
-@compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd")
+
+def gen_fmha_v3_fwd_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+    
+    if out is not None:
+        assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
+        assert out.device == q.device, "Output must be on the same device as inputs"
+        assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
+        assert out.shape == (batch_size, seqlen_q, num_heads, head_size_v), "Output tensor has incorrect shape"
+    else:
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_size_v),
+            dtype=q.dtype,
+            device=q.device,
+            requires_grad=q.requires_grad
+        )
+    
+    if return_softmax_lse:
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device
+        )
+    else:
+        softmax_lse = torch.empty(
+            (0,),
+            dtype=torch.float32,
+            device=q.device
+        )
+    
+    if return_dropout_randval:
+        assert dropout_p > 0, "return_dropout_randval requires p_dropout > 0"
+        p = torch.empty(
+            (batch_size, num_heads, seqlen_q, seqlen_k),
+            dtype=torch.uint8,
+            device=q.device
+        )
+    else:
+        p = torch.empty(
+            (0,),
+            device=q.device
+        )
+    
+    rng_state = torch.empty(
+        (2,),
+        dtype=torch.int64,
+        device=q.device
+    )
+    
+    return out, softmax_lse, p, rng_state
+
+
+@compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd", gen_fake=gen_fmha_v3_fwd_fake_tensors)
 def fmha_v3_fwd(
-    output: Tensor,
-    softmax_lse: Tensor,
-    S_dmask: Tensor,
-    rng_state: Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -125,14 +257,10 @@ def fmha_v3_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+) -> List[Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_fwd(
-    output: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    S_dmask: torch.Tensor,
-    rng_state: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -279,17 +407,7 @@ def cmdGenFunc_mha_varlen_fwd(
     }
 
 
-@compile_ops(
-    "module_mha_varlen_fwd",
-    fc_name="mha_varlen_fwd",
-    gen_func=cmdGenFunc_mha_varlen_fwd,
-)
-def mha_varlen_fwd(
-    # output: list[torch.Tensor],
-    output: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    S_dmask: torch.Tensor,
-    rng_state: torch.Tensor,
+def gen_mha_varlen_fwd_fake_tensor(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -312,14 +430,97 @@ def mha_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> None: ...
+) -> list[torch.Tensor]:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+    
+    if out is not None:
+        assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
+        assert out.device == q.device, "Output must be on the same device as inputs"
+        assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
+        assert out.shape == (batch_size, seqlen_q, num_heads, head_size_v), "Output tensor has incorrect shape"
+    else:
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_size_v),
+            dtype=q.dtype,
+            device=q.device,
+            requires_grad=q.requires_grad
+        )
+    
+    if return_softmax_lse:
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q),
+            dtype=torch.float32,
+            device=q.device
+        )
+    else:
+        softmax_lse = torch.empty(
+            (0,),
+            dtype=torch.float32,
+            device=q.device
+        )
+    
+    if return_dropout_randval:
+        assert dropout_p > 0, "return_dropout_randval requires p_dropout > 0"
+        p = torch.empty(
+            (batch_size, num_heads, seqlen_q, seqlen_k),
+            dtype=torch.uint8,
+            device=q.device
+        )
+    else:
+        p = torch.empty(
+            (0,),
+            device=q.device
+        )
+    
+    rng_state = torch.empty(
+        (2,),
+        dtype=torch.int64,
+        device=q.device
+    )
+    
+    return out, softmax_lse, p, rng_state
+
+
+
+@compile_ops(
+    "module_mha_varlen_fwd",
+    fc_name="mha_varlen_fwd",
+    gen_func=cmdGenFunc_mha_varlen_fwd,
+    gen_fake=gen_mha_fwd_fake_tensors
+)
+def mha_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> list[torch.Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(
-    dq_: Tensor,
-    dk_: Tensor,
-    dv_: Tensor,
-    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -403,13 +604,7 @@ def cmdGenFunc_mha_bwd(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
-
-@compile_ops("module_mha_bwd", fc_name="mha_bwd", gen_func=cmdGenFunc_mha_bwd)
-def mha_bwd(
-    dq_: Tensor,
-    dk_: Tensor,
-    dv_: Tensor,
-    softmax_d: Tensor,
+def gen_mha_bwd_fake_tensors(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -430,15 +625,74 @@ def mha_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+) -> List[Tensor]:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+    
+    if dq is None:
+        dq = torch.empty_like(q)  # (batch_size, seqlen_q, num_heads, head_size_q)
+    else:
+        assert dq.dtype == q.dtype, "dq must have the same dtype as q"
+        assert dq.device == q.device, "dq must be on the same device as q"
+        assert dq.stride(-1) == 1, "dq must have contiguous last dimension"
+        assert dq.shape == (batch_size, seqlen_q, num_heads, head_size_q), "dq has incorrect shape"
+    
+    if dk is None:
+        dk = torch.empty_like(k)  # (batch_size, seqlen_k, num_heads_k, head_size_q)
+    else:
+        assert dk.dtype == q.dtype, "dk must have the same dtype as q"
+        assert dk.device == q.device, "dk must be on the same device as q"
+        assert dk.stride(-1) == 1, "dk must have contiguous last dimension"
+        assert dk.shape == (batch_size, seqlen_k, num_heads_k, head_size_q), "dk has incorrect shape"
+    
+    if dv is None:
+        dv = torch.empty_like(v)  # (batch_size, seqlen_k, num_heads_k, head_size_v)
+    else:
+        assert dv.dtype == q.dtype, "dv must have the same dtype as q"
+        assert dv.device == q.device, "dv must be on the same device as q"
+        assert dv.stride(-1) == 1, "dv must have contiguous last dimension"
+        assert dv.shape == (batch_size, seqlen_k, num_heads_k, head_size_v), "dv has incorrect shape"
+    
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device
+    )
+    
+    return [dq, dk, dv, softmax_d]
 
 
-@compile_ops("module_fmha_v3_bwd", fc_name="fmha_v3_bwd")
-def fmha_v3_bwd(
-    dq_: Tensor,
-    dk_: Tensor,
-    dv_: Tensor,
-    softmax_d: Tensor,
+@compile_ops("module_mha_bwd", fc_name="mha_bwd", gen_func=cmdGenFunc_mha_bwd, gen_fake=gen_mha_bwd_fake_tensors)
+def mha_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    dbias: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
+
+
+def gen_fmha_v3_bwd_fake_tensors(
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -459,14 +713,74 @@ def fmha_v3_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+) -> List[Tensor]:
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+    
+    if dq is None:
+        dq = torch.empty_like(q)  # (batch_size, seqlen_q, num_heads, head_size_q)
+    else:
+        assert dq.dtype == q.dtype, "dq must have the same dtype as q"
+        assert dq.device == q.device, "dq must be on the same device as q"
+        assert dq.stride(-1) == 1, "dq must have contiguous last dimension"
+        assert dq.shape == (batch_size, seqlen_q, num_heads, head_size_q), "dq has incorrect shape"
+    
+    if dk is None:
+        dk = torch.empty_like(k)  # (batch_size, seqlen_k, num_heads_k, head_size_q)
+    else:
+        assert dk.dtype == q.dtype, "dk must have the same dtype as q"
+        assert dk.device == q.device, "dk must be on the same device as q"
+        assert dk.stride(-1) == 1, "dk must have contiguous last dimension"
+        assert dk.shape == (batch_size, seqlen_k, num_heads_k, head_size_q), "dk has incorrect shape"
+    
+    if dv is None:
+        dv = torch.empty_like(v)  # (batch_size, seqlen_k, num_heads_k, head_size_v)
+    else:
+        assert dv.dtype == q.dtype, "dv must have the same dtype as q"
+        assert dv.device == q.device, "dv must be on the same device as q"
+        assert dv.stride(-1) == 1, "dv must have contiguous last dimension"
+        assert dv.shape == (batch_size, seqlen_k, num_heads_k, head_size_v), "dv has incorrect shape"
+    
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device
+    )
+    
+    return [dq, dk, dv, softmax_d]    
+
+
+@compile_ops("module_fmha_v3_bwd", fc_name="fmha_v3_bwd", gen_fake=gen_fmha_v3_bwd_fake_tensors)
+def fmha_v3_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_bwd(
-    dq_: Tensor,
-    dk_: Tensor,
-    dv_: Tensor,
-    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -545,10 +859,6 @@ def cmdGenFunc_mha_varlen_bwd(
 
 
 def cmdGenFunc_mha_batch_prefill(
-    out_: Tensor,
-    softmax_lse: Tensor,
-    p: Tensor,
-    rng_state: Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -625,12 +935,13 @@ def cmdGenFunc_mha_batch_prefill(
     }
 
 
-@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd", gen_func=cmdGenFunc_mha_varlen_bwd)
+@compile_ops(
+    "module_mha_varlen_bwd",
+    fc_name="mha_varlen_bwd",
+    gen_func=cmdGenFunc_mha_varlen_bwd,
+    gen_fake=gen_mha_bwd_fake_tensors
+)
 def mha_varlen_bwd(
-    dq_: Tensor,
-    dk_: Tensor,
-    dv_: Tensor,
-    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -654,13 +965,11 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+    custom_build_args: Optional[dict] = None,
+) -> List[Tensor]: ...
 
 
-@compile_ops(
-    "module_fmha_v3_varlen_bwd",
-    fc_name="fmha_v3_varlen_bwd"
-)
+@compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
 def fmha_v3_varlen_bwd(
     dq_: Tensor,
     dk_: Tensor,
@@ -741,17 +1050,7 @@ def _flash_attn_forward(
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     if can_impl_fmha_v3_fwd():
-        output, softmax_lse, S_dmask, rng_state = (
-            torch.empty_like(q),
-            torch.empty_like(q),
-            torch.empty_like(q),
-            torch.empty_like(q),
-        )
-        fmha_v3_fwd(
-            output,
-            softmax_lse,
-            S_dmask,
-            rng_state,
+        out, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
             v,
@@ -768,17 +1067,7 @@ def _flash_attn_forward(
             None,
         )
     else:
-        output, softmax_lse, S_dmask, rng_state = (
-            torch.empty_like(q),
-            torch.empty_like(q),
-            torch.empty_like(q),
-            torch.empty_like(q),
-        )
-        mha_fwd(
-            output,
-            softmax_lse,
-            S_dmask,
-            rng_state,
+        out, softmax_lse, S_dmask, rng_state = mha_fwd(
             q,
             k,
             v,
@@ -795,7 +1084,7 @@ def _flash_attn_forward(
             None,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
-    return output, softmax_lse, S_dmask, rng_state
+    return out, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_backward(
@@ -997,18 +1286,13 @@ def _flash_attn_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d = (
-        torch.empty_like(dout),
-        torch.empty_like(dout),
-        torch.empty_like(dout),
-        torch.empty_like(dout),
-    )
     if can_impl_fmha_v3_bwd():
-        fmha_v3_bwd(
+        (
             dq,
             dk,
             dv,
             softmax_d,
+        ) = fmha_v3_bwd(
             dout,
             q,
             k,
@@ -1031,11 +1315,12 @@ def _flash_attn_backward(
             None,
         )
     else:
-        mha_bwd(
+        (
             dq,
             dk,
             dv,
             softmax_d,
+        ) = mha_bwd(
             dout,
             q,
             k,
@@ -1272,17 +1557,7 @@ def _flash_attn_varlen_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    output, softmax_lse, S_dmask, rng_state = (
-        torch.empty_like(q),
-        torch.empty_like(q),
-        torch.empty_like(q),
-        torch.empty_like(q),
-    )
-    mha_varlen_fwd(
-        output,
-        softmax_lse,
-        S_dmask,
-        rng_state,
+    out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
         q,
         k,
         v,
@@ -1305,8 +1580,9 @@ def _flash_attn_varlen_forward(
         bias,
         alibi_slopes,
         None,
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
-    return output, softmax_lse, S_dmask, rng_state
+    return out, softmax_lse, S_dmask, rng_state
 
 
 def _flash_attn_varlen_backward(
@@ -1747,16 +2023,83 @@ def flash_attn_varlen_func(
     )
 
 
+def mha_batch_prefill_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]:
+# ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_heads = q.size(1)                 # num_heads = q.sizes()[1]
+    head_size_v = v.size(2)               # head_size_v = v.size(2)
+    total_q = q.size(0)                   # total_q = q.size(0)
+
+    if out is None:
+        out = torch.empty(
+            (total_q, num_heads, head_size_v),  # {total_q, num_heads, head_size_v}
+            dtype=q.dtype,
+            device=q.device,
+            requires_grad=q.requires_grad
+        )
+    
+    if return_softmax_lse:
+        softmax_lse = torch.empty(
+            (num_heads, total_q),  # {num_heads, total_q}
+            dtype=torch.float32,
+            device=q.device
+        )
+    else:
+        softmax_lse = torch.empty(
+            (0,),
+            dtype=torch.float32,
+            device=q.device
+        )
+    
+    if return_dropout_randval:
+        assert dropout_p > 0, "return_dropout_randval requires p_dropout > 0"
+        p = torch.empty(
+            (num_heads, total_q, max_seqlen_k),  # {num_heads, total_q, max_seqlen_k}
+            dtype=torch.uint8,
+            device=q.device
+        )
+    else:
+        p = torch.empty(
+            (0,),
+            device=q.device
+        )
+    
+    rng_state = torch.empty(
+        (2,),
+        dtype=torch.int64,
+        device=q.device
+    )
+    
+    return (out, softmax_lse, p, rng_state)
+
+
 @compile_ops(
     "module_mha_batch_prefill",
     fc_name="mha_batch_prefill",
     gen_func=cmdGenFunc_mha_batch_prefill,
+    gen_fake=mha_batch_prefill_fake_tensors
 )
 def mha_batch_prefill(
-    output: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    S_dmask: torch.Tensor,
-    rng_state: torch.Tensor,
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -1777,7 +2120,7 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+) -> List[Tensor]: ...
 
 
 def _mha_batch_prefill(
@@ -1803,17 +2146,7 @@ def _mha_batch_prefill(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    output, softmax_lse, S_dmask, rng_state = (
-        torch.empty_like(q),
-        torch.empty_like(q),
-        torch.empty_like(q),
-        torch.empty_like(q),
-    )
-    mha_batch_prefill(
-        output,
-        softmax_lse,
-        S_dmask,
-        rng_state,
+    out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
         q,
         k,
         v,
@@ -1834,8 +2167,9 @@ def _mha_batch_prefill(
         out,
         alibi_slopes,
         None,
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
-    return output, softmax_lse, S_dmask, rng_state
+    return out, softmax_lse, S_dmask, rng_state
 
 
 def mha_batch_prefill_func(

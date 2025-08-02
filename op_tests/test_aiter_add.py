@@ -4,6 +4,7 @@
 import torch
 import aiter
 from torch.profiler import profile, ProfilerActivity
+from aiter.test_common import checkAllclose
 from aiter import dtypes
 
 input_shapes = [
@@ -157,12 +158,12 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
         record_shapes=True,
     ) as prof:
         for j in range(100):
-            output = torch.empty_like(tensor0)
             # cache_flush1 = torch.randn(10000, 10000, requires_grad=True, device="cuda", dtype=dtypes.fp32).to(dtypes.i32)
             # output = torch.empty_like(tensor1)
-            aiter.add(tensor0, tensor1, output)
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            output = aiter.add(tensor0, tensor1)
 
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+    checkAllclose(result, output, msg="add")
     print(torch.equal(result, output))
 # print("result:", result)
 # print("output:", output)

@@ -36,10 +36,9 @@ void rocb_create_extension();
 
 void rocb_destroy_extension();
 
-void RocSolIdxBlas(
+torch::Tensor RocSolIdxBlas(
     const torch::Tensor &mat1,
     const torch::Tensor &mat2,
-    torch::Tensor &result,
     const int32_t solution_index = 0);
 
 std::vector<rocblas_int> RocFindAllSolIdxBlas(

@@ -573,21 +573,8 @@ def generate_schema(func) -> str:
         return_type = "float"
     elif return_annotation is bool:
         return_type = "bool"
-    elif get_origin(return_annotation) is tuple:
-        return_type = (
-            "("
-            + ", ".join(
-                [
-                    (
-                        "Tensor"
-                        if t is torch.Tensor
-                        else "int" if t is int else str(t.__name__)
-                    )
-                    for t in get_args(return_annotation)
-                ]
-            )
-            + ")"
-        )
+    elif get_origin(return_annotation) is list and get_args(return_annotation)[0] is torch.Tensor:
+        return_type = "Tensor[]"
 
     schema = f"({', '.join(parameters)}) -> {return_type}"
 
@@ -600,6 +587,7 @@ def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
+    gen_fake: Optional[Callable[..., Any]] = None
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import aiter_lib
@@ -618,9 +606,10 @@ def compile_ops(
             for name, param in sig.parameters.items():
                 if param.annotation is torch.Tensor:
                     mutates_args.append(name)
-            sig = torch.library.infer_schema(func, mutates_args=mutates_args)
+            sig = torch.library.infer_schema(func, mutates_args="unknown")
             schema = f"{sig}"
         loadName = func.__name__
+        print('op name:', loadName)
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -728,8 +717,6 @@ def compile_ops(
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
                     callargs = inspect.getcallargs(func, *args, **kwargs)
-                    # if func.__name__ == "mha_varlen_fwd":
-                    #     return True
 
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -805,13 +792,13 @@ def compile_ops(
             return op(*args, **kwargs)
 
         def abstract_impl(*args, custom_build_args={}, **kwargs):
+            if gen_fake is not None:
+                return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
-
 
         if loadName in NONE_WRAPPED_OP:
             return wrapper
-        # if _md_name == "module_aiter_operator":
-        #     return wrapper
+
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             op_schema = f"aiter::wrapper_{loadName}" + schema
             aiter_lib.define(op_schema)

@@ -236,8 +236,7 @@ def run_aiter_asm(
     v_scale=None,
     qo_indptr=None,
 ):
-    out = torch.empty_like(query)
-    aiter.pa_fwd_asm(
+    return aiter.pa_fwd_asm(
         query,
         k_cache,
         v_cache,
@@ -247,10 +246,9 @@ def run_aiter_asm(
         max_qlen,
         k_scale,
         v_scale,
-        out,
+        None,
         qo_indptr,
     )
-    return out
 
 
 def asm_V_shuffle(VC):

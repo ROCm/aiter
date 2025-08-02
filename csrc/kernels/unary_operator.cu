@@ -174,14 +174,12 @@ torch::Tensor unary_operation(torch::Tensor &input)
     }
 }
 
-void aiter_sigmoid(torch::Tensor &input, torch::Tensor &output)
+torch::Tensor aiter_sigmoid(torch::Tensor &input)
 {
-    output = unary_operation<aiter::SigmoidOp>(input);
-    // return output;
+    return unary_operation<aiter::SigmoidOp>(input);
 }
 
-void aiter_tanh(torch::Tensor &input, torch::Tensor &output)
+torch::Tensor aiter_tanh(torch::Tensor &input)
 {
-    output = unary_operation<aiter::TanhOp>(input);
-    // return output;
+    return unary_operation<aiter::TanhOp>(input);
 }
