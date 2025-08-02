@@ -9,6 +9,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -59,7 +60,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("GEMM A8W8 Blockscale Benchmark", args)
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(
@@ -95,7 +96,7 @@ def run_model_benchmark(args):
 
 
 def run_shape_benchmark(args):
-    benchmark = get_shape_benchmark_object("GEMM A8W8 Blockscale Benchmark", args)
+    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
@@ -143,7 +144,7 @@ def main():
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
-        print_vgpr(fun, "GEMM")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)
 

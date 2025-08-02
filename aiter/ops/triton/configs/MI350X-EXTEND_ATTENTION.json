@@ -5,6 +5,6 @@
       "waves_per_eu": 1,
       "num_warps": 4,
       "matrix_instr_nonkdim": 16,
-      "kpack": 2
+      "kpack": 1
   }
 }
