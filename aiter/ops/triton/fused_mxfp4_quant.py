@@ -3,6 +3,9 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -135,7 +138,7 @@ def fused_rms_mxfp4_quant(
         if res1 provided, return (out1_fp4, out1_bs), out_res1
         if both inp2 and res1 not provided, return (out1_fp4, out1_bs)
     """
-
+    _LOGGER.info(f"FUSED_RMS_MXFP4_QUANT: inp1={tuple(inp1.shape)}")
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = inp1.shape
     BLOCK_SIZE = max(triton.next_power_of_2(N1), MXFP4_QUANT_BLOCK_SIZE)
@@ -269,6 +272,7 @@ def fused_flatten_mxfp4_quant(
     - out: The output matrix with shape (M, (N1 * N2) // 2).
     - out_block_scales: The output matrix with shape (M, cdiv(N1 * N2, MXFP4_QUANT_BLOCK_SIZE)).
     """
+    _LOGGER.info(f"FUSED_FLATTEN_MXFP4_QUANT: x={tuple(x.shape)}")
     M, N1, N2 = x.shape
 
     MXFP4_QUANT_BLOCK_SIZE = 32

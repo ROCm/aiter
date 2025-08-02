@@ -7,6 +7,9 @@ from typing import Optional
 import triton
 import triton.language as tl
 import torch
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 # This code is derived from sglang and FLASHNN projects
 # https://github.com/AlibabaPAI/FLASHNN/blob/main/flashnn/triton_kernels/paged_attn.py
@@ -33,6 +36,9 @@ def paged_attention_decode(
     #TODO: Add Doc
     """
 
+    _LOGGER.info(
+        f"PA_DECODE: q={tuple(query.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)}"
+    )
     # get num_seqs, num_kv_heads, kv_blk_sz, head_sz and query_grp_sz
     num_seqs = query.shape[0]
     num_q_heads = query.shape[1]

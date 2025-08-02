@@ -10,6 +10,9 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 BASE_BLOCK = 64
 NUM_WARPS = 4
@@ -602,6 +605,9 @@ if triton.__version__ >= "2.1.0":
         #TODO: Add Doc
         """
 
+        _LOGGER.info(
+            f"PA_PREFILL: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
         q_dtype_is_f32 = q.dtype is torch.float32
         # need to reduce num. blocks when using fp32
         # due to increased use of GPU shared memory

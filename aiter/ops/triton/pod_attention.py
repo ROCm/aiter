@@ -4,6 +4,9 @@ import triton.language as tl
 
 import importlib.util
 from pathlib import Path
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 file_path = Path("./aiter/ops/triton/lean_atten.py").resolve()
 module_name = "la_persistent"
@@ -47,6 +50,9 @@ def pod_attention(
     prefill_ratio: int,
     decode_ratio: int,
 ):
+    _LOGGER.info(
+        f"POD_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+    )
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
     assert (

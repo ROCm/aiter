@@ -7,6 +7,9 @@ import triton.language as tl
 from typing import Optional
 from aiter.ops.triton.utils.types import get_dtype_max
 from aiter.ops.triton.utils.arch_info import get_num_sms
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 def num_programs(x):
@@ -1145,6 +1148,7 @@ def rms_norm(input: torch.Tensor, weight: torch.Tensor, epsilon: float):
     Returns:
     - Output: The output tensor with shape (M, N).
     """
+    _LOGGER.info(f"RMSNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
     return _RMSNorm.apply(input, weight, epsilon, torch.is_grad_enabled())
 
 
@@ -1171,6 +1175,9 @@ def rmsnorm2d_fwd_with_add(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+    )
     return _RMSNorm2dFwdWithAdd.apply(
         out, input, residual_in, residual_out, weight, epsilon, torch.is_grad_enabled()
     )
@@ -1195,6 +1202,10 @@ def rmsnorm2d_fwd_with_smoothquant(
     - Weight: The learnable weights tensor with shape (N, ).
     - Epsilon: A value added to the denominator for numerical stability.
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
+        + f"xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+    )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
@@ -1262,6 +1273,9 @@ def rmsnorm2d_fwd_with_dynamicquant(
     - Weight: The learnable weights tensor with shape (N, ).
     - Epsilon: A value added to the denominator for numerical stability.
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+    )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
@@ -1335,6 +1349,10 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     - Weight: The learnable weights tensor with shape (N, ).
     - Epsilon: A value added to the denominator for numerical stability.
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
+        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+    )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)
@@ -1395,6 +1413,9 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     - Weight: The learnable weights tensor with shape (N, ).
     - Epsilon: A value added to the denominator for numerical stability.
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+    )
     n_rows, n_cols = input.shape
 
     blk_size = block_size(input)

@@ -48,6 +48,9 @@ except ImportError:
             fast_dividef,
             fast_expf,
         )  # @manual=//triton:triton
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -966,6 +969,9 @@ def triton_hstu_attention_fwd(
     Returns:
     - Y: output with the shape (L, H, D).
     """
+    _LOGGER.info(
+        f"HSTU_ATTENTION_FWD: N={N} alpha={alpha} q={tuple(q.shape)} k={tuple(k.shape)}  v={tuple(v.shape)} seq_offsets={tuple(seq_offsets.shape)}"
+    )
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
     L, H, DimQ = q.shape
@@ -1099,6 +1105,9 @@ def triton_hstu_attention_bwd(
     Returns:
     - dq, dk, dv: gradients of q, k, and v
     """
+    _LOGGER.info(
+        f"HSTU_ATTENTION_BKWD: dout={dout.shape}  q={tuple(q.shape)} k={tuple(k.shape)}  v={tuple(v.shape)} dq={tuple(dq.shape)} dk={tuple(dk.shape)}  dv={tuple(dv.shape)}"
+    )
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)

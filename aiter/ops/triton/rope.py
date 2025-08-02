@@ -7,6 +7,9 @@ import triton.language as tl
 from torch import autograd
 from enum import IntEnum
 from typing import Tuple, Union
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 class RotateStyle(IntEnum):

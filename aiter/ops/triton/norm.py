@@ -6,6 +6,9 @@ import triton
 import triton.language as tl
 from typing import Optional
 from aiter.ops.triton.utils.types import get_dtype_max
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -1066,6 +1069,7 @@ def layer_norm(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
+    _LOGGER.info(f"LAYERNORM: input={tuple(input.shape)} weight={tuple(weight.shape)} ")
     return _LayerNorm.apply(input, weight, bias, eps, torch.is_grad_enabled())
 
 
@@ -1095,6 +1099,9 @@ def layernorm2d_fwd_with_add(
     - out: The output tensor with shape (M, N).
     - residual_out: Output tensor that is input + residual_in with shape (M, N).
     """
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_ADD: input={tuple(input.shape)} weight={tuple(weight.shape)} residual_in={tuple(residual_in.shape)}  "
+    )
     return _Layernorm2dFwdWithAdd.apply(
         out,
         input,
@@ -1131,6 +1138,9 @@ def layernorm2d_fwd_with_dynamicquant(
     - out: The output tensor with shape (M, N).
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_DYNAMICQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} yscale={tuple(yscale.shape)}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -1190,6 +1200,9 @@ def layernorm2d_fwd_with_smoothquant(
     Returns:
     - Output: The output tensor with shape (M, N).
     """
+    _LOGGER.info(
+        f"RMSNORM_2D_FWD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -1252,6 +1265,9 @@ def layernorm2d_fwd_with_add_dynamicquant(
     - out: The output tensor with shape (M, N).
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_ADD_DYNAMICQUANT: input={input.shape} weight={weight.shape} residual_in={residual_in.shape} yscale={yscale.shape}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel
@@ -1319,6 +1335,10 @@ def layernorm2d_fwd_with_add_smoothquant(
     - yscale: Output scale tensor with shape (M,). Allocated by the caller
     """
 
+    _LOGGER.info(
+        f"LAYERNORM_2D_FWD_ADD_SMOOTHQUANT: input={tuple(input.shape)} weight={tuple(weight.shape)} "
+        + f"residual_in={tuple(residual_in.shape)} xscale={tuple(xscale.shape)} yscale={tuple(yscale.shape)}  "
+    )
     M, N = input.shape
 
     # Less than 64KB per feature: enqueue fused kernel

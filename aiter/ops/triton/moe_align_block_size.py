@@ -4,6 +4,9 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 def ceil_div(a, b):
@@ -100,6 +103,10 @@ def moe_align_block_size_triton(
     expert_ids: torch.Tensor,
     num_tokens_post_pad: torch.Tensor,
 ) -> None:
+    _LOGGER.info(
+        f"MOE_ALIGN_BLOCK_SIZE_TRITON:  topk_ids={tuple(topk_ids.shape)} num_experts={num_experts}  sorted_token_ids={tuple(sorted_token_ids.shape)} "
+        + "block_size={block_size} expert_ids={tuple(expert_ids.shape)} num_tokens_post_pad={tuple(num_tokens_post_pad.shape)}"
+    )
     numel = topk_ids.numel()
     grid = (num_experts,)
     tokens_cnts = torch.zeros(
