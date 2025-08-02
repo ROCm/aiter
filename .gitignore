@@ -49,3 +49,6 @@ __pycache__
 debug
 aiter_logs
 *.log
+.analysis
+.rocprofv3
+scripts
