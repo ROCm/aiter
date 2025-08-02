@@ -128,6 +128,9 @@ def generate_gemm_a8w8_inputs(
     ],
 )
 def test_gemm(in_dtype, out_dtype, m, n, k, output):
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype[out_dtype]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(

@@ -118,6 +118,7 @@ def generate_gemm_a8w8_per_token_scale_inputs(
     ],
 )
 def test_gemm(dtype, M, N, K, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
