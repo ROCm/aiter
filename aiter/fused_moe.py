@@ -473,24 +473,19 @@ def get_2stage_cfgs(
         ksplit = cfg["ksplit"]
         kernelName1 = cfg["kernelName1"]
         kernelName2 = cfg["kernelName2"]
-        run_1stage = cfg["run_1stage"]
+        run_1stage = cfg.get("run_1stage", False)
 
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'} {'default' if cfg is None else tag} for {keys} "
     )
 
-    if (
-        "ck" in kernelName1
-        or q_dtype_w
-        in [
-            dtypes.bf16,
-            dtypes.fp16,
-            torch.uint32,
-            torch.uint8,
-        ]
-        or (q_dtype_w == dtypes.fp8 and q_type == QuantType.per_1x128)
-    ):
+    if "ck2stages" in kernelName1 or q_dtype_w in [
+        dtypes.bf16,
+        dtypes.fp16,
+        torch.uint32,
+        torch.uint8,
+    ]:
         return MOEMetadata(
             functools.partial(
                 aiter.ck_moe_stage1_fwd,
@@ -596,6 +591,8 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
     elif hidden_states.dtype != q_dtype_a:
+        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+            quant_func = functools.partial(quant_func, transpose_scale=True)
         a1, a1_scale = quant_func(
             hidden_states,
             scale=a1_scale,
@@ -841,6 +838,7 @@ def torch_moe_stage1(
     w1_scale=None,  # [expert, inter_dim, 1]
     doweight=False,
 ):
+    quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
     B, D = hidden_states.shape
     topk = topk_weight.shape[1]
@@ -860,8 +858,8 @@ def torch_moe_stage1(
     if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
         w1 = w1 * w1_scale.view(w1_scale.shape[0], -1, 1)
         hidden_states = hidden_states * a1_scale
-    # per_128x128
-    elif quant_type == QuantType.per_128x128:
+    # per_1x128
+    elif quant_type == QuantType.per_1x128:
         w1_shape = w1.shape
         w1 = w1.view(
             w1.shape[0], w1.shape[1] // 128, 128, w1.shape[2] // 128, 128
@@ -929,6 +927,7 @@ def torch_moe_stage2(
     a2_scale=None,  # [expert]]'
     doweight=True,
 ):
+    quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     if quant_type == QuantType.per_1x32:
@@ -948,7 +947,7 @@ def torch_moe_stage2(
     if quant_type in [QuantType.per_Token, QuantType.per_Tensor]:
         hidden_states = hidden_states * a2_scale.view(a2_scale.shape[0], -1, 1)
         w2 = w2 * w2_scale.view(w2_scale.shape[0], -1, 1)
-    elif quant_type == QuantType.per_128x128:
+    elif quant_type == QuantType.per_1x128:
         a2_scale = a2_scale.view(hidden_states.shape[0], topk, -1, 1)
         a2_scale = a2_scale.repeat(1, 1, 1, 128).view(hidden_states.shape[0], topk, -1)
         hidden_states = hidden_states * a2_scale

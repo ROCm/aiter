@@ -33,7 +33,7 @@ def moe_sorting_ck(
     sorted_expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=dtypes.i32, device=device
     )
-    num_valid_ids = torch.empty((1), dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(

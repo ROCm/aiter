@@ -248,7 +248,7 @@ def get_moe_stage_module(
     Cdtype = dtype2str_dict[output_dtype]
 
     quant_type = (
-        QuantType.per_128x128 if quant_type == QuantType.per_1x128 else quant_type
+        QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
     )
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()

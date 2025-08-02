@@ -278,7 +278,7 @@ gemm2_kernels_dict = {
 bit8_list = ["F8", "I8", "f8", "i8"]
 bit16_list = ["B16", "F16", "b16", "f16"]
 bit4_list = ["I4", "i4", "FP4X2", "fp4x2"]
-QuantType_list = ["per_128x128", "per_1x32"]
+QuantType_list = ["per_1x128", "per_1x32"]
 
 
 def get_gemm1_kernels_list(
