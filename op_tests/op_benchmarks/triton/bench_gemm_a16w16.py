@@ -17,10 +17,18 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     print_vgpr,
 )
+from typing import Optional
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, atomic: bool = False, **kwargs
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    atomic: bool = False,
+    activation: Optional[str] = None,
+    **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
@@ -29,6 +37,8 @@ def bench_gemm_fn(
     )
     # flops
     flops = 2.0 * M * N * K
+    if activation is not None:
+        flops += M * N  # elementwise ops on the GEMM output
     # memory transfer
     mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
     mem_write = (M * N) * x.element_size()
@@ -36,6 +46,9 @@ def bench_gemm_fn(
 
     if atomic:
         # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
+        assert (
+            activation is None
+        ), "Atomic kernel does not currently support fused activation"
         y = y.to(torch.float32).zero_()
         ms = triton.testing.do_bench(
             lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
@@ -44,7 +57,9 @@ def bench_gemm_fn(
         )
     else:
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, c_dtype, y), warmup=25, rep=100  # noqa: E731
+            lambda: gemm_a16w16(x, w, c_dtype, y, activation=activation),
+            warmup=25,
+            rep=100,  # noqa: E731
         )
 
     # Return exactly one scalar depending on which metric is active
@@ -92,7 +107,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, atomic=args.atomic, activation=args.activation
+        )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -146,6 +163,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use the atomic kernel (split-k with atomic_add) instead of the standard a16w16 kernel.",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default=None,
+        help="Activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
     )
     return get_ff_args(parser)
 
