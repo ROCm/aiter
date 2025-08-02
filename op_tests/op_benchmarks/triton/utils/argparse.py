@@ -101,7 +101,7 @@ def add_argparse_ff(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="user-defined shape to benchmark. Can be 3D (M, N, K) or 4D (B, M, N, K) for batched kernels.",
     )
     parser.add_argument(
-        "--print_vgpr",
+        "-print_vgpr",
         action="store_true",
         help="Print VGPR usage for Triton kernels.",
     )

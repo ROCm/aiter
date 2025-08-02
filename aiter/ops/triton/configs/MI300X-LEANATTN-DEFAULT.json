@@ -1,0 +1,10 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 64,
+    "num_warps": 4,
+    "num_stages": 1,
+    "waves_per_eu": 2,
+    "matrix_instr_nonkdim": 16
+  }
+}

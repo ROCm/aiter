@@ -13,36 +13,107 @@ It currently supports ragged batching decode and prefill attention with causal=1
 TO be added features:
 - Add GQA support
 - Misc
-    - N_CTX with non-integer number of BLOCK_N (pad zeros or add mask)
+    - N_CTX with non-integer number of BLOCK_SIZE_N (pad zeros or add mask)
     -
 """
 
 import torch
-
+import functools
+import json
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from typing import Optional
 import triton
 import triton.language as tl
 
-
+LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
-def persistent_lean_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    Mp: torch.Tensor,
-    Lp: torch.Tensor,
-    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
-    locks: torch.Tensor,
-    batch_num_block_n: torch.Tensor,
-    total_programs: int,
-    BLOCK_M: int,
-    BLOCK_N: int,
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_config(
     causal: bool,
     batch_size: int,
+):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-LEANATTN-DEFAULT.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    config = _get_config._config_dict["any"]
+    return (
+        config.copy()
+    )  # return a copy to avoid mutation of stored config in LRU cache
+
+
+def persistent_lean_attention(
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d)
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N
+    batch_size: int,
     sm_scale: torch.float16,
+    causal: bool = True,  # causal masking
+    config: Optional[dict] = None,
+):
+    """
+    Lean Attention kernel.
+    """
+    if config is None:
+        config = _get_config(causal=causal, batch_size=batch_size)
+    sm_count = arch_info.get_num_sms()
+
+    return _persistent_lean_attention(
+        q=q,
+        k=k,
+        v=v,
+        Mp=Mp,
+        Lp=Lp,
+        Op=Op,
+        locks=locks,
+        batch_num_block_n=batch_num_block_n,
+        total_programs=sm_count,
+        BLOCK_M=config["BLOCK_SIZE_M"],
+        BLOCK_N=config["BLOCK_SIZE_N"],
+        causal=causal,
+        batch_size=batch_size,
+        sm_scale=sm_scale,
+        num_warps=config["num_warps"],
+        waves_per_eu=config["waves_per_eu"],
+        config=config,
+    )
+
+
+# Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
+def _persistent_lean_attention(
+    q: torch.Tensor,  # (B * seq_len_q, H, d)
+    k: torch.Tensor,  # (total_seq_len_k, H, d) -> supports ragged batching
+    v: torch.Tensor,  # (total_seq_len_k, H, d)
+    Mp: torch.Tensor,  # temp buffer to store partial max during sm
+    Lp: torch.Tensor,  # temp buffer to store partial se during sm
+    Op: torch.Tensor,  # (total_programs, n_ctx_q, d) -> stores partial output values
+    locks: torch.Tensor,  # (H, seq_len_q) -> used to synchronize blocks
+    batch_num_block_n: torch.Tensor,  # (B) -> cumulative sum of BLOCK_N for each item in the batch
+    total_programs: int,  # number of thread blocks (CTAs) to launch -> eq to num SMs
+    BLOCK_M: int,  # seq_q tile size
+    BLOCK_N: int,  # seq_k tile size
+    causal: bool,  # causal masking
+    batch_size: int,
+    sm_scale: torch.float16,  # typically 1 / sqrt(d)
     num_warps: int,
     waves_per_eu: int,
     max_output_tile_cnt: int,
+    config: dict = {},
 ):
+    """
+    Inner kernel launching function.
+    """
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
     assert (
@@ -63,7 +134,7 @@ def persistent_lean_attention(
     N_CTX_K = k.shape[0]  # This is the sum of all ctx_n in a batch
     H = q.shape[1]
 
-    qk_scale = sm_scale * 1.44269504
+    qk_scale = sm_scale * LOG_TWO_E
 
     (
         num_m_blocks,
@@ -154,6 +225,7 @@ def persistent_lean_attention(
         num_warps=num_warps,
         num_stages=1,
         num_ctas=1,
+        **config,
     )
     """
     kernel_timing["attn_fwd"]["end_event"].record()
@@ -179,7 +251,10 @@ def get_num_splits_and_buffer_sizes(
     BLOCK_N,
     num_SMs,
 ):
-    ##### Lean Atteion: Calculate Splits and Tile Sizes #####
+    """
+    Calculates parameters for Lean Attention (num CTAs, num_m_blocks, num_n_blocks, etc.))
+    """
+    ##### Lean Attention: Calculate Splits and Tile Sizes #####
     ## based on onnxruntime/contrib_ops/cuda/bert/lean_attention
     num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
     num_n_blocks = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
