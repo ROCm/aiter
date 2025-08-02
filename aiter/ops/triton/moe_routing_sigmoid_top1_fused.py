@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -135,6 +138,9 @@ def _get_config(M, N, K):
 def routing_sigmoid_top1(
     x, w, topk, fused_shared_experts=False, config: Optional[dict[str, any]] = None
 ):
+    _LOGGER.info(
+        f"ROUTING_SIGMOID_TOP1:  x={tuple(x.shape)}  w={tuple(w.shape)}  topk={topk} "
+    )
     x = x.view(-1, x.shape[-1])
 
     assert topk == 1

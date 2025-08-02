@@ -23,8 +23,8 @@ class AiterTritonLogger(object):
             cls._instance = super(AiterTritonLogger, cls).__new__(cls)
             log_level_str = os.getenv("AITER_TRITON_LOG_LEVEL", "WARNING").upper()
             numeric_level = getattr(logging, log_level_str, logging.WARNING)
-            logging.basicConfig(level=numeric_level)
             cls._instance._logger = logging.getLogger("AITER_TRITON")
+            cls._instance._logger.setLevel(numeric_level)
 
         return cls._instance
 

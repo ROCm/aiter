@@ -1,6 +1,9 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -66,6 +69,7 @@ def softmax(x):
     Note:
         - The input tensor 'x' must reside on the GPU.
     """
+    _LOGGER.info(f"SOFTMAX: x={tuple(x.shape)}")
     n_rows, n_cols = x.shape
 
     MAX_FUSED_SIZE = 65536 // x.element_size()

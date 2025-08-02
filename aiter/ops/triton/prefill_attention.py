@@ -24,6 +24,9 @@ It supporst page size = 1.
 # https://github.com/ModelTC/lightllm/blob/f2a54f0912293f683bf1d1695fd12c4098a5bf82/lightllm/models/llama/triton_kernel/context_flashattention_nopad.py#L1
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 def is_hip():
@@ -180,6 +183,9 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
+    _LOGGER.info(
+        f"PREFILL_ATTENTION: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+    )
     if _is_hip:
         BLOCK = 128
     else:
