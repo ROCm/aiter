@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     batched_model_benchmark_shapes,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 from aiter.ops.triton.batched_gemm_a8w8 import (
     batched_gemm_a8w8 as batched_gemm_a8w8,
@@ -89,7 +90,7 @@ def run_model_benchmark(args):
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
-        plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
+        plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["batch", "M", "N", "K"],
     )

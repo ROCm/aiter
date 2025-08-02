@@ -12,6 +12,7 @@ from op_tests.triton_tests.test_hstu_attn import (
     get_flops,
     get_bytes,
 )
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 
 def get_x_values():
@@ -85,7 +86,7 @@ def run_benchmark(args):
                 line_names=line_names,
                 styles=[("green", "-")],
                 ylabel=ylabel,
-                plot_name=f"HSTU attention Benchmark ({mode}), {ylabel}",
+                plot_name=get_caller_name_no_ext(),
                 args={"metric": metric, "mode": mode},
             )
         )
@@ -217,7 +218,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_hstu_attn.run(save_path=".", print_data=True)
+    bench_hstu_attn.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -290,6 +291,10 @@ def parse_args():
         action="store_true",
         default=False,
         help="Run user input info",
+    )
+
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
 
     args = parser.parse_args()
