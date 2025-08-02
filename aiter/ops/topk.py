@@ -34,7 +34,7 @@ def grouped_topk(
     need_renorm: bool,
     scoring_func: str = "softmax",
     routed_scaling_factor: float = 1.0,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_moe_asm")
@@ -43,12 +43,13 @@ def moe_fused_gate(
     bias: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
+    result: list[torch.Tensor],
     num_expert_group: int,
     topk_group: int,
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> list[torch.Tensor]: ...
+) -> None: ...
 
 
 def biased_grouped_topk(

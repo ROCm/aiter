@@ -14,7 +14,7 @@ def rms_norm_cu(
     input: Tensor,
     weight: Tensor,
     epsilon: float,
-):
+) -> None:
     """
     Cuda version of rmsnorm
     """
@@ -27,7 +27,7 @@ def fused_add_rms_norm_cu(
     residual_in: Tensor,  # residual_in/out
     weight: Tensor,
     epsilon: float,
-):
+) -> None:
     """
     Cuda version of rmsnorm fused add
     """
@@ -40,7 +40,7 @@ def rms_norm(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-):
+) -> None:
     """
     CK version of rmsnorm
     """
@@ -53,7 +53,7 @@ def rmsnorm2d_fwd(
     weight: torch.Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -65,7 +65,7 @@ def rmsnorm2d_fwd_with_add(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -77,7 +77,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -91,7 +91,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -102,7 +102,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_rmsnorm")
@@ -115,4 +115,4 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     weight: Tensor,
     epsilon: float,
     use_model_sensitive_rmsnorm: int,
-): ...
+) -> None: ...

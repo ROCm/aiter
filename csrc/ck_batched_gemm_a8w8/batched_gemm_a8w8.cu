@@ -146,7 +146,7 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
   return batched_rowwise_heuristic_dispatch<DDataType, EDataType>(B, M, N, K);
 }
 
-torch::Tensor batched_gemm_a8w8(
+void batched_gemm_a8w8(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -189,5 +189,5 @@ torch::Tensor batched_gemm_a8w8(
   {
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
-  return Y;
+  // return Y;
 }

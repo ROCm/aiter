@@ -434,6 +434,10 @@
 #define MHA_VARLEN_BWD_ASM_PYBIND                 \
     m.def("fmha_v3_varlen_bwd",                   \
           &aiter::torch_itfs::fmha_v3_varlen_bwd, \
+          py::arg("dp"),                          \
+          py::arg("dk"),                          \
+          py::arg("dv"),                          \
+          py::arg("softmax_d"),                   \
           py::arg("dout"),                        \
           py::arg("q"),                           \
           py::arg("k"),                           \
@@ -453,9 +457,9 @@
           py::arg("deterministic"),               \
           py::arg("is_v3_atomic_fp32"),           \
           py::arg("how_v3_bf16_cvt"),             \
-          py::arg("dq")           = std::nullopt, \
-          py::arg("dk")           = std::nullopt, \
-          py::arg("dv")           = std::nullopt, \
+          py::arg("dq_")           = std::nullopt, \
+          py::arg("dk_")           = std::nullopt, \
+          py::arg("dv_")           = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);
@@ -505,6 +509,10 @@
 #define MHA_FWD_PYBIND                            \
     m.def("mha_fwd",                              \
           &aiter::torch_itfs::mha_fwd,            \
+          py::arg("output"),                      \
+          py::arg("softmax_lse"),                 \
+          py::arg("p"),                           \
+          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
@@ -579,6 +587,7 @@
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
           py::arg("sorted_weights") = std::nullopt);
+
 
 #define MHA_VARLEN_FWD_PYBIND                     \
     m.def("mha_varlen_fwd",                       \
@@ -794,6 +803,7 @@
 #define NORM_PYBIND                                               \
     m.def("layernorm2d_fwd",                                      \
           &layernorm2d,                                           \
+          py::arg("out"),                                         \
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \
@@ -957,6 +967,7 @@
           py::arg("mat1"),                                                         \
           py::arg("mat2"),                                                         \
           py::arg("solution_index"),                                               \
+          py::arg("result"),                                                        \
           py::arg("bias")      = std::nullopt,                                     \
           py::arg("out_dtype") = std::nullopt,                                     \
           py::arg("scaleA")    = std::nullopt,                                     \
