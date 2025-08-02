@@ -6,7 +6,7 @@ import random
 import pytest
 import torch
 import triton
-from aiter.ops.triton.pa_prefill import context_attention_fwd
+from aiter.ops.triton.chunked_pa_prefill import chunked_prefill_paged_decode
 
 
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -366,7 +366,7 @@ def test_contexted_kv_attention(
     output_triton = output
 
     # Run Triton
-    context_attention_fwd(
+    chunked_prefill_paged_decode(
         query,
         k,
         v,
@@ -448,7 +448,7 @@ def test_contexted_kv_attention_alibi(
     output_triton = output
 
     # Run Triton
-    context_attention_fwd(
+    chunked_prefill_paged_decode(
         query,
         k,
         v,
