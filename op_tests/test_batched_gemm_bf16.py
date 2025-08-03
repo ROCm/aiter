@@ -97,13 +97,15 @@ parser.add_argument(
     e.g.: -b 16""",
 )
 parser.add_argument(
-    "-mnk",
+    "-s",
+    "--mnk",
     type=dtypes.str2tuple,
     nargs="?",
     const=None,
     default=None,
-    help="""shape of mnk.
-    e.g. -mnk 1280,8192,1024""",
+    help="""Shape of mnk.
+    e.g.    -s 1024,8192,1024
+            --mnk 1024,8192,1024""",
 )
 args = parser.parse_args()
 if args.dtype is None:
