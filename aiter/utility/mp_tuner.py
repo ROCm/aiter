@@ -21,8 +21,8 @@ def worker(
 ):
     from aiter.test_common import run_perftest
 
-    # pid = mp.current_process().pid
     pid = mp.current_process().pid
+    # pid = mp.current_process().pid
     # gpuID = gpuIDMap[pid]
     gpuID = torch.cuda.current_device()
     device = torch.device(f"cuda:{gpuID}")
@@ -36,8 +36,8 @@ def worker(
         try:
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
-        except RuntimeError:
-            print(f" info:{info}\t No support")
+        except RuntimeError as e:
+            print(f" info:{info}\t {e}")
 
         if us == 0:
             print("!!!! us = 0, rerun it ")
@@ -50,6 +50,7 @@ def worker(
                 ref = [ref]
             if isinstance(res, torch.Tensor):
                 res = [res]
+
             ref = [
                 (
                     el.to(device)
@@ -103,7 +104,7 @@ def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
     bestConfigs = []
     best_config = list(sorted_rets[0])
     for info, us, max_err_ratio in sorted_rets:
-        # print(f"{info=}, {us=}, {max_err_ratio=}")
+        print(f"{info=}, {us=}, {max_err_ratio=}")
         if max_err_ratio > tol_err_ratio:
             continue
         if info[0] == cur_info[0]:
@@ -134,34 +135,63 @@ def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
 def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
-    info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref, *rest = group_task[0]
+    (
+        info,
+        gen_data,
+        gen_args,
+        func,
+        args,
+        kwargs,
+        ref_func,
+        ref_args,
+        ref_kwargs,
+        ref,
+        *rest,
+    ) = group_task[0]
 
-    updated_ref_args = ref_args if not input_data else input_data[:-1] + ref_args
     pid = mp.current_process().pid
     gpuID = gpuIDMap[pid]
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
-
+    data = (
+        gen_data(*gen_args, device=device)
+        if not input_data and gen_data is not None
+        else input_data
+    )
+    assert ref_func is not None or ref is not None or fast_mode != 0
     if ref is None and not fast_mode:
-        updated_ref_args = [
-            el.to(device) if isinstance(el, torch.Tensor) else el
-            for el in updated_ref_args
-        ]
+        ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
+        updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
         ref = ref_func(*updated_ref_args, **ref_kwargs)
         torch.cuda.synchronize()
 
     rets = []
     shape_grouped = isinstance(tasks, list)
     solutions = 1 if not shape_grouped else kernels_num
-
     for i in range(solutions):
-        info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref_noused, *rest = (
-            group_task[i]
+        (
+            info,
+            gen_data,
+            gen_args,
+            func,
+            args,
+            kwargs,
+            ref_func,
+            ref_args,
+            ref_kwargs,
+            ref_noused,
+            *rest,
+        ) = group_task[i]
+        # either gen_data func or inpur data
+        new_args = (
+            (tuple(data[i] for i in args[0]) + tuple(args[1:]))
+            if gen_data is not None
+            else args
         )
         work_args = (
             info,
             func,
-            input_data + args,
+            new_args,
             kwargs,
             ref,
             *rest,
@@ -180,8 +210,8 @@ def mp_tuner(
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
 
     ##if mp_num > 1, gpu 0 do not participate in tuning, as the primary gpu.
-    parallel_num = mp_num - 1 if mp_num > 1 else 1
-    start_idx = 1 if mp_num > 1 else 0
+    parallel_num = mp_num  # - 1 if mp_num > 1 else 1
+    start_idx = 0  # 1 if mp_num > 1 else 0
     if mp_num == 1:
         shape_grouped = True
     pool = mp.Pool(processes=parallel_num)

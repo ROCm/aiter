@@ -9,15 +9,16 @@ import numpy as np
 import pandas as pd
 from aiter import logger
 
-# pd.set_option("display.max_rows", 200)
-pd.set_option("display.max_rows", None)  # 显示所有行
-pd.set_option("display.max_columns", None)  # 显示所有列
-pd.set_option("display.width", None)  # 自动调整列宽（避免换行）
-pd.set_option("display.max_colwidth", None)  # 显示完整列内容（不截断字符串）
+pd.set_option("display.max_rows", 200)
+## debug ##
+# pd.set_option("display.max_rows", None)
+# pd.set_option("display.max_columns", None)
+# pd.set_option("display.width", None)
+# pd.set_option("display.max_colwidth", None)
 
 
 def perftest(
-    num_iters=103, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -168,7 +169,7 @@ def run_iters_rotate(num_iters, func, rotate_args):
 def run_perftest(
     func,
     *args,
-    num_iters=103,
+    num_iters=101,
     num_warmup=2,
     testGraph=False,
     num_rotate_args=0,
@@ -216,8 +217,9 @@ def log_args(func, *args, **kwargs):
 
 
 def post_process_data(df):
-    """remove min value and max value and abnormal data"""
+    """remove abnormal data"""
     device_df = df[df["device_type"].astype(str).str.contains("DeviceType.CUDA")]
+    # print(df)
     if device_df.empty:
         return []
     kernel_dfs = [
@@ -227,9 +229,8 @@ def post_process_data(df):
     sum_df = pd.DataFrame(0, index=kernel_dfs[0].index, columns=kernel_dfs[0].columns)
     for d in kernel_dfs:
         sum_df["self_device_time_total"] += d["self_device_time_total"]
-    idx_min = sum_df["self_device_time_total"].idxmin()
-    idx_max = sum_df["self_device_time_total"].idxmax()
 
+    # IQR to remove abnormal data
     k = 1.5
     Q1 = sum_df["self_device_time_total"].quantile(0.25)
     Q3 = sum_df["self_device_time_total"].quantile(0.75)
@@ -239,13 +240,14 @@ def post_process_data(df):
 
     out_range_idx = sum_df.index[
         (sum_df["self_device_time_total"] < lower)
-        & (sum_df["self_device_time_total"] > upper)
+        | (sum_df["self_device_time_total"] > upper)
     ].tolist()
-    if len(out_range_idx) > 0:
-        print("out_range_idx is ", out_range_idx)
+
     indexs = {d.iloc[i]["original_index"] for d in kernel_dfs for i in out_range_idx}
-    for i in indexs:
-        print(f" i is ,val is {df.iloc[i]['self_device_time_total']}")
+    if int(os.environ.get("AITER_LOG_MORE", 0)):
+        logger.info(f"abnormal data indices: {out_range_idx}")
+        for i in indexs:
+            logger.info(f"abnormal data: {df.iloc[i]['self_device_time_total']}")
     return list(indexs)
 
 
@@ -263,9 +265,10 @@ def get_trace_perf(prof, num_iters):
     for el in prof.events():
         df.append([getattr(el, x, None) for x in cols])
     df = pd.DataFrame(df, columns=cols)
-    ###remove min/max and abnormal data
-    dropped_indexs = post_process_data(df)
-    df = df.drop(dropped_indexs)
+    ###remove abnormal data
+    if num_iters > 50:
+        dropped_indexs = post_process_data(df)
+        df = df.drop(dropped_indexs)
     df["cnt"] = 1
     rets = []
     for name, d in df.groupby("name", sort=False):
@@ -281,7 +284,6 @@ def get_trace_perf(prof, num_iters):
             else:
                 r["host_time_sum"] = r["self_device_time_total"]
                 r["device_time_sum"] = 0
-
         rets.append(r)
     df = pd.DataFrame(rets)
     cols = [
@@ -302,7 +304,7 @@ def get_trace_perf(prof, num_iters):
     df = df[cols].sort_values(timerList, ignore_index=True)
     actual_iters = num_iters
     if df.empty:
-        logger.info(f"no valida data after post process!")
+        logger.info("no valida data after post process!")
     else:
         actual_iters = df.at[0, "cnt"]
 

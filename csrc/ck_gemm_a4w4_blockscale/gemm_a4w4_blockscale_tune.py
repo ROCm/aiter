@@ -13,7 +13,7 @@ import argparse
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.jit.core import get_asm_dir
 
-torch.set_default_device("cuda")
+# torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 torch.random.manual_seed(0)
 SCALE_GROUP_SIZE = 32
@@ -91,15 +91,17 @@ def run_gemm_a4w4_blockscale_asm(
     x_scale,
     w_scale,
     out,
-    kernelName,
     bias,
+    kernelName,
     dtype=dtypes.bf16,
     bpreshuffle=True,
     splitK=None,
 ):
     m, k = x.shape
     if splitK is not None and splitK > 0:
-        out_reset = torch.zeros(out.shape[0], out.shape[1], dtype=dtype)
+        out_reset = torch.zeros(
+            out.shape[0], out.shape[1], dtype=dtype, device=torch.cuda.current_device()
+        )
         out = out_reset
     res = aiter.gemm_a4w4_asm(
         x,
@@ -115,16 +117,17 @@ def run_gemm_a4w4_blockscale_asm(
     return res[:m]
 
 
-def generate_data(m, n, k, useSplitK=False, dtype=dtypes.bf16):
+def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
+    torch.manual_seed(seed)
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    x = torch.randn((m, k), dtype=dtype)
-    w = torch.randn((n, k), dtype=dtype)
+    x = torch.randn((m, k), dtype=dtype, device=device)  #
+    w = torch.randn((n, k), dtype=dtype, device=device)  #
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
     x, x_scales_shuffle = quant_func(x, shuffle=True)
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     w_shuffle = shuffle_weight(w)
-    out_ck = torch.empty((m + 255) // 256 * 256, n, dtype=dtype)
+    out_ck = torch.empty((m + 255) // 256 * 256, n, dtype=dtype, device=device)
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
     bias_f32 = None
@@ -176,7 +179,12 @@ def tune_gemm_list(
     cu_num = device_properties.multi_processor_count
     task = []
     tasks_in_data = []
+
     ck_kernels_num = len(kernels_list)
+    gemm_a4w4_data_idx = [0, 4, 5, 6, 7]
+    gemm_asm_data_idx = [0, 4, 5, 6, 7, 8]
+    torch_data_idx = [0, 1, 2, 3]
+    seed = 1000
     for i in range(len(untunedf)):
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
@@ -188,8 +196,10 @@ def tune_gemm_list(
             & (tunedf["K"] == K)
             & (tunedf["cu_num"] == cu_num)
         ].empty:
-            input_data = generate_data(M, N, K)
+            input_data = generate_data(M, N, K, 0)
             total_kernel_nums = 0
+            seed = seed + 1
+
             for i in range(ck_kernels_num):
                 kernel = kernels_list[i]
                 maxsplitK = (
@@ -204,26 +214,30 @@ def tune_gemm_list(
                     task.append(
                         (
                             info,
+                            generate_data,
+                            (M, N, K, seed),
                             run_gemm_a4w4_blockscale,
                             (
-                                input_data[0],
-                                input_data[4],
-                                input_data[5],
-                                input_data[6],
-                                input_data[7],
+                                gemm_a4w4_data_idx,
+                                # input_data[0],
+                                # input_data[4],
+                                # input_data[5],
+                                # input_data[6],
+                                # input_data[7],
                                 i,
                                 splitK,
                             ),
                             {
                                 "num_warmup": 10,
-                                "num_iters": 103,
+                                "num_iters": 101,
                             },
                             run_torch,
                             (
-                                input_data[0],
-                                input_data[1],
-                                input_data[2],
-                                input_data[3],
+                                torch_data_idx,
+                                # input_data[0],
+                                # input_data[1],
+                                # input_data[2],
+                                # input_data[3],
                                 dtypes.bf16,
                             ),
                             {},
@@ -256,29 +270,29 @@ def tune_gemm_list(
                     task.append(
                         (
                             info,
+                            generate_data,
+                            (M, N, K, seed),
                             run_gemm_a4w4_blockscale_asm,
                             (
-                                input_data[0],
-                                input_data[4],
-                                input_data[5],
-                                input_data[6],
-                                input_data[7],
+                                gemm_asm_data_idx,
+                                # input_data[0],
+                                # input_data[4],
+                                # input_data[5],
+                                # input_data[6],
+                                # input_data[7],
+                                # input_data[8],
                                 kernel_name,
-                                input_data[8],
                                 dtypes.bf16,
                                 True,
                                 splitK,
                             ),
                             {
                                 "num_warmup": 10,
-                                "num_iters": 103,
+                                "num_iters": 101,
                             },
                             run_torch,
                             (
-                                input_data[0],
-                                input_data[1],
-                                input_data[2],
-                                input_data[3],
+                                torch_data_idx,
                                 dtypes.bf16,
                             ),
                             {},
@@ -386,6 +400,12 @@ if __name__ == "__main__":
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
     tunedf = tune_gemm_list(
-        untunedf, tunedf, True, args.splitK, args.mp, errRatio=args.errRatio
+        untunedf,
+        tunedf,
+        args.sort,
+        args.splitK,
+        args.mp,
+        shape_grouped=False,
+        errRatio=args.errRatio,
     )
     tunedf.to_csv(args.tune_file, index=False)

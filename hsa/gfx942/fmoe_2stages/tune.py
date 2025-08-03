@@ -357,6 +357,8 @@ def go(
                     tasks.append(
                         (
                             ("stage1", el, blockM),  # tag
+                            None,
+                            (),
                             asm_stage1,  # func
                             (
                                 a1_qt,
@@ -413,6 +415,8 @@ def go(
                     tasks_ck.append(
                         (
                             ("stage1", kernel.name, blockM),  # tag
+                            None,
+                            (),
                             ck_moe_stage1_fwd_out,  # func
                             (
                                 a1_qt,
@@ -448,6 +452,8 @@ def go(
                     tasks_ck.append(
                         (
                             ("stage2", kernel.name, blockM),  # tag
+                            None,
+                            (),
                             ck_moe_stage2_fwd_out,  # func
                             (
                                 a2_qt,
