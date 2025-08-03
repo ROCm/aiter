@@ -41,7 +41,7 @@ void register_graph_buffers(fptr_t _fa, const std::vector<torch::Tensor> &handle
                             const std::vector<torch::Tensor> &offsets);
 #ifdef USE_ROCM
 torch::Tensor allocate_meta_buffer(int64_t size);
-torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp, torch::Tensor &out);
+torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp);
 #endif
 
 } // namespace aiter

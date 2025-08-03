@@ -506,8 +506,13 @@ NONE_WRAPPED_OP = [
     "getHipblasltKernelName",
     "rocb_create_extension",
     "rocb_destroy_extension",
+    "get_meta_buffer_ipc_handle",
+    "get_graph_buffer_ipc_meta",
     "_ActivationType",
     "_QuantType",
+    "allocate_meta_buffer",
+    "dispose",
+    "meta_size"
 ]
 
 
@@ -797,7 +802,8 @@ def compile_ops(
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
-
+        # if _md_name == "module_custom_all_reduce":
+        #     return wrapper
         if loadName in NONE_WRAPPED_OP:
             return wrapper
 

@@ -177,7 +177,7 @@ def register_graph_buffers(
 
 
 @compile_ops("module_custom_all_reduce")
-def allocate_meta_buffer(size: int, out: torch.Tensor) -> None: ...
+def allocate_meta_buffer(size: int) -> torch.Tensor: ...
 
 
 def get_meta_buffer_ipc_handle_fake(inp: torch.Tensor) -> torch.Tensor:
@@ -185,8 +185,8 @@ def get_meta_buffer_ipc_handle_fake(inp: torch.Tensor) -> torch.Tensor:
     if not inp.is_cuda:
         raise RuntimeError("Input tensor must be on CUDA device")
 
-    return torch.empty((handle_size,), dtype=torch.uint8, device=inp.device)
+    return torch.empty(handle_size, dtype=torch.uint8, device=inp.device)
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=get_meta_buffer_ipc_handle_fake)
+@compile_ops("module_custom_all_reduce")
 def get_meta_buffer_ipc_handle(inp: torch.Tensor) -> torch.Tensor: ...

@@ -172,11 +172,11 @@ std::vector<at::Tensor> get_graph_buffer_ipc_meta(
   auto [handle_bytes, offsets] = fa->get_graph_buffer_ipc_meta();
   auto options =
       torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
-  handles =
+  auto handles =
       torch::empty({static_cast<int64_t>(handle_bytes.size())}, options);
   std::memcpy(handles.data_ptr(), handle_bytes.data(), handle_bytes.size());
 
-  offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
+  torch::Tensor offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
   return {handles, offset_tensor};
 }
 
@@ -199,6 +199,7 @@ torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp)
       torch::empty({static_cast<int64_t>(sizeof(cudaIpcMemHandle_t))}, options);
   CUDACHECK(cudaIpcGetMemHandle((cudaIpcMemHandle_t *)data_handle.data_ptr(),
                                 inp.data_ptr()));
+  std::cout << "data_handle size: " << data_handle.sizes() << std::endl;
   return data_handle;
 }
 

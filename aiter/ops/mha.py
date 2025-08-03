@@ -97,10 +97,8 @@ def gen_mha_fwd_fake_tensors(
     batch_size = q.size(0)
     seqlen_q = q.size(1)
     num_heads = q.size(2)
-    head_size_q = q.size(3)
     head_size_v = v.size(3)
     seqlen_k = k.size(1)
-    num_heads_k = k.size(2)
 
     if out is not None:
         assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
@@ -180,10 +178,8 @@ def gen_fmha_v3_fwd_fake_tensors(
     batch_size = q.size(0)
     seqlen_q = q.size(1)
     num_heads = q.size(2)
-    head_size_q = q.size(3)
     head_size_v = v.size(3)
     seqlen_k = k.size(1)
-    num_heads_k = k.size(2)
 
     if out is not None:
         assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
@@ -420,10 +416,8 @@ def gen_mha_varlen_fwd_fake_tensor(
     batch_size = q.size(0)
     seqlen_q = q.size(1)
     num_heads = q.size(2)
-    head_size_q = q.size(3)
     head_size_v = v.size(3)
     seqlen_k = k.size(1)
-    num_heads_k = k.size(2)
 
     if out is not None:
         assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
