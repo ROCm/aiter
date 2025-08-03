@@ -497,7 +497,7 @@ MANUAL_SCHEMA_OPS = [
     "rocb_findallsols",
     "_ActivationType",
     "_QuantType",
-    "init_custom_ar"
+    "init_custom_ar",
 ]
 
 NONE_WRAPPED_OP = [

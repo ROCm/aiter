@@ -3,6 +3,7 @@
 
 # user interface
 
+from typing import List
 import torch
 from ..jit.core import (
     compile_ops,
@@ -43,7 +44,7 @@ def moe_fused_gate(
     bias: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    result: list[torch.Tensor],
+    result: List[torch.Tensor],
     num_expert_group: int,
     topk_group: int,
     topk: int,

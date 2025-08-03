@@ -416,7 +416,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> list[torch.Tensor]:
+) -> List[torch.Tensor]:
     batch_size = q.size(0)
     seqlen_q = q.size(1)
     num_heads = q.size(2)
@@ -494,7 +494,7 @@ def mha_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> list[torch.Tensor]: ...
+) -> List[torch.Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(
