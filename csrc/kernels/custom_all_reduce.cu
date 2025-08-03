@@ -199,7 +199,6 @@ torch::Tensor get_meta_buffer_ipc_handle(torch::Tensor &inp)
       torch::empty({static_cast<int64_t>(sizeof(cudaIpcMemHandle_t))}, options);
   CUDACHECK(cudaIpcGetMemHandle((cudaIpcMemHandle_t *)data_handle.data_ptr(),
                                 inp.data_ptr()));
-  std::cout << "data_handle size: " << data_handle.sizes() << std::endl;
   return data_handle;
 }
 

@@ -172,7 +172,7 @@ def get_graph_buffer_ipc_meta(_fa: int) -> List[torch.Tensor]: ...
 
 @compile_ops("module_custom_all_reduce")
 def register_graph_buffers(
-    _fa: int, handles: List[torch.Tensor], offsets: List[torch.Tensor]
+    _fa: int, handles: list[torch.Tensor], offsets: list[torch.Tensor]
 ) -> None: ...
 
 

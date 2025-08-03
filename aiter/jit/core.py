@@ -512,7 +512,7 @@ NONE_WRAPPED_OP = [
     "_QuantType",
     "allocate_meta_buffer",
     "dispose",
-    "meta_size"
+    "meta_size",
 ]
 
 
@@ -585,8 +585,6 @@ def generate_schema(func) -> str:
         return_type = "Tensor[]"
 
     schema = f"({', '.join(parameters)}) -> {return_type}"
-
-    # schema = f"({', '.join(parameters)}) -> ()"
 
     return schema
 
@@ -802,8 +800,7 @@ def compile_ops(
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
-        # if _md_name == "module_custom_all_reduce":
-        #     return wrapper
+
         if loadName in NONE_WRAPPED_OP:
             return wrapper
 
@@ -811,6 +808,7 @@ def compile_ops(
             op_schema = f"aiter::wrapper_{loadName}" + schema
             aiter_lib.define(op_schema)
             aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
+            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
             aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
 
         def wrapper_return(*args, **kwargs):
