@@ -114,9 +114,9 @@ if args.dtype is None:
 else:
     l_dtype = [dtypes.d_dtypes[args.dtype]]
 if args.batch is not None:
-    l_b = [args.bitch]
+    l_b = [args.batch]
 if args.mnk is not None:
-    l_mnk = [args.m]
+    l_mnk = [args.mnk]
 
 
 for dtype in l_dtype:
