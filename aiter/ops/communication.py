@@ -112,4 +112,3 @@ def all_reduce_rmsnorm_quant(
         ca.buffer,
         ca._IS_CAPTURING,
     )
-
