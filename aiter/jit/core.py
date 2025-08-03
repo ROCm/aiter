@@ -573,7 +573,10 @@ def generate_schema(func) -> str:
         return_type = "float"
     elif return_annotation is bool:
         return_type = "bool"
-    elif get_origin(return_annotation) is list and get_args(return_annotation)[0] is torch.Tensor:
+    elif (
+        get_origin(return_annotation) is list
+        and get_args(return_annotation)[0] is torch.Tensor
+    ):
         return_type = "Tensor[]"
 
     schema = f"({', '.join(parameters)}) -> {return_type}"
@@ -587,7 +590,7 @@ def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
-    gen_fake: Optional[Callable[..., Any]] = None
+    gen_fake: Optional[Callable[..., Any]] = None,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import aiter_lib
@@ -609,7 +612,6 @@ def compile_ops(
             sig = torch.library.infer_schema(func, mutates_args="unknown")
             schema = f"{sig}"
         loadName = func.__name__
-        print('op name:', loadName)
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):

@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import List, Optional
+from typing import List
 from ..jit.core import (
     compile_ops,
 )
@@ -32,6 +32,7 @@ def all_reduce_unreg(
     _fa: int, inp: torch.Tensor, reg_buffer: torch.Tensor, out: torch.Tensor
 ) -> None: ...
 
+
 def all_reduce_asm_fake_tensor(
     inp: torch.Tensor,
     ca: int,
@@ -47,7 +48,7 @@ def all_reduce_asm_fake_tensor(
     )
 
 
-@compile_ops("module_custom_all_reduce", gen_fake= all_reduce_asm_fake_tensor)
+@compile_ops("module_custom_all_reduce", gen_fake=all_reduce_asm_fake_tensor)
 def all_reduce_asm_(
     inp: torch.Tensor,
     ca: int,
@@ -55,6 +56,7 @@ def all_reduce_asm_(
     reg_buffer: torch.Tensor,
     isGraph: bool,
 ) -> torch.Tensor: ...
+
 
 def all_reduce_rmsnorm_fake_tensors(
     input: torch.Tensor,
@@ -69,20 +71,15 @@ def all_reduce_rmsnorm_fake_tensors(
 ) -> List[torch.Tensor]:
 
     output = torch.empty_like(
-        input,
-        dtype=input.dtype,
-        device=input.device,
-        requires_grad=input.requires_grad
+        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
     )
-    
+
     residual_out = torch.empty_like(
-        input,
-        dtype=input.dtype,
-        device=input.device,
-        requires_grad=input.requires_grad
+        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
     )
-    
+
     return [output, residual_out]
+
 
 @compile_ops("module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_fake_tensors)
 def all_reduce_rmsnorm_(
@@ -96,6 +93,7 @@ def all_reduce_rmsnorm_(
     reg_buffer: torch.Tensor,
     isGraph: bool,
 ) -> List[torch.Tensor]: ...
+
 
 def all_reduce_rmsnorm_quant_fake_tensors(
     input: torch.Tensor,
@@ -112,28 +110,19 @@ def all_reduce_rmsnorm_quant_fake_tensors(
 
     N = input.size(-1)
     M = input.numel() // N
-    
+
     output = torch.empty_like(
-        input,
-        dtype=input.dtype,
-        device=input.device,
-        requires_grad=input.requires_grad
+        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
     )
-    
+
     residual_out = torch.empty_like(
-        input,
-        dtype=input.dtype,
-        device=input.device,
-        requires_grad=input.requires_grad
+        input, dtype=input.dtype, device=input.device, requires_grad=input.requires_grad
     )
-    
-    y_scale = torch.empty(
-        (M, 1),
-        dtype=torch.float32,
-        device=input.device
-    )
-    
+
+    y_scale = torch.empty((M, 1), dtype=torch.float32, device=input.device)
+
     return [output, residual_out, y_scale]
+
 
 @compile_ops("module_custom_all_reduce", gen_fake=all_reduce_rmsnorm_quant_fake_tensors)
 def all_reduce_rmsnorm_quant_(
@@ -167,24 +156,18 @@ def register_buffer(
 def gen_get_graph_buffer_ipc_meta_fake_tensors(_fa: int) -> List[torch.Tensor]:
 
     handle_sz = 64  # sizeof(cudaIpcMemHandle_t) is 64 byte
-    num_buffers = 4 # ???
-    handles = torch.empty(
-        (handle_sz * num_buffers,),
-        dtype=torch.uint8,
-        device='cuda'
-    )
+    num_buffers = 4  # ???
+    handles = torch.empty((handle_sz * num_buffers,), dtype=torch.uint8, device="cuda")
 
-    offset_tensor = torch.empty(
-        (num_buffers,), 
-        dtype=torch.int64,
-        device='cuda'
-    )
+    offset_tensor = torch.empty((num_buffers,), dtype=torch.int64, device="cuda")
 
     return [handles, offset_tensor]
 
 
-@compile_ops("module_custom_all_reduce", gen_fake=gen_get_graph_buffer_ipc_meta_fake_tensors)
-def get_graph_buffer_ipc_meta( _fa: int) -> List[torch.Tensor]: ...
+@compile_ops(
+    "module_custom_all_reduce", gen_fake=gen_get_graph_buffer_ipc_meta_fake_tensors
+)
+def get_graph_buffer_ipc_meta(_fa: int) -> List[torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")
@@ -196,16 +179,13 @@ def register_graph_buffers(
 @compile_ops("module_custom_all_reduce")
 def allocate_meta_buffer(size: int, out: torch.Tensor) -> None: ...
 
+
 def get_meta_buffer_ipc_handle_fake(inp: torch.Tensor) -> torch.Tensor:
     handle_size = 64
     if not inp.is_cuda:
         raise RuntimeError("Input tensor must be on CUDA device")
 
-    return torch.empty(
-        (handle_size,),
-        dtype=torch.uint8,
-        device=inp.device
-    )
+    return torch.empty((handle_size,), dtype=torch.uint8, device=inp.device)
 
 
 @compile_ops("module_custom_all_reduce", gen_fake=get_meta_buffer_ipc_handle_fake)

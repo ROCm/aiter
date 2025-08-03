@@ -15,6 +15,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 MD_NAME = "module_attention"
 
+
 def gen_pa_fwd_native_fake(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
