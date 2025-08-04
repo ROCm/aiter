@@ -723,9 +723,11 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
+                    if loadName in activation_list:
+                        return True
+                    if loadName in quant_list:
+                        return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
-
                     for el, arg in callargs.items():
                         expected_type = ann[el]
                         origin = typing.get_origin(expected_type)
@@ -794,9 +796,6 @@ def compile_ops(
                 ):
                     args_list[quant_index] = QuantType(args_list[quant_index])
                     args = tuple(args_list)
-            # if loadName in ["ck_moe_stage2", "ck_moe_stage1"]:
-            #     return op(*args[:-2], **kwargs)
-
             return op(*args, **kwargs)
 
         def abstract_impl(*args, custom_build_args={}, **kwargs):

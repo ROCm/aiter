@@ -206,7 +206,7 @@ def cmdGenFunc_ck_moe_stage(
     activation: int = 0,
 ):
 
-    mul_routed_weight_stage = 1 if sorted_weights is None else 2
+    mul_routed_weight_stage = 2 if sorted_weights is None else 1
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
@@ -239,7 +239,7 @@ def cmdGenFunc_ck_moe_stage2(
     activation: int = 0,
 ):
 
-    mul_routed_weight_stage = 2 if sorted_weights is None else 1
+    mul_routed_weight_stage = 1 if sorted_weights is None else 2
     md_name, blob_gen_cmd = get_moe_stage_module(
         hidden_states.dtype,
         w1.dtype,
