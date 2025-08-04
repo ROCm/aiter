@@ -70,7 +70,11 @@ def test_act_mul_and_mxfp4_quant(M: int, N: int, dtype, activation: str, shuffle
     # TODO: extend tests to different shapes with proper padding
     if shuffle and (M % 256 != 0 or N % 512 != 0):
         pytest.skip()
+
     torch.manual_seed(20)
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     x = torch.randn((M, N), dtype=dtype, device="cuda")
 
     if DEBUG_MODE:

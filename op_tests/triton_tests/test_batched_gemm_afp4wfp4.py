@@ -192,6 +192,8 @@ def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_inputs(
         B, M, N, K, dtype, output=True
     )

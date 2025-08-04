@@ -150,6 +150,8 @@ def test_hstu_attention(
     max_seq_len: int,  # for repro
     sparsity: float,  # for repro
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     dropout_pr = 0.0
     heads: int = 4
     attn_dim: int = 128

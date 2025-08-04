@@ -74,6 +74,8 @@ def generate_fused_rms_quant_data(
 @pytest.mark.parametrize("N", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_flatten_quant(B: int, M: int, N: int, dtype):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     x = torch.randn((B, M, N), dtype=dtype, device="cuda").transpose(0, 1)
 
     torch_out, torch_scale = torch_dynamic_mxfp4_quant(x.flatten(1, 2))
@@ -93,6 +95,8 @@ def test_flatten_quant(B: int, M: int, N: int, dtype):
 def test_fused_rms_quant(
     B: int, M: int, N: int, stride: int, skip_second: bool, residual: bool, dtype
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     mat1, mat2, rms1_w, rms2_w, resid1 = generate_fused_rms_quant_data(
         mat1_shape=(B, M),
         mat2_shape=(B, N),
