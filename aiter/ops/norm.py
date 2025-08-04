@@ -8,6 +8,7 @@ from ..jit.core import compile_ops
 
 MD_NAME = "module_norm"
 
+
 def gen_layer_norm_fake_tensors(
     input: Tensor,
     # normalized_shape: List[int],
@@ -22,7 +23,10 @@ def gen_layer_norm_fake_tensors(
         device=input.device,
     )
 
-@compile_ops("module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors)
+
+@compile_ops(
+    "module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors
+)
 def layer_norm(
     input: Tensor,
     # normalized_shape: List[int],
@@ -33,7 +37,9 @@ def layer_norm(
 ) -> Tensor: ...
 
 
-@compile_ops("module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors)
+@compile_ops(
+    "module_norm", fc_name="layernorm2d_fwd", gen_fake=gen_layer_norm_fake_tensors
+)
 def layernorm2d_fwd(
     input: Tensor,
     # normalized_shape: List[int],

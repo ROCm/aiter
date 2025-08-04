@@ -220,6 +220,7 @@ def cmdGenFunc_ck_moe_stage(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
+
 def cmdGenFunc_ck_moe_stage2(
     hidden_states: Tensor,
     w1: Tensor,
@@ -251,7 +252,6 @@ def cmdGenFunc_ck_moe_stage2(
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
-
 
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)

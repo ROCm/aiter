@@ -18,6 +18,7 @@ from torch.library import Library
 aiter_lib = Library("aiter", "FRAGMENT")
 from ..ops.gemm_op_common import get_padded_m
 
+
 def gen_gemm_a8w8_ck_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -29,7 +30,10 @@ def gen_gemm_a8w8_ck_fake_tensors(
 ) -> torch.Tensor:
     return Out
 
-@compile_ops("module_gemm_a8w8", fc_name="gemm_a8w8", gen_fake=gen_gemm_a8w8_ck_fake_tensors)
+
+@compile_ops(
+    "module_gemm_a8w8", fc_name="gemm_a8w8", gen_fake=gen_gemm_a8w8_ck_fake_tensors
+)
 def gemm_a8w8_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -50,7 +54,12 @@ def gen_gemm_a8w8_bpreshuffle_ck_fake_tensors(
 ) -> torch.Tensor:
     return Out
 
-@compile_ops("module_gemm_a8w8_bpreshuffle", fc_name="gemm_a8w8_bpreshuffle", gen_fake=gen_gemm_a8w8_bpreshuffle_ck_fake_tensors)
+
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle",
+    fc_name="gemm_a8w8_bpreshuffle",
+    gen_fake=gen_gemm_a8w8_bpreshuffle_ck_fake_tensors,
+)
 def gemm_a8w8_bpreshuffle_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -58,6 +67,7 @@ def gemm_a8w8_bpreshuffle_ck(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
 ) -> torch.Tensor: ...
+
 
 def gen_gemm_a8w8_asm_fake_tensors(
     XQ: Tensor,  # A:[M, K] i8
@@ -76,7 +86,11 @@ def gen_gemm_a8w8_asm_fake_tensors(
     return Out
 
 
-@compile_ops("module_gemm_a8w8_asm", fc_name="gemm_a8w8_asm", gen_fake=gen_gemm_a8w8_asm_fake_tensors)
+@compile_ops(
+    "module_gemm_a8w8_asm",
+    fc_name="gemm_a8w8_asm",
+    gen_fake=gen_gemm_a8w8_asm_fake_tensors,
+)
 def gemm_a8w8_asm(
     XQ: Tensor,  # A:[M, K] i8
     WQ: Tensor,  # B:[N, K] i8 -> shuffle layout(32,16)
@@ -92,6 +106,7 @@ def gemm_a8w8_asm(
     splitK: Optional[int] = 0,
 ) -> torch.Tensor: ...
 
+
 def gen_gemm_a8w8_blockscale_ck_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -101,14 +116,19 @@ def gen_gemm_a8w8_blockscale_ck_fake_tensors(
 ) -> Tensor:
     return Out
 
-@compile_ops("module_gemm_a8w8_blockscale", fc_name="gemm_a8w8_blockscale", gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors)
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale",
+    fc_name="gemm_a8w8_blockscale",
+    gen_fake=gen_gemm_a8w8_blockscale_ck_fake_tensors,
+)
 def gemm_a8w8_blockscale_ck(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-) -> Tensor: ...
+) -> torch.Tensor: ...
 
 
 def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
@@ -117,10 +137,15 @@ def gen_flatmm_a8w8_blockscale_asm_fake_tensors(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-) -> Tensor: 
+) -> Tensor:
     return out
 
-@compile_ops("module_gemm_a8w8_blockscale_asm", fc_name="flatmm_a8w8_blockscale_asm", gen_fake=gen_flatmm_a8w8_blockscale_asm_fake_tensors)
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_asm",
+    fc_name="flatmm_a8w8_blockscale_asm",
+    gen_fake=gen_flatmm_a8w8_blockscale_asm_fake_tensors,
+)
 def flatmm_a8w8_blockscale_asm(
     XQ: Tensor,
     WQ: Tensor,
@@ -378,7 +403,12 @@ def gen_gemm_a8w8_tune_fake_tensors(
 ) -> torch.Tensor:
     return Out
 
-@compile_ops("module_gemm_a8w8_tune", fc_name="gemm_a8w8_tune", gen_fake=gen_gemm_a8w8_tune_fake_tensors)
+
+@compile_ops(
+    "module_gemm_a8w8_tune",
+    fc_name="gemm_a8w8_tune",
+    gen_fake=gen_gemm_a8w8_tune_fake_tensors,
+)
 def gemm_a8w8_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -388,6 +418,7 @@ def gemm_a8w8_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
+
 
 def gen_gemm_a8w8_blockscale_tune_fake_tensors(
     XQ: torch.Tensor,
@@ -400,7 +431,12 @@ def gen_gemm_a8w8_blockscale_tune_fake_tensors(
 ) -> torch.Tensor:
     return Out
 
-@compile_ops("module_gemm_a8w8_blockscale_tune", fc_name="gemm_a8w8_blockscale_tune", gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors)
+
+@compile_ops(
+    "module_gemm_a8w8_blockscale_tune",
+    fc_name="gemm_a8w8_blockscale_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
 def gemm_a8w8_blockscale_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
