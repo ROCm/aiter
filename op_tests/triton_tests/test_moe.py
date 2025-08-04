@@ -656,6 +656,7 @@ def test_fused_moe(
     silu_fused: bool,
     dtype,
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     if persistent:
@@ -789,6 +790,7 @@ def test_fused_moe_int4_w4a16(
     silu_fused: bool,
 ):
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     if (
         M == 1
         and N == 64
@@ -931,6 +933,7 @@ def test_fused_moe_gelu(
     persistent: bool,
     dtype,
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     if persistent:
@@ -1053,6 +1056,8 @@ def test_moe_e2e(
     persistent: bool,
     dtype,
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     torch.manual_seed(20)
     torch.set_printoptions(threshold=100000)
     if persistent:

@@ -498,6 +498,8 @@ def compile_ops(
                 loadName = func.__name__
             try:
                 module = None
+                if gen_func is not None:
+                    custom_build_args.update(gen_func(*args, **kwargs))
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
@@ -505,9 +507,6 @@ def compile_ops(
                     rebuilded_list.append(md_name)
                     raise ModuleNotFoundError("")
                 if module is None:
-                    if gen_func is not None:
-                        gen_build_args = gen_func(*args, **kwargs)
-                        custom_build_args.update(gen_build_args)
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
             except ModuleNotFoundError:

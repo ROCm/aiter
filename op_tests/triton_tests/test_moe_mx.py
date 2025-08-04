@@ -8,24 +8,9 @@ import triton
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from op_tests.triton_tests.test_moe import torch_moe_ref, torch_moe_align_block_size_ref
+import aiter.ops.triton.utils.arch_info as arch_info
 
 DEBUG_MODE = False
-
-
-def get_cdna_version():
-    """
-    Gets the AMD architecture version, i.e. CDNA3 or CDNA4, currently
-    only supports 3 (gfx942) or 4 (gfx950). Returns -1 if it is not AMD
-    hardware or unsupported architecture
-    """
-    target = triton.runtime.driver.active.get_current_target()
-    if target.backend != "hip":
-        return -1
-    if target.arch == "gfx942":
-        return 3
-    if target.arch == "gfx950":
-        return 4
-    return -1
 
 
 def torch_dynamic_mxfp4_quant(
@@ -246,7 +231,9 @@ def test_fused_moe(
     routed_weight: bool,
     swizzle_mx_scale: bool,
 ):
-    if triton.runtime.driver.active.get_current_target().arch not in ("gfx950"):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
         pytest.skip("MXFP4 not supported on this architecture")
 
     is_a_mixed_input = a_dtype_str.startswith("mx")
