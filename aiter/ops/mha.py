@@ -77,6 +77,7 @@ def cmdGenFunc_mha_fwd(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
+
 def common_mha_fwd_fake_tensors(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -148,7 +149,9 @@ def gen_mha_fwd_fake_tensors(
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return common_mha_fwd_fake_tensors(q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out)
+    return common_mha_fwd_fake_tensors(
+        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
+    )
 
 
 @compile_ops("module_mha_fwd", fc_name="mha_fwd", gen_fake=gen_mha_fwd_fake_tensors)
@@ -186,7 +189,9 @@ def gen_fmha_v3_fwd_fake_tensors(
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return common_mha_fwd_fake_tensors(q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out)
+    return common_mha_fwd_fake_tensors(
+        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
+    )
 
 
 @compile_ops(
@@ -381,7 +386,9 @@ def gen_mha_varlen_fwd_fake_tensor(
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
 ) -> List[torch.Tensor]:
-    return common_mha_fwd_fake_tensors(q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out)
+    return common_mha_fwd_fake_tensors(
+        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
+    )
 
 
 @compile_ops(
@@ -499,6 +506,7 @@ def cmdGenFunc_mha_bwd(
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
     }
+
 
 def common_mha_bwd_fake_tensors(
     q: Tensor,
@@ -642,6 +650,7 @@ def gen_fmha_v3_bwd_fake_tensors(
     gen: Optional[Generator] = None,
 ) -> List[Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
 
 @compile_ops(
     "module_fmha_v3_bwd", fc_name="fmha_v3_bwd", gen_fake=gen_fmha_v3_bwd_fake_tensors
