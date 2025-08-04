@@ -14,18 +14,38 @@ def hipb_create_extension() -> None: ...
 def hipb_destroy_extension() -> None: ...
 
 
-@compile_ops("module_hipbsolgemm")
-def hipb_mm(
+def gen_hipb_mm_fake_tensor(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
     solution_index: int,
-    result: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     scaleA: Optional[torch.Tensor] = None,
     scaleB: Optional[torch.Tensor] = None,
     scaleOut: Optional[torch.Tensor] = None,
-) -> None: ...
+):
+    mat1_sizes = mat1.size()
+    mat2_sizes = mat2.size()
+    in_dtype = mat1.dtype
+    out_dtype = out_dtype if out_dtype is not None else in_dtype
+    result = torch.empty(
+        (mat1_sizes[0], mat2_sizes[1]), dtype=out_dtype, device=mat1.device
+    )
+
+    return result
+
+
+@compile_ops("module_hipbsolgemm", gen_fake=gen_hipb_mm_fake_tensor)
+def hipb_mm(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    solution_index: int,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    scaleA: Optional[torch.Tensor] = None,
+    scaleB: Optional[torch.Tensor] = None,
+    scaleOut: Optional[torch.Tensor] = None,
+) -> torch.Tensor: ...
 
 
 @compile_ops("module_hipbsolgemm")

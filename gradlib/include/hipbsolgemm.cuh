@@ -38,8 +38,8 @@ void hipb_create_extension();
 
 void hipb_destroy_extension();
 
-void hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
-                      const int solution_index, torch::Tensor &result,
+torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
+                      const int solution_index,
                       std::optional<torch::Tensor> bias = std::nullopt,
                       std::optional<c10::ScalarType> out_dtype = std::nullopt,
                       std::optional<torch::Tensor> scaleA = std::nullopt,

@@ -595,13 +595,14 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
 ):
-    import torch
-    from csrc.cpp_itfs.torch_utils import aiter_lib
-    import torch.library
 
     def decorator(func):
-        func.arg_checked = False
+        import torch
+        from csrc.cpp_itfs.torch_utils import aiter_lib
+        import torch.library
         import inspect
+
+        func.arg_checked = False
 
         schema = ""
         if func.__name__ in MANUAL_SCHEMA_OPS:

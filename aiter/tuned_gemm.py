@@ -175,11 +175,7 @@ class TunedGemm:
     ):
         if otype is None:
             otype = inp.dtype
-        output = torch.empty(inp.shape[0], weights.shape[1], device=inp.device)
-        hipb_mm(
-            inp, weights.t(), solidx, output, bias, otype, scale_a, scale_b, scale_c
-        )
-        return output
+        return hipb_mm(inp, weights.t(), solidx, bias, otype, scale_a, scale_b, scale_c)
 
     def apply_rocb_mm(
         self,

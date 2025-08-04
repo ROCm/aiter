@@ -140,7 +140,7 @@ def all_reduce_rmsnorm_quant_(
 
 
 @compile_ops("module_custom_all_reduce")
-def dispose(_fa: int, out: torch.Tensor) -> None: ...
+def dispose(_fa: int) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce")
@@ -153,21 +153,19 @@ def register_buffer(
 ) -> None: ...
 
 
-def gen_get_graph_buffer_ipc_meta_fake_tensors(_fa: int) -> List[torch.Tensor]:
+# def gen_get_graph_buffer_ipc_meta_fake_tensors(_fa: int) -> List[torch.Tensor]:
 
-    handle_sz = 64  # sizeof(cudaIpcMemHandle_t) is 64 byte
-    num_buffers = 4  # ???
-    handles = torch.empty((handle_sz * num_buffers,), dtype=torch.uint8, device="cuda")
+#     handle_sz = 64  # sizeof(cudaIpcMemHandle_t) is 64 byte
+#     num_buffers = 4  # ???
+#     handles = torch.empty((handle_sz * num_buffers,), dtype=torch.uint8, device="cuda")
 
-    offset_tensor = torch.empty((num_buffers,), dtype=torch.int64, device="cuda")
+#     offset_tensor = torch.empty((num_buffers,), dtype=torch.int64, device="cuda")
 
-    return [handles, offset_tensor]
+#     return [handles, offset_tensor]
 
 
-@compile_ops(
-    "module_custom_all_reduce", gen_fake=gen_get_graph_buffer_ipc_meta_fake_tensors
-)
-def get_graph_buffer_ipc_meta(_fa: int) -> List[torch.Tensor]: ...
+@compile_ops("module_custom_all_reduce")
+def get_graph_buffer_ipc_meta(_fa: int) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 @compile_ops("module_custom_all_reduce")
@@ -180,12 +178,12 @@ def register_graph_buffers(
 def allocate_meta_buffer(size: int) -> torch.Tensor: ...
 
 
-def get_meta_buffer_ipc_handle_fake(inp: torch.Tensor) -> torch.Tensor:
-    handle_size = 64
-    if not inp.is_cuda:
-        raise RuntimeError("Input tensor must be on CUDA device")
+# def get_meta_buffer_ipc_handle_fake(inp: torch.Tensor) -> torch.Tensor:
+#     handle_size = 64
+#     if not inp.is_cuda:
+#         raise RuntimeError("Input tensor must be on CUDA device")
 
-    return torch.empty(handle_size, dtype=torch.uint8, device=inp.device)
+#     return torch.empty(handle_size, dtype=torch.uint8, device=inp.device)
 
 
 @compile_ops("module_custom_all_reduce")
