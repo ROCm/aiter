@@ -434,10 +434,6 @@
 #define MHA_VARLEN_BWD_ASM_PYBIND                 \
     m.def("fmha_v3_varlen_bwd",                   \
           &aiter::torch_itfs::fmha_v3_varlen_bwd, \
-          py::arg("dp"),                          \
-          py::arg("dk"),                          \
-          py::arg("dv"),                          \
-          py::arg("softmax_d"),                   \
           py::arg("dout"),                        \
           py::arg("q"),                           \
           py::arg("k"),                           \
@@ -457,9 +453,9 @@
           py::arg("deterministic"),               \
           py::arg("is_v3_atomic_fp32"),           \
           py::arg("how_v3_bf16_cvt"),             \
-          py::arg("dq_")           = std::nullopt, \
-          py::arg("dk_")           = std::nullopt, \
-          py::arg("dv_")           = std::nullopt, \
+          py::arg("dq")           = std::nullopt, \
+          py::arg("dk")           = std::nullopt, \
+          py::arg("dv")           = std::nullopt, \
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("rng_state")    = std::nullopt, \
           py::arg("gen")          = std::nullopt);

@@ -181,7 +181,7 @@ def moe_stage1_g1u1(
     block_m: int,
     ksplit: int = 0,
     activation: Optional[Enum] = ActivationType.Silu.value,
-    quant_type: int = int(QuantType.No),
+    quant_type: Optional[Enum] = QuantType.No.value,
     a1_scale: Optional[torch.Tensor] = None,
     w1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
