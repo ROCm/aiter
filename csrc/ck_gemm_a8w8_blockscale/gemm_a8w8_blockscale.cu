@@ -97,7 +97,6 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
                                    torch::Tensor& w_scale,
                                    torch::Tensor& Y)
 {
-    std::cout << "XQ.dtype()" << XQ.dtype() << "w_scale.dtype()" << w_scale.dtype() <<std::endl;
     TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
     TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
 

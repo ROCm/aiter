@@ -505,10 +505,6 @@
 #define MHA_FWD_PYBIND                            \
     m.def("mha_fwd",                              \
           &aiter::torch_itfs::mha_fwd,            \
-          py::arg("output"),                      \
-          py::arg("softmax_lse"),                 \
-          py::arg("p"),                           \
-          py::arg("rng_state"),                   \
           py::arg("q"),                           \
           py::arg("k"),                           \
           py::arg("v"),                           \
@@ -802,7 +798,7 @@
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
+          py::arg("epsilon") = 1e-5f,                             \
           py::arg("x_bias") = std::nullopt);                      \
     m.def("layernorm2d_fwd_with_add",                             \
           &layernorm2d_with_add,                                  \

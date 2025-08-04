@@ -119,8 +119,7 @@ for tensor0, tensor1 in zip(tensors0, tensors1):
             # output = torch.empty_like(tensor1)
             aiter_add_a_ = tensor0.clone()
             aiter_add_b_ = tensor1.clone()
-            aiter.add_(aiter_add_a_, aiter_add_b_)
-            output = aiter_add_a_
+            output = aiter.add_(aiter_add_a_, aiter_add_b_)
     print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     print(torch.equal(result, output))

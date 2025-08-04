@@ -356,8 +356,7 @@ def gemm_a8w8_bpreshuffle(
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
-    return Y
+    return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
 
 def gemm_a8w8_blockscale(
