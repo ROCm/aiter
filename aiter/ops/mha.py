@@ -974,16 +974,98 @@ def mha_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-    custom_build_args: Optional[dict] = None,
 ) -> List[Tensor]: ...
 
 
-@compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
+def gen_fmha_v3_varlen_bwd_fake_tensor(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+):
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+
+    if dq is None:
+        dq = torch.empty_like(q)  # (batch_size, seqlen_q, num_heads, head_size_q)
+    else:
+        assert dq.dtype == q.dtype, "dq must have the same dtype as q"
+        assert dq.device == q.device, "dq must be on the same device as q"
+        assert dq.stride(-1) == 1, "dq must have contiguous last dimension"
+        assert dq.shape == (
+            batch_size,
+            seqlen_q,
+            num_heads,
+            head_size_q,
+        ), "dq has incorrect shape"
+
+    if dk is None:
+        dk = torch.empty_like(k)  # (batch_size, seqlen_k, num_heads_k, head_size_q)
+    else:
+        assert dk.dtype == q.dtype, "dk must have the same dtype as q"
+        assert dk.device == q.device, "dk must be on the same device as q"
+        assert dk.stride(-1) == 1, "dk must have contiguous last dimension"
+        assert dk.shape == (
+            batch_size,
+            seqlen_k,
+            num_heads_k,
+            head_size_q,
+        ), "dk has incorrect shape"
+
+    if dv is None:
+        dv = torch.empty_like(v)  # (batch_size, seqlen_k, num_heads_k, head_size_v)
+    else:
+        assert dv.dtype == q.dtype, "dv must have the same dtype as q"
+        assert dv.device == q.device, "dv must be on the same device as q"
+        assert dv.stride(-1) == 1, "dv must have contiguous last dimension"
+        assert dv.shape == (
+            batch_size,
+            seqlen_k,
+            num_heads_k,
+            head_size_v,
+        ), "dv has incorrect shape"
+
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    return [dq, dk, dv, softmax_d]
+
+
+@compile_ops(
+    "module_fmha_v3_varlen_bwd",
+    fc_name="fmha_v3_varlen_bwd",
+    gen_fake=gen_fmha_v3_varlen_bwd_fake_tensor,
+)
 def fmha_v3_varlen_bwd(
-    dq_: Tensor,
-    dk_: Tensor,
-    dv_: Tensor,
-    softmax_d: Tensor,
     dout: Tensor,
     q: Tensor,
     k: Tensor,
@@ -1697,18 +1779,13 @@ def _flash_attn_varlen_backward(
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d = (
-        torch.empty_like(dout),
-        torch.empty_like(dout),
-        torch.empty_like(dout),
-        torch.empty_like(dout),
-    )
     if can_impl_fmha_v3_bwd():
-        fmha_v3_varlen_bwd(
+        (
             dq,
             dk,
             dv,
             softmax_d,
+        ) = fmha_v3_varlen_bwd(
             dout,
             q,
             k,
@@ -1728,19 +1805,20 @@ def _flash_attn_varlen_backward(
             deterministic,
             is_v3_atomic_fp32,
             how_v3_bf16_cvt,
-            None,
-            None,
-            None,
+            dq,
+            dk,
+            dv,
             alibi_slopes,
             rng_state,
             None,
         )
     else:
-        mha_varlen_bwd(
+        (
             dq,
             dk,
             dv,
             softmax_d,
+        ) = mha_varlen_bwd(
             dout,
             q,
             k,
@@ -1758,12 +1836,13 @@ def _flash_attn_varlen_backward(
             window_size_left,
             window_size_right,
             deterministic,
-            None,
-            None,
-            None,
+            dq,
+            dk,
+            dv,
             alibi_slopes,
             rng_state,
             None,
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
 
