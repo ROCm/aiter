@@ -158,10 +158,10 @@ def _persistent_lean_attention(
     )
 
     print(
-       f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
+        f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
     )
     print(
-       f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
+        f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
     )
     print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
 
@@ -174,7 +174,6 @@ def _persistent_lean_attention(
         causal=causal,
         MASKED_BLOCKS=MASKED_BLOCKS,
     )
-
 
     max_output_tile_cnt = max_output_tile_cnt + 4
 
@@ -300,8 +299,11 @@ def get_num_splits_and_buffer_sizes(
     # StreamK Lean has as many threadblocks as SMs
     # This should be a function of tile size and number of scratchpad space
     # LeanAttention assign 3 CTAs per SM (bounded by LDS size)
-    if (total_tiles <= num_SMs):
-        lean_griddimz =  min((total_tiles + 1) // 2, (32 * total_tiles + num_n_blocks - 1) // num_n_blocks)
+    if total_tiles <= num_SMs:
+        lean_griddimz = min(
+            (total_tiles + 1) // 2,
+            (32 * total_tiles + num_n_blocks - 1) // num_n_blocks,
+        )
     else:
         lean_griddimz = num_SMs  # CTA launch grid
     # if (total_tiles <= 2 * 2 * num_SMs):
@@ -340,6 +342,7 @@ def get_num_splits_and_buffer_sizes(
         num_splits,
         even_split,
     )
+
 
 def calculate_max_output_tiles_analytically(
     tiles_per_head: int,
@@ -454,10 +457,29 @@ def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
     # Return values
     return final_q_block_idx, final_task_size, final_total_blocks
 
+
 @triton.jit
-def _attention_inner(q, k_ptrs, v_ptrs, stride_vn, stride_kn, m_i, l_i, acc, qk_scale,
-                    causal, q_start_m, b_seq_size,
-                    offs_m, offs_n, BLOCK_M, BLOCK_N, HEAD_DIM, local_iter, local_iter_end):
+def _attention_inner(
+    q,
+    k_ptrs,
+    v_ptrs,
+    stride_vn,
+    stride_kn,
+    m_i,
+    l_i,
+    acc,
+    qk_scale,
+    causal,
+    q_start_m,
+    b_seq_size,
+    offs_m,
+    offs_n,
+    BLOCK_M,
+    BLOCK_N,
+    HEAD_DIM,
+    local_iter,
+    local_iter_end,
+):
     """
     Performs attention calculation for an (maybe partial) output tile
     """
@@ -504,8 +526,8 @@ def _attention_inner(q, k_ptrs, v_ptrs, stride_vn, stride_kn, m_i, l_i, acc, qk_
         v_ptrs += BLOCK_N * stride_vn
         k_ptrs += BLOCK_N * stride_kn
 
-
     return m_i, l_i, acc
+
 
 @triton.jit
 def la_persistent(
@@ -803,10 +825,28 @@ def la_persistent_inner(
 
     q = tl.load(q_ptrs)
 
-    m_i, l_i, acc = _attention_inner(q, k_ptrs, v_ptrs, stride_vn, stride_kn, m_i, l_i, acc, qk_scale,
-                        causal, q_start_m, b_seq_size,
-                        offs_m, offs_n, BLOCK_M, BLOCK_N, HEAD_DIM, local_iter, local_iter_end)
-    
+    m_i, l_i, acc = _attention_inner(
+        q,
+        k_ptrs,
+        v_ptrs,
+        stride_vn,
+        stride_kn,
+        m_i,
+        l_i,
+        acc,
+        qk_scale,
+        causal,
+        q_start_m,
+        b_seq_size,
+        offs_m,
+        offs_n,
+        BLOCK_M,
+        BLOCK_N,
+        HEAD_DIM,
+        local_iter,
+        local_iter_end,
+    )
+
     # initialize pointer to m and l
     m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_cta = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0

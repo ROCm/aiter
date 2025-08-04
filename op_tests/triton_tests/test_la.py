@@ -65,7 +65,8 @@ def get_lean_attn_inputs(
 
     return q, k, v, Mp, Lp, Op, locks, batch_num_block_n
 
-def reference_attention(q,k,v,n_ctx,n_ctx_q,sm_scale,causal):
+
+def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 
     # Calculate Pytorch refence output
     ref_out = torch.empty_like(q, dtype=q.dtype)
@@ -91,6 +92,7 @@ def reference_attention(q,k,v,n_ctx,n_ctx_q,sm_scale,causal):
         start += b
         start_q += n_ctx_q
     return ref_out
+
 
 @pytest.mark.parametrize(
     "causal, batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
@@ -240,7 +242,7 @@ def test_persistent_lean_attention(
     )
 
     # Calculate Pytorch refence output
-    ref_out = reference_attention(q,k,v,n_ctx,n_ctx_q,sm_scale,causal)
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
@@ -312,7 +314,7 @@ def test_persistent_lean_attention_outer(
     )
 
     # Calculate Pytorch refence output
-    ref_out = reference_attention(q,k,v,n_ctx,n_ctx_q,sm_scale,causal)
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
@@ -418,8 +420,8 @@ def main():
         waves_per_eu,
     )
     # print(f"ms={ms}")
-    
-    ref_out = reference_attention(q,k,v,n_ctx,n_ctx_q,sm_scale,causal)
+
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
 
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
@@ -436,4 +438,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
