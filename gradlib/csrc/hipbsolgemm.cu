@@ -347,7 +347,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
   auto inDtype{mat1.options().dtype().toScalarType()};
   auto outDtype{
       out_dtype.has_value()
-          ? torch::python::detail::py_object_to_dtype(out_dtype.value())
+          ? out_dtype.value()
           : inDtype};
   auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
   auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
