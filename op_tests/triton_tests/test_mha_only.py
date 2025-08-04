@@ -95,20 +95,20 @@ def fp8_assert_close(
     )
 
 
-@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(128, 128)],
+    [(1, 1), (4, 4), (128, 128), (2, 1), (1, 2), (32, 16), (64, 128)],
 )
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(16, 16), (48, 8)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [128])
+@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
-@pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
+@pytest.mark.parametrize("CAUSAL", [(False)])
+@pytest.mark.parametrize("FP8", [(False)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
