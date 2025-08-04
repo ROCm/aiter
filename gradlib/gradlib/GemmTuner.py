@@ -236,27 +236,18 @@ class Gemm:
             task.append(
                 (
                     info,
-                    None,  # generate_data,
-                    (),  # (self.m, self.n, self.k, self.indtype, self.outdtype, self.scaleAB),
+                    generate_data,
+                    (self.m, self.n, self.k, self.indtype, self.outdtype, self.scaleAB),
                     call_hipb_mm,
-                    # ([0, 2, 3, 4, 4], solidx, self.outdtype),
-                    (
-                        self.inp,
-                        self.weights.t(),
-                        self.bias if self.bias is not None else None,
-                        scaleA,
-                        scaleB,
-                        solidx,
-                        self.outdtype,
-                    ),
+                    ([0, 2, 3, 4, 4], solidx, self.outdtype),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    None,  # get_gemm_ref,
-                    (),  # ([0, 1, 3, 4], self.indtype, self.outdtype),
+                    get_gemm_ref,
+                    ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    self.ref if fast_mode == 0 else None,  # None,
+                    None, # self.ref if fast_mode == 0 else None, 
                     self.rtol,
                     self.atol,
                 )
@@ -264,13 +255,7 @@ class Gemm:
         in_data = [
             (
                 len(solutions),
-                (
-                    #    self.inp,
-                    #    self.weights.t(),
-                    #    self.bias if self.bias is not None else None,
-                    #    scaleA,
-                    #    scaleB,
-                ),
+                (),
             )
         ]
         ret = mp_tuner(task, in_data, self.mp, fast_mode == 1)
@@ -288,9 +273,11 @@ class Gemm:
         print(self.hipb_gtimedf.head(self.topn))
 
     def find_rocblas_sols(self):
+        print(self.scaleAB, self.bias)
         if self.scaleAB or self.bias is not None:
             sols = []
         else:
+            print(self.inp.device, self.weights.device)
             sols = aiter.rocb_findallsols(self.inp, self.weights.t())
         print(
             "M N K dtype",
@@ -325,23 +312,21 @@ class Gemm:
             task.append(
                 (
                     info,
-                    None,  # generate_data,
-                    (),  # (self.m, self.n, self.k, self.indtype, self.outdtype, False),
+                    generate_data,
+                    (self.m, self.n, self.k, self.indtype, self.outdtype, False),
                     call_rocb_mm,
                     (
-                        # [0, 2],
-                        self.inp,
-                        self.weights.t(),
+                        [0, 2],
                         solidx,
                     ),
                     {
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    None,  # get_gemm_ref,
-                    (),  # ([0, 1, 3, 4], self.indtype, self.outdtype),
+                    get_gemm_ref,
+                    ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    self.ref if fast_mode == 0 else None,  # None,
+                    None,  #self.ref if fast_mode == 0 else None, 
                     self.rtol,
                     self.atol,
                 )

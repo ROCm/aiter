@@ -37,7 +37,7 @@ def worker(
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
         except RuntimeError as e:
-            print(f" info:{info}\t {e}")
+            print(f"run gpu func error: info:{info}\t {e}")
 
         if us == 0:
             print("!!!! us = 0, rerun it ")
@@ -158,7 +158,12 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
         if not input_data and gen_data is not None
         else input_data
     )
+
     assert ref_func is not None or ref is not None or fast_mode != 0
+    # ref=None & fast_mode=1, fast tune, not compare results, do not postprocess,return all results
+    # ref=None & fast_mode=0, ref_func should be given and return best result
+    # ref!=None & fast_mode=1, return all results, do not postprocess
+    # ref!=None & fast_mode=0, return best result, postprocess
     if ref is None and not fast_mode:
         ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
         updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
@@ -167,7 +172,9 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
 
     rets = []
     shape_grouped = isinstance(tasks, list)
+    shape_grouped = False
     solutions = 1 if not shape_grouped else kernels_num
+
     for i in range(solutions):
         (
             info,
@@ -188,6 +195,7 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
             if gen_data is not None
             else args
         )
+        ref = ref if ref_noused is None else ref_noused
         work_args = (
             info,
             func,
@@ -212,15 +220,14 @@ def mp_tuner(
     ##if mp_num > 1, gpu 0 do not participate in tuning, as the primary gpu.
     parallel_num = mp_num  # - 1 if mp_num > 1 else 1
     start_idx = 0  # 1 if mp_num > 1 else 0
-    if mp_num == 1:
+    if mp_num == 1 & fast_mode == 0:
         shape_grouped = True
     pool = mp.Pool(processes=parallel_num)
 
     pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     # time.sleep(2)
     task_group = []
-    if mp_num == 1:
-        shape_grouped = True
+    
     # dispatch per shape to one pid
     if not tasks:
         return []
@@ -260,6 +267,6 @@ def mp_tuner(
     pool.join()
     return (
         [el.get() for el in rets]
-        if shape_grouped
+        if shape_grouped and not fast_mode
         else post_process([el.get() for el in rets], fast_mode, err_ratio)
     )

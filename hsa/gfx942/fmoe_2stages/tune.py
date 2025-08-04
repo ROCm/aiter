@@ -489,6 +489,7 @@ def go(
         print(f"tasks is {len(tasks)}, tasks_ck is {len(tasks_ck)}")
         in_data = [(len(tasks) + len(tasks_ck), ())]
         rets = mp_tuner(tasks + tasks_ck, in_data, 1, True)
+        print(rets)
 
         profileDF = []
         for (stage, kernelName, block_m), us, err in rets:
