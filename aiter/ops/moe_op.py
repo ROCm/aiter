@@ -202,8 +202,8 @@ def cmdGenFunc_ck_moe_stage(
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-    quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: int = 0,
+    activation: int = 0,
 ):
 
     mul_routed_weight_stage = 1 if sorted_weights is None else 2
@@ -235,8 +235,8 @@ def cmdGenFunc_ck_moe_stage2(
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-    quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: int = 0,
+    activation: int = 0,
 ):
 
     mul_routed_weight_stage = 2 if sorted_weights is None else 1
@@ -269,8 +269,8 @@ def ck_moe_stage1(
     a1_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-    quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: int = 0,
+    activation: int = 0,
 ) -> None: ...
 
 
@@ -289,8 +289,8 @@ def ck_moe_stage2(
     a2_scale: Optional[Tensor] = None,
     block_m: Optional[int] = 32,
     sorted_weights: Optional[Tensor] = None,
-    quant_type: Optional[Enum] = QuantType.No.value,
-    activation: Optional[Enum] = ActivationType.Silu.value,
+    quant_type: int = 0,
+    activation: int = 0,
 ) -> None: ...
 
 

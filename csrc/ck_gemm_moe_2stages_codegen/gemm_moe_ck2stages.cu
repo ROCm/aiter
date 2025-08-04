@@ -54,8 +54,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
                    std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32,
                    std::optional<torch::Tensor> sorted_weights = std::nullopt,
-                   QuantType quant_type = QuantType::No,
-                   ActivationType activation = ActivationType::Silu)
+                   int quant_type = 0,
+                   int activation = 0)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(out));
     at::cuda::getCurrentCUDAStream().stream();
@@ -111,8 +111,8 @@ void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
                    std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
                    std::optional<int> block_m = 32,
                    std::optional<torch::Tensor> sorted_weights = std::nullopt,
-                   QuantType quant_type = QuantType::No,
-                   ActivationType activation = ActivationType::Silu)
+                   int quant_type = 0,
+                   int activation = 0)
 {
     TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!")

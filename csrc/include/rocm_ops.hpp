@@ -563,8 +563,8 @@
           py::arg("a1_scale")       = std::nullopt,      \
           py::arg("block_m")        = 32,                \
           py::arg("sorted_weights") = std::nullopt,      \
-          py::arg("quant_type") = QuantType::No,         \
-          py::arg("activation") = ActivationType::Silu); \
+          py::arg("quant_type") = 0,                     \
+          py::arg("activation") = 0);                    \
                                                          \
                                                          \
     m.def("ck_moe_stage2",                               \
@@ -582,8 +582,8 @@
           py::arg("a2_scale")       = std::nullopt,      \
           py::arg("block_m")        = 32,                \
           py::arg("sorted_weights") = std::nullopt,      \
-          py::arg("quant_type") = QuantType::No,         \
-          py::arg("activation") = ActivationType::Silu); \
+          py::arg("quant_type") = 0,                     \
+          py::arg("activation") = 0);                    \
 
 
 #define MHA_VARLEN_FWD_PYBIND                     \
