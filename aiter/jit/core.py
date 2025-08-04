@@ -166,8 +166,7 @@ def check_and_set_ninja_worker():
         free_memory_gb = psutil.virtual_memory().available / (
             1024**3
         )  # free memory in GB
-        # each JOB peak memory cost is ~8-9GB when threads = 4
-        max_num_jobs_memory = int(free_memory_gb / 9)
+        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
         # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
         max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
@@ -499,6 +498,8 @@ def compile_ops(
                 loadName = func.__name__
             try:
                 module = None
+                if gen_func is not None:
+                    custom_build_args.update(gen_func(*args, **kwargs))
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
@@ -506,9 +507,6 @@ def compile_ops(
                     rebuilded_list.append(md_name)
                     raise ModuleNotFoundError("")
                 if module is None:
-                    if gen_func is not None:
-                        gen_build_args = gen_func(*args, **kwargs)
-                        custom_build_args.update(gen_build_args)
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
             except ModuleNotFoundError:

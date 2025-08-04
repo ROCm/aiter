@@ -464,7 +464,7 @@ def run_benchmark(custom, args):
         elif "TFLOPS" in provider:
             return total_flops / ms * 1e-9
         else:  # GB/s
-            return mem / ms * 1e-3
+            return mem / ms * 1e-6
 
     bench_mha.run(save_path="." if args.o else None, print_data=True)
 
@@ -514,12 +514,6 @@ def parse_args():
     parser.add_argument("-fused_bwd", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
     parser.add_argument(
-        "-return_all",
-        action="store_true",
-        default=False,
-        help="Prints TFLOPS, walltime, bandwidth.",
-    )
-    parser.add_argument(
         "-test_mode",
         action="store_true",
         default=False,
@@ -527,7 +521,14 @@ def parse_args():
     )
 
     parser.add_argument("--layout", type=str, default=None, help=supported_layouts())
-
+    parser.add_argument(
+        "-metric",
+        nargs="?",
+        const="throughput",
+        choices=["time", "throughput", "bandwidth"],
+        default=None,
+        help="Metrics for the kernel benchmark.",
+    )
     parser.add_argument(
         "-persistent",
         nargs="?",

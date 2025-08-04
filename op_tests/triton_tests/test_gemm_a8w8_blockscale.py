@@ -142,6 +142,8 @@ def generate_gemm_a8w8_blockscale_inputs(
     ],
 )
 def test_gemm(dtype, M, N, K, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     block_shape_n, block_shape_k = block_shape
 
     dtype = str_to_torch_dtype[dtype]

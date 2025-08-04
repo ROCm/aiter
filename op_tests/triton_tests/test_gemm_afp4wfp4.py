@@ -191,6 +191,8 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     if TRITON_HIP_PRESHUFFLE_SCALES:
         if N % 32 > 0:
             pytest.skip(

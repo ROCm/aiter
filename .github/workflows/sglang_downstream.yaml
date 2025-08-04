@@ -1,0 +1,65 @@
+name: Sglang Downstream Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]  # Triggers on PRs targeting `main`
+
+jobs:
+  sglang:
+    name: sglang integration
+    runs-on: mi300x-1gpu
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+
+      - name: Clone sglang repo
+        run: |
+          git clone https://github.com/sgl-project/sglang.git
+        
+      # TODO: Currently, we use PAT, it should be replaced by repo token
+      - name: Make authenticated API request
+        run: |
+          curl -sSfL https://api.github.com/repos/casey/just/releases/latest
+
+      - name: Build sglang_aiter_test image
+        run: |
+          cd sglang
+          sed -i 's/ENV AITER_COMMIT="v0.1.4"/ARG AITER_COMMIT="v0.1.4"/g' docker/Dockerfile.rocm
+          docker build --no-cache --build-arg SGL_BRANCH=v0.4.9.post3 --build-arg GPU_ARCH=gfx942 --build-arg AITER_COMMIT="${{ github.event.pull_request.head.sha }}" -t sglang_aiter_test -f docker/Dockerfile.rocm .
+            
+      - name: Start CI container
+        run: |
+          cd sglang
+          sed -i 's|-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout"|-v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout"|g' scripts/amd_ci_start_container.sh
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_start_container.sh
+          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm; bash scripts/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+      
+      - name: Install wget
+        run: sudo apt-get update && sudo apt-get install -y wget
+
+      - name: Install dependencies
+        run: |
+          cd sglang
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_install_dependency.sh
+          bash scripts/amd_ci_install_dependency.sh
+
+      - name: Evaluate Accuracy
+        timeout-minutes: 30
+        run: |
+          cd sglang
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_exec.sh
+          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/amd_ci_exec.sh python3 models/test_qwen_models.py
+        
+      # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
+      - name: Clean Up
+        if: always()
+        run:
+          docker exec -u root sglang_aiter_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"

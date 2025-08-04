@@ -333,6 +333,8 @@ def test_contexted_kv_attention(
     kv_cache_dtype: str,
     device: str,
 ) -> None:
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     (
         query,
         k,
@@ -415,6 +417,7 @@ def test_contexted_kv_attention_alibi(
     kv_cache_dtype: str,
     device: str,
 ) -> None:
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     (
         query,
         k,
