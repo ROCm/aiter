@@ -196,7 +196,6 @@ def tune_gemm_list(
             & (tunedf["K"] == K)
             & (tunedf["cu_num"] == cu_num)
         ].empty:
-            input_data = generate_data(M, N, K, 0)
             total_kernel_nums = 0
             seed = seed + 1
 
