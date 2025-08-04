@@ -22,7 +22,7 @@ import functools
 import json
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from typing import Optional, Union, List
+from typing import Optional 
 from bisect import bisect_right
 import triton
 import triton.language as tl
