@@ -362,7 +362,7 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""shape of mnk.
+    help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
 

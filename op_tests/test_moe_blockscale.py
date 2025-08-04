@@ -331,6 +331,22 @@ parser.add_argument(
     help="""Intermediate dimension. Default is 256.
     e.g.: -idim 256""",
 )
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    default=256,
+    help="""Number of experts. Default is 256.
+    e.g.: -e 256""",
+)
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    default=8,
+    help="""Top-k value. Default is 8.
+    e.g.: -k 8""",
+)
 
 args = parser.parse_args()
 if args.dtype is None:
@@ -347,5 +363,13 @@ for dtype in l_dtype:
             for idim in [args.idim]:
                 scale_blks = (128, 128)
                 test_fmoe(
-                    dtype, m, dim, idim, scale_blks, 256, 8, quant="No", use_g1u1=True
+                    dtype,
+                    m,
+                    dim,
+                    idim,
+                    scale_blks,
+                    args.expert,
+                    args.topk,
+                    quant="No",
+                    use_g1u1=True,
                 )
