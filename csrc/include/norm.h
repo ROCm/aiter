@@ -4,8 +4,7 @@
 #include <torch/extension.h>
 
 // void layernorm2d(torch::Tensor &out, torch::Tensor &input, torch::Tensor &weight, torch::Tensor &bias, double epsilon);
-torch::Tensor layernorm2d(torch::Tensor &out,
-                          torch::Tensor &input,
+torch::Tensor layernorm2d(torch::Tensor &input,
                           torch::Tensor &weight,
                           torch::Tensor &bias,
                           double epsilon,

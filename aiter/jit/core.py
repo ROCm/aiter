@@ -722,6 +722,10 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
+                    if loadName in ["ck_moe_stage2", "ck_moe_stage1"]:
+                        # We added two additional parameters for gen build, but not needed later.
+                        return True
+
                     callargs = inspect.getcallargs(func, *args, **kwargs)
 
                     for el, arg in callargs.items():

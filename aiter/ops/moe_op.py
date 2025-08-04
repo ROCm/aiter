@@ -220,6 +220,39 @@ def cmdGenFunc_ck_moe_stage(
         "blob_gen_cmd": blob_gen_cmd,
     }
 
+def cmdGenFunc_ck_moe_stage2(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str = "",
+    w1_scale: Optional[Tensor] = None,
+    a1_scale: Optional[Tensor] = None,
+    block_m: Optional[int] = 32,
+    sorted_weights: Optional[Tensor] = None,
+    quant_type: Optional[Enum] = QuantType.No.value,
+    activation: Optional[Enum] = ActivationType.Silu.value,
+):
+
+    mul_routed_weight_stage = 2 if sorted_weights is None else 1
+    md_name, blob_gen_cmd = get_moe_stage_module(
+        hidden_states.dtype,
+        w1.dtype,
+        out.dtype,
+        activation,
+        quant_type,
+        mul_routed_weight_stage,
+    )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
 
 @compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
 def ck_moe_stage1(
@@ -241,7 +274,7 @@ def ck_moe_stage1(
 ) -> None: ...
 
 
-@compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
+@compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage2)
 def ck_moe_stage2(
     inter_states: Tensor,
     w1: Tensor,

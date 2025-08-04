@@ -57,7 +57,7 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int id)
 }
 
 
-void batched_gemm_a8w8_tune(
+torch::Tensor batched_gemm_a8w8_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -99,5 +99,5 @@ void batched_gemm_a8w8_tune(
   {
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
-  // return Y;
+  return Y;
 }

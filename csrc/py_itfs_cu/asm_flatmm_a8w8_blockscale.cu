@@ -32,7 +32,7 @@ struct __attribute__((packed)) KernelArgs
 };
 
 using namespace hip_fp8_impl;
-void flatmm_a8w8_blockscale_asm(
+torch::Tensor flatmm_a8w8_blockscale_asm(
     torch::Tensor &XQ,      // [M, K]
     torch::Tensor &WQ,      // [N, K] -> [N/128, K*128]
     torch::Tensor &x_scale, // [K/128, M]
@@ -88,5 +88,5 @@ void flatmm_a8w8_blockscale_asm(
                              1,     // bdz
                              stream});                                 
 
-    // return out;
+    return out;
 }

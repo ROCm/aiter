@@ -52,7 +52,7 @@ RowwiseKernel rowwise_dispatch(int id)
 }
 
 
-void gemm_a8w8_tune(
+torch::Tensor gemm_a8w8_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &x_scale,
@@ -93,5 +93,5 @@ void gemm_a8w8_tune(
   {
     TORCH_CHECK(false, "Unsupported scales/output dtype!");
   }
-  // return Y;
+  return Y;
 }

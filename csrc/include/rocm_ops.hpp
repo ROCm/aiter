@@ -799,7 +799,6 @@
 #define NORM_PYBIND                                               \
     m.def("layernorm2d_fwd",                                      \
           &layernorm2d,                                           \
-          py::arg("out"),                                         \
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \
