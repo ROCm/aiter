@@ -59,7 +59,7 @@ def gen_pa_fwd_asm(
     high_precision: Optional[
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: str = "",
+    kernelName: Optional[str] = None,
 ):
     if out_ is not None:
         return out_
@@ -108,7 +108,7 @@ def pa_fwd_asm(
     high_precision: Optional[
         int
     ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
-    kernelName: str = "",
+    kernelName: Optional[str] = None,
 ) -> torch.Tensor: ...
 
 
