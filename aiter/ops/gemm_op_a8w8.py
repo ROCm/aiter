@@ -204,7 +204,7 @@ def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
         # for pytorch 2.4
         import torch._custom_op.impl
 
-        schema_str = torch._custom_op.impl.infer_schema(get_CKGEMM_config_, ["unknown"])
+        schema_str = torch._custom_op.impl.infer_schema(get_CKGEMM_config_, ["X"])
 
     torch.library.define(op_name, schema_str, lib=aiter_lib)
     torch.library.impl(op_name, "cuda", get_CKGEMM_config_, lib=aiter_lib)
