@@ -89,12 +89,9 @@ def gemm_a4w4(
         or (ck_config is not None and kernelName.find("_ZN") == -1)
         # or bias is None
     ):
-        splitK = 0 if splitK is None else splitK
-        return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
-    assert (
-        out.shape[0] % 32 == 0
-    ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
-    return gemm_a4w4_asm(
+        gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
+        return out
+    gemm_a4w4_asm(
         A,
         B,
         A_scale,
@@ -107,6 +104,7 @@ def gemm_a4w4(
         bpreshuffle,
         log2_k_split=splitK,
     )
+    return out
 
 
 @compile_ops("module_gemm_a4w4_asm")
@@ -122,7 +120,7 @@ def gemm_a4w4_asm(
     beta: Optional[float] = 0.0,
     bpreshuffle: Optional[bool] = True,
     log2_k_split: Optional[int] = None,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a4w4_blockscale")
@@ -133,7 +131,7 @@ def gemm_a4w4_blockscale(
     w_scale: torch.Tensor,
     Out: torch.Tensor,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...
 
 
 @compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune")
@@ -145,4 +143,4 @@ def gemm_a4w4_blockscale_tune(
     Out: torch.Tensor,
     kernelId: int,
     splitK: int = 0,
-) -> torch.Tensor: ...
+) -> None: ...

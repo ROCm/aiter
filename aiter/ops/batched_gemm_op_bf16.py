@@ -16,8 +16,8 @@ from ..jit.utils.chip_info import get_cu_num
 
 @compile_ops("module_batched_gemm_bf16", fc_name="batched_gemm_bf16")
 def batched_gemm_bf16(
-    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK=0
-): ...
+    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK: int = 0
+) -> None: ...
 
 
 @functools.lru_cache(maxsize=1024)
@@ -80,10 +80,11 @@ def batched_gemm_bf16_CK(
         else:
             splitK = 0
     Y = torch.empty(b, m, n, dtype=dtype, device=XQ.device)
-    return batched_gemm_bf16(XQ, WQ, Y, bias, splitK)
+    batched_gemm_bf16(XQ, WQ, Y, bias, splitK)
+    return Y
 
 
 @compile_ops("module_batched_gemm_bf16_tune", fc_name="batched_gemm_bf16_tune")
 def batched_gemm_bf16_tune(
-    XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK=0
-): ...
+    XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK: int = 0
+) -> None: ...

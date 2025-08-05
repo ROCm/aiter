@@ -13,13 +13,15 @@ from ..utility import dtypes, fp4_utils
 
 
 @compile_ops("module_smoothquant")
-def smoothquant_fwd(input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor): ...
+def smoothquant_fwd(
+    input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor
+) -> None: ...
 
 
 @compile_ops("module_smoothquant")
 def moe_smoothquant_fwd(
     input: Tensor, out: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
-): ...
+) -> None: ...
 
 
 # following are pure torch implement
@@ -356,11 +358,11 @@ def get_torch_act(aType):
 
 
 @compile_ops("module_quant")
-def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
 @compile_ops("module_quant")
-def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
 @compile_ops("module_quant")
@@ -381,10 +383,10 @@ def dynamic_per_group_scaled_quant_fp4(
     input: Tensor,
     scales: Tensor,
     group_size: Optional[int] = 32,
-    shuffle_scale=True,
+    shuffle_scale: bool = True,
     num_rows: Optional[Tensor] = None,
     num_rows_factor: int = 1,
-):
+) -> None:
     """
     Only support group_size in [32, 64, 128]
     """
@@ -396,4 +398,4 @@ def partial_transpose(
     out: Tensor,
     input: Tensor,
     num_rows: Tensor,
-): ...
+) -> None: ...

@@ -17,7 +17,7 @@ def rope_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of traditional RoPE (Rotary Position Embedding).
     Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
@@ -37,7 +37,7 @@ def rope_bwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Backward propagation of traditional RoPE (Rotary Position Embedding).
     Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
@@ -59,7 +59,7 @@ def rope_2c_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of traditional RoPE (Rotary Position Embedding) on two channels.
     Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
@@ -81,7 +81,7 @@ def rope_2c_bwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Backward propagation of traditional RoPE (Rotary Position Embedding) on two channels.
     Input and output should be in "sbhd" format and freqs should be in shape of [s, 1, 1, d // 2]
@@ -102,7 +102,7 @@ def rope_cached_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
@@ -123,7 +123,7 @@ def rope_cached_bwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin.
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
@@ -146,7 +146,7 @@ def rope_cached_2c_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin on two channels.
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
@@ -169,7 +169,7 @@ def rope_cached_2c_bwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Backward propagation of RoPE (Rotary Position Embedding) with cached cos and sin on two channels.
     Input and output should be in "sbhd" format, and cos and sin should be in shape of [s, 1, 1, d // 2]
@@ -191,7 +191,7 @@ def rope_cached_positions_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
     on one channel. Offsets here is optional. Both positions and offsets should be in [s, b].
@@ -216,7 +216,7 @@ def rope_cached_positions_2c_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
     on two channels. Offsets here is optional. Both positions and offsets should be in [s, b].
@@ -240,7 +240,7 @@ def rope_cached_positions_offsets_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
     on one channel. Offsets here is optional. Both positions and offsets should be in [s, b].
@@ -266,7 +266,7 @@ def rope_cached_positions_offsets_2c_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with cached cos and sin with positions and offsets
     on two channels. Offsets here is optional. Both positions and offsets should be in [s, b].
@@ -288,7 +288,7 @@ def rope_thd_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with input sizes: (t, h, d).
     where t is cumulative sum of sequence lengths.
@@ -310,7 +310,7 @@ def rope_thd_bwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Backward propagation of RoPE (Rotary Position Embedding) with input sizes: (t, h, d).
     where t is cumulative sum of sequence lengths.
@@ -336,7 +336,7 @@ def rope_2d_fwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Forward propagation of RoPE (Rotary Position Embedding) with 2D image as input.
     Input and output should be in (b, s, h, d) where s = H * W.
@@ -364,7 +364,7 @@ def rope_2d_bwd_impl(
     rotate_style: int,
     reuse_freqs_front_part: bool,
     nope_first: bool,
-):
+) -> None:
     """
     Backward propagation of RoPE (Rotary Position Embedding) with 2D image as input.
     output_grads and input_grads should be in (b, s, h, d) where s = H * W.
