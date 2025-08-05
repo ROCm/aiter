@@ -237,7 +237,7 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
                         (a.batch_stride_lse >= a.nhead_stride_lse) && (a.hdim_q == a.hdim_v) &&
                         (a.hdim_q == 128) && (a.stride_q == a.stride_o) && (a.nhead_stride_q == a.nhead_stride_o) &&
                         (a.stride_k == a.stride_v) && (a.nhead_stride_k == a.nhead_stride_v) && (a.batch_stride_k == a.batch_stride_v) &&
-                        (a.batch_stride_q == a.batch_stride_o) && (a.batch_stride_q >= a.stride_q) && (a.batch_stride_o >= a.stride_o)) {{
+                        (a.batch_stride_q == a.batch_stride_o) && (a.batch_stride_q >= a.stride_q) && (a.batch_stride_k >= a.stride_k)) {{
                         {F_dispatch}
             }}
         }}
