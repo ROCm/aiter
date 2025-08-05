@@ -619,6 +619,7 @@ def compile_ops(
             else:
                 # for pytorch 2.4
                 import torch._custom_op.impl
+
                 sig = torch._custom_op.impl.infer_schema(func, ["unknown"])
             schema = f"{sig}"
         loadName = func.__name__
