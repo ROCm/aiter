@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import aiter
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
+import argparse
 
 
 @perftest()
@@ -105,11 +106,48 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     checkAllclose(res_a, res_c, atol=0.01, msg="asm res")
 
 
+l_dtype = ["bf16"]
+parser = argparse.ArgumentParser(
+    description="Test layernorm2d performance and correctness",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-m",
+    type=int,
+    nargs="?",
+    default=128,
+    help="""Number of rows in the input tensor.
+    e.g.: -m 128""",
+)
+parser.add_argument(
+    "-n",
+    type=int,
+    nargs="?",
+    default=8192,
+    help="""Number of columns in the input tensor.
+    e.g.: -n 8192""",
+)
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
 #             test_layernorm2d(dtype, m, n)
-test_layernorm2d_fuseAdd(dtypes.bf16, 128, 8192)
+for dtype in l_dtype:
+    test_layernorm2d_fuseAdd(dtype, args.m, args.n)
 
 
 # print('\nstart fuse add test')
