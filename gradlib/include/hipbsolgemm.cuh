@@ -41,7 +41,7 @@ void hipb_destroy_extension();
 torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
                       const int solution_index,
                       std::optional<torch::Tensor> bias = std::nullopt,
-                      std::optional<py::object> out_dtype = std::nullopt,
+                      std::optional<c10::ScalarType> out_dtype = std::nullopt,
                       std::optional<torch::Tensor> scaleA = std::nullopt,
                       std::optional<torch::Tensor> scaleB = std::nullopt,
                       std::optional<torch::Tensor> scaleOut = std::nullopt);
@@ -49,7 +49,7 @@ torch::Tensor hipb_mm(const torch::Tensor &mat1, const torch::Tensor &mat2,
 std::vector<int> hipb_findallsols(
     const torch::Tensor &mat1, const torch::Tensor &mat2,
     std::optional<torch::Tensor> bias = std::nullopt,
-    std::optional<py::object> out_dtype = std::nullopt,
+    std::optional<c10::ScalarType> out_dtype = std::nullopt,
     std::optional<torch::Tensor> scaleA = std::nullopt,
     std::optional<torch::Tensor> scaleB = std::nullopt,
     std::optional<torch::Tensor> scaleC = std::nullopt);
