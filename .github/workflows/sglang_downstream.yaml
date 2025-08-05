@@ -32,8 +32,8 @@ jobs:
           docker build --no-cache \
           --build-arg SGL_BRANCH=v0.4.9.post3 \
           --build-arg GPU_ARCH=gfx942 \
-          --build-arg AITER_COMMIT="${{ github.event.pull_request.head.sha }}" \
           --build-arg AITER_REPO="${{ github.event.pull_request.head.repo.clone_url }}" \
+          --build-arg AITER_COMMIT="${{ github.event.pull_request.head.sha }}" \
           -t sglang_aiter_test -f docker/Dockerfile.rocm .
             
       - name: Start CI container
