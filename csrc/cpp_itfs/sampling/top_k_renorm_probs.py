@@ -74,3 +74,13 @@ def top_k_renorm_probs(
         stream,
     )
     return renorm_probs
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--d", type=int, required=True)
+    parser.add_argument("--folder", type=str, default=None)
+    args = parser.parse_args()
+    compile(**vars(args))

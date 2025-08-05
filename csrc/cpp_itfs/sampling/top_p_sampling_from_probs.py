@@ -3,7 +3,7 @@
 
 
 from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
+from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 
 
 MD_NAME = "top_p_sampling_from_probs"
@@ -92,3 +92,14 @@ def top_p_sampling_from_probs(
         stream,
     )
     return samples
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--d", type=int, required=True)
+    parser.add_argument("--deterministic", type=str_to_bool, required=True)
+    parser.add_argument("--folder", type=str, default=None)
+    args = parser.parse_args()
+    compile(**vars(args))
