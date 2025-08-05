@@ -331,7 +331,15 @@ parser.add_argument(
     choices=l_test,
     default=None,
     help="""Select test to run.
-    e.g.: -t test_fmoe_16_bit""",
+    e.g.: -t test_fmoe_16_bit
+          or  -t test_fmoe_16_bit
+          or  -t g1u1_no_quant
+          or  -t g1u1_int8quant
+          or  -t g1u1_fp8quant
+          or  -t g1u0_int8smoothquant
+          or  -t g1u1_int8smoothquant
+          or  -t g1u1_fp8smoothquant
+          or  -t g1u1_int4""",
 )
 parser.add_argument(
     "-d",

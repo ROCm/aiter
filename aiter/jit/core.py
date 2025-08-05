@@ -482,13 +482,141 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
+MANUAL_SCHEMA_OPS = [
+    "register_graph_buffers",
+    "module_moe_ck2stages",
+    "mha_fwd",
+    "fmha_v3_fwd",
+    "mha_varlen_fwd",
+    "mha_bwd",
+    "fmha_v3_bwd",
+    "mha_varlen_bwd",
+    "fmha_v3_varlen_bwd",
+    "mha_batch_prefill",
+    "hipb_findallsols",
+    "rocb_findallsols",
+    "_ActivationType",
+    "_QuantType",
+    "init_custom_ar",
+]
+
+NONE_WRAPPED_OP = [
+    "hipb_create_extension",
+    "hipb_destroy_extension",
+    "getHipblasltKernelName",
+    "rocb_create_extension",
+    "rocb_destroy_extension",
+    "get_meta_buffer_ipc_handle",
+    "get_graph_buffer_ipc_meta",
+    "_ActivationType",
+    "_QuantType",
+    "allocate_meta_buffer",
+    "dispose",
+    "meta_size",
+    "get_padded_m",
+]
+
+
+def generate_schema(func) -> str:
+    import inspect
+    import torch
+    from typing import Optional, Union, List, get_origin, get_args
+
+    sig = inspect.signature(func)
+    parameters = []
+
+    for idx, (name, param) in enumerate(sig.parameters.items()):
+        param_type = param.annotation
+        flag = True
+
+        if param_type is torch.Tensor:
+            type_str = f"Tensor(a{idx}!)"
+        elif param_type == Optional[torch.Tensor]:
+            type_str = f"Tensor(a{idx}!)?"
+        elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
+            type_str = f"Tensor(a{idx}!)?"
+        elif param_type in (torch.SymInt, int):
+            type_str = "SymInt"
+        elif param_type in (float, bool, str):
+            type_str = param_type.__name__
+        elif param_type == Optional[torch.Generator]:
+            type_str = "Generator?"
+        elif (
+            get_origin(param_type) in (list, List)
+            and get_args(param_type)[0] is torch.Tensor
+        ):
+            type_str = f"Tensor(a{idx}!)[]"
+        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
+            type_str = "int[]"
+        else:
+            type_str = "*"
+            flag = False
+        if flag:
+            param_str = f"{type_str} {name}"
+
+            if param.default != inspect.Parameter.empty:
+                if param.default is None:
+                    param_str += "=None"
+                else:
+                    param_str += f"={param.default}"
+        else:
+            param_str = f"{type_str} "
+
+        parameters.append(param_str)
+    return_annotation = sig.return_annotation
+    return_type = ""
+    if return_annotation is type(None) or return_annotation is None:
+        return_type = "()"
+    elif return_annotation is torch.Tensor:
+        return_type = "Tensor"
+    elif (
+        get_origin(return_annotation) is list and get_args(return_annotation)[0] is int
+    ):
+        return_type = "int[]"
+    elif return_annotation is int:
+        return_type = "int"
+    elif return_annotation is float:
+        return_type = "float"
+    elif return_annotation is bool:
+        return_type = "bool"
+    elif (
+        get_origin(return_annotation) is list
+        and get_args(return_annotation)[0] is torch.Tensor
+    ):
+        return_type = "Tensor[]"
+
+    schema = f"({', '.join(parameters)}) -> {return_type}"
+
+    return schema
+
+
 def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
+    gen_fake: Optional[Callable[..., Any]] = None,
 ):
+
     def decorator(func):
+        import torch
+        from csrc.cpp_itfs.torch_utils import aiter_lib
+        import torch.library
+        import inspect
+
         func.arg_checked = False
+
+        schema = ""
+        if func.__name__ in MANUAL_SCHEMA_OPS:
+            schema = generate_schema(func)
+        else:
+            sig = inspect.signature(func)
+            mutates_args = []
+            for name, param in sig.parameters.items():
+                if param.annotation is torch.Tensor:
+                    mutates_args.append(name)
+            sig = torch.library.infer_schema(func, mutates_args="unknown")
+            schema = f"{sig}"
+        loadName = func.__name__
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -563,6 +691,16 @@ def compile_ops(
                 op = getattr(module, loadName)
             else:
                 return None
+            activation_index = 0
+            quant_index = 0
+            activation_list = [
+                "fmoe_g1u1",
+                "fmoe_int8_g1u0",
+                "fmoe_g1u1_tkw1",
+                "fmoe_fp8_blockscale_g1u1",
+                "moe_stage1_g1u1",
+            ]
+            quant_list = ["moe_stage1_g1u1"]
 
             def check_args():
                 get_asm_dir()
@@ -585,7 +723,10 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
+                    if loadName in activation_list:
+                        return True
+                    if loadName in quant_list:
+                        return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -630,8 +771,51 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
+            sig = inspect.signature(func)
+            params = list(sig.parameters.keys())
+            if loadName in activation_list:
+                activation_index = params.index("activation")
+                args_list = list(args)
+                from aiter import ActivationType, QuantType
+
+                if len(args_list) > activation_index and isinstance(
+                    args_list[activation_index], int
+                ):
+                    args_list[activation_index] = ActivationType(
+                        args_list[activation_index]
+                    )
+                    args = tuple(args_list)
+
+            if loadName in quant_list:
+                quant_index = params.index("quant_type")
+                args_list = list(args)
+                from aiter import ActivationType, QuantType
+
+                if len(args_list) > quant_index and isinstance(
+                    args_list[quant_index], int
+                ):
+                    args_list[quant_index] = QuantType(args_list[quant_index])
+                    args = tuple(args_list)
             return op(*args, **kwargs)
 
-        return wrapper
+        def abstract_impl(*args, custom_build_args={}, **kwargs):
+            if gen_fake is not None:
+                return gen_fake(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        if loadName in NONE_WRAPPED_OP:
+            return wrapper
+
+        if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            op_schema = f"aiter::wrapper_{loadName}" + schema
+            aiter_lib.define(op_schema)
+            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
+            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
+            aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+
+        def wrapper_return(*args, **kwargs):
+            return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
+
+        return wrapper_return
 
     return decorator
