@@ -2,15 +2,14 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, Generator
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Any
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
 from ..jit.utils.chip_info import get_gfx, get_cu_num
 from ..utility import dtypes
 import torch
 
 
-@compile_ops("module_mha_fwd", fc_name="mha_fwd")
-def mha_fwd(
+def cmdGenFunc_mha_fwd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -25,184 +24,10 @@ def mha_fwd(
     bias: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_fmha_v3_fwd", fc_name="fmha_v3_fwd")
-def fmha_v3_fwd(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_fwd", fc_name="mha_varlen_fwd")
-def mha_varlen_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    min_seqlen_q: int,
-    dropout_p: float,
-    softmax_scale: float,
-    logits_soft_cap: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    return_softmax_lse: bool,
-    return_dropout_randval: bool,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-) -> list[torch.Tensor]: ...
-
-
-@compile_ops("module_mha_bwd", fc_name="mha_bwd")
-def mha_bwd(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    dbias: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_fmha_v3_bwd", fc_name="fmha_v3_bwd")
-def fmha_v3_bwd(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    is_v3_atomic_fp32: bool,
-    how_v3_bf16_cvt: int,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-@compile_ops("module_mha_varlen_bwd", fc_name="mha_varlen_bwd")
-def mha_varlen_bwd(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    custom_build_args: Optional[dict] = None,
-): ...
-
-
-@compile_ops("module_fmha_v3_varlen_bwd", fc_name="fmha_v3_varlen_bwd")
-def fmha_v3_varlen_bwd(
-    dout: Tensor,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    out: Tensor,
-    softmax_lse: Tensor,
-    cu_seqlens_q: Tensor,
-    cu_seqlens_k: Tensor,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    dropout_p: float,
-    softmax_scale: float,
-    zero_tensors: bool,
-    is_causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    deterministic: bool,
-    is_v3_atomic_fp32: bool,
-    how_v3_bf16_cvt: int,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-): ...
-
-
-def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
-
-
-def _flash_attn_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dropout_p: float,
-    softmax_scale: float,
-    causal: bool,
-    window_size_left: int,
-    window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    return_lse: bool,
-    return_softmax: bool,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+):
     (_, seqlen_q, _, _) = q.shape
     # causal=true is the same as causal=false in this case
+    causal = is_causal
     if seqlen_q == 1 and alibi_slopes is None:
         causal = False
 
@@ -229,7 +54,7 @@ def _flash_attn_forward(
     else:
         md_name += "_mask"
         filter += "_mask*"
-    if return_lse:
+    if return_softmax_lse:
         md_name += "_lse"
         filter += "_lse*"
     else:
@@ -247,6 +72,883 @@ def _flash_attn_forward(
         "--receipt 100 --filter {} --output_dir {{}}".format(filter),
         f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 2 --output_dir {{}}",
     ]
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+def common_mha_fwd_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+):
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+
+    if out is not None:
+        assert out.dtype == q.dtype, "Output must have the same dtype as inputs"
+        assert out.device == q.device, "Output must be on the same device as inputs"
+        assert out.stride(-1) == 1, "Output tensor must have contiguous last dimension"
+        assert out.shape == (
+            batch_size,
+            seqlen_q,
+            num_heads,
+            head_size_v,
+        ), "Output tensor has incorrect shape"
+    else:
+        out = torch.empty(
+            (batch_size, seqlen_q, num_heads, head_size_v),
+            dtype=q.dtype,
+            device=q.device,
+            requires_grad=q.requires_grad,
+        )
+
+    if return_softmax_lse:
+        softmax_lse = torch.empty(
+            (batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+
+    if return_dropout_randval:
+        assert dropout_p > 0, "return_dropout_randval requires p_dropout > 0"
+        p = torch.empty(
+            (batch_size, num_heads, seqlen_q, seqlen_k),
+            dtype=torch.uint8,
+            device=q.device,
+        )
+    else:
+        p = torch.empty((0,), device=q.device)
+
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+
+    return out, softmax_lse, p, rng_state
+
+
+def gen_mha_fwd_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return common_mha_fwd_fake_tensors(
+        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
+    )
+
+
+@compile_ops("module_mha_fwd", fc_name="mha_fwd", gen_fake=gen_mha_fwd_fake_tensors)
+def mha_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
+
+
+def gen_fmha_v3_fwd_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return common_mha_fwd_fake_tensors(
+        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
+    )
+
+
+@compile_ops(
+    "module_fmha_v3_fwd", fc_name="fmha_v3_fwd", gen_fake=gen_fmha_v3_fwd_fake_tensors
+)
+def fmha_v3_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
+
+
+def cmdGenFunc_mha_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+):
+    # causal=true is the same as causal=false in this case
+    causal = is_causal
+    if max_seqlen_q == 1 and alibi_slopes is None:
+        causal = False
+    md_name = "mha_varlen_fwd"
+    if block_table is None:
+        filter_fwd = "*"  # get_fwd_blobs()
+        if q.dtype == dtypes.fp16:
+            md_name += "_fp16"
+            filter_fwd += "fp16*"
+        elif q.dtype == dtypes.bf16:
+            md_name += "_bf16"
+            filter_fwd += "bf16*"
+        if 0.0 < logits_soft_cap:
+            md_name += "_logits"
+            filter_fwd += "_logits*"
+        else:
+            md_name += "_nlogits"
+            filter_fwd += "_nlogits*"
+        if bias is not None:
+            md_name += "_bias"
+            filter_fwd += "_bias*"
+        elif alibi_slopes is not None:
+            md_name += "_alibi"
+            filter_fwd += "_alibi*"
+        else:
+            md_name += "_nbias"
+            filter_fwd += "_nbias*"
+        if not causal and window_size_left == -1 and window_size_right == -1:
+            md_name += "_nmask"
+            filter_fwd += "_nmask*"
+        else:
+            md_name += "_mask"
+            filter_fwd += "_mask*"
+        if return_softmax_lse:
+            md_name += "_lse"
+            filter_fwd += "_lse*"
+        else:
+            md_name += "_nlse"
+            filter_fwd += "_nlse*"
+        if dropout_p == 0:
+            md_name += "_ndropout"
+            filter_fwd += "_ndropout*"
+        else:
+            md_name += "_dropout"
+            filter_fwd += "_dropout*"
+        if min_seqlen_q == 0:
+            md_name += "_nskip"
+            filter_fwd += "_nskip*"
+        else:
+            md_name += "_skip"
+            filter_fwd += "_skip*"
+        blob_gen_cmd = [
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        ]
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            "--receipt 200 --filter {} --output_dir {{}}".format('" @ "')
+        )
+        blob_gen_cmd.append(
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
+        )
+    else:
+        filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
+        filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
+        if q.dtype == dtypes.fp16:
+            md_name += "_fp16"
+            filter_fwd_splitkv1 += "fp16*"
+            filter_fwd_splitkv2 += "fp16*"
+        elif q.dtype == dtypes.bf16:
+            md_name += "_bf16"
+            filter_fwd_splitkv1 += "bf16*"
+            filter_fwd_splitkv2 += "bf16*"
+        if 0.0 < logits_soft_cap:
+            md_name += "_logits"
+            filter_fwd += "_logits*"
+        else:
+            md_name += "_nlogits"
+            filter_fwd += "_nlogits*"
+        if bias is not None:
+            md_name += "_bias"
+            filter_fwd_splitkv2 += "_bias*"
+        elif alibi_slopes is not None:
+            md_name += "_alibi"
+            filter_fwd_splitkv2 += "_alibi*"
+        else:
+            md_name += "_nbias"
+            filter_fwd_splitkv2 += "_nbias*"
+        if not is_causal and window_size_left == -1 and window_size_right == -1:
+            md_name += "_nmask"
+            filter_fwd_splitkv2 += "_nmask*"
+        else:
+            md_name += "_mask"
+            filter_fwd_splitkv2 += "_mask*"
+        if return_softmax_lse:
+            md_name += "_lse"
+            filter_fwd_splitkv1 += "_lse*"
+            filter_fwd_splitkv2 += "_lse*"
+        else:
+            md_name += "_nlse"
+            filter_fwd_splitkv1 += "_nlse*"
+            filter_fwd_splitkv2 += "_nlse*"
+        md_name += "_pagedkv"
+        filter_fwd_splitkv2 += "_pagedkv*"
+        filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
+        blob_gen_cmd = [
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
+            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+        ]
+        blob_gen_cmd.append(
+            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
+            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+        )
+        blob_gen_cmd.append(
+            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
+        )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+def gen_mha_varlen_fwd_fake_tensor(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> List[torch.Tensor]:
+    return common_mha_fwd_fake_tensors(
+        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
+    )
+
+
+@compile_ops(
+    "module_mha_varlen_fwd",
+    fc_name="mha_varlen_fwd",
+    gen_func=cmdGenFunc_mha_varlen_fwd,
+    gen_fake=gen_mha_fwd_fake_tensors,
+)
+def mha_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> List[torch.Tensor]: ...
+
+
+def cmdGenFunc_mha_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    dbias: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+):
+    md_name = "mha_bwd"
+    filter1 = "*"  # get_bwd_dot_do_o_blobs()
+    filter2 = "*"  # get_bwd_convert_dq_blobs()
+    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == dtypes.fp16:
+        md_name += "_fp16"
+        filter1 += "fp16*"
+        filter2 += "fp16*"
+        filter3 += "fp16*"
+    elif q.dtype == dtypes.bf16:
+        md_name += "_bf16"
+        filter1 += "bf16*"
+        filter2 += "bf16*"
+        filter3 += "bf16*"
+    if bias is not None:
+        md_name += "_bias"
+        filter3 += "_bias*"
+    elif alibi_slopes is not None:
+        md_name += "_alibi"
+        filter3 += "_alibi*"
+    else:
+        md_name += "_nbias"
+        filter3 += "_nbias*"
+    if dbias is not None:
+        md_name += "_dbias"
+        filter3 += "_dbias*"
+    else:
+        md_name += "_ndbias"
+        filter3 += "_ndbias*"
+    if not is_causal and window_size_left == -1 and window_size_right == -1:
+        md_name += "_nmask"
+        filter3 += "_nmask*"
+    else:
+        md_name += "_mask"
+        filter3 += "_mask*"
+    if dropout_p == 0:
+        md_name += "_ndropout"
+        filter3 += "_ndropout*"
+    else:
+        md_name += "_dropout"
+        filter3 += "_dropout*"
+    if deterministic:
+        md_name += "_deterministic"
+        filter2 += "_deterministic*"
+        filter3 += "_deterministic*"
+    else:
+        md_name += "_ndeterministic"
+        filter2 += "_ndeterministic*"
+        filter3 += "_ndeterministic*"
+
+    filter = f"{filter1}@{filter2}@{filter3}"
+
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+    ]
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+def common_mha_bwd_fake_tensors(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+):
+    batch_size = q.size(0)
+    seqlen_q = q.size(1)
+    num_heads = q.size(2)
+    head_size_q = q.size(3)
+    head_size_v = v.size(3)
+    seqlen_k = k.size(1)
+    num_heads_k = k.size(2)
+
+    if dq is None:
+        dq = torch.empty_like(q)  # (batch_size, seqlen_q, num_heads, head_size_q)
+    else:
+        assert dq.dtype == q.dtype, "dq must have the same dtype as q"
+        assert dq.device == q.device, "dq must be on the same device as q"
+        assert dq.stride(-1) == 1, "dq must have contiguous last dimension"
+        assert dq.shape == (
+            batch_size,
+            seqlen_q,
+            num_heads,
+            head_size_q,
+        ), "dq has incorrect shape"
+
+    if dk is None:
+        dk = torch.empty_like(k)  # (batch_size, seqlen_k, num_heads_k, head_size_q)
+    else:
+        assert dk.dtype == q.dtype, "dk must have the same dtype as q"
+        assert dk.device == q.device, "dk must be on the same device as q"
+        assert dk.stride(-1) == 1, "dk must have contiguous last dimension"
+        assert dk.shape == (
+            batch_size,
+            seqlen_k,
+            num_heads_k,
+            head_size_q,
+        ), "dk has incorrect shape"
+
+    if dv is None:
+        dv = torch.empty_like(v)  # (batch_size, seqlen_k, num_heads_k, head_size_v)
+    else:
+        assert dv.dtype == q.dtype, "dv must have the same dtype as q"
+        assert dv.device == q.device, "dv must be on the same device as q"
+        assert dv.stride(-1) == 1, "dv must have contiguous last dimension"
+        assert dv.shape == (
+            batch_size,
+            seqlen_k,
+            num_heads_k,
+            head_size_v,
+        ), "dv has incorrect shape"
+
+    softmax_d = torch.empty(
+        (batch_size, num_heads, seqlen_q),  # {batch_size, num_heads, seqlen_q}
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    return [dq, dk, dv, softmax_d]
+
+
+def gen_mha_bwd_fake_tensors(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    dbias: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]:
+    return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
+
+@compile_ops(
+    "module_mha_bwd",
+    fc_name="mha_bwd",
+    gen_func=cmdGenFunc_mha_bwd,
+    gen_fake=gen_mha_bwd_fake_tensors,
+)
+def mha_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    dbias: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
+
+
+def gen_fmha_v3_bwd_fake_tensors(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]:
+    return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
+
+@compile_ops(
+    "module_fmha_v3_bwd", fc_name="fmha_v3_bwd", gen_fake=gen_fmha_v3_bwd_fake_tensors
+)
+def fmha_v3_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
+
+
+def cmdGenFunc_mha_varlen_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> dict[str, Any]:
+    md_name = "mha_varlen_bwd"
+    filter1 = "*"  # get_bwd_dot_do_o_blobs()
+    filter2 = "*"  # get_bwd_convert_dq_blobs()
+    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
+    if q.dtype == dtypes.fp16:
+        md_name += "_fp16"
+        filter1 += "fp16*"
+        filter2 += "fp16*"
+        filter3 += "fp16*"
+    elif q.dtype == dtypes.bf16:
+        md_name += "_bf16"
+        filter1 += "bf16*"
+        filter2 += "bf16*"
+        filter3 += "bf16*"
+    if alibi_slopes is None:
+        md_name += "_nbias"
+        filter3 += "_nbias*"
+    else:
+        md_name += "_alibi"
+        filter3 += "_alibi*"
+    if not is_causal and window_size_left == -1 and window_size_right == -1:
+        md_name += "_nmask"
+        filter3 += "_nmask*"
+    else:
+        md_name += "_mask"
+        filter3 += "_mask*"
+    if dropout_p == 0:
+        md_name += "_ndropout"
+        filter3 += "_ndropout*"
+    else:
+        md_name += "_dropout"
+        filter3 += "_dropout*"
+    if deterministic:
+        md_name += "_deterministic"
+        filter2 += "_deterministic*"
+        filter3 += "_deterministic*"
+    else:
+        md_name += "_ndeterministic"
+        filter2 += "_ndeterministic*"
+        filter3 += "_ndeterministic*"
+    filter = f"{filter1}@{filter2}@{filter3}"
+
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
+        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
+    ]
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+def cmdGenFunc_mha_batch_prefill(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    kv_indptr: Tensor,
+    kv_page_indices: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+):
+    # causal=true is the same as causal=false in this case
+    causal = is_causal
+    if max_seqlen_q == 1 and alibi_slopes is None:
+        causal = False
+    md_name = "mha_batch_prefill"
+    filter_fwd = "*"  # get_fwd_blobs()
+    if q.dtype == torch.float16:
+        md_name += "_fp16"
+        filter_fwd += "fp16*"
+    elif q.dtype == torch.bfloat16:
+        md_name += "_bf16"
+        filter_fwd += "bf16*"
+    if 0.0 < logits_soft_cap:
+        md_name += "_logits"
+        filter_fwd += "_logits*"
+    else:
+        md_name += "_nlogits"
+        filter_fwd += "_nlogits*"
+    if alibi_slopes is None:
+        md_name += "_nbias"
+        filter_fwd += "_nbias*"
+    else:
+        md_name += "_alibi"
+        filter_fwd += "_alibi*"
+    if not causal and window_size_left == -1 and window_size_right == -1:
+        md_name += "_nmask"
+        filter_fwd += "_nmask*"
+    else:
+        md_name += "_mask"
+        filter_fwd += "_mask*"
+    if return_softmax_lse:
+        md_name += "_lse"
+        filter_fwd += "_lse*"
+    else:
+        md_name += "_nlse"
+        filter_fwd += "_nlse*"
+    if dropout_p == 0:
+        md_name += "_ndropout"
+        filter_fwd += "_ndropout*"
+    else:
+        md_name += "_dropout"
+        filter_fwd += "_dropout*"
+    blob_gen_cmd = [
+        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
+        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+    ]
+    blob_gen_cmd.append(
+        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}"
+    )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+@compile_ops(
+    "module_mha_varlen_bwd",
+    fc_name="mha_varlen_bwd",
+    gen_func=cmdGenFunc_mha_varlen_bwd,
+    gen_fake=gen_mha_bwd_fake_tensors,
+)
+def mha_varlen_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]: ...
+
+
+def gen_fmha_v3_varlen_bwd_fake_tensor(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+):
+    return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
+
+
+@compile_ops(
+    "module_fmha_v3_varlen_bwd",
+    fc_name="fmha_v3_varlen_bwd",
+    gen_fake=gen_fmha_v3_varlen_bwd_fake_tensor,
+)
+def fmha_v3_varlen_bwd(
+    dout: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    softmax_lse: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    deterministic: bool,
+    is_v3_atomic_fp32: bool,
+    how_v3_bf16_cvt: int,
+    dq: Optional[Tensor] = None,
+    dk: Optional[Tensor] = None,
+    dv: Optional[Tensor] = None,
+    alibi_slopes: Optional[Tensor] = None,
+    rng_state: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> None: ...
+
+
+def maybe_contiguous(x):
+    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _flash_attn_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    return_lse: bool,
+    return_softmax: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
@@ -308,7 +1010,7 @@ def _flash_attn_forward(
             bias,
             alibi_slopes,
             None,
-            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -340,63 +1042,6 @@ def _flash_attn_backward(
         logger.warning(
             "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
         )
-    md_name = "mha_bwd"
-    filter1 = "*"  # get_bwd_dot_do_o_blobs()
-    filter2 = "*"  # get_bwd_convert_dq_blobs()
-    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
-    if q.dtype == dtypes.fp16:
-        md_name += "_fp16"
-        filter1 += "fp16*"
-        filter2 += "fp16*"
-        filter3 += "fp16*"
-    elif q.dtype == dtypes.bf16:
-        md_name += "_bf16"
-        filter1 += "bf16*"
-        filter2 += "bf16*"
-        filter3 += "bf16*"
-    if bias is not None:
-        md_name += "_bias"
-        filter3 += "_bias*"
-    elif alibi_slopes is not None:
-        md_name += "_alibi"
-        filter3 += "_alibi*"
-    else:
-        md_name += "_nbias"
-        filter3 += "_nbias*"
-    if dbias is not None:
-        md_name += "_dbias"
-        filter3 += "_dbias*"
-    else:
-        md_name += "_ndbias"
-        filter3 += "_ndbias*"
-    if not causal and window_size_left == -1 and window_size_right == -1:
-        md_name += "_nmask"
-        filter3 += "_nmask*"
-    else:
-        md_name += "_mask"
-        filter3 += "_mask*"
-    if dropout_p == 0:
-        md_name += "_ndropout"
-        filter3 += "_ndropout*"
-    else:
-        md_name += "_dropout"
-        filter3 += "_dropout*"
-    if deterministic:
-        md_name += "_deterministic"
-        filter2 += "_deterministic*"
-        filter3 += "_deterministic*"
-    else:
-        md_name += "_ndeterministic"
-        filter2 += "_ndeterministic*"
-        filter3 += "_ndeterministic*"
-
-    filter = f"{filter1}@{filter2}@{filter3}"
-
-    blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
-    ]
 
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
@@ -624,7 +1269,7 @@ def _flash_attn_backward(
             alibi_slopes,
             rng_state,
             None,
-            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
 
@@ -838,123 +1483,6 @@ def _flash_attn_varlen_forward(
     out: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # causal=true is the same as causal=false in this case
-    if max_seqlen_q == 1 and alibi_slopes is None:
-        causal = False
-
-    md_name = "mha_varlen_fwd"
-    if block_table is None:
-        filter_fwd = "*"  # get_fwd_blobs()
-        if q.dtype == dtypes.fp16:
-            md_name += "_fp16"
-            filter_fwd += "fp16*"
-        elif q.dtype == dtypes.bf16:
-            md_name += "_bf16"
-            filter_fwd += "bf16*"
-        if 0.0 < logits_soft_cap:
-            md_name += "_logits"
-            filter_fwd += "_logits*"
-        else:
-            md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
-        if bias is not None:
-            md_name += "_bias"
-            filter_fwd += "_bias*"
-        elif alibi_slopes is not None:
-            md_name += "_alibi"
-            filter_fwd += "_alibi*"
-        else:
-            md_name += "_nbias"
-            filter_fwd += "_nbias*"
-        if not causal and window_size_left == -1 and window_size_right == -1:
-            md_name += "_nmask"
-            filter_fwd += "_nmask*"
-        else:
-            md_name += "_mask"
-            filter_fwd += "_mask*"
-        if return_lse:
-            md_name += "_lse"
-            filter_fwd += "_lse*"
-        else:
-            md_name += "_nlse"
-            filter_fwd += "_nlse*"
-        if dropout_p == 0:
-            md_name += "_ndropout"
-            filter_fwd += "_ndropout*"
-        else:
-            md_name += "_dropout"
-            filter_fwd += "_dropout*"
-        if min_seqlen_q == 0:
-            md_name += "_nskip"
-            filter_fwd += "_nskip*"
-        else:
-            md_name += "_skip"
-            filter_fwd += "_skip*"
-        blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
-        ]
-        blob_gen_cmd.append(
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" @ "')
-        )
-        blob_gen_cmd.append(
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
-        )
-    else:
-        filter_fwd_splitkv1 = "*"  # get_fwd_splitkv_combine_blobs()
-        filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
-        if q.dtype == dtypes.fp16:
-            md_name += "_fp16"
-            filter_fwd_splitkv1 += "fp16*"
-            filter_fwd_splitkv2 += "fp16*"
-        elif q.dtype == dtypes.bf16:
-            md_name += "_bf16"
-            filter_fwd_splitkv1 += "bf16*"
-            filter_fwd_splitkv2 += "bf16*"
-        if 0.0 < logits_soft_cap:
-            md_name += "_logits"
-            filter_fwd += "_logits*"
-        else:
-            md_name += "_nlogits"
-            filter_fwd += "_nlogits*"
-        if bias is not None:
-            md_name += "_bias"
-            filter_fwd_splitkv2 += "_bias*"
-        elif alibi_slopes is not None:
-            md_name += "_alibi"
-            filter_fwd_splitkv2 += "_alibi*"
-        else:
-            md_name += "_nbias"
-            filter_fwd_splitkv2 += "_nbias*"
-        if not causal and window_size_left == -1 and window_size_right == -1:
-            md_name += "_nmask"
-            filter_fwd_splitkv2 += "_nmask*"
-        else:
-            md_name += "_mask"
-            filter_fwd_splitkv2 += "_mask*"
-        if return_lse:
-            md_name += "_lse"
-            filter_fwd_splitkv1 += "_lse*"
-            filter_fwd_splitkv2 += "_lse*"
-        else:
-            md_name += "_nlse"
-            filter_fwd_splitkv1 += "_nlse*"
-            filter_fwd_splitkv2 += "_nlse*"
-        md_name += "_pagedkv"
-        filter_fwd_splitkv2 += "_pagedkv*"
-        filter_fwd_splitkv = f"{filter_fwd_splitkv1}@{filter_fwd_splitkv2}"
-        blob_gen_cmd = [
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-            "--receipt 200 --filter {} --output_dir {{}}".format('" "')
-        ]
-        blob_gen_cmd.append(
-            f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
-            "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
-        )
-        blob_gen_cmd.append(
-            f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 3 --output_dir {{}}"
-        )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
@@ -980,7 +1508,7 @@ def _flash_attn_varlen_forward(
         bias,
         alibi_slopes,
         None,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -1011,53 +1539,6 @@ def _flash_attn_varlen_backward(
     how_v3_bf16_cvt: Optional[int] = 1,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
-    md_name = "mha_varlen_bwd"
-    filter1 = "*"  # get_bwd_dot_do_o_blobs()
-    filter2 = "*"  # get_bwd_convert_dq_blobs()
-    filter3 = "*"  # get_bwd_dq_dk_dv_blobs()
-    if q.dtype == dtypes.fp16:
-        md_name += "_fp16"
-        filter1 += "fp16*"
-        filter2 += "fp16*"
-        filter3 += "fp16*"
-    elif q.dtype == dtypes.bf16:
-        md_name += "_bf16"
-        filter1 += "bf16*"
-        filter2 += "bf16*"
-        filter3 += "bf16*"
-    if alibi_slopes is None:
-        md_name += "_nbias"
-        filter3 += "_nbias*"
-    else:
-        md_name += "_alibi"
-        filter3 += "_alibi*"
-    if not causal and window_size_left == -1 and window_size_right == -1:
-        md_name += "_nmask"
-        filter3 += "_nmask*"
-    else:
-        md_name += "_mask"
-        filter3 += "_mask*"
-    if dropout_p == 0:
-        md_name += "_ndropout"
-        filter3 += "_ndropout*"
-    else:
-        md_name += "_dropout"
-        filter3 += "_dropout*"
-    if deterministic:
-        md_name += "_deterministic"
-        filter2 += "_deterministic*"
-        filter3 += "_deterministic*"
-    else:
-        md_name += "_ndeterministic"
-        filter2 += "_ndeterministic*"
-        filter3 += "_ndeterministic*"
-    filter = f"{filter1}@{filter2}@{filter3}"
-
-    blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_bwd_generate.py --receipt 1 --output_dir {{}}",
-    ]
 
     (_, nhead_q, hdim_q) = q.shape
 
@@ -1198,7 +1679,7 @@ def _flash_attn_varlen_backward(
             alibi_slopes,
             rng_state,
             None,
-            custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     return softmax_d
 
@@ -1467,7 +1948,71 @@ def flash_attn_varlen_func(
     )
 
 
-@compile_ops("module_mha_batch_prefill", fc_name="mha_batch_prefill")
+def mha_batch_prefill_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    out: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[Generator] = None,
+) -> List[Tensor]:
+    # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_heads = q.size(1)  # num_heads = q.sizes()[1]
+    head_size_v = v.size(2)  # head_size_v = v.size(2)
+    total_q = q.size(0)  # total_q = q.size(0)
+
+    if out is None:
+        out = torch.empty(
+            (total_q, num_heads, head_size_v),  # {total_q, num_heads, head_size_v}
+            dtype=q.dtype,
+            device=q.device,
+            requires_grad=q.requires_grad,
+        )
+
+    if return_softmax_lse:
+        softmax_lse = torch.empty(
+            (num_heads, total_q),  # {num_heads, total_q}
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+
+    if return_dropout_randval:
+        assert dropout_p > 0, "return_dropout_randval requires p_dropout > 0"
+        p = torch.empty(
+            (num_heads, total_q, max_seqlen_k),  # {num_heads, total_q, max_seqlen_k}
+            dtype=torch.uint8,
+            device=q.device,
+        )
+    else:
+        p = torch.empty((0,), device=q.device)
+
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+
+    return (out, softmax_lse, p, rng_state)
+
+
+@compile_ops(
+    "module_mha_batch_prefill",
+    fc_name="mha_batch_prefill",
+    gen_func=cmdGenFunc_mha_batch_prefill,
+    gen_fake=mha_batch_prefill_fake_tensors,
+)
 def mha_batch_prefill(
     q: Tensor,
     k: Tensor,
@@ -1489,7 +2034,7 @@ def mha_batch_prefill(
     out: Optional[Tensor] = None,
     alibi_slopes: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-): ...
+) -> List[Tensor]: ...
 
 
 def _mha_batch_prefill(
@@ -1513,55 +2058,6 @@ def _mha_batch_prefill(
     zero_tensors: bool = False,
     out: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    # causal=true is the same as causal=false in this case
-    if max_seqlen_q == 1 and alibi_slopes is None:
-        causal = False
-
-    md_name = "mha_batch_prefill"
-    filter_fwd = "*"  # get_fwd_blobs()
-    if q.dtype == torch.float16:
-        md_name += "_fp16"
-        filter_fwd += "fp16*"
-    elif q.dtype == torch.bfloat16:
-        md_name += "_bf16"
-        filter_fwd += "bf16*"
-    if 0.0 < logits_soft_cap:
-        md_name += "_logits"
-        filter_fwd += "_logits*"
-    else:
-        md_name += "_nlogits"
-        filter_fwd += "_nlogits*"
-    if alibi_slopes is None:
-        md_name += "_nbias"
-        filter_fwd += "_nbias*"
-    else:
-        md_name += "_alibi"
-        filter_fwd += "_alibi*"
-    if not causal and window_size_left == -1 and window_size_right == -1:
-        md_name += "_nmask"
-        filter_fwd += "_nmask*"
-    else:
-        md_name += "_mask"
-        filter_fwd += "_mask*"
-    if return_lse:
-        md_name += "_lse"
-        filter_fwd += "_lse*"
-    else:
-        md_name += "_nlse"
-        filter_fwd += "_nlse*"
-    if dropout_p == 0:
-        md_name += "_ndropout"
-        filter_fwd += "_ndropout*"
-    else:
-        md_name += "_dropout"
-        filter_fwd += "_dropout*"
-    blob_gen_cmd = [
-        f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
-        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
-    ]
-    blob_gen_cmd.append(
-        f"{AITER_CSRC_DIR}/cpp_itfs/mha_fwd_generate.py --receipt 4 --output_dir {{}}"
-    )
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
@@ -1585,7 +2081,7 @@ def _mha_batch_prefill(
         out,
         alibi_slopes,
         None,
-        custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
     )
     return out, softmax_lse, S_dmask, rng_state
 

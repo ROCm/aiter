@@ -137,7 +137,7 @@ BatchedKernel batched_dispatch(int B, int M, int N, int K)
   return batched_heuristic_dispatch(B, M, N, K);
 }
 
-torch::Tensor batched_gemm_bf16(
+void batched_gemm_bf16(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
@@ -158,5 +158,5 @@ torch::Tensor batched_gemm_bf16(
 
   batched_dispatch(B, M, N, K)(XQ, WQ, Y, bias, KBatch);
 
-  return Y;
+  // return Y;
 }

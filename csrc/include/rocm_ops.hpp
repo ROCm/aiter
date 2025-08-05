@@ -558,11 +558,14 @@
           py::arg("num_valid_ids"),                  \
           py::arg("out"),                            \
           py::arg("topk"),                           \
-          py::arg("kernelName"),                     \
+          py::arg("kernelName")     = "",            \
           py::arg("w1_scale")       = std::nullopt,  \
           py::arg("a1_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt); \
+          py::arg("sorted_weights") = std::nullopt,  \
+          py::arg("quant_type") = 0,                 \
+          py::arg("activation") = 0);                \
+                                                     \
                                                      \
     m.def("ck_moe_stage2",                           \
           &ck_moe_stage2,                            \
@@ -574,11 +577,14 @@
           py::arg("num_valid_ids"),                  \
           py::arg("out"),                            \
           py::arg("topk"),                           \
-          py::arg("kernelName"),                     \
+          py::arg("kernelName")     = "",            \
           py::arg("w2_scale")       = std::nullopt,  \
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
-          py::arg("sorted_weights") = std::nullopt);
+          py::arg("sorted_weights") = std::nullopt,  \
+          py::arg("quant_type") = 0,                 \
+          py::arg("activation") = 0);                \
+
 
 #define MHA_VARLEN_FWD_PYBIND                     \
     m.def("mha_varlen_fwd",                       \
@@ -797,7 +803,7 @@
           py::arg("input"),                                       \
           py::arg("weight"),                                      \
           py::arg("bias"),                                        \
-          py::arg("epsilon"),                                     \
+          py::arg("epsilon") = 1e-5f,                             \
           py::arg("x_bias") = std::nullopt);                      \
     m.def("layernorm2d_fwd_with_add",                             \
           &layernorm2d_with_add,                                  \
