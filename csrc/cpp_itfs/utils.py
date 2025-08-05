@@ -34,6 +34,7 @@ AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
 AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
+AITER_PREBUILT_SO_DIR = os.environ.get("AITER_PREBUILT_SO_DIR", None)
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
@@ -213,7 +214,11 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
 def run_lib(func_name, folder=None):
     if folder is None:
         folder = func_name
-    lib = ctypes.CDLL(f"{BUILD_DIR}/{folder}/lib.so", os.RTLD_LAZY)
+    if AITER_PREBUILT_SO_DIR is not None:
+        lib_path = f"{AITER_PREBUILT_SO_DIR}/{func_name}.so"
+    else:
+        lib_path = f"{BUILD_DIR}/{folder}/lib.so"
+    lib = ctypes.CDLL(lib_path, os.RTLD_LAZY)
     return getattr(lib, func_name)
 
 
@@ -228,6 +233,8 @@ def get_default_func_name(md_name, args: tuple):
 
 
 def not_built(folder):
+    if AITER_PREBUILT_SO_DIR is not None:
+        return not os.path.exists(f"{AITER_PREBUILT_SO_DIR}/{folder}.so")
     return not os.path.exists(f"{BUILD_DIR}/{folder}/lib.so")
 
 
