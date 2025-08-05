@@ -245,7 +245,7 @@ class Gemm:
                     get_gemm_ref,
                     ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    None, #self.ref if fast_mode == 0 else None, 
+                    None, # self.ref if fast_mode == 0 else None, 
                     self.rtol,
                     self.atol,
                 )
@@ -322,7 +322,7 @@ class Gemm:
                     get_gemm_ref,
                     ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    None, #self.ref if fast_mode == 0 else None, 
+                    None, # self.ref if fast_mode == 0 else None,
                     self.rtol,
                     self.atol,
                 )
