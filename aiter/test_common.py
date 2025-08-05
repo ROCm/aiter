@@ -25,7 +25,6 @@ def perftest(
             num = num_rotate_args
             if num < 1:
                 gpu_id = torch.cuda.current_device()
-                torch.cuda.set_device(torch.cuda.current_device())
                 iter_used_memory, inputSize, _, _ = device_memory_profiling(
                     func, *args, **kwargs
                 )

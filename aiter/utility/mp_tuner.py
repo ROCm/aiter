@@ -104,7 +104,7 @@ def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
     bestConfigs = []
     best_config = list(sorted_rets[0])
     for info, us, max_err_ratio in sorted_rets:
-        print(f"{info=}, {us=}, {max_err_ratio=}")
+        #print(f"{info=}, {us=}, {max_err_ratio=}")
         if max_err_ratio > tol_err_ratio:
             continue
         if info[0] == cur_info[0]:
@@ -172,7 +172,6 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
 
     rets = []
     shape_grouped = isinstance(tasks, list)
-    shape_grouped = False
     solutions = 1 if not shape_grouped else kernels_num
 
     for i in range(solutions):
@@ -216,10 +215,8 @@ def mp_tuner(
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
-
-    ##if mp_num > 1, gpu 0 do not participate in tuning, as the primary gpu.
-    parallel_num = mp_num  # - 1 if mp_num > 1 else 1
-    start_idx = 0  # 1 if mp_num > 1 else 0
+    parallel_num = mp_num  
+    start_idx = 0  
     if mp_num == 1 & fast_mode == 0:
         shape_grouped = True
     pool = mp.Pool(processes=parallel_num)
@@ -227,7 +224,6 @@ def mp_tuner(
     pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     # time.sleep(2)
     task_group = []
-    
     # dispatch per shape to one pid
     if not tasks:
         return []

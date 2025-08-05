@@ -130,8 +130,6 @@ class Gemm:
         self.scaleAB = scaleAB
         self.use_rocblas = indtype == outdtype and str(indtype) != "dtypes.fp8"
         self.nb = CACHE_INVALIDATE_BUFFERS
-        # self.inp = torch.randn((self.m, self.k), device="cuda").to(self.indtype)
-        # self.weights = torch.randn((self.n, self.k), device="cuda").to(self.indtype)
         (self.inp, self.weights, _, self.bias, scaleA) = generate_data(
             m, n, k, indtype, outdtype, scaleAB, 0, bias
         )
@@ -247,7 +245,7 @@ class Gemm:
                     get_gemm_ref,
                     ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    None, # self.ref if fast_mode == 0 else None, 
+                    None, #self.ref if fast_mode == 0 else None, 
                     self.rtol,
                     self.atol,
                 )
@@ -273,11 +271,9 @@ class Gemm:
         print(self.hipb_gtimedf.head(self.topn))
 
     def find_rocblas_sols(self):
-        print(self.scaleAB, self.bias)
         if self.scaleAB or self.bias is not None:
             sols = []
         else:
-            print(self.inp.device, self.weights.device)
             sols = aiter.rocb_findallsols(self.inp, self.weights.t())
         print(
             "M N K dtype",
@@ -326,7 +322,7 @@ class Gemm:
                     get_gemm_ref,
                     ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
-                    None,  #self.ref if fast_mode == 0 else None, 
+                    None, #self.ref if fast_mode == 0 else None, 
                     self.rtol,
                     self.atol,
                 )
