@@ -194,12 +194,16 @@ def get_CKGEMM_config_fake(
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     import torch
+
     op_name = "aiter::get_CKGEMM_config_"
     if hasattr(torch.library, "infer_schema"):
-        schema_str = torch.library.infer_schema(get_CKGEMM_config_, mutates_args="unknown")
+        schema_str = torch.library.infer_schema(
+            get_CKGEMM_config_, mutates_args="unknown"
+        )
     else:
         # for pytorch 2.4
         import torch._custom_op.impl
+
         schema_str = torch._custom_op.impl.infer_schema(get_CKGEMM_config_, ["unknown"])
 
     torch.library.define(op_name, schema_str, lib=aiter_lib)
