@@ -598,31 +598,7 @@ def compile_ops(
 ):
 
     def decorator(func):
-        import torch
-        from csrc.cpp_itfs.torch_utils import aiter_lib
-        import torch.library
-        import inspect
-
         func.arg_checked = False
-
-        schema = ""
-        if func.__name__ in MANUAL_SCHEMA_OPS:
-            schema = generate_schema(func)
-        else:
-            sig = inspect.signature(func)
-            mutates_args = []
-            for name, param in sig.parameters.items():
-                if param.annotation is torch.Tensor:
-                    mutates_args.append(name)
-            if hasattr(torch.library, "infer_schema"):
-                sig = torch.library.infer_schema(func, mutates_args="unknown")
-            else:
-                # for pytorch 2.4
-                import torch._custom_op.impl
-
-                sig = torch._custom_op.impl.infer_schema(func, mutates_args)
-            schema = f"{sig}"
-        loadName = func.__name__
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -777,6 +753,7 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
+            import inspect
             sig = inspect.signature(func)
             params = list(sig.parameters.keys())
             if loadName in activation_list:
@@ -809,19 +786,39 @@ def compile_ops(
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
 
-        if loadName in NONE_WRAPPED_OP:
-            return wrapper
+        def wrapper_custom(*args, custom_build_args={}, **kwargs):
+            import torch
+            from csrc.cpp_itfs.torch_utils import aiter_lib
+            import torch.library
+            import inspect
 
-        if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
-            op_schema = f"aiter::wrapper_{loadName}" + schema
-            aiter_lib.define(op_schema)
-            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
-            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
-            aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+            schema = ""
+            if func.__name__ in MANUAL_SCHEMA_OPS:
+                schema = generate_schema(func)
+            else:
+                sig = inspect.signature(func)
+                mutates_args = []
+                for name, param in sig.parameters.items():
+                    if param.annotation is torch.Tensor:
+                        mutates_args.append(name)
+                sig = torch.library.infer_schema(func, mutates_args="unknown")
+                schema = f"{sig}"
+            loadName = func.__name__
 
-        def wrapper_return(*args, **kwargs):
+            if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+                op_schema = f"aiter::wrapper_{loadName}" + schema
+                aiter_lib.define(op_schema)
+                aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
+                aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
+                aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
 
-        return wrapper_return
+        loadName = func.__name__
+        if loadName in NONE_WRAPPED_OP:
+            return wrapper
+        else:
+            return wrapper_custom
+        
 
     return decorator
