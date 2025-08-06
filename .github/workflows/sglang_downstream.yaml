@@ -12,6 +12,7 @@ jobs:
     runs-on: mi300x-1gpu
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+
     steps:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
@@ -32,16 +33,19 @@ jobs:
           docker build --no-cache \
           --build-arg SGL_BRANCH=v0.4.9.post3 \
           --build-arg GPU_ARCH=gfx942 \
-          --build-arg AITER_REPO="${{ github.event.pull_request.head.repo.clone_url }}" \
-          --build-arg AITER_COMMIT="${{ github.event.pull_request.head.sha }}" \
+          --build-arg AITER_REPO=${GITHUB_REPO_URL} \
+          --build-arg AITER_COMMIT="${GITHUB_COMMIT_SHA}" \
           -t sglang_aiter_test -f docker/Dockerfile.rocm .
+        env:
+          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }} 
+          GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
             
       - name: Start CI container
         run: |
           cd sglang
-          sed -i 's|-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout"|-v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout"|g' scripts/amd_ci_start_container.sh
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_start_container.sh
-          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm; bash scripts/amd_ci_start_container.sh
+          sed -i 's|-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout"|-v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout"|g' scripts/ci/amd_ci_start_container.sh
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_start_container.sh
+          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm; bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
       
@@ -51,17 +55,17 @@ jobs:
       - name: Install dependencies
         run: |
           cd sglang
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_install_dependency.sh
-          bash scripts/amd_ci_install_dependency.sh
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
         timeout-minutes: 30
         run: |
           cd sglang
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_exec.sh
-          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/amd_ci_exec.sh python3 models/test_qwen_models.py
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
         
       # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
       - name: Clean Up
