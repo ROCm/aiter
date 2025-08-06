@@ -36,3 +36,13 @@ jobs:
           -w /workspace \
           aiter_test \
           ./.github/scripts/build_triton.sh
+      
+      - name: Standard Tests
+        run: |
+          echo "Running Standard Tests..."
+          docker exec \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/aiter_test.sh
+
+        
