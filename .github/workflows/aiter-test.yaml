@@ -33,4 +33,7 @@ jobs:
       - name: Setup-Triton
         run: |
           echo "Setuping Triton..."
+          docker exec \
+          -w "${{ github.workspace }}" \
+          aiter_test "$@"
           ./.github/scripts/build_triton.sh
