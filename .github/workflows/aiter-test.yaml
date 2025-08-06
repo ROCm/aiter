@@ -34,6 +34,6 @@ jobs:
         run: |
           echo "Setuping Triton..."
           docker exec \
-          -w "${{ github.workspace }}" \
+          -w /workspace \
           aiter_test \
           ./.github/scripts/build_triton.sh
