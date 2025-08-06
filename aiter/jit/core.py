@@ -791,6 +791,9 @@ def compile_ops(
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
 
+        if func.__name__ in NONE_WRAPPED_OP:
+            return wrapper
+
         def wrapper_register(func):
             import torch
             import torch.library
@@ -837,9 +840,6 @@ def compile_ops(
 
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
 
-        if func.__name__ in NONE_WRAPPED_OP:
-            return wrapper
-        else:
-            return wrapper_custom
+        return wrapper_custom
 
     return decorator
