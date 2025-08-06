@@ -21,6 +21,9 @@ sys.path.insert(0, f"{this_dir}/utils/")
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from chip_info import get_gfx
+from torch.library import Library
+
+aiter_lib = Library("aiter", "FRAGMENT")
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -791,11 +794,8 @@ def compile_ops(
 
         def wrapper_custom(*args, custom_build_args={}, **kwargs):
             import torch
-            from torch.library import Library
             import torch.library
             import inspect
-
-            aiter_lib = Library("aiter", "FRAGMENT")
 
             schema = ""
             if func.__name__ in MANUAL_SCHEMA_OPS:
