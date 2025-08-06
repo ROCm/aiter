@@ -794,6 +794,7 @@ def compile_ops(
             from torch.library import Library
             import torch.library
             import inspect
+
             aiter_lib = Library("aiter", "FRAGMENT")
 
             schema = ""
@@ -812,8 +813,12 @@ def compile_ops(
             if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
                 op_schema = f"aiter::wrapper_{loadName}" + schema
                 aiter_lib.define(op_schema, tags=())
-                aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA")
-                aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU")
+                aiter_lib.impl(
+                    f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA"
+                )
+                aiter_lib.impl(
+                    f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU"
+                )
                 aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
 
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
