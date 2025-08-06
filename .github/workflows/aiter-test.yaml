@@ -23,7 +23,6 @@ jobs:
           echo "Starting container: aiter_test"
           docker run -dt --device=/dev/dri \
           --user=root \
-          --network=none \
           --shm-size=16G \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
