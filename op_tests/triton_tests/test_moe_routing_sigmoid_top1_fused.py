@@ -43,6 +43,8 @@ def torch_routing_sigmoid_top1(
 @pytest.mark.parametrize("K", [16, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_routing_sigmoid_top1(M, N, K, dtype):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     TOPK = 1
 
     torch.manual_seed(7)

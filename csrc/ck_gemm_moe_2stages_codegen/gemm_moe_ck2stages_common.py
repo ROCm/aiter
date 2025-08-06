@@ -278,7 +278,7 @@ gemm2_kernels_dict = {
 bit8_list = ["F8", "I8", "f8", "i8"]
 bit16_list = ["B16", "F16", "b16", "f16"]
 bit4_list = ["I4", "i4", "FP4X2", "fp4x2"]
-QuantType_list = ["per_128x128", "per_1x32"]
+QuantType_list = ["per_1x128", "per_1x32"]
 
 
 def get_gemm1_kernels_list(
@@ -322,7 +322,7 @@ def get_gemm1_kernels_list(
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeight"
+            kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4":
             kernel.CDEElementOp = "MulABScale"
         elif tag == "a16w16":
@@ -368,7 +368,7 @@ def get_gemm2_kernels_list(
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":
-            kernel.CDEElementOp = "MulABScaleExpertWeight"
+            kernel.CDEElementOp = "MulABScaleExpertWeightA8W8blkscale"
         elif tag == "a8w8" or tag == "a4w4":
             kernel.CDEElementOp = "MulABScaleExpertWeight"
         elif tag == "a16w16":

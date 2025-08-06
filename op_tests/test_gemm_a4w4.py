@@ -39,7 +39,8 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @perftest()
 def run_gemm_ck(x, weight, x_scale, w_scale, out):
-    return aiter.gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out)
+    aiter.gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out)
+    return out
 
 
 @perftest()
@@ -63,13 +64,13 @@ def run_gemm_asm(
     bpreshuffle=True,
     log2_k_split=None,
 ):
-    if log2_k_split is not None:
+    if log2_k_split is not None and log2_k_split > 0:
         out_reset = torch.zeros(
             (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtype
         )
         out = out_reset
 
-    return aiter.gemm_a4w4_asm(
+    aiter.gemm_a4w4_asm(
         x,
         weightshuffle,
         x_scale,
@@ -80,6 +81,7 @@ def run_gemm_asm(
         bpreshuffle=bpreshuffle,
         log2_k_split=log2_k_split,
     )
+    return out
 
 
 @benchmark()
@@ -117,10 +119,10 @@ def test_gemm(dtype, M, N, K):
         x_scales_shuffle,
         w_scales_shuffle,
         out2,
-        "",  # kernelName
+        "",  # kernelName _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x256E
         bias_f32,
         bpreshuffle=True,
-        # log2_k_split=0,
+        log2_k_split=0,
     )
 
     err_c = checkAllclose(a, c[:M], msg="asm no splitK  ")
@@ -226,6 +228,27 @@ l_mnk = [
     (4096, 8192, 1024),
     (8192, 8192, 1024),
     (16384, 8192, 1024),
+    # tune
+    (1552, 8192, 8192),
+    (1664, 8192, 8192),
+    (1792, 8192, 8192),
+    (1920, 8192, 8192),
+    (3072, 8192, 8192),
+    (1552, 10240, 8192),
+    (1664, 10240, 8192),
+    (1792, 10240, 8192),
+    (1920, 10240, 8192),
+    (3072, 10240, 8192),
+    (1552, 57344, 8192),
+    (1664, 57344, 8192),
+    (1792, 57344, 8192),
+    (1920, 57344, 8192),
+    (3072, 57344, 8192),
+    (1552, 8192, 28672),
+    (1664, 8192, 28672),
+    (1792, 8192, 28672),
+    (1920, 8192, 28672),
+    (3072, 8192, 28672),
 ]
 
 parser = argparse.ArgumentParser(
@@ -250,7 +273,7 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""shape of mnk.
+    help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
 

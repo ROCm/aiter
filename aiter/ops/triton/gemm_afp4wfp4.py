@@ -14,6 +14,9 @@ from aiter.ops.triton.utils.pid_preprocessing import (
 )
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
@@ -479,6 +482,9 @@ def _get_config(
     elif M <= 256:
         return _get_config._config_dict[key]["large"]
     else:
+        BLK_M = triton.next_power_of_2(M)
+        if f"xlarge_M{BLK_M}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"xlarge_M{BLK_M}"]
         return _get_config._config_dict[key]["xlarge"]
 
 
@@ -507,6 +513,12 @@ def gemm_afp4wfp4(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+
+    _LOGGER.info(
+        f"GEMM_AFPWFP4: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
+    )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     M, K = x.shape
     N, K = w.shape

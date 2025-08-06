@@ -132,6 +132,7 @@ def get_x_vals():
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
+    x_vals += [(7, 4608, 7168), (7, 7168, 2304)]
     x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
@@ -189,6 +190,8 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     if TRITON_HIP_PRESHUFFLE_SCALES:
         if N % 32 > 0:

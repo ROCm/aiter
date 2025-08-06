@@ -11,7 +11,9 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
+_LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
@@ -392,6 +394,9 @@ def batched_gemm_afp4wfp4(
     Returns:
     - Y: The output matrix with shape (B, M, N).
     """
+    _LOGGER.info(
+        f"BATCHED_GEMM_AFP4WFP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x.shape)} w_scale={tuple(w.shape)}"
+    )
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 

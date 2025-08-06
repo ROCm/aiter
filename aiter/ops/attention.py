@@ -16,7 +16,58 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 MD_NAME = "module_attention"
 
 
-@compile_ops("module_attention")
+def gen_pa_fwd_native_fake(
+    # [num_seqs, num_heads, head_size]
+    query: torch.Tensor,
+    # [num_blocks, num_kv_heads, head_size/x, block_size, x]
+    key_cache: torch.Tensor,
+    # [num_blocks, num_kv_heads, head_size, block_size]
+    value_cache: torch.Tensor,
+    # [num_seqs, max_num_blocks_per_seq]
+    block_tables: torch.Tensor,
+    # [num_seqs]
+    context_lens: torch.Tensor,
+    k_dequant_scales: torch.Tensor,
+    v_dequant_scales: torch.Tensor,
+    max_seq_len: int,
+    num_kv_heads: int,
+    scale_s: float,
+    scale_k: float,
+    scale_v: float,
+    block_size: int,
+    quant_algo: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if out is not None:
+        return out
+    else:
+        return torch.empty_like(query)
+
+
+def gen_pa_fwd_asm(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_num_blocks: int,
+    max_qlen: int = 1,
+    K_QScale: Optional[torch.Tensor] = None,
+    V_QScale: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
+    qo_indptr: Optional[torch.Tensor] = None,
+    high_precision: Optional[
+        int
+    ] = 1,  # [0, 1, 2] 2 is the highest precision, this is only for fp8 kvcache
+    kernelName: str = "",
+):
+    if out_ is not None:
+        return out_
+    else:
+        return torch.empty_like(query)
+
+
+@compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake)
 def pa_fwd_naive(
     # [num_seqs, num_heads, head_size]
     query: torch.Tensor,
@@ -41,7 +92,7 @@ def pa_fwd_naive(
 ) -> torch.Tensor: ...
 
 
-@compile_ops("module_attention_asm")
+@compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
 def pa_fwd_asm(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -244,7 +295,7 @@ def mla_decode_stage1_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-): ...
+) -> None: ...
 
 
 @compile_ops(MD_NAME)
@@ -267,4 +318,4 @@ def mla_prefill_asm_fwd(
     splitData: torch.Tensor,
     # [batch_size, num_kv_splits, num_heads,  1]
     splitLse: torch.Tensor,
-): ...
+) -> None: ...

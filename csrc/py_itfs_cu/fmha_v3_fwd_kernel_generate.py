@@ -8,8 +8,14 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-this_dir = os.path.abspath(__file__)
-sys.path.insert(0, str(Path(this_dir).parents[2] / "aiter/"))
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter")  # pip install mode
+else:
+    AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../aiter")  # develop mode
+sys.path.insert(0, AITER_CORE_DIR)
+
 from jit.core import get_asm_dir
 from jit.utils.chip_info import get_gfx, get_device_name
 
@@ -229,7 +235,9 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dropout == false) &&
                         (a.seqlen_q == a.seqlen_k) && (a.seqlen_q >= 384) &&
                         (a.batch_stride_lse >= a.nhead_stride_lse) && (a.hdim_q == a.hdim_v) &&
-                        (a.hdim_q == 128)) {{
+                        (a.hdim_q == 128) && (a.stride_q == a.stride_o) && (a.nhead_stride_q == a.nhead_stride_o) &&
+                        (a.stride_k == a.stride_v) && (a.nhead_stride_k == a.nhead_stride_v) && (a.batch_stride_k == a.batch_stride_v) &&
+                        (a.batch_stride_q == a.batch_stride_o) && (a.batch_stride_q >= a.stride_q) && (a.batch_stride_k >= a.stride_k)) {{
                         {F_dispatch}
             }}
         }}

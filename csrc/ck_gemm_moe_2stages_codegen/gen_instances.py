@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import os
 import argparse
+import itertools
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
@@ -441,7 +442,7 @@ class ck_moe_2stage_gemm_codegen:
                 )
                 if os.path.exists(f_instance):
                     os.remove(f_instance)
-                if "per_128x128" in self.quant_type:
+                if self.quant_type in ["per_128x128", "per_1x128"]:
                     quanttype = "_blockscale"
                 elif "FP4" in self.a_dtype:
                     quanttype = "_mxfp4"
@@ -540,7 +541,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-a",
         "--a_dtype",
-        default="f8",
+        nargs="*",
         required=False,
         type=str,
         choices=["f8", "i8", "f16", "b16", "fp4x2"],
@@ -550,7 +551,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-b",
         "--b_dtype",
-        default="f8",
+        nargs="*",
         required=False,
         type=str,
         choices=["f8", "i8", "f16", "b16", "i4", "fp4x2"],
@@ -573,7 +574,14 @@ if __name__ == "__main__":
         default="per_tensor",
         required=False,
         type=str,
-        choices=["per_tensor", "per_token", "per_128x128", "per_1x32", "no"],
+        choices=[
+            "per_tensor",
+            "per_token",
+            "per_128x128",
+            "per_1x128",
+            "per_1x32",
+            "no",
+        ],
         help="select quant_type",
     )
 
@@ -606,14 +614,83 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    codegen = ck_moe_2stage_gemm_codegen(
-        args.working_path,
-        args.a_dtype,
-        args.b_dtype,
-        args.c_dtype,
-        args.quant_type,
-        args.activation,
-        args.mul_routed_weight_stage,
+    args.quant_type = (
+        "per_1x128" if args.quant_type == "per_128x128" else args.quant_type
     )
-    codegen.generate_instance_and_lookUpTable()
+
+    # build all
+    if args.b_dtype is None:
+        # quanted moe
+        b_quant_dtypes = ["f8", "i8", "i4", "fp4x2"]
+        c_dtypes = ["f16", "b16"]
+        acts = ["silu", "gelu"]
+        routed_weight_l = [1, 2]
+        general_quant_l = ["per_tensor", "per_token"]
+        for b_dtype, c_dtype, act, routed_weight, quant in itertools.product(
+            b_quant_dtypes, c_dtypes, acts, routed_weight_l, general_quant_l
+        ):
+            a_dtype = b_dtype if b_dtype != "i4" else "f8"
+            quant = quant if b_dtype != "fp4x2" else "per_1x32"
+            codegen = ck_moe_2stage_gemm_codegen(
+                args.working_path,
+                a_dtype,
+                b_dtype,
+                c_dtype,
+                quant,
+                act,
+                routed_weight,
+            )
+            codegen.generate_instance_and_lookUpTable()
+
+        # blk-quant moe
+        blk_quant_l = ["per_128x128", "per_1x32"]
+        for c_dtype, act, routed_weight, qaunt in itertools.product(
+            c_dtypes, acts, routed_weight_l, blk_quant_l
+        ):
+
+            codegen = ck_moe_2stage_gemm_codegen(
+                args.working_path,
+                "f8",
+                "f8",
+                c_dtype,
+                "no",
+                act,
+                routed_weight,
+            )
+            codegen.generate_instance_and_lookUpTable()
+
+        # no-quant moe
+        b_quant_dtypes = [
+            "f16",
+            "b16",
+        ]
+        for (
+            b_dtype,
+            act,
+            routed_weight,
+        ) in itertools.product(b_quant_dtypes, acts, routed_weight_l):
+            c_dtype = a_dtype = b_dtype
+
+            codegen = ck_moe_2stage_gemm_codegen(
+                args.working_path,
+                a_dtype,
+                b_dtype,
+                c_dtype,
+                "no",
+                act,
+                routed_weight,
+            )
+            codegen.generate_instance_and_lookUpTable()
+    else:
+        for b_dtype in args.b_dtype:
+            a_dtype = b_dtype if b_dtype != "i4" else "f8"
+            codegen = ck_moe_2stage_gemm_codegen(
+                args.working_path,
+                a_dtype,
+                b_dtype,
+                args.c_dtype,
+                args.quant_type,
+                args.activation,
+                args.mul_routed_weight_stage,
+            )
+            codegen.generate_instance_and_lookUpTable()

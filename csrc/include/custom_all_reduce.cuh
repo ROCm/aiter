@@ -928,7 +928,7 @@ namespace aiter
             std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
     }
 
-    void register_buffer(const std::vector<std::string> &handles,
+    void register_buffer(const std::vector<torch::Tensor> &handles,
                          const std::vector<int64_t> &offsets, void *self)
     {
       check_rank_data_capacity();
@@ -937,7 +937,8 @@ namespace aiter
       {
         if (i != rank_)
         {
-          char *handle = open_ipc_handle(handles[i].data());
+          cudaIpcMemHandle_t* ipc_handle_ptr = (cudaIpcMemHandle_t*)handles[i].data_ptr();
+          char *handle = open_ipc_handle((void*)ipc_handle_ptr);
           handle += offsets[i];
           data.ptrs[i] = handle;
         }
@@ -989,8 +990,8 @@ namespace aiter
     // got a different address. IPC handles have internal reference counting
     // mechanism so overhead should be small.
     void register_graph_buffers(
-        const std::vector<std::string> &handles,
-        const std::vector<std::vector<int64_t>> &offsets)
+        const std::vector<torch::Tensor> &handles,
+        const std::vector<torch::Tensor> &offsets)
     {
       auto num_buffers = graph_unreg_buffers_.size();
       check_rank_data_capacity(num_buffers);
@@ -1003,9 +1004,9 @@ namespace aiter
         {
           if (j != rank_)
           {
-            char *handle =
-                open_ipc_handle(&handles[j][i * sizeof(cudaIpcMemHandle_t)]);
-            handle += offsets[j][i];
+            cudaIpcMemHandle_t* ipc_handle_ptr = (cudaIpcMemHandle_t*)handles[j].data_ptr() + i;
+            char *handle = open_ipc_handle(ipc_handle_ptr);
+            handle += *((int64_t*)offsets[j].data_ptr() + i);
             rd.ptrs[j] = handle;
           }
           else

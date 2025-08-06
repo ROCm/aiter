@@ -3,6 +3,9 @@ from typing import Literal
 import triton
 import triton.language as tl
 import torch
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -38,12 +41,19 @@ def _gelu_tanh(x):
     return 0.5 * x * (1.0 + _tanh(inner))
 
 
+@triton.jit
+def _relu(x):
+    return tl.maximum(0.0, x)
+
+
 @tl.constexpr_function
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
         "gelu_tanh": _gelu_tanh,
         "silu": _silu,
+        "silu_exp2": _silu_exp2,
+        "relu": _relu,
     }
     return mapping[activation]
 
@@ -197,6 +207,7 @@ def act_mul_and_mxfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
+    _LOGGER.info(f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation}")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4

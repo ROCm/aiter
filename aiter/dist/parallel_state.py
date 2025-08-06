@@ -933,11 +933,11 @@ def init_distributed_environment(
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment")
-        if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        if "HIP_VISIBLE_DEVICES" not in os.environ:
             from .utils import update_environment_variables
-            update_environment_variables({
-                "CUDA_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))
-            })
+            update_environment_variables(
+                {"HIP_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))}
+            )
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,

@@ -33,7 +33,7 @@ def moe_sorting_ck(
     sorted_expert_ids = torch.empty(
         (max_num_m_blocks,), dtype=dtypes.i32, device=device
     )
-    num_valid_ids = torch.empty((1), dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty((2), dtype=dtypes.i32, device=device)
     moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
 
     aiter.moe_sorting_fwd(
@@ -112,6 +112,7 @@ def asm_moe(
                 fc2_scale,
                 fc1_smooth_scale,
                 fc2_smooth_scale,
+                activation,
             )
         elif w1.dtype == dtypes.i8 and inter_dim == w1.shape[1]:
             aiter.fmoe_int8_g1u0_a16(
