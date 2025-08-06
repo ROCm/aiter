@@ -456,7 +456,11 @@ def gemm_a8w8_blockscale_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
-@compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune", gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors)
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle_tune",
+    fc_name="gemm_a8w8_bpreshuffle_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
 def gemm_a8w8_bpreshuffle_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,

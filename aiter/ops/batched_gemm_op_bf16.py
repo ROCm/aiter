@@ -13,12 +13,18 @@ from ..jit.core import (
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 
+
 def gen_batched_gemm_bf16_tune_fake_tensor(
     XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK: int = 0
 ) -> Tensor:
     return out
 
-@compile_ops("module_batched_gemm_bf16", fc_name="batched_gemm_bf16", gen_fake=gen_batched_gemm_bf16_tune_fake_tensor)
+
+@compile_ops(
+    "module_batched_gemm_bf16",
+    fc_name="batched_gemm_bf16",
+    gen_fake=gen_batched_gemm_bf16_tune_fake_tensor,
+)
 def batched_gemm_bf16(
     XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK: int = 0
 ) -> Tensor: ...
@@ -87,7 +93,11 @@ def batched_gemm_bf16_CK(
     return batched_gemm_bf16(XQ, WQ, Y, bias, splitK)
 
 
-@compile_ops("module_batched_gemm_bf16_tune", fc_name="batched_gemm_bf16_tune", gen_fake=gen_batched_gemm_bf16_tune_fake_tensor)
+@compile_ops(
+    "module_batched_gemm_bf16_tune",
+    fc_name="batched_gemm_bf16_tune",
+    gen_fake=gen_batched_gemm_bf16_tune_fake_tensor,
+)
 def batched_gemm_bf16_tune(
     XQ: Tensor, WQ: Tensor, out: Tensor, kernelId: int, splitK: int = 0
 ) -> Tensor: ...
