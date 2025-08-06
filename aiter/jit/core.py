@@ -791,7 +791,7 @@ def compile_ops(
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
 
-        def wrapper_custom(*args, custom_build_args={}, **kwargs):
+        def wrapper_register(func):
             import torch
             import torch.library
             import inspect
@@ -816,8 +816,14 @@ def compile_ops(
 
                     sig = torch._custom_op.impl.infer_schema(func, mutates_args)
                 schema = f"{sig}"
-            loadName = func.__name__
+            return schema
 
+        schema = wrapper_register(func)
+
+        def wrapper_custom(*args, custom_build_args={}, **kwargs):
+            import torch
+
+            loadName = func.__name__
             if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
                 op_schema = f"aiter::wrapper_{loadName}" + schema
                 aiter_lib.define(op_schema, tags=())
@@ -831,8 +837,7 @@ def compile_ops(
 
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
 
-        loadName = func.__name__
-        if loadName in NONE_WRAPPED_OP:
+        if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
         else:
             return wrapper_custom
