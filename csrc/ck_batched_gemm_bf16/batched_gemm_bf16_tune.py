@@ -62,10 +62,10 @@ def run_batched_gemm(x, weight, out, kernel_id, splitK=0):
     return out
 
 
-def generate_data(b, m, n, k):
-    x = torch.randint(-20, 20, (b, m, k), dtype=dtypes.bf16, device="cuda")
-    weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.bf16, device="cuda")
-    out = torch.empty(b, m, n, dtype=dtypes.bf16, device="cuda")
+def generate_data(b, m, n, k, device="cuda"):
+    x = torch.randint(-20, 20, (b, m, k), dtype=dtypes.bf16, device=device)
+    weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.bf16, device=device)
+    out = torch.empty(b, m, n, dtype=dtypes.bf16, device=device)
     return x, weight, out
 
 
@@ -88,7 +88,6 @@ def tune_batched_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False, mp
             & (tunedf["K"] == K)
             & (tunedf["cu_num"] == cu_num)
         ].empty:
-            input_datas = generate_data(B, M, N, K)
             print(f"tuning B:{B}, M:{M}, N:{N}, K:{K}")
             # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
             total_kernel_nums = 0
@@ -106,11 +105,13 @@ def tune_batched_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False, mp
                     task.append(
                         (
                             info,
+                            generate_data,
+                            (B, M, N, K),
                             run_batched_gemm,
-                            (i, splitK),
+                            ([0, 1, 2], i, splitK),
                             {},
                             run_torch,
-                            (),
+                            ([0, 1],),
                             {},
                             None,
                             1e-2,
@@ -119,7 +120,11 @@ def tune_batched_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False, mp
                     )
                     total_kernel_nums = total_kernel_nums + 1
 
-            tasks_data.append((total_kernel_nums, input_datas))
+            tasks_data.append((total_kernel_nums, ()))
+        else:
+            print(f"B:{B}, M:{M}, N:{N}, K{K} is in tuned batched_gemm, skip!!!")
+            print()
+            print()
     if task:
         shape_grouped = False
         ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
@@ -146,10 +151,6 @@ def tune_batched_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False, mp
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-    else:
-        print(f"B:{B}, M:{M}, N:{N}, K{K} is in tuned batched_gemm, skip!!!")
-        print()
-        print()
     if issorted:
         tunedf = tunedf.sort_values(by=["B", "M", "N", "K"])
     print("Totall tuning result:")
