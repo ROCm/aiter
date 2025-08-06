@@ -514,6 +514,8 @@ NONE_WRAPPED_OP = [
     "dispose",
     "meta_size",
     "get_padded_m",
+    "compile_mha_fwd",
+    "compile_mha_bwd",
 ]
 
 
@@ -789,9 +791,10 @@ def compile_ops(
 
         def wrapper_custom(*args, custom_build_args={}, **kwargs):
             import torch
-            from csrc.cpp_itfs.torch_utils import aiter_lib
+            from torch.library import Library
             import torch.library
             import inspect
+            aiter_lib = Library("aiter", "FRAGMENT")
 
             schema = ""
             if func.__name__ in MANUAL_SCHEMA_OPS:
@@ -808,9 +811,9 @@ def compile_ops(
 
             if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
                 op_schema = f"aiter::wrapper_{loadName}" + schema
-                aiter_lib.define(op_schema)
-                aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
-                aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
+                aiter_lib.define(op_schema, tags=())
+                aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA")
+                aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU")
                 aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
 
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
