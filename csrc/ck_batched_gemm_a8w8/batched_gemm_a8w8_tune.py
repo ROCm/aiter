@@ -10,7 +10,7 @@ from aiter.test_common import perftest
 from batched_gemm_a8w8_common import kernels_list
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
-import time
+
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
@@ -45,7 +45,8 @@ def get_untuned_batched_gemm_list(untuned_batched_gemm_file):
         untuned_batched_gemm_file
     ), f"Not exist a8w8_untuned_batched_gemm.csv file: {untuned_batched_gemm_file}"
     untunedf = pd.read_csv(untuned_batched_gemm_file)
-    return untunedf
+    filtered_df = untunedf.drop_duplicates().reset_index(drop=True)
+    return filtered_df
 
 
 def get_tuned_batched_gemm_list(tuned_batched_gemm_file):
@@ -94,7 +95,7 @@ def tune_batched_gemm_list(untunedf, tunedf, issorted=False, useSplitK=False, mp
             kernels_num = len(kernels_list)
 
             print(
-                f"*******************B:{B} X M:{M} X N:{N} X K{K}**************************"
+                f"******************tune B:{B} X M:{M} X N:{N} X K{K}*******************"
             )
             # kernelId, splitK, time = tune_batched_gemm(B, M, N, K, useSplitK)
             total_kernel_nums = 0
@@ -208,7 +209,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     untunedf = get_untuned_batched_gemm_list(args.untune_file)
     tunedf = get_tuned_batched_gemm_list(args.tune_file)
-    start = time.time()
     tunedf = tune_batched_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
-    print("Tuning time: ", time.time() - start)
     tunedf.to_csv(args.tune_file, index=False)

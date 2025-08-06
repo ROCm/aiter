@@ -10,7 +10,6 @@ from aiter import dtypes
 from batched_gemm_bf16_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 import argparse
-import time
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -200,7 +199,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     untunedf = get_untuned_batched_gemm_list(args.untune_file)
     tunedf = get_tuned_batched_gemm_list(args.tune_file)
-    start = time.time()
     tunedf = tune_batched_gemm_list(untunedf, tunedf, args.sort, args.splitK, args.mp)
-    print("tuning time: ", time.time() - start)
     tunedf.to_csv(args.tune_file, index=False)
