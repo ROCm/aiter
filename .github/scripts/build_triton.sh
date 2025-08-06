@@ -5,6 +5,7 @@ set -ex
 # Install dependencies
 pip install pandas zmq einops
 pip install numpy==1.26.2
+python3 setup.py develop
 
 # Install aiter
 pip uninstall -y triton || true
