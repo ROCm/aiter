@@ -4,6 +4,9 @@ import functools
 import os
 import re
 import subprocess
+import torch
+from torch.library import Library
+aiter_lib = Library("aiter", "FRAGMENT")
 
 from cpp_extension import executable_path
 
@@ -27,9 +30,10 @@ def get_gfx():
         gfx = gfx.split(";")[-1]
     return gfx
 
+CU_NUM = 0
 
-@functools.lru_cache(maxsize=1)
-def get_cu_num():
+def get_cu_num_custom_op(dummy: torch.Tensor) -> None:
+    global CU_NUM
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -51,7 +55,36 @@ def get_cu_num():
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
-    return cu_num
+    CU_NUM = cu_num
+
+_CU_NUM_OP_REGISTERED = False
+
+@functools.lru_cache(maxsize=1)
+def get_cu_num():
+    global _CU_NUM_OP_REGISTERED
+    if _CU_NUM_OP_REGISTERED ==False:
+    # if not hasattr(torch.ops.aiter, "get_cu_num_custom_op"):
+
+        op_name = "aiter::get_cu_num_custom_op"
+        version_parts = torch.__version__.split('.')
+        major = int(version_parts[0])
+        minor = int(version_parts[1])
+        if major > 2 or (major == 2 and minor >= 5):
+            schema_str = torch.library.infer_schema(get_cu_num_custom_op, mutates_args=())
+        else:
+            # for pytorch 2.4
+            import torch._custom_op.impl
+            schema_str = torch._custom_op.impl.infer_schema(get_cu_num_custom_op, [])
+
+        # schema_str = "(Tensor(a0!) aaa, str tuned_file='a8w8_tuned_gemm.csv') -> Tensor"
+        torch.library.define(op_name, schema_str, lib=aiter_lib)
+        torch.library.impl(op_name, "cuda", get_cu_num_custom_op, lib=aiter_lib)
+        torch.library.register_fake(op_name, get_cu_num_custom_op, lib=aiter_lib)
+        _CU_NUM_OP_REGISTERED = True
+
+    x = torch.empty(1, device="cuda")
+    torch.ops.aiter.get_cu_num_custom_op(x)
+    return CU_NUM
 
 
 def get_device_name():

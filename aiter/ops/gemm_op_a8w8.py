@@ -263,10 +263,10 @@ def gemm_a8w8(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    # assert dtype in [
+    #     dtypes.bf16,
+    #     dtypes.fp16,
+    # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias, dtype, splitK)
 
 
@@ -320,10 +320,10 @@ def gemm_a8w8_CK(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
+    # assert dtype in [
+    #     dtypes.bf16,
+    #     dtypes.fp16,
+    # ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -456,7 +456,7 @@ def gemm_a8w8_blockscale_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
-@compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune")
+@compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune", gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors)
 def gemm_a8w8_bpreshuffle_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -465,4 +465,4 @@ def gemm_a8w8_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> None: ...
+) -> torch.Tensor: ...

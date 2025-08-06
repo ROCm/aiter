@@ -79,8 +79,10 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     m, k = x.shape
     n, k = weight.shape
-    aiter.gemm_a4w4_blockscale_tune(x, weight, x_scale, w_scale, out, kernel_id, splitK)
-    return out[:m]
+    res = aiter.gemm_a4w4_blockscale_tune(
+        x, weight, x_scale, w_scale, out, kernel_id, splitK
+    )
+    return res[:m]
 
 
 def run_gemm_a4w4_blockscale_asm(
@@ -101,7 +103,7 @@ def run_gemm_a4w4_blockscale_asm(
             out.shape[0], out.shape[1], dtype=dtype, device=torch.cuda.current_device()
         )
         out = out_reset
-    aiter.gemm_a4w4_asm(
+    res = aiter.gemm_a4w4_asm(
         x,
         weight_shuffle,
         x_scale,
@@ -112,7 +114,7 @@ def run_gemm_a4w4_blockscale_asm(
         bpreshuffle=bpreshuffle,
         log2_k_split=splitK,
     )
-    return out[:m]
+    return res[:m]
 
 
 def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
