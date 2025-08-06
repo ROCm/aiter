@@ -754,6 +754,7 @@ def compile_ops(
                 log_args(func, *args, **kwargs)
 
             import inspect
+
             sig = inspect.signature(func)
             params = list(sig.parameters.keys())
             if loadName in activation_list:
@@ -819,6 +820,5 @@ def compile_ops(
             return wrapper
         else:
             return wrapper_custom
-        
 
     return decorator
