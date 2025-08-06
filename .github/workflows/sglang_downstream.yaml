@@ -10,8 +10,6 @@ jobs:
   sglang:
     name: sglang integration
     runs-on: mi300x-1gpu
-    env:
-      HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
     steps:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
