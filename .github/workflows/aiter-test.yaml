@@ -40,6 +40,15 @@ jobs:
           aiter_test \
           ./.github/scripts/build_triton.sh
       
+      - name: MultiGPU Tests
+        run: |
+          echo "Running Standard Tests..."
+          docker exec \
+          -e MULTIGPU=TRUE \
+          -w /workspace \
+          aiter_test \
+          ./.github/scripts/aiter_test.sh
+
       - name: Standard Tests
         run: |
           echo "Running Standard Tests..."
@@ -48,13 +57,5 @@ jobs:
           aiter_test \
           ./.github/scripts/aiter_test.sh
 
-      - name: MultiGPU Tests
-        run: |
-          echo "Running Standard Tests..."
-          docker exec \
-          -e MULTIGPU=TRUE
-          -w /workspace \
-          aiter_test \
-          ./.github/scripts/aiter_test.sh
 
         
