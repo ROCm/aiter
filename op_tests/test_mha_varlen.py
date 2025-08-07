@@ -500,7 +500,7 @@ if __name__ == "__main__":
         "-rlse",
         "--return_lse",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="""return logsumexp, default is False.
     -rlse or --return_lse    # enable return logsumexp
     --no-return_lse          # disable return logsumexp""",
