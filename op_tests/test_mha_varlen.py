@@ -231,7 +231,7 @@ def test_flash_attn_varlen_func(
     deterministic,
     mha_type,
     dtype,
-    return_lse
+    return_lse,
 ):
     torch.random.manual_seed(0)
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
@@ -306,7 +306,6 @@ def test_flash_attn_varlen_func(
         return_attn_probs = True
     else:
         return_attn_probs = False
-
 
     out, dropout_mask, dq, dk, dv = run_ck(
         q,
