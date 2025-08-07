@@ -52,9 +52,9 @@ jobs:
         run: |
           echo "Running Standard Tests..."
           docker exec \
+          -e MULTIGPU=TRUE
           -w /workspace \
           aiter_test \
-          -e MULTIGPU=TRUE
           ./.github/scripts/aiter_test.sh
 
         
