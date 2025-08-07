@@ -22,7 +22,9 @@ def worker(
     from aiter.test_common import run_perftest
 
     pid = mp.current_process().pid
-    gpuID = gpuIDMap[pid]
+    # pid = mp.current_process().pid
+    # gpuID = gpuIDMap[pid]
+    gpuID = torch.cuda.current_device()
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
     args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
@@ -34,8 +36,13 @@ def worker(
         try:
             res, us = run_perftest(func, *args, **kwargs)
             us = round(us, 4)
-        except RuntimeError:
-            print(f" info:{info}\t No support")
+        except RuntimeError as e:
+            print(f"run gpu func error: info:{info}\t {e}")
+
+        if us == 0:
+            print("!!!! us = 0, rerun it ")
+            res, us = run_perftest(func, *args, **kwargs)
+            us = round(us, 4)
 
         torch.cuda.synchronize()
         if ref is not None:
@@ -43,6 +50,7 @@ def worker(
                 ref = [ref]
             if isinstance(res, torch.Tensor):
                 res = [res]
+
             ref = [
                 (
                     el.to(device)
@@ -127,20 +135,74 @@ def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
 def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     group_task = [tasks] if not isinstance(tasks, list) else tasks
     kernels_num, (input_data) = in_data
-    info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref, *rest = group_task[0]
+    (
+        info,
+        gen_data,
+        gen_args,
+        func,
+        args,
+        kwargs,
+        ref_func,
+        ref_args,
+        ref_kwargs,
+        ref,
+        *rest,
+    ) = group_task[0]
 
-    updated_ref_args = ref_args if not input_data else input_data[:-1] + ref_args
+    pid = mp.current_process().pid
+    gpuID = gpuIDMap[pid]
+    device = torch.device(f"cuda:{gpuID}")
+    torch.cuda.set_device(device)
+    data = (
+        gen_data(*gen_args, device=device)
+        if not input_data and gen_data is not None
+        else input_data
+    )
+
+    assert ref_func is not None or ref is not None or fast_mode != 0
+    # ref=None & fast_mode=1, fast tune, not compare results, do not postprocess,return all results
+    # ref=None & fast_mode=0, ref_func should be given and return best result
+    # ref!=None & fast_mode=1, return all results, do not postprocess
+    # ref!=None & fast_mode=0, return best result, postprocess
     if ref is None and not fast_mode:
+        ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
+        updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
         ref = ref_func(*updated_ref_args, **ref_kwargs)
+        torch.cuda.synchronize()
 
     rets = []
     shape_grouped = isinstance(tasks, list)
     solutions = 1 if not shape_grouped else kernels_num
+
     for i in range(solutions):
-        info, func, args, kwargs, ref_func, ref_args, ref_kwargs, ref_noused, *rest = (
-            group_task[i]
+        (
+            info,
+            gen_data,
+            gen_args,
+            func,
+            args,
+            kwargs,
+            ref_func,
+            ref_args,
+            ref_kwargs,
+            ref_noused,
+            *rest,
+        ) = group_task[i]
+        # either gen_data func or inpur data
+        new_args = (
+            (tuple(data[i] for i in args[0]) + tuple(args[1:]))
+            if gen_data is not None
+            else args
         )
-        work_args = (info, func, input_data + args, kwargs, ref, *rest)
+        ref = ref if ref_noused is None else ref_noused
+        work_args = (
+            info,
+            func,
+            new_args,
+            kwargs,
+            ref,
+            *rest,
+        )
         ret = worker(gpuIDMap, *work_args, tol_err_ratio=err_ratio)
         rets.append(ret)
 
@@ -153,8 +215,13 @@ def mp_tuner(
     gpu_num = torch.cuda.device_count()
     mp.set_start_method("spawn", force=True)
     mp_num = gpu_num if mp_num < 1 or mp_num > gpu_num else mp_num
-    pool = mp.Pool(processes=mp_num)
-    pids = [pool.apply_async(get_pid) for i in range(mp_num)]
+    parallel_num = mp_num
+    start_idx = 0
+    if mp_num == 1 & fast_mode == 0:
+        shape_grouped = True
+    pool = mp.Pool(processes=parallel_num)
+
+    pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     # time.sleep(2)
     task_group = []
     # dispatch per shape to one pid
@@ -168,7 +235,7 @@ def mp_tuner(
             start = end + 1
     else:
         task_group = tasks
-    gpu_map = {el.get(): i for i, el in enumerate(pids)}
+    gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     # to get index of input data for task_group
     import numpy as np
 
@@ -178,7 +245,6 @@ def mp_tuner(
         ref_data_index = np.searchsorted(
             cumulative, np.arange(len(task_group)), side="right"
         )
-        gpu_map = {el.get(): i for i, el in enumerate(pids)}
     rets = [
         pool.apply_async(
             work_group,
@@ -197,6 +263,6 @@ def mp_tuner(
     pool.join()
     return (
         [el.get() for el in rets]
-        if shape_grouped
+        if shape_grouped and not fast_mode
         else post_process([el.get() for el in rets], fast_mode, err_ratio)
     )

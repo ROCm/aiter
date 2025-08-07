@@ -330,6 +330,11 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+    _LOGGER.info(
+        f"EXTEND_ATTENTION_FWD: q_extend={tuple(q_extend.shape)} k_extend={tuple(k_extend.shape)} v_extend={tuple(v_extend.shape)} "
+        + f"k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+    )
+
     Lq, Lv = (
         q_extend.shape[-1],
         v_extend.shape[-1],
@@ -425,6 +430,10 @@ def redundant_attention(
     b_seq_len_prefix,
     max_len_in_batch,
 ):
+    _LOGGER.info(
+        f"REDUNDANT_ATTENTION: q_extend={tuple(q_extend.shape)} o_extend={tuple(o_extend.shape)} \
+        k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+    )
     total_token_num = k_buffer.shape[0]
     B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
     q_buffer = torch.empty(

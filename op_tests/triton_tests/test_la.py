@@ -66,144 +66,32 @@ def get_lean_attn_inputs(
     return q, k, v, Mp, Lp, Op, locks, batch_num_block_n
 
 
-def get_lean_attention_params(
-    causal, batch_size, max_seqlen_q, max_seqlen_k, num_heads, BLOCK_M, BLOCK_N, num_SMs
-):
-    """
-    Mirrors the get_num_splits_and_buffer_sizes logic from the host code.
-    """
-    num_m_blocks = (max_seqlen_q + BLOCK_M - 1) // BLOCK_M
+def reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal):
 
-    if max_seqlen_q == 1:
-        causal = False
+    # Calculate Pytorch refence output
+    ref_out = torch.empty_like(q, dtype=q.dtype)
+    start = 0
+    start_q = 0
 
-    tiles_per_head = 0
-    if causal:
-        # The total number of lean tiles for a single head/batch item
-        for i in range(num_m_blocks):
-            tiles_per_head += (i + 1) * (BLOCK_M // BLOCK_N)
-        tiles_per_head *= batch_size
-    else:
-        num_n_blocks_total = (max_seqlen_k + BLOCK_N - 1) // BLOCK_N
-        tiles_per_head = num_m_blocks * num_n_blocks_total
-
-    total_tiles = tiles_per_head * num_heads
-    lean_griddimz = num_SMs
-
-    if lean_griddimz == 0:
-        return 0, 0, 0, 0, 0
-
-    max_tiles_per_wg = (total_tiles + lean_griddimz - 1) // lean_griddimz
-    high_load_wgs = total_tiles % lean_griddimz
-    if high_load_wgs == 0 and total_tiles > 0:
-        high_load_wgs = lean_griddimz
-
-    return (
-        tiles_per_head,
-        num_m_blocks,
-        lean_griddimz,
-        high_load_wgs,
-        max_tiles_per_wg,
-    )
-
-
-def calculate_max_output_tiles_analytically(
-    causal: bool,
-    batch_size: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    num_heads: int,
-    num_SMs: int,
-    BLOCK_M: int,
-    BLOCK_N: int,
-):
-    """
-    Calculates the maximum number of output tiles any single workgroup will process
-    using a fast, analytical method with binary search.
-    """
-    MASKED_BLOCKS = BLOCK_M // BLOCK_N
-    if causal and BLOCK_M % BLOCK_N != 0:
-        raise ValueError("For causal, BLOCK_M must be a multiple of BLOCK_N")
-
-    (
-        tiles_per_head,
-        num_m_blocks,
-        num_wgs,
-        high_load_wgs,
-        max_tiles_per_wg,
-    ) = get_lean_attention_params(
-        causal,
-        batch_size,
-        max_seqlen_q,
-        max_seqlen_k,
-        num_heads,
-        BLOCK_M,
-        BLOCK_N,
-        num_SMs,
-    )
-
-    if num_wgs == 0:
-        return 0
-
-    m_block_boundaries = []
-    if causal:
-        # Pre-compute the boundaries of each M-block's workload for a single head.
-        # This list will be used for binary searches.
-        total_blocks = 0
-        for i in range(num_m_blocks):
-            pair_idx = i // 2
-            q_block_idx = pair_idx if (i % 2) == 0 else num_m_blocks - 1 - pair_idx
-            task_size = (q_block_idx + 1) * MASKED_BLOCKS
-            total_blocks += task_size
-            m_block_boundaries.append(total_blocks)
-
-    max_total_output_tiles = 0
-    # Loop through each workgroup to find the one that spans the most output tiles.
-    for wg_id in range(num_wgs):
-        total_output_tiles_for_wg = 0
-
-        # Determine the range of global lean tile indices for this WG
-        if wg_id < high_load_wgs:
-            start_iter = max_tiles_per_wg * wg_id
-            end_iter = start_iter + max_tiles_per_wg
-        else:
-            start_iter = (max_tiles_per_wg - 1) * (
-                wg_id - high_load_wgs
-            ) + high_load_wgs * max_tiles_per_wg
-            end_iter = start_iter + (max_tiles_per_wg - 1)
-
-        start_head = start_iter // tiles_per_head
-        end_head = (end_iter - 1) // tiles_per_head
-
-        # Loop through each head this workgroup touches
-        for head_idx in range(start_head, end_head + 1):
-            head_start_iter = head_idx * tiles_per_head
-
-            # Find the intersection of the WG's range and the current head's range
-            wg_start_in_head = max(start_iter, head_start_iter)
-            wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
-
-            if not causal:
-                # For non-causal, each head is one output tile.
-                total_output_tiles_for_wg += 1
-                continue
-
-            # --- Causal Logic using Binary Search ---
-            # Convert to indices relative to the start of the head's workload
-            relative_start = wg_start_in_head - head_start_iter
-            relative_end = wg_end_in_head - head_start_iter
-
-            # Use binary search to find which M-block the start and end tiles fall into
-            start_m_idx = bisect_right(m_block_boundaries, relative_start)
-            end_m_idx = bisect_right(m_block_boundaries, relative_end - 1)
-
-            # The number of output tiles is the number of boundaries crossed
-            tiles_in_this_head = (end_m_idx - start_m_idx) + 1
-            total_output_tiles_for_wg += tiles_in_this_head
-
-        max_total_output_tiles = max(max_total_output_tiles, total_output_tiles_for_wg)
-
-    return max_total_output_tiles
+    for b in n_ctx:
+        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
+        qb_reshaped = qb.transpose(0, 1)
+        kb = k[start : (start + int(b)), :, :]
+        kb_reshaped = kb.transpose(0, 1)
+        vb = v[start : (start + int(b)), :, :]
+        vb_reshaped = vb.transpose(0, 1)
+        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
+        if causal:
+            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
+            mask = M == 0
+            p[:, mask] = float("-inf")
+        # print(f"p shape: {p.shape}")
+        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
+        refb = torch.matmul(p, vb_reshaped)
+        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
+        start += b
+        start_q += n_ctx_q
+    return ref_out
 
 
 @pytest.mark.parametrize(
@@ -304,19 +192,6 @@ def test_persistent_lean_attention(
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
 
-    max_output_tile_cnt = calculate_max_output_tiles_analytically(
-        causal=causal,
-        batch_size=batch,
-        max_seqlen_q=n_ctx_q,
-        max_seqlen_k=sum_n_ctx,
-        num_heads=h,
-        num_SMs=total_programs,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-
-    max_output_tile_cnt = max_output_tile_cnt + 4
-
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
     # Second, Convert it to a list of assumulative lengthes "list_sum_block_n"
@@ -364,33 +239,10 @@ def test_persistent_lean_attention(
         sm_scale,
         num_warps,
         waves_per_eu,
-        max_output_tile_cnt,
     )
 
     # Calculate Pytorch refence output
-    ref_out = torch.empty_like(q, dtype=v.dtype)
-    start = 0
-    start_q = 0
-
-    for b in n_ctx:
-        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
-        qb_reshaped = qb.transpose(0, 1)
-        kb = k[start : (start + int(b)), :, :]
-        kb_reshaped = kb.transpose(0, 1)
-        vb = v[start : (start + int(b)), :, :]
-        vb_reshaped = vb.transpose(0, 1)
-        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
-        if causal:
-            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
-            mask = M == 0
-            p[:, mask] = float("-inf")
-        # print(f"p shape: {p.shape}")
-        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
-        refb = torch.matmul(p, vb_reshaped)
-        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
-        start += b
-        start_q += n_ctx_q
-
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
@@ -462,29 +314,7 @@ def test_persistent_lean_attention_outer(
     )
 
     # Calculate Pytorch refence output
-    ref_out = torch.empty_like(q, dtype=v.dtype)
-    start = 0
-    start_q = 0
-
-    for b in n_ctx:
-        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
-        qb_reshaped = qb.transpose(0, 1)
-        kb = k[start : (start + int(b)), :, :]
-        kb_reshaped = kb.transpose(0, 1)
-        vb = v[start : (start + int(b)), :, :]
-        vb_reshaped = vb.transpose(0, 1)
-        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
-        if causal:
-            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
-            mask = M == 0
-            p[:, mask] = float("-inf")
-        # print(f"p shape: {p.shape}")
-        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
-        refb = torch.matmul(p, vb_reshaped)
-        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
-        start += b
-        start_q += n_ctx_q
-
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
@@ -524,10 +354,10 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 def main():
     batch = 1
-    causal = True
-    h = 64
-    n_ctx_q = 8192
-    n_ctx = [8192]
+    causal = False
+    h = 8
+    n_ctx_q = 128
+    n_ctx = [1024]
     d = 128
     total_programs = 304
     init_dtype = torch.float16
@@ -541,19 +371,6 @@ def main():
         sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
         print(f"N_CTX contains non-numeric values: {n_ctx}")
-
-    max_output_tile_cnt = calculate_max_output_tiles_analytically(
-        causal=causal,
-        batch_size=batch,
-        max_seqlen_q=n_ctx_q,
-        max_seqlen_k=sum_n_ctx,
-        num_heads=h,
-        num_SMs=total_programs,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-    )
-    print(f"max_output_tile_cnt={max_output_tile_cnt}")
-    max_output_tile_cnt = max_output_tile_cnt + 4
     print(f"causal={causal}, batch={batch}")
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
@@ -601,34 +418,10 @@ def main():
         sm_scale,
         num_warps,
         waves_per_eu,
-        max_output_tile_cnt,
     )
     # print(f"ms={ms}")
-    # Calculate Pytorch refence output
-    ref_out = torch.empty_like(q, dtype=v.dtype)
-    start = 0
-    start_q = 0
 
-    for b in n_ctx:
-        qb = q[start_q : (start_q + int(n_ctx_q)), :, :]
-        # print(f"qb shape: {qb.shape}")
-        qb_reshaped = qb.transpose(0, 1)
-        # print(f"qb reshaped shape: {qb_reshaped.shape}")
-        kb = k[start : (start + int(b)), :, :]
-        kb_reshaped = kb.transpose(0, 1)
-        vb = v[start : (start + int(b)), :, :]
-        vb_reshaped = vb.transpose(0, 1)
-        p = torch.matmul(qb_reshaped, kb_reshaped.transpose(-2, -1)) * sm_scale
-        if causal:
-            M = torch.tril(torch.ones((n_ctx_q, b), device="cuda"))
-            mask = M == 0
-            p[:, mask] = float("-inf")
-        # print(f"p shape: {p.shape}")
-        p = torch.softmax(p.float(), dim=-1).to(q.dtype)
-        refb = torch.matmul(p, vb_reshaped)
-        ref_out[start_q : (start_q + int(n_ctx_q)), :, :] = refb.transpose(0, 1)
-        start += b
-        start_q += n_ctx_q
+    ref_out = reference_attention(q, k, v, n_ctx, n_ctx_q, sm_scale, causal)
 
     # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
@@ -645,6 +438,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-#     benchmark_params = BenchmarkArgs()
-#     args = benchmark_params.parse_args()
-#     bench_streamk(args.m, args.n, args.k, args.total_programs_streamk, str_to_dtype(args.in_dtype), str_to_dtype(args.out_dtype), args.BLK_M, args.BLK_N, args.BLK_K, args.gsize_m)

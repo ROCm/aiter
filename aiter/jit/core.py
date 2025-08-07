@@ -614,7 +614,13 @@ def compile_ops(
             for name, param in sig.parameters.items():
                 if param.annotation is torch.Tensor:
                     mutates_args.append(name)
-            sig = torch.library.infer_schema(func, mutates_args="unknown")
+            if hasattr(torch.library, "infer_schema"):
+                sig = torch.library.infer_schema(func, mutates_args="unknown")
+            else:
+                # for pytorch 2.4
+                import torch._custom_op.impl
+
+                sig = torch._custom_op.impl.infer_schema(func, mutates_args)
             schema = f"{sig}"
         loadName = func.__name__
 

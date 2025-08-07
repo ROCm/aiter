@@ -3,6 +3,9 @@ from typing import Literal
 import triton
 import triton.language as tl
 import torch
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -204,6 +207,7 @@ def act_mul_and_mxfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
+    _LOGGER.info(f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation}")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
