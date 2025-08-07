@@ -62,7 +62,7 @@ float mha_bwd(mha_bwd_args args,
     }} else if (get_gpu_arch() == "gfx950") {{
         arch = GPUArch::gfx950;
     }} else {{
-        // TODO: return with error
+        std::cout << "No supported GPU arch found!" << std::endl;
         return -1;
     }}
     int head_size_q = args.hdim_q;
