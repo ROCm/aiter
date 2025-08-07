@@ -11,6 +11,7 @@ from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
 )
+from csrc.cpp_itfs.torch_utils import torch_compile_guard
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 from torch.library import Library
@@ -168,7 +169,7 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 
 _CKGEMM_CONFIG_CACHE = None
 
-
+@torch_compile_guard()
 def get_CKGEMM_config_(X: Tensor, tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
     global _CKGEMM_CONFIG_CACHE
 
@@ -193,26 +194,27 @@ def get_CKGEMM_config_fake(
 
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    import torch
+    # import torch
 
-    op_name = "aiter::get_CKGEMM_config_"
-    if not hasattr(torch.ops.aiter, "get_CKGEMM_config_"):
-        if hasattr(torch.library, "infer_schema"):
-            schema_str = torch.library.infer_schema(
-                get_CKGEMM_config_, mutates_args="unknown"
-            )
-        else:
-            # for pytorch 2.4
-            import torch._custom_op.impl
+    # op_name = "aiter::get_CKGEMM_config_"
+    # if not hasattr(torch.ops.aiter, "get_CKGEMM_config_"):
+    #     if hasattr(torch.library, "infer_schema"):
+    #         schema_str = torch.library.infer_schema(
+    #             get_CKGEMM_config_, mutates_args="unknown"
+    #         )
+    #     else:
+    #         # for pytorch 2.4
+    #         import torch._custom_op.impl
 
-            schema_str = torch._custom_op.impl.infer_schema(get_CKGEMM_config_, ["X"])
+    #         schema_str = torch._custom_op.impl.infer_schema(get_CKGEMM_config_, ["X"])
 
-        torch.library.define(op_name, schema_str, lib=aiter_lib)
-        torch.library.impl(op_name, "cuda", get_CKGEMM_config_, lib=aiter_lib)
-        torch.library.register_fake(op_name, get_CKGEMM_config_, lib=aiter_lib)
+    #     torch.library.define(op_name, schema_str, lib=aiter_lib)
+    #     torch.library.impl(op_name, "cuda", get_CKGEMM_config_, lib=aiter_lib)
+    #     torch.library.register_fake(op_name, get_CKGEMM_config_, lib=aiter_lib)
 
     x = torch.empty(1, device="cuda")
-    getattr(torch.ops.aiter, "get_CKGEMM_config_")(x, tuned_file)
+    get_CKGEMM_config_(x)
+    # getattr(torch.ops.aiter, "get_CKGEMM_config_")(x, tuned_file)
 
     cu_num = get_cu_num()
 

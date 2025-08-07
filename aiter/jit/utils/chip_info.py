@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import torch
-import csrc.cpp_itfs.torch_utils
+from csrc.cpp_itfs.torch_utils import torch_compile_guard
 from torch.library import Library
 
 aiter_lib = Library("aiter", "FRAGMENT")
@@ -36,6 +36,7 @@ def get_gfx():
 CU_NUM = 0
 
 
+@torch_compile_guard()
 def get_cu_num_custom_op(dummy: torch.Tensor) -> None:
     global CU_NUM
     cu_num = int(os.getenv("CU_NUM", 0))
@@ -62,24 +63,25 @@ def get_cu_num_custom_op(dummy: torch.Tensor) -> None:
     CU_NUM = cu_num
 
 
-_CU_NUM_OP_REGISTERED = False
+# _CU_NUM_OP_REGISTERED = False
 
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
 
-    global _CU_NUM_OP_REGISTERED
+    # global _CU_NUM_OP_REGISTERED
 
-    if not _CU_NUM_OP_REGISTERED:
-        op_name = "aiter::get_cu_num_custom_op"
-        schema_str = "(Tensor dummy) -> ()"
-        torch.library.define(op_name, schema_str, lib=aiter_lib)
-        torch.library.impl(op_name, "cuda", get_cu_num_custom_op, lib=aiter_lib)
-        torch.library.register_fake(op_name, get_cu_num_custom_op, lib=aiter_lib)
-        _CU_NUM_OP_REGISTERED = True
+    # if not _CU_NUM_OP_REGISTERED:
+    #     op_name = "aiter::get_cu_num_custom_op"
+    #     schema_str = "(Tensor dummy) -> ()"
+    #     torch.library.define(op_name, schema_str, lib=aiter_lib)
+    #     torch.library.impl(op_name, "cuda", get_cu_num_custom_op, lib=aiter_lib)
+    #     torch.library.register_fake(op_name, get_cu_num_custom_op, lib=aiter_lib)
+    #     _CU_NUM_OP_REGISTERED = True
 
     x = torch.empty(1, device="cuda")
-    torch.ops.aiter.get_cu_num_custom_op(x)
+    get_cu_num_custom_op(x)
+    # torch.ops.aiter.get_cu_num_custom_op(x)
     return CU_NUM
 
 

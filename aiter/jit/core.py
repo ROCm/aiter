@@ -217,7 +217,7 @@ __mds = {}
 
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
-    check_numa()
+    # check_numa()
     if md_name not in __mds:
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
@@ -520,6 +520,18 @@ NONE_WRAPPED_OP = [
     "compile_mha_bwd",
 ]
 
+SPECIAL_OPS_MUTATES_ARGS = {
+    "topk_softmax": [
+        "arg0",
+        "arg1",
+        "arg2",
+    ],  # "topk_weights", "topk_indices", "token_expert_indices"
+    "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
+    "moe_fused_gate": ["topk_weights", "topk_ids"],
+    "grouped_topk": ["topk_weights", "topk_ids"],
+    "mha_varlen_fwd": ["out"],
+}
+
 
 def generate_schema(func) -> str:
     import inspect
@@ -807,12 +819,9 @@ def compile_ops(
                 schema = generate_schema(func)
             else:
                 sig = inspect.signature(func)
-                mutates_args = []
-                for name, param in sig.parameters.items():
-                    if param.annotation is torch.Tensor:
-                        mutates_args.append(name)
+                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
                 if hasattr(torch.library, "infer_schema"):
-                    sig = torch.library.infer_schema(func, mutates_args="unknown")
+                    sig = torch.library.infer_schema(func, mutates_args=mutates_args)
                 else:
                     # for pytorch 2.4
                     import torch._custom_op.impl
