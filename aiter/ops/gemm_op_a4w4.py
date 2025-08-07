@@ -148,7 +148,9 @@ def gen_gemm_a4w4_blockscale_fake_tensors(
     return Out
 
 
-@compile_ops("module_gemm_a4w4_blockscale", gen_fake=gen_gemm_a4w4_blockscale_fake_tensors)
+@compile_ops(
+    "module_gemm_a4w4_blockscale", gen_fake=gen_gemm_a4w4_blockscale_fake_tensors
+)
 def gemm_a4w4_blockscale(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -159,7 +161,11 @@ def gemm_a4w4_blockscale(
 ) -> Tensor: ...
 
 
-@compile_ops("module_gemm_a4w4_blockscale_tune", fc_name="gemm_a4w4_blockscale_tune", gen_fake=gen_gemm_a4w4_blockscale_fake_tensors)
+@compile_ops(
+    "module_gemm_a4w4_blockscale_tune",
+    fc_name="gemm_a4w4_blockscale_tune",
+    gen_fake=gen_gemm_a4w4_blockscale_fake_tensors,
+)
 def gemm_a4w4_blockscale_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,

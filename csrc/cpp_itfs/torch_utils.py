@@ -147,7 +147,10 @@ def torch_compile_guard(
         else:
             # for pytorch 2.4
             import torch._custom_op.impl
-            schema_str = torch._custom_op.impl.infer_schema(func, mutates_args = mutates_args)
+
+            schema_str = torch._custom_op.impl.infer_schema(
+                func, mutates_args=mutates_args
+            )
 
         op_name = func.__name__
         my_lib = aiter_lib
@@ -155,8 +158,6 @@ def torch_compile_guard(
         my_lib.impl(op_name, wrapper, dispatch_key="CUDA")
         my_lib._register_fake(op_name, abstract_impl)
 
-
         return custom_wrapper
-    
-    return decorator
 
+    return decorator

@@ -12,9 +12,13 @@ aiter_lib = Library("aiter", "FRAGMENT")
 
 from cpp_extension import executable_path
 
+# Since custom op not supported return str and so on, we use global to save
+CU_NUM = 0
+GFX = ""
 
-@functools.lru_cache(maxsize=1)
-def get_gfx():
+@torch_compile_guard()
+def get_gfx_custom_op(dummy: torch.Tensor) -> None:
+    global GFX
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
@@ -25,15 +29,20 @@ def get_gfx():
             output = result.stdout
             for line in output.split("\n"):
                 if "gfx" in line.lower():
-                    return line.split(":")[-1].strip()
+                    # return line.split(":")[-1].strip()
+                    GFX = line.split(":")[-1].strip()
         except Exception as e:
             raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
+    GFX = gfx
+
+
+@functools.lru_cache(maxsize=1)
+def get_gfx():
+    get_gfx_custom_op(torch.empty(1, device="cuda"))
+    gfx = GFX
     return gfx
-
-
-CU_NUM = 0
 
 
 @torch_compile_guard()
@@ -68,16 +77,6 @@ def get_cu_num_custom_op(dummy: torch.Tensor) -> None:
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
-
-    # global _CU_NUM_OP_REGISTERED
-
-    # if not _CU_NUM_OP_REGISTERED:
-    #     op_name = "aiter::get_cu_num_custom_op"
-    #     schema_str = "(Tensor dummy) -> ()"
-    #     torch.library.define(op_name, schema_str, lib=aiter_lib)
-    #     torch.library.impl(op_name, "cuda", get_cu_num_custom_op, lib=aiter_lib)
-    #     torch.library.register_fake(op_name, get_cu_num_custom_op, lib=aiter_lib)
-    #     _CU_NUM_OP_REGISTERED = True
 
     x = torch.empty(1, device="cuda")
     get_cu_num_custom_op(x)
