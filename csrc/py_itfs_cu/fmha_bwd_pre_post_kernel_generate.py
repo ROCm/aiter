@@ -201,7 +201,7 @@ def get_bwd_dot_do_o_blobs(
 
     for dtype in BWD_DTYPE_MAP.keys():
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
-        if d == None:
+        if d is None:
             continue
         for hdim_str, mode, spad, dvpad in itertools.product(
             d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"]
@@ -362,7 +362,7 @@ def get_bwd_convert_dq_blobs(
 
     for dtype in BWD_DTYPE_MAP.keys():
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
-        if d == None:
+        if d is None:
             continue
         for hdim_str, mode, spad, dpad, deterministic in itertools.product(
             d.keys(), MODE_MAP.keys(), ["t", "f"], ["t", "f"], ["t", "f"]
