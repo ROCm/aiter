@@ -443,7 +443,7 @@ if __name__ == "__main__":
         "--min_seqlen_q",
         type=int,
         nargs="?",
-        default=1,
+        default=0,
         help="""Minimum sequence length of query.
     e.g. -msq 1""",
     )
