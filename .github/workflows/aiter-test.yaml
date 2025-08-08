@@ -36,7 +36,7 @@ jobs:
       - name: Setup-Triton
         run: |
           set -ex
-          echo "Setuping Triton..."
+          echo "Setting up Triton..."
           docker exec \
           -w /workspace \
           aiter_test \
