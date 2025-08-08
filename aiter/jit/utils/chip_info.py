@@ -12,14 +12,9 @@ aiter_lib = Library("aiter", "FRAGMENT")
 
 from cpp_extension import executable_path
 
-# Since custom op not supported return str and so on, we use global to save
-CU_NUM = 0
-GFX = ""
-
 
 @torch_compile_guard()
-def get_gfx_custom_op(dummy: torch.Tensor) -> None:
-    global GFX
+def get_gfx_custom_op(dummy: torch.Tensor) -> torch.Tensor:
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
@@ -30,70 +25,25 @@ def get_gfx_custom_op(dummy: torch.Tensor) -> None:
             output = result.stdout
             for line in output.split("\n"):
                 if "gfx" in line.lower():
-                    # return line.split(":")[-1].strip()
-                    GFX = line.split(":")[-1].strip()
+                    gfx = line.split(":")[-1].strip()
+                    encoded = torch.tensor([ord(c) for c in gfx], dtype=torch.int32)
+                    return encoded
         except Exception as e:
             raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
-    GFX = gfx
+        encoded = torch.tensor([ord(c) for c in gfx], dtype=torch.int32)
+        return encoded
 
 
 @functools.lru_cache(maxsize=1)
 def get_gfx():
-    # get_gfx_custom_op(torch.empty(1, device="cuda"))
-    # gfx = GFX
-    # return gfx
-    gfx = os.getenv("GPU_ARCHS", "native")
-    if gfx == "native":
-        try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            for line in output.split("\n"):
-                if "gfx" in line.lower():
-                    return line.split(":")[-1].strip()
-        except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
-    elif ";" in gfx:
-        gfx = gfx.split(";")[-1]
-    return gfx
+    encoded_tensor = get_gfx_custom_op(torch.empty(1, device="cpu"))
+    return "".join(chr(c) for c in encoded_tensor.cpu().tolist())
 
 
 @torch_compile_guard()
-def get_cu_num_custom_op(dummy: torch.Tensor) -> None:
-    global CU_NUM
-    cu_num = int(os.getenv("CU_NUM", 0))
-    if cu_num == 0:
-        try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            devices = re.split(r"Agent\s*\d+", output)
-            gpu_compute_units = []
-            for device in devices:
-                for line in device.split("\n"):
-                    if "Device Type" in line and line.find("GPU") != -1:
-                        match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
-                        if match:
-                            gpu_compute_units.append(int(match.group(1)))
-                        break
-        except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
-        assert len(set(gpu_compute_units)) == 1
-        cu_num = gpu_compute_units[0]
-    CU_NUM = cu_num
-
-
-# _CU_NUM_OP_REGISTERED = False
-
-
-@functools.lru_cache(maxsize=1)
-def get_cu_num():
+def get_cu_num_custom_op(dummy: torch.Tensor) -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -116,10 +66,12 @@ def get_cu_num():
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
     return cu_num
-    # x = torch.empty(1, device="cuda")
-    # get_cu_num_custom_op(x)
-    # # torch.ops.aiter.get_cu_num_custom_op(x)
-    # return CU_NUM
+
+
+@functools.lru_cache(maxsize=1)
+def get_cu_num():
+    x = torch.empty(1, device="cuda")
+    return get_cu_num_custom_op(x)
 
 
 def get_device_name():

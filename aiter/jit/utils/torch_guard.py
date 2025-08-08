@@ -34,6 +34,7 @@ def torch_compile_guard(
         my_lib = aiter_lib
         my_lib.define(op_name + schema_str, tags=())
         my_lib.impl(op_name, wrapper, dispatch_key="CUDA")
+        my_lib.impl(op_name, wrapper, dispatch_key="CPU")
         my_lib._register_fake(op_name, abstract_impl)
 
         return custom_wrapper
