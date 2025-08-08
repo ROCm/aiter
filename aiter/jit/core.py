@@ -579,6 +579,8 @@ def generate_schema(func) -> str:
                 type_str = "Tensor[]"
         elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
             type_str = "int[]"
+        elif param_type == Optional[torch.dtype]:
+            type_str = "ScalarType?"
         else:
             type_str = "*"
             flag = False

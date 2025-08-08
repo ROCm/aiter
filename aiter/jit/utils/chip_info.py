@@ -35,13 +35,15 @@ def get_gfx_custom_op(dummy: torch.Tensor) -> torch.Tensor:
             raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
-        encoded = torch.tensor([ord(c) for c in gfx], dtype=torch.int32)
-        return encoded
+    encoded = torch.tensor([ord(c) for c in gfx], dtype=torch.int32)
+    return encoded
 
 
 @functools.lru_cache(maxsize=1)
 def get_gfx():
     encoded_tensor = get_gfx_custom_op(torch.empty(1, device="cpu"))
+    if encoded_tensor is None or encoded_tensor.numel() == 0:
+        return ""
     return "".join(chr(c) for c in encoded_tensor.cpu().tolist())
 
 
