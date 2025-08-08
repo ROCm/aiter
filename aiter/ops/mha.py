@@ -154,7 +154,12 @@ def gen_mha_fwd_fake_tensors(
     )
 
 
-@compile_ops("module_mha_fwd", fc_name="mha_fwd", gen_fake=gen_mha_fwd_fake_tensors)
+@compile_ops(
+    "module_mha_fwd",
+    fc_name="mha_fwd",
+    gen_func=cmdGenFunc_mha_fwd,
+    gen_fake=gen_mha_fwd_fake_tensors,
+)
 def mha_fwd(
     q: Tensor,
     k: Tensor,

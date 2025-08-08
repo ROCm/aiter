@@ -24,6 +24,8 @@ from chip_info import get_gfx
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
+aiter_lib = None
+
 
 def mp_lock(
     lockPath: str,
@@ -514,6 +516,8 @@ NONE_WRAPPED_OP = [
     "dispose",
     "meta_size",
     "get_padded_m",
+    "compile_mha_fwd",
+    "compile_mha_bwd",
 ]
 
 
@@ -598,31 +602,7 @@ def compile_ops(
 ):
 
     def decorator(func):
-        import torch
-        from csrc.cpp_itfs.torch_utils import aiter_lib
-        import torch.library
-        import inspect
-
         func.arg_checked = False
-
-        schema = ""
-        if func.__name__ in MANUAL_SCHEMA_OPS:
-            schema = generate_schema(func)
-        else:
-            sig = inspect.signature(func)
-            mutates_args = []
-            for name, param in sig.parameters.items():
-                if param.annotation is torch.Tensor:
-                    mutates_args.append(name)
-            if hasattr(torch.library, "infer_schema"):
-                sig = torch.library.infer_schema(func, mutates_args="unknown")
-            else:
-                # for pytorch 2.4
-                import torch._custom_op.impl
-
-                sig = torch._custom_op.impl.infer_schema(func, mutates_args)
-            schema = f"{sig}"
-        loadName = func.__name__
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
@@ -777,6 +757,8 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
+            import inspect
+
             sig = inspect.signature(func)
             params = list(sig.parameters.keys())
             if loadName in activation_list:
@@ -809,19 +791,55 @@ def compile_ops(
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
 
-        if loadName in NONE_WRAPPED_OP:
+        if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
 
-        if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
-            op_schema = f"aiter::wrapper_{loadName}" + schema
-            aiter_lib.define(op_schema)
-            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
-            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
-            aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+        def wrapper_register(func):
+            import torch
+            import torch.library
+            import inspect
+            from torch.library import Library
 
-        def wrapper_return(*args, **kwargs):
+            global aiter_lib
+            aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
+            schema = ""
+            if func.__name__ in MANUAL_SCHEMA_OPS:
+                schema = generate_schema(func)
+            else:
+                sig = inspect.signature(func)
+                mutates_args = []
+                for name, param in sig.parameters.items():
+                    if param.annotation is torch.Tensor:
+                        mutates_args.append(name)
+                if hasattr(torch.library, "infer_schema"):
+                    sig = torch.library.infer_schema(func, mutates_args="unknown")
+                else:
+                    # for pytorch 2.4
+                    import torch._custom_op.impl
+
+                    sig = torch._custom_op.impl.infer_schema(func, mutates_args)
+                schema = f"{sig}"
+            return schema
+
+        schema = wrapper_register(func)
+
+        def wrapper_custom(*args, custom_build_args={}, **kwargs):
+            import torch
+
+            loadName = func.__name__
+            if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+                op_schema = f"aiter::wrapper_{loadName}" + schema
+                aiter_lib.define(op_schema, tags=())
+                aiter_lib.impl(
+                    f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA"
+                )
+                aiter_lib.impl(
+                    f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU"
+                )
+                aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
 
-        return wrapper_return
+        return wrapper_custom
 
     return decorator
