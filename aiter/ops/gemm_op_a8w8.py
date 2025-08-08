@@ -196,8 +196,7 @@ def get_CKGEMM_config_fake(
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
     x = torch.empty(1, device="cuda")
-    get_CKGEMM_config_(x)
-    # getattr(torch.ops.aiter, "get_CKGEMM_config_")(x, tuned_file)
+    get_CKGEMM_config_(x, tuned_file)
 
     cu_num = get_cu_num()
 
