@@ -23,8 +23,12 @@ import json
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from typing import Optional
+from bisect import bisect_right
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 LOG_TWO_E = 1.44269504  # log_2(e) value for softmax scaling
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
@@ -65,6 +69,9 @@ def persistent_lean_attention(
     """
     Lean Attention kernel.
     """
+    _LOGGER.info(
+        f"LEAN_ATTEN_PAGED: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
+    )
     if config is None:
         config = _get_config(causal=causal, batch_size=batch_size)
     sm_count = arch_info.get_num_sms()
@@ -108,7 +115,6 @@ def _persistent_lean_attention(
     sm_scale: torch.float16,  # typically 1 / sqrt(d)
     num_warps: int,
     waves_per_eu: int,
-    max_output_tile_cnt: int,
     config: dict = {},
 ):
     """
@@ -156,13 +162,26 @@ def _persistent_lean_attention(
         BLOCK_N,
         total_programs,
     )
-    # print(
-    #    f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
-    # )
-    # print(
-    #    f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
-    # )
-    # print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
+
+    print(
+        f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
+    )
+    print(
+        f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
+    )
+    print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
+
+    max_output_tile_cnt = calculate_max_output_tiles_analytically(
+        tiles_per_head=tiles_per_head,
+        num_m_blocks=num_m_blocks,
+        num_wgs=total_programs,
+        high_load_wgs=high_load_wgs,
+        max_tiles_per_wg=max_tiles_per_wg,
+        causal=causal,
+        MASKED_BLOCKS=MASKED_BLOCKS,
+    )
+
+    max_output_tile_cnt = max_output_tile_cnt + 4
 
     grid = (total_programs, 1, 1)
 
@@ -286,7 +305,13 @@ def get_num_splits_and_buffer_sizes(
     # StreamK Lean has as many threadblocks as SMs
     # This should be a function of tile size and number of scratchpad space
     # LeanAttention assign 3 CTAs per SM (bounded by LDS size)
-    lean_griddimz = num_SMs  # CTA launch grid
+    if total_tiles <= num_SMs:
+        lean_griddimz = min(
+            (total_tiles + 1) // 2,
+            (32 * total_tiles + num_n_blocks - 1) // num_n_blocks,
+        )
+    else:
+        lean_griddimz = num_SMs  # CTA launch grid
     # if (total_tiles <= 2 * 2 * num_SMs):
     #    lean_griddimz = min((total_tiles + 1) / 2, (32 * total_tiles + num_n_blocks - 1) / num_n_blocks)
     # else:
@@ -325,6 +350,83 @@ def get_num_splits_and_buffer_sizes(
     )
 
 
+def calculate_max_output_tiles_analytically(
+    tiles_per_head: int,
+    num_m_blocks: int,
+    num_wgs: int,
+    high_load_wgs: int,
+    max_tiles_per_wg: int,
+    causal: bool,
+    MASKED_BLOCKS: int,
+):
+    """
+    Calculates the maximum number of output tiles any single workgroup will process
+    using a fast, analytical method with binary search.
+    """
+    if num_wgs == 0:
+        return 0
+
+    m_block_boundaries = []
+    if causal:
+        # Pre-compute the boundaries of each M-block's workload for a single head.
+        # This list will be used for binary searches.
+        total_blocks = 0
+        for i in range(num_m_blocks):
+            pair_idx = i // 2
+            q_block_idx = pair_idx if (i % 2) == 0 else num_m_blocks - 1 - pair_idx
+            task_size = (q_block_idx + 1) * MASKED_BLOCKS
+            total_blocks += task_size
+            m_block_boundaries.append(total_blocks)
+
+    max_total_output_tiles = 0
+    # Loop through each workgroup to find the one that spans the most output tiles.
+    for wg_id in range(num_wgs):
+        total_output_tiles_for_wg = 0
+
+        # Determine the range of global lean tile indices for this WG
+        if wg_id < high_load_wgs:
+            start_iter = max_tiles_per_wg * wg_id
+            end_iter = start_iter + max_tiles_per_wg
+        else:
+            start_iter = (max_tiles_per_wg - 1) * (
+                wg_id - high_load_wgs
+            ) + high_load_wgs * max_tiles_per_wg
+            end_iter = start_iter + (max_tiles_per_wg - 1)
+
+        start_head = start_iter // tiles_per_head
+        end_head = (end_iter - 1) // tiles_per_head
+
+        # Loop through each head this workgroup touches
+        for head_idx in range(start_head, end_head + 1):
+            head_start_iter = head_idx * tiles_per_head
+
+            # Find the intersection of the WG's range and the current head's range
+            wg_start_in_head = max(start_iter, head_start_iter)
+            wg_end_in_head = min(end_iter, head_start_iter + tiles_per_head)
+
+            if not causal:
+                # For non-causal, each head is one output tile.
+                total_output_tiles_for_wg += 1
+                continue
+
+            # --- Causal Logic using Binary Search ---
+            # Convert to indices relative to the start of the head's workload
+            relative_start = wg_start_in_head - head_start_iter
+            relative_end = wg_end_in_head - head_start_iter
+
+            # Use binary search to find which M-block the start and end tiles fall into
+            start_m_idx = bisect_right(m_block_boundaries, relative_start)
+            end_m_idx = bisect_right(m_block_boundaries, relative_end - 1)
+
+            # The number of output tiles is the number of boundaries crossed
+            tiles_in_this_head = (end_m_idx - start_m_idx) + 1
+            total_output_tiles_for_wg += tiles_in_this_head
+
+        max_total_output_tiles = max(max_total_output_tiles, total_output_tiles_for_wg)
+
+    return max_total_output_tiles
+
+
 @triton.jit
 def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
     total_blocks_processed = 0
@@ -360,6 +462,77 @@ def find_group(x, MASKED_BLOCKS: tl.constexpr, num_m_blocks: tl.constexpr):
         total_blocks_processed += task_size
     # Return values
     return final_q_block_idx, final_task_size, final_total_blocks
+
+
+@triton.jit
+def _attention_inner(
+    q,
+    k_ptrs,
+    v_ptrs,
+    stride_vn,
+    stride_kn,
+    m_i,
+    l_i,
+    acc,
+    qk_scale,
+    causal,
+    q_start_m,
+    b_seq_size,
+    offs_m,
+    offs_n,
+    BLOCK_M,
+    BLOCK_N,
+    HEAD_DIM,
+    local_iter,
+    local_iter_end,
+):
+    """
+    Performs attention calculation for an (maybe partial) output tile
+    """
+    for l_iter in range(local_iter, local_iter_end):
+        k = tl.load(k_ptrs)
+        qk = tl.dot(q, k) * qk_scale
+
+        if causal:
+            # Get the starting column index of the current K block
+            k_start_n = (b_seq_size + l_iter) * BLOCK_N
+            # Create mask based on absolute sequence positions
+            mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
+            # Apply the mask
+            qk = tl.where(mask, qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+
+        if causal:
+            # Safe exp2 calculation to avoid NaNs
+            p_arg = qk - m_ij[:, None]
+            p_arg = tl.where(m_ij[:, None] == float("-inf"), float("-inf"), p_arg)
+            p = tl.math.exp2(p_arg)
+
+            # Safe scaling factor calculation
+            alpha_arg = m_i - m_ij
+            alpha_arg = tl.where(m_ij == float("-inf"), 0.0, alpha_arg)
+            alpha = tl.math.exp2(alpha_arg)
+        else:
+            qk = qk - m_ij[:, None]
+            p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
+            alpha = tl.math.exp2(m_i - m_ij)
+
+        # Update accumulator
+        acc = acc * alpha[:, None]
+        v = tl.load(v_ptrs)
+        acc += tl.dot(p.to(v.dtype), v)
+
+        # Update stats
+        l_ij = tl.sum(p, 1)
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij.to(m_i.dtype)
+
+        # update k/v pointer
+        v_ptrs += BLOCK_N * stride_vn
+        k_ptrs += BLOCK_N * stride_kn
+
+    return m_i, l_i, acc
 
 
 @triton.jit
@@ -638,8 +811,11 @@ def la_persistent_inner(
 
     if causal:
         q_idx = per_head_tile_idx + tile_batch_idx * num_m_blocks
+        q_start_m = q_idx * BLOCK_M
     else:
         q_idx = tile_batch_idx
+        q_start_m = 0
+
     q_offs = (
         q_idx * BLOCK_M * stride_qm
         + tile_head_idx * stride_qh
@@ -649,62 +825,33 @@ def la_persistent_inner(
     q_ptrs = Q + q_offs
     q_ptrs = tl.multiple_of(q_ptrs, (1, 16))
 
-    if causal:
-        q_start_m = q_idx * BLOCK_M
-
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     q = tl.load(q_ptrs)
 
-    for l_iter in range(local_iter, local_iter_end):
-        # -- compute qk ----
-        # k = tl.load(k_ptrs, cache_modifier=".cg")
-        k = tl.load(k_ptrs)
-        qk = tl.dot(q, k)
-        qk = qk * qk_scale
-
-        # Apply the causal mask
-        #    qk = tl.where(mask, qk, float("-inf"))
-
-        if causal:
-            # Get the starting column index of the current K block
-            k_start_n = (b_seq_size + l_iter) * BLOCK_N
-            # Create mask based on absolute sequence positions
-            mask = (q_start_m + offs_m[:, None]) >= (k_start_n + offs_n[None, :])
-            # Apply the mask
-            qk = tl.where(mask, qk, float("-inf"))
-
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
-        p = tl.math.exp2(qk)  # p.shape = [BLOCK_M, BLOCK_N]
-        # -- update output accumulator --
-        alpha = tl.math.exp2(m_i - m_ij)
-        acc = (
-            acc * alpha[:, None]
-        )  # Scale each row of acc by the corresponding elements in alpha
-        # v = tl.load(v_ptrs, cache_modifier=".cg")  # v.shape = [BLOCK_N, HEAD_DIM]
-        v = tl.load(v_ptrs)
-        acc += tl.dot(p.to(v.dtype), v)  # acc.shape = [BLOCK_M, HEAD_DIM]
-        # -- update l_i
-        l_ij = tl.sum(p, 1)  # rowsum(p)
-        l_i = l_i * alpha + l_ij
-        # update m_i
-        m_i = m_ij.to(m_i.dtype)
-        if (
-            (l_iter == (tile_iter_end - tile_iter) - 1)
-            and (iter == tile_iter_end - 1)
-            and (MASKED_BLOCKS == 2)
-        ):
-            mask1 = offs_m >= BLOCK_N
-            m_i = tl.where(mask1, m_i, float("-inf"))
-            l_i = tl.where(mask1, l_i, 1.0)
-            mask1 = mask1[:, None]
-            acc = tl.where(mask1, acc, 0.0)
-        # update k/v pointer
-        v_ptrs += BLOCK_N * stride_vn
-        k_ptrs += BLOCK_N * stride_kn
+    m_i, l_i, acc = _attention_inner(
+        q,
+        k_ptrs,
+        v_ptrs,
+        stride_vn,
+        stride_kn,
+        m_i,
+        l_i,
+        acc,
+        qk_scale,
+        causal,
+        q_start_m,
+        b_seq_size,
+        offs_m,
+        offs_n,
+        BLOCK_M,
+        BLOCK_N,
+        HEAD_DIM,
+        local_iter,
+        local_iter_end,
+    )
 
     # initialize pointer to m and l
     m_cta = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")

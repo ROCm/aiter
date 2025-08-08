@@ -234,8 +234,9 @@ float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_confi
         if (t.data_type.compare("bf16") == 0) {{
             if ((t.bias_type == bias_enum::no_bias) && (t.has_dropout == false) &&
                         (a.seqlen_q == a.seqlen_k) && (a.seqlen_q >= 384) &&
-                        (a.batch_stride_lse >= a.nhead_stride_lse) && (a.hdim_q == a.hdim_v) &&
-                        (a.hdim_q == 128)) {{
+                        (a.hdim_q == 128) && (a.batch_stride_lse >= a.nhead_stride_lse) && (a.hdim_q == a.hdim_v) &&
+                        (a.stride_k == a.stride_v) && (a.nhead_stride_k == a.nhead_stride_v) && (a.batch_stride_k == a.batch_stride_v) &&
+                        (a.batch_stride_q == a.batch_stride_o) && (a.batch_stride_q >= a.stride_q) && (a.batch_stride_k >= a.stride_k)) {{
                         {F_dispatch}
             }}
         }}

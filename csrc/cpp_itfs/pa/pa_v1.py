@@ -1,5 +1,5 @@
 from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
+from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import ctypes
 import math
 
@@ -247,7 +247,8 @@ if __name__ == "__main__":
     parser.add_argument("--fp8_kv_dtype", type=str, required=True)
     parser.add_argument("--out_dtype", type=str, required=True)
     parser.add_argument("--block_size", type=int, required=True)
-    parser.add_argument("--alibi_enabled", type=str, required=True)
+    parser.add_argument("--alibi_enabled", type=str_to_bool, required=True)
+    parser.add_argument("--logits_soft_cap_enabled", type=str_to_bool, required=True)
     parser.add_argument("--mtp", type=int, default=1)
     parser.add_argument("--folder", type=str, default=None)
     args = parser.parse_args()

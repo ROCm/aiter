@@ -66,7 +66,7 @@
           py::arg("out_")           = std::nullopt, \
           py::arg("qo_indptr")      = std::nullopt, \
           py::arg("high_precision") = 1,            \
-          py::arg("kernelName")     = "");
+          py::arg("kernelName")     = std::nullopt);
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -558,7 +558,7 @@
           py::arg("num_valid_ids"),                  \
           py::arg("out"),                            \
           py::arg("topk"),                           \
-          py::arg("kernelName")     = "",            \
+          py::arg("kernelName")     = std::nullopt,  \
           py::arg("w1_scale")       = std::nullopt,  \
           py::arg("a1_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
@@ -577,7 +577,7 @@
           py::arg("num_valid_ids"),                  \
           py::arg("out"),                            \
           py::arg("topk"),                           \
-          py::arg("kernelName")     = "",            \
+          py::arg("kernelName")     = std::nullopt,  \
           py::arg("w2_scale")       = std::nullopt,  \
           py::arg("a2_scale")       = std::nullopt,  \
           py::arg("block_m")        = 32,            \
@@ -647,7 +647,7 @@
           py::arg("num_expert_group"),                                                        \
           py::arg("topk_grp"),                                                                \
           py::arg("need_renorm"),                                                             \
-          py::arg("scoring_func")          = "softmax",                                       \
+          py::arg("scoring_func") = true,                                                     \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
           "Apply grouped topk softmax/sigmodd to the gating outputs.");                       \
     m.def("biased_grouped_topk",                                                              \
