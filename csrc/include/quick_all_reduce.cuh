@@ -504,8 +504,8 @@ struct CodecFp8 : public CodecBase {
     }
   }
 
-  __device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
-                              int32x4_t* __restrict__ data) {
+  __quickreduce_device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
+                                          int32x4_t* __restrict__ data) {
     for (int k = 0; k < kRankAtoms; k++) {
       // Directly read quantized atom from recv_buffer
       uint8_t* atom_ptr = reinterpret_cast<uint8_t*>(*recv_buffer);
