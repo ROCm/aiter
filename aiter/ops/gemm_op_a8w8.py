@@ -11,7 +11,7 @@ from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
 )
-from csrc.cpp_itfs.torch_utils import torch_compile_guard
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 from torch.library import Library

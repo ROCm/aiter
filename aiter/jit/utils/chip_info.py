@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import torch
-from csrc.cpp_itfs.torch_utils import torch_compile_guard
+from torch_guard import torch_compile_guard
 from torch.library import Library
 
 aiter_lib = Library("aiter", "FRAGMENT")
@@ -15,6 +15,7 @@ from cpp_extension import executable_path
 # Since custom op not supported return str and so on, we use global to save
 CU_NUM = 0
 GFX = ""
+
 
 @torch_compile_guard()
 def get_gfx_custom_op(dummy: torch.Tensor) -> None:

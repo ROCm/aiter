@@ -540,17 +540,29 @@ def generate_schema(func) -> str:
 
     sig = inspect.signature(func)
     parameters = []
-
+    mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
+        is_mutates = False
+        if name in mutates_args:
+            is_mutates = True
 
         if param_type is torch.Tensor:
-            type_str = f"Tensor(a{idx}!)"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)"
+            else:
+                type_str = "Tensor"
         elif param_type == Optional[torch.Tensor]:
-            type_str = f"Tensor(a{idx}!)?"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)?"
+            else:
+                type_str = "Tensor?"
         elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
-            type_str = f"Tensor(a{idx}!)?"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)?"
+            else:
+                type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
         elif param_type in (float, bool, str):
@@ -561,7 +573,10 @@ def generate_schema(func) -> str:
             get_origin(param_type) in (list, List)
             and get_args(param_type)[0] is torch.Tensor
         ):
-            type_str = f"Tensor(a{idx}!)[]"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)[]"
+            else:
+                type_str = "Tensor[]"
         elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
             type_str = "int[]"
         else:
@@ -618,6 +633,7 @@ def compile_ops(
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
+
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
