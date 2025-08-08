@@ -4,8 +4,8 @@
 from ..jit.core import (
     compile_ops,
 )
-import torch
 
 
 @compile_ops("module_gemm_common")
-def get_padded_m(M: int, N: int, K: int, gl: int) -> int: ...
+def get_padded_m(M: int, N: int, K: int, gl: int) -> int:
+    ...
