@@ -850,21 +850,17 @@ def compile_ops(
 
         schema = wrapper_register(func)
 
+        import torch
+
+        loadName = func.__name__
+        if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            op_schema = f"aiter::wrapper_{loadName}" + schema
+            aiter_lib.define(op_schema, tags=())
+            aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA")
+            aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU")
+            aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+
         def wrapper_custom(*args, custom_build_args={}, **kwargs):
-            import torch
-
-            loadName = func.__name__
-            if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
-                op_schema = f"aiter::wrapper_{loadName}" + schema
-                aiter_lib.define(op_schema, tags=())
-                aiter_lib.impl(
-                    f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA"
-                )
-                aiter_lib.impl(
-                    f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU"
-                )
-                aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
-
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
 
         return wrapper_custom

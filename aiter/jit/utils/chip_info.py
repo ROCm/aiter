@@ -4,6 +4,11 @@ import functools
 import os
 import re
 import subprocess
+import torch
+from torch_guard import torch_compile_guard
+from torch.library import Library
+
+aiter_lib = Library("aiter", "FRAGMENT")
 
 from cpp_extension import executable_path
 
@@ -28,8 +33,8 @@ def get_gfx():
     return gfx
 
 
-@functools.lru_cache(maxsize=1)
-def get_cu_num():
+@torch_compile_guard()
+def get_cu_num_custom_op(dummy: torch.Tensor) -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -52,6 +57,12 @@ def get_cu_num():
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
     return cu_num
+
+
+@functools.lru_cache(maxsize=1)
+def get_cu_num():
+    x = torch.empty(1, device="cpu")
+    return get_cu_num_custom_op(x)
 
 
 def get_device_name():
