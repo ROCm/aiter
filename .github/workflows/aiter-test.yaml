@@ -20,6 +20,7 @@ jobs:
     
       - name: Run the container
         run: |
+          set -ex
           echo "Starting container: aiter_test"
           docker run -dt \
           --device=/dev/dri \
@@ -34,6 +35,7 @@ jobs:
 
       - name: Setup-Triton
         run: |
+          set -ex
           echo "Setuping Triton..."
           docker exec \
           -w /workspace \
@@ -42,6 +44,7 @@ jobs:
       
       - name: Standard Tests
         run: |
+          set -ex
           echo "Running Standard Tests..."
           docker exec \
           -w /workspace \
@@ -50,13 +53,26 @@ jobs:
 
       - name: MultiGPU Tests
         run: |
+          set -ex
           echo "Running Standard Tests..."
           docker exec \
           -e MULTIGPU=TRUE \
           -w /workspace \
           aiter_test \
           ./.github/scripts/aiter_test.sh
+      
+      - name: Copy test logs
+        if: always()
+        run: |
+          docker cp aiter_test:/workspace/latest_test.log ${{ github.workspace }}/latest_test.log || true
+      
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: latest_test.log
 
-
-
-        
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f aiter_test || true
