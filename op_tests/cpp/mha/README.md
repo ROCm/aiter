@@ -29,31 +29,34 @@ you can also call this python script from different directory, the generated `.s
 
 Second, link the `.so` into your executable and compile. You need specify the correct path through `-L` inorder to link to the device lib. You also need to specify the include directory through `-I`, for this example you need set `$TOP_DIR/csrc/include` for the `aiter` API header, and the dependent ck header `$TOP_DIR/3rdparty/composable_kernel/include` and `$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/`. Please refer to `build_mha.sh` for detailed command
 
-## bwd_v3 supported arguments configuration
-- common restrictions:
-    - `bias` and `dbias` must be `False`
-    - `dropout` must be `False`
-    - `deterministic` must be `False`
-    - `head_dim_q` must equal to `head_dim_v` and must be divisible by `8`
+## `aiter::mha_bwd` supported arguments configuration
+Note: For optimal performance, the input configuration preferentially matches the supported parameters of the asm kernel type.
 
-- batch mode restrictions:
-    - `head_dim_q` must in range `[64, 192]`
+| No. | hdim_q       | hdim_v          | q_dtype_str  | is_group_mode | mask_type   | bias_type   | has_dbias     | p_drop | deterministic | use_ext_asm   | is_v3_atomic_fp32 | how_v3_bf16_cvt                                   | shape&stride constraints                                                                                                                                                                                                        | kernel type(asm/ck) | mi308 | mi300/325 | mi350/355                        |
+|-----|--------------|-----------------|--------------|---------------|-------------|-------------|---------------|--------|---------------|---------------|-------------------|---------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------|-------|-----------|----------------------------------|
+| 1   | (128,192]/x8 | equal to hdim_q | fp16 or bf16 | FALSE         | 0 or 1 or 2 | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE              | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD                                                                                                                                                                                                        | asm                 | y     | y         | n                                |
+| 2   | (128,192]/x8 | equal to hdim_q | fp16 or bf16 | TRUE          | 0 or 1      | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE              | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD                                                                                                                                                                                                        | asm                 | y     | y         | n                                |
+| 3   | (64,128]/x8  | equal to hdim_q | fp16 or bf16 | FALSE         | 0 or 1 or 2 | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE or FALSE     | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD when is_v3_atomic_fp32 is TRUE. The shape&stride of q and do must be the same and the shape&stride of k and v must be the same and seqlen_q must be equal to seqlen_k when is_v3_atomic_fp32 is FALSE. | asm                 | y     | y         | bf16;hd128;sq == sk;sq % 256==0  |
+| 4   | (64,128]/x8  | equal to hdim_q | fp16 or bf16 | TRUE          | 0 or 1 or 2 | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE              | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD                                                                                                                                                                                                        | asm                 | y     | y         | bf16;hd128;sq == sk;sq % 256==0  |
+| 5   | 64           | equal to hdim_q | fp16 or bf16 | TRUE or FALSE | 0           | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE or FALSE     | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD when is_v3_atomic_fp32 is TRUE. The shape&stride of q and do must be the same and the shape&stride of k and v must be the same and seqlen_q must be equal to seqlen_k when is_v3_atomic_fp32 is FALSE. | asm                 | y     | y         | n                                |
+| 6   | 64           | equal to hdim_q | fp16 or bf16 | TRUE          | 1           | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE              | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD                                                                                                                                                                                                        | asm                 | y     | y         | n                                |
+| 7   | 64           | equal to hdim_q | fp16 or bf16 | FALSE         | 1 or 2      | 0           | FALSE         | 0.0    | FALSE         | TRUE          | TRUE              | 0 or 1 or 2(needed only when q_dtype_str is bf16) | dq_acc only support BHSD                                                                                                                                                                                                        | asm                 | y     | y         | n                                |
+| 8   | 64           | equal to hdim_q | fp16 or bf16 | TRUE or FALSE | 1 or 2      | 0           | FALSE         | 0.0    | FALSE         | TRUE          | FALSE             | 0 or 1 or 2(needed only when q_dtype_str is bf16) | the shape&stride of q and do must be the same and the shape&stride of k and v must be the same and seqlen_q must be equal to seqlen_k                                                                                           | asm                 | y     | y         | n                                |
+| 9   | [0,32]       | [0,32]          | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | TRUE or FALSE | UNCONSTRAINED | UNCONSTRAINED     | UNCONSTRAINED                                     | UNCONSTRAINED                                                                                                                                                                                                                   | ck                  | y     | y         | y                                |
+| 10  | (0,64]       | (0,64]          | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | TRUE or FALSE | UNCONSTRAINED | UNCONSTRAINED     | UNCONSTRAINED                                     | UNCONSTRAINED                                                                                                                                                                                                                   | ck                  | y     | y         | y                                |
+| 11  | (0,128]      | (0,128]         | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | TRUE or FALSE | UNCONSTRAINED | UNCONSTRAINED     | UNCONSTRAINED                                     | UNCONSTRAINED                                                                                                                                                                                                                   | ck                  | y     | y         | y                                |
+| 12  | (0,256]      | (0,256]         | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | TRUE or FALSE | UNCONSTRAINED | UNCONSTRAINED     | UNCONSTRAINED                                     | UNCONSTRAINED                                                                                                                                                                                                                   | ck                  | y     | y         | y                                |
 
-- group mode restrictions:
-    - `head_dim_q` must in range `[64, 128]`
 
-## fwd_v3 supported arguments configuration
-- gfx942 restrictions:
-    - `prec` must be `bf16`
-    - `bias` must be `False`
-    - `dropout` must be `False`
-    - `head_dim_q` must equal to `head_dim_v` and must equal to `128`
-    - `seqlen_q` must be greater than `384` and equal to `seqlen_k`
+## `aiter::mha_fwd` supported arguments configuration
+Note: For optimal performance, the input configuration preferentially matches the supported parameters of the asm kernel type.
 
-- gfx950 restrictions:
-    - `prec` must be `bf16`
-    - `bias` must be `False`
-    - `dropout` must be `False`
-    - `head_dim_q` must equal to `head_dim_v` and must equal to `128`
-    - `seqlen_q` must be greater than `384` and equal to `seqlen_k`
-    - `lse` must be `true`
+| No. | hdim_q  | hdim_v  | q_dtype_str  | is_group_mode | mask_type   | bias_type   | has_lse       | p_drop | use_ext_asm   | seqlen_q      | seqlen_k          | kernel type | mi308 | mi300/325 | mi350/355  |
+|-----|---------|---------|--------------|---------------|-------------|-------------|---------------|--------|---------------|---------------|-------------------|-------------|-------|-----------|------------|
+| 1   | 128     | 128     | bf16         | TRUE or FALSE | 0 or 1 or 2 | 0           | TRUE          | 0.0    | TRUE          | [384,)        | equal to seqlen_q | asm         | y     | y         | y          |
+| 2   | 128     | 128     | bf16         | TRUE or FALSE | 0 or 1 or 2 | 0           | FALSE         | 0.0    | TRUE          | [384,)        | equal to seqlen_q | asm         | y     | y         | n          |
+| 3   | [0,32]  | [0,32]  | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | UNCONSTRAINED | UNCONSTRAINED | UNCONSTRAINED     | ck          | y     | y         | y          |
+| 4   | (0,64]  | (0,64]  | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | UNCONSTRAINED | UNCONSTRAINED | UNCONSTRAINED     | ck          | y     | y         | y          |
+| 5   | (0,128] | (0,128] | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | UNCONSTRAINED | UNCONSTRAINED | UNCONSTRAINED     | ck          | y     | y         | y          |
+| 6   | (0,192] | (0,128] | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | UNCONSTRAINED | UNCONSTRAINED | UNCONSTRAINED     | ck          | y     | y         | y          |
+| 7   | (0,256] | (0,256] | fp16 or bf16 | TRUE or FALSE | 0 or 1 or 2 | 0 or 1 or 2 | TRUE or FALSE | [0,1)  | UNCONSTRAINED | UNCONSTRAINED | UNCONSTRAINED     | ck          | y     | y         | y          |
