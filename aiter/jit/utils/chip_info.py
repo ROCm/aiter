@@ -4,11 +4,7 @@ import functools
 import os
 import re
 import subprocess
-import torch
 from torch_guard import torch_compile_guard
-from torch.library import Library
-
-aiter_lib = Library("aiter", "FRAGMENT")
 
 from cpp_extension import executable_path
 
@@ -34,7 +30,7 @@ def get_gfx():
 
 
 @torch_compile_guard()
-def get_cu_num_custom_op(dummy: torch.Tensor) -> int:
+def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -61,8 +57,7 @@ def get_cu_num_custom_op(dummy: torch.Tensor) -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
-    x = torch.empty(1, device="cpu")
-    return get_cu_num_custom_op(x)
+    return get_cu_num_custom_op()
 
 
 def get_device_name():

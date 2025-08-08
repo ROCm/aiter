@@ -171,7 +171,7 @@ _CKGEMM_CONFIG_CACHE = None
 
 
 @torch_compile_guard()
-def get_CKGEMM_config_(X: Tensor, tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
+def get_CKGEMM_config_(tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
     global _CKGEMM_CONFIG_CACHE
 
     if _CKGEMM_CONFIG_CACHE is None:
@@ -187,16 +187,9 @@ def get_CKGEMM_config_(X: Tensor, tuned_file: str = "a8w8_tuned_gemm.csv") -> No
     return None
 
 
-def get_CKGEMM_config_fake(
-    X: Tensor,
-) -> None:
-    return None
-
-
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    x = torch.empty(1, device="cuda")
-    get_CKGEMM_config_(x, tuned_file)
+    get_CKGEMM_config_(tuned_file)
 
     cu_num = get_cu_num()
 
