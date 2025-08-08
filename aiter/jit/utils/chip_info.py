@@ -12,6 +12,9 @@ aiter_lib = Library("aiter", "FRAGMENT")
 
 from cpp_extension import executable_path
 
+# Since custom op return int will cause graph break in fullgraph
+CU_NUM = 0
+
 
 @torch_compile_guard()
 def get_gfx_custom_op(dummy: torch.Tensor) -> torch.Tensor:
@@ -35,7 +38,6 @@ def get_gfx_custom_op(dummy: torch.Tensor) -> torch.Tensor:
         encoded = torch.tensor([ord(c) for c in gfx], dtype=torch.int32)
         return encoded
 
-
 @functools.lru_cache(maxsize=1)
 def get_gfx():
     encoded_tensor = get_gfx_custom_op(torch.empty(1, device="cpu"))
@@ -43,7 +45,8 @@ def get_gfx():
 
 
 @torch_compile_guard()
-def get_cu_num_custom_op(dummy: torch.Tensor) -> int:
+def get_cu_num_custom_op(dummy: torch.Tensor) -> None:
+    global CU_NUM
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -65,13 +68,17 @@ def get_cu_num_custom_op(dummy: torch.Tensor) -> int:
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
-    return cu_num
+    CU_NUM = cu_num
+
+
+# _CU_NUM_OP_REGISTERED = False
 
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
     x = torch.empty(1, device="cuda")
-    return get_cu_num_custom_op(x)
+    get_cu_num_custom_op(x)
+    return CU_NUM
 
 
 def get_device_name():
