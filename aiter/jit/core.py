@@ -217,7 +217,7 @@ __mds = {}
 
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
-    # check_numa()
+    check_numa()
     if md_name not in __mds:
         __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return __mds[md_name]
