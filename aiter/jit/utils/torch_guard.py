@@ -3,9 +3,16 @@ aiter_lib = None
 
 def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
     def decorator(func):
-        import torch
-        from torch.library import Library
-        import inspect
+        try:
+            import torch
+            from torch.library import Library
+            import inspect
+        except ImportError:
+
+            def wrapper(*args, **kwargs):
+                return func(*args, **kwargs)
+
+            return wrapper
 
         global aiter_lib
         aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
