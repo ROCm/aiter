@@ -38,6 +38,7 @@ def get_gfx_custom_op(dummy: torch.Tensor) -> torch.Tensor:
         encoded = torch.tensor([ord(c) for c in gfx], dtype=torch.int32)
         return encoded
 
+
 @functools.lru_cache(maxsize=1)
 def get_gfx():
     encoded_tensor = get_gfx_custom_op(torch.empty(1, device="cpu"))
