@@ -94,6 +94,7 @@ def asm_moe(
             sorted_expert_ids,
             num_valid_ids,
             topk,
+            "",
         )
     elif a16:
         # a16w8 smooth quant fmoe
@@ -241,6 +242,7 @@ def asm_moe(
             a8_scale,
             fc1_scale,
             fc2_scale,
+            "",
             fc2_smooth_scale,
             activation,
         )
@@ -394,6 +396,7 @@ def asm_moe_tkw1(
             a8_scale,
             fc1_scale,
             fc2_scale,
+            "",
             fc2_smooth_scale,
             activation,
         )

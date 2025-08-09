@@ -278,7 +278,23 @@ def fused_moe_1stage(
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
         else:
-            fmoe_func = aiter.fmoe_int8_g1u0
+            aiter.fmoe_int8_g1u0(
+                moe_buf,
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            return moe_buf
 
         fmoe_func(
             moe_buf,
@@ -293,6 +309,7 @@ def fused_moe_1stage(
             a1_scale,
             w1_scale,
             w2_scale,
+            "",
             fc2_smooth_scale=None,
             activation=activation,
         )
@@ -426,7 +443,6 @@ def get_2stage_cfgs(
 
     def FinalFunc():
         logger.info("\033[0m")
-
     cfg = cfg_2stages.get(keys, None)
     if cfg is None and os.environ.get("AITER_ONLINE_TUNE", "0") == "1":
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{keys}")
@@ -435,7 +451,6 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
-
     if cfg is None:
         ksplit = 0
         kernelName1 = ""
