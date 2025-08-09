@@ -155,6 +155,7 @@ API_MAP = {
     5: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API)
     + FMHA_FWD_SPLITKV_API
     + FMHA_BATCH_PREFILL_API,
+    6: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API,
 }
 
 
