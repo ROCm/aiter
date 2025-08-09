@@ -3,8 +3,9 @@ import torch.nn.functional as F
 import triton
 import pytest
 from aiter.ops.triton.gemm_a16w16_gated import gemm_a16w16_gated
-from op_tests.triton_tests.test_gemm_a16w16 import minimal_x_vals
+from op_tests.triton_tests.test_gemm_a16w16 import get_x_vals
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.utils import minimal_x_vals
 
 
 def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
@@ -36,9 +37,9 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
 
 
 @pytest.mark.parametrize(
-    "activation", ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu"]
+    "activation", ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None]
 )
-@pytest.mark.parametrize("M, N, K", minimal_x_vals())
+@pytest.mark.parametrize("M, N, K", minimal_x_vals(get_x_vals()))
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, activation):
@@ -53,12 +54,12 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, activation):
         gating = F.gelu(torch_out[:, : N // 2])
     elif activation == "gelu_tanh":
         gating = F.gelu(torch_out[:, : N // 2], approximate="tanh")
-    elif activation == "silu":
-        gating = F.silu(torch_out[:, : N // 2])
-    elif activation == "silu_exp2":
+    elif activation == "silu" or activation == "silu_exp2":
         gating = F.silu(torch_out[:, : N // 2])
     elif activation == "relu":
         gating = F.relu(torch_out[:, : N // 2])
+    elif activation is None:
+        gating = torch_out[:, : N // 2]
     else:
         raise Exception(f"Unsupported activation: {activation}")
     torch_y = torch_out[:, N // 2 :]
