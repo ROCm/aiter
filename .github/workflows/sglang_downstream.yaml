@@ -12,6 +12,7 @@ jobs:
     runs-on: mi300x-1gpu
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN_TEST }}
+
     steps:
       - name: Checkout aiter repo
         uses: actions/checkout@v4
@@ -32,9 +33,12 @@ jobs:
           docker build --no-cache \
           --build-arg SGL_BRANCH=v0.4.9.post3 \
           --build-arg GPU_ARCH=gfx942 \
-          --build-arg AITER_REPO="${{ github.event.pull_request.head.repo.clone_url }}" \
-          --build-arg AITER_COMMIT="${{ github.event.pull_request.head.sha }}" \
+          --build-arg AITER_REPO=${GITHUB_REPO_URL} \
+          --build-arg AITER_COMMIT="${GITHUB_COMMIT_SHA}" \
           -t sglang_aiter_test -f docker/Dockerfile.rocm .
+        env:
+          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }} 
+          GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
             
       - name: Start CI container
         run: |
