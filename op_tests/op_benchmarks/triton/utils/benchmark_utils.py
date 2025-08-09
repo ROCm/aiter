@@ -202,7 +202,7 @@ def get_x_vals(dims: int, args=None):
 
 
 def get_model_configs(
-    config_path="./utils/model_configs.json", models="llama3,mistral_7B"
+    config_path="./utils/model_configs.json", models="llama3,mixtral_7B"
 ):
     """
     Load model names from the configuration file.

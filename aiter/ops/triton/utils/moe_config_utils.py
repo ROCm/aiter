@@ -20,6 +20,7 @@ def get_config_dtype_str(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "FP8_W8A8"
@@ -29,6 +30,8 @@ def get_config_dtype_str(
         return "INT8_W8A8"
     elif use_int4_w4a16:
         return "INT4_W4A16"
+    elif use_mxfp4:
+        return "MX_FP4"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs
@@ -71,10 +74,11 @@ def get_optimal_moe_config(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(
-        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16
+        dtype, use_int8_w8a16, use_int8_w8a8, use_fp8_w8a8, use_int4_w4a16, use_mxfp4
     )
     # print(f"dtype_str={dtype_str}")
     configs = get_moe_configs(dtype_str)
@@ -110,6 +114,7 @@ def get_optimal_moe_config_func(
     use_int8_w8a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_mxfp4: Optional[bool] = False,
 ):
     return functools.partial(
         get_optimal_moe_config,
@@ -118,4 +123,5 @@ def get_optimal_moe_config_func(
         use_int8_w8a8,
         use_fp8_w8a8,
         use_int4_w4a16,
+        use_mxfp4,
     )

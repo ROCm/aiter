@@ -12,7 +12,7 @@ import sys
 
 def model_benchmark_configs(args):
     config_file = args.model_configs
-    configs = get_model_configs(config_path=config_file, models="mistral")
+    configs = get_model_configs(config_path=config_file, models="mixtral")
     moe_configs = []
     M = args.M if args.M else 4096  # check size
     # M, K, N, E, top_k
