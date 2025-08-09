@@ -56,6 +56,15 @@ float mha_bwd(mha_bwd_args args,
               bool is_v3_atomic_fp32,
               int how_v3_bf16_cvt)
 {{
+    GPUArch arch;
+    if (get_gpu_arch() == "gfx942") {{
+        arch = GPUArch::gfx942;
+    }} else if (get_gpu_arch() == "gfx950") {{
+        arch = GPUArch::gfx950;
+    }} else {{
+        std::cout << "No supported GPU arch found!" << std::endl;
+        return -1;
+    }}
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0;
@@ -83,9 +92,9 @@ float mha_bwd(mha_bwd_args args,
 
 V2_API = "t = fmha_bwd(traits, args, stream_config);"
 
-V3_API = "t = fmha_bwd_v3(traits, args, stream_config);"
+V3_API = "t = fmha_bwd_v3(traits, args, stream_config, arch);"
 
-COMBINED_API = """t = fmha_bwd_v3(traits, args, stream_config);
+COMBINED_API = """t = fmha_bwd_v3(traits, args, stream_config, arch);
     if (t == -1) { t = fmha_bwd(traits, args, stream_config); }
 """
 

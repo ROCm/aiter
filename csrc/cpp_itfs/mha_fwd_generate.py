@@ -72,6 +72,15 @@ float mha_fwd(mha_fwd_args args,
               bool has_lse,
               bool use_ext_asm)
 {{
+    GPUArch arch;
+    if (get_gpu_arch() == "gfx942") {{
+        arch = GPUArch::gfx942;
+    }} else if (get_gpu_arch() == "gfx950") {{
+        arch = GPUArch::gfx950;
+    }} else {{
+        std::cout << "No supported GPU arch found!" << std::endl;
+        return -1;
+    }}
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
     bool has_dropout = args.p_drop > 0.f;
@@ -141,9 +150,9 @@ float mha_batch_prefill(mha_batch_prefill_args args,
 
 V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
-V3_API = """t = fmha_fwd_v3(traits, args, stream_config);"""
+V3_API = """t = fmha_fwd_v3(traits, args, stream_config, arch);"""
 
-COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
+COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config, arch);
     if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
 """
 

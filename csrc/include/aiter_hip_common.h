@@ -5,6 +5,10 @@
 #include <iostream>
 #include "ck_tile/core.hpp"
 
+enum class GPUArch {
+    gfx942,
+    gfx950
+};
 
 #define HIP_CALL(call)                                                                                                           \
     do                                                                                                                           \
@@ -111,6 +115,25 @@ public:
                                        0, kargs.stream, nullptr, (void **)&config));
     };
 };
+
+static const std::string get_gpu_arch() {
+    int device_count;
+    hipError_t err = hipGetDeviceCount(&device_count);
+    if (err != hipSuccess || device_count == 0) {
+        return "No GPU Found";
+    }
+
+    hipDeviceProp_t prop;
+    hipGetDeviceProperties(&prop, 0);
+
+    std::string arch_full = prop.gcnArchName;
+    size_t colon_pos = arch_full.find(':');
+    if (colon_pos != std::string::npos) {
+        return arch_full.substr(0, colon_pos);
+    } else {
+        return arch_full;
+    }
+}
 
 static const uint32_t get_num_cu_func()
 {
