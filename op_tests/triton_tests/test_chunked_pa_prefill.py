@@ -6,7 +6,7 @@ import random
 import pytest
 import torch
 import triton
-from aiter.ops.triton.pa_prefill import context_attention_fwd
+from aiter.ops.triton.chunked_pa_prefill import chunked_prefill_paged_decode
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
@@ -324,8 +324,6 @@ def test_contexted_kv_attention(
     kv_cache_dtype: str,
     device: str,
 ) -> None:
-
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     (
         query,
         k,
@@ -359,7 +357,7 @@ def test_contexted_kv_attention(
     output_triton = output
 
     # Run Triton
-    context_attention_fwd(
+    chunked_prefill_paged_decode(
         query,
         k,
         v,
@@ -408,7 +406,6 @@ def test_contexted_kv_attention_alibi(
     kv_cache_dtype: str,
     device: str,
 ) -> None:
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     (
         query,
         k,
@@ -442,7 +439,7 @@ def test_contexted_kv_attention_alibi(
     output_triton = output
 
     # Run Triton
-    context_attention_fwd(
+    chunked_prefill_paged_decode(
         query,
         k,
         v,
