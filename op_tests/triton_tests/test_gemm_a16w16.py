@@ -8,10 +8,11 @@ import pytest
 import functools
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
+from aiter.ops.triton.gemm_a16w16_autograd import gemm_a16w16_autograd
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
-def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
+def generate_gemm_a16w16_inputs(M, N, K, BIAS_DIM, dtype, layout="TN", output=True):
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
 
@@ -26,6 +27,13 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     else:
         weight = torch.randn((N, K), dtype=dtype).cuda()
 
+    if BIAS_DIM == 1:
+        bias = torch.randn((N,), dtype=dtype).cuda()
+    elif BIAS_DIM == 2:
+        bias = torch.randn((M, N), dtype=dtype).cuda()
+    else:
+        bias = None
+
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype).cuda()
@@ -33,7 +41,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
     else:
         out_dtype = dtype
 
-    return x, weight, out_dtype, y
+    return x, weight, bias, out_dtype, y
 
 
 def get_x_vals():
@@ -69,6 +77,10 @@ def get_x_vals():
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
+        (971541, 2048, 512),
+        (971541, 512, 1536),
+        (512, 2048, 971541),
+        (1536, 512, 971541),
     ]
     return x_vals
 
@@ -85,18 +97,26 @@ def minimal_x_vals(num_vals=20):
 
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu", "silu_exp2"])
 @pytest.mark.parametrize("M, N, K", minimal_x_vals())
+@pytest.mark.parametrize("BIAS_DIM", [0, 1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation):
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
+def test_gemm_a16_w16_activation(M: int, N: int, K: int, BIAS_DIM: int, dtype, output, activation):
+    x, w, b, out_dtype, y = generate_gemm_a16w16_inputs(
         M,
         N,
         K,
+        BIAS_DIM,
         dtype,
         output=output,
     )
 
-    torch_out = F.linear(x, w, bias=None)
+    if BIAS_DIM == 1:
+        torch_out = F.linear(x, w, bias=b)
+    elif BIAS_DIM == 2:
+        torch_out = F.linear(x, w) + b
+    else:
+        torch_out = F.linear(x, w, bias=None)
+
     if activation == "gelu":
         torch_out = F.gelu(torch_out)
     elif activation == "gelu_tanh":
@@ -110,6 +130,7 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         triton_out = gemm_a16w16(
             x,
             w,
+            b,
             out_dtype,
             y,
             activation=activation,
@@ -118,6 +139,7 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
         triton_out = gemm_a16w16(
             x,
             w,
+            b,
             out_dtype,
             activation=activation,
         )
@@ -126,19 +148,25 @@ def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activati
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("BIAS_DIM", [0, 1, 2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
+def test_gemm_a16_w16(M: int, N: int, K: int, BIAS_DIM: int, dtype, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, b, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, BIAS_DIM, dtype, output=output)
 
-    torch_out = F.linear(x, w, bias=None)
+    if BIAS_DIM == 1:
+        torch_out = F.linear(x, w, bias=b)
+    elif BIAS_DIM == 2:
+        torch_out = F.linear(x, w) + b
+    else:
+        torch_out = F.linear(x, w, bias=None)
 
     if output:
-        triton_out = gemm_a16w16(x, w, out_dtype, y)
+        triton_out = gemm_a16w16(x, w, b, out_dtype, y)
     else:
-        triton_out = gemm_a16w16(x, w, out_dtype)
+        triton_out = gemm_a16w16(x, w, b, out_dtype)
 
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
@@ -149,7 +177,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, dtype, output=output)
+    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, 0, dtype, output=output)
 
     torch_out = F.linear(x, w, bias=None)
 
@@ -161,3 +189,39 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
         triton_out = gemm_a16w16_atomic(x, w, dtype=torch.float32).to(dtype)
 
     triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("M, N, K", get_x_vals())
+@pytest.mark.parametrize("BIAS_DIM", [0, 1, 2])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output", [False])
+def test_gemm_a16_w16_autograd(M: int, N: int, K: int, BIAS_DIM: int, dtype, output):
+    x, w, b, out_dtype, y = generate_gemm_a16w16_inputs(M, N, K, BIAS_DIM, dtype, output=output)
+    w = w.T
+    x.requires_grad_(True)
+    w.requires_grad_(True)
+    if b is not None:
+        b.requires_grad_(True)
+    dy = 0.1 * torch.randn((M, N), dtype=dtype).cuda()
+
+    # forward pass
+    if b is not None:
+        torch_out = torch.addmm(b, x, w)
+    else:
+        torch_out = torch.mm(x, w)
+    triton_out = gemm_a16w16_autograd(x, w, b)
+    # backward pass (torch)
+    torch_out.backward(dy, retain_graph=True)
+    torch_dx, torch_dw, torch_db = [_.grad.clone() if _ is not None else None for _ in [x, w, b]]
+    x.grad, w.grad= None, None
+    if b is not None:
+        b.grad = None
+    # backward pass (triton)
+    triton_out.backward(dy, retain_graph=True)
+    triton_dx, triton_dw, triton_db = [_.grad.clone() if _ is not None else None for _ in [x, w, b]]
+    
+    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    triton.testing.assert_close(triton_dx, torch_dx, atol=1e-1, rtol=1e-1)
+    triton.testing.assert_close(triton_dw, torch_dw, atol=1e-1, rtol=1e-1)
+    if b is not None:
+        triton.testing.assert_close(triton_db, torch_db, atol=1e-1, rtol=1e-1)

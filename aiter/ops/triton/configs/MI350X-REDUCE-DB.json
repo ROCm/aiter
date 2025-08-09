@@ -1,0 +1,10 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 512,
+    "BLOCK_SIZE_N": 64,
+    "NUM_MSPLIT": 8,
+    "num_warps": 8,
+    "num_stages": 2,
+    "waves_per_eu": 2
+  }
+}

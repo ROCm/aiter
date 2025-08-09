@@ -28,21 +28,26 @@ _LOGGER = AiterTritonLogger()
 def _gemm_a16_w16_kernel(
     a_ptr,
     b_ptr,
+    bias_ptr,
     c_ptr,
     M,
     N,
     K,
+    BIAS_DIM: tl.constexpr,
     stride_am,
     stride_ak,
     stride_bk,
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_biasm,
+    stride_biasn,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    DISABLE_BUFFER_LOADS: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
@@ -53,12 +58,13 @@ def _gemm_a16_w16_kernel(
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
     """
 
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
+    if not DISABLE_BUFFER_LOADS:
+        tl.assume(stride_am > 0)
+        tl.assume(stride_ak > 0)
+        tl.assume(stride_bk > 0)
+        tl.assume(stride_bn > 0)
+        tl.assume(stride_cm > 0)
+        tl.assume(stride_cn > 0)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -82,7 +88,14 @@ def _gemm_a16_w16_kernel(
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+    if BIAS_DIM == 1:
+        offs_biasn = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        bias_ptrs = bias_ptr + offs_biasn
+        bias_mask = offs_biasn < N
+        accumulator = tl.load(bias_ptrs, mask=bias_mask)
+        accumulator = tl.broadcast_to(accumulator[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N)).to(acc_dtype)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -105,15 +118,18 @@ def _gemm_a16_w16_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
-    if use_activation:
-        accumulator = activation(accumulator)
-    c = accumulator.to(c_ptr.type.element_ty)
-
     # Write back the block of the output matrix C with masks.
     offs_cm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if BIAS_DIM == 2:
+        bias_ptrs = bias_ptr + stride_biasm * offs_cm[:, None] + stride_biasn * offs_cn[None, :]
+        bias = tl.load(bias_ptrs, mask=c_mask)
+        accumulator += bias
+    if use_activation:
+        accumulator = activation(accumulator)
+    c = accumulator.to(c_ptr.type.element_ty)
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -153,6 +169,7 @@ def _get_config(
 def gemm_a16w16(
     x,
     w,
+    b: Optional[torch.Tensor] = None,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
@@ -164,6 +181,7 @@ def gemm_a16w16(
     Key parameters:
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
+    - B: Optional with with shape (N,) or (M, N).
     - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
     - Y: Output Matrix Y with shape (M, N).
     If this is none, then it's created by this API and returned as output.
@@ -182,11 +200,26 @@ def gemm_a16w16(
     N, K = w.shape
     w = w.T
 
+    if b is not None and b.dim() == 1:
+        BIAS_DIM = 1
+        bias_stride0 = 1
+        bias_stride1 = b.stride(0)
+    elif b is not None and b.dim() == 2:
+        BIAS_DIM = 2
+        bias_stride0 = b.stride(0)
+        bias_stride1 = b.stride(1)
+    else:
+        BIAS_DIM = 0
+        bias_stride0 = 1
+        bias_stride1 = 1
+
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
     if config is None:
         config = _get_config(M, N, K)
+    if "DISABLE_BUFFER_LOADS" not in config:
+        config["DISABLE_BUFFER_LOADS"] = False
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -194,16 +227,20 @@ def gemm_a16w16(
     _gemm_a16_w16_kernel[grid](
         x,
         w,
+        b,
         y,
         M,
         N,
         K,
+        BIAS_DIM,
         x.stride(0),
         x.stride(1),
         w.stride(0),
         w.stride(1),
         y.stride(0),
         y.stride(1),
+        bias_stride0,
+        bias_stride1,
         activation=_get_activation_from_str(activation) if activation else "",
         use_activation=activation is not None,
         **config,
