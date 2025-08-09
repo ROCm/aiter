@@ -163,7 +163,7 @@ def run_benchmark(args: argparse.Namespace):
         Right now q_heads == kv_heads).
         """
 
-        kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+        kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
             input_helper(
                 BATCH,
                 H,
