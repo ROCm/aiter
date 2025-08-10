@@ -4,7 +4,7 @@ import functools
 import os
 import re
 import subprocess
-from torch_guard import torch_compile_guard
+from torch_guard import torch_compile_guard, GlobalStateManager
 
 from cpp_extension import executable_path
 
@@ -28,8 +28,9 @@ def _detect_native() -> list[str]:
     raise RuntimeError("No gfx arch found in rocminfo output.")
 
 
-@functools.lru_cache(maxsize=1)
-def get_gfx():
+
+@torch_compile_guard()
+def get_gfx_custom_op() -> None:
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
@@ -40,11 +41,36 @@ def get_gfx():
             output = result.stdout
             for line in output.split("\n"):
                 if "gfx" in line.lower():
-                    return line.split(":")[-1].strip()
+                    GlobalStateManager.set_gfx_name(line.split(":")[-1].strip())
+                    return
+                    # return line.split(":")[-1].strip()
         except Exception as e:
             raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
+    GlobalStateManager.set_gfx_name(gfx)
+    return
+
+
+@functools.lru_cache(maxsize=1)
+def get_gfx():
+    # gfx = os.getenv("GPU_ARCHS", "native")
+    # if gfx == "native":
+    #     try:
+    #         rocminfo = executable_path("rocminfo")
+    #         result = subprocess.run(
+    #             [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    #         )
+    #         output = result.stdout
+    #         for line in output.split("\n"):
+    #             if "gfx" in line.lower():
+    #                 return line.split(":")[-1].strip()
+    #     except Exception as e:
+    #         raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
+    # elif ";" in gfx:
+    #     gfx = gfx.split(";")[-1]
+    get_gfx_custom_op()
+    gfx = GlobalStateManager.get_gfx_name()
     return gfx
 
 
@@ -59,7 +85,7 @@ def get_gfx_list() -> list[str]:
 
 
 @torch_compile_guard()
-def get_cu_num_custom_op() -> int:
+def get_cu_num_custom_op() -> None:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -81,12 +107,15 @@ def get_cu_num_custom_op() -> int:
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
-    return cu_num
+    GlobalStateManager.set_cu_num(cu_num)
+    # return cu_num
 
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
-    return get_cu_num_custom_op()
+    get_cu_num_custom_op()
+    cu_num = GlobalStateManager.get_cu_num()
+    return cu_num
 
 
 def get_device_name():

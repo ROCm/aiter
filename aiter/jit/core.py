@@ -21,6 +21,7 @@ sys.path.insert(0, f"{this_dir}/utils/")
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from chip_info import get_gfx
+from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
@@ -201,8 +202,8 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
-@functools.lru_cache()
-def check_numa():
+@torch_compile_guard()
+def check_numa_custom_op() -> None:
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
     if numa_balance_set == "1":
         logger.warning(
@@ -210,6 +211,18 @@ def check_numa():
             "It is recommended to disable NUMA balancing by running \"sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'\" "
             "for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing"
         )
+
+
+@functools.lru_cache()
+def check_numa():
+    check_numa_custom_op()
+    # numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
+    # if numa_balance_set == "1":
+    #     logger.warning(
+    #         "WARNING: NUMA balancing is enabled, which may cause errors. "
+    #         "It is recommended to disable NUMA balancing by running \"sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'\" "
+    #         "for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing"
+    #     )
 
 
 __mds = {}
@@ -515,7 +528,7 @@ NONE_WRAPPED_OP = [
     "allocate_meta_buffer",
     "dispose",
     "meta_size",
-    "get_padded_m",
+    # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
 ]
@@ -816,10 +829,13 @@ def compile_ops(
                     args = tuple(args_list)
             return op(*args, **kwargs)
 
-        def abstract_impl(*args, custom_build_args={}, **kwargs):
+        def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
             if gen_fake is not None:
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
+
+        def outer_wrapper(dummy, *args, **kwargs):
+            return wrapper(*args, **kwargs)
 
         if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
@@ -851,17 +867,34 @@ def compile_ops(
         schema = wrapper_register(func)
 
         import torch
+        import inspect
+
+        sig = inspect.signature(func)
+        input_part, output_part = schema.split("->", 1)
+        if not sig.parameters:
+            new_input = "(Tensor dummy)"
+        else:
+            new_input = "(Tensor dummy, " + input_part[1:]
+
+        schema = f"{new_input} -> {output_part}".strip()
 
         loadName = func.__name__
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             op_schema = f"aiter::wrapper_{loadName}" + schema
             aiter_lib.define(op_schema, tags=())
-            aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA")
-            aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU")
+            aiter_lib.impl(
+                f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CUDA"
+            )
+            aiter_lib.impl(
+                f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CPU"
+            )
             aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
 
         def wrapper_custom(*args, custom_build_args={}, **kwargs):
-            return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
+            dummy = torch.empty(1, device="cuda")
+            return getattr(torch.ops.aiter, f"wrapper_{loadName}")(
+                dummy, *args, **kwargs
+            )
 
         return wrapper_custom
 

@@ -55,3 +55,29 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         return outer_wrapper
 
     return decorator
+
+
+class GlobalStateManager:
+    cu_num = 0
+    gfx_name = ""
+
+    @classmethod
+    def reset(cls):
+        cls.cu_num = 0
+        cls.gfx_name = ""
+
+    @classmethod
+    def set_cu_num(cls, cu_num_):
+        cls.cu_num = cu_num_
+
+    @classmethod
+    def set_gfx_name(cls, gfx_):
+        cls.gfx_name = gfx_
+
+    @classmethod
+    def get_cu_num(cls):
+        return cls.cu_num
+
+    @classmethod
+    def get_gfx_name(cls):
+        return cls.gfx_name
