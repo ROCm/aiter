@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
+// Include these 2 headers instead of torch/extension.h since we don't need all of the torch
+// headers.
 #include "aiter_hip_common.h"
 #include "fmha_bwd.hpp"
 #include "mask.hpp"
@@ -45,19 +46,18 @@ struct mha_bwd_traits : public fmha_bwd_traits
 
 using mha_bwd_args = fmha_bwd_args;
 
-__attribute__((visibility("default")))
-float mha_bwd(mha_bwd_args args,
-              const ck_tile::stream_config& stream_config,
-              std::string q_dtype_str,
-              bool is_group_mode,
-              mask_enum mask_type,
-              bias_enum bias_type,
-              bool has_dbias,
-              bool is_store_randval,
-              bool deterministic,
-              bool use_ext_asm,
-              bool is_v3_atomic_fp32,
-              int how_v3_bf16_cvt);
+__attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
+                                                     const ck_tile::stream_config& stream_config,
+                                                     std::string q_dtype_str,
+                                                     bool is_group_mode,
+                                                     mask_enum mask_type,
+                                                     bias_enum bias_type,
+                                                     bool has_dbias,
+                                                     bool is_store_randval,
+                                                     bool deterministic,
+                                                     bool use_ext_asm,
+                                                     bool is_v3_atomic_fp32,
+                                                     int how_v3_bf16_cvt);
 
 struct __attribute__((packed)) fmha_bwd_v3_args
 {
@@ -237,7 +237,7 @@ struct __attribute__((packed)) fmha_bwd_v3_group_args
     p1 _p2;
     unsigned int Hs_lsed;
     p1 _p3;
-    unsigned int seqlen_k; //total length of k sequences
+    unsigned int seqlen_k; // total length of k sequences
     p1 _p4;
     unsigned int Hs_q;
     p1 _p5;
@@ -336,7 +336,7 @@ struct __attribute__((packed)) fmha_bwd_v3_swa_genl_args
 
 struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
 {
-    void *ptr_dq;
+    void* ptr_dq;
     p2 _p0;
     unsigned int Ts;
     p3 _p1;
@@ -382,11 +382,18 @@ struct fmha_bwd_dq_dk_dv_v3_traits_
     static constexpr bool kIsGroupMode        = kIsGroupMode_;
 };
 
-template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Name;
-template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Buf;
-template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Ts;
+template <typename fmha_bwd_dq_dk_dv_v3_traits_>
+struct FmhaBwdV3Name;
+template <typename fmha_bwd_dq_dk_dv_v3_traits_>
+struct FmhaBwdV3Buf;
+template <typename fmha_bwd_dq_dk_dv_v3_traits_>
+struct FmhaBwdV3Ts;
 
-template <GPUArch Arch>
+namespace gfx942 {
 float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
+}
 
+namespace gfx950 {
+float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
+}
 } // namespace aiter

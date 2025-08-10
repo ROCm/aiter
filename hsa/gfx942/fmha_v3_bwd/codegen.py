@@ -306,6 +306,7 @@ template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,    
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdBf16,        1,       true,      2,     true,    true, GPUArch::gfx942,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        0,       true,      0,     true,    true, GPUArch::gfx942,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true, GPUArch::gfx942,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
+namespace gfx942{{
 
 class fmha_bwd_v3_kernel
 {{
@@ -830,8 +831,7 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
     );
 }}
 
-template <>
-float fmha_bwd_v3<GPUArch::gfx942>(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_config& s){{
+float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
 
     if (t.use_ext_asm == true){{
@@ -955,7 +955,7 @@ float fmha_bwd_v3<GPUArch::gfx942>(mha_bwd_traits t, fmha_bwd_args a, const ck_t
                                 r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
                                 return r;
                             }}
-                            
+
                         }}
                         else if((t.mask_type != mask_enum::no_mask) && ((a.window_size_left == -1) && (a.window_size_right == 0)) && (t.mask_type == mask_enum::mask_top_left)){{
                             using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<256, FmhaBwdBf16, true/*group*/, true, true>;
@@ -2090,6 +2090,7 @@ float fmha_bwd_v3<GPUArch::gfx942>(mha_bwd_traits t, fmha_bwd_args a, const ck_t
     }}
 
     return r;
+}}
 }}
 }} // namespace aiter
 """

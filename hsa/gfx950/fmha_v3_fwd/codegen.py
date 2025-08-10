@@ -52,6 +52,7 @@ template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,
 // template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0,          GPUArch::gfx950>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; }};
 // template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1,          GPUArch::gfx950>> {{ static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; }};
 
+namespace gfx950{{
 class fmha_fwd_v3_kernel
 {{
     public:
@@ -145,8 +146,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
     );
 }}
 
-template <>
-float fmha_fwd_v3<GPUArch::gfx950>(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s){{
+float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
     if (t.use_ext_asm == true) {{
         if (t.data_type.compare("bf16") == 0) {{
@@ -170,6 +170,7 @@ float fmha_fwd_v3<GPUArch::gfx950>(mha_fwd_traits t, fmha_fwd_args a, const ck_t
         }}
     }}
     return r;
+}}
 }}
 }} // namespace aiter
 """

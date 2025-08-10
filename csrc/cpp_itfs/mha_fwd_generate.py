@@ -11,12 +11,14 @@ from typing import Optional
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
-    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter")  # pip install mode
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
 else:
-    AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../aiter")  # develop mode
+    AITER_CORE_DIR = os.path.abspath(
+        f"{this_dir}/../../aiter/jit/utils"
+    )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-import jit.utils
+from chip_info import get_gfx  # noqa: E402
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -154,37 +156,39 @@ float mha_batch_prefill(mha_batch_prefill_args args,
 
 V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
-V3_MULTI_TARGET_API = """std::cout << "========================" << std::endl;
-    std::cout << "gpu arch: " << get_gpu_arch() << std::endl;
-    if (get_gpu_arch() == "gfx942") {{
-        std::cout << "gpu arch 1: " << get_gpu_arch() << std::endl;
-        t = fmha_fwd_v3<GPUArch::gfx942>(traits, args, stream_config);
-    }} else if (get_gpu_arch() == "gfx950") {{
-        std::cout << "gpu arch 2: " << get_gpu_arch() << std::endl;
-        t = fmha_fwd_v3<GPUArch::gfx950>(traits, args, stream_config);
-    }} else {{
+V3_MULTI_TARGET_API = """
+    if (get_gpu_arch() == "gfx942") {
+        t = gfx942::fmha_fwd_v3(traits, args, stream_config);
+    } else if (get_gpu_arch() == "gfx950") {
+        t = gfx950::fmha_fwd_v3(traits, args, stream_config);
+    } else {
         std::cout << "No supported GPU arch found!" << std::endl;
         return -1;
-    }}
+    }
 """
+
 
 def get_v3_api():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     if archs[0] == "native":
-        gfx = chip_info.get_gfx()
-        return f"t = fmha_fwd_v3<GPUArch::{gfx}>(traits, args, stream_config);"
+        gfx = get_gfx()
+        return f"t = {gfx}::fmha_fwd_v3(traits, args, stream_config);"
     else:
         archs = [arch.strip() for arch in archs]
         if len(archs) == 1:
-            return f"t = fmha_fwd_v3<GPUArch::{archs[0]}>(traits, args, stream_config);"
+            return f"t = {archs[0]}::fmha_fwd_v3(traits, args, stream_config);"
         else:
             return V3_MULTI_TARGET_API
 
+
 V3_API = get_v3_api()
 
-COMBINED_API = V3_API + """
+COMBINED_API = (
+    V3_API
+    + """
     if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
 """
+)
 
 API_MAP = {
     1: FMHA_FWD_API.format(F_inner_dispatch=V3_API),
