@@ -16,8 +16,7 @@ else:
     AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../aiter")  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-import jit.core
-from jit.utils.chip_info import get_gfx
+import jit.utils
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -172,7 +171,7 @@ V3_MULTI_TARGET_API = """std::cout << "========================" << std::endl;
 def get_v3_api():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     if archs[0] == "native":
-        gfx = get_gfx()
+        gfx = chip_info.get_gfx()
         return f"t = fmha_fwd_v3<GPUArch::{gfx}>(traits, args, stream_config);"
     else:
         archs = [arch.strip() for arch in archs]
