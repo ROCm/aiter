@@ -61,7 +61,6 @@ class fmha_fwd_v3_kernel
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
         std::string AITER_ASM_DIR = "{F_AITER_ASM_DIR}";
         uint32_t cu_num = get_num_cu_func();
-        std::cout << "cu_num: " << cu_num << std::endl;
         if (cu_num == 304) {{
             AITER_ASM_DIR += "MI300/";
         }} else if (cu_num == 80 || cu_num == 64) {{
@@ -70,7 +69,6 @@ class fmha_fwd_v3_kernel
             // TODO: return with error
             return;
         }}
-        std::cout << "AITER_ASM_DIR: " << AITER_ASM_DIR << std::endl;
         HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }}
@@ -152,7 +150,8 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
     );
 }}
 
-float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s, GPUArch arch){{
+template <>
+float fmha_fwd_v3<GPUArch::gfx942>(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
     if (t.use_ext_asm == true) {{
         if (t.data_type.compare("bf16") == 0) {{

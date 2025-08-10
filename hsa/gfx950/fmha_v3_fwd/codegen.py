@@ -145,7 +145,8 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, fmha_fwd_args a)
     );
 }}
 
-float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s, GPUArch arch){{
+template <>
+float fmha_fwd_v3<GPUArch::gfx950>(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
     if (t.use_ext_asm == true) {{
         if (t.data_type.compare("bf16") == 0) {{

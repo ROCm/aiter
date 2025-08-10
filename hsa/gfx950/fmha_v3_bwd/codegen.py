@@ -885,7 +885,8 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
     );
 }}
 
-float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_config& s, GPUArch arch){{
+template <>
+float fmha_bwd_v3<GPUArch::gfx950>(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_config& s){{
     float r = -1;
 
     if (t.use_ext_asm == true){{

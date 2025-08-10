@@ -386,6 +386,7 @@ template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Name;
 template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Buf;
 template <typename fmha_bwd_dq_dk_dv_v3_traits_> struct FmhaBwdV3Ts;
 
-float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s, GPUArch arch);
+template <GPUArch Arch>
+float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
 
 } // namespace aiter

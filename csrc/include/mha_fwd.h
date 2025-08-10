@@ -141,6 +141,7 @@ template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Name;
 template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Buf;
 template <typename fmha_fwd_kernel_selector> struct FmhaFwdV3Ts;
 
-float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config &s, GPUArch arch);
+template <GPUArch Arch>
+float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config &s);
 
 } // namespace aiter
