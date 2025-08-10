@@ -11,6 +11,7 @@ from ..jit.core import (
     compile_ops,
     AITER_ROOT_DIR,
 )
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from ..jit.utils.chip_info import get_cu_num
 from torch.library import Library
@@ -169,7 +170,8 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
 _CKGEMM_CONFIG_CACHE = None
 
 
-def get_CKGEMM_config_(X: Tensor, tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
+@torch_compile_guard()
+def get_CKGEMM_config_(tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
     global _CKGEMM_CONFIG_CACHE
 
     if _CKGEMM_CONFIG_CACHE is None:
@@ -185,34 +187,9 @@ def get_CKGEMM_config_(X: Tensor, tuned_file: str = "a8w8_tuned_gemm.csv") -> No
     return None
 
 
-def get_CKGEMM_config_fake(
-    X: Tensor,
-) -> None:
-    return None
-
-
 @functools.lru_cache(maxsize=1024)
 def get_CKGEMM_config(M: int, N: int, K: int, tuned_file="a8w8_tuned_gemm.csv"):
-    import torch
-
-    op_name = "aiter::get_CKGEMM_config_"
-    if not hasattr(torch.ops.aiter, "get_CKGEMM_config_"):
-        if hasattr(torch.library, "infer_schema"):
-            schema_str = torch.library.infer_schema(
-                get_CKGEMM_config_, mutates_args="unknown"
-            )
-        else:
-            # for pytorch 2.4
-            import torch._custom_op.impl
-
-            schema_str = torch._custom_op.impl.infer_schema(get_CKGEMM_config_, ["X"])
-
-        torch.library.define(op_name, schema_str, lib=aiter_lib)
-        torch.library.impl(op_name, "cuda", get_CKGEMM_config_, lib=aiter_lib)
-        torch.library.register_fake(op_name, get_CKGEMM_config_, lib=aiter_lib)
-
-    x = torch.empty(1, device="cuda")
-    getattr(torch.ops.aiter, "get_CKGEMM_config_")(x, tuned_file)
+    get_CKGEMM_config_(tuned_file)
 
     cu_num = get_cu_num()
 
@@ -263,10 +240,10 @@ def gemm_a8w8(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    # assert dtype in [
+    #     dtypes.bf16,
+    #     dtypes.fp16,
+    # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias, dtype, splitK)
 
 
@@ -320,10 +297,10 @@ def gemm_a8w8_CK(
     dtype=dtypes.bf16,
     splitK: Optional[int] = None,
 ):
-    assert dtype in [
-        dtypes.bf16,
-        dtypes.fp16,
-    ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
+    # assert dtype in [
+    #     dtypes.bf16,
+    #     dtypes.fp16,
+    # ], f"Output {dtype=} is currently not supported in gemm_a8w8 CK"
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[-1]
@@ -456,7 +433,11 @@ def gemm_a8w8_blockscale_tune(
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
-@compile_ops("module_gemm_a8w8_bpreshuffle_tune", fc_name="gemm_a8w8_bpreshuffle_tune")
+@compile_ops(
+    "module_gemm_a8w8_bpreshuffle_tune",
+    fc_name="gemm_a8w8_bpreshuffle_tune",
+    gen_fake=gen_gemm_a8w8_blockscale_tune_fake_tensors,
+)
 def gemm_a8w8_bpreshuffle_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -465,4 +446,4 @@ def gemm_a8w8_bpreshuffle_tune(
     Out: torch.Tensor,
     kernelId: int = 0,
     splitK: int = 0,
-) -> None: ...
+) -> torch.Tensor: ...

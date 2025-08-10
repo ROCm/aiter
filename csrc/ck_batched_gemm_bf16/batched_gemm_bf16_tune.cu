@@ -50,7 +50,7 @@ BatchedKernel batched_dispatch(int id)
 }
 
 
-void batched_gemm_bf16_tune(
+torch::Tensor batched_gemm_bf16_tune(
     torch::Tensor &XQ,
     torch::Tensor &WQ,
     torch::Tensor &Y,
@@ -75,5 +75,5 @@ void batched_gemm_bf16_tune(
   {
     TORCH_CHECK(false, "Unsupported output dtype!");
   }
-  // return Y;
+  return Y;
 }

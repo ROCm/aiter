@@ -24,6 +24,8 @@ from chip_info import get_gfx
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
+aiter_lib = None
+
 
 def mp_lock(
     lockPath: str,
@@ -514,7 +516,21 @@ NONE_WRAPPED_OP = [
     "dispose",
     "meta_size",
     "get_padded_m",
+    "compile_mha_fwd",
+    "compile_mha_bwd",
 ]
+
+SPECIAL_OPS_MUTATES_ARGS = {
+    "topk_softmax": [
+        "arg0",
+        "arg1",
+        "arg2",
+    ],  # "topk_weights", "topk_indices", "token_expert_indices"
+    "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
+    "moe_fused_gate": ["topk_weights", "topk_ids"],
+    "grouped_topk": ["topk_weights", "topk_ids"],
+    "mha_varlen_fwd": ["out"],
+}
 
 
 def generate_schema(func) -> str:
@@ -524,17 +540,29 @@ def generate_schema(func) -> str:
 
     sig = inspect.signature(func)
     parameters = []
-
+    mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
+        is_mutates = False
+        if name in mutates_args:
+            is_mutates = True
 
         if param_type is torch.Tensor:
-            type_str = f"Tensor(a{idx}!)"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)"
+            else:
+                type_str = "Tensor"
         elif param_type == Optional[torch.Tensor]:
-            type_str = f"Tensor(a{idx}!)?"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)?"
+            else:
+                type_str = "Tensor?"
         elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
-            type_str = f"Tensor(a{idx}!)?"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)?"
+            else:
+                type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
         elif param_type in (float, bool, str):
@@ -545,9 +573,14 @@ def generate_schema(func) -> str:
             get_origin(param_type) in (list, List)
             and get_args(param_type)[0] is torch.Tensor
         ):
-            type_str = f"Tensor(a{idx}!)[]"
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)[]"
+            else:
+                type_str = "Tensor[]"
         elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
             type_str = "int[]"
+        elif param_type == Optional[torch.dtype]:
+            type_str = "ScalarType?"
         else:
             type_str = "*"
             flag = False
@@ -598,34 +631,11 @@ def compile_ops(
 ):
 
     def decorator(func):
-        import torch
-        from csrc.cpp_itfs.torch_utils import aiter_lib
-        import torch.library
-        import inspect
-
         func.arg_checked = False
-
-        schema = ""
-        if func.__name__ in MANUAL_SCHEMA_OPS:
-            schema = generate_schema(func)
-        else:
-            sig = inspect.signature(func)
-            mutates_args = []
-            for name, param in sig.parameters.items():
-                if param.annotation is torch.Tensor:
-                    mutates_args.append(name)
-            if hasattr(torch.library, "infer_schema"):
-                sig = torch.library.infer_schema(func, mutates_args="unknown")
-            else:
-                # for pytorch 2.4
-                import torch._custom_op.impl
-
-                sig = torch._custom_op.impl.infer_schema(func, mutates_args)
-            schema = f"{sig}"
-        loadName = func.__name__
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
+
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
@@ -777,6 +787,8 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
+            import inspect
+
             sig = inspect.signature(func)
             params = list(sig.parameters.keys())
             if loadName in activation_list:
@@ -809,19 +821,48 @@ def compile_ops(
                 return gen_fake(*args, **kwargs)
             return func(*args, **kwargs)
 
-        if loadName in NONE_WRAPPED_OP:
+        if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
 
+        def wrapper_register(func):
+            import torch
+            import torch.library
+            import inspect
+            from torch.library import Library
+
+            global aiter_lib
+            aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
+            schema = ""
+            if func.__name__ in MANUAL_SCHEMA_OPS:
+                schema = generate_schema(func)
+            else:
+                sig = inspect.signature(func)
+                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
+                if hasattr(torch.library, "infer_schema"):
+                    sig = torch.library.infer_schema(func, mutates_args=mutates_args)
+                else:
+                    # for pytorch 2.4
+                    import torch._custom_op.impl
+
+                    sig = torch._custom_op.impl.infer_schema(func, mutates_args)
+                schema = f"{sig}"
+            return schema
+
+        schema = wrapper_register(func)
+
+        import torch
+
+        loadName = func.__name__
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             op_schema = f"aiter::wrapper_{loadName}" + schema
-            aiter_lib.define(op_schema)
-            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CUDA")
-            aiter_lib.impl(f"wrapper_{loadName}", wrapper, "CPU")
+            aiter_lib.define(op_schema, tags=())
+            aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CUDA")
+            aiter_lib.impl(f"aiter::wrapper_{loadName}", wrapper, dispatch_key="CPU")
             aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
 
-        def wrapper_return(*args, **kwargs):
+        def wrapper_custom(*args, custom_build_args={}, **kwargs):
             return getattr(torch.ops.aiter, f"wrapper_{loadName}")(*args, **kwargs)
 
-        return wrapper_return
+        return wrapper_custom
 
     return decorator
