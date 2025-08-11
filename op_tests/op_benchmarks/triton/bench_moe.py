@@ -9,6 +9,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 
@@ -185,7 +186,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{kernel_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 

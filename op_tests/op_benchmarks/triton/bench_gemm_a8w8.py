@@ -16,6 +16,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 
@@ -56,7 +57,7 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("GEMM A8W8 Benchmark", args)
+    benchmark = get_model_benchmark_object("get_caller_name_no_ext()", args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_a8w8(

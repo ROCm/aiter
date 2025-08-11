@@ -1,0 +1,28 @@
+benchmarks:
+  moe:
+    input_columns: [model, M, N, K, E, top_k]
+    output_columns: [Time (ms), TFLOPS, Bandwidth (GB/s)]
+  gemm_afp4wfp4:
+    input_columns: [M, N, K]
+    output_columns: [Triton]
+  gemm_a8w8:
+    input_columns: [M, N, K]
+    output_columns: [Triton]
+  batch_gemm_a8w8:
+    input_columns: [batch, M, N, K]
+    output_columns: [Triton]
+  gemm_a16w16:
+    input_columns: [M, N, K]
+    output_columns: [Triton]
+  mha:
+    input_columns: [BATCH, HQ, HK, N_CTX_Q, N_CTX_K]
+    output_columns: [fwd(TFLOPS)]
+  pa_prefill:
+    input_columns: [model, BS, HQ, HK, MAX_SEQ_LEN, HEAD_DIM]
+    output_columns: [Time (ms), TFLOPS, Bandwidth (GB/s)]
+  pa_decode:
+    input_columns: [model, BS, HQ, HK, SEQ_LEN, HEAD_DIM]
+    output_columns: [Time (ms), TFLOPS, Bandwidth (GB/s)]
+  hstu_attn:
+    input_columns: [batch_size, max_seq_len, sparsity, heads, attn_dim, hidden_dim]
+    output_columns: [Triton]
