@@ -16,6 +16,10 @@ namespace aiter {
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
+using fp32x2_t  = __attribute__((__vector_size__(2 * sizeof(float)))) float;
+using fp32x4_t  = __attribute__((__vector_size__(4 * sizeof(float)))) float;
+using fp32x8_t  = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+using fp32x16_t = __attribute__((__vector_size__(16 * sizeof(float)))) float;
 
 // Setup acquire-release semantics for vector memory reads (mubuf instruction)
 // as per architecture.

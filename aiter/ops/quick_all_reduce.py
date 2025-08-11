@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import List, Optional
+from typing import Optional
 from ..jit.core import (
     compile_ops,
 )
@@ -35,7 +35,7 @@ def qr_get_handle(fa: int) -> torch.Tensor: ...
 
 
 @compile_ops("module_quick_all_reduce")
-def qr_open_handles(fa: int, handles: List[torch.Tensor]) -> None: ...
+def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None: ...
 
 
 @compile_ops("module_quick_all_reduce")

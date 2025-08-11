@@ -3,6 +3,7 @@
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "quick_all_reduce_base.h"
 #include <vector>
+#define caltime
 
 namespace aiter {
 
@@ -388,8 +389,7 @@ struct CodecQ6 : public CodecBase {
 // We quantize the FP16 data to block-scaled Fp8 in blocks of 4 *
 // kThreadGroupSize.
 template <typename T, int world_size>
-template <int world_size, typename T>
-struct CodecFp8 : public CodecBase {
+struct CodecFP8 : public CodecBase {
   static int constexpr kWorldSize = world_size;
 
   // Codec tile size process by this workgroup.
@@ -416,7 +416,7 @@ struct CodecFp8 : public CodecBase {
   static int constexpr kScaleEpsilon =
       std::is_same<T, half>::value ? 0x00010001 : 0x33D733D7;  // {1e-7, 1e-7}
 
-  __quickreduce_device_inline__ CodecFp8(int thread, int rank)
+  __quickreduce_device_inline__ CodecFP8(int thread, int rank)
       : CodecBase(thread, rank) {}
 
   __quickreduce_device_inline__ void send(int32x4_t* __restrict__ send_buffer,
@@ -504,7 +504,7 @@ struct CodecFp8 : public CodecBase {
     }
   }
 
-  __device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
+  __quickreduce_device_inline__ void recv(int32x4_t** __restrict__ recv_buffer,
                               int32x4_t* __restrict__ data) {
     for (int k = 0; k < kRankAtoms; k++) {
       // Directly read quantized atom from recv_buffer
@@ -886,7 +886,7 @@ struct DeviceComms {
     auto quant_level_ = static_cast<QuickReduceQuantLevel>(quant_level);
     switch (quant_level_) {
       case QuickReduceQuantLevel::FP8:
-        TWOSHOT_DISPATCH(CodecFp8)
+        TWOSHOT_DISPATCH(CodecFP8)
         break;
       case QuickReduceQuantLevel::INT6:
         TWOSHOT_DISPATCH(CodecQ6)

@@ -370,7 +370,7 @@ class GroupCoordinator:
         if self.tpu_communicator is not None and not self.tpu_communicator.disabled:
             # TPU handles Dynamo with its own logic.
             return self.tpu_communicator.all_reduce(input_)
-
+        outplace_all_reduce_method = None
         if (
             self.qr_comm is not None
             and not self.qr_comm.disabled

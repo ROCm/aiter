@@ -175,9 +175,9 @@ class QuickAllReduce:
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
         self.use_fp16_kernels = int(
-            os.environ.get("ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
+            os.environ.get("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
         )
-        regime_str = os.environ.get("ROCM_QUICK_REDUCE_QUANTIZATION", "NONE")
+        regime_str = os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
             logger.warning(
                 "Custom quick allreduce:",
@@ -191,7 +191,7 @@ class QuickAllReduce:
             logger.debug(
                 "Custom quick allreduce is disabled based "
                 "on env variable "
-                "ROCM_QUICK_REDUCE_QUANTIZATION='NONE'"
+                "AITER_QUICK_REDUCE_QUANTIZATION='NONE'"
             )
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
@@ -199,8 +199,8 @@ class QuickAllReduce:
         # TODO: If the dtype is not bfloat16 or then float16,
         # quickallreduce should not be created.
 
-        # ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = int(os.environ.get("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
+        # AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
+        qr_max_size = int(os.environ.get("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
         if qr_max_size > 0:
             if qr_max_size < 1:
                 logger.info(
