@@ -37,7 +37,7 @@ jobs:
           --build-arg AITER_COMMIT="${GITHUB_COMMIT_SHA}" \
           -t sglang_aiter_test -f docker/Dockerfile.rocm .
         env:
-          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }} 
+          GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
           GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
             
       - name: Start CI container
