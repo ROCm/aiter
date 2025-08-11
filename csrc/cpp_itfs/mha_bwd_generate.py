@@ -18,7 +18,7 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx  # noqa: E402
+from chip_info import get_gfx_list  # noqa: E402
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
@@ -111,16 +111,11 @@ V3_MULTI_TARGET_API = """
 
 
 def get_v3_api():
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
-    if archs[0] == "native":
-        gfx = get_gfx()
-        return f"t = {gfx}::fmha_bwd_v3(traits, args, stream_config);"
+    gfx_list = get_gfx_list()
+    if len(gfx_list) == 1:
+        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config);"
     else:
-        archs = [arch.strip() for arch in archs]
-        if len(archs) == 1:
-            return f"t = {archs[0]}::fmha_bwd_v3(traits, args, stream_config);"
-        else:
-            return V3_MULTI_TARGET_API
+        return V3_MULTI_TARGET_API
 
 
 V3_API = get_v3_api()
