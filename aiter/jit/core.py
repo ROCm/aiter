@@ -829,14 +829,6 @@ def compile_ops(
                     args = tuple(args_list)
             return op(*args, **kwargs)
 
-        def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
-            if gen_fake is not None:
-                return gen_fake(*args, **kwargs)
-            return func(*args, **kwargs)
-
-        def outer_wrapper(dummy, *args, **kwargs):
-            return wrapper(*args, **kwargs)
-
         if func.__name__ in NONE_WRAPPED_OP:
             return wrapper
 
@@ -876,9 +868,29 @@ def compile_ops(
         else:
             new_input = "(Tensor dummy, " + input_part[1:]
 
-        schema = f"{new_input} -> {output_part}".strip()
+        return_int = False
+        return_annotation = sig.return_annotation
+        if return_annotation is int:
+            output_part = "(Tensor, " + output_part + ")"
+            return_int = True
 
+        schema = f"{new_input} -> {output_part}".strip()
         loadName = func.__name__
+
+        def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
+            if return_int:
+                return torch.empty(1, device="cuda"), 1
+            if gen_fake is not None:
+                return gen_fake(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        def outer_wrapper(dummy, *args, **kwargs):
+            return (
+                wrapper(*args, **kwargs)
+                if not return_int
+                else (torch.empty(1, device="cuda"), wrapper(*args, **kwargs))
+            )
+
         if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
             op_schema = f"aiter::wrapper_{loadName}" + schema
             aiter_lib.define(op_schema, tags=())
@@ -892,9 +904,10 @@ def compile_ops(
 
         def wrapper_custom(*args, custom_build_args={}, **kwargs):
             dummy = torch.empty(1, device="cuda")
-            return getattr(torch.ops.aiter, f"wrapper_{loadName}")(
+            result = getattr(torch.ops.aiter, f"wrapper_{loadName}")(
                 dummy, *args, **kwargs
             )
+            return result[1:] if return_int else result
 
         return wrapper_custom
 
