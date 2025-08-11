@@ -44,6 +44,33 @@ ctypes_map = {
 
 aiter_lib = Library("aiter", "FRAGMENT")
 
+aiter_user_set_stream = None
+
+
+def set_gpu_stream(stream: Optional[torch.cuda.Stream]) -> None:
+    global aiter_user_set_stream
+    aiter_user_set_stream = stream
+
+
+def get_gpu_stream() -> Optional[torch.cuda.Stream]:
+    if aiter_user_set_stream is not None:
+        return aiter_user_set_stream
+    return torch.cuda.current_stream()
+
+
+aiter_warp_size = None
+
+
+def set_warp_size_for_device(device: int) -> None:
+    global aiter_warp_size
+    aiter_warp_size = torch.cuda.get_device_properties(device).warp_size
+
+
+def get_warp_size_for_device(device: int) -> int:
+    if aiter_warp_size is not None:
+        return aiter_warp_size
+    return torch.cuda.get_device_properties(device).warp_size
+
 
 def torch_to_c_types(*args):
     c_args = []
