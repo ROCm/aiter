@@ -7,10 +7,10 @@ files=()
 
 if [[ "$MULTIGPU" == "TRUE" ]]; then
     # Recursively find all files under op_tests/multigpu_tests
-    mapfile -t files < <(find op_tests/multigpu_tests -type f)
+    mapfile -t files < <(find op_tests/multigpu_tests -type f -name "*.py")
 else
     # Recursively find all files under op_tests, excluding op_tests/multigpu_tests
-    mapfile -t files < <(find op_tests -type f ! -path "op_tests/multigpu_tests/*")
+    mapfile -t files < <(find op_tests -maxdepth 1 -type f -name "*.py")
 fi
 
 for file in "${files[@]}"; do
