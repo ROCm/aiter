@@ -900,7 +900,7 @@ def compile_ops(
             result = getattr(torch.ops.aiter, f"wrapper_{loadName}")(
                 dummy, *args, **kwargs
             )
-            return result[1:] if return_int else result
+            return result[1] if return_int else result
 
         return wrapper_custom
 

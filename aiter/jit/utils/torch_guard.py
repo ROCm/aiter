@@ -31,7 +31,9 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         def outer_wrapper(*args, **kwargs):
             dummy = torch.empty(1, device=device)
             if return_int:
-                return getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)[1:]
+                result = getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)
+                _, int_value, *_ = result
+                return int_value
             return getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)
 
         if hasattr(torch.ops.aiter, func.__name__):
