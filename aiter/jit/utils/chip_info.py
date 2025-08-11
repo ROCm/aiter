@@ -10,43 +10,43 @@ from cpp_extension import executable_path
 
 
 @functools.lru_cache(maxsize=1)
+def _detect_native() -> list[str]:
+    try:
+        rocminfo = executable_path("rocminfo")
+        result = subprocess.run(
+            [rocminfo],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        for line in result.stdout.splitlines():
+            if "gfx" in line.lower():
+                return [line.split(":", 1)[-1].strip()]
+    except Exception as e:
+        raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
+    raise RuntimeError("No gfx arch found in rocminfo output.")
+
+
+@functools.lru_cache(maxsize=1)
 def get_gfx():
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
-        try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            for line in output.split("\n"):
-                if "gfx" in line.lower():
-                    return line.split(":")[-1].strip()
-        except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
+        return _detect_native()
+
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
     return gfx
 
 
 @functools.lru_cache(maxsize=1)
-def get_gfx_list():
-    gfx = os.getenv("GPU_ARCHS", "native")
-    if gfx == "native":
-        try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            for line in output.split("\n"):
-                if "gfx" in line.lower():
-                    return [line.split(":")[-1].strip()]
-        except Exception as e:
-            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
-    elif ";" in gfx:
-        gfx = gfx.split(";")
-    return gfx
+def get_gfx_list() -> list[str]:
+
+    gfx_env = os.getenv("GPU_ARCHS", "native")
+    if gfx_env == "native":
+        return _detect_native()
+
+    return [g.strip() for g in gfx_env.split(";") if g.strip()]
 
 
 @torch_compile_guard()
