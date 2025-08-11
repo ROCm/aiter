@@ -43,9 +43,9 @@ jobs:
       - name: Start CI container
         run: |
           cd sglang
-          sed -i 's|-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout"|-v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout"|g' scripts/amd_ci_start_container.sh
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_start_container.sh
-          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm; bash scripts/amd_ci_start_container.sh
+          sed -i 's|-v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout"|-v "${GITHUB_WORKSPACE:-$PWD}/sglang:/sglang-checkout"|g' scripts/ci/amd_ci_start_container.sh
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_start_container.sh
+          docker ps -aq -f name=sglang_aiter_test | xargs -r docker stop | xargs -r docker rm; bash scripts/ci/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
       
@@ -55,17 +55,17 @@ jobs:
       - name: Install dependencies
         run: |
           cd sglang
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_install_dependency.sh
-          bash scripts/amd_ci_install_dependency.sh
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd_ci_install_dependency.sh
 
       - name: Evaluate Accuracy
         timeout-minutes: 30
         run: |
           cd sglang
-          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/amd_ci_exec.sh
-          bash scripts/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-          bash scripts/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
-          bash scripts/amd_ci_exec.sh python3 models/test_qwen_models.py
+          sed -i 's/ci_sglang/sglang_aiter_test/g' scripts/ci/amd_ci_exec.sh
+          bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
+          bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
         
       # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
       - name: Clean Up
