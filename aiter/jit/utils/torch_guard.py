@@ -2,7 +2,6 @@
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 
-
 aiter_lib = None
 
 
@@ -12,7 +11,6 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
             import torch
             from torch.library import Library
             import inspect
-            from torch import Tensor
         except ImportError:
 
             def wrapper(*args, **kwargs):
