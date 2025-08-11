@@ -113,7 +113,7 @@ V3_MULTI_TARGET_API = """
 def get_v3_api():
     gfx_list = get_gfx_list()
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config);"
+        return f"t = {gfx_list[0]}::fmha_bwd_v3(traits, args, stream_config);"
     else:
         return V3_MULTI_TARGET_API
 
