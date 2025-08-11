@@ -26,9 +26,22 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         global aiter_lib
         aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
         op_name = func.__name__
+        sig = inspect.signature(func)
+        return_annotation = sig.return_annotation
+        return_int = False
+        if (
+            return_annotation is type(None)
+            or return_annotation is None
+            or return_annotation in SUPPORTED_RETURN_TYPES
+        ):
+            pass
+        else:
+            return_int = True
 
         def outer_wrapper(*args, **kwargs):
             dummy = torch.empty(1, device=device)
+            if return_int:
+                return getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)[1]
             return getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)
 
         if hasattr(torch.ops.aiter, func.__name__):
@@ -43,25 +56,18 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
                 func, mutates_args=mutates_args
             )
 
-        sig = inspect.signature(func)
         input_part, output_part = schema_str.split("->", 1)
         if not sig.parameters:
             new_input = "(Tensor dummy)"
         else:
             new_input = "(Tensor dummy, " + input_part[1:]
-        return_annotation = sig.return_annotation
+
         output_part = output_part.strip()
-        return_int = False
-        if (
-            return_annotation is type(None)
-            or return_annotation is None
-            or return_annotation in SUPPORTED_RETURN_TYPES
-        ):
+        if not return_int:
             new_output = output_part
         else:
             # return only int will cause graph breaks and we add dummy_out
             new_output = "(Tensor, " + output_part + ")"
-            return_int = True
         schema_str = f"{new_input} -> {new_output}".strip()
 
         def custom_impl(dummy_tensor, *args, **kwargs):

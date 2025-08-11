@@ -77,7 +77,7 @@ def get_gfx_custom_op() -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_gfx():
-    _, gfx_num = get_gfx_custom_op()
+    gfx_num = get_gfx_custom_op()
     return GFX_MAP.get(gfx_num, "unknown")
 
 
@@ -119,7 +119,7 @@ def get_cu_num_custom_op() -> int:
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
-    _, cu_num = get_cu_num_custom_op()
+    cu_num = get_cu_num_custom_op()
     return cu_num
 
 
