@@ -216,13 +216,6 @@ def check_numa_custom_op() -> None:
 @functools.lru_cache()
 def check_numa():
     check_numa_custom_op()
-    # numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
-    # if numa_balance_set == "1":
-    #     logger.warning(
-    #         "WARNING: NUMA balancing is enabled, which may cause errors. "
-    #         "It is recommended to disable NUMA balancing by running \"sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'\" "
-    #         "for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing"
-    #     )
 
 
 __mds = {}
