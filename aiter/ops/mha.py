@@ -1205,7 +1205,7 @@ def can_impl_fmha_v3_bwd(
     ret &= bias is None
     ret &= dbias is None
     ret &= dropout_p == 0.0
-    ret &= deterministic == False
+    ret &= not deterministic
     ret &= hdim_q == hdim_v
     ret &= nhead_q % nhead_k == 0
     ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
