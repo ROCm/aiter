@@ -4,8 +4,7 @@
 from ..jit.core import (
     compile_ops,
 )
-import torch
 
 
 @compile_ops("module_gemm_common")
-def get_padded_m(M: int, N: int, K: int, gl: int) -> torch.Tensor: ...
+def get_padded_m(M: int, N: int, K: int, gl: int) -> int: ...

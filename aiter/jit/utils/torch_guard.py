@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import typing
+
+
 aiter_lib = None
 
 
@@ -10,6 +13,7 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
             import torch
             from torch.library import Library
             import inspect
+            from torch import Tensor
         except ImportError:
 
             def wrapper(*args, **kwargs):
@@ -17,12 +21,11 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
 
             return wrapper
 
+        # These supported type will not cause graph breaks
+        SUPPORTED_RETURN_TYPES = [Tensor, typing.List[Tensor], list[Tensor], bool]
         global aiter_lib
         aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
         op_name = func.__name__
-
-        def custom_impl(dummy_tensor, *args, **kwargs):
-            return func(*args, **kwargs)
 
         def outer_wrapper(*args, **kwargs):
             dummy = torch.empty(1, device=device)
@@ -46,8 +49,26 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
             new_input = "(Tensor dummy)"
         else:
             new_input = "(Tensor dummy, " + input_part[1:]
+        return_annotation = sig.return_annotation
+        output_part = output_part.strip()
+        return_int = False
+        if (
+            return_annotation is type(None)
+            or return_annotation is None
+            or return_annotation in SUPPORTED_RETURN_TYPES
+        ):
+            new_output = output_part
+        else:
+            # return only int will cause graph breaks and we add dummy_out
+            new_output = "(Tensor, " + output_part + ")"
+            return_int = True
+        schema_str = f"{new_input} -> {new_output}".strip()
 
-        schema_str = f"{new_input} -> {output_part}".strip()
+        def custom_impl(dummy_tensor, *args, **kwargs):
+            out = torch.empty(1, device=device)
+            if not return_int:
+                return func(*args, **kwargs)
+            return out, func(*args, **kwargs)
 
         my_lib = aiter_lib
         my_lib.define(op_name + schema_str, tags=())
@@ -58,29 +79,3 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         return outer_wrapper
 
     return decorator
-
-
-class GlobalStateManager:
-    cu_num = 0
-    gfx_name = ""
-
-    @classmethod
-    def reset(cls):
-        cls.cu_num = 0
-        cls.gfx_name = ""
-
-    @classmethod
-    def set_cu_num(cls, cu_num_):
-        cls.cu_num = cu_num_
-
-    @classmethod
-    def set_gfx_name(cls, gfx_):
-        cls.gfx_name = gfx_
-
-    @classmethod
-    def get_cu_num(cls):
-        return cls.cu_num
-
-    @classmethod
-    def get_gfx_name(cls):
-        return cls.gfx_name

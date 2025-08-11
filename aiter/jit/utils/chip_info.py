@@ -4,9 +4,21 @@ import functools
 import os
 import re
 import subprocess
-from torch_guard import torch_compile_guard, GlobalStateManager
+from torch_guard import torch_compile_guard
 
 from cpp_extension import executable_path
+
+GFX_MAP = {
+    0: "native",
+    1: "gfx90a",
+    2: "gfx908",
+    3: "gfx940",
+    4: "gfx941",
+    5: "gfx942",
+    6: "gfx945",
+    7: "gfx1100",
+    8: "gfx950",
+}
 
 
 @functools.lru_cache(maxsize=1)
@@ -30,7 +42,8 @@ def _detect_native() -> list[str]:
 
 
 @torch_compile_guard()
-def get_gfx_custom_op() -> None:
+def get_gfx_custom_op() -> int:
+    gfx_mapping = {v: k for k, v in GFX_MAP.items()}
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
@@ -41,37 +54,31 @@ def get_gfx_custom_op() -> None:
             output = result.stdout
             for line in output.split("\n"):
                 if "gfx" in line.lower():
-                    GlobalStateManager.set_gfx_name(line.split(":")[-1].strip())
-                    return
-                    # return line.split(":")[-1].strip()
+                    try:
+                        return gfx_mapping[line.split(":")[-1].strip()]
+                    except KeyError:
+                        raise KeyError(
+                            f"Unknown GPU architecture: {line.split(":")[-1].strip()}. "
+                            f"Supported architectures: {list(gfx_mapping.values())}"
+                        )
+
         except Exception as e:
             raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
-    GlobalStateManager.set_gfx_name(gfx)
-    return
+    try:
+        return gfx_mapping[gfx]
+    except KeyError:
+        raise KeyError(
+            f"Unknown GPU architecture: {gfx}. "
+            f"Supported architectures: {list(gfx_mapping.values())}"
+        )
 
 
 @functools.lru_cache(maxsize=1)
 def get_gfx():
-    # gfx = os.getenv("GPU_ARCHS", "native")
-    # if gfx == "native":
-    #     try:
-    #         rocminfo = executable_path("rocminfo")
-    #         result = subprocess.run(
-    #             [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    #         )
-    #         output = result.stdout
-    #         for line in output.split("\n"):
-    #             if "gfx" in line.lower():
-    #                 return line.split(":")[-1].strip()
-    #     except Exception as e:
-    #         raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
-    # elif ";" in gfx:
-    #     gfx = gfx.split(";")[-1]
-    get_gfx_custom_op()
-    gfx = GlobalStateManager.get_gfx_name()
-    return gfx
+    _, gfx_num = get_gfx_custom_op()
+    return GFX_MAP.get(gfx_num, "unknown")
 
 
 @functools.lru_cache(maxsize=1)
@@ -85,7 +92,7 @@ def get_gfx_list() -> list[str]:
 
 
 @torch_compile_guard()
-def get_cu_num_custom_op() -> None:
+def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
@@ -107,14 +114,12 @@ def get_cu_num_custom_op() -> None:
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
-    GlobalStateManager.set_cu_num(cu_num)
-    # return cu_num
+    return cu_num
 
 
 @functools.lru_cache(maxsize=1)
 def get_cu_num():
-    get_cu_num_custom_op()
-    cu_num = GlobalStateManager.get_cu_num()
+    _, cu_num = get_cu_num_custom_op()
     return cu_num
 
 
