@@ -32,8 +32,17 @@ def _detect_native() -> list[str]:
 def get_gfx():
     gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
-        return _detect_native()
-
+        try:
+            rocminfo = executable_path("rocminfo")
+            result = subprocess.run(
+                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            output = result.stdout
+            for line in output.split("\n"):
+                if "gfx" in line.lower():
+                    return line.split(":")[-1].strip()
+        except Exception as e:
+            raise RuntimeError(f"Get GPU arch from rocminfo failed {str(e)}")
     elif ";" in gfx:
         gfx = gfx.split(";")[-1]
     return gfx
