@@ -58,7 +58,7 @@ def get_gfx_custom_op() -> int:
                         return gfx_mapping[line.split(":")[-1].strip()]
                     except KeyError:
                         raise KeyError(
-                            f"Unknown GPU architecture: {line.split(":")[-1].strip()}. "
+                            f'Unknown GPU architecture: {line.split(":")[-1].strip()}. '
                             f"Supported architectures: {list(gfx_mapping.values())}"
                         )
 
