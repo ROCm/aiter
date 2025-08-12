@@ -4,7 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]  # Triggers on PRs targeting `main`
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   aiter:
@@ -26,6 +30,8 @@ jobs:
           --device=/dev/dri \
           --device=/dev/kfd \
           --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name aiter_test \
