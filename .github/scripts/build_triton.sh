@@ -3,7 +3,7 @@
 set -ex
 
 # Install dependencies
-pip install --upgrade
+pip install --upgrade pip
 pip install pandas zmq einops numpy==1.26.2
 python3 setup.py develop
 
