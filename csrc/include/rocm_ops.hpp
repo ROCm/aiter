@@ -33,6 +33,7 @@
           py::arg("kv_page_indices"),      \
           py::arg("kv_last_page_lens"),    \
           py::arg("num_kv_splits_indptr"), \
+          py::arg("work_meta_data"),       \
           py::arg("work_indptr"),          \
           py::arg("work_info_set"),        \
           py::arg("max_seqlen_q"),         \

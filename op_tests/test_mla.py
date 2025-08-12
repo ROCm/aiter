@@ -380,6 +380,7 @@ def test_mla(
     #         batch_split_table=None
     #         split_table=None
 
+    work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
     work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
     work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
     reduce_indptr      = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
@@ -387,13 +388,13 @@ def test_mla(
     reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
     
-    
-    work_meta_data, reduce_indptr_tsr, reduce_final_map_tsr, reduce_partial_map_tsr = aiter.get_mla_metadata_v1(
+    aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
         nhead_kv,
         True,
+        work_meta_data,
         work_info_set,
         work_indptr,
         reduce_indptr,
@@ -422,7 +423,7 @@ def test_mla(
         kv_last_page_lens,
         max_seqlen_qo,
         sm_scale,
-        work_indptr=work_meta_data,
+        work_meta_data=work_meta_data,
         # work_indptr=work_indptr,
         work_info_set=work_info_set,
         reduce_indptr=reduce_indptr,
@@ -441,9 +442,6 @@ def test_mla(
         kv_last_page_lens,
         max_seqlen_qo,
         sm_scale,
-        varlen,
-        0.0,
-        None,
     )
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")

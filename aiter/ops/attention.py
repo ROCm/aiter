@@ -239,6 +239,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
     num_kv_splits_indptr: Optional[torch.Tensor],
+    work_meta_data: Optional[torch.Tensor],
     work_indptr: Optional[torch.Tensor],
     work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
@@ -300,6 +301,7 @@ def get_mla_metadata_v1(
     num_heads_k: int,
     is_causal: bool,
 
+    work_meta_data: torch.Tensor,
     work_info_set_tsr: torch.Tensor,
     work_indptr_tsr: torch.Tensor,
     reduce_indptr_tsr: torch.Tensor,
