@@ -40,7 +40,6 @@ def _detect_native() -> list[str]:
     raise RuntimeError("No gfx arch found in rocminfo output.")
 
 
-
 @torch_compile_guard()
 def get_gfx_custom_op() -> int:
     gfx_mapping = {v: k for k, v in GFX_MAP.items()}
