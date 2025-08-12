@@ -457,6 +457,7 @@ namespace aiter
         ((P *)result)[idx] = write_reg;
       }
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
   }
 
   template <typename T, int ngpus>
