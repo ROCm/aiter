@@ -32,7 +32,7 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
             dummy = torch.empty(1, device=device)
             if return_int:
                 result = getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)
-                _, int_value, *_ = result
+                _, int_value = result
                 return int_value
             return getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)
 
