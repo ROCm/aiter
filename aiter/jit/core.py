@@ -221,11 +221,18 @@ def check_numa():
 __mds = {}
 
 
+@torch_compile_guard()
+def get_module_custom_op(md_name: str) -> None:
+    global __mds
+    if md_name not in __mds:
+        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+    return
+
+
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
     check_numa()
-    if md_name not in __mds:
-        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+    get_module_custom_op(md_name)
     return __mds[md_name]
 
 
@@ -623,6 +630,8 @@ def generate_schema(func) -> str:
         and get_args(return_annotation)[0] is torch.Tensor
     ):
         return_type = "Tensor[]"
+    else:
+        return_type = "Any"
 
     schema = f"({', '.join(parameters)}) -> {return_type}"
 
