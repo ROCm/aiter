@@ -4,9 +4,9 @@
 #include "ck_tile/core.hpp"
 #include <hip/hip_runtime.h>
 #include <iostream>
+#include "ck_tile/core.hpp"
 
-enum class GPUArch
-{
+enum class GPUArch {
     gfx942,
     gfx950
 };
@@ -134,12 +134,10 @@ class AiterAsmKernelFast
     };
 };
 
-static const std::string get_gpu_arch()
-{
+static const std::string get_gpu_arch() {
     int device_count;
     hipError_t err = hipGetDeviceCount(&device_count);
-    if(err != hipSuccess || device_count == 0)
-    {
+    if (err != hipSuccess || device_count == 0) {
         return "No GPU Found";
     }
 
@@ -147,13 +145,10 @@ static const std::string get_gpu_arch()
     hipGetDeviceProperties(&prop, 0);
 
     std::string arch_full = prop.gcnArchName;
-    size_t colon_pos      = arch_full.find(':');
-    if(colon_pos != std::string::npos)
-    {
+    size_t colon_pos = arch_full.find(':');
+    if (colon_pos != std::string::npos) {
         return arch_full.substr(0, colon_pos);
-    }
-    else
-    {
+    } else {
         return arch_full;
     }
 }
