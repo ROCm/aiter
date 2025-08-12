@@ -387,7 +387,8 @@ def test_mla(
     reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
     
-    aiter.get_mla_metadata_v1(
+    
+    work_meta_data, reduce_indptr_tsr, reduce_final_map_tsr, reduce_partial_map_tsr = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
@@ -401,8 +402,11 @@ def test_mla(
         # num_reduce_tile,
     )
 
-    # print(work_indptr)
-    # print(work_info_set)
+
+
+    print(work_meta_data)
+    print(work_indptr)
+    print(work_info_set)
     # print(reduce_indptr)
     # print(reduce_final_map)
     # print(reduce_partial_map)
@@ -418,7 +422,8 @@ def test_mla(
         kv_last_page_lens,
         max_seqlen_qo,
         sm_scale,
-        work_indptr=work_indptr,
+        work_indptr=work_meta_data,
+        # work_indptr=work_indptr,
         work_info_set=work_info_set,
         reduce_indptr=reduce_indptr,
         reduce_final_map=reduce_final_map,

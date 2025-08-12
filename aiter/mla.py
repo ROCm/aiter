@@ -296,7 +296,6 @@ def mla_decode_fwd(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
-    num_reduce_tile=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -561,7 +560,6 @@ def mla_decode_fwd_dispatch(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
-    num_reduce_tile=None,
 ):
     if batch_split_table is None:
         return mla_decode_fwd(

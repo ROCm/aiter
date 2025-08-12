@@ -94,19 +94,20 @@ void mla_decode_stage1_asm_fwd(
 
     if (persistent)
     {
-        assert(work_indptr.has_value() && work_info_set.has_value());
-        assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
-
-        uint64_t* persistent_meta_data = new uint64_t[10];
-        persistent_meta_data[0] = (uint64_t)work_indptr.value().data_ptr();
-        persistent_meta_data[1] = (uint64_t)work_info_set.value().data_ptr();
-        uint32_t* dev_PS_META_DATA;
-
-        unsigned long buf_size_META = 10 * sizeof(uint64_t);
-        hipMalloc(&dev_PS_META_DATA, buf_size_META);
-        hipMemcpy(dev_PS_META_DATA, persistent_meta_data, buf_size_META, hipMemcpyHostToDevice);
-
-        args.ptr_STP = dev_PS_META_DATA;
+        // assert(work_indptr.has_value() && work_info_set.has_value());
+        // assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
+        //
+        // uint64_t* persistent_meta_data = new uint64_t[10];
+        // persistent_meta_data[0] = (uint64_t)work_indptr.value().data_ptr();
+        // persistent_meta_data[1] = (uint64_t)work_info_set.value().data_ptr();
+        // uint32_t* dev_PS_META_DATA;
+        //
+        // unsigned long buf_size_META = 10 * sizeof(uint64_t);
+        // hipMalloc(&dev_PS_META_DATA, buf_size_META);
+        // hipMemcpy(dev_PS_META_DATA, persistent_meta_data, buf_size_META, hipMemcpyHostToDevice);
+        //
+        // args.ptr_STP = dev_PS_META_DATA;
+        args.ptr_STP = work_indptr.value().data_ptr();
     }
     else
     {
@@ -195,7 +196,7 @@ void mla_decode_stage1_asm_fwd(
     if(persistent)
     {
         gdx = 80;
-        gdy = 1;
+        gdy = num_kv_heads;
         gdz = 1;
     }
     // printf("gdx: %d \n", gdx);

@@ -541,6 +541,15 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
                        work_indptr.data(),
                        static_cast<int32_t>(work_indptr.size()) * sizeof(int32_t),
                        hipMemcpyHostToDevice));
+
+
+    uint64_t* persistent_meta_data = new uint64_t[10];
+    persistent_meta_data[0] = (uint64_t)work_indptr_tsr.data_ptr();
+    persistent_meta_data[1] = (uint64_t)work_info_set_tsr.data_ptr();
+    auto work_meta_data = torch::from_blob(persistent_meta_data, 10*sizeof(uint64_t), int_opts.dtype(torch::kUInt64));
+
+
+
     HIP_CALL(hipMemcpy(reduce_indptr_tsr.data_ptr(),
                        reduce_indptr.data(),
                        static_cast<int32_t>(reduce_indptr.size()) * sizeof(int32_t),
@@ -560,8 +569,9 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
 
     // Last step. Copy to the device of input and return the results.
     auto input_opts = seqlens_qo_indptr.options();
-    return {work_indptr_tsr.to(input_opts),
-            work_info_set_tsr.to(input_opts),
+    // return {work_indptr_tsr.to(input_opts),
+    //         work_info_set_tsr.to(input_opts),
+    return {work_meta_data.to(input_opts.dtype(torch::kUInt64)),
             reduce_indptr_tsr.to(input_opts),
             reduce_final_map_tsr.to(input_opts),
             reduce_partial_map_tsr.to(input_opts)};
