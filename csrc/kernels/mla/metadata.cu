@@ -6,67 +6,60 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "aiter_hip_common.h"
 #include "mla.h"
-#include <iostream>
 
 
 #define PRINT_DBG 0
 
+// ===================================================================================================================
+// MLA Metadata V0
+// ===================================================================================================================
 
-__device__ constexpr int32_t get_warp_size()
-{
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
-    return 64;
-#else
-    return 32;
-#endif
-}
-
-__device__ float get_overhead(
+CK_TILE_HOST_DEVICE float get_overhead(
     const int32_t num_cu,
-    const int32_t batch_size,
+    const int32_t num_batches,
     const int32_t seqlen,
     const int32_t num_splits)
 {
     constexpr float kSplitOverhead = 84.1f;
 
-    const float bs_ratio = float(batch_size * num_splits) /
-                           float((batch_size * num_splits + num_cu - 1) / num_cu) * float(num_cu);
+    const float bs_ratio = float(num_batches * num_splits) /
+                           float((num_batches * num_splits + num_cu - 1) / num_cu) * float(num_cu);
     const float sq_ratio = float(seqlen) / float(seqlen + kSplitOverhead * num_splits);
     const float overhead = bs_ratio * sq_ratio;
 
     return overhead;
 }
 
-__launch_bounds__(get_warp_size())
+__launch_bounds__(ck_tile::get_warp_size())
 __global__ void kn_get_mla_metadata_v0(
     int32_t*       p_num_kv_splits,
     int32_t*       p_max_num_splits,
     const int32_t* p_seqlens,
     const int32_t  num_cu,
-    const int32_t  batch_size,
+    const int32_t  num_batches,
     const int32_t  num_heads_per_head_k,
     const int32_t  num_heads_k)
 {
     constexpr int32_t kMaxSplits = 16;
-    constexpr int32_t kWarpSize  = get_warp_size();
+    constexpr int32_t kWarpSize  = ck_tile::get_warp_size();
 
     int32_t base_scan  = 0;
     int32_t max_splits = 1;
 
-    const int32_t num_loops = (batch_size + kWarpSize - 1) / kWarpSize;
+    const int32_t num_loops = (num_batches + kWarpSize - 1) / kWarpSize;
     for (int32_t i = 0; i < num_loops; ++i)
     {
         const int32_t seqlen_idx = threadIdx.x + i * kWarpSize;
         int32_t splits = 0;
 
-        if (seqlen_idx < batch_size)
+        if (seqlen_idx < num_batches)
         {
             const int32_t seqlen = p_seqlens[seqlen_idx + 1] - p_seqlens[seqlen_idx];
             float min_overhead   = std::numeric_limits<float>::max();
             #pragma unroll
             for (int32_t test_splits = 1; test_splits <= kMaxSplits; ++test_splits)
             {
-                const float overhead = get_overhead(num_cu, batch_size, seqlen, test_splits);
+                const float overhead = get_overhead(num_cu, num_batches, seqlen, test_splits);
                 if (overhead < min_overhead)
                 {
                     min_overhead = overhead;
@@ -88,7 +81,7 @@ __global__ void kn_get_mla_metadata_v0(
 
         const int32_t global_scan = scan + base_scan;
 
-        if (seqlen_idx < batch_size)
+        if (seqlen_idx < num_batches)
         {
             p_num_kv_splits[seqlen_idx + 1] = global_scan;
         }
@@ -116,7 +109,7 @@ __global__ void kn_get_mla_metadata_v0(
 // group support.
 //
 // Returns
-//   [0] num_kv_splits: (batch_size + 1), dtype torch.int32.
+//   [0] num_kv_splits:  (num_batches + 1), dtype torch.int32.
 //   [1] max_num_splits: (1), dtype torch.int32.
 //
 std::vector<torch::Tensor> get_mla_metadata_v0(
@@ -137,10 +130,10 @@ std::vector<torch::Tensor> get_mla_metadata_v0(
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    const int32_t batch_size = seqlens_kv_indptr.size(0) - 1;
+    const int32_t num_batches = seqlens_kv_indptr.size(0) - 1;
 
     // declare outputs
-    auto num_kv_splits = torch::empty({batch_size + 1}, seqlens_kv_indptr.options());
+    auto num_kv_splits = torch::empty({num_batches + 1}, seqlens_kv_indptr.options());
     auto max_num_splits = torch::empty({1}, seqlens_kv_indptr.options());
 
     // launch kernel
@@ -151,14 +144,18 @@ std::vector<torch::Tensor> get_mla_metadata_v0(
         max_num_splits.data_ptr<int32_t>(),
         seqlens_kv_indptr.data_ptr<int32_t>(),
         dev_prop.multiProcessorCount,
-        batch_size,
+        num_batches,
         num_heads_per_head_k,
         num_heads_k);
 
     return {num_kv_splits, max_num_splits};
 }
 
-inline int32_t cal_packed_causal_kv_len(
+// ===================================================================================================================
+// MLA Metadata V1
+// ===================================================================================================================
+
+CK_TILE_HOST_DEVICE int32_t cal_packed_causal_kv_len(
     const int32_t qo_len,
     const int32_t kv_len,
     const int32_t qo_tile_idx,
@@ -179,37 +176,41 @@ inline int32_t cal_packed_causal_kv_len(
     return result;
 }
 
-inline int32_t cal_cost(
+CK_TILE_HOST_DEVICE int32_t cal_cost(
     const int32_t qo_len,
     const int32_t kv_len)
 {
     return 2 * qo_len + kv_len;
 }
 
-inline int32_t cal_kv_len(
+CK_TILE_HOST_DEVICE int32_t cal_kv_len(
     const int32_t cost,
     const int32_t qo_len)
 {
     return cost - 2 * qo_len;
 }
 
-inline int32_t get_remaining_kv_capability(
+CK_TILE_HOST_DEVICE int32_t get_remaining_kv_capability(
     const int32_t kv_len_upper_bound,
     const int32_t kv_len_used)
 {
     return ck_tile::integer_least_multiple(kv_len_upper_bound - kv_len_used, 16);
 }
 
-inline void tensor_pad(
-    std::vector<uint32_t> &work_indptr,
-    const int32_t pad_size)
+CK_TILE_DEVICE auto get_cost_top(
+    const int32_t* p_cost_heap,
+    const int32_t  num_clusters)
 {
-    int32_t num_works = work_indptr.size();
-    int32_t work_indptr_end = work_indptr[num_works - 1];
-    for (int i = work_indptr.size(); i <= pad_size; ++i)
-    {
-        work_indptr.emplace_back(work_indptr_end);
+    int32_t cid_min = -1;
+    int32_t cost_min = 0x7fffffff;
+    for (int32_t cid = 0; cid < num_clusters; ++cid) {
+        int32_t cost = p_cost_heap[cid];
+        if (cost < cost_min) {
+            cost_min = cost;
+            cid_min = cid;
+        }
     }
+    return std::make_tuple(cid_min, cost_min);
 }
 
 template <typename T>
@@ -244,54 +245,378 @@ template<int32_t kPackedQoLenPerWg_,
          int32_t kMaxClusterSize_>
 struct MlaMetadataTraits
 {
-    static constexpr int32_t kPackedQoLenPerWg = kPackedQoLenPerWg_;
-    static constexpr int32_t kMaxClusterSize   = kMaxClusterSize_;
-    static constexpr int32_t kSplitTolerance   = 16;
+    static constexpr int32_t kPackedQoLenPerWg  = kPackedQoLenPerWg_;
+    static constexpr int32_t kMaxClusterSize    = kMaxClusterSize_;
+    static constexpr int32_t kSplitTolerance    = 16;
+    static constexpr int32_t kMaxQoTilePerBatch = 1;
 };
 
-//
-// Persistent thread group solution which take variable query/output lengths into consideration as well.
-//
-// Returns
-//   [0] work_indptr:        (#cu_part + 1),      The IDs of work handled by each cu_part.
-//   [1] work information    (#work, 8)
-//   [1.0] bs_index:         (#work),             The index of batch handled by each work.
-//   [1.1] partial_qo_loc:   (#work),             The location in qo of tile in output buffer when splits. -1 means no split.
-//   [1.2] q_start:          (#work),             The global index in seq where q/o starts.
-//   [1.3] q_end:            (#work),             The global index in seq where q/o ends (not included).
-//   [1.4] kv_start:         (#work),             The global index in seq where k/v starts.
-//   [1.5] kv_end:           (#work),             The global index in seq where k/v ends (not included).
-//   [1.6] kv_offset:        (#work),             The delta between kv_end and seqlens_kv_indptr[batch_idx].
-//   [1.7] paddings:         (#work, 1),          Pad to 8 DWs.
-//   [2] reduce_indptr:      (#reduce_tiles + 1), The IDs in reduce_partial_map indicates the tiles should be merged
-//                                                together.
-//   [3] reduce_final_map:   (#reduce_tiles, 2),  The final output location and length of each group of tiles.
-//   [3.0] q_start           (#reduce_tiles),     The global index in seq where q/o starts.
-//   [3.1] q_end             (#reduce_tiles),     The global index in seq where q/o ends (not included).
-//   [4] reduce_partial_map: (#partial_tiles),    The locations in partial buffer of partial tiles waiting for being
-//                                                reduced.
-//
-std::vector<torch::Tensor> get_mla_metadata_v1(
+struct MlaMetadataV1KernelParameter
+{
+    // Outputs
+    uint64_t* p_work_metadata_ptrs;
+    int32_t*  p_work_indptr;
+    int32_t*  p_work_info_set_raw;
+    int32_t*  p_reduce_indptr;
+    int32_t*  p_reduce_final_map;
+    int32_t*  p_reduce_partial_map;
+
+    // Inputs
+    const int32_t* p_seqlens_qo_indptr;
+    const int32_t* p_seqlens_kv_indptr;
+    int32_t        num_batches;
+    int32_t        num_heads;
+    int32_t        num_cu;
+    bool           is_causal;
+};
+
+template <typename Traits>
+__launch_bounds__(ck_tile::get_warp_size(), 1)
+__global__ void kn_get_mla_metadata_v1(
+    const MlaMetadataV1KernelParameter params)
+{
+    extern __shared__ uint8_t p_smem[];
+ 
+    if (threadIdx.x == 0)
+    {
+        params.p_work_metadata_ptrs[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.p_work_indptr));
+        params.p_work_metadata_ptrs[1] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(params.p_work_info_set_raw));
+
+        // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
+        //         composing each cluster. The size is determined by average packed qo length.
+        int32_t sum_packed_qo_len = 0;
+        for (int32_t bid = 0; bid < params.num_batches; ++bid)
+        {
+            const int32_t qo_len = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+            sum_packed_qo_len += qo_len * params.num_heads;
+        }
+        const int32_t cluster_size =
+        [&]() {
+            const int32_t avg_packed_qo_len = sum_packed_qo_len / params.num_batches;
+            const int32_t cluster_size =
+                ck_tile::integer_divide_ceil(avg_packed_qo_len, Traits::kPackedQoLenPerWg);
+            return ck_tile::min(cluster_size, Traits::kMaxClusterSize);
+        }();
+        // assert((params.num_cu % cluster_size) == 0);
+        const int32_t num_clusters  = params.num_cu / cluster_size;
+        const int32_t cluster_len_q = cluster_size * Traits::kPackedQoLenPerWg;
+
+        // Step.2.
+        //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
+        //   b. Get a indptr array about #cluster for each batch in direction of qo.
+        int32_t sum_kv_lens = 0;
+        int32_t* p_num_qo_clusters_indptr = reinterpret_cast<int32_t*>(p_smem);
+        p_num_qo_clusters_indptr[0] = 0;
+        for (int32_t bid = 0; bid < params.num_batches; ++bid)
+        {
+            const int32_t kv_len = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+            const int32_t qo_len = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+            const int32_t packed_qo_len = qo_len * params.num_heads;
+            const int32_t num_qo_tiles = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+
+            p_num_qo_clusters_indptr[bid + 1] = (p_num_qo_clusters_indptr[bid] + num_qo_tiles);
+
+            for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
+            {
+                const int32_t kv_len_valid =
+                    cal_packed_causal_kv_len(
+                        qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
+                sum_kv_lens += kv_len_valid;
+            }
+        }
+        const int32_t kv_len_limit_global =
+        [&]() {
+            const int32_t avg_kv_lens = ck_tile::max(ck_tile::integer_divide_ceil(sum_kv_lens, num_clusters), 1);
+            // TODO: The following code just follow FlashInfer. Further tune may be required for AMD GPU.
+            int32_t limit;
+            if (avg_kv_lens <= 8) limit = 32;
+            else if (avg_kv_lens <= 16) limit = 64;
+            else if (avg_kv_lens <= 32) limit = 128;
+            else if (avg_kv_lens <= 64) limit = 192;
+            else limit = ck_tile::integer_least_multiple(avg_kv_lens, 16);
+            return limit;
+        }();
+
+        // Step.3.1. Initialize lds
+        int32_t* p_cost_heap = p_num_qo_clusters_indptr + params.num_batches + 1;
+        int32_t* p_cluster_work_counter = p_cost_heap + num_clusters + 1;
+        for (int32_t cid = 0; cid < num_clusters; ++cid)
+        {
+            p_cost_heap[cid] = 0;
+            p_cluster_work_counter[cid] = 0;
+        }
+
+        // Step.4. Fill the output buffers except indptrs
+        MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
+
+        // Step.4.1. Get total work for each cluster
+        for (int32_t bid = 0; bid < params.num_batches; ++bid)
+        {
+            const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
+            const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
+            const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
+            const int32_t kv_len         = kv_batch_end - kv_batch_start;
+            const int32_t qo_len         = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
+            const int32_t packed_qo_len  = qo_len * params.num_heads;
+            const int32_t num_qo_tiles   = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+
+            for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
+            {
+                int32_t remaining_kv_len =
+                    cal_packed_causal_kv_len(qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
+
+                do
+                {
+                    // Check and update cost_heap
+                    auto [cid, accum_cost] = get_cost_top(p_cost_heap, num_clusters);
+                    const int32_t remaining_capability =
+                        get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost, cluster_len_q));
+                    const int32_t kv_len_limit_local =
+                    [&]() {
+                        const int32_t limit_ori = remaining_capability > 64 ? remaining_capability : 128;
+                        const int32_t tail_size = (remaining_kv_len > limit_ori) ? (remaining_kv_len - limit_ori) : 0x7fffffff;
+                        const int32_t limit_fin = (tail_size <= Traits::kSplitTolerance) ? remaining_kv_len : limit_ori;
+                        return limit_fin;
+                    }();
+                    const int32_t kv_len_consuming = ck_tile::min(remaining_kv_len, kv_len_limit_local);
+                    const int32_t cost = cal_cost(cluster_len_q, kv_len_consuming);
+                    const int32_t new_cost = accum_cost + cost;
+                    p_cost_heap[cid] = new_cost;
+
+                    ++p_cluster_work_counter[cid];
+
+                    // Update state
+                    remaining_kv_len -= kv_len_consuming;
+                }
+                while (remaining_kv_len > 0);
+            }
+        }
+
+        // Step.4.2. Re-init cost heap and cumulative sum cluster_work_tot
+        int32_t cum_cluster_work = 0;
+        params.p_work_indptr[0] = 0;
+        for (int32_t cid = 0; cid < num_clusters; ++cid)
+        {
+            cum_cluster_work += p_cluster_work_counter[cid];
+            params.p_work_indptr[cid + 1] = cum_cluster_work;
+            p_cost_heap[cid] = 0;
+            p_cluster_work_counter[cid] = 0;
+        }
+        const int32_t max_qo_tiles = params.num_batches * Traits::kMaxQoTilePerBatch;
+        MlaPartialTileInfo* p_reduce_partial_map =
+            reinterpret_cast<MlaPartialTileInfo*>(p_cluster_work_counter + num_clusters);
+        MlaPartialTileInfo* p_reduce_final_map = p_reduce_partial_map + max_qo_tiles;
+        for (int32_t global_cluster_q_idx = 0; global_cluster_q_idx < max_qo_tiles; ++global_cluster_q_idx)
+        {
+            p_reduce_partial_map[global_cluster_q_idx] = MlaPartialTileInfo{-1, -2};
+            p_reduce_final_map[global_cluster_q_idx] = MlaPartialTileInfo{-1, -2};
+        }
+
+        // Step.4.3. Output work info
+        int32_t num_partial_outputs = 0;
+        int32_t loc_partial_outputs = 0;
+        for (int32_t bid = 0; bid < params.num_batches; ++bid)
+        {
+            const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
+            const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
+            const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
+            const int32_t kv_len         = kv_batch_end - kv_batch_start;
+            const int32_t qo_len         = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
+            const int32_t packed_qo_len  = qo_len * params.num_heads;
+            const int32_t num_qo_tiles   = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
+
+            for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
+            {
+                int32_t remaining_kv_len =
+                    cal_packed_causal_kv_len(qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
+                int32_t kv_start_local = 0;
+
+                const auto [cid_top, accum_cost_top] = get_cost_top(p_cost_heap, num_clusters);
+                const int32_t remaining_capability_top =
+                    get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost_top, cluster_len_q));
+                const int32_t num_splits_estimated =
+                    ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
+                // For the case of #splits==2, make sure that the tailing tile is smaller than Traits::kSplitTolerance.
+                const bool split_kv = (num_splits_estimated == 2) ?
+                    ((remaining_kv_len - remaining_capability_top) > Traits::kSplitTolerance) :
+                                                                     (num_splits_estimated > 1);
+
+                do
+                {
+                    // Check and update cost_heap
+                    auto [cid, accum_cost] = get_cost_top(p_cost_heap, num_clusters);
+                    const int32_t remaining_capability =
+                        get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost, cluster_len_q));
+                    const int32_t kv_len_limit_local =
+                    [&]() {
+                        const int32_t limit_ori = remaining_capability > 64 ? remaining_capability : 128;
+                        const int32_t tail_size = (remaining_kv_len > limit_ori) ? (remaining_kv_len - limit_ori) : 0x7fffffff;
+                        const int32_t limit_fin = (tail_size <= Traits::kSplitTolerance) ? remaining_kv_len : limit_ori;
+                        return limit_fin;
+                    }();
+                    const int32_t kv_len_consuming = ck_tile::min(remaining_kv_len, kv_len_limit_local);
+                    const int32_t cost = cal_cost(cluster_len_q, kv_len_consuming);
+                    const int32_t new_cost = accum_cost + cost;
+                    p_cost_heap[cid] = new_cost;
+
+                    // Record work
+                    MlaWorkInfo work_info{};
+                    work_info.bs_index  = bid;
+                    work_info.q_start   = tid * cluster_len_q + qo_batch_start;
+                    work_info.q_end     = ck_tile::min(work_info.q_start + cluster_len_q, qo_batch_start + qo_len);
+                    work_info.kv_start  = kv_start_local + kv_batch_start;
+                    work_info.kv_end    = work_info.kv_start + kv_len_consuming;
+                    work_info.kv_offset = kv_batch_end - work_info.kv_end;
+                    if (split_kv)
+                    {
+                        const int32_t global_cluster_q_idx = p_num_qo_clusters_indptr[bid] + tid;
+                        work_info.partial_qo_loc = loc_partial_outputs;
+                        if (p_reduce_partial_map[global_cluster_q_idx].q_start == -1)
+                        {
+                            p_reduce_partial_map[global_cluster_q_idx].q_start = loc_partial_outputs;
+                            p_reduce_final_map[global_cluster_q_idx] = { work_info.q_start, work_info.q_end };
+                        }
+                        ++num_partial_outputs;
+                        loc_partial_outputs += (work_info.q_end - work_info.q_start);
+                        p_reduce_partial_map[global_cluster_q_idx].q_end = loc_partial_outputs;
+                    }
+                    else
+                    {
+                        work_info.partial_qo_loc = -1;
+                    }
+
+                    const int32_t work_info_set_idx = params.p_work_indptr[cid] + p_cluster_work_counter[cid];
+                    ++p_cluster_work_counter[cid];
+                    p_work_info_set[work_info_set_idx] = work_info;
+
+                    // Update state
+                    remaining_kv_len -= kv_len_consuming;
+                    kv_start_local += kv_len_consuming;
+                }
+                while (remaining_kv_len > 0);
+            }
+        }
+
+        int32_t cum_reduce_tiles = 0;
+        params.p_reduce_indptr[0] = cum_reduce_tiles;
+        for (int32_t global_cluster_q_idx = 0; global_cluster_q_idx < max_qo_tiles; ++global_cluster_q_idx)
+        {
+            const MlaPartialTileInfo final_info = p_reduce_final_map[global_cluster_q_idx];
+            const MlaPartialTileInfo partial_range = p_reduce_partial_map[global_cluster_q_idx];
+            const int32_t reduce_tile_size = (final_info.q_start == -1) ? 0 : (final_info.q_end - final_info.q_start);
+            const int32_t num_reduce_tiles =
+                (reduce_tile_size == 0) ? 0 : ((partial_range.q_end - partial_range.q_start) / reduce_tile_size);
+
+            for (int32_t tid = cum_reduce_tiles; tid < cum_reduce_tiles + num_reduce_tiles; ++tid)
+            {
+                const int32_t local_tid = tid - cum_reduce_tiles;
+                params.p_reduce_partial_map[tid] = partial_range.q_start + local_tid * reduce_tile_size;
+            }
+
+            cum_reduce_tiles += num_reduce_tiles;
+            params.p_reduce_indptr[global_cluster_q_idx + 1] = cum_reduce_tiles;
+            params.p_reduce_final_map[2 * global_cluster_q_idx] = final_info.q_start;
+            params.p_reduce_final_map[2 * global_cluster_q_idx + 1] = final_info.q_end;
+        }
+    }
+}
+
+template <typename Traits>
+void get_mla_metadata_v1_device(
     const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
     const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
-
-
-    torch::Tensor& work_meta_data,
-    torch::Tensor& work_info_set_tsr,
-    torch::Tensor& work_indptr_tsr,
-    torch::Tensor& reduce_indptr_tsr,
-    torch::Tensor& reduce_final_map_tsr,
-    torch::Tensor& reduce_partial_map_tsr)
-    // torch::Tensor& num_reduce_tile_tensor)
+    const bool           no_redundant,
+    torch::Tensor&       work_metadata_ptrs,
+    torch::Tensor&       work_indptr,
+    torch::Tensor&       work_info_set,
+    torch::Tensor&       reduce_indptr,
+    torch::Tensor&       reduce_final_map,
+    torch::Tensor&       reduce_partial_map)
 {
-    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
-    // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent 
-    // spliting in any case supported by it.
-    //                                PackedQoLenPerWg, MaxClusterSize
-    using Traits  = MlaMetadataTraits<64,               1>;
+    TORCH_CHECK(seqlens_qo_indptr.stride(0) == 1,
+                __func__, ": seqlens_qo_indptr should be continuous!");
+    TORCH_CHECK(seqlens_qo_indptr.scalar_type() == at::ScalarType::Int,
+                __func__, ": seqlens_qo_indptr's element type should be int!");
+    TORCH_CHECK(seqlens_kv_indptr.stride(0) == 1,
+                __func__, ": seqlens_kv_indptr should be continuous!");
+    TORCH_CHECK(seqlens_kv_indptr.scalar_type() == at::ScalarType::Int,
+                __func__, ": seqlens_kv_indptr's element type should be int!");
+
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto opts = seqlens_kv_indptr.options();
+
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+
+    const int32_t num_batches  = seqlens_qo_indptr.size(0) - 1;
+    const int32_t num_cu       = dev_prop.multiProcessorCount;
+    const int32_t max_works    = num_cu + num_batches * Traits::kMaxQoTilePerBatch;
+    const int32_t max_qo_tiles = num_batches * Traits::kMaxQoTilePerBatch;
+
+    const int32_t lds_size_in_bytes = [&]()
+    {
+        int32_t lds_size = 0;
+        // this is maximun #clusters
+        const int32_t num_clusters = dev_prop.multiProcessorCount;
+        // Memory for indptr about #cluster for each batch in direction of qo
+        lds_size += (num_batches + 1) * sizeof(int32_t);
+        // Memory for cost. Its size should be the same as #clusters
+        lds_size += num_clusters * sizeof(int32_t);
+        // Memory for counter of #works for each cluster.
+        lds_size += num_clusters * sizeof(int32_t);
+        // Memory for range of partial memory
+        lds_size += max_qo_tiles * sizeof(MlaPartialTileInfo);
+        // Memory for range of output of partial memory
+        lds_size += max_qo_tiles * sizeof(MlaPartialTileInfo);
+        return lds_size;
+    }();
+
+    TORCH_CHECK(lds_size_in_bytes <= dev_prop.maxSharedMemoryPerMultiProcessor,
+                __func__, ": There is no enough LDS.");
+
+    // auto work_ptrs          = torch::empty({2}, opts.dtype(torch::kUInt64));
+    // auto work_indptr        = torch::empty({num_cu + 1}, opts);
+    // auto work_info_set      = torch::empty({max_works, kSizeMlaWorkInfoInDw}, opts);
+    // auto reduce_indptr      = torch::empty({max_qo_tiles + 1}, opts);
+    // auto reduce_final_map   = torch::empty({max_qo_tiles, kSizeMlaPartialTileInfoInDw}, opts);
+    // auto reduce_partial_map = torch::empty({max_works}, opts);
+
+    // kernel input parameters
+    MlaMetadataV1KernelParameter params = {};
+    params.p_work_metadata_ptrs = work_metadata_ptrs.data_ptr<uint64_t>();
+    params.p_work_indptr        = work_indptr.data_ptr<int32_t>();
+    params.p_work_info_set_raw  = work_info_set.data_ptr<int32_t>();
+    params.p_reduce_indptr      = reduce_indptr.data_ptr<int32_t>();
+    params.p_reduce_final_map   = reduce_final_map.data_ptr<int32_t>();
+    params.p_reduce_partial_map = reduce_partial_map.data_ptr<int32_t>();
+    params.p_seqlens_qo_indptr  = seqlens_qo_indptr.data_ptr<int32_t>();
+    params.p_seqlens_kv_indptr  = seqlens_kv_indptr.data_ptr<int32_t>();
+    params.num_batches          = num_batches;
+    params.num_heads            = num_heads_per_head_k * num_heads_k;
+    params.num_cu               = num_cu;
+    params.is_causal            = is_causal;
+
+    // launch kernel
+    const dim3 grid = dim3(1, 1, 1);
+    const int32_t num_thr = dev_prop.warpSize; // only use 1 warp for simplicity
+    kn_get_mla_metadata_v1<Traits><<<grid, num_thr, dev_prop.maxSharedMemoryPerMultiProcessor, stream>>>(params);
+}
+
+template <typename Traits>
+std::vector<torch::Tensor> get_mla_metadata_v1_host(
+    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
+    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
+    const int32_t        num_heads_per_head_k,
+    const int32_t        num_heads_k,
+    const bool           is_causal,
+    const bool           no_redundant)
+{
     using index_t = uint32_t;
 
     hipDevice_t dev;
@@ -299,7 +624,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
 
-    const int32_t batch_size = seqlens_qo_indptr.size(0) - 1;
+    const int32_t num_batches = seqlens_qo_indptr.size(0) - 1;
     const int32_t num_heads  = num_heads_k * num_heads_per_head_k;
 
     auto seqlens_qo_indptr_cpu = seqlens_qo_indptr.to(at::DeviceType::CPU);
@@ -310,9 +635,9 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
     std::vector<BatchInfo> batch_infos;
-    batch_infos.reserve(batch_size);
+    batch_infos.reserve(num_batches);
     int32_t sum_packed_qo_len = 0;
-    for (int32_t bid = 0; bid < batch_size; ++bid)
+    for (int32_t bid = 0; bid < num_batches; ++bid)
     {
         const int32_t qo_len = p_seqlens_qo_indptr[bid + 1] - p_seqlens_qo_indptr[bid];
         const int32_t kv_len = p_seqlens_kv_indptr[bid + 1] - p_seqlens_kv_indptr[bid];
@@ -329,7 +654,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
     //         composing each cluster. The size is determined by average packed qo length.
     const int32_t cluster_size =
     [&]() {
-        const int32_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
+        const int32_t avg_packed_qo_len = sum_packed_qo_len / num_batches;
         const int32_t cluster_size =
             ck_tile::integer_divide_ceil(avg_packed_qo_len, Traits::kPackedQoLenPerWg);
         return ck_tile::min(cluster_size, Traits::kMaxClusterSize);
@@ -343,7 +668,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
     //   b. Get a indptr array about #cluster for each batch in direction of qo.
     int32_t sum_kv_lens = 0;
     std::vector<int32_t> num_qo_clusters_indptr;
-    num_qo_clusters_indptr.reserve(batch_size + 1);
+    num_qo_clusters_indptr.reserve(num_batches + 1);
     num_qo_clusters_indptr.push_back(0);
     for (const auto& binfo : batch_infos)
     {
@@ -379,13 +704,13 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
     // Step.3.1. Allocates output buffers except indptrs
     std::vector<std::vector<MlaWorkInfo>> work_info_set(num_clusters, std::vector<MlaWorkInfo>());
     std::vector<std::vector<index_t>> reduce_partial_map(num_qo_clusters_indptr.back(), std::vector<index_t>());
-    std::vector<MlaPartialTileInfo> reduce_partial_info(num_qo_clusters_indptr.back(), {-1, 0});
+    std::vector<MlaPartialTileInfo> reduce_partial_info(num_qo_clusters_indptr.back(), {-1, -2});
 
     // Step.3.2. Declare priority queue
     using ClusterCost = std::tuple<int32_t, int32_t>; // cluster_id(cid), cost
     auto pq_cmp = [](const ClusterCost& l, const ClusterCost& r) { return std::get<1>(l) > std::get<1>(r); };
     std::priority_queue<ClusterCost, std::vector<ClusterCost>, decltype(pq_cmp)> cost_heap(pq_cmp);
-    for (int32_t cid = 0; cid < num_clusters; ++cid) { cost_heap.push(std::tuple{cid, 0.0f}); }
+    for (int32_t cid = 0; cid < num_clusters; ++cid) { cost_heap.push(std::tuple{cid, 0}); }
 
     // Step.4. Fill the output buffers except indptrs
     int32_t num_reduce_row      = 0;
@@ -407,7 +732,9 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
 
         for (int32_t tid = 0; tid < num_qo_tiles; ++tid)
         {
-            int32_t remaining_kv_len = 
+            const int32_t global_cluster_q_idx = num_qo_clusters_indptr[bid] + tid;
+
+            int32_t remaining_kv_len =
                 cal_packed_causal_kv_len(qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, num_heads, is_causal);
             int32_t kv_start_local = 0;
 
@@ -453,7 +780,6 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
                 work_info.kv_offset = kv_batch_end - work_info.kv_end;
                 if (split_kv)
                 {
-                    const int32_t global_cluster_q_idx = num_qo_clusters_indptr[bid] + tid;
                     work_info.partial_qo_loc = loc_partial_outputs;
                     if (reduce_partial_map[global_cluster_q_idx].empty())
                     {
@@ -494,23 +820,25 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
     work_indptr.push_back(0);
     for (int32_t cid = 0; cid < num_clusters; ++cid)
     {
-        if (work_info_set[cid].empty() == false)
+        if ((work_info_set[cid].empty() == false) || (no_redundant == false))
         {
             work_indptr.push_back(work_indptr.back() + work_info_set[cid].size());
         }
     }
     const int32_t num_works = work_indptr.back();
 
+    const int32_t reduce_final_map_size = no_redundant ? num_reduce_row : num_qo_clusters_indptr.back();
+    const int32_t reduce_indptr_size = reduce_final_map_size + 1;
     std::vector<MlaPartialTileInfo> reduce_final_map;
     std::vector<index_t> reduce_indptr;
-    reduce_final_map.reserve(num_reduce_row);
-    reduce_indptr.reserve(num_reduce_row + 1);
+    reduce_final_map.reserve(reduce_final_map_size);
+    reduce_indptr.reserve(reduce_indptr_size);
     reduce_indptr.push_back(0);
     for (auto [global_cluster_q_idx ,rid] = std::tuple{0, 0};
-         (global_cluster_q_idx < num_qo_clusters_indptr.back()) && (rid < num_reduce_row);
+         (global_cluster_q_idx < num_qo_clusters_indptr.back()) && ((rid < num_reduce_row) || (no_redundant == false));
          ++global_cluster_q_idx)
     {
-        if (reduce_partial_map[global_cluster_q_idx].empty() == false)
+        if ((reduce_partial_map[global_cluster_q_idx].empty() == false) || (no_redundant == false))
         {
             reduce_indptr.push_back(reduce_indptr.back() + reduce_partial_map[global_cluster_q_idx].size());
             reduce_final_map.push_back(reduce_partial_info[global_cluster_q_idx]);
@@ -523,62 +851,107 @@ std::vector<torch::Tensor> get_mla_metadata_v1(
     auto reduce_partial_map_flatten = flatten(reduce_partial_map, num_partial_outputs);
 
     // Step.7. Create tensors.
+    auto input_opts = seqlens_qo_indptr.options();
     auto int_opts = torch::TensorOptions().dtype(torch::kInt32);
+    auto work_metadata_ptrs_tsr = torch::empty({2}, torch::TensorOptions().dtype(torch::kUInt64));
+    auto work_info_set_tsr = torch::from_blob(work_info_set_flatten.data(), {num_works, kSizeMlaWorkInfoInDw}, int_opts).to(input_opts);
+    auto work_indptr_tsr = torch::from_blob(work_indptr.data(), {static_cast<int32_t>(work_indptr.size())}, int_opts).to(input_opts);
+    auto reduce_indptr_tsr = torch::from_blob(reduce_indptr.data(), {reduce_indptr_size}, int_opts).to(input_opts);
+    auto reduce_final_map_tsr = torch::from_blob(reduce_final_map.data(), {reduce_final_map_size, kSizeMlaPartialTileInfoInDw}, int_opts).to(input_opts);
+    auto reduce_partial_map_tsr = torch::from_blob(reduce_partial_map_flatten.data(), {num_partial_outputs}, int_opts).to(input_opts);
 
-    // work_info_set_tsr = torch::from_blob(work_info_set_flatten.data(), {num_works, kSizeMlaWorkInfoInDw}, int_opts);
-    // work_indptr_tsr   = torch::from_blob(work_indptr.data(), {static_cast<int32_t>(work_indptr.size())}, int_opts);
-    // reduce_indptr_tsr = torch::from_blob(reduce_indptr.data(), {num_reduce_row + 1}, int_opts);
-    // reduce_final_map_tsr   = torch::from_blob(reduce_final_map.data(), {num_reduce_row, kSizeMlaPartialTileInfoInDw}, int_opts);
-    // reduce_partial_map_tsr = torch::from_blob(reduce_partial_map_flatten.data(), {num_partial_outputs}, int_opts);
-
-    tensor_pad(work_indptr, work_indptr_tsr.size(0));
-    tensor_pad(reduce_indptr, reduce_indptr_tsr.size(0));
-
-    HIP_CALL(hipMemcpy(work_info_set_tsr.data_ptr(),
-                       work_info_set_flatten.data(),
-                       num_works * kSizeMlaWorkInfoInDw * sizeof(int32_t),
-                       hipMemcpyHostToDevice));
-    HIP_CALL(hipMemcpy(work_indptr_tsr.data_ptr(),
-                       work_indptr.data(),
-                       static_cast<int32_t>(work_indptr.size()) * sizeof(int32_t),
-                       hipMemcpyHostToDevice));
-
-
-    uint64_t* persistent_meta_data = new uint64_t[10];
-    persistent_meta_data[0] = (uint64_t)work_indptr_tsr.data_ptr();
-    persistent_meta_data[1] = (uint64_t)work_info_set_tsr.data_ptr();
-    // auto work_meta_data = torch::from_blob(persistent_meta_data, 10*sizeof(uint64_t), int_opts.dtype(torch::kUInt64));
-    HIP_CALL(hipMemcpy(work_meta_data.data_ptr(),
-                       persistent_meta_data,
-                       sizeof(uint64_t) * 10,
-                       hipMemcpyHostToDevice));
-
-
-
-    HIP_CALL(hipMemcpy(reduce_indptr_tsr.data_ptr(),
-                       reduce_indptr.data(),
-                       static_cast<int32_t>(reduce_indptr.size()) * sizeof(int32_t),
-                       hipMemcpyHostToDevice));
-    HIP_CALL(hipMemcpy(reduce_final_map_tsr.data_ptr(),
-                       reduce_final_map.data(),
-                       (num_reduce_row * kSizeMlaPartialTileInfoInDw) * sizeof(int32_t),
-                       hipMemcpyHostToDevice));
-    HIP_CALL(hipMemcpy(reduce_partial_map_tsr.data_ptr(),
-                       reduce_partial_map_flatten.data(),
-                       num_partial_outputs * sizeof(int32_t),
-                       hipMemcpyHostToDevice));
-    // HIP_CALL(hipMemcpy(num_reduce_tile_tensor.data_ptr(),
-    //                    &num_reduce_row,
-    //                    sizeof(int32_t),
-    //                    hipMemcpyHostToDevice));
+    work_metadata_ptrs_tsr.index_put_({0}, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(work_indptr_tsr.data_ptr())));
+    work_metadata_ptrs_tsr.index_put_({1}, static_cast<uint64_t>(reinterpret_cast<uintptr_t>(work_info_set_tsr.data_ptr())));
 
     // Last step. Copy to the device of input and return the results.
-    auto input_opts = seqlens_qo_indptr.options();
-    return {work_meta_data.to(input_opts.dtype(torch::kUInt64)),
-            work_indptr_tsr.to(input_opts),
-            work_info_set_tsr.to(input_opts),
-            reduce_indptr_tsr.to(input_opts),
-            reduce_final_map_tsr.to(input_opts),
-            reduce_partial_map_tsr.to(input_opts)};
-            // num_reduce_tile_tensor.to(input_opts)};
+    return {work_metadata_ptrs_tsr.to(input_opts),
+            work_indptr_tsr,
+            work_info_set_tsr,
+            reduce_indptr_tsr,
+            reduce_final_map_tsr,
+            reduce_partial_map_tsr};
+}
+
+//
+// Persistent thread group solution which take variable query/output lengths into consideration as well.
+//
+// Returns
+//   [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
+//                                               work_info.
+//   [1] work_indptr:        (#cu_part + 1),     The IDs of work handled by each cu_part.
+//   [2] work_info           (#work, 8)
+//   [2.0] bs_index:         (#work),            The index of batch handled by each work.
+//   [2.1] partial_index:    (#work),            The index of tile in output buffer when splits. -1 means no split.
+//   [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
+//                                               reduce memory access count in kernel.
+//   [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
+//   [2.4] kv_start:         (#work),            The global index in seq where k/v starts.
+//   [2.5] kv_end:           (#work),            The global index in seq where k/v ends (not included).
+//   [2.6] pad               (#work, 2),         Pad to 8 DWs.
+//   [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
+//                                               The IDs in reduce_partial_map indicates the tiles should be merged
+//                                               together.
+//   [4] reduce_final_map:   (sum(qo_seqlen_blk_count)),
+//                                               The final output location of each group of tiles.
+//   [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
+//                                               reduced.
+//
+void get_mla_metadata_v1(
+    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
+    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
+    const int32_t        num_heads_per_head_k,
+    const int32_t        num_heads_k,
+    const bool           is_causal,
+    torch::Tensor&       work_metadata_ptrs,
+    torch::Tensor&       work_info_set_tsr,
+    torch::Tensor&       work_indptr_tsr,
+    torch::Tensor&       reduce_indptr,
+    torch::Tensor&       reduce_final_map,
+    torch::Tensor&       reduce_partial_map)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
+
+    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
+    // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent 
+    // spliting in any case supported by it.
+    //                                PackedQoLenPerWg, MaxClusterSize
+    using Traits  = MlaMetadataTraits<64,               1>;
+
+    get_mla_metadata_v1_device<Traits>(
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        false,
+        work_metadata_ptrs,
+        work_indptr_tsr,
+        work_info_set_tsr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map);
+}
+
+std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
+    const torch::Tensor& seqlens_qo_indptr,     // [batch size + 1]
+    const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
+    const int32_t        num_heads_per_head_k,
+    const int32_t        num_heads_k,
+    const bool           is_causal)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
+
+    // This default settings is for our ASM MLA decode kernel. This kernel supports num_heads=16 and qo size from 1 to 4
+    // without support to split qo for each workgroup. This means that kPackedQoLenPerWg should be 4*16=64 to prevent 
+    // spliting in any case supported by it.
+    //                                PackedQoLenPerWg, MaxClusterSize
+    using Traits  = MlaMetadataTraits<64,               1>;
+
+    return get_mla_metadata_v1_host<Traits>(
+        seqlens_qo_indptr,
+        seqlens_kv_indptr,
+        num_heads_per_head_k,
+        num_heads_k,
+        is_causal,
+        true);
 }
