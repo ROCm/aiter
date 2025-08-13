@@ -43,6 +43,14 @@ def get_fp8_e4m3_dtype():
 
     return e4m3_dtype
 
+def get_fp8_e5m2_dtype():
+    if get_arch() in ("gfx950"):
+        e5m2_dtype = torch.float8_e5m2
+    else:
+        e5m2_dtype = torch.float8_e5m2fnuz
+
+    return e5m2_dtype
+
 
 def get_num_sms():
     # Returns the Compute Unit count of the current device

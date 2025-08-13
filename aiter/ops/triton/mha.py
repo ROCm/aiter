@@ -1505,9 +1505,12 @@ class _FlashAttnFP8Func(torch.autograd.Function):
 
 
 def flash_attn_fp8_func(
-    q,
-    k,
-    v,
+    q_fp8,
+    k_fp8,
+    v_fp8,
+    q_descale,
+    k_descale,
+    v_descale,
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
@@ -1519,16 +1522,10 @@ def flash_attn_fp8_func(
     config: Optional[dict[str, any]] = None,
 ):
     _LOGGER.info(
-        f"FLASH_ATTN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+        f"FLASH_ATTN_FP8:  q={tuple(q_fp8.shape)}  k={tuple(k_fp8.shape)}  v={tuple(v_fp8.shape)}"
     )
 
-    # cast input to fp8
-    fp8_dtype = arch_info.get_fp8_e4m3_dtype()
-    q_fp8, descale_q = _cast_to_fp8(q, fp8_dtype, "bshd")
-    k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd")
-    v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd")
-
-    (o_fp8, descale_o), softmax_lse, S_dmask = _FlashAttnFP8Func.apply(
+    o_fp32, softmax_lse, S_dmask = _FlashAttnFP8Func.apply(
         q_fp8,
         k_fp8,
         v_fp8,
@@ -1541,18 +1538,45 @@ def flash_attn_fp8_func(
         return_lse,
         return_attn_probs,
         torch.is_grad_enabled(),
-        descale_q,
-        descale_k,
-        descale_v,
+        q_descale,
+        k_descale,
+        v_descale,
         config,
     )
 
-    result = [(o_fp8, descale_o)]
+    result = [o_fp32]
     if return_lse:
         result.append(softmax_lse)
     if return_attn_probs:
         result.append(S_dmask)
     return result[0] if len(result) == 1 else tuple(result)
+
+def fp8_example():
+    BATCH = 2
+    SEQLEN = 1024
+    NUM_HEADS = 2
+    HEAD_DIM = 128
+    
+    # forward inputs
+    q_fp32 = torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_DIM)
+    k_fp32 = torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_DIM)
+    v_fp32 = torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_DIM)
+    fp8_dtype = arch_info.get_fp8_e4m3_dtype()
+    q_fp8, q_descale = _cast_to_fp8(q_fp32, fp8_dtype, "bshd")
+    k_fp8, k_descale = _cast_to_fp8(k_fp32, fp8_dtype, "bshd")
+    v_fp8, v_descale = _cast_to_fp8(v_fp32, fp8_dtype, "bshd")
+
+    # emulate fa v3. See https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_attn_interface.py
+    out_fp32 = flash_attn_fp8_func(q_fp8,
+                        k_fp8,
+                        v_fp8,
+                        q_descale,
+                        k_descale,
+                        v_descale)
+
+    # backward with fp8 is not supported in fa v3. See https://github.com/Dao-AILab/flash-attention/blob/3c51f15dc04c05e97cae1cfbd494e1f02962516a/hopper/test_flash_attn.py#L221
+    # dq_fp32, dk_fp32, dv_fp32 = torch.autograd.grad(out_fp32, (q_fp8, k_fp8, v_fp8), do_fp32)
+
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
