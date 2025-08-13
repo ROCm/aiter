@@ -1569,6 +1569,7 @@ def flash_attn_onekernel_backward(
     descale_q: Optional[torch.Tensor] = None,
     descale_k: Optional[torch.Tensor] = None,
     descale_v: Optional[torch.Tensor] = None,
+    descale_o: Optional[torch.Tensor] = None,
     descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,

@@ -1377,16 +1377,19 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         )
         # out = out_padded[..., :head_size_og]
 
+        o_fp8, descale_o = _cast_to_fp8(out, q_fp8.dtype, "bshd")
         if is_grad:
             ctx.save_for_backward(
                 q_fp8,
                 k_fp8,
                 v_fp8,
+                o_fp8,
                 out,
                 softmax_lse,
                 descale_q,
                 descale_k,
                 descale_v,
+                descale_o
             )
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
@@ -1396,32 +1399,33 @@ class _FlashAttnFP8Func(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
  
-        return (out, softmax_lse, S_dmask)
+        return ((o_fp8, descale_o), softmax_lse, S_dmask)
 
     @staticmethod
-    def backward(ctx, do, *args):
-        q_fp8, k_fp8, v_fp8, out, softmax_lse, descale_q, descale_k, descale_v = (
+    def backward(ctx, do_fp8, descale_do, *args):
+        q_fp8, k_fp8, v_fp8, o_fp8, softmax_lse, descale_q, descale_k, descale_v, descale_o = (
             ctx.saved_tensors
         )
+        
+        # head_size_v_og = do_fp8.size(3)
+        # do_padded = do
+        # if head_size_v_og % 8 != 0:
+        #     do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
+
+
+        # result in fp32 currently
         dq, dk, dv = (
             torch.zeros_like(q_fp8, dtype=torch.float32),
             torch.zeros_like(k_fp8, dtype=torch.float32),
             torch.zeros_like(v_fp8, dtype=torch.float32),
         )
-        head_size_v_og = do.size(3)
-        do_padded = do
-        if head_size_v_og % 8 != 0:
-            do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-        fp8_dtype = arch_info.get_fp8_e4m3_dtype()
-        do_padded_fp8, descale_do = _cast_to_fp8(do_padded, fp8_dtype, "bshd")
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
-                do_padded_fp8,
+                do_fp8,
                 q_fp8,
                 k_fp8,
                 v_fp8,
-                out,
+                o_fp8,
                 softmax_lse,
                 dq,
                 dk,
@@ -1440,16 +1444,17 @@ class _FlashAttnFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                descale_o=descale_o,
                 descale_do=descale_do,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
-                do_padded_fp8,
+                do_fp8,
                 q_fp8,
                 k_fp8,
                 v_fp8,
-                out,
+                o_fp8,
                 softmax_lse,
                 dq,
                 dk,
@@ -1468,6 +1473,7 @@ class _FlashAttnFP8Func(torch.autograd.Function):
                 descale_q=descale_q,
                 descale_k=descale_k,
                 descale_v=descale_v,
+                descale_o=descale_o,
                 descale_do=descale_do,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
@@ -1475,10 +1481,15 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         # dq = dq[..., : q_fp8.shape[-1]]  # We could have padded the head dimension
         # dk = dk[..., : k_fp8.shape[-1]]
         # dv = dv[..., : v_fp8.shape[-1]]
+
+        dq_fp8, descale_dq = _cast_to_fp8(dq, q_fp8.dtype, "bshd")
+        dk_fp8, descale_dk = _cast_to_fp8(dk, k_fp8.dtype, "bshd")
+        dv_fp8, descale_dv = _cast_to_fp8(dv, v_fp8.dtype, "bshd")
+
         return (
-            dq,
-            dk,
-            dv,
+            (dq_fp8, descale_dq),
+            (dk_fp8, descale_dk),
+            (dv_fp8, descale_dv),
             None,
             None,
             None,
@@ -1517,7 +1528,7 @@ def flash_attn_fp8_func(
     k_fp8, descale_k = _cast_to_fp8(k, fp8_dtype, "bshd")
     v_fp8, descale_v = _cast_to_fp8(v, fp8_dtype, "bshd")
 
-    o_fp32, softmax_lse, S_dmask = _FlashAttnFP8Func.apply(
+    (o_fp8, descale_o), softmax_lse, S_dmask = _FlashAttnFP8Func.apply(
         q_fp8,
         k_fp8,
         v_fp8,
@@ -1536,7 +1547,7 @@ def flash_attn_fp8_func(
         config,
     )
 
-    result = [o_fp32]
+    result = [(o_fp8, descale_o)]
     if return_lse:
         result.append(softmax_lse)
     if return_attn_probs:
