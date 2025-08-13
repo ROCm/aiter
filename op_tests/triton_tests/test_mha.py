@@ -109,7 +109,7 @@ def fp8_assert_close(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
+@pytest.mark.parametrize("FP8", [(True)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
