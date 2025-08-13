@@ -6,9 +6,9 @@ import itertools
 import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
+    flash_attn_func_v3,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
+    flash_attn_varlen_func_v3,
     mha_set_use_fused_bwd_kernel,
 )
 from aiter.test_mha_common import (
@@ -363,7 +363,7 @@ def run_benchmark(custom, args):
             if args.fp8:
 
                 def fn():
-                    return flash_attn_varlen_fp8_func(
+                    return flash_attn_varlen_func_v3(
                         q_input,
                         k_input,
                         v_input,
@@ -400,7 +400,7 @@ def run_benchmark(custom, args):
             if args.fp8:
 
                 def fn():
-                    return flash_attn_fp8_func(
+                    return flash_attn_func_v3(
                         q_input,
                         k_input,
                         v_input,

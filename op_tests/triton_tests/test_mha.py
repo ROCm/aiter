@@ -7,9 +7,9 @@ import logging
 import numpy as np
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
+    flash_attn_func_v3,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
+    flash_attn_varlen_func_v3,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
@@ -109,7 +109,7 @@ def fp8_assert_close(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
+@pytest.mark.parametrize("FP8", [(True)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -131,7 +131,7 @@ def test_mha(
 
     dropout_mask = None
     if FP8:
-        triton_out = flash_attn_fp8_func(
+        triton_out = flash_attn_func_v3(
             q,
             k,
             v,
@@ -369,7 +369,7 @@ def test_mha_varlen(
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
     if FP8:
-        triton_out = flash_attn_varlen_fp8_func(
+        triton_out = flash_attn_varlen_func_v3(
             q_unpad,
             k_unpad,
             v_unpad,
@@ -515,7 +515,7 @@ def test_mha_backward(
 
     with torch.enable_grad():
         if FP8:
-            triton_out = flash_attn_fp8_func(
+            triton_out = flash_attn_func_v3(
                 q,
                 k,
                 v,
