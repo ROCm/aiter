@@ -1,5 +1,4 @@
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
 import aiter.ops.triton.utils.arch_info as arch_info

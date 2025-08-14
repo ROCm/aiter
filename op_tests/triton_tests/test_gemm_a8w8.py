@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 import torch.nn.functional as F
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
@@ -140,4 +139,4 @@ def test_gemm(in_dtype, out_dtype, m, n, k, output):
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)

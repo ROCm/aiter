@@ -27,22 +27,24 @@ def input_helper(
         max_prefix_length = prefix_length
 
         seqlens_extend = torch.randint(
-            1, max_extend_length + 1, (B,), dtype=torch.int32
+            1, max_extend_length + 1, (B,), dtype=torch.int32,
+            device="cuda",
         )
         if prefix_length == 0:
-            seqlens_prefix = torch.full((B,), prefix_length)
+            seqlens_prefix = torch.full((B,), prefix_length, device="cuda")
         else:
             seqlens_prefix = torch.randint(
-                1, max_prefix_length + 1, (B,), dtype=torch.int32
+                1, max_prefix_length + 1, (B,), dtype=torch.int32,
+                device="cuda",
             )
 
     else:
-        seqlens_extend = torch.full((B,), extend_length)
-        seqlens_prefix = torch.full((B,), prefix_length)
+        seqlens_extend = torch.full((B,), extend_length, device="cuda")
+        seqlens_prefix = torch.full((B,), prefix_length, device="cuda")
 
     cu_seqlens_extend = torch.cat(
         [
-            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32, device="cuda"),
             seqlens_extend.cumsum(dim=0, dtype=torch.int32),
         ]
     )
@@ -52,9 +54,6 @@ def input_helper(
             seqlens_prefix.cumsum(dim=0, dtype=torch.int32),
         ]
     )
-
-    cu_seqlens_extend = cu_seqlens_extend.to(device="cuda")
-    cu_seqlens_prefix = cu_seqlens_prefix.to(device="cuda")
 
     total_extend = cu_seqlens_extend[-1].item()
     total_prefix = cu_seqlens_prefix[-1].item()

@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
@@ -11,7 +10,6 @@ import torch.nn.functional as F
 
 
 block_shape = (128, 128)
-
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
@@ -127,7 +125,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda")
+        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
 
     return x, weight, x_scale, w_scale, y
 
@@ -160,4 +158,4 @@ def test_gemm(dtype, M, N, K, output):
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     b = run_triton(x, weight, x_scale, w_scale, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

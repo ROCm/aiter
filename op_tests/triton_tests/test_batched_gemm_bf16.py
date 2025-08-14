@@ -2,14 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 from aiter.ops.triton.batched_gemm_bf16 import batched_gemm_bf16
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 from typing import Union
-
 
 def generate_batched_gemm_a16w16_inputs(
     B: int,
@@ -23,16 +21,16 @@ def generate_batched_gemm_a16w16_inputs(
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
     if layout[0] == "T":
-        x = torch.randint(-20, 20, (B, M, K), dtype=dtype).cuda()
+        x = torch.randint(-20, 20, (B, M, K), dtype=dtype, device="cuda")
     else:
-        x = torch.randint(-20, 20, (B, K, M), dtype=dtype).cuda().permute(0, 2, 1)
+        x = torch.randint(-20, 20, (B, K, M), dtype=dtype, device="cuda").permute(0, 2, 1)
 
     if layout[1] == "N":
-        weight = torch.randint(-20, 20, (B, N, K), dtype=dtype).cuda()
+        weight = torch.randint(-20, 20, (B, N, K), dtype=dtype, device="cuda")
     else:
-        weight = torch.randint(-20, 20, (B, K, N), dtype=dtype).cuda().permute(0, 2, 1)
+        weight = torch.randint(-20, 20, (B, K, N), dtype=dtype, device="cuda").permute(0, 2, 1)
 
-    bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+    bias = torch.rand([B, 1, N], dtype=dtype, device="cuda") * 10
 
     y = None
     if output:
@@ -118,4 +116,4 @@ def test_batched_gemm_bf16(dtype, b, m, n, k, output):
     a = run_torch(x, weight, bias, dtype)
     b = run_triton(x, weight, bias, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
