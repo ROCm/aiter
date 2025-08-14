@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import triton
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 
 
@@ -19,22 +18,22 @@ def generate_ff_inputs(
 
     # TN is default layout
     if layout[0] == "T":
-        x = torch.randn((batch, hidden_dim), dtype=dtype).cuda()
+        x = torch.randn((batch, hidden_dim), dtype=dtype, device="cuda")
     else:
-        x = torch.randn((hidden_dim, batch), dtype=dtype).cuda().T
+        x = torch.randn((hidden_dim, batch), dtype=dtype, device="cuda").T
 
     if layout[1] == "T":
         if gating:
-            w1 = torch.randn((hidden_dim, intermediate_dim * 2), dtype=dtype).cuda().T
+            w1 = torch.randn((hidden_dim, intermediate_dim * 2), dtype=dtype, device="cuda").T
         else:
-            w1 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype).cuda().T
-        w2 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype).cuda()
+            w1 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype, device="cuda").T
+        w2 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
     else:
         if gating:
-            w1 = torch.randn((intermediate_dim * 2, hidden_dim), dtype=dtype).cuda()
+            w1 = torch.randn((intermediate_dim * 2, hidden_dim), dtype=dtype, device="cuda")
         else:
-            w1 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype).cuda()
-        w2 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype).cuda().T
+            w1 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
+        w2 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype, device="cuda").T
 
     w1 = w1 / (intermediate_dim**0.5)  # scale down output variance
     w2 = w2 / (hidden_dim**0.5)
@@ -43,11 +42,11 @@ def generate_ff_inputs(
     y = None
     if output:
         if y_init == "empty":
-            intermediate = torch.empty((batch, intermediate_dim), dtype=dtype).cuda()
-            y = torch.empty((batch, hidden_dim), dtype=dtype).cuda()
+            intermediate = torch.empty((batch, intermediate_dim), dtype=dtype, device="cuda")
+            y = torch.empty((batch, hidden_dim), dtype=dtype, device="cuda")
         elif y_init == "zeros":
-            intermediate = torch.zeros((batch, intermediate_dim), dtype=dtype).cuda()
-            y = torch.zeros((batch, hidden_dim), dtype=dtype).cuda()
+            intermediate = torch.zeros((batch, intermediate_dim), dtype=dtype, device="cuda")
+            y = torch.zeros((batch, hidden_dim), dtype=dtype, device="cuda")
         else:
             raise ValueError(f"Unsupported y_init value: {y_init}")
 
@@ -106,7 +105,7 @@ def ff_ungated_test(
             activation=activation,
         )
 
-    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=5e-2, rtol=5e-2)
 
 
 def ff_gated_test(
@@ -165,4 +164,4 @@ def ff_gated_test(
     Note: There's a small distinction between Triton and Torch's implementations of silu
     (due to tl.sigmoid() vs torch.sigmoid()). The gated outputs can differ by as much as 3%.
     """
-    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
