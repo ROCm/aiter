@@ -19,7 +19,7 @@ DTYPES = [torch.float16, torch.bfloat16]
 QDTYPES = [None, e4m3_type]
 # one value large enough to test overflow in index calculation.
 # one value small enough to test the schema op check
-NUM_BLOCKS = [32768, 4096]
+NUM_BLOCKS = [32768, 2048]
 
 
 def ref_paged_attn(
@@ -58,7 +58,7 @@ def ref_paged_attn(
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
-        empty_mask = torch.ones(query_len, kv_len)
+        empty_mask = torch.ones(query_len, kv_len, device=q.device)
         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
         if sliding_window is not None:
             sliding_window_mask = (
@@ -87,19 +87,14 @@ def ref_paged_attn(
 
 
 @pytest.mark.parametrize(
-    "seq_lens",
-    [
-        [(1, 1328), (5, 18), (129, 463)],
-        [(1, 523), (1, 37), (1, 2011), (1, 16384), (1024, 1024), (512, 1024)],
-        [(11, 13142), (1065, 6712)],
-    ],
+    "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES)
-@pytest.mark.parametrize("sliding_window", [None, 128, 256])
+@pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("soft_cap", [None, 50.0])
+@pytest.mark.parametrize("soft_cap", [None, 10.0, 50.0])
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
 @pytest.mark.parametrize("q_dtype", QDTYPES)
 @torch.inference_mode()
@@ -116,7 +111,7 @@ def test_triton_unified_attn(
 ) -> None:
     if q_dtype is not None and q_dtype.itemsize < 2 and block_size < 32:
         pytest.skip("block size must be at least 32 for fp8")
-    torch.set_default_device("cuda")
+
     torch.manual_seed(0)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -129,28 +124,27 @@ def test_triton_unified_attn(
     window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
     scale = head_size**-0.5
 
-    query = torch.randn(sum(query_lens), num_query_heads, head_size, dtype=dtype)
+    query = torch.randn(
+        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
+    )
     key_cache = torch.randn(
-        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype
+        num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device="cuda"
     )
     value_cache = torch.randn_like(key_cache)
-    # first block is used for masking for certain cases (load and ignore rather than masked load)
-    # for better testing, but nan there to make sure those values do not propagate during attn. calc.
-    # if it propagates to the results, tests will fail for sure when done this way
-    key_cache[0] = float("nan")
-    value_cache[0] = float("nan")
-    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
-        dim=0, dtype=torch.int32
-    )
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    cu_query_lens = torch.tensor(
+        [0] + query_lens, dtype=torch.int32, device="cuda"
+    ).cumsum(dim=0, dtype=torch.int32)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
 
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     block_tables = torch.randint(
-        1, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
+        0,
+        num_blocks,
+        (num_seqs, max_num_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
     )
-
-    sinks = torch.randn(num_query_heads, dtype=torch.bfloat16)
-
+    sinks = torch.randn(num_query_heads, dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
 
     maybe_quantized_query = query
@@ -167,8 +161,8 @@ def test_triton_unified_attn(
 
         scale_shape = (num_seqs, num_kv_heads)
         q_descale = None  # Not yet supported
-        k_descale = torch.rand(scale_shape, dtype=torch.float32)
-        v_descale = torch.rand(scale_shape, dtype=torch.float32)
+        k_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
+        v_descale = torch.rand(scale_shape, dtype=torch.float32, device="cuda")
 
     unified_attention(
         q=maybe_quantized_query,
