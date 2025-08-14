@@ -1,5 +1,4 @@
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
 import aiter.ops.triton.utils.arch_info as arch_info
@@ -142,8 +141,9 @@ def run_torch(x, w, w_scales, dtype):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
+def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, layout, output: bool):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
@@ -154,7 +154,7 @@ def test_gemm_afp4_wfp4_pre_quant(M: int, N: int, K: int, dtype, output: bool):
         pytest.skip("Skipping this config. due to compilation error.")
 
     x, w, _, w_scales, y = generate_gemm_afp4wfp4_pre_quant_inputs(
-        M, N, K, output=output
+        M, N, K, layout=layout, output=output
     )
     if output:
         y = gemm_afp4wfp4_pre_quant(x, w, w_scales, torch.float32, y).to(dtype)
