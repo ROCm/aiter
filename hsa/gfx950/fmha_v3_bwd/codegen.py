@@ -556,23 +556,32 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
-    if(s.log_level_ > 0)
-        std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
-    fmha_bwd_dq_shuffle_args dq_shuffule_args;
-    dq_shuffule_args.ptr_dq  = a.dq_ptr;
-    dq_shuffule_args.Ts      = 64 * a.stride_q * 2; // ts_dq * a.stride_q * 2
-    dq_shuffule_args.Hs      = a.nhead_stride_q * 2;
-    dq_shuffule_args.BAs     = a.batch_stride_q * 2;
-    dq_shuffule_args.Seqs    = a.stride_q * 2;
-
-    static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_bf16_dq_shuffle", "fmha_bwd_bf16_dq_shuffle.co"); // static here is for thread safety.
 
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
-    return ck_tile::launch_kernel(s,
-        [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
-        [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }},
-        [=](const ck_tile::stream_config& s_){{ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_); }}
-    );
+    
+    if (a.hdim_q > 64 && a.hdim_q <=128) {{
+        if(s.log_level_ > 0)
+            std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
+        fmha_bwd_dq_shuffle_args dq_shuffule_args;
+        dq_shuffule_args.ptr_dq  = a.dq_ptr;
+        dq_shuffule_args.Ts      = 64 * a.stride_q * 2; // ts_dq * a.stride_q * 2
+        dq_shuffule_args.Hs      = a.nhead_stride_q * 2;
+        dq_shuffule_args.BAs     = a.batch_stride_q * 2;
+        dq_shuffule_args.Seqs    = a.stride_q * 2;
+
+        static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_bf16_dq_shuffle", "fmha_bwd_bf16_dq_shuffle.co"); // static here is for thread safety.
+
+        return ck_tile::launch_kernel(s,
+            [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
+            [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }},
+            [=](const ck_tile::stream_config& s_){{ impl_dq_shuffle.launch_kernel(traits, dq_shuffule_args, s_); }}
+        );
+    }} else {{
+        return ck_tile::launch_kernel(s,
+            [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
+            [=](const ck_tile::stream_config& s_){{ impl.launch_kernel(traits, args, s_); }}
+        );
+    }}
 }}
 
 template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_>
