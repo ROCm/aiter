@@ -280,7 +280,7 @@ CK_TILE_DEVICE void GenerateWork(
     const int32_t       qo_batch_start,
     const int32_t       kv_batch_start,
     const int32_t       kv_batch_end,
-    const int32_t       kv_len_limit_global,
+    const int32_t       workload_limit_global,
     const int32_t       num_clusters,
     const int32_t*      p_work_indptr,
     const int32_t*      p_num_qo_clusters_indptr,
@@ -296,8 +296,7 @@ CK_TILE_DEVICE void GenerateWork(
     int32_t kv_start_local = 0;
 
     const auto [cid_top, accum_cost_top] = get_cost_top(p_cost_heap, num_clusters);
-    const int32_t remaining_capability_top =
-        get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost_top, cluster_len_q));
+    const int32_t remaining_capability_top = cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q);
     const int32_t num_splits_estimated =
         ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
     // For the case of #splits==2, make sure that the tailing tile is smaller than Traits::kSplitTolerance.
@@ -311,8 +310,7 @@ CK_TILE_DEVICE void GenerateWork(
     {
         // Check and update cost_heap
         auto [cid, accum_cost] = get_cost_top(p_cost_heap, num_clusters);
-        const int32_t remaining_capability =
-            get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost, cluster_len_q));
+        const int32_t remaining_capability = cal_kv_len(workload_limit_global - accum_cost, cluster_len_q);
         const int32_t kv_len_limit_local =
         [&]() {
             const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
@@ -405,7 +403,7 @@ __global__ void kn_get_mla_metadata_v1(
         // Step.2.
         //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
         //   b. Get a indptr array about #cluster for each batch in direction of qo.
-        int32_t sum_kv_lens = 0;
+        int32_t sum_workload = 0;
         int32_t* p_num_qo_clusters_indptr = reinterpret_cast<int32_t*>(p_smem);
         p_num_qo_clusters_indptr[0] = 0;
         for (int32_t bid = 0; bid < params.num_batches; ++bid)
@@ -422,24 +420,26 @@ __global__ void kn_get_mla_metadata_v1(
                 const int32_t kv_len_valid =
                     cal_packed_causal_kv_len(
                         qo_len, kv_len, tid, cluster_len_q, num_qo_tiles, params.num_heads, params.is_causal);
-                sum_kv_lens += kv_len_valid;
+                // always assume that each batch of tile will be splited once along kv.
+                const int32_t kv_len_splited =
+                    ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len_valid, 2), 16);
+                sum_workload += 2 * cal_cost(cluster_len_q, kv_len_splited) + 16;
             }
         }
-        const int32_t kv_len_limit_global =
+        const int32_t workload_limit_global =
         [&]() {
-            const int32_t avg_kv_lens = ck_tile::max(ck_tile::integer_divide_ceil(sum_kv_lens, num_clusters), 1);
+            const int32_t avg_workload = ck_tile::max(ck_tile::integer_divide_ceil(sum_workload, num_clusters), 1);
             // TODO: The following code just follow FlashInfer. Further tune may be required for AMD GPU.
             int32_t limit;
-            if (avg_kv_lens <= 8) limit = 32;
-            else if (avg_kv_lens <= 16) limit = 64;
-            else if (avg_kv_lens <= 32) limit = 128;
-            else if (avg_kv_lens <= 64) limit = 192;
-            else limit = ck_tile::integer_least_multiple(avg_kv_lens, 16);
+            if (avg_workload <= 8) limit = 32;
+            else if (avg_workload <= 16) limit = 64;
+            else if (avg_workload <= 32) limit = 128;
+            else if (avg_workload <= 64) limit = 192;
+            else limit = ck_tile::integer_least_multiple(avg_workload, 16);
             return limit;
         }();
 #if PRINT_DBG
-    printf("[metadata] kv_len_limit_global=%d\n",
-           kv_len_limit_global);
+    printf("[metadata] workload_limit_global=%d\n", workload_limit_global);
 #endif
 
         // Step.3.1. Initialize lds
@@ -473,7 +473,7 @@ __global__ void kn_get_mla_metadata_v1(
 
                 GenerateWork<Traits, true>(
                     bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                    kv_len_limit_global, num_clusters, nullptr, p_num_qo_clusters_indptr,
+                    workload_limit_global, num_clusters, nullptr, p_num_qo_clusters_indptr,
                     nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap, p_cluster_work_counter);
             }
         }
@@ -522,7 +522,7 @@ __global__ void kn_get_mla_metadata_v1(
 
                 GenerateWork<Traits, false>(
                     bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                    kv_len_limit_global, num_clusters, params.p_work_indptr, p_num_qo_clusters_indptr,
+                    workload_limit_global, num_clusters, params.p_work_indptr, p_num_qo_clusters_indptr,
                     &loc_partial_outputs, &num_partial_outputs, p_work_info_set, p_reduce_final_map, p_reduce_partial_map,
                     p_cost_heap, p_cluster_work_counter);
             }
@@ -705,7 +705,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
     // Step.2.
     //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
     //   b. Get a indptr array about #cluster for each batch in direction of qo.
-    int32_t sum_kv_lens = 0;
+    int32_t sum_workload = 0;
     std::vector<int32_t> num_qo_clusters_indptr;
     num_qo_clusters_indptr.reserve(num_batches + 1);
     num_qo_clusters_indptr.push_back(0);
@@ -720,24 +720,26 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
         {
             const int32_t kv_len_valid =
                 cal_packed_causal_kv_len(binfo.qo_len, binfo.kv_len, tid, cluster_len_q, num_qo_tiles, num_heads, is_causal);
-            sum_kv_lens += kv_len_valid;
+            // always assume that each batch of tile will be splited once along kv.
+            const int32_t kv_len_splited =
+                ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len_valid, 2), 16);
+            sum_workload += 2 * cal_cost(cluster_len_q, kv_len_splited) + 16;
         }
     }
-    const int32_t kv_len_limit_global =
+    const int32_t workload_limit_global =
     [&]() {
-        const int32_t avg_kv_lens = ck_tile::max(ck_tile::integer_divide_ceil(sum_kv_lens, num_clusters), 1);
+        const int32_t avg_workload = ck_tile::max(ck_tile::integer_divide_ceil(sum_workload, num_clusters), 1);
         // TODO: The following code just follow FlashInfer. Further tune may be required for AMD GPU.
         int32_t limit;
-        if (avg_kv_lens <= 8) limit = 32;
-        else if (avg_kv_lens <= 16) limit = 64;
-        else if (avg_kv_lens <= 32) limit = 128;
-        else if (avg_kv_lens <= 64) limit = 192;
-        else limit = ck_tile::integer_least_multiple(avg_kv_lens, 16);
+        if (avg_workload <= 8) limit = 32;
+        else if (avg_workload <= 16) limit = 64;
+        else if (avg_workload <= 32) limit = 128;
+        else if (avg_workload <= 64) limit = 192;
+        else limit = ck_tile::integer_least_multiple(avg_workload, 16);
         return limit;
     }();
 #if PRINT_DBG
-    printf("[metadata] kv_len_limit_global=%d\n",
-           kv_len_limit_global);
+    printf("[metadata] workload_limit_global=%d\n", workload_limit_global);
 #endif
 
     // Step.3.1. Allocates output buffers except indptrs
@@ -778,24 +780,24 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
             int32_t kv_start_local = 0;
 
             const auto [cid_top, accum_cost_top] = cost_heap.top();
-            const int32_t remaining_capability_top =
-                get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost_top, cluster_len_q));
+            const int32_t remaining_capability_top = cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q);
             const int32_t num_splits_estimated =
                 ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
             // For the case of #splits==2, make sure that the tailing tile is smaller than Traits::kSplitTolerance.
             const bool split_kv = (num_splits_estimated == 2) ?
                 ((remaining_kv_len - remaining_capability_top) > Traits::kSplitTolerance) : (num_splits_estimated > 1);
+            const int32_t kv_len_limit_floor =
+                ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), 16);
 
             do
             {
                 // Check and update cost_heap
                 auto [cid, accum_cost] = cost_heap.top();
                 cost_heap.pop();
-                const int32_t remaining_capability =
-                    get_remaining_kv_capability(kv_len_limit_global, cal_kv_len(accum_cost, cluster_len_q));
+                const int32_t remaining_capability = cal_kv_len(workload_limit_global - accum_cost, cluster_len_q);
                 const int32_t kv_len_limit_local =
                 [&]() {
-                    const int32_t limit_ori = remaining_capability > 64 ? remaining_capability : 128;
+                    const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
                     const int32_t tail_size = (remaining_kv_len > limit_ori) ? (remaining_kv_len - limit_ori) : 0x7fffffff;
                     const int32_t limit_fin = (tail_size <= Traits::kSplitTolerance) ? remaining_kv_len : limit_ori;
                     return limit_fin;
