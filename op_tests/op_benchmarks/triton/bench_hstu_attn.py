@@ -12,6 +12,10 @@ from op_tests.triton_tests.test_hstu_attn import (
     get_flops,
     get_bytes,
 )
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    print_vgpr,
+    get_caller_name_no_ext,
+)
 
 
 def get_x_values():
@@ -62,8 +66,13 @@ def run_benchmark(args):
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    line_names = ["Triton"]
-    line_vals = ["triton"]
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "Time_(ms)",
+        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
+    }
+    line_names = [evaluation_metric_to_unit[args.metric]]
+    line_vals = line_names
     modes = [args.mode]
     if args.mode == "both":
         modes = ["fwd", "bwd"]
@@ -80,12 +89,12 @@ def run_benchmark(args):
             triton.testing.Benchmark(
                 x_names=x_names,
                 x_vals=x_val_list,
-                line_arg="provider",
+                line_arg="unit",
                 line_vals=line_vals,
                 line_names=line_names,
                 styles=[("green", "-")],
                 ylabel=ylabel,
-                plot_name=f"HSTU attention Benchmark ({mode}), {ylabel}",
+                plot_name=get_caller_name_no_ext(),
                 args={"metric": metric, "mode": mode},
             )
         )
@@ -100,7 +109,7 @@ def run_benchmark(args):
         hidden_dim,
         metric,
         mode,
-        provider,
+        **kwargs,
     ):
         type_str = args.dtype
         assert type_str in [
@@ -217,7 +226,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_hstu_attn.run(save_path=".", print_data=True)
+    bench_hstu_attn.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -284,12 +293,21 @@ def parse_args():
         choices=["fwd", "bwd", "both"],
         help="indicate run forward, backward, or both",
     )
-
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Prints the VGPR usage of the compiled triton kernel.",
+    )
     parser.add_argument(
         "--user_input",
         action="store_true",
         default=False,
         help="Run user input info",
+    )
+
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
     )
 
     args = parser.parse_args()
@@ -298,6 +316,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(args)
 
 

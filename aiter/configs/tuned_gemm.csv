@@ -1,1 +1,2 @@
-M,N,K,bias,dtype,outdtype,scaleAB,libtype,solidx,soltimes,kernelName
+M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName
+

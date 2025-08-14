@@ -4,7 +4,8 @@
 from torch import Tensor, Generator
 from typing import List, Optional, Tuple, Any
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
-from ..jit.utils.chip_info import get_gfx, get_cu_num
+from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 import torch
 
@@ -936,8 +937,13 @@ def fmha_v3_varlen_bwd(
 ) -> None: ...
 
 
-def maybe_contiguous(x):
+@torch_compile_guard()
+def maybe_contiguous_custom_op(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def maybe_contiguous(x):
+    return maybe_contiguous_custom_op(x)
 
 
 def _flash_attn_forward(
@@ -1020,34 +1026,24 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-def _flash_attn_backward(
+@torch_compile_guard()
+def can_impl_fmha_v3_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
     dbias: Optional[torch.Tensor],
     dropout_p: float,
-    softmax_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
-) -> torch.Tensor:
-    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
-        logger.warning(
-            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
-        )
-
+) -> bool:
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
 
@@ -1204,22 +1200,70 @@ def _flash_attn_backward(
 
         return ret
 
-    def can_impl_fmha_v3_bwd():
-        # basic
-        ret = alibi_slopes is None
-        ret &= bias is None
-        ret &= dbias is None
-        ret &= dropout_p == 0.0
-        ret &= deterministic == False
-        ret &= hdim_q == hdim_v
-        ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= np() or pssk() or pddv() or psskddv()
-        return ret
+    # basic
+    ret = alibi_slopes is None
+    ret &= bias is None
+    ret &= dbias is None
+    ret &= dropout_p == 0.0
+    ret &= not deterministic
+    ret &= hdim_q == hdim_v
+    ret &= nhead_q % nhead_k == 0
+    ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
+    ret &= np() or pssk() or pddv() or psskddv()
+    return ret
+
+
+@torch_compile_guard()
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,
+    how_v3_bf16_cvt: Optional[int] = 1,
+) -> torch.Tensor:
+    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
+        logger.warning(
+            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
+        )
+
+    # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
+    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
+        dout,
+        q,
+        k,
+        v,
+        dk,
+        dv,
+        dbias,
+        dropout_p,
+        causal,
+        window_size_left,
+        window_size_right,
+        bias,
+        alibi_slopes,
+        deterministic,
+        is_v3_atomic_fp32,
+    )
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if can_impl_fmha_v3_bwd():
+    if can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,

@@ -1,20 +1,21 @@
+import torch
+import sys
+import math
+import random
 import triton
+
+from aiter.ops.triton.pa_prefill import context_attention_fwd
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
-    get_available_models,
     get_dtype_bytes,
+    get_caller_name_no_ext,
+    print_vgpr,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.test_pa_prefill import (
     seed_everything,
     STR_DTYPE_TO_TORCH_DTYPE,
 )
-import torch
-import argparse
-from aiter.ops.triton.pa_prefill import context_attention_fwd
-import sys
-import math
-import random
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -210,7 +211,7 @@ def run_benchmark(args):
 
     model_name = "paged-attn-decode"
 
-    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -221,7 +222,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{model_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -353,6 +354,12 @@ def parse_args():
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Print VGPR usage for Triton kernels.",
+    )
     args = parser.parse_args()
     return args
 
@@ -368,6 +375,11 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(args)
 
 

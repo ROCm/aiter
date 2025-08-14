@@ -1,5 +1,7 @@
 import os
 import json
+import inspect
+from pathlib import Path
 import torch
 import triton.language as tl
 import triton
@@ -53,14 +55,19 @@ def get_shape_benchmark_object(plot_name, args, x_names=None):
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
+    evaluation_metric_to_unit = {
+        "throughput": "TFLOPS",
+        "time": "Time_(ms)",
+        "bandwidth": "Bandwidth_(GB/s)",  # spaces break prettytable parsing
+    }
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
         x_vals=x_vals_list,
         x_log=True,
         y_log=True,
-        line_arg="provider",
-        line_vals=["Triton"],
-        line_names=["Triton"],
+        line_arg="unit",
+        line_vals=[evaluation_metric_to_unit[args.metric]],
+        line_names=[evaluation_metric_to_unit[args.metric]],
         styles=[("green", "-")],
         ylabel=ylabel,
         plot_name=plot_name,
@@ -366,3 +373,8 @@ def get_dtype_bytes(dtype):
         return 1
     else:
         raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def get_caller_name_no_ext():
+    caller_file = inspect.stack()[1].filename  # full path of caller
+    return Path(caller_file).stem  # filename without extension
