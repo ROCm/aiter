@@ -358,7 +358,7 @@ def kernel_unified_attention_3d(
     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
-    key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
+    key_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
     value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
     sink_ptr,  # [num_query_heads]
     block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
