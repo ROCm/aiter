@@ -795,7 +795,7 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = get_num_sms() * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = max_seqlen_q == 1
+    ALL_DECODE = q.shape[0] == num_seqs
 
     # call 2d if sliding window is used
     if (
