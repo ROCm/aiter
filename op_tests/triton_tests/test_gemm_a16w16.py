@@ -17,18 +17,18 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
 
     # TN is default layout
     if layout[0] == "T":
-        x = torch.randn((M, K), dtype=dtype).cuda()
+        x = torch.randn((M, K), dtype=dtype, device="cuda")
     else:
-        x = torch.randn((K, M), dtype=dtype).cuda().T
+        x = torch.randn((K, M), dtype=dtype, device="cuda").T
 
     if layout[1] == "T":
-        weight = torch.randn((K, N), dtype=dtype).cuda().T
+        weight = torch.randn((K, N), dtype=dtype, device="cuda").T
     else:
-        weight = torch.randn((N, K), dtype=dtype).cuda()
+        weight = torch.randn((N, K), dtype=dtype, device="cuda")
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
         out_dtype = (None,)
     else:
         out_dtype = dtype

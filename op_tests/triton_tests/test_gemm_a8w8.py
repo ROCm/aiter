@@ -108,11 +108,11 @@ def generate_gemm_a8w8_inputs(
     weight = weight / w_scale.T
     weight = weight.to(in_dtype)
 
-    bias = torch.rand([1, N], dtype=torch.float32).cuda() * 10
+    bias = torch.rand([1, N], dtype=torch.float32, device="cuda") * 10
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=out_dtype).cuda()
+        y = torch.empty((M, N), dtype=out_dtype, device="cuda")
 
     return x, weight, x_scale, w_scale, bias, y
 

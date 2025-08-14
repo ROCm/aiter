@@ -127,7 +127,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     return x, weight, x_scale, w_scale, y
 
