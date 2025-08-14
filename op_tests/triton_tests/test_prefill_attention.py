@@ -34,13 +34,18 @@ def varlen_input_helper(
 ):
     if not equal_seqlens:
         max_seqlens = SEQLEN // BATCH
-        seqlens = torch.randint(1, max_seqlens + 1, (BATCH,), dtype=torch.int32, device="cuda")
+        seqlens = torch.randint(
+            1, max_seqlens + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
     else:
         seqlens = torch.full((BATCH,), SEQLEN // BATCH, device="cuda")
 
     # Calculate cumulative sequence lengths
     cu_seqlens = torch.cat(
-        [torch.tensor([0], dtype=torch.int32, device="cuda"), seqlens.cumsum(dim=0, dtype=torch.int32)]
+        [
+            torch.tensor([0], dtype=torch.int32, device="cuda"),
+            seqlens.cumsum(dim=0, dtype=torch.int32),
+        ]
     )
 
     # Initialize q, k, v with variable lengths

@@ -27,14 +27,20 @@ def input_helper(
         max_prefix_length = prefix_length
 
         seqlens_extend = torch.randint(
-            1, max_extend_length + 1, (B,), dtype=torch.int32,
+            1,
+            max_extend_length + 1,
+            (B,),
+            dtype=torch.int32,
             device="cuda",
         )
         if prefix_length == 0:
             seqlens_prefix = torch.full((B,), prefix_length, device="cuda")
         else:
             seqlens_prefix = torch.randint(
-                1, max_prefix_length + 1, (B,), dtype=torch.int32,
+                1,
+                max_prefix_length + 1,
+                (B,),
+                dtype=torch.int32,
                 device="cuda",
             )
 

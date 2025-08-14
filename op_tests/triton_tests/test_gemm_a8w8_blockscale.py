@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 block_shape = (128, 128)
 
+
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
     m, k = x.shape

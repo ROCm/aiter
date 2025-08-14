@@ -140,13 +140,12 @@ def context_attention_fwd_torch(
     return
 
 
-def _get_alibi_slopes(total_num_heads: int,
-                      device: torch.device) -> torch.Tensor:
+def _get_alibi_slopes(total_num_heads: int, device: torch.device) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
     base = torch.tensor(
         2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
         dtype=torch.float32,
-        device=device
+        device=device,
     )
     powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32, device=device)
     slopes = torch.pow(base, powers)
@@ -155,14 +154,17 @@ def _get_alibi_slopes(total_num_heads: int,
         extra_base = torch.tensor(
             2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
             dtype=torch.float32,
-            device=device
+            device=device,
         )
         num_remaining_heads = min(
             closest_power_of_2, total_num_heads - closest_power_of_2
         )
         extra_powers = torch.arange(
-            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32,
-            device=device
+            start=1,
+            end=1 + 2 * num_remaining_heads,
+            step=2,
+            dtype=torch.int32,
+            device=device,
         )
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
