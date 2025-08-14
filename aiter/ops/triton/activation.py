@@ -46,7 +46,7 @@ def _relu(x):
     return tl.maximum(0.0, x)
 
 
-@tl.constexpr_function
+@tl.constexpr
 def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
