@@ -426,17 +426,25 @@ def _attn_fwd(
     NUM_XCD: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
 ):
+    # num blocks along seqlen
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
     wid = tl.program_id(
         0
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
-    # num blocks along seqlen
+    
+    # works because NUM_Q_HEADS is a multiple of NUM_XCDS
+    off_block_head = wid % (NUM_Q_HEADS * NUM_BLOCKS)
+    off_block_head = remap_xcd(off_block_head, (NUM_Q_HEADS * NUM_BLOCKS), NUM_XCD)
 
-    off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    start_m = off_block_head % NUM_BLOCKS # block idx
+    off_q_head = off_block_head // NUM_BLOCKS # head idx
+
+    # off_q_head = wid % NUM_Q_HEADS
+    # off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
+    # start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+    
+    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH # batch idx
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
