@@ -31,26 +31,28 @@ def input_helper(
             max_extend_length + 1,
             (B,),
             dtype=torch.int32,
-            device="cuda",
+            device=device,
         )
         if prefix_length == 0:
-            seqlens_prefix = torch.full((B,), prefix_length, device="cuda")
+            seqlens_prefix = torch.full((B,), prefix_length, device=device)
         else:
             seqlens_prefix = torch.randint(
                 1,
                 max_prefix_length + 1,
                 (B,),
                 dtype=torch.int32,
-                device="cuda",
+                device=device,
             )
 
     else:
-        seqlens_extend = torch.full((B,), extend_length, device="cuda")
-        seqlens_prefix = torch.full((B,), prefix_length, device="cuda")
+        seqlens_extend = torch.full((B,), extend_length, device=device)
+        seqlens_prefix = torch.full((B,), prefix_length, device=device)
+
+    B_Seqlen = seqlens_extend + seqlens_prefix
 
     cu_seqlens_extend = torch.cat(
         [
-            torch.tensor([0], dtype=torch.int32, device="cuda"),
+            torch.tensor([0], dtype=torch.int32, device=device),
             seqlens_extend.cumsum(dim=0, dtype=torch.int32),
         ]
     )
@@ -60,6 +62,8 @@ def input_helper(
             seqlens_prefix.cumsum(dim=0, dtype=torch.int32),
         ]
     )
+
+    B_Start_Loc = cu_seqlens_extend
 
     total_extend = cu_seqlens_extend[-1].item()
     total_prefix = cu_seqlens_prefix[-1].item()
@@ -101,6 +105,14 @@ def input_helper(
     kv_indptr = cu_seqlens_prefix
     kv_indices = torch.arange(total_prefix, device=device)
 
+    max_prefix = seqlens_prefix.max().item()
+    B_Loc = torch.full((B, max_prefix), -1, dtype=torch.int32, device=device)
+    for b in range(B):
+        start = cu_seqlens_prefix[b].item()
+        end = cu_seqlens_prefix[b + 1].item()
+        B_Loc[b, : seqlens_prefix[b]] = torch.arange(start, end, device=device)
+    B_Loc = B_Loc.unsqueeze(-1)  # [B, max_prefix, 1]
+
     custom_mask = None
     mask_indptr = None
     max_len_extend = extend_length
@@ -117,6 +129,9 @@ def input_helper(
         custom_mask,
         mask_indptr,
         max_len_extend,
+        B_Start_Loc,
+        B_Loc,
+        B_Seqlen,
     )
 
 
@@ -167,6 +182,9 @@ def test_op_fwd(
         custom_mask,
         mask_indptr,
         max_len_extend,
+        _,
+        _,
+        _,
     ) = input_helper(
         B,
         H,
