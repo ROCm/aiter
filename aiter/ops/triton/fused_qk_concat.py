@@ -460,6 +460,7 @@ def _qk_rope_cat_and_cache_mla_kernel(
     cos_ptr,
     sin_ptr,
     q_out_ptr,
+    q_nope_zeros_out_ptr,
     kv_cache_ptr,
     slot_mapping_ptr,
     B,
@@ -482,6 +483,9 @@ def _qk_rope_cat_and_cache_mla_kernel(
     q_out_stride_b,
     q_out_stride_h,
     q_out_stride_d,
+    q_nope_zeros_out_stride_b,
+    q_nope_zeros_out_stride_h,
+    q_nope_zeros_out_stride_d,
     kv_cache_stride_b,
     kv_cache_stride_h,
     kv_cache_stride_d,
@@ -493,6 +497,7 @@ def _qk_rope_cat_and_cache_mla_kernel(
     BLOCK_D_nope: tl.constexpr,
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
+    OUTPUT_Q_NOPE_ZEROS: tl.constexpr = False,
     K_SCALE: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
@@ -549,6 +554,16 @@ def _qk_rope_cat_and_cache_mla_kernel(
             BLOCK_D_pe,
             BLOCK_D_HALF_pe,
         )
+
+        if OUTPUT_Q_NOPE_ZEROS:
+            z = tl.zeros((BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + d_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
@@ -621,6 +636,7 @@ def fused_qk_rope_cat_and_cache_mla(
     sin: torch.Tensor,
     k_scale: torch.Tensor,
     is_neox: bool,
+    output_q_nope_zeros: bool = False,
 ):
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
@@ -675,6 +691,11 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out = torch.empty(
         (b, qh, d_nope + d_pe), dtype=q_nope.dtype, device=q_nope.device
     )
+    q_nope_zeros_out = None
+    if output_q_nope_zeros:
+        q_nope_zeros_out = torch.empty(
+            (b, qh, d_nope), dtype=q_nope.dtype, device=q_nope.device
+        )
 
     n_pid = b * qh + (b_slot - b) * kh
     grid = (n_pid, 1, 1)
@@ -687,6 +708,7 @@ def fused_qk_rope_cat_and_cache_mla(
         cos,
         sin,
         q_out,
+        q_nope_zeros_out,
         kv_cache,
         slot_mapping,
         b,
@@ -699,6 +721,7 @@ def fused_qk_rope_cat_and_cache_mla(
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
+        *q_nope_zeros_out.stride(),
         *kv_cache.stride(),
         QH_PER_KH=qh // kh,
         QH=qh,
@@ -708,9 +731,12 @@ def fused_qk_rope_cat_and_cache_mla(
         BLOCK_D_nope=d_nope,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
+        OUTPUT_Q_NOPE_ZEROS=output_q_nope_zeros,
         K_SCALE=k_scale.item(),
     )
 
+    if output_q_nope_zeros:
+        return q_out, q_nope_zeros_out
     return q_out
 
 
