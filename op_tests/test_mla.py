@@ -383,12 +383,12 @@ def test_mla(
     work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
     work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
     work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr      = torch.empty([batch_size * 1 + 1], dtype=torch.int32, device="cuda")
+    reduce_indptr      = torch.empty([100], dtype=torch.int32, device="cuda")
     reduce_final_map   = torch.empty([batch_size * 2, 2], dtype=torch.int32, device="cuda")
     reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
     
-    aiter.get_mla_metadata_v1(
+    meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
@@ -400,15 +400,38 @@ def test_mla(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        # num_reduce_tile,
     )
 
     # print(work_meta_data)
     # print(work_indptr)
     # print(work_info_set)
-    # print(reduce_indptr)
-    # print(reduce_final_map)
-    # print(reduce_partial_map)
+    print(reduce_indptr)
+    print(reduce_final_map)
+    print(reduce_partial_map)
+
+    # import pdb; pdb.set_trace()
+    # work_meta_data_2     = torch.empty([10], dtype=torch.uint64, device="cuda")
+    # work_indptr_2        = torch.empty([81], dtype=torch.int32, device="cuda")
+    # work_info_set_2      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
+    # reduce_indptr_2      = torch.empty([batch_size * 1 + 1], dtype=torch.int32, device="cuda")
+    # reduce_final_map_2   = torch.empty([batch_size * 2, 2], dtype=torch.int32, device="cuda")
+    # reduce_partial_map_2 = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
+    #
+    # aiter.get_mla_metadata_v2(
+    #     qo_indptr,
+    #     kv_indptr,
+    #     nhead // nhead_kv,
+    #     nhead_kv,
+    #     True,
+    #     work_meta_data_2,
+    #     work_info_set_2,
+    #     work_indptr_2,
+    #     reduce_indptr_2,
+    #     reduce_final_map_2,
+    #     reduce_partial_map_2,
+    #     # num_reduce_tile,
+    # )
+    # import pdb; pdb.set_trace()
 
     (attn_logits, attn_lse), us_asm_decode = run_perftest(
         aiter.mla.mla_decode_fwd_dispatch,
@@ -546,7 +569,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[512, 1023, 4888, 12800], #
+    default=[28, 1200, 8192], #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -555,7 +578,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(60, 65)], # [41],
+    default=[i for i in range(1, 80)], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
