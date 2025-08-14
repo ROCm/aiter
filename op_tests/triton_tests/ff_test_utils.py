@@ -24,13 +24,19 @@ def generate_ff_inputs(
 
     if layout[1] == "T":
         if gating:
-            w1 = torch.randn((hidden_dim, intermediate_dim * 2), dtype=dtype, device="cuda").T
+            w1 = torch.randn(
+                (hidden_dim, intermediate_dim * 2), dtype=dtype, device="cuda"
+            ).T
         else:
-            w1 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype, device="cuda").T
+            w1 = torch.randn(
+                (hidden_dim, intermediate_dim), dtype=dtype, device="cuda"
+            ).T
         w2 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
     else:
         if gating:
-            w1 = torch.randn((intermediate_dim * 2, hidden_dim), dtype=dtype, device="cuda")
+            w1 = torch.randn(
+                (intermediate_dim * 2, hidden_dim), dtype=dtype, device="cuda"
+            )
         else:
             w1 = torch.randn((intermediate_dim, hidden_dim), dtype=dtype, device="cuda")
         w2 = torch.randn((hidden_dim, intermediate_dim), dtype=dtype, device="cuda").T
@@ -42,10 +48,14 @@ def generate_ff_inputs(
     y = None
     if output:
         if y_init == "empty":
-            intermediate = torch.empty((batch, intermediate_dim), dtype=dtype, device="cuda")
+            intermediate = torch.empty(
+                (batch, intermediate_dim), dtype=dtype, device="cuda"
+            )
             y = torch.empty((batch, hidden_dim), dtype=dtype, device="cuda")
         elif y_init == "zeros":
-            intermediate = torch.zeros((batch, intermediate_dim), dtype=dtype, device="cuda")
+            intermediate = torch.zeros(
+                (batch, intermediate_dim), dtype=dtype, device="cuda"
+            )
             y = torch.zeros((batch, hidden_dim), dtype=dtype, device="cuda")
         else:
             raise ValueError(f"Unsupported y_init value: {y_init}")

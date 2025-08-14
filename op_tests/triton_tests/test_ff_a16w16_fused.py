@@ -14,7 +14,9 @@ def test_ff_a16w16_fused_ungated(
     batch: int, hidden_dim: int, intermediate_dim: int, dtype, output, activation
 ):
     if (batch * intermediate_dim * hidden_dim) > 5000 * 5000 * 5000:
-        pytest.skip("Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices.")
+        pytest.skip(
+            "Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices."
+        )
     ff_ungated_test(
         ff_a16w16_fused_ungated,
         batch=batch,
@@ -35,7 +37,9 @@ def test_ff_a16w16_fused_gated(
     batch: int, hidden_dim: int, intermediate_dim: int, dtype, output, activation
 ):
     if (batch * intermediate_dim * hidden_dim) > 5000 * 5000 * 5000:
-        pytest.skip("Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices.")
+        pytest.skip(
+            "Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices."
+        )
 
     ff_gated_test(
         ff_a16w16_fused_gated,
