@@ -291,9 +291,9 @@ def run_benchmark(custom, args):
             return 0
 
         # Generate base inputs
-        q = torch.randn((BATCH, N_CTX_Q, HQ, D_HEAD), device=device, dtype=dtype)
-        k = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
-        v = torch.randn((BATCH, N_CTX_K, HK, D_HEAD), device=device, dtype=dtype)
+        q = torch.randn((BATCH, N_CTX_Q, HQ, 192), device=device, dtype=dtype)
+        k = torch.randn((BATCH, N_CTX_K, HK, 192), device=device, dtype=dtype)
+        v = torch.randn((BATCH, N_CTX_K, HK, 128), device=device, dtype=dtype)
         q.requires_grad = requires_grad
         k.requires_grad = requires_grad
         v.requires_grad = requires_grad
