@@ -459,7 +459,6 @@ template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,    
 template<> struct FmhaBwdV3Ts<fmha_bwd_dq_dk_dv_v3_traits_<192, FmhaBwdFp16,        1,       true,      0,     true,    true, GPUArch::gfx950,        true>> {{ static constexpr int ts_qo = 16; static constexpr int ts_kv = 64; }};
 
 namespace gfx950{{
-// TODO: update dq_shuffle kernel launch
 class fmha_dq_shuffle_kernel
 {{
     public:
@@ -472,7 +471,6 @@ class fmha_dq_shuffle_kernel
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }}
 
-    // TODO: maybe update fmha_bwd_dq_shuffle_args
     void
     launch_kernel(fmha_bwd_v3_traits fmha_v3_traits, fmha_bwd_dq_shuffle_args args, const ck_tile::stream_config& s) const
     {{
@@ -743,7 +741,7 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
 
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
-    
+
     if (a.hdim_q > 64 && a.hdim_q <=128) {{
         if(s.log_level_ > 0)
             std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
@@ -754,7 +752,7 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
         dq_shuffule_args.BAs     = a.batch_stride_q * 2;
         dq_shuffule_args.Seqs    = a.stride_q * 2;
 
-        static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_bf16_dq_shuffle", "fmha_bwd_bf16_dq_shuffle.co"); // static here is for thread safety.
+        static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_dq_shuffle", "bwd_dq_shuffle.co"); // static here is for thread safety.
 
         return ck_tile::launch_kernel(s,
             [=](const ck_tile::stream_config& s_){{ fmha_bwd_dot_do_o_oneshot_<dot_do_o_trait_>(s_, a); }},
@@ -1198,15 +1196,23 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
 
     if(s.log_level_ > 0)
-        std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
-    fmha_bwd_dq_shuffle_args dq_shuffule_args;
-    dq_shuffule_args.ptr_dq  = a.dq_ptr;
-    dq_shuffule_args.Ts      = 64 * a.stride_q * 2; // ts_dq * a.stride_q * 2
-    dq_shuffule_args.Hs      = a.nhead_stride_q * 2;
-    dq_shuffule_args.BAs     = a.batch_stride_q * 2;
-    dq_shuffule_args.Seqs    = a.stride_q * 2;
+        std::cout << ", " << "fmha_bwd_dq_shuffle" << std::flush;
 
-    static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_bf16_dq_shuffle", "fmha_bwd_bf16_dq_shuffle.co"); // static here is for thread safety.
+    fmha_bwd_dq_shuffle_args dq_shuffule_args;
+
+    dq_shuffule_args.ptr_dq_acc     = a.dq_acc_ptr;
+    dq_shuffule_args.ptr_dq         = a.dq_acc;
+    dq_shuffule_args.Ts             = 64 * a.stride_dq * 2;
+    dq_shuffule_args.Hs_dq_acc      = a.nhead_stride_dq_acc * 2;
+    dq_shuffule_args.BAs_dq_acc     = a.batch_stride_dq_acc * 2;
+    dq_shuffule_args.Seqs_dq_acc    = a.stride_dq_acc * 2;
+    dq_shuffule_args.Hs_dq          = a.nhead_stride_dq * 2;
+    dq_shuffule_args.BAs_dq         = a.batch_stride_dq * 2;
+    dq_shuffule_args.Seqs_dq        = a.stride_dq * 2;
+    dq_shuffule_args.seqlen_q       = a.seqlen_q;
+    dq_shuffule_args.head_dim       = a.hdim_q;
+
+    static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_dq_shuffle", "bwd_dq_shuffle.co"); // static here is for thread safety.
 
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
     return ck_tile::launch_kernel(s,
@@ -1418,11 +1424,19 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
                                     (a.stride_k == a.stride_v) && (a.nhead_stride_k == a.nhead_stride_v) && (a.batch_stride_k == a.batch_stride_v) && (a.nhead_stride_k == a.nhead_stride_dk) && (a.nhead_stride_v == a.nhead_stride_dv) &&
                                     (a.batch_stride_q >= a.stride_q) && (a.batch_stride_do >= a.stride_do) && ((a.batch_stride_dk / a.batch_stride_k) == (a.nhead_q / a.nhead_k)) && ((a.batch_stride_dv / a.batch_stride_v) == (a.nhead_q / a.nhead_k))){{
                             if(a.hdim_q == 128){{
-                                using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, false>;
-                                using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, false, 0, false, false, GPUArch::gfx950>;
-                                // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a16";
-                                r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
-                                return r;
+                                if (a.seqlen_q % 64 == 0) {{
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, false>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, false, 0, false, false, GPUArch::gfx950>;
+                                    // const std::string bwd_v3_name = "bwd_v3_hd128_fp16_a16_pssk";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    return r;
+                                }} else {{
+                                    using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, true, false>;
+                                    using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<128, FmhaBwdFp16, false, false, 0, true, false, GPUArch::gfx950>;
+                                    // const std::string bwd_v3_name = "bwd_hd128_fp16_a16_pssk";
+                                    r = fmha_bwd_v3_genl_gfx950<dot_do_o_trait_, dq_dk_dv_v3_traits_>(s, a);
+                                    return r;
+                                }}
                             }}
                             else{{
                                 using dot_do_o_trait_ = fmha_bwd_dot_do_o_traits_<128, FmhaBwdFp16, false, false, true>;
