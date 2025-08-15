@@ -578,13 +578,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              drop_seed_offset};
     }();
 
-    std::cout << "seq stride dq: " << fmha_args.stride_dq * 2 << std::endl
-              << "nhead stride dq: " << fmha_args.nhead_stride_dq * 2 << std::endl
-              << "batch stride dq: " << fmha_args.batch_stride_dq * 2 << std::endl
-              << "seq stride dq_acc: " << fmha_args.stride_dq_acc * 2 << std::endl
-              << "nhead stride dq_acc: " << fmha_args.nhead_stride_dq_acc * 2 << std::endl
-              << "batch stride dq_acc: " << fmha_args.batch_stride_dq_acc * 2 << std::endl;
-
     float ave_time = aiter::mha_bwd(fmha_args,
                                     stream_config,
                                     data_type,
