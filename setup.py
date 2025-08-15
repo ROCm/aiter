@@ -69,8 +69,7 @@ if IS_ROCM:
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
-                flags_extra_cc=one_opt_args["flags_extra_cc"]
-                + ["-DPREBUILD_KERNELS"],
+                flags_extra_cc=one_opt_args["flags_extra_cc"] + ["-DPREBUILD_KERNELS"],
                 flags_extra_hip=one_opt_args["flags_extra_hip"]
                 + ["-DPREBUILD_KERNELS"],
                 blob_gen_cmd=one_opt_args["blob_gen_cmd"],
