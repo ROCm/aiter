@@ -364,7 +364,8 @@ struct fmha_bwd_v3_traits
 {
     int b;
     int h;
-    int s;
+    int sq;
+    int sk;
     int d;
 
     int mask;

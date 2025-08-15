@@ -482,7 +482,7 @@ class fmha_dq_shuffle_kernel
                            HIP_LAUNCH_PARAM_END}};
 
         int bdx = 256;
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_dq - 1) / fmha_v3_traits.ts_dq;
+        int gdx = (fmha_v3_traits.sq + fmha_v3_traits.ts_dq - 1) / fmha_v3_traits.ts_dq;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
 
@@ -526,12 +526,12 @@ class fmha_bwd_v3_kernel
                            HIP_LAUNCH_PARAM_END}};
 
         int bdx = 256;
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdx = (fmha_v3_traits.sq + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
         if(fmha_v3_traits.mask > 0)
         {{
-            int num_tg = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+            int num_tg = (fmha_v3_traits.sq + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
             gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
         }}
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
@@ -558,12 +558,12 @@ class fmha_bwd_v3_kernel
                            HIP_LAUNCH_PARAM_END}};
 
         int bdx = 256;
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdx = (fmha_v3_traits.sq + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
         if(fmha_v3_traits.mask > 0)
         {{
-            int num_tg = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+            int num_tg = (fmha_v3_traits.sq + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
             gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
         }}
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
@@ -590,12 +590,12 @@ class fmha_bwd_v3_kernel
                            HIP_LAUNCH_PARAM_END}};
 
         int bdx = 256;
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
         if(fmha_v3_traits.mask > 0)
         {{
-            int num_tg = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+            int num_tg = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
             gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
         }}
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
@@ -621,7 +621,7 @@ class fmha_bwd_v3_kernel
                            &arg_size,
                            HIP_LAUNCH_PARAM_END}};
 
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         if(fmha_v3_traits.mask > 0)
         {{
             gdx = (gdx % 2) ? (gdx / 2 + 1) : (gdx / 2);
@@ -650,7 +650,7 @@ class fmha_bwd_v3_kernel
                            HIP_LAUNCH_PARAM_END}};
 
         int bdx = 256;
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
 
@@ -678,12 +678,12 @@ class fmha_bwd_v3_kernel
                            HIP_LAUNCH_PARAM_END}};
 
         int bdx = 256;
-        int gdx = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+        int gdx = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
         int gdy = fmha_v3_traits.h;
         int gdz = fmha_v3_traits.b;
         if(fmha_v3_traits.mask > 0)
         {{
-            int num_tg = (fmha_v3_traits.s + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
+            int num_tg = (fmha_v3_traits.sk + fmha_v3_traits.ts_kv - 1) / fmha_v3_traits.ts_kv;
             gdx        = (num_tg % 2) ? (num_tg / 2 + 1) : (num_tg / 2);
         }}
         HIP_CALL(hipModuleLaunchKernel(kernel_func,
@@ -735,6 +735,7 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
                                       a.seqlen_q,
+                                      a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
@@ -808,6 +809,7 @@ float fmha_bwd_v3_gen_(const ck_tile::stream_config& s, fmha_bwd_args a)
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
                                       a.seqlen_q,
+                                      a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
@@ -851,6 +853,7 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
                                       a.seqlen_q,
+                                      a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
@@ -896,6 +899,7 @@ float fmha_bwd_v3_gen_(const ck_tile::stream_config& s, fmha_bwd_args a)
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
                                       a.seqlen_q,
+                                      a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_qo,
@@ -951,6 +955,7 @@ float fmha_bwd_v3_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
 
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
+                                      a.seqlen_q,
                                       a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
@@ -1005,6 +1010,7 @@ float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a)
 
     auto traits = fmha_bwd_v3_traits{{ a.batch,
                                        a.nhead_q,
+                                       a.max_seqlen_q,
                                        a.max_seqlen_k,
                                        a.hdim_q,
                                        a.mask_type,
@@ -1073,6 +1079,7 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
 
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
+                                      a.seqlen_q,
                                       a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
@@ -1134,6 +1141,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a)
 
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
+                                      a.seqlen_q,
                                       a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
@@ -1148,7 +1156,6 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a)
     );
 }}
 
-// TODO: dq_shuffle
 template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_>
 float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a)
 {{
@@ -1197,6 +1204,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a)
 
     auto traits = fmha_bwd_v3_traits{{a.batch,
                                       a.nhead_q,
+                                      a.seqlen_q,
                                       a.seqlen_k,
                                       a.hdim_q,
                                       a.mask_type,
