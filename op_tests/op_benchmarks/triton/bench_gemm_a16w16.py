@@ -25,6 +25,7 @@ def bench_gemm_fn(
     M: int,
     N: int,
     K: int,
+    BIAS_DIM: int,
     metric: str,
     layout: str,
     atomic: bool = False,
@@ -33,15 +34,23 @@ def bench_gemm_fn(
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, c_dtype, layout=layout, output=True
+    x, w, b, out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, BIAS_DIM, c_dtype, layout=layout, output=True
     )
     # flops
     flops = 2.0 * M * N * K
+    if BIAS_DIM == 2:
+        flops += M * N
     if activation is not None:
         flops += M * N  # elementwise ops on the GEMM output
     # memory transfer
-    mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
+    if BIAS_DIM == 1:
+        mem_read_bias = N * b.element_size()
+    elif BIAS_DIM == 2:
+        mem_read_bias = M * N * b.element_size()
+    else:
+        mem_read_bias = 0
+    mem_read = (M * K) * x.element_size() + (N * K) * w.element_size() + mem_read_bias
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
@@ -58,7 +67,7 @@ def bench_gemm_fn(
         )
     else:
         ms = triton.testing.do_bench(
-            lambda: gemm_a16w16(x, w, c_dtype, y, activation=activation),
+            lambda: gemm_a16w16(x, w, b, c_dtype, y, activation=activation),
             warmup=25,
             rep=100,  # noqa: E731
         )
@@ -106,10 +115,11 @@ def run_model_benchmark(args):
             N, K = hidden_dim, intermediate_dim
             # Divide K by tensor parallel
             K = math.ceil(K / args.tp)
+        BIAS_DIM = args.bias_dim
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
         return bench_gemm_fn(
-            M, N, K, metric, args.layout, atomic=args.atomic, activation=args.activation
+            M, N, K, BIAS_DIM, metric, args.layout, atomic=args.atomic, activation=args.activation
         )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
@@ -125,7 +135,8 @@ def run_shape_benchmark(args):
     def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
+        BIAS_DIM = args.bias_dim
+        return bench_gemm_fn(M, N, K, BIAS_DIM, metric, args.layout, atomic=args.atomic)
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -164,6 +175,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Use the atomic kernel (split-k with atomic_add) instead of the standard a16w16 kernel.",
+    )
+    parser.add_argument(
+        "--bias-dim",
+        type=int,
+        default=0,
+        help="Add bias to result of matmul.",
     )
     parser.add_argument(
         "--activation",
