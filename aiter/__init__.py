@@ -26,7 +26,16 @@ def getLogger():
             )
         console_handler.setFormatter(formatter)
         console_handler.setLevel(logging.INFO)
+
         logger.addHandler(console_handler)
+        torch._dynamo.config.ignore_logger_methods = (
+            logging.Logger.info,
+            logging.Logger.warning,
+            logging.Logger.debug,
+            logger.warning,
+            logger.info,
+            logger.debug,
+        )
 
     return logger
 
