@@ -22,7 +22,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 global _USE_FUSED_BWD_KERNEL
-_USE_FUSED_BWD_KERNEL = False
+_USE_FUSED_BWD_KERNEL = True
 
 
 def mha_set_use_fused_bwd_kernel(value: bool):
@@ -200,7 +200,9 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
+    q_pe,
     k_ptrs,
+    k_pe_ptrs,
     v_ptrs,
     stride_kn,
     stride_vk,
@@ -248,8 +250,9 @@ def _attn_fwd_inner(
             k_offs_n = start_n + tl.arange(0, BLOCK_N)
         else:
             k_offs_n = None
-        k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL_POW2)
-        k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
+        k_offs_k = None #if not PADDED_HEAD else tl.arange(0, 128)
+        k = _load_fn(k_ptrs, k_offs_k, k_offs_n, 128, seqlen_k)
+        k_pe = _load_fn(k_pe_ptrs, k_offs_k, k_offs_n, 192, seqlen_k)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -283,6 +286,7 @@ def _attn_fwd_inner(
         if IS_FP8:
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
+            qk += tl.dot(q_pe, k_pe.to(q_pe.dtype))
             qk += tl.dot(q, k)
 
         if IS_CAUSAL:
@@ -335,7 +339,7 @@ def _attn_fwd_inner(
         m_diff_scaled = m_i * SM_SCALE * RCP_LN2 - m_ij_scaled
         alpha = tl.math.exp2(m_diff_scaled)
         acc = acc * alpha[:, None]
-        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+        v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, 128)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
@@ -441,7 +445,8 @@ def _attn_fwd(
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+    offs_d = tl.arange(0, 128)
+    offs_pe = tl.arange(128, 192)
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -567,8 +572,8 @@ def _attn_fwd(
                 + offs_m[:, None] * stride_om
                 + offs_d[None, :] * stride_on
             )
-            acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=out_ptr.type.element_ty)
-            out_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
+            acc = tl.zeros([BLOCK_M, 128], dtype=out_ptr.type.element_ty)
+            out_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < 128)
             tl.store(out_ptr + offs_out, acc, mask=out_mask)
 
             if softmax_lse_ptr is not None:
@@ -601,6 +606,15 @@ def _attn_fwd(
     )
     q_ptrs = q_ptr + q_offs
 
+    q_pe_offs = (
+        off_z * stride_qz
+        + off_q_head * stride_qh
+        + cu_seqlens_q_start * stride_qm
+        + offs_m[:, None] * stride_qm
+        + offs_pe[None, :] * stride_qk
+    )
+    q_pe_ptrs = q_ptr + q_pe_offs
+
     k_offs = (
         off_z * stride_kz
         + off_k_head * stride_kh
@@ -609,6 +623,15 @@ def _attn_fwd(
         + offs_n[None, :] * stride_kn
     )
     k_ptrs = k_ptr + k_offs
+
+    k_pe_offs = (
+        off_z * stride_kz
+        + off_k_head * stride_kh
+        + cu_seqlens_k_start * stride_kn
+        + offs_pe[:, None] * stride_kk
+        + offs_n[None, :] * stride_kn
+    )
+    k_pe_ptrs = k_ptr + k_pe_offs
 
     v_offs = (
         off_z * stride_vz
@@ -660,12 +683,13 @@ def _attn_fwd(
 
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, 128], dtype=tl.float32)
     if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
         q_mask = offs_m[:, None] < seqlen_q
     else:
-        q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
+        q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < 128)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    q_pe = tl.load(q_pe_ptrs, mask=(offs_m[:, None] < seqlen_q), other=0.0)
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
         descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -705,7 +729,9 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_ptrs,
+            k_pe_ptrs,
             v_ptrs,
             stride_kn,
             stride_vn,
@@ -752,6 +778,7 @@ def _attn_fwd(
         else:
             offs_n_causal = 0
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        k_pe_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vn
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
@@ -762,7 +789,9 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_ptrs,
+            k_pe_ptrs,
             v_ptrs,
             stride_kn,
             stride_vn,
@@ -816,7 +845,7 @@ def _attn_fwd(
     if IS_CAUSAL:
         if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
             out_mask_boundary = tl.full(
-                (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
+                (128,), causal_start_idx, dtype=tl.int32
             )
             mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
             out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
@@ -867,11 +896,11 @@ def _attn_fwd(
         + offs_m[:, None] * stride_om
         + offs_d[None, :] * stride_on
     )
-    out_mask = tl.full([BLOCK_M, BLOCK_DMODEL_POW2], 1, dtype=tl.int1)
+    out_mask = tl.full([BLOCK_M, 128], 1, dtype=tl.int1)
     if overflow_size > 0:
         out_mask = out_mask & (offs_m[:, None] < seqlen_q)
     if BLOCK_DMODEL != BLOCK_DMODEL_POW2:
-        out_mask = out_mask & (offs_d[None, :] < BLOCK_DMODEL)
+        out_mask = out_mask & (offs_d[None, :] < 128)
     op = acc.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs_out, op, mask=out_mask)
 
@@ -920,8 +949,8 @@ def _flash_attn_forward(
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_left != -1 or window_size_right != -1:
-        raise ValueError("Sliding Window is not supported yet in the Triton Backend")
+    #if window_size_left != -1 or window_size_right != -1:
+    #    raise ValueError("Sliding Window is not supported yet in the Triton Backend")
 
     # FP8
     IS_FP8 = _is_fp8(q)
@@ -932,6 +961,8 @@ def _flash_attn_forward(
         o = torch.zeros_like(q, dtype=torch.float32)
     else:
         o = torch.zeros_like(q)
+
+    o = o[..., :128].contiguous()
     if is_varlen:
         # Layout for q,k,v is thd ie [total_tokens, num_head, head_dim]
         batch, seqlen_q, num_q_heads, head_sz = (
@@ -1165,7 +1196,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
 
-        print("Using fused backward kernel:", _USE_FUSED_BWD_KERNEL)
+        #print("Using fused backward kernel:", _USE_FUSED_BWD_KERNEL)
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
@@ -1569,7 +1600,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
         if head_size_og % 8 != 0:
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+            #v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
                 q,
@@ -2033,3 +2064,4 @@ def flash_attn_varlen_fp8_func(
         torch.is_grad_enabled(),
         config,
     )
+
