@@ -268,6 +268,7 @@ def build_module(
     is_standalone,
     torch_exclude,
     hipify=True,
+    prebuild=0,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
@@ -289,7 +290,10 @@ def build_module(
         if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
             os.remove(f"{get_user_jit_dir()}/{target_name}")
 
-        sources = rename_cpp_to_cu(srcs, src_dir)
+        if prebuild != 2:
+            sources = rename_cpp_to_cu(srcs, src_dir)
+        else:
+            sources = rename_cpp_to_cu([get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"], opbd_dir + "/srcs")
 
         flags_cc = ["-O3", "-std=c++20"]
         flags_hip = [
@@ -352,11 +356,12 @@ def build_module(
                 sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)
             return sources
 
-        if isinstance(blob_gen_cmd, list):
-            for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-        else:
-            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
+        if prebuild != 2:
+            if isinstance(blob_gen_cmd, list):
+                for s_blob_gen_cmd in blob_gen_cmd:
+                    sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
+            else:
+                sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         # TODO: Move all torch api into torch folder
         old_bd_include_dir = f"{op_dir}/build/include"
@@ -393,6 +398,7 @@ def build_module(
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
                 hipify=hipify,
+                prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -459,10 +465,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
         if isinstance(data, dict):
-            # parse all ops
+            # parse all ops, return list
             if ops_name == "all":
+                all_ops_list = []
                 d_all_ops = {
-                    "srcs": [],
                     "flags_extra_cc": [],
                     "flags_extra_hip": [],
                     "extra_include": [],
@@ -477,13 +483,22 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
+                    d_single_ops = {
+                        "md_name": ops_name,
+                        "srcs": single_ops["srcs"],
+                        "flags_extra_cc": single_ops["flags_extra_cc"],
+                        "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_include": single_ops["extra_include"],
+                        "blob_gen_cmd": single_ops["blob_gen_cmd"],
+                    }
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
                             d_all_ops[k] += single_ops[k]
                         elif isinstance(single_ops[k], str) and single_ops[k] != "":
                             d_all_ops[k].append(single_ops[k])
+                    all_ops_list.append(d_single_ops)
 
-                return d_all_ops
+                return all_ops_list, d_all_ops
             # no find opt_name in json.
             elif data.get(ops_name) == None:
                 logger.warning(

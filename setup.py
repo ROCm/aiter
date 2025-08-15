@@ -56,25 +56,62 @@ if IS_ROCM:
             "module_mha_varlen_bwd",
         ]
 
-        all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
-        # remove pybind, because there are already duplicates in rocm_opt
-        new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
-        all_opts_args_build["srcs"] = new_list
+        all_opts_args_build, prebuild_link_param = core.get_args_of_build("all", exclude=exclude_ops)
+        prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
+        if os.path.exists(prebuild_dir) and os.path.isdir(prebuild_dir):
+            shutil.rmtree(prebuild_dir)
+        os.makedirs(prebuild_dir + "/srcs")
 
+        # step 1, build *.cu -> module*.so
+        for one_opt_args in all_opts_args_build:
+            core.build_module(
+                md_name=one_opt_args["md_name"],
+                srcs=one_opt_args["srcs"],# + [f"{this_dir}/csrc"],
+                flags_extra_cc=one_opt_args["flags_extra_cc"]
+                + ["-DPREBUILD_KERNELS"],
+                flags_extra_hip=one_opt_args["flags_extra_hip"]
+                + ["-DPREBUILD_KERNELS"],
+                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                extra_include=one_opt_args["extra_include"],
+                extra_ldflags=None,
+                verbose=False,
+                is_python_module=True,
+                is_standalone=False,
+                torch_exclude=False,
+                prebuild=1,
+            )
+
+        ck_batched_gemm_folders = [
+            f"{this_dir}/csrc/{name}/include" for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name)) and name.startswith("ck_batched_gemm")
+        ]
+        ck_gemm_folders = [
+            f"{this_dir}/csrc/{name}/include" for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name)) and name.startswith("ck_gemm_a")
+        ]
+        ck_gemm_inc = ck_batched_gemm_folders + ck_gemm_folders
+        for src in ck_gemm_inc:
+            dst = f"{prebuild_dir}/include"
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+
+        shutil.copytree(f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True)
+
+        # step 2, link module*.so -> aiter_.so
         core.build_module(
             md_name="aiter_",
-            srcs=all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
-            flags_extra_cc=all_opts_args_build["flags_extra_cc"]
+            srcs=[f"{prebuild_dir}/srcs/rocm_ops.cu"],
+            flags_extra_cc=prebuild_link_param["flags_extra_cc"]
             + ["-DPREBUILD_KERNELS"],
-            flags_extra_hip=all_opts_args_build["flags_extra_hip"]
+            flags_extra_hip=prebuild_link_param["flags_extra_hip"]
             + ["-DPREBUILD_KERNELS"],
-            blob_gen_cmd=all_opts_args_build["blob_gen_cmd"],
-            extra_include=all_opts_args_build["extra_include"],
+            blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
+            extra_include=prebuild_link_param["extra_include"],
             extra_ldflags=None,
             verbose=False,
             is_python_module=True,
             is_standalone=False,
             torch_exclude=False,
+            prebuild=2,
         )
 else:
     raise NotImplementedError("Only ROCM is supported")
