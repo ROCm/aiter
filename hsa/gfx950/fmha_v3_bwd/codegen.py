@@ -749,7 +749,7 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
         fmha_bwd_dq_shuffle_args dq_shuffule_args;
 
         dq_shuffule_args.ptr_dq_acc     = a.dq_acc_ptr;
-        dq_shuffule_args.ptr_dq         = a.dq_acc;
+        dq_shuffule_args.ptr_dq         = a.dq_ptr;
         dq_shuffule_args.Ts             = 64 * a.stride_dq * 2;
         dq_shuffule_args.Hs_dq_acc      = a.nhead_stride_dq_acc * 2;
         dq_shuffule_args.BAs_dq_acc     = a.batch_stride_dq_acc * 2;
@@ -1209,7 +1209,7 @@ float fmha_bwd_v3_genl_gfx950(const ck_tile::stream_config& s, fmha_bwd_args a)
     fmha_bwd_dq_shuffle_args dq_shuffule_args;
 
     dq_shuffule_args.ptr_dq_acc     = a.dq_acc_ptr;
-    dq_shuffule_args.ptr_dq         = a.dq_acc;
+    dq_shuffule_args.ptr_dq         = a.dq_ptr;
     dq_shuffule_args.Ts             = 64 * a.stride_dq * 2;
     dq_shuffule_args.Hs_dq_acc      = a.nhead_stride_dq_acc * 2;
     dq_shuffule_args.BAs_dq_acc     = a.batch_stride_dq_acc * 2;
