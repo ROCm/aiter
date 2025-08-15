@@ -200,7 +200,9 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
+    q_pe,
     k_ptrs,
+    k_pe_ptrs,
     v_ptrs,
     stride_kn,
     stride_vk,
@@ -228,20 +230,25 @@ def _attn_fwd_inner(
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
+    BLOCK_DMODEL_PE: tl.constexpr,
+    BLOCK_DMODEL_PE_POW2: tl.constexpr,
     SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     MASK_STEPS: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     PADDED_HEAD: tl.constexpr,
+    PADDED_PE: tl.constexpr,
     IS_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    ENABLE_PIPELINING: tl.constexpr,
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
 
     # loop over k, v, and update accumulator
 
-    for start_n in range(block_min, block_max, BLOCK_N):
+    num_stages: tl.constexpr = None if ENABLE_PIPELINING else 1  # Set num_stages==1 if we want to disable pipelining
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=num_stages):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
@@ -250,6 +257,10 @@ def _attn_fwd_inner(
             k_offs_n = None
         k_offs_k = None if not PADDED_HEAD else tl.arange(0, BLOCK_DMODEL_POW2)
         k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
+
+        if BLOCK_DMODEL_PE > 0:
+            k_offs_pe = None if not PADDED_PE else (BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE_POW2))
+            k_pe = _load_fn(k_pe_ptrs, k_offs_pe, k_offs_n, (BLOCK_DMODEL + BLOCK_DMODEL_PE), seqlen_k)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -280,6 +291,9 @@ def _attn_fwd_inner(
         p_mask = q_mask & k_mask
 
         # -- compute qk ----
+        if BLOCK_DMODEL_PE > 0:
+            qk += tl.dot(q_pe, k_pe)
+
         if IS_FP8:
             qk += tl.dot(q, k) * descale_q * descale_k
         else:
@@ -417,6 +431,8 @@ def _attn_fwd(
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
+    BLOCK_DMODEL_PE: tl.constexpr,
+    BLOCK_DMODEL_PE_POW2: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_FP8: tl.constexpr,
@@ -442,6 +458,8 @@ def _attn_fwd(
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+    if BLOCK_DMODEL_PE > 0:
+        offs_pe = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE_POW2)
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -515,6 +533,39 @@ def _attn_fwd(
         stride_lse_z = stride_lse_z_in
         stride_lse_h = stride_lse_h_in
         stride_lse_m = stride_lse_m_in
+
+    tl.assume(stride_qz_in >= 0)
+    tl.assume(stride_qh_in >= 0)
+    tl.assume(stride_qm_in >= 0)
+    tl.assume(stride_qk_in >= 0)
+    tl.assume(stride_kz_in >= 0)
+    tl.assume(stride_kh_in >= 0)
+    tl.assume(stride_kn_in >= 0)
+    tl.assume(stride_kk_in >= 0)
+    tl.assume(stride_vz_in >= 0)
+    tl.assume(stride_vh_in >= 0)
+    tl.assume(stride_vn_in >= 0)
+    tl.assume(stride_vk_in >= 0)
+    if IS_FP8:
+        tl.assume(stride_descale_q_z_in >= 0)
+        tl.assume(stride_descale_k_z_in >= 0)
+        tl.assume(stride_descale_v_z_in >= 0)
+        tl.assume(stride_oz_in >= 0)
+        tl.assume(stride_oh_in >= 0)
+        tl.assume(stride_om_in >= 0)
+        tl.assume(stride_on_in >= 0)
+        tl.assume(stride_alibi_z_in >= 0)
+        tl.assume(stride_alibi_h_in >= 0)
+
+        # NOTE: philox offset is need in dropout pointer calculations
+    tl.assume(philox_offset_base_in >= 0)
+    tl.assume(stride_sd_z_in >= 0)
+    tl.assume(stride_sd_h_in >= 0)
+    tl.assume(stride_sd_m_in >= 0)
+    tl.assume(stride_sd_n_in >= 0)
+    tl.assume(stride_lse_z_in >= 0)
+    tl.assume(stride_lse_h_in >= 0)
+    tl.assume(stride_lse_m_in >= 0)
 
     if VARLEN:
         cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
@@ -601,6 +652,18 @@ def _attn_fwd(
     )
     q_ptrs = q_ptr + q_offs
 
+    if BLOCK_DMODEL_PE > 0:
+        q_pe_offs = (
+            off_z * stride_qz
+            + off_q_head * stride_qh
+            + cu_seqlens_q_start * stride_qm
+            + offs_m[:, None] * stride_qm
+            + offs_pe[None, :] * stride_qk
+        )
+        q_pe_ptrs = q_ptr + q_pe_offs
+    else:
+        q_pe_ptrs = None
+
     k_offs = (
         off_z * stride_kz
         + off_k_head * stride_kh
@@ -609,6 +672,18 @@ def _attn_fwd(
         + offs_n[None, :] * stride_kn
     )
     k_ptrs = k_ptr + k_offs
+
+    if BLOCK_DMODEL_PE > 0:
+        k_pe_offs = (
+            off_z * stride_kz
+            + off_k_head * stride_kh
+            + cu_seqlens_k_start * stride_kn
+            + offs_pe[:, None] * stride_kk
+            + offs_n[None, :] * stride_kn
+        )
+        k_pe_ptrs = k_ptr + k_pe_offs
+    else:
+        k_pe_ptrs = None
 
     v_offs = (
         off_z * stride_vz
@@ -666,6 +741,15 @@ def _attn_fwd(
     else:
         q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    if BLOCK_DMODEL_PE > 0:
+        if BLOCK_DMODEL_PE == BLOCK_DMODEL_PE_POW2:
+            q_pe_mask = q_mask
+        else:
+            q_pe_mask = q_mask & (offs_pe[None, :] < (BLOCK_DMODEL + BLOCK_DMODEL_PE))
+        q_pe = tl.load(q_pe_ptrs, mask=q_pe_mask, other=0.0)
+    else:
+        q_pe = None
+
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
         descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -705,7 +789,9 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_ptrs,
+            k_pe_ptrs,
             v_ptrs,
             stride_kn,
             stride_vn,
@@ -733,14 +819,18 @@ def _attn_fwd(
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
+            BLOCK_DMODEL_PE_POW2,
             sm_scale,
             False,
             MASK_STEPS=False,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             RETURN_SCORES=RETURN_SCORES,
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
+            PADDED_PE=BLOCK_DMODEL_PE != BLOCK_DMODEL_PE_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=True,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -752,6 +842,8 @@ def _attn_fwd(
         else:
             offs_n_causal = 0
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        if BLOCK_DMODEL_PE > 0:
+            k_pe_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vn
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
@@ -762,7 +854,9 @@ def _attn_fwd(
             l_i,
             m_i,
             q,
+            q_pe,
             k_ptrs,
+            k_pe_ptrs,
             v_ptrs,
             stride_kn,
             stride_vn,
@@ -790,14 +884,18 @@ def _attn_fwd(
             BLOCK_N,
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
+            BLOCK_DMODEL_PE,
+            BLOCK_DMODEL_PE_POW2,
             sm_scale,
             IS_CAUSAL,
             MASK_STEPS=True,
             ENABLE_DROPOUT=ENABLE_DROPOUT,
             RETURN_SCORES=RETURN_SCORES,
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
+            PADDED_PE=BLOCK_DMODEL_PE != BLOCK_DMODEL_PE_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
+            ENABLE_PIPELINING=False,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -929,16 +1027,15 @@ def _flash_attn_forward(
     is_varlen = True if cu_seqlens_q is not None else False
 
     if IS_FP8:
-        o = torch.zeros_like(q, dtype=torch.float32)
+        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device)
     else:
-        o = torch.zeros_like(q)
+        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
     if is_varlen:
-        # Layout for q,k,v is thd ie [total_tokens, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = (
+        # Layout for q,k,v is thd ie [total_tokens, num_head, head_dim(_v)]
+        batch, seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
-            q.shape[2],
         )
         seqlen_k, num_k_heads = max_seqlen_k, k.shape[1]
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
@@ -946,8 +1043,8 @@ def _flash_attn_forward(
         v_strides = (0, v.stride(1), v.stride(0), v.stride(2))
         o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
     else:
-        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = q.shape
+        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim(_v)]
+        batch, seqlen_q, num_q_heads = q.shape[:-1]
         seqlen_k = k.shape[1]
         num_k_heads = k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
@@ -955,9 +1052,15 @@ def _flash_attn_forward(
         v_strides = (v.stride(0), v.stride(2), v.stride(1), v.stride(3))
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
+    qk_head_dim = q.shape[-1]
+    v_head_dim  = v.shape[-1]
+    pe_head_dim = qk_head_dim - v_head_dim
     # padding for head_dim. Power of 2 or 16
-    BLOCK_DMODEL_POW2 = triton.next_power_of_2(head_sz)
+    BLOCK_DMODEL_POW2 = triton.next_power_of_2(v_head_dim)
     BLOCK_DMODEL_POW2 = max(BLOCK_DMODEL_POW2, 16)
+    BLOCK_DMODEL_PE_POW2 = triton.next_power_of_2(pe_head_dim)
+    if BLOCK_DMODEL_PE_POW2 > 0:
+        BLOCK_DMODEL_PE_POW2 = max(BLOCK_DMODEL_PE_POW2, 16)
 
     # softmax_lse [batch, num_q_heads, seqlen_q]
     if is_varlen:
@@ -1070,8 +1173,10 @@ def _flash_attn_forward(
         IS_CAUSAL=causal,
         NUM_Q_HEADS=num_q_heads,
         NUM_K_HEADS=num_k_heads,
-        BLOCK_DMODEL=head_sz,
+        BLOCK_DMODEL=v_head_dim,
         BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+        BLOCK_DMODEL_PE=pe_head_dim,
+        BLOCK_DMODEL_PE_POW2=BLOCK_DMODEL_PE_POW2,
         RETURN_SCORES=return_softmax,
         ENABLE_DROPOUT=enable_dropout,
         IS_FP8=IS_FP8,
