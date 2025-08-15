@@ -432,10 +432,20 @@ def _attn_fwd(
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
 
-    off_q_head = tl.program_id(0)
+    wid = tl.program_id(0)
+    
+    # works because NUM_Q_HEADS is a multiple of NUM_XCDS
+    # off_block_head = wid % (NUM_Q_HEADS * NUM_BLOCKS)
+    # off_block_head = remap_xcd(off_block_head, (NUM_Q_HEADS * NUM_BLOCKS), NUM_XCD)
+
+    # start_m = off_block_head % NUM_BLOCKS # block idx
+    # off_q_head = off_block_head // NUM_BLOCKS # head idx
+
+    off_q_head = wid % NUM_Q_HEADS
     off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = tl.program_id(1)
-    off_z = tl.program_id(2)
+    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+    
+    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH # batch idx
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -1062,9 +1072,7 @@ def _flash_attn_forward(
     """
 
     grid = lambda META: (  # noqa: E731
-        num_q_heads,
-        triton.cdiv(seqlen_q, META["BLOCK_M"]),
-        batch,
+        num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]) * batch,
     )
 
     _attn_fwd[grid](
