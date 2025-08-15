@@ -113,7 +113,12 @@ def run_ck(
         bias_unpad = bias.reshape(batch_size * max_seqlen_q, max_seqlen_k)
     else:
         bias_unpad = None
-
+    print("cu_seqlens_q", cu_seqlens_q)
+    print("cu_seqlens_k", cu_seqlens_k)
+    print("max_seqlen_q", max_seqlen_q)
+    print("max_seqlen_k", max_seqlen_k)
+    print(q_unpad.shape)
+    print(k_unpad.shape)
     outputs = aiter.flash_attn_varlen_func(
         q_unpad,
         k_unpad,
@@ -411,7 +416,7 @@ if __name__ == "__main__":
         "--seqlen_q_k",
         type=dtypes.str2tuple,
         nargs="?",
-        default=(4, 4),
+        default=(16, 16),
         help="""Sequence length of query&key.
     e.g. -s 4,4""",
     )
