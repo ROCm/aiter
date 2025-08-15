@@ -48,7 +48,7 @@ def get_tuned_gemm_list(tuned_gemm_file):
         tunedf = pd.read_csv(tuned_gemm_file)
     else:
         tunedf = pd.DataFrame(
-            columns=["M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
+            columns=["cu_num", "M", "N", "K", "kernelId", "splitK", "us", "kernelName"]
         )
     return tunedf
 
@@ -131,6 +131,9 @@ def tune_gemm_list(
                     total_kernel_nums = total_kernel_nums + 1
 
             tasks_data.append((total_kernel_nums, ()))
+        else:
+            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
+            print()
     if task:
         ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
         for el in ret:
@@ -140,6 +143,9 @@ def tune_gemm_list(
                 "None"
                 if kernelId == -1 or time == "nan"
                 else kernels_list[kernelId].name
+            )
+            print(
+                f"Tuning result for M:{M}, N:{N}, K:{K}, cu_num:{cu_num} is kernelId={kernelId} {kernels_list[kernelId].name} {splitK=}, {time}us"
             )
             temp = pd.DataFrame(
                 {
@@ -155,10 +161,6 @@ def tune_gemm_list(
             )
             tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-    else:
-        print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-        print()
-        print()
     if issorted:
         tunedf = tunedf.sort_values(by=["M", "N", "K"])
     print("Totall tuning result:")

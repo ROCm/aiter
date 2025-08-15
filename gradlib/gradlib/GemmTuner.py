@@ -242,7 +242,7 @@ class Gemm:
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    get_gemm_ref,
+                    get_gemm_ref if fast_mode == 0 else None,
                     ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
                     None,  # self.ref if fast_mode == 0 else None,
@@ -319,7 +319,7 @@ class Gemm:
                         "num_warmup": warmi,
                         "num_iters": coldi,
                     },
-                    get_gemm_ref,
+                    get_gemm_ref if fast_mode == 0 else None,
                     ([0, 1, 3, 4], self.indtype, self.outdtype),
                     {},
                     None,  # self.ref if fast_mode == 0 else None,
@@ -421,6 +421,10 @@ class GemmTuner:
             self.tuned_shapes = pd.read_csv(tuned_file)
         else:
             self.tuned_shapes = None
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        self.cu_num = cu_num
 
     def add_gemm(self, m, n, k, indtype, bias=False, outdtype=None, scaleAB=False):
         assert indtype is not None
@@ -428,7 +432,8 @@ class GemmTuner:
         assert outdtype is not None
         if self.tuned_shapes is None or (
             self.tuned_shapes[
-                (self.tuned_shapes["M"] == m)
+                (self.tuned_shapes["cu_num"] == self.cu_num)
+                & (self.tuned_shapes["M"] == m)
                 & (self.tuned_shapes["N"] == n)
                 & (self.tuned_shapes["K"] == k)
                 & (self.tuned_shapes["bias"] == bias)
@@ -455,7 +460,9 @@ class GemmTuner:
 
     def find_best_sols(self):
         df = self.gemm_problems
-        soldf = pd.DataFrame(columns=["libtype", "solidx", "soltimes", "kernelName"])
+        soldf = pd.DataFrame(
+            columns=["cu_num", "libtype", "solidx", "soltimes", "kernelName"]
+        )
         for i in range(len(df)):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
@@ -472,13 +479,14 @@ class GemmTuner:
                 mp=self.mp,
             )
             gemmobj.find_fastest_solution()
+            soldf.loc[i, "cu_num"] = self.cu_num
             soldf.loc[i, "libtype"] = gemmobj.best_libtype
             soldf.loc[i, "solidx"] = gemmobj.best_solidx
             soldf.loc[i, "soltimes"] = round(gemmobj.best_soltime * 1000, 2)
             soldf.loc[i, "kernelName"] = (
                 aiter.getHipblasltKernelName(int(gemmobj.best_solidx))
                 if gemmobj.best_libtype == "hipblaslt"
-                else ""
+                else "rocblas"
             )
 
             del gemmobj
