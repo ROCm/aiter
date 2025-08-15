@@ -293,7 +293,9 @@ def build_module(
         if prebuild != 2:
             sources = rename_cpp_to_cu(srcs, src_dir)
         else:
-            sources = rename_cpp_to_cu([get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"], opbd_dir + "/srcs")
+            sources = rename_cpp_to_cu(
+                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"], opbd_dir + "/srcs"
+            )
 
         flags_cc = ["-O3", "-std=c++20"]
         flags_hip = [

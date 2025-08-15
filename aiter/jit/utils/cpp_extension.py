@@ -1372,7 +1372,9 @@ def verify_ninja_availability():
         raise RuntimeError("Ninja is required to load C++ extensions")
 
 
-def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude, prebuild):
+def _prepare_ldflags(
+    extra_ldflags, with_cuda, verbose, is_standalone, torch_exclude, prebuild
+):
     extra_ldflags.append("-mcmodel=large")
     extra_ldflags.append("-ffunction-sections")
     extra_ldflags.append("-fdata-sections ")
@@ -1390,7 +1392,9 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
                 extra_ldflags.append("-lc10_hip" if IS_HIP_EXTENSION else "-lc10_cuda")
             extra_ldflags.append("-ltorch_cpu")
             if with_cuda:
-                extra_ldflags.append("-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda")
+                extra_ldflags.append(
+                    "-ltorch_hip" if IS_HIP_EXTENSION else "-ltorch_cuda"
+                )
             extra_ldflags.append("-ltorch")
             if not is_standalone:
                 extra_ldflags.append("-ltorch_python")
@@ -1723,7 +1727,7 @@ def _write_ninja_file(
         for root, dirs, files in os.walk(o_path):
             for file in files:
                 mid_file_dir = o_path + file
-                if file.endswith('.so') and mid_file_dir not in objects:
+                if file.endswith(".so") and mid_file_dir not in objects:
                     objects.append(mid_file_dir)
 
     flags.append(f'ldflags = {" ".join(ldflags)}')

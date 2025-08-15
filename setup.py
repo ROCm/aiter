@@ -56,7 +56,9 @@ if IS_ROCM:
             "module_mha_varlen_bwd",
         ]
 
-        all_opts_args_build, prebuild_link_param = core.get_args_of_build("all", exclude=exclude_ops)
+        all_opts_args_build, prebuild_link_param = core.get_args_of_build(
+            "all", exclude=exclude_ops
+        )
         prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
         if os.path.exists(prebuild_dir) and os.path.isdir(prebuild_dir):
             shutil.rmtree(prebuild_dir)
@@ -66,7 +68,7 @@ if IS_ROCM:
         for one_opt_args in all_opts_args_build:
             core.build_module(
                 md_name=one_opt_args["md_name"],
-                srcs=one_opt_args["srcs"],# + [f"{this_dir}/csrc"],
+                srcs=one_opt_args["srcs"],
                 flags_extra_cc=one_opt_args["flags_extra_cc"]
                 + ["-DPREBUILD_KERNELS"],
                 flags_extra_hip=one_opt_args["flags_extra_hip"]
@@ -82,19 +84,25 @@ if IS_ROCM:
             )
 
         ck_batched_gemm_folders = [
-            f"{this_dir}/csrc/{name}/include" for name in os.listdir(f"{this_dir}/csrc")
-            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name)) and name.startswith("ck_batched_gemm")
+            f"{this_dir}/csrc/{name}/include"
+            for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
+            and name.startswith("ck_batched_gemm")
         ]
         ck_gemm_folders = [
-            f"{this_dir}/csrc/{name}/include" for name in os.listdir(f"{this_dir}/csrc")
-            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name)) and name.startswith("ck_gemm_a")
+            f"{this_dir}/csrc/{name}/include"
+            for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
+            and name.startswith("ck_gemm_a")
         ]
         ck_gemm_inc = ck_batched_gemm_folders + ck_gemm_folders
         for src in ck_gemm_inc:
             dst = f"{prebuild_dir}/include"
             shutil.copytree(src, dst, dirs_exist_ok=True)
 
-        shutil.copytree(f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True)
+        shutil.copytree(
+            f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True
+        )
 
         # step 2, link module*.so -> aiter_.so
         core.build_module(
