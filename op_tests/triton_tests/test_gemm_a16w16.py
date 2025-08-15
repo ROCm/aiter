@@ -160,7 +160,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, dtype, layout, output):
     else:
         triton_out = gemm_a16w16(x, w, out_dtype)
 
-    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
