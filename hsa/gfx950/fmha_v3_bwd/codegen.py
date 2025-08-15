@@ -745,12 +745,20 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
     if (a.hdim_q > 64 && a.hdim_q <=128) {{
         if(s.log_level_ > 0)
             std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
+
         fmha_bwd_dq_shuffle_args dq_shuffule_args;
-        dq_shuffule_args.ptr_dq  = a.dq_ptr;
-        dq_shuffule_args.Ts      = 64 * a.stride_q * 2; // ts_dq * a.stride_q * 2
-        dq_shuffule_args.Hs      = a.nhead_stride_q * 2;
-        dq_shuffule_args.BAs     = a.batch_stride_q * 2;
-        dq_shuffule_args.Seqs    = a.stride_q * 2;
+
+        dq_shuffule_args.ptr_dq_acc     = a.dq_acc_ptr;
+        dq_shuffule_args.ptr_dq         = a.dq_acc;
+        dq_shuffule_args.Ts             = 64 * a.stride_dq * 2;
+        dq_shuffule_args.Hs_dq_acc      = a.nhead_stride_dq_acc * 2;
+        dq_shuffule_args.BAs_dq_acc     = a.batch_stride_dq_acc * 2;
+        dq_shuffule_args.Seqs_dq_acc    = a.stride_dq_acc * 2;
+        dq_shuffule_args.Hs_dq          = a.nhead_stride_dq * 2;
+        dq_shuffule_args.BAs_dq         = a.batch_stride_dq * 2;
+        dq_shuffule_args.Seqs_dq        = a.stride_dq * 2;
+        dq_shuffule_args.seqlen_q       = a.seqlen_q;
+        dq_shuffule_args.head_dim       = a.hdim_q;
 
         static thread_local fmha_dq_shuffle_kernel impl_dq_shuffle("fmha_bwd_dq_shuffle", "bwd_dq_shuffle.co"); // static here is for thread safety.
 
