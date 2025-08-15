@@ -687,7 +687,7 @@ def unified_attention(
     v_descale,
     alibi_slopes=None,
     sinks=None,  # Optional tensor for sinks
-    output_scale=None, #Optional
+    output_scale=None, # Optional for compatiblity
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
