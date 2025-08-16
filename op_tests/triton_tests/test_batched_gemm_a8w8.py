@@ -4,6 +4,7 @@
 import torch
 import triton
 import pytest
+import functools
 from aiter.ops.triton.batched_gemm_a8w8 import batched_gemm_a8w8
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
@@ -110,6 +111,16 @@ def get_x_vals():
     return x_vals
 
 
+def minimal_x_vals(num_vals=20):
+    """
+    Returns the num_vals smallest test cases. Useful for generating a subset to quickly test on.
+    """
+    x_vals = get_x_vals()
+    num_ops = [(i, functools.reduce(lambda x, y: x * y, i)) for i in x_vals]
+    sorted_x_vals = sorted(num_ops, key=lambda x: x[1])
+    return [i[0] for i in sorted_x_vals[: min(num_vals, len(sorted_x_vals))]]
+
+
 @pytest.mark.parametrize(
     "dtype, b, m, n, k, output",
     [
@@ -126,6 +137,30 @@ def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
     dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
         b, m, n, k, dtype, output
+    )
+    a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
+
+    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "dtype, b, m, n, k, layout, output",
+    [
+        (dtype, b, *shape, layout, output)
+        for dtype in ["bf16"]
+        for b in [16]
+        for shape in minimal_x_vals()
+        for output in [True, False]
+        for layout in ["TT", "NN", "NT"]
+    ],
+)
+def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    dtype = str_to_torch_dtype[dtype]
+    x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
+        b, m, n, k, dtype, output, layout
     )
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)

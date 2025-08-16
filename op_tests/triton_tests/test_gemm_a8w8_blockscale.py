@@ -133,15 +133,16 @@ def generate_gemm_a8w8_blockscale_inputs(
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K, output",
+    "dtype, M, N, K, layout, output",
     [
-        (dtype, *shape, output)
+        (dtype, *shape, layout, output)
         for output in [True, False]
         for dtype in ["bf16"]
+        for layout in ["TN", "TT", "NN", "NT"]
         for shape in get_x_vals()
     ],
 )
-def test_gemm(dtype, M, N, K, output):
+def test_gemm(dtype, M, N, K, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     block_shape_n, block_shape_k = block_shape
@@ -154,6 +155,7 @@ def test_gemm(dtype, M, N, K, output):
         block_shape_n,
         block_shape_k,
         dtype=dtype,
+        layout=layout,
         output=output,
     )
 
