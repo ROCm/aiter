@@ -4,6 +4,7 @@ import torch
 import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from aiter.ops.triton.moe_op import fused_moe as triton_moe
+from aiter.ops.triton.moe_op_silu_fused import fused_moe_silu as triton_moe_silu
 from op_tests.triton_tests.test_moe import input_helper, input_helper_int4_w4a16
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
@@ -17,7 +18,7 @@ def model_benchmark_configs(args):
     no_bench_stage2 = args.no_bench_stage2
     config_file = args.model_configs
     configs = get_model_configs(
-        config_path=config_file, models="mistral" if args.model is None else args.model
+        config_path=config_file, models="mixtral" if args.model is None else args.model
     )
     moe_configs = []
     M = args.M if args.M else 4096  # check size
@@ -53,13 +54,16 @@ def fused_moe(
     int8_w8a16=False,
     group_size=128,
     has_zp=True,
+    silu_fused=False,
 ):
+    moe_fn = triton_moe_silu if silu_fused else triton_moe
+
     if int4_w4a16:
         (
             a,
             b,
             triton_out,
-            _,
+            triton_out_silu,
             b_zp,
             b_scale,
             topk_weights,
@@ -80,10 +84,10 @@ def fused_moe(
             has_zp=has_zp,
         )
 
-        return lambda: triton_moe(  # noqa: E731
+        return lambda: moe_fn(  # noqa: E731
             a,
             b,
-            triton_out,
+            triton_out_silu if silu_fused else triton_out,
             None,
             b_scale,
             b_zp,
@@ -106,7 +110,7 @@ def fused_moe(
             a,
             b,
             triton_out,
-            _,
+            triton_out_silu,
             b_zp,
             a_scale,
             b_scale,
@@ -128,10 +132,10 @@ def fused_moe(
             int8_w8a16=int8_w8a16,
         )
 
-        return lambda: triton_moe(
+        return lambda: moe_fn(
             a,
             b,
-            triton_out,
+            triton_out_silu if silu_fused else triton_out,
             a_scale,
             b_scale,
             b_zp,
@@ -158,8 +162,12 @@ def run_benchmark(args):
     group_size = args.group_size
     has_zp = args.has_zp
     print_time = args.print_time
+    silu_fused = args.silu_fused
     dtype = str_to_torch_dtype[args.dtype]
     fp8_type = str_to_torch_dtype[args.fp8_type]
+
+    if silu_fused:
+        args.no_bench_stage2 = True
 
     if int4_w4a16:
         assert group_size != None, "set group_size with -group_size"
@@ -214,7 +222,11 @@ def run_benchmark(args):
         mem_read = (M * K) * a_bytes + (max_expert_loaded * N * K) * b_bytes
 
         mem_write = (M * top_k * N) * c_bytes
-        mem = mem_read + mem_write
+        if silu_fused:
+            mem = mem_read + (mem_write // 2)
+            flops += M * top_k * N
+        else:
+            mem = mem_read + mem_write
 
         fn = fused_moe(
             M,
@@ -229,6 +241,7 @@ def run_benchmark(args):
             int8_w8a16=int8_w8a16,
             group_size=group_size,
             has_zp=has_zp,
+            silu_fused=silu_fused,
         )
 
         ms = triton.testing.do_bench(fn, warmup=25, rep=100)
@@ -286,6 +299,7 @@ def parse_args():
     parser.add_argument("-no_bench_stage2", action="store_false", default=True)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-fp8_type", default="e5m2fnuz")
+    parser.add_argument("-silu_fused", action="store_true", default=False)
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )

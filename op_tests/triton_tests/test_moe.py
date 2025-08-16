@@ -21,32 +21,12 @@ from aiter.ops.triton.moe_op_gelu import (
     fused_moe_gelu as triton_moe_gelu,
     moe_set_use_persistent_kernel as triton_moe_gelu_set_use_persistent_kernel,
 )
-
+import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
 
 DEBUG_MODE = False
-
-
-def torch_silu_and_mul_ref(input):
-    """
-    Performs the SiLU activation on the first half of the input tensor and
-    multiplies it element-wise with the second half.
-    Args:
-        input (torch.Tensor): Input tensor of shape [..., 2 * d].
-        param (float): Parameter for the SiLU activation function.
-    Returns:
-        torch.Tensor: Output tensor of shape [..., d].
-    """
-    dtype = input.dtype
-    d = input.size(-1) // 2
-    A, B = input[:, :d], input[:, d:]
-
-    silu_A = A / (1.0 + torch.exp(-A.float()))
-
-    output = silu_A * B
-
-    return output.to(dtype)
 
 
 def torch_moe_ref(
@@ -343,9 +323,15 @@ def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
 def quantize_fp8(
     tensor: torch.Tensor, dim=()
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dev = arch_info.get_device()
+    if dev == "MI350X":
+        fp8_type = torch.float8_e4m3fn
+    else:
+        fp8_type = torch.float8_e4m3fnuz
+
     quantize_dim = [i for i in range(tensor.dim()) if i not in dim]
     max_vals = tensor.abs().amax(dim=quantize_dim, keepdim=True)
-    max_repr_val = torch.finfo(torch.float8_e4m3fnuz).max
+    max_repr_val = torch.finfo(fp8_type).max
     max_vals[max_vals == 0] = 1e-8  # Avoid division by zero
 
     # Compute scale factors for each channel
@@ -354,7 +340,7 @@ def quantize_fp8(
     # Quantize the tensor
     tensor = tensor * scale
     tensor.clamp_(-max_repr_val, max_repr_val)
-    tensor_quantized = tensor.to(torch.float8_e4m3fnuz)
+    tensor_quantized = tensor.to(fp8_type)
 
     scale = scale.squeeze(dim=quantize_dim)
 

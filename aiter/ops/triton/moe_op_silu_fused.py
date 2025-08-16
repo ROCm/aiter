@@ -296,7 +296,6 @@ def _fused_moe_silu_kernel_gptq_awq(
     silu_acc, mul_acc = (
         accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
     )
-    # silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
     silu_acc = _silu_exp2(silu_acc)
     accumulator = (silu_acc * mul_acc).to(compute_type)
 
@@ -542,7 +541,7 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
         silu_acc, mul_acc = (
             accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
         )
-        silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
+        silu_acc = _silu_exp2(silu_acc)
         accumulator = (silu_acc * mul_acc).to(compute_type)
 
         # -----------------------------------------------------------
@@ -775,7 +774,7 @@ def _fused_moe_silu_kernel(
     silu_acc, mul_acc = (
         accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
     )
-    silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
+    silu_acc = _silu_exp2(silu_acc)
     accumulator = (silu_acc * mul_acc).to(compute_type)
 
     # -----------------------------------------------------------
@@ -991,7 +990,7 @@ def _fused_moe_persistent_silu_kernel(
         silu_acc, mul_acc = (
             accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
         )
-        silu_acc = silu_acc / (1.0 + tl.exp2(-(silu_acc * 1.44269504089)))
+        silu_acc = _silu_exp2(silu_acc)
         accumulator = (silu_acc * mul_acc).to(compute_type)
 
         # -----------------------------------------------------------
@@ -1041,7 +1040,7 @@ def fused_moe_silu(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            output = torch.zeros(A.shape, device=A.device, dtype=torch.float8_e4m3fnuz)
+            output = torch.zeros(A.shape, device=A.device, dtype=B.dtype)
             A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
             A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
         else:

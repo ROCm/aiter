@@ -28,7 +28,7 @@
       "top_k": 2
     }
   },
-  "mistral": {
+  "mixtral": {
     "7B": {
       "hidden_size": 4096,
       "intermediate_size": 14336,

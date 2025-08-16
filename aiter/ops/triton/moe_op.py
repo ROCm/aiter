@@ -985,7 +985,7 @@ def fused_moe(
     if use_fp8_w8a8:
         assert B_scale is not None
         if block_shape is None:
-            output = torch.zeros(A.shape, device=A.device, dtype=torch.float8_e4m3fnuz)
+            output = torch.zeros(A.shape, device=A.device, dtype=B.dtype)
             A_scale = torch.zeros(1, device=A.device, dtype=torch.float32)
             A, A_scale = _MOE_A_QUANT_FUNC(output, A, A_scale)
         else:
