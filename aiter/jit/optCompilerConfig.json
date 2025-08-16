@@ -330,7 +330,7 @@
             "'-mllvm -greedy-reverse-local-assignment=1'",
             "'-mllvm --amdgpu-use-amdgpu-trackers=1'",
             "'-mllvm --slp-threshold=-32'",
-            "'-mllvm --misched-bottomup=1'"
+            "'-mllvm --misched-prera-direction=bottomup'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
