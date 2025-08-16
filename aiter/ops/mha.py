@@ -187,6 +187,22 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
+
+
+# torch.compile() support is only enabled for pytorch >= 2.4
+# The reason for this is that we are using the new custom_op and register_fake
+# APIs, which support inplace modification of inputs in the function itself
+if torch.__version__ >= "2.4.0":
+    _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
+else:
+    # TODO
+    pass
+
+
+@_torch_custom_op_wrapper("aiter::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -313,6 +329,42 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
+@_torch_register_fake_wrapper("aiter::_flash_attn_forward")
+def _flash_attn_forward_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    return_lse: bool,
+    return_softmax: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    batch_size, seqlen_q, num_heads, head_size = q.shape
+    seqlen_k = k.shape[1]
+    out = torch.empty_like(q)
+    softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
+    p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
+    if return_softmax:
+        p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
+    rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    
+    return out, softmax_lse, p, rng_state
+
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_forward = torch.ops.aiter._flash_attn_forward
+else:
+    # TODO:
+    pass
+
+
+@_torch_custom_op_wrapper("aiter::_flash_attn_backward", mutates_args=("dq", "dk", "dv"), device_types="cuda")
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -333,8 +385,8 @@ def _flash_attn_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
+    is_v3_atomic_fp32: Optional[bool] = False,
+    how_v3_bf16_cvt: Optional[int] = 0,
 ) -> torch.Tensor:
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
         logger.warning(
@@ -629,6 +681,49 @@ def _flash_attn_backward(
     return softmax_d
 
 
+@_torch_register_fake_wrapper("aiter::_flash_attn_backward")
+def _flash_attn_backward_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = False,
+    how_v3_bf16_cvt: Optional[int] = 0,
+) -> torch.Tensor:
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if dq is None:
+        dq = torch.empty_like(q)
+    if dk is None:
+        dk = torch.empty_like(k)
+    if dv is None:
+        dv = torch.empty_like(v)
+    batch_size, seqlen_q, num_heads, _ = q.shape
+    softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
+    
+    return softmax_d
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_backward = torch.ops.aiter._flash_attn_backward
+else:
+    # TODO:
+    pass
+
+
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -646,8 +741,8 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1,
+        is_v3_atomic_fp32: Optional[bool] = False,
+        how_v3_bf16_cvt: Optional[int] = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -659,7 +754,7 @@ class FlashAttnFunc(torch.autograd.Function):
             k = torch.nn.functional.pad(k, [0, 8 - head_size_q_og % 8])
         if head_size_v_og % 8 != 0:
             v = torch.nn.functional.pad(v, [0, 8 - head_size_v_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
             k,
             v,
@@ -697,6 +792,8 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if not dout.is_contiguous():
+            dout = dout.contiguous() 
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
         bias = ctx.bias
@@ -706,7 +803,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dout_padded = dout
         if head_size_v_og % 8 != 0:
             dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_v_og % 8])
-        _flash_attn_backward(
+        _wrapped_flash_attn_backward(
             dout_padded,
             q,
             k,
@@ -1007,8 +1104,8 @@ def _flash_attn_varlen_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
+    is_v3_atomic_fp32: Optional[bool] = False,
+    how_v3_bf16_cvt: Optional[int] = 0,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
     md_name = "mha_varlen_bwd"
@@ -1228,8 +1325,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         out,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1,
+        is_v3_atomic_fp32: Optional[bool] = False,
+        how_v3_bf16_cvt: Optional[int] = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
