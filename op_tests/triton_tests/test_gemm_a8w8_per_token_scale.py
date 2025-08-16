@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import triton
@@ -109,15 +109,16 @@ def generate_gemm_a8w8_per_token_scale_inputs(
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K, output",
+    "dtype, M, N, K, layout, output",
     [
-        (dtype, *shape, output)
+        (dtype, *shape, layout, output)
         for output in [True, False]
         for dtype in ["bf16"]
+        for layout in ["TN", "TT", "NN", "NT"]
         for shape in get_x_vals()
     ],
 )
-def test_gemm(dtype, M, N, K, output):
+def test_gemm(dtype, M, N, K, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
@@ -126,6 +127,7 @@ def test_gemm(dtype, M, N, K, output):
         N,
         K,
         dtype=dtype,
+        layout=layout,
         output=output,
     )
 
