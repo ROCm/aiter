@@ -403,6 +403,8 @@ namespace aiter
     }
   }
 
+#define THREAD_NUM 512
+
   template <typename T, int ngpus>
   __global__ void __launch_bounds__(512, 1)
       cross_device_reduce_1stage(RankData *_dp, RankSignals sg,
@@ -415,7 +417,7 @@ namespace aiter
     using P = typename packed_t<T>::P;
     using A = typename packed_t<T>::A;
     constexpr int pack_size = packed_t<T>::P::size;
-    constexpr int tnum_gpu = 512 / ngpus;
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
     __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
     // note: we don't reorder the address so the accumulation order is the same
     // for all ranks, ensuring bitwise identical results
@@ -439,13 +441,14 @@ namespace aiter
         {
           add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[threadIdx.x * pack_size + i]);
         }
+        constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
         for (int i = 1; i < ngpus; ++i)
         {
 #pragma unroll
           for (int j = 0; j < pack_size; ++j)
           {
-            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[512 * i + threadIdx.x * pack_size + j]);
+            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[smem_gpu_loop_stride * i + threadIdx.x * pack_size + j]);
           }
         }
         P write_reg;
@@ -470,7 +473,7 @@ namespace aiter
                                  T *__restrict__ result, int rank, int size)
   {
     constexpr int pack_size = packed_t<T>::P::size;
-    constexpr int tnum_gpu = 512 / ngpus;
+    constexpr int tnum_gpu = THREAD_NUM / ngpus;
     using P = typename packed_t<T>::P;
     using A = typename packed_t<T>::A;
     __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
@@ -507,13 +510,14 @@ namespace aiter
         {
           add_reg.data[i] = ck_tile::type_convert<float>(tmp_smem[pack_size * threadIdx.x + i]);
         }
+        constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
 #pragma unroll
         for (int i = 1; i < ngpus; ++i)
         {
 #pragma unroll
           for (int j = 0; j < pack_size; ++j)
           {
-            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * 512 + pack_size * threadIdx.x + j]);
+            add_reg.data[j] += ck_tile::type_convert<float>(tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
           }
         }
         P write_reg;
