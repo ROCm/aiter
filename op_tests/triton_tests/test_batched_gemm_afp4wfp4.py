@@ -27,16 +27,17 @@ def generate_batched_gemm_afp4wfp4_inputs(
     torch.manual_seed(5)
     if layout[0] == "T":
         # 34 is two packed e2m1 values 0010 which is 1.0.
-        x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
-        x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8)
+        x_low = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
+        x_high = torch.randint(0, 16, (B, M, K // 2), dtype=torch.uint8, device="cuda")
     else:
         # 34 is two packed e2m1 values 0010 which is 1.0.
-        x_low = torch.randint(0, 16, (B, K // 2, M), dtype=torch.uint8).permute(0, 2, 1)
-        x_high = torch.randint(0, 16, (B, K // 2, M), dtype=torch.uint8).permute(
-            0, 2, 1
-        )
+        x_low = torch.randint(
+            0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda"
+        ).permute(0, 2, 1)
+        x_high = torch.randint(
+            0, 16, (B, K // 2, M), dtype=torch.uint8, device="cuda"
+        ).permute(0, 2, 1)
     x = x_low | x_high << 4  # Doing this computation with GPU tensors results in NaN
-    x = x.to(device="cuda")
 
     if layout[1] == "N":
         w_low = torch.randint(0, 16, (B, N, K // 2), dtype=torch.uint8, device="cuda")
