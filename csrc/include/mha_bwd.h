@@ -336,23 +336,36 @@ struct __attribute__((packed)) fmha_bwd_v3_swa_genl_args
 
 struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
 {
-    void* ptr_dq;
+    void* ptr_dq_acc;
     p2 _p0;
+    void* ptr_dq;
+    p2 _p1;
     unsigned int Ts;
-    p3 _p1;
-    unsigned int Hs;
     p3 _p2;
-    unsigned int BAs;
+    unsigned int Hs_dq_acc;
     p3 _p3;
-    unsigned int Seqs;
+    unsigned int BAs_dq_acc;
     p3 _p4;
+    unsigned int Seqs_dq_acc;
+    p3 _p5;
+    unsigned int Hs_dq;
+    p3 _p6;
+    unsigned int BAs_dq;
+    p3 _p7;
+    unsigned int Seqs_dq;
+    p3 _p8;
+    unsigned int seqlen_q;
+    p3 _p9;
+    unsigned int head_dim;
+    p3 _p10;
 };
 
 struct fmha_bwd_v3_traits
 {
     int b;
     int h;
-    int s;
+    int sq;
+    int sk;
     int d;
 
     int mask;
