@@ -975,16 +975,16 @@ def _flash_attn_forward(
         # basic
         gfx = get_gfx()
         ret = alibi_slopes is None
-        ret &= bias is None
-        ret &= dropout_p == 0.0
-        ret &= seqlen_q == seqlen_k
-        ret &= seqlen_q >= 384
-        ret &= hdim_q == hdim_v
-        ret &= hdim_q == 128
-        ret &= nhead_q % nhead_k == 0
-        ret &= not swa
-        ret &= q.dtype == dtypes.bf16
-        ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942")
+        ret = ret and (bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (seqlen_q == seqlen_k)
+        ret = ret and (seqlen_q >= 384)
+        ret = ret and (hdim_q == hdim_v)
+        ret = ret and (hdim_q == 128)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and ((return_lse and gfx == "gfx950") or (gfx == "gfx942"))
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1213,7 +1213,6 @@ def can_impl_fmha_v3_bwd(
     return ret
 
 
-@torch_compile_guard()
 def _flash_attn_backward(
     dout: torch.Tensor,
     q: torch.Tensor,
