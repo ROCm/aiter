@@ -14,11 +14,23 @@ GEN_DIR = ""  # in Cmake, have to generate files in same folder
 FMHA_BWD_API_FILENAME = "asm_fmha_bwd_v3_gfx942.cpp"
 
 FMHA_BWD_KERNEL_HEADER = """// SPDX-License-Identifier: MIT
-// Copyright (c) 2018-2024, Advanced Micro Devices, Inc. All rights reserved.\n
+// Copyright (c) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.\n
 """
 
 FMHA_BWD_API = """#include <hip/hip_fp16.h>
 #include "mha_bwd.h"
+
+#if {F_HAS_AITER_ASM_DIR_FUNC}
+const char *{F_AITER_ASM_DIR_FUNC}();
+#endif
+static inline std::string get_aiter_asm_dir()
+{{
+#if {F_HAS_AITER_ASM_DIR_FUNC}
+    return std::string({F_AITER_ASM_DIR_FUNC}()) + "{F_AITER_ASM_DIR}";
+#else
+    return "{F_AITER_ASM_DIR}";
+#endif
+}}
 
 namespace aiter {{
 
@@ -315,7 +327,7 @@ class fmha_bwd_v3_kernel
     {{
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
-        std::string AITER_ASM_DIR = "{F_AITER_ASM_DIR}";
+        std::string AITER_ASM_DIR = get_aiter_asm_dir();
         HIP_CALL(hipModuleLoad(&module, (AITER_ASM_DIR + hsaco).c_str()));
         HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_func_name.c_str()));
     }}
@@ -2104,8 +2116,22 @@ def write_blobs(output_dir: Optional[str]) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    aiter_asm_dir_func = os.getenv("AITER_ASM_DIR_FUNC")
+    if aiter_asm_dir_func is not None:
+        # Ensure the script is running in the expected directory structure
+        # And get relative ASM_DIR path
+        path_components = Path(this_dir).parts
+        if path_components[-2] != "gfx942":
+            raise ValueError("Expected 'gfx942' as the second last component of the path")
+        asm_dir = os.path.join(path_components[-2], path_components[-1], "")
+    else:
+        # Use static absolute path
+        asm_dir = this_dir + "/"
+
     dqdkdv_kernel = FMHA_BWD_KERNEL_HEADER + FMHA_BWD_API.format(
-        F_AITER_ASM_DIR=this_dir + "/",
+        F_HAS_AITER_ASM_DIR_FUNC = "1" if aiter_asm_dir_func is not None else "0",
+        F_AITER_ASM_DIR_FUNC=aiter_asm_dir_func,
+        F_AITER_ASM_DIR=asm_dir,
     )
     (output_dir / FMHA_BWD_API_FILENAME).write_text(dqdkdv_kernel)
 
