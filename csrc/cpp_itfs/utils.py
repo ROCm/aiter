@@ -41,7 +41,9 @@ AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
 
 if AITER_REBUILD >= 1:
     subprocess.run(f"rm -rf {BUILD_DIR}/*", shell=True)
-os.makedirs(BUILD_DIR, exist_ok=True)
+
+if not os.path.exists(BUILD_DIR):
+    os.makedirs(BUILD_DIR, exist_ok=True)
 
 CK_DIR = os.environ.get("CK_DIR", f"{AITER_CORE_DIR}/3rdparty/composable_kernel")
 
@@ -259,6 +261,7 @@ def compile_template_op(
         if cxxflags is None:
             cxxflags = []
         src_file = src_template.render(func_name=func_name, **kwargs)
+        logger.info(f"compile_template_op {func_name = } with {locals()}...")
         compile_lib(src_file, folder, includes, sources, cxxflags)
     return run_lib(func_name, folder)
 
