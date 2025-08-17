@@ -23,14 +23,14 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
         op_name = func.__name__
         sig = inspect.signature(func)
         return_annotation = sig.return_annotation
-        return_int = False
-        # Only return int will cause graph breaks
-        if return_annotation is int:
-            return_int = True
+        return_non_tensor = False
+        # Only return int/bool/float will cause graph breaks
+        if return_annotation in [int, bool, float]:
+            return_non_tensor = True
 
         def outer_wrapper(*args, **kwargs):
             dummy = torch.empty(1, device=device)
-            if return_int:
+            if return_non_tensor:
                 result = getattr(torch.ops.aiter, op_name)(dummy, *args, **kwargs)
                 _, int_value = result
                 return int_value
@@ -55,7 +55,7 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
             new_input = "(Tensor dummy, " + input_part[1:]
 
         output_part = output_part.strip()
-        if not return_int:
+        if not return_non_tensor:
             new_output = output_part
         else:
             # return only int will cause graph breaks and we add dummy_out
@@ -64,7 +64,7 @@ def torch_compile_guard(mutates_args: list[str] = [], device: str = "cpu"):
 
         def custom_impl(dummy_tensor, *args, **kwargs):
             out = torch.empty(1, device=device)
-            if not return_int:
+            if not return_non_tensor:
                 return func(*args, **kwargs)
             return out, func(*args, **kwargs)
 
