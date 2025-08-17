@@ -40,12 +40,17 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
 )
 @pytest.mark.parametrize("M, N, K", minimal_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, activation):
+def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activation):
     if N % 2 != 0:
         pytest.skip("Skipping shape incompatible w/gating")
+    # This is done to reduce CI execution time
+    if layout != "TN" and activation != "relu":
+        pytest.skip("Skipping non-TN layouts when activation isn't ReLU")
+
     x, w, out_dtype, y = generate_gemm_a16w16_gated_inputs(
-        M, N, K, dtype, output=output
+        M, N, K, dtype, layout=layout, output=output
     )
 
     torch_out = F.linear(x, w, bias=None)
