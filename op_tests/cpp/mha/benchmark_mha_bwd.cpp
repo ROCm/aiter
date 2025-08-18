@@ -350,11 +350,11 @@ bool run(const ck_tile::ArgParser& arg_parser)
     }
     else if(init_method == 1)
     {
-        ck_tile::FillUniformDistribution<QDataType>{0.f, 1.f, seed}(q_host);
-        ck_tile::FillUniformDistribution<KDataType>{0.f, 1.f, seed}(k_host);
-        ck_tile::FillUniformDistribution<VDataType>{0.f, 1.f, seed}(v_host);
-        ck_tile::FillUniformDistribution<BiasDataType>{0.f, 1.f, seed}(bias_host);
-        ck_tile::FillUniformDistribution<OGradDataType>{0.f, 1.f, seed}(do_host);
+        ck_tile::FillUniformDistribution<QDataType>{-1.f, 1.f, seed}(q_host);
+        ck_tile::FillUniformDistribution<KDataType>{-1.f, 1.f, seed}(k_host);
+        ck_tile::FillUniformDistribution<VDataType>{-1.f, 1.f, seed}(v_host);
+        ck_tile::FillUniformDistribution<BiasDataType>{-1.f, 1.f, seed}(bias_host);
+        ck_tile::FillUniformDistribution<OGradDataType>{-1.f, 1.f, seed}(do_host);
         // ck_tile::FillConstant<QDataType>{1}(q_host);
         // ck_tile::FillConstant<KDataType>{1}(k_host);
         // ck_tile::FillConstant<OGradDataType>{2}(do_host);

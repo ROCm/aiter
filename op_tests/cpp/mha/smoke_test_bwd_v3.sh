@@ -84,18 +84,16 @@ run_group_mode_tests() {
 
 # Current native gfx950 kernels has seqlen restriction
 run_gfx950_bwd_v3() {
-    for prec in "fp16" ; do
+    for prec in "bf16" "fp16" ; do
+    for mask in 0 1 ; do
+    for v3_atomic_fp32 in 1 0 ; do
     for batch in 1 3 ; do
-    for head in 2 4 8 ; do
+    for head in 2 4 ; do
     # for hdim in 72 80 88 96 104 112 120 ; do
-    for sq in 13 25 64 174 256 ; do
-    for sk in 13 25 64 174 256 577 713 ; do
-    for mask in 0 ; do
-    for v3_atomic_fp32 in 1 ; do
+    for sq in 13 62 174 260 513 ; do
+    for sk in 13 65 174 299 577 799 1025; do
     for perm in 0 1 ; do
-
-    $EXE -prec=$prec -b=$batch -h=$head -d=128 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
-
+        $EXE -prec=$prec -b=$batch -h=$head -h_k=2 -d=128 -s=$sq -s_k=$sk -iperm=$perm -operm=$perm -mask=$mask -bwd_v3=1 -v3_atomic_fp32=$v3_atomic_fp32 -mode=0 -kname=$KNAME $COMMON_ARGS
     done
     done
     done
