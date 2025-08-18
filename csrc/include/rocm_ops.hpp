@@ -39,7 +39,9 @@
           py::arg("softmax_scale"),        \
           py::arg("splitData"),            \
           py::arg("splitLse"),             \
-          py::arg("output"));              \
+          py::arg("output"),               \
+          py::arg("q_scale"),              \
+          py::arg("kv_scale"));            \
     m.def("mla_prefill_asm_fwd",           \
           &mla_prefill_asm_fwd,            \
           "mla_prefill_asm_fwd",           \

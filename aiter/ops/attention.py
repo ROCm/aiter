@@ -238,9 +238,9 @@ def mla_decode_stage1_asm_fwd(
     kv_page_indices: torch.Tensor,
     # [batch_size]
     kv_last_page_lens: torch.Tensor,
-    num_kv_splits_indptr: torch.Tensor,
-    work_indptr: torch.Tensor,
-    work_info_set: torch.Tensor,
+    num_kv_splits_indptr: Optional[torch.Tensor],
+    work_indptr: Optional[torch.Tensor],
+    work_info_set: Optional[torch.Tensor],
     max_seqlen_q: int,
     softmax_scale: float,
     # [batch_size, num_kv_splits, num_heads, v_head_dim]
@@ -249,6 +249,8 @@ def mla_decode_stage1_asm_fwd(
     splitLse: torch.Tensor,
     output: torch.Tensor,
     # [batch_size, num_heads, v_head_dim]
+    q_scale: Optional[torch.Tensor],
+    kv_scale: Optional[torch.Tensor],
 ): ...
 
 

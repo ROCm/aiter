@@ -42,9 +42,9 @@ struct __attribute__((packed)) KernelArgs
     void* ptr_RP;
     p2 _p20;
     void* ptr_QSCALE;
-    p2 _p19;
+    p2 _p21;
     void* ptr_KVSCALE;
-    p2 _p20;
+    p2 _p22;
 };
 
 void mla_decode_stage1_asm_fwd(
@@ -63,6 +63,8 @@ void mla_decode_stage1_asm_fwd(
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& splitLse,  //[batch_size, num_kv_splits, num_heads,  1]
     torch::Tensor& output     //[batch_size, num_heads, v_head_dim]
+    std::optional<torch::Tensor>& q_scale,            //   [1]
+    std::optional<torch::Tensor>& kv_scale,           //   [1]
 )
 {
     int batch           = qo_indptr.size(0) - 1;
@@ -191,6 +193,11 @@ void mla_decode_stage1_asm_fwd(
     }
     else if(Q.dtype() == at::ScalarType::Float8_e4m3fn) // at::ScalarType::Float8_e4m3fnuz or at::ScalarType::Float8_e4m3fn ?
     {
+        args.ptr_QSCALE  = q_scale.value().data_ptr();
+        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+
+        assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
+
         if(gqa_ratio == 16)
         {
             if(max_seqlen_q == 2)
