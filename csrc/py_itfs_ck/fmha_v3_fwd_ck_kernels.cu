@@ -144,52 +144,38 @@ using get_kernel_t = typename get_kernel<DataType, PadSeqlen, IsMasking>::type;
 template <typename Kernel>
 void launch(const host_args& args)
 {
-    auto kargs = Kernel::MakeKargsImpl(args.q_ptr,
-                                       args.k_ptr,
-                                       args.v_ptr,
-                                       nullptr, // bias_ptr
-                                       nullptr, // rand_val_ptr
-                                       nullptr, // lse_ptr
-                                       args.o_ptr,
-                                       args.seqlen_q,
-                                       args.seqlen_k,
-                                       args.hdim_q,
-                                       args.hdim_v,
-                                       args.nhead_q,
-                                       args.nhead_q / args.nhead_k,
-                                       args.scale_s,
-                                       1.0f, // scale_p
-                                       1.0f, // scale_o
-                                       0.0f, // logits_soft_cap
-                                       args.stride_q,
-                                       args.stride_k,
-                                       args.stride_v,
-                                       0, // stride_bias
-                                       0, // stride_randval
-                                       args.stride_o,
-                                       args.nhead_stride_q,
-                                       args.nhead_stride_k,
-                                       args.nhead_stride_v,
-                                       0, // nhead_stride_bias
-                                       0, // nhead_stride_randval
-                                       0, // nhead_stride_lse
-                                       args.nhead_stride_o,
-                                       args.batch_stride_q,
-                                       args.batch_stride_k,
-                                       args.batch_stride_v,
-                                       0, // batch_stride_bias
-                                       0, // batch_stride_randval
-                                       0, // batch_stride_lse
-                                       args.batch_stride_o,
-                                       args.window_size_left,
-                                       args.window_size_right,
-                                       args.mask_type,
-                                       0.0f,                      // p_drop
-                                       false,                     // s_randval
-                                       std::make_pair(0UL, 0UL)); // drop_seed_offset
+    auto kargs = Kernel::MakeKargs(args.q_ptr,
+                                   args.k_ptr,
+                                   args.v_ptr,
+                                   nullptr, // lse_ptr
+                                   args.o_ptr,
+                                   args.seqlen_q,
+                                   args.seqlen_k,
+                                   args.hdim_q,
+                                   args.hdim_v,
+                                   args.nhead_q,
+                                   args.nhead_q / args.nhead_k,
+                                   args.scale_s,
+                                   args.stride_q,
+                                   args.stride_k,
+                                   args.stride_v,
+                                   args.stride_o,
+                                   args.nhead_stride_q,
+                                   args.nhead_stride_k,
+                                   args.nhead_stride_v,
+                                   0, // nhead_stride_lse
+                                   args.nhead_stride_o,
+                                   args.batch_stride_q,
+                                   args.batch_stride_k,
+                                   args.batch_stride_v,
+                                   0, // batch_stride_lse
+                                   args.batch_stride_o,
+                                   args.window_size_left,
+                                   args.window_size_right,
+                                   args.mask_type);
 
-    dim3 grids = Kernel::GridSize(args.batch, args.nhead_q, args.seqlen_q, args.hdim_v, false);
-    constexpr dim3 blocks                  = Kernel::BlockSize();
+    dim3 grids            = Kernel::GridSize(args.batch, args.nhead_q, args.seqlen_q, args.hdim_v);
+    constexpr dim3 blocks = Kernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
