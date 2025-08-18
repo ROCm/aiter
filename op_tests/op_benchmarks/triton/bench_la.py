@@ -160,6 +160,8 @@ def bench_lean_attention(
     Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
+    XCD_REMAP = True
+    NUM_XCDS = 8
 
     # Triton LeanAttention output
     fn = lambda: _persistent_lean_attention(  # noqa: E731
@@ -174,6 +176,8 @@ def bench_lean_attention(
         total_programs,
         BLOCK_M,
         BLOCK_N,
+        XCD_REMAP,
+        NUM_XCDS,
         causal,
         batch,
         sm_scale,
