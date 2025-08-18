@@ -29,8 +29,17 @@
 namespace aiter {
 namespace torch_itfs {
 namespace {
-struct host_args
+struct fmha_fwd_v3_args
 {
+    enum class data_type_enum
+    {
+        fp16,
+        bf16
+    };
+
+    data_type_enum data_type;
+    // bool is_varlen;
+
     ck_tile::index_t batch;
     ck_tile::index_t seqlen_q;
     ck_tile::index_t seqlen_k;
@@ -127,7 +136,7 @@ template <typename DataType, bool PadSeqlen, bool IsMasking>
 using get_kernel_t = typename get_kernel<DataType, PadSeqlen, IsMasking>::type;
 
 template <typename Kernel>
-void launch(const host_args& args)
+float launch(const fmha_fwd_v3_args& args, const ck_tile::stream_config& config)
 {
     auto kargs = Kernel::MakeKargs(args.q_ptr,
                                    args.k_ptr,
@@ -163,12 +172,51 @@ void launch(const host_args& args)
     constexpr dim3 blocks = Kernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = Kernel::kBlockPerCu;
 
-    auto stream = at::cuda::getCurrentHIPStream().stream();
-    ck_tile::stream_config stream_config{stream};
+    return ck_tile::launch_kernel(
+        config, ck_tile::make_kernel<blocks.x, kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
+}
 
-    [[maybe_unused]] const float time = ck_tile::launch_kernel(
-        stream_config,
-        ck_tile::make_kernel<blocks.x, kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
+float fmha_fwd_v3(const fmha_fwd_v3_args& args, const ck_tile::stream_config& config)
+{
+    float time = 0.0;
+
+    // TODO: compile fp16/bf16, masking=true/false kernels separately
+    if(args.data_type == fmha_fwd_v3_args::data_type_enum::fp16)
+    {
+        if(args.mask_type == static_cast<int>(mask_enum::no_mask))
+        {
+#if !DEBUG_SINGLE_INST || \
+    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
+            time = launch<get_kernel_t<FmhaFwdFp16, true, false>>(args, config);
+#endif
+        }
+        else
+        {
+#if !DEBUG_SINGLE_INST || \
+    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
+            time = launch<get_kernel_t<FmhaFwdFp16, true, true>>(args, config);
+#endif
+        }
+    }
+    else if(args.data_type == fmha_fwd_v3_args::data_type_enum::bf16)
+    {
+        if(args.mask_type == static_cast<int>(mask_enum::no_mask))
+        {
+#if !DEBUG_SINGLE_INST || \
+    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
+            time = launch<get_kernel_t<FmhaFwdBf16, true, false>>(args, config);
+#endif
+        }
+        else
+        {
+#if !DEBUG_SINGLE_INST || \
+    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
+            time = launch<get_kernel_t<FmhaFwdBf16, true, true>>(args, config);
+#endif
+        }
+    }
+
+    return 0.0;
 }
 } // namespace
 //////////////////////////////////////////////////////////////////////////////////////
@@ -250,7 +298,10 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         mask = mask_info::decode(mask_identify, seqlen_q, seqlen_k); // local
     }
 
-    host_args args;
+    fmha_fwd_v3_args args;
+
+    args.data_type = (q_dtype == at::ScalarType::Half) ? fmha_fwd_v3_args::data_type_enum::fp16
+                                                       : fmha_fwd_v3_args::data_type_enum::bf16;
 
     args.batch    = batch_size;
     args.seqlen_q = seqlen_q;
@@ -290,41 +341,10 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
     args.stride_o       = out.stride(1);
     args.nhead_stride_o = out.stride(2);
 
-    // TODO: compile fp16/bf16, masking=true/false kernels separately
-    if(q_dtype == at::ScalarType::Half)
-    {
-        if(mask.type == mask_enum::no_mask)
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            launch<get_kernel_t<FmhaFwdFp16, true, false>>(args);
-#endif
-        }
-        else
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            launch<get_kernel_t<FmhaFwdFp16, true, true>>(args);
-#endif
-        }
-    }
-    else if(q_dtype == at::ScalarType::BFloat16)
-    {
-        if(mask.type == mask_enum::no_mask)
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            launch<get_kernel_t<FmhaFwdBf16, true, false>>(args);
-#endif
-        }
-        else
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            launch<get_kernel_t<FmhaFwdBf16, true, true>>(args);
-#endif
-        }
-    }
+    auto stream = at::cuda::getCurrentHIPStream().stream();
+    ck_tile::stream_config stream_config{stream};
+
+    fmha_fwd_v3(args, stream_config);
 
     return {out};
 }
