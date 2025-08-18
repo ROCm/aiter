@@ -2075,6 +2075,8 @@ def _flash_attn_forward(
     if persistent:
         vanilla = True    
         NUM_WGS = torch.cuda.get_device_properties("cuda").multi_processor_count # launch a persistent workgroup per CU
+        NUM_XCDS = 8
+
         if vanilla:
             num_tiles = batch * num_q_heads * triton.cdiv(max_seqlen_q, config["BLOCK_M"]) 
             grid = (min(num_tiles, NUM_WGS),)
@@ -2161,7 +2163,6 @@ def _flash_attn_forward(
             num_tiles = num_seq_tiles * num_q_heads
 
             grid = (min(num_tiles, NUM_WGS),) # TODO: get rid of the min to avoid recompiling in case of num_tiles < NUM_WGS
-            NUM_XCDS = 8
 
             _attn_fwd_persistent_static[grid](
                 q,
