@@ -11,138 +11,8 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 
 import torch
 import argparse
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-is_hip_ = is_hip()
-
-
-def input_helper(
-    B,
-    H,
-    prefix_length,
-    extend_length,
-    kv_lora_rank,
-    qk_rope_head_dim,
-    v_head_dim,
-    dtype,
-    device,
-    attn_impl="absorb",
-    equal_seqlens=False,
-    requires_grad=False,
-):
-    torch.manual_seed(0)
-
-    if not equal_seqlens:
-        max_extend_length = extend_length
-        max_prefix_length = prefix_length
-
-        seqlens_extend = torch.randint(
-            1, max_extend_length + 1, (B,), dtype=torch.int32
-        )
-        if prefix_length == 0:
-            seqlens_prefix = torch.full((B,), prefix_length)
-        else:
-            seqlens_prefix = torch.randint(
-                1, max_prefix_length + 1, (B,), dtype=torch.int32
-            )
-
-    else:
-        seqlens_extend = torch.full((B,), extend_length)
-        seqlens_prefix = torch.full((B,), prefix_length)
-
-    B_Seqlen = seqlens_extend + seqlens_prefix
-    B_Seqlen = B_Seqlen.to(device="cuda")
-
-    cu_seqlens_extend = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32),
-            seqlens_extend.cumsum(dim=0, dtype=torch.int32),
-        ]
-    )
-    cu_seqlens_prefix = torch.cat(
-        [
-            torch.tensor([0], dtype=torch.int32),
-            seqlens_prefix.cumsum(dim=0, dtype=torch.int32),
-        ]
-    )
-
-    cu_seqlens_extend = cu_seqlens_extend.to(device="cuda")
-    cu_seqlens_prefix = cu_seqlens_prefix.to(device="cuda")
-
-    B_Start_Loc = cu_seqlens_extend
-
-    total_extend = cu_seqlens_extend[-1].item()
-    total_prefix = cu_seqlens_prefix[-1].item()
-
-    if attn_impl == "absorb":
-        Lq = kv_lora_rank + qk_rope_head_dim
-        Lk = kv_lora_rank + qk_rope_head_dim
-        Lv = kv_lora_rank
-    else:
-        Lq = v_head_dim + qk_rope_head_dim
-        Lk = v_head_dim + qk_rope_head_dim
-        Lv = v_head_dim
-
-    q_extend = torch.randn(
-        total_extend, H, Lq, dtype=dtype, device=device
-    ).requires_grad_(requires_grad)
-
-    # extend parts
-    k_extend = torch.randn(
-        total_extend, 1, Lk, dtype=dtype, device=device
-    ).requires_grad_(requires_grad)
-    v_extend = k_extend[..., :Lv]
-
-    # extend indexing
-    qo_indptr = cu_seqlens_extend  # torch.arange(B + 1, device=device) * (extend_length) # 0, extend_length, extend_length*2
-
-    # prefix parts
-    k_buffer = torch.randn(
-        total_prefix, 1, Lk, dtype=dtype, device=device
-    ).requires_grad_(requires_grad)
-    v_buffer = k_buffer[..., :Lv]
-
-    if attn_impl != "absorb":
-        # simulate v = kv_latent * w_vc which changes the values compared to k
-        v_extend = torch.randn_like(v_extend)
-        v_buffer = torch.randn_like(v_buffer)
-
-    # prefix indexing
-    kv_indptr = cu_seqlens_prefix  # torch.arange(B + 1, device=device) * prefix_length # 0, prefix_length, prefix_length*2
-    kv_indices = torch.arange(total_prefix, device=device)
-
-    max_prefix = seqlens_prefix.max().item()
-    B_Loc = torch.full((B, max_prefix), -1, dtype=torch.int32, device=device)
-    for b in range(B):
-        start = cu_seqlens_prefix[b].item()
-        end = cu_seqlens_prefix[b + 1].item()
-        B_Loc[b, : seqlens_prefix[b]] = torch.arange(start, end, device=device)
-    B_Loc = B_Loc.unsqueeze(-1)  # [B, max_prefix, 1]
-
-    custom_mask = None
-    mask_indptr = None
-    max_len_extend = extend_length
-
-    return (
-        q_extend,
-        k_extend,
-        v_extend,
-        k_buffer,
-        v_buffer,
-        kv_indptr,
-        kv_indices,
-        qo_indptr,
-        custom_mask,
-        mask_indptr,
-        max_len_extend,
-        B_Start_Loc,
-        B_Loc,
-        B_Seqlen,
-    )
+from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.test_extend_attention import input_helper
 
 
 def extend_forward(
@@ -277,9 +147,9 @@ def model_benchmark_configs(args):
     x_vals_list = []
 
     for model_name, config in configs.items():
-        HQ = config["num_attention_heads"] // 8  # tp8 mode
-        prefix = args.prefix if args.prefix else 16324
-        extend = args.extend if args.extend else 8192
+        HQ = config["num_attention_heads"]
+        prefix = args.prefix
+        extend = args.extend
         attn_impl = args.attn_impl if args.attn_impl else "non-absorb"
         x_vals_list.append(
             (model_name, batch_size, HQ, prefix, extend, 512, 64, 128, attn_impl)
@@ -289,13 +159,16 @@ def model_benchmark_configs(args):
 
 
 def benchmark(args):
-    dtype = arg_to_torch_dtype[args.dtype]
+    dtype = str_to_torch_dtype[args.dtype]
     torch.set_default_dtype(dtype)
 
     configs = []
 
+    causal = args.causal
+
     if args.model:
         x_names, x_vals_list = model_benchmark_configs(args)
+        causal = True  # Force causal=True for model benchmarks
     else:
         if args.mode == "extend":
             x_names, x_vals_list = get_extend_benchmark_configs()
@@ -355,9 +228,6 @@ def benchmark(args):
             custom_mask,
             mask_indptr,
             max_len_extend,
-            B_Start_Loc,
-            B_Loc,
-            B_Seqlen,
         ) = input_helper(
             B,
             H,
@@ -368,48 +238,26 @@ def benchmark(args):
             v_head_dim,
             dtype,
             device,
+            attn_impl=args.attn_impl,
         )
 
-        if provider == "extend_attention_fwd":
-
-            def extend_attention():
-                return extend_forward(
-                    q_extend,
-                    k_extend,
-                    v_extend,
-                    k_buffer,
-                    v_buffer,
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    custom_mask,
-                    mask_indptr,
-                    max_len_extend,
-                    args.causal,
-                    sm_scale,
-                    logit_cap,
-                )
-
-            def context_attention():
-                return extend_forward(
-                    q_extend,
-                    k_extend,
-                    v_extend,
-                    B_Start_Loc,
-                    B_Seqlen,
-                    max_len_extend,
-                    args.causal,
-                )
-
-            if provider == "extend_attention_fwd":
-                fn = extend_attention
-            elif provider == "context_attention_fwd":
-                assert (
-                    prefix == 0
-                ), "Prefix length must be 0 for context attention. Try setting -mode prefill."
-                fn = context_attention
-            else:
-                raise ValueError(f"Unknown provider: {provider}")
+        def fn():
+            return extend_forward(
+                q_extend,
+                k_extend,
+                v_extend,
+                k_buffer,
+                v_buffer,
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                custom_mask,
+                mask_indptr,
+                max_len_extend,
+                causal,
+                sm_scale,
+                logit_cap,
+            )
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
 
@@ -417,13 +265,6 @@ def benchmark(args):
 
     bench_MLA.run(save_path="." if args.o else None, print_data=True, show_plots=False)
     return x_vals_list, x_names, line_vals
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
 
 
 def parse_args():
@@ -483,13 +324,6 @@ def parse_args():
         help="Write performance results to CSV file",
     )
     return parser.parse_args()
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
 
 
 def run_bench(args):
