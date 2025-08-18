@@ -164,8 +164,7 @@ def _ff_a16w16_fused_gated(
     y_ptrs = y_ptr + (offs_ym[:, None] * stride_ym + offs_k[None, :] * stride_yk)
 
     # Stagger k-loop start position based on N block index (to minimize contention)
-    P = 7 # cheap hashing prime
-    k_cyclic_offset = (pid_n * P + pid_m) % tl.cdiv(K, BLOCK_SIZE_K)
+    k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
     w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
     y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
