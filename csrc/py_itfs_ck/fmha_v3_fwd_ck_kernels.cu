@@ -5,8 +5,7 @@
 
 #include "ck_tile/core.hpp"
 #include "ck_tile/core/utility/functional.hpp"
-#include "ck_tile/ops/common.hpp"
-#include "ck_tile/ops/fmha/block/block_attention_bias_enum.hpp"
+#include "ck_tile/ops/epilogue/default_2d_epilogue.hpp"
 #include "ck_tile/ops/fmha/kernel/fmha_fwd_v3_kernel.hpp"
 #include "ck_tile/ops/fmha/pipeline/block_fmha_fwd_v3_pipeline.hpp"
 
@@ -298,16 +297,6 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-#if 0
-            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
-            {
-                launch<get_kernel_t<FmhaFwdFp16, false, false>>(args);
-            }
-            else
-            {
-                launch<get_kernel_t<FmhaFwdFp16, true, false>>(args);
-            }
-#endif
             launch<get_kernel_t<FmhaFwdFp16, true, false>>(args);
 #endif
         }
@@ -315,16 +304,6 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-#if 0
-            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
-            {
-                launch<get_kernel_t<FmhaFwdFp16, false, true>>(args);
-            }
-            else
-            {
-                launch<get_kernel_t<FmhaFwdFp16, true, true>>(args);
-            }
-#endif
             launch<get_kernel_t<FmhaFwdFp16, true, true>>(args);
 #endif
         }
@@ -335,16 +314,6 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-#if 0
-            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
-            {
-                launch<get_kernel_t<FmhaFwdBf16, false, false>>(args);
-            }
-            else
-            {
-                launch<get_kernel_t<FmhaFwdBf16, true, false>>(args);
-            }
-#endif
             launch<get_kernel_t<FmhaFwdBf16, true, false>>(args);
 #endif
         }
@@ -352,16 +321,6 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-#if 0
-            if(seqlen_q % 256 == 0 && seqlen_k % 32 == 0)
-            {
-                launch<get_kernel_t<FmhaFwdBf16, false, true>>(args);
-            }
-            else
-            {
-                launch<get_kernel_t<FmhaFwdBf16, true, true>>(args);
-            }
-#endif
             launch<get_kernel_t<FmhaFwdBf16, true, true>>(args);
 #endif
         }
