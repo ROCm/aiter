@@ -275,7 +275,8 @@ def build_module(
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
-        recopy_ck()
+        if prebuild != 1:
+            recopy_ck()
         if AITER_REBUILD == 1:
             rm_module(md_name)
             clear_build(md_name)
