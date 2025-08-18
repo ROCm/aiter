@@ -1345,8 +1345,155 @@ def _attn_fwd_persistent_static(
             USE_INT64_STRIDES)
 
     
+@triton.jit
+def _attn_fwd_persistent_vanilla(
+    q_ptr: torch.Tensor,
+    k_ptr: torch.Tensor,
+    v_ptr: torch.Tensor,
+    descale_q_ptr: torch.Tensor,
+    descale_k_ptr: torch.Tensor,
+    descale_v_ptr: torch.Tensor,
+    out_ptr: torch.Tensor,
+    alibi_slopes_ptr: torch.Tensor,
+    s_dmask_ptr: torch.Tensor,
+    dropout_mask_ptr: torch.Tensor,
+    softmax_lse_ptr: torch.Tensor,
+    stride_qz_in,
+    stride_qh_in,
+    stride_qm_in,
+    stride_qk_in,
+    stride_kz_in,
+    stride_kh_in,
+    stride_kn_in,
+    stride_kk_in,
+    stride_vz_in,
+    stride_vh_in,
+    stride_vn_in,
+    stride_vk_in,
+    stride_descale_q_z_in,
+    stride_descale_k_z_in,
+    stride_descale_v_z_in,
+    stride_oz_in,
+    stride_oh_in,
+    stride_om_in,
+    stride_on_in,
+    stride_alibi_z_in,
+    stride_alibi_h_in,
+    stride_sd_z_in,
+    stride_sd_h_in,
+    stride_sd_m_in,
+    stride_sd_n_in,
+    stride_lse_z_in,
+    stride_lse_h_in,
+    stride_lse_m_in,
+    sm_scale: tl.constexpr,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    dropout_p,
+    philox_seed,
+    philox_offset_base_in,
+    SEQLEN_Q: tl.constexpr,
+    num_tiles,
+    SEQLEN_K: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_K_HEADS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DMODEL_POW2: tl.constexpr,
+    RETURN_SCORES: tl.constexpr,
+    ENABLE_DROPOUT: tl.constexpr,
+    IS_FP8: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    VARLEN: tl.constexpr,
+    BATCH,
+    NUM_XCD: tl.constexpr,
+    USE_INT64_STRIDES: tl.constexpr,
+    NUM_WGS: tl.constexpr,
+):
+    """
+    cu_tilecounts_q: [NUM_BLOCKS] number of tiles per tile range across sequences. 
+    For example, with sequence lengths [300, 100, 200], and tile size 100, we have NUM_BLOCKS = 3, 
+    tilecounts_q = [3, 2, 1], i.e. 3 sequences in the batch are >= 0, 2 sequences are >= 100, and 1 sequence is >= 200. 
+    to get cu_tilecounts_q we do a cumsum and add 0 in front.
+    """
+    # max num blocks along seqlen
+    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
+    # calculate offsets
+    workgroup_id = tl.program_id(
+        0
+    )  # persistent workgroup id ranging: 0,1,2,...., NUM_WGS - 1
+    for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, flatten=True):
+        off_q_head = tile_id % NUM_Q_HEADS
+        start_m = tile_id // NUM_Q_HEADS % NUM_BLOCKS
+        off_z = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
+        _process_tile(
+            start_m,
+            off_z,
+            off_q_head,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            descale_q_ptr,
+            descale_k_ptr,
+            descale_v_ptr,
+            out_ptr,
+            alibi_slopes_ptr,
+            s_dmask_ptr,
+            dropout_mask_ptr,
+            softmax_lse_ptr,
+            stride_qz_in,
+            stride_qh_in,
+            stride_qm_in,
+            stride_qk_in,
+            stride_kz_in,
+            stride_kh_in,
+            stride_kn_in,
+            stride_kk_in,
+            stride_vz_in,
+            stride_vh_in,
+            stride_vn_in,
+            stride_vk_in,
+            stride_descale_q_z_in,
+            stride_descale_k_z_in,
+            stride_descale_v_z_in,
+            stride_oz_in,
+            stride_oh_in,
+            stride_om_in,
+            stride_on_in,
+            stride_alibi_z_in,
+            stride_alibi_h_in,
+            stride_sd_z_in,
+            stride_sd_h_in,
+            stride_sd_m_in,
+            stride_sd_n_in,
+            stride_lse_z_in,
+            stride_lse_h_in,
+            stride_lse_m_in,
+            sm_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            dropout_p,
+            philox_seed,
+            philox_offset_base_in,
+            SEQLEN_Q,
+            SEQLEN_K,
+            IS_CAUSAL,
+            NUM_Q_HEADS,
+            NUM_K_HEADS,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+            RETURN_SCORES,
+            ENABLE_DROPOUT,
+            IS_FP8,
+            FP8_MAX,
+            VARLEN,
+            USE_INT64_STRIDES)
 
-
+    
 @triton.jit
 def find_seq_idx(
     cu_seqlens_q,
@@ -1924,93 +2071,152 @@ def _flash_attn_forward(
     if config is None:
         config = _get_config(enable_dropout, persistent, q.dtype)
     
+
     if persistent:
-        # Compute seqtile counts across batch given cumulative sequence lengths (cu_seqlens_q)
-        # Example: cu_seqlens_q = tensor([0, 200, 600, 900]) -> sequence lengths: [200, 400, 300]
-        # For a tile size of 100, we want counts per tile index:
-        #   tile 0: all sequences have at least 100 tokens  -> count = 3
-        #   tile 1: all sequences have at least 200 tokens -> count = 3
-        #   tile 2: sequences with ≥ 300 tokens  -> count = 2
-        #   tile 3: sequences with ≥ 400 tokens  -> count = 1
-
-        tile_size = config["BLOCK_M"]
-        # Get each sequence length
-        seq_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-
-        # Determine how many tiles maximum (rounding up)
-        max_tile = (max_seqlen_q + tile_size - 1) // tile_size
-
-        tile_counts = torch.empty(max_tile, dtype=torch.int32, device=cu_seqlens_q.device)
-        for i in range(max_tile):
-            # For tile index i, need sequences with length at least (i+1)*tile_size
-            threshold = (i) * tile_size
-            tile_counts[i] = (seq_lengths > threshold).sum()
-
-        # add 0 in front
-        tile_counts = torch.cat([torch.zeros(1, dtype=tile_counts.dtype, device=tile_counts.device), tile_counts.cumsum(dim=0)])        
-        
+        vanilla = True    
         NUM_WGS = torch.cuda.get_device_properties("cuda").multi_processor_count # launch a persistent workgroup per CU
-        # total number of tiles
-        num_seq_tiles = q.shape[0] // config["BLOCK_M"] + batch # + batch in case there are tiles at sequence boundaries
-        num_tiles = num_seq_tiles * num_q_heads
+        if vanilla:
+            num_tiles = batch * num_q_heads * triton.cdiv(max_seqlen_q, config["BLOCK_M"]) 
+            grid = (min(num_tiles, NUM_WGS),)
+            _attn_fwd_persistent_vanilla[grid](
+                q,
+                k,
+                v,
+                descale_q,
+                descale_k,
+                descale_v,
+                o,
+                alibi_slopes,
+                s_dmask,
+                dropout_mask,
+                softmax_lse,
+                *q_strides,
+                *k_strides,
+                *v_strides,
+                descale_q.stride(0) if descale_q is not None else 0,
+                descale_k.stride(0) if descale_k is not None else 0,
+                descale_v.stride(0) if descale_v is not None else 0,
+                *o_strides,
+                alibi_slopes.stride(0) if alibi_slopes is not None else 0,
+                alibi_slopes.stride(1) if alibi_slopes is not None else 0,
+                s_dmask.stride(0) if s_dmask is not None else 0,
+                s_dmask.stride(1) if s_dmask is not None else 0,
+                s_dmask.stride(2) if s_dmask is not None else 0,
+                s_dmask.stride(3) if s_dmask is not None else 0,
+                stride_lse_z if softmax_lse is not None else 0,
+                stride_lse_h if softmax_lse is not None else 0,
+                stride_lse_m if softmax_lse is not None else 0,
+                softmax_scale,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                dropout_p=dropout_p,
+                philox_seed=philox_seed,
+                philox_offset_base_in=philox_offset,
+                SEQLEN_Q=max_seqlen_q,
+                num_tiles=num_tiles,
+                SEQLEN_K=max_seqlen_k,
+                IS_CAUSAL=causal,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_K_HEADS=num_k_heads,
+                BLOCK_DMODEL=head_sz,
+                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+                RETURN_SCORES=return_softmax,
+                ENABLE_DROPOUT=enable_dropout,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                VARLEN=is_varlen,
+                BATCH=batch,
+                NUM_XCD=NUM_XCDS,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                NUM_WGS=NUM_WGS,
+                **config,
+            )
+        else:
+            # Compute seqtile counts across batch given cumulative sequence lengths (cu_seqlens_q)
+            # Example: cu_seqlens_q = tensor([0, 200, 600, 900]) -> sequence lengths: [200, 400, 300]
+            # For a tile size of 100, we want counts per tile index:
+            #   tile 0: all sequences have at least 100 tokens  -> count = 3
+            #   tile 1: all sequences have at least 200 tokens -> count = 3
+            #   tile 2: sequences with ≥ 300 tokens  -> count = 2
+            #   tile 3: sequences with ≥ 400 tokens  -> count = 1
 
-        grid = (min(num_tiles, NUM_WGS),) # TODO: get rid of the min to avoid recompiling in case of num_tiles < NUM_WGS
-        NUM_XCDS = 8
+            tile_size = config["BLOCK_M"]
+            # Get each sequence length
+            seq_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
 
-        _attn_fwd_persistent_static[grid](
-            q,
-            k,
-            v,
-            descale_q,
-            descale_k,
-            descale_v,
-            o,
-            alibi_slopes,
-            s_dmask,
-            dropout_mask,
-            softmax_lse,
-            *q_strides,
-            *k_strides,
-            *v_strides,
-            descale_q.stride(0) if descale_q is not None else 0,
-            descale_k.stride(0) if descale_k is not None else 0,
-            descale_v.stride(0) if descale_v is not None else 0,
-            *o_strides,
-            alibi_slopes.stride(0) if alibi_slopes is not None else 0,
-            alibi_slopes.stride(1) if alibi_slopes is not None else 0,
-            s_dmask.stride(0) if s_dmask is not None else 0,
-            s_dmask.stride(1) if s_dmask is not None else 0,
-            s_dmask.stride(2) if s_dmask is not None else 0,
-            s_dmask.stride(3) if s_dmask is not None else 0,
-            stride_lse_z if softmax_lse is not None else 0,
-            stride_lse_h if softmax_lse is not None else 0,
-            stride_lse_m if softmax_lse is not None else 0,
-            softmax_scale,
-            cu_tilecounts_q=tile_counts,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            dropout_p=dropout_p,
-            philox_seed=philox_seed,
-            philox_offset_base_in=philox_offset,
-            SEQLEN_Q=max_seqlen_q,
-            num_tiles=num_tiles,
-            SEQLEN_K=max_seqlen_k,
-            IS_CAUSAL=causal,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_K_HEADS=num_k_heads,
-            BLOCK_DMODEL=head_sz,
-            BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
-            RETURN_SCORES=return_softmax,
-            ENABLE_DROPOUT=enable_dropout,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            VARLEN=is_varlen,
-            BATCH=batch,
-            NUM_XCD=NUM_XCDS,
-            USE_INT64_STRIDES=_USE_INT64_STRIDES,
-            NUM_WGS=NUM_WGS,
-            **config,
-        )
+            # Determine how many tiles maximum (rounding up)
+            max_tile = (max_seqlen_q + tile_size - 1) // tile_size
+
+            tile_counts = torch.empty(max_tile, dtype=torch.int32, device=cu_seqlens_q.device)
+            for i in range(max_tile):
+                # For tile index i, need sequences with length at least (i+1)*tile_size
+                threshold = (i) * tile_size
+                tile_counts[i] = (seq_lengths > threshold).sum()
+
+            # add 0 in front
+            tile_counts = torch.cat([torch.zeros(1, dtype=tile_counts.dtype, device=tile_counts.device), tile_counts.cumsum(dim=0)])        
+            
+            # total number of tiles
+            num_seq_tiles = q.shape[0] // config["BLOCK_M"] + batch # + batch in case there are tiles at sequence boundaries
+            num_tiles = num_seq_tiles * num_q_heads
+
+            grid = (min(num_tiles, NUM_WGS),) # TODO: get rid of the min to avoid recompiling in case of num_tiles < NUM_WGS
+            NUM_XCDS = 8
+
+            _attn_fwd_persistent_static[grid](
+                q,
+                k,
+                v,
+                descale_q,
+                descale_k,
+                descale_v,
+                o,
+                alibi_slopes,
+                s_dmask,
+                dropout_mask,
+                softmax_lse,
+                *q_strides,
+                *k_strides,
+                *v_strides,
+                descale_q.stride(0) if descale_q is not None else 0,
+                descale_k.stride(0) if descale_k is not None else 0,
+                descale_v.stride(0) if descale_v is not None else 0,
+                *o_strides,
+                alibi_slopes.stride(0) if alibi_slopes is not None else 0,
+                alibi_slopes.stride(1) if alibi_slopes is not None else 0,
+                s_dmask.stride(0) if s_dmask is not None else 0,
+                s_dmask.stride(1) if s_dmask is not None else 0,
+                s_dmask.stride(2) if s_dmask is not None else 0,
+                s_dmask.stride(3) if s_dmask is not None else 0,
+                stride_lse_z if softmax_lse is not None else 0,
+                stride_lse_h if softmax_lse is not None else 0,
+                stride_lse_m if softmax_lse is not None else 0,
+                softmax_scale,
+                cu_tilecounts_q=tile_counts,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                dropout_p=dropout_p,
+                philox_seed=philox_seed,
+                philox_offset_base_in=philox_offset,
+                SEQLEN_Q=max_seqlen_q,
+                num_tiles=num_tiles,
+                SEQLEN_K=max_seqlen_k,
+                IS_CAUSAL=causal,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_K_HEADS=num_k_heads,
+                BLOCK_DMODEL=head_sz,
+                BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
+                RETURN_SCORES=return_softmax,
+                ENABLE_DROPOUT=enable_dropout,
+                IS_FP8=IS_FP8,
+                FP8_MAX=FP8_MAX,
+                VARLEN=is_varlen,
+                BATCH=batch,
+                NUM_XCD=NUM_XCDS,
+                USE_INT64_STRIDES=_USE_INT64_STRIDES,
+                NUM_WGS=NUM_WGS,
+                **config,
+            )
     
     else:
         num_tiles = batch * num_q_heads * triton.cdiv(max_seqlen_q, config["BLOCK_M"]) 
