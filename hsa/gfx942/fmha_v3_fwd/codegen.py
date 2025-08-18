@@ -194,7 +194,9 @@ def write_blobs(output_dir: Optional[str]) -> None:
         output_dir = Path(output_dir) / GEN_DIR
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / FMHA_FWD_API_FILENAME).write_text(FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API)
+    (output_dir / FMHA_FWD_API_FILENAME).write_text(
+        FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API
+    )
 
 
 if __name__ == "__main__":
