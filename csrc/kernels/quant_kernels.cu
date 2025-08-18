@@ -414,13 +414,10 @@ __global__ void dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     float row_scale     = std::get<0>(res);
     DTYPE_I* vec_ptr    = std::get<1>(res);
 
-    // __shared__ float token_scale;
     if(threadIdx.x == 0)
     {
-        // token_scale = row_scale;
         if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
         {
-            // scale[token_idx] = token_scale;
             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
             uint8_t exponent = (ck_tile::bit_cast<uint32_t>(row_scale) >> 23) & 0b11111111;
             tmp[token_idx]   = exponent;
@@ -430,7 +427,6 @@ __global__ void dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             scale[token_idx] = row_scale;
         }
     }
-    // __syncthreads();
 
     if constexpr(thread_data_size == 0)
     {
@@ -440,6 +436,111 @@ __global__ void dynamic_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         scaled_quant_vgpr_impl<DTYPE_I, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols);
     }
+}
+
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
+__device__ std::tuple<float, float*> smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
+                                                                    const float* __restrict__ smooth_scale,
+                                                                    const int32_t* __restrict__ smooth_scale_map,
+                                                                    const int32_t cols)
+{
+    static constexpr int32_t vec_size_i =
+        thread_data_size == 0 ? 16 / sizeof(DTYPE_O) : thread_data_size;
+    static constexpr int32_t vec_size_o =
+        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t> ? vec_size_i / 2 : vec_size_i;
+    using vec_i = ck_tile::vec_t<DTYPE_I, vec_size_i>;
+    using vec_s = ck_tile::vec_t<float, vec_size_i>;
+    const float inverted_DTYPE_MAX =
+        std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+            ? 0.25
+            : (1. / ck_tile::type_convert<float>(ck_tile::numeric<DTYPE_O>::max()));
+
+    const int32_t smcale_map_idx    = smooth_scale_map == nullptr? 0 : smooth_scale_map[blockIdx.x];
+    const int64_t row_offset        = blockIdx.x * cols;
+    auto const* ptr_i               = reinterpret_cast<DTYPE_I const*>(input + row_offset);
+    auto const* input_vecs          = reinterpret_cast<vec_i const*>(ptr_i);
+    static constexpr int32_t ooba_i = 4 / sizeof(DTYPE_I);
+    const int32_t oob_i             = (cols + ooba_i - 1) / ooba_i * ooba_i;
+    auto buffer_i = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_i, oob_i);
+    buffer_i.init_raw();
+
+    auto const* ptr_smscale         = reinterpret_cast<float const*>(smooth_scale + smcale_map_idx * cols);
+    auto const* smscale_vecs          = reinterpret_cast<vec_s const*>(ptr_smscale);
+    auto buffer_s = ck_tile::make_buffer_view<ck_tile::address_space_enum::global>(ptr_smscale, cols);
+    buffer_s.init_raw();
+
+    const int32_t num_vecs       = (cols + vec_size_i - 1) / vec_size_i;
+    vec_i vec_cur;
+    vec_s smscale_cur;
+    size_t vec_idx    = threadIdx.x;
+    float absMax = 0.f;
+    if(vec_idx < num_vecs)
+    {
+        vec_cur = buffer_i.template get<vec_i>(vec_idx * vec_size_i, 0, true);
+        smscale_cur = buffer_s.template get<vec_s>(vec_idx * vec_size_i, 0, true);
+#pragma unroll
+        for(size_t j = 0; j < vec_size_i; j++)
+        {
+            smscale_cur[j] = ck_tile::type_convert<float>(vec_cur[j]) * smscale_cur[j];
+            absMax = max(absMax, abs(smscale_cur[j]));
+        }
+    }
+
+    absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+
+    auto fp4_scale = [](float tmp) {
+        uint32_t u32      = ck_tile::bit_cast<uint32_t>(tmp);
+        uint32_t exponent = (u32 >> 23) & 0b11111111;
+        if(exponent == 0b11111111)
+        {
+            return ck_tile::bit_cast<float>(exponent << 23);
+        }
+        if(((u32 & 0x400000)) && (((u32 & 0x200000)) || ((u32 & 0x1FFFFF)) || (exponent)))
+            exponent += 1;
+        return ck_tile::bit_cast<float>(exponent << 23);
+    };
+    float row_scale = std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>
+                          ? fp4_scale(absMax) * inverted_DTYPE_MAX
+                          : absMax * inverted_DTYPE_MAX;
+    return std::make_tuple(row_scale, reinterpret_cast<float*>(&smscale_cur));
+}
+
+template <typename DTYPE_I, typename DTYPE_O, int block_size, int thread_data_size = 16>
+__global__ void smooth_per_token_scaled_quant_kernel(DTYPE_O* __restrict__ out,
+                                                     float* __restrict__ scale,
+                                                     DTYPE_I* __restrict__ input,
+                                                     float* __restrict__ smooth_scale,
+                                                     int* __restrict__ smooth_scale_map,
+                                                     const int32_t cols,
+                                                     int32_t const* __restrict__ num_rows = nullptr,
+                                                     const int32_t num_rows_factor = 1)
+{
+    const int token_idx = blockIdx.x;
+    if (num_rows != nullptr)
+    {
+        int32_t rows = *num_rows * num_rows_factor;
+        if (token_idx >= rows)
+            return;
+    }
+    auto res            = smooth_data_to_per_row_scale<DTYPE_I, DTYPE_O, block_size, thread_data_size>(input, smooth_scale, smooth_scale_map, cols);
+    float row_scale     = std::get<0>(res);
+    float* vec_ptr      = std::get<1>(res);
+
+    if(threadIdx.x == 0)
+    {
+        if constexpr(std::is_same_v<DTYPE_O, ck_tile::fp4x2_t>)
+        {
+            auto* tmp        = reinterpret_cast<uint8_t*>(scale);
+            uint8_t exponent = (ck_tile::bit_cast<uint32_t>(row_scale) >> 23) & 0b11111111;
+            tmp[token_idx]   = exponent;
+        }
+        else
+        {
+            scale[token_idx] = row_scale;
+        }
+    }
+
+    scaled_quant_vgpr_impl<float, DTYPE_O, thread_data_size>(out, vec_ptr, &row_scale, cols);
 }
 
 void static_per_tensor_quant(torch::Tensor& out,         // [..., d]
@@ -747,6 +848,83 @@ void dynamic_per_group_scaled_quant_fp4(torch::Tensor& out,         // [..., d]
 #else
     TORCH_CHECK(false, __func__, " device not support Float4_e2m1fn_x2 dtype");
 #endif
+}
+
+#define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE)                  \
+    AITER_DISPATCH_FLOATING16_TYPES(input.scalar_type(), "quant_kernel", [&] {                                     \
+        using input_dtype = typename t2ck<scalar_t>::type;                                                         \
+        aiter::quant_kernel<input_dtype, DTYPE_O, BLOCK_SIZE, THREAD_DATA><<<grid, dim3(BLOCK_SIZE), 0, stream>>>( \
+            reinterpret_cast<DTYPE_O*>(out.data_ptr()),                                                            \
+            scales.data_ptr<float>(),                                                                              \
+            reinterpret_cast<input_dtype*>(input.data_ptr()),                                                      \
+            smooth_scale.data_ptr<float>() ,                                                                       \
+            smooth_scale_map_ptr,                                                                                  \
+            cols,                                                                                                  \
+            num_rows_ptr,                                                                                          \
+            num_rows_factor);                                                                                      \
+    });
+
+#define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(quant_kernel, DTYPE_O, cols)            \
+    if(cols <= 8 * BlockSize)                                                                 \
+    {                                                                                         \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 8, BlockSize)        \
+    }                                                                                         \
+    else if(cols <= 16 * BlockSize)                                                           \
+    {                                                                                         \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 16, BlockSize)       \
+    }                                                                                         \
+    else if(cols <= 16 * BlockSize * 2)                                                       \
+    {                                                                                         \
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, 16, BlockSize * 2)   \
+    }                                                                                         \
+    else                                                                                      \
+    {                                                                                         \
+        TORCH_CHECK(false, "input last dim has exceeded the maximum value ", 32 * BlockSize)  \
+    }
+
+void smooth_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
+                                    torch::Tensor const& input, // [..., d]
+                                    torch::Tensor& scales,
+                                    torch::Tensor const& smooth_scale,
+                                    std::optional<torch::Tensor> const& smooth_scale_map = std::nullopt,
+                                    bool shuffle_scale = false,
+                                    std::optional<torch::Tensor> const& num_rows = std::nullopt,
+                                    int num_rows_factor = 1)
+{
+    TORCH_CHECK(input.is_contiguous());
+    TORCH_CHECK(out.is_contiguous());
+
+    int const cols = input.size(-1);
+    int const rows = input.numel() / cols;
+    int32_t* num_rows_ptr = num_rows.has_value() ? num_rows->data_ptr<int32_t>() : nullptr;
+    int32_t* smooth_scale_map_ptr = smooth_scale_map.has_value() ? smooth_scale_map->data_ptr<int32_t>() : nullptr;
+
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    dim3 const grid(rows);
+    dim3 const block(BlockSize);
+    if(out.dtype() == torch_fp8)
+    {
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+            smooth_per_token_scaled_quant_kernel, FP8_TYPE, cols);
+    }
+    else if(out.dtype() == torch::kInt8)
+    {
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+            smooth_per_token_scaled_quant_kernel, ck_tile::int8_t, cols);
+    }
+#if defined(__Float4_e2m1fn_x2)
+    else if(out.dtype() == torch::kFloat4_e2m1fn_x2 || out.dtype() == torch::kUInt8)
+    {
+        SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_DISPATCH(
+            smooth_per_token_scaled_quant_kernel, ck_tile::fp4x2_t, cols);
+    }
+#endif
+    else
+    {
+        TORCH_CHECK(false, __func__, " not support output type: ", out.dtype());
+    }
 }
 
 template <typename DTYPE, int BLOCK_SIZE = 256, int thread_data_size = 4, int MAX_ITERS = 10000>
