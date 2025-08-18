@@ -1,2 +1,3 @@
 M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName
-
+16,1280,8192,False,torch.bfloat16,torch.bfloat16,False,256,rocblas,504955,12.38,rocblas
+1,1280,8192,False,torch.bfloat16,torch.bfloat16,False,256,rocblas,504960,12.16,rocblas
