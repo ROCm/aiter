@@ -87,42 +87,28 @@ struct get_kernel
                                               true // IsVLayoutRowMajor
                                               >;
 
-    using fmha_traits = ck_tile::TileFmhaTraits<PadSeqlen, // kPadSeqLenQ
-                                                PadSeqlen, // kPadSeqLenK
-                                                false,     // kPadHeadDimQ
-                                                false,     // kPadHeadDimV
-                                                false,     // kHasLogitsSoftCap
-                                                ck_tile::BlockAttentionBiasEnum::NO_BIAS,
-                                                false, // kHasBiasGrad
-                                                false, // kStoreLSE
-                                                false, // kHasDropout
-                                                false, // kDoFp8StaticQuant
-                                                -1,    // kBlockPerCu
-                                                false  // kSkipMinSeqlenQ
-                                                >;
-
-    using fmha_variant =
-        ck_tile::ComposedAttention<false * ck_tile::LOGITS_SOFT_CAP, // VARIANT_CODE
-                                   CK_TILE_FMHA_FWD_FAST_EXP2        // UseExp2
-                                   >; // placeholder type, we are not using this
+    using fmha_traits = ck_tile::TileFmhaFwdV3Traits<PadSeqlen, // kPadSeqLenQ
+                                                     PadSeqlen, // kPadSeqLenK
+                                                     false,     // kPadHeadDimQ
+                                                     false,     // kPadHeadDimV
+                                                     false,     // kStoreLSE
+                                                     -1         // kBlockPerCu
+                                                     >;
 
     using fmha_mask = ck_tile::SimplifiedGenericAttentionMask<IsMasking>;
 
-    using fmha_problem = ck_tile::BlockFmhaPipelineProblem<
+    using fmha_problem = ck_tile::BlockFmhaFwdV3PipelineProblem<
         typename FmhaFwdTypeConfig<fmha_dtype>::QDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::KDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::VDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::SaccDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::SMPLComputeDataType,
-        typename FmhaFwdTypeConfig<fmha_dtype>::BiasDataType,
-        typename FmhaFwdTypeConfig<fmha_dtype>::RandValOutputDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::LSEDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::PDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::OaccDataType,
         typename FmhaFwdTypeConfig<fmha_dtype>::ODataType,
         fmha_shape,
         false, // kIsGroupMode
-        fmha_variant,
         fmha_mask,
         fmha_traits>;
 
