@@ -113,8 +113,8 @@ def _persistent_lean_attention(
     total_programs: int,  # number of thread blocks (CTAs) to launch -> eq to num SMs
     BLOCK_M: int,  # seq_q tile size
     BLOCK_N: int,  # seq_k tile size
-    XCD_REMAP: bool, # xcd_remap for spatial 
-    NUM_XCDS: int, # Num of XCDs
+    XCD_REMAP: bool,  # xcd_remap for spatial
+    NUM_XCDS: int,  # Num of XCDs
     causal: bool,  # causal masking
     batch_size: int,
     sm_scale: torch.float16,  # typically 1 / sqrt(d)
@@ -174,13 +174,15 @@ def _persistent_lean_attention(
     )
     if DEBUG:
         print(
-           f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
+            f"high_load_wgs={high_load_wgs}, max_tiles_per_wg={max_tiles_per_wg}, tiles_per_head={tiles_per_head}"
         )
         print(
-           f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
+            f"total_programs={total_programs}, num_splits={num_splits}, even_split={even_split}"
         )
         print(f"num_m_blocks={num_m_blocks}, num_n_blocks={num_n_blocks}")
-        print(f"HEADS_PER_XCD={HEADS_PER_XCD}, NUM_XCDS={NUM_XCDS}. XCD_REMAP={XCD_REMAP}")
+        print(
+            f"HEADS_PER_XCD={HEADS_PER_XCD}, NUM_XCDS={NUM_XCDS}. XCD_REMAP={XCD_REMAP}"
+        )
 
     CAUSAL_MODE = 0  # 0:ping-pong, 1: sequential
     max_output_tile_cnt = calculate_max_output_tiles_analytically(
@@ -320,7 +322,7 @@ def get_num_splits_and_buffer_sizes(
     else:
         # Decode or Not Causal
         tiles_per_head = num_m_blocks * num_n_blocks
-    
+
     if XCD_REMAP:
         total_tiles = tiles_per_head * (num_heads_k // NUM_XCDS)
     else:
@@ -340,7 +342,7 @@ def get_num_splits_and_buffer_sizes(
     # Max number lean tiles per task block (CTA)
     if XCD_REMAP:
         xcd_programs = lean_griddimz // NUM_XCDS
-    else: 
+    else:
         xcd_programs = lean_griddimz
 
     max_tiles_per_tb = (total_tiles + xcd_programs - 1) // xcd_programs
@@ -399,7 +401,7 @@ def calculate_max_output_tiles_analytically(
         # This list will be used for binary searches.
         total_blocks = 0
         for i in range(num_m_blocks):
-            if MODE == 0:       # ping-pong selection of output tile
+            if MODE == 0:  # ping-pong selection of output tile
                 pair_idx = i // 2
                 q_block_idx = pair_idx if (i % 2) == 0 else num_m_blocks - 1 - pair_idx
             else:
@@ -571,7 +573,7 @@ def _attention_inner(
         v_ptrs += BLOCK_N * stride_vn
         k_ptrs += BLOCK_N * stride_kn
     return m_i, l_i, acc
-    
+
 
 @triton.jit
 def remap_xcd(pid, GRID_MN: tl.constexpr, NUM_XCDS: tl.constexpr = 8):
@@ -658,7 +660,9 @@ def la_persistent(
 
     if XCD_REMAP:
         # remap pid's so contiguous group of pid's reside on the same XCD
-        current_pid, pids_per_xcd = remap_xcd(current_pid, GRID_MN=total_programs, NUM_XCDS=NUM_XCDS)
+        current_pid, pids_per_xcd = remap_xcd(
+            current_pid, GRID_MN=total_programs, NUM_XCDS=NUM_XCDS
+        )
         # XCD_REMAP: high_load_wgs, max_tiles_per_wg are relative to 1 XCD
         xcd_pid = current_pid % pids_per_xcd
         xcd_id = current_pid // pids_per_xcd
@@ -772,9 +776,9 @@ def la_persistent_inner(
     stride_opn,  # head_dim
     iter,
     cta_end_tile_gid,
-    current_pid,    # SOC pid  
-    xcd_pid,        # XCD pid
-    xcd_id,         # The XCD the pid belongs to
+    current_pid,  # SOC pid
+    xcd_pid,  # XCD pid
+    xcd_id,  # The XCD the pid belongs to
     HEADS_PER_XCD,
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -937,7 +941,7 @@ def la_persistent_inner(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
     q = tl.load(q_ptrs)
-    
+
     m_i, l_i, acc = _attention_inner(
         q,
         k_ptrs,
@@ -995,7 +999,7 @@ def la_persistent_inner(
 
         if not finishing_block:
             # if host not finishing_block: # another CTA is processing the end of the output tile and store partial results
-            '''
+            """
             last_cta = xcd_pid + 1
             temp_end_gid = cta_end_tile_gid
             split = 1
@@ -1013,14 +1017,16 @@ def la_persistent_inner(
 
                 last_cta += 1
                 split += 1
-            '''
+            """
 
             # Calculate #CTAs that store partial result for this output tile
             zero_i = tl.full((), 0, dtype=tl.int32)
             start_cta = tl.cast(xcd_pid + 1, tl.int32)
 
             # remaining tiles to cover
-            remaining = tl.maximum(tl.cast(tile_iter_end - cta_end_tile_gid, tl.int32), zero_i)
+            remaining = tl.maximum(
+                tl.cast(tile_iter_end - cta_end_tile_gid, tl.int32), zero_i
+            )
 
             # capacities (use int32)
             cap_high = tl.cast(max_tiles_per_wg, tl.int32)
@@ -1028,7 +1034,9 @@ def la_persistent_inner(
             cap_low = tl.where(cap_low > 0, cap_low, tl.full((), 1, dtype=tl.int32))
 
             # available high-load CTAs starting from start_cta
-            ctas_high_avail = tl.maximum(tl.cast(high_load_wgs, tl.int32) - start_cta, zero_i)
+            ctas_high_avail = tl.maximum(
+                tl.cast(high_load_wgs, tl.int32) - start_cta, zero_i
+            )
             total_high_capacity = ctas_high_avail * cap_high
             need_high_only = (remaining + cap_high - 1) // cap_high
 
@@ -1037,7 +1045,11 @@ def la_persistent_inner(
 
             # CTAs required in the low region (ceil)
             need_low_after_high = (rem_after_high + cap_low - 1) // cap_low
-            ctas_needed = tl.where(remaining <= total_high_capacity, need_high_only, ctas_high_avail + need_low_after_high)
+            ctas_needed = tl.where(
+                remaining <= total_high_capacity,
+                need_high_only,
+                ctas_high_avail + need_low_after_high,
+            )
 
             # Allowed at most (num_splits - 1) extra CTAs:
             max_ctas_allowed = tl.maximum(tl.cast(num_splits - 1, tl.int32), zero_i)
@@ -1048,7 +1060,7 @@ def la_persistent_inner(
             cap_by_k = tl.where(
                 k <= ctas_high_avail,
                 k * cap_high,
-                total_high_capacity + (k - ctas_high_avail) * cap_low
+                total_high_capacity + (k - ctas_high_avail) * cap_low,
             )
             covered = tl.minimum(remaining, cap_by_k)
 
@@ -1057,15 +1069,17 @@ def la_persistent_inner(
             last_cta = tl.where(ctas_to_use == 0, start_cta - 1, last_cta)
 
             # Next, load nonHost partial restult
-            temp_pid = current_pid 
-            
+            temp_pid = current_pid
+
             for cta in range((xcd_pid + 1), last_cta):
                 # last_cta is calculated using xcd local pid
                 # locks, mp/lp/op are referenced using global pid
                 temp_pid = temp_pid + 1
                 # According to treamK gemm, atomic_cas is universal solution but less performant
                 # while tl.atomic_cas(locks + cta, 1, 1) != 1:
-                while tl.load(locks + temp_pid, cache_modifier=".cv", volatile=True) != 1:
+                while (
+                    tl.load(locks + temp_pid, cache_modifier=".cv", volatile=True) != 1
+                ):
                     pass
                 # Partial results are stored in [nonHost, Host-nonFinishing] layout
                 offs_mplp = temp_pid * BLOCK_M + offs_m

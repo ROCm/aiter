@@ -362,7 +362,7 @@ def main():
     causal = True
     h = 64
     n_ctx_q = 8192
-    n_ctx = [8192] #[16384] #[8192]
+    n_ctx = [8192]  # [16384] #[8192]
     d = 128
     total_programs = 304
     init_dtype = torch.float16
