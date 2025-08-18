@@ -164,7 +164,8 @@ def _ff_a16w16_fused_gated(
     y_ptrs = y_ptr + (offs_ym[:, None] * stride_ym + offs_k[None, :] * stride_yk)
 
     # Stagger k-loop start position based on N block index (to minimize contention)
-    k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
+    P = 7 # cheap hashing prime
+    k_cyclic_offset = (pid_n * P + pid_m) % tl.cdiv(K, BLOCK_SIZE_K)
     w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
     y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
@@ -226,7 +227,7 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    bounds = [4, 8, 16, 32, 64]
+    bounds = [4, 8, 64]
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             return _get_config._config_dict[key][f"M_LEQ_{bound}"]
@@ -271,9 +272,9 @@ def ff_a16w16_fused_gated(
 
     N, K = w_up.shape
     M = x.shape[0]
-    if M > 32:
+    if M > 64:
         warnings.warn(
-            "The fused FF kernel is slower than the unfused equivalent for large batch sizes (>32)."
+            "The fused FF kernel is slower than the unfused equivalent for large batch sizes (>64)."
         )
 
     assert N % 2 == 0, "Weight shape incompatible with gating (N not divisible by 2)"

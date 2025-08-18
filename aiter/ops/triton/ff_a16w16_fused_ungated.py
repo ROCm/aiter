@@ -190,7 +190,7 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    bounds = [4, 8, 16, 32, 64]
+    bounds = [4, 8, 64]
     for bound in bounds:
         if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
             return _get_config._config_dict[key][f"M_LEQ_{bound}"]
@@ -234,9 +234,9 @@ def ff_a16w16_fused_ungated(
 
     N, K = w_up.shape
     M = x.shape[0]
-    if M > 32:
+    if M > 64:
         warnings.warn(
-            "The fused FF kernel is slower than the unfused equivalent for large batch sizes (>32)."
+            "The fused FF kernel is slower than the unfused equivalent for large batch sizes (>64)."
         )
 
     w_up = w_up.T
