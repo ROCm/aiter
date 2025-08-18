@@ -18,16 +18,6 @@
 #include "fmha_fwd.hpp"
 #include "mask.hpp"
 
-#define ENABLE_ASM_MARKER 1
-#if ENABLE_ASM_MARKER
-#define ASM_MARKER(marker)               \
-    __builtin_amdgcn_sched_barrier(0);   \
-    asm volatile("; [POYENC] " #marker); \
-    __builtin_amdgcn_sched_barrier(0);
-#else
-#define ASM_MARKER(marker)
-#endif
-
 #define DEBUG_DTYPE_FP16 0
 #define DEBUG_DTYPE_BF16 1
 #define DEBUG_MASK_NONE 0
@@ -36,10 +26,6 @@
 #define DEBUG_SINGLE_INST 0
 #define DEBUG_SINGLE_INST_DTYPE DEBUG_DTYPE_BF16
 #define DEBUG_SINGLE_INST_MASK DEBUG_MASK_NONE
-
-#define ENALBE_INLINE_ASM_ELEMWISE_OPS 0
-
-#define ADD_SBARRIER_FOR_PHASE0 1
 
 namespace aiter {
 namespace torch_itfs {
