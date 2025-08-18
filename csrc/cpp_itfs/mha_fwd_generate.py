@@ -18,7 +18,7 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx_list  # noqa: E402
+from aiter.jit.utils.chip_info import get_gfx_list
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
