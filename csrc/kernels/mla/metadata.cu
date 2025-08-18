@@ -76,7 +76,7 @@ __global__ void kn_get_mla_metadata_v0(
         #pragma unroll
         for (int32_t offset = 1; offset <= (kWarpSize >> 1) ; offset *= 2)
         {
-            const int32_t remote = __shfl_up(scan, offset);
+            const int32_t remote = ck_tile::warp_shuffle_up(scan, offset);
             scan += (threadIdx.x >= offset) ? remote : 0;
         }
 
@@ -88,7 +88,7 @@ __global__ void kn_get_mla_metadata_v0(
         }
 
         // update base_scan
-        base_scan = __shfl(global_scan, kWarpSize - 1);
+        base_scan = ck_tile::warp_shuffle(global_scan, kWarpSize - 1);
     }
 
     // Reduce max_num_split
@@ -220,8 +220,9 @@ CK_TILE_DEVICE auto get_cost_top(
     #pragma unroll
     for (int32_t offset = (ck_tile::get_warp_size() >> 1); offset > 0; offset >>= 1)
     {
-        const int32_t cid_remote  = __shfl_xor(cid_min,  offset);
-        const int32_t cost_remote = __shfl_xor(cost_min, offset);
+        const int32_t srd_lane    = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
+        const int32_t cid_remote  = ck_tile::warp_shuffle(cid_min,  srd_lane);
+        const int32_t cost_remote = ck_tile::warp_shuffle(cost_min, srd_lane);
         if ((cost_remote < cost_min) || ((cost_remote == cost_min) && (cid_remote < cid_min)))
         {
             cost_min = cost_remote;
@@ -232,8 +233,90 @@ CK_TILE_DEVICE auto get_cost_top(
     return std::make_tuple(cid_min, cost_min);
 }
 
+// Warp level customized bitonic sort for sort batch idx based on cost.
+CK_TILE_DEVICE void WarpSort(
+    int32_t*       p_batch_idx,
+    int32_t*       p_workspace,
+    const int32_t* p_qo_lens,
+    const int32_t* p_kv_lens,
+    const int32_t  num_batches)
+{
+    const int32_t lane_idx = ck_tile::get_lane_id();
+
+    const int32_t num_batches_padded =
+        ck_tile::integer_least_multiple(ck_tile::next_power_of_two(num_batches), ck_tile::get_warp_size());
+    const int32_t warp_loops = num_batches_padded / ck_tile::get_warp_size();
+    int32_t* p_costs = p_workspace;
+    int32_t* p_indices = p_costs + num_batches_padded;
+
+    auto check_and_swap = [&](const int32_t idx0, const int32_t idx1, const bool dir) {
+        const int32_t cost0 = p_costs[idx0];
+        const int32_t cost1 = p_costs[idx1];
+        if ((cost0 > cost1) == dir)
+        {
+            int32_t temp_idx = p_indices[idx0];
+            p_indices[idx0] = p_indices[idx1];
+            p_indices[idx1] = temp_idx;
+            p_costs[idx1] = cost0;
+            p_costs[idx0] = cost1;
+        }
+    };
+
+    // Initialize smem
+    // Pre-calculate cost for each batch
+    for (int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
+    {
+        p_costs[bid] = cal_cost(p_qo_lens[bid], p_kv_lens[bid]);
+        p_indices[bid] = bid;
+    }
+    for (int32_t bid = lane_idx + num_batches; bid < num_batches_padded; bid += ck_tile::get_warp_size())
+    {
+        p_costs[bid] = 0;
+        p_indices[bid] = bid;
+    }
+
+    for (int32_t size = 2; size < num_batches_padded; size <<= 1)
+    {
+        const int32_t max_stride = size >> 1;
+        for (int32_t loop_idx = 0; loop_idx < warp_loops; ++loop_idx)
+        {
+            const int32_t thr_idx = lane_idx + loop_idx * ck_tile::get_warp_size();
+            if (thr_idx * 2 < num_batches_padded)
+            {
+                const bool dir = ((thr_idx & max_stride) == 0);
+                for (int32_t stride = max_stride; stride > 0; stride >>= 1)
+                {
+                    const int32_t stride_m1 = stride - 1;
+                    const int32_t idx = 2 * thr_idx - (thr_idx & stride_m1);
+                    check_and_swap(idx, idx + stride, dir);
+                }
+            }
+        }
+    }
+
+    for (int32_t stride = num_batches_padded >> 1; stride > 0; stride >>= 1)
+    {
+        const int32_t stride_m1 = stride - 1;
+        for (int32_t loop_idx = 0; loop_idx < warp_loops; ++loop_idx)
+        {
+            const int32_t thr_idx = lane_idx + loop_idx * ck_tile::get_warp_size();
+            if (thr_idx * 2 < num_batches_padded)
+            {
+                const int32_t idx = 2 * thr_idx - (thr_idx & stride_m1);
+                check_and_swap(idx, idx + stride, false);
+            }
+        }
+    }
+
+    // Output results
+    for (int32_t bid = lane_idx; bid < num_batches; bid += ck_tile::get_warp_size())
+    {
+        p_batch_idx[bid] = p_indices[bid];
+    }
+}
+
 template <typename T>
-std::vector<T> flatten(
+std::vector<T> Flatten(
     const std::vector<std::vector<T>>& vec,
     const int size_after_flatten)
 {
@@ -254,9 +337,14 @@ struct BatchInfo
     int32_t qo_len;
     int32_t kv_len;
 
+    int32_t get_cost() const
+    {
+        cal_cost(qo_len, kv_len);
+    }
+
     bool operator > (const BatchInfo& rhs) const
     {
-        return cal_cost(qo_len, kv_len) > cal_cost(rhs.qo_len, rhs.kv_len);
+        return get_cost() > rhs.get_cost();
     }
 };
 
@@ -393,13 +481,13 @@ CK_TILE_DEVICE void GenerateWork(
 }
 
 template <typename T>
-CK_TILE_DEVICE T WarpSumIndptr(const T* p_data, const int32_t size)
+CK_TILE_DEVICE T WarpSum(const T* p_data, const int32_t size)
 {
     T sum = T(0);
 
     for (int32_t idx = ck_tile::get_lane_id(); idx < size; idx += ck_tile::get_warp_size())
     {
-        sum += p_data[idx + 1] - p_data[idx];
+        sum += p_data[idx];
     }
 
     sum = aiter::warpReduce<aiter::AddFunctor, T, ck_tile::get_warp_size()>(sum);
@@ -414,7 +502,7 @@ CK_TILE_DEVICE T WarpPrefixSum(T value, const int32_t size)
     #pragma unroll
     for (int32_t offset = 1; offset <= (ck_tile::get_warp_size() >> 1) ; offset *= 2)
     {
-        const T remote = __shfl_up(value, offset);
+        const T remote = ck_tile::warp_shuffle_up(value, offset);
         value += (ck_tile::get_lane_id() >= offset) ? remote : 0;
     }
     return value;
@@ -429,9 +517,20 @@ __global__ void kn_get_mla_metadata_v1(
 
     const int32_t lane_idx = ck_tile::get_lane_id();
 
+    // Step.0. Get sequence lengths of query/output and key/value for each batch.
+    int32_t* p_batch_idx = reinterpret_cast<int32_t*>(p_smem);
+    int32_t* p_qo_lens   = p_batch_idx + params.num_batches;
+    int32_t* p_kv_lens   = p_qo_lens + params.num_batches;
+    for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
+    {
+        p_batch_idx[bid] = bid;
+        p_qo_lens[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+        p_kv_lens[bid] = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+    }
+
     // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
     //         composing each cluster. The size is determined by average packed qo length.
-    int32_t sum_packed_qo_len = WarpSumIndptr(params.p_seqlens_qo_indptr, params.num_batches);
+    int32_t sum_packed_qo_len = WarpSum(p_qo_lens, params.num_batches);
     const int32_t cluster_size =
     [&]() {
         const int32_t avg_packed_qo_len = sum_packed_qo_len / params.num_batches;
@@ -446,7 +545,7 @@ __global__ void kn_get_mla_metadata_v1(
     // Step.2.
     //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
     //   b. Get a indptr array about #cluster for each batch in direction of qo.
-    int32_t* p_num_qo_clusters_indptr = reinterpret_cast<int32_t*>(p_smem);
+    int32_t* p_num_qo_clusters_indptr = p_kv_lens + params.num_batches;
     if (lane_idx == 0)
     {
         p_num_qo_clusters_indptr[0] = 0;
@@ -463,8 +562,8 @@ __global__ void kn_get_mla_metadata_v1(
 
         if (bid < params.num_batches)
         {
-            const int32_t kv_len = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
-            const int32_t qo_len = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
+            const int32_t kv_len = p_kv_lens[bid];
+            const int32_t qo_len = p_qo_lens[bid];
             const int32_t packed_qo_len = qo_len * params.num_heads;
             num_qo_tiles = ck_tile::integer_divide_ceil(packed_qo_len, cluster_len_q);
 
@@ -486,7 +585,7 @@ __global__ void kn_get_mla_metadata_v1(
         {
             p_num_qo_clusters_indptr[bid + 1] = global_sum_qo_tiles;
         }
-        scan_base = __shfl(global_sum_qo_tiles, ck_tile::get_warp_size() - 1);
+        scan_base = ck_tile::warp_shuffle(global_sum_qo_tiles, ck_tile::get_warp_size() - 1);
 
         sum_workload += aiter::warpReduce<aiter::AddFunctor, decltype(workload), ck_tile::get_warp_size()>(workload);
     }
@@ -510,8 +609,12 @@ __global__ void kn_get_mla_metadata_v1(
     }
 #endif
 
-    // Step.3.1. Initialize lds
-    int32_t* p_cost_heap = p_num_qo_clusters_indptr + params.num_batches + 1;
+    // Step.3. Sort batch idx based on cost. High cost batch first.
+    int32_t *p_sort_workspace = p_num_qo_clusters_indptr + params.num_batches + 1; // will be reused later.
+    WarpSort(p_batch_idx, p_sort_workspace, p_qo_lens, p_kv_lens, params.num_batches);
+
+    // Step.4.1. Initialize lds
+    int32_t* p_cost_heap = p_sort_workspace;
     int32_t* p_cluster_work_counter = p_cost_heap + num_clusters + 1;
     for (int32_t cid = lane_idx; cid < num_clusters; cid += ck_tile::get_warp_size())
     {
@@ -519,12 +622,13 @@ __global__ void kn_get_mla_metadata_v1(
         p_cluster_work_counter[cid] = 0;
     }
 
-    // Step.4. Fill the output buffers except indptrs
+    // Step.5. Fill the output buffers except indptrs
     const int32_t max_qo_tiles = params.num_batches * Traits::kMaxQoTilePerBatch;
 
-    // Step.4.1. Get total work for each cluster
-    for (int32_t bid = 0; bid < params.num_batches; ++bid)
+    // Step.5.1. Get total work for each cluster
+    for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
+        const int32_t bid            = p_batch_idx[idx];
         const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
         const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
         const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
@@ -546,16 +650,7 @@ __global__ void kn_get_mla_metadata_v1(
         }
     }
 
-    // Step.4.2. Re-init cost heap and cumulative sum cluster_work_tot
-    // int32_t cum_cluster_work = 0;
-    // params.p_work_indptr[0] = 0;
-    // for (int32_t cid = 0; cid < num_clusters; ++cid)
-    // {
-    //     cum_cluster_work += p_cluster_work_counter[cid];
-    //     params.p_work_indptr[cid + 1] = cum_cluster_work;
-    //     p_cost_heap[cid] = 0;
-    //     p_cluster_work_counter[cid] = 0;
-    // }
+    // Step.5.2. Re-init cost heap and cumulative sum cluster_work_tot
     scan_base = 0;
     const int32_t num_loop_clusters = ck_tile::integer_divide_ceil(num_clusters, ck_tile::get_warp_size());
     for (int32_t loop_idx = 0; loop_idx < num_loop_clusters; ++loop_idx)
@@ -564,7 +659,7 @@ __global__ void kn_get_mla_metadata_v1(
 
         const int32_t cluster_work = (cid < num_clusters) ? p_cluster_work_counter[cid] : 0;
         const int32_t cum_cluster_work = WarpPrefixSum(cluster_work, ck_tile::get_warp_size()) + scan_base;
-        scan_base = __shfl(cum_cluster_work, ck_tile::get_warp_size() - 1);
+        scan_base = ck_tile::warp_shuffle(cum_cluster_work, ck_tile::get_warp_size() - 1);
 
         if (cid < num_clusters)
         {
@@ -587,12 +682,13 @@ __global__ void kn_get_mla_metadata_v1(
         p_reduce_final_map[cluster_q_idx] = MlaPartialTileInfo{-1, -2};
     }
 
-    // Step.4.3. Output work info
+    // Step.5.3. Output work info
     int32_t num_partial_outputs = 0;
     int32_t loc_partial_outputs = 0;
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
-    for (int32_t bid = 0; bid < params.num_batches; ++bid)
+    for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
+        const int32_t bid            = p_batch_idx[idx];
         const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
         const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
         const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
@@ -622,7 +718,7 @@ __global__ void kn_get_mla_metadata_v1(
         }
     }
 
-    // Step.5. Output metadata for reduce kernel
+    // Step.6. Output metadata for reduce kernel
     scan_base = 0;
     const int32_t num_loop_reduce = ck_tile::integer_divide_ceil(max_qo_tiles, ck_tile::get_warp_size());
     for (int32_t loop_idx = 0; loop_idx < num_loop_reduce; ++loop_idx)
@@ -645,7 +741,7 @@ __global__ void kn_get_mla_metadata_v1(
 
         const int32_t curr_cum_reduce_tiles = WarpPrefixSum(num_reduce_tiles, ck_tile::get_warp_size()) + scan_base;
         const int32_t prev_cum_reduce_tiles = curr_cum_reduce_tiles - num_reduce_tiles;
-        scan_base = __shfl(curr_cum_reduce_tiles, ck_tile::get_warp_size() - 1);
+        scan_base = ck_tile::warp_shuffle(curr_cum_reduce_tiles, ck_tile::get_warp_size() - 1);
 
         if (global_cluster_q_idx < max_qo_tiles)
         {
@@ -661,7 +757,7 @@ __global__ void kn_get_mla_metadata_v1(
         }
     }
 
-    // Step.6. Fill metadata pointers for MLA kernel and the 1st element of reduce_indptr.
+    // Step.7. Fill metadata pointers for MLA kernel and the 1st element of reduce_indptr.
     if (lane_idx == 0)
     {
         params.p_reduce_indptr[0] = 0;
@@ -722,10 +818,18 @@ void get_mla_metadata_v1_device(
     const int32_t lds_size_in_bytes = [&]()
     {
         int32_t lds_size = 0;
+
         // this is maximun #clusters
         const int32_t num_clusters = dev_prop.multiProcessorCount;
+        // Stores batch_id, qo_len and kv_len
+        lds_size += 3 * num_batches * sizeof(int32_t);
         // Memory for indptr about #cluster for each batch in direction of qo
         lds_size += (num_batches + 1) * sizeof(int32_t);
+        // LDS for sorting
+        const int32_t lds_sort_size =
+            lds_size +
+            ck_tile::integer_least_multiple(ck_tile::next_power_of_two(num_batches),
+                                            ck_tile::get_warp_size()) * 2 * sizeof(int32_t);
         // Memory for cost. Its size should be the same as #clusters
         lds_size += num_clusters * sizeof(int32_t);
         // Memory for counter of #works for each cluster.
@@ -734,7 +838,8 @@ void get_mla_metadata_v1_device(
         lds_size += max_qo_tiles * sizeof(MlaPartialTileInfo);
         // Memory for range of output of partial memory
         lds_size += max_qo_tiles * sizeof(MlaPartialTileInfo);
-        return lds_size;
+
+        return ck_tile::max(lds_size, lds_sort_size);
     }();
 
     TORCH_CHECK(lds_size_in_bytes <= dev_prop.maxSharedMemoryPerMultiProcessor,
@@ -1009,8 +1114,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
     }
 
     // Step.6. Flatten 2D arries
-    auto work_info_set_flatten = flatten(work_info_set, num_works);
-    auto reduce_partial_map_flatten = flatten(reduce_partial_map, num_partial_outputs);
+    auto work_info_set_flatten = Flatten(work_info_set, num_works);
+    auto reduce_partial_map_flatten = Flatten(reduce_partial_map, num_partial_outputs);
 
     // Step.7. Create tensors.
     auto input_opts = seqlens_qo_indptr.options();
