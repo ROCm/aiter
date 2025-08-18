@@ -354,10 +354,10 @@ def print_mismatches(ref_out, la_out, atol=1e-8, rtol=1e-5):
 
 def main():
     batch = 1
-    causal = False
-    h = 8
-    n_ctx_q = 128
-    n_ctx = [1024]
+    causal = True
+    h = 64
+    n_ctx_q = 8192
+    n_ctx = [8192]  # [16384] #[8192]
     d = 128
     total_programs = 304
     init_dtype = torch.float16

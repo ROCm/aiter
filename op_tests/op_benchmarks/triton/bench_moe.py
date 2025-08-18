@@ -9,6 +9,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 
@@ -171,10 +172,10 @@ def run_benchmark(args):
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
     if print_time:
-        line_names = ["Time (ms)"]
+        line_names = ["Time_(ms)"]
         line_vals = ["time"]
     else:
-        line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+        line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
         line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -185,7 +186,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{kernel_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -301,7 +302,7 @@ def main():
         def fun():
             return run_benchmark(args)
 
-        print_vgpr(fun, "_fused_moe_kernel-benchmark")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)
 

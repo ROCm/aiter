@@ -7,25 +7,16 @@ import pytest
 import torch
 import triton
 from aiter.ops.triton.pa_prefill import context_attention_fwd
-
-
-STR_DTYPE_TO_TORCH_DTYPE = {
-    "half": torch.half,
-    "bfloat16": torch.bfloat16,
-    "float": torch.float,
-    "fp8": torch.uint8,
-    "fp8_e4m3": torch.uint8,
-    "fp8_e5m2": torch.uint8,
-}
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 8, 64]
 HEAD_SIZES = [128, 96, 24]
 DTYPES = [torch.float16]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
+CUDA_DEVICES = [f"cuda:{i}" for i in range(1)]
 SLIDING_WINDOW = [0, 16, 64, 128, 256, 512, 2048]
-KV_CACHE_DTYPES = ["auto", "fp8", "fp8_e5m2"]
+KV_CACHE_DTYPES = ["auto", "fp8e4m3", "fp8e5m2"]
 
 
 def context_attention_fwd_torch(
@@ -55,7 +46,7 @@ def context_attention_fwd_torch(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim**0.5)
 
-    is_kv_cache_fp8 = k_cache.dtype == torch.uint8
+    is_kv_cache_fp8 = torch.finfo(k_cache.dtype).bits == 8
 
     # Cast all inputs to float32
     query = query.to(torch.float32)
@@ -101,7 +92,7 @@ def context_attention_fwd_torch(
                 rel_dist = q_pos[:, None] - k_pos[None, :]
                 qk_ctx = qk_ctx.masked_fill(rel_dist >= sliding_window, -1e4)
 
-            if alibi_slopes is not None:
+            elif alibi_slopes is not None:
                 alibi_slope = alibi_slopes[h]
                 q_pos = torch.arange(ctx_len, ctx_len + q_len, device=device)[:, None]
                 k_pos = torch.arange(ctx_len, device=device)[None, :]
@@ -224,7 +215,7 @@ def input_helper(
     if kv_cache_dtype == "auto":
         cache_dtype = dtype
     else:
-        cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[kv_cache_dtype]
+        cache_dtype = str_to_torch_dtype[kv_cache_dtype]
     k_cache = torch.zeros(
         cache_size, block_size, num_kv_heads, head_size, dtype=cache_dtype
     )

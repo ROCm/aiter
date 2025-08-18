@@ -1,14 +1,9 @@
-import triton
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    print_vgpr,
-)
 import torch
 import sys
 import warnings
 import argparse
 import itertools
-
+import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
     flash_attn_fp8_func,
@@ -21,6 +16,11 @@ from aiter.test_mha_common import (
     generate_qkv,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_model_configs,
+    print_vgpr,
+    get_caller_name_no_ext,
+)
 
 
 def nonvarlen_benchmark_configs():
@@ -120,7 +120,7 @@ def create_benchmark_configs(custom, args):
     varlen = args.layout == "thd"
 
     configs = []
-    plot_name = f"fused-attention-{mode}-D_HEAD-{head_size}-layout-{args.layout}-fp8-{args.fp8}-causal-{causal}"
+    plot_name = get_caller_name_no_ext()
     extra_args = {"D_HEAD": head_size, "dtype": dtype, "causal": causal, "mode": mode}
 
     if custom:
@@ -608,7 +608,7 @@ def main():
         def fun():
             return run_benchmark(custom_config, args)
 
-        print_vgpr(fun, "fused-attention")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
 
     run_benchmark(custom_config, args)
