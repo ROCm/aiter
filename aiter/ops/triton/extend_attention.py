@@ -17,27 +17,22 @@ Memory-efficient attention for prefill.
 It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
+from typing import Optional
+import functools
+import json
 import torch
 import triton
 import triton.language as tl
 
 
 from aiter.ops.triton.prefill_attention import context_attention_fwd
+from aiter.ops.triton.activation import _tanh
+import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-_is_cuda = False
-
-_is_hip = is_hip()
-
-
-@triton.jit
-def tanh(x):
-    # Tanh is just a scaled sigmoid
-    return 2 * tl.sigmoid(2 * x) - 1
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -79,10 +74,19 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BATCH: tl.constexpr,
 ):
-    cur_seq = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    cur_block_m = tl.program_id(2)
+    workgroup_id = tl.program_id(0)  # workgroup index
+    NUM_XCDS: tl.constexpr = 8  # number of XCDs on mi3xx series GPUs
+    # Doing the round robin over heads ensures load balancing
+    # (because NUM_Q_HEADS is usually a multiple of the round robin length, i.e. NUM_XCDS)
+    cur_head = workgroup_id % NUM_Q_HEADS
+    cur_head = remap_xcd(cur_head, NUM_Q_HEADS, NUM_XCDS)
+    cur_block_m = (workgroup_id // NUM_Q_HEADS) % NUM_BLOCKS  # sequence block index
+    cur_seq = workgroup_id // (NUM_Q_HEADS * NUM_BLOCKS)  # batch sample index
+
     cur_kv_head = cur_head // kv_group_num
 
     cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
@@ -163,7 +167,7 @@ def _fwd_kernel(
         qk *= sm_scale
 
         if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            qk = logit_cap * _tanh(qk / logit_cap)
 
         if USE_CUSTOM_MASK and not SKIP_PREFIX_CUSTOM_MASK:
             custom_mask = tl.load(
@@ -236,7 +240,7 @@ def _fwd_kernel(
         qk *= sm_scale
 
         if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            qk = logit_cap * _tanh(qk / logit_cap)
 
         if USE_CUSTOM_MASK:
             custom_mask = tl.load(
@@ -299,6 +303,23 @@ def _fwd_kernel(
         )
 
 
+@functools.lru_cache(maxsize=1024)
+def _get_config(HEAD_SIZE, dtype):
+    if not hasattr(_get_config, "_config_dict"):
+        dev = arch_info.get_device()
+        _get_config._config_dict = {}
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-EXTEND_ATTENTION.json"
+        with open(fpath, "r") as file:
+            config = json.load(file)
+        _get_config._config_dict = config
+
+    # HEAD_SIZE 192 = 128 head and 64 pe head dim
+    if (HEAD_SIZE > 192) or dtype == torch.float32:
+        return _get_config._config_dict["large_head_or_fp32"]
+
+    return _get_config._config_dict["default"]
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -316,12 +337,18 @@ def extend_attention_fwd(
     sm_scale=None,
     logit_cap=0.0,
     skip_prefix_custom_mask=True,
+    config: Optional[dict[str, any]] = None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+    _LOGGER.info(
+        f"EXTEND_ATTENTION_FWD: q_extend={tuple(q_extend.shape)} k_extend={tuple(k_extend.shape)} v_extend={tuple(v_extend.shape)} "
+        + f"k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+    )
+
     Lq, Lv = (
         q_extend.shape[-1],
         v_extend.shape[-1],
@@ -341,9 +368,6 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    BLOCK_M, BLOCK_N = (64, 64)
-    num_warps = 4
-
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
@@ -352,12 +376,11 @@ def extend_attention_fwd(
     # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
+    if config is None:
+        config = _get_config(HEAD_SIZE=Lq, dtype=q_extend.dtype)
 
-    extra_kargs = {}
-
-    extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    num_blocks = triton.cdiv(max_len_extend, config["BLOCK_M"])
+    grid = (head_num * num_blocks * batch_size,)
 
     _fwd_kernel[grid](
         q_extend,
@@ -389,17 +412,20 @@ def extend_attention_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        # BLOCK_M=BLOCK_M,
+        # BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
-        STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
+        STORE_TRANSPOSE=True,
+        NUM_Q_HEADS=head_num,
+        NUM_BLOCKS=num_blocks,
+        BATCH=batch_size,
+        # num_warps=num_warps,
+        # num_stages=num_stages,
+        **config,
     )
 
 
@@ -414,6 +440,10 @@ def redundant_attention(
     b_seq_len_prefix,
     max_len_in_batch,
 ):
+    _LOGGER.info(
+        f"REDUNDANT_ATTENTION: q_extend={tuple(q_extend.shape)} o_extend={tuple(o_extend.shape)} \
+        k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+    )
     total_token_num = k_buffer.shape[0]
     B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
     q_buffer = torch.empty(

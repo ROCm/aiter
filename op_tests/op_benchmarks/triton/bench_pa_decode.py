@@ -8,6 +8,8 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     get_dtype_bytes,
+    get_caller_name_no_ext,
+    print_vgpr,
 )
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
@@ -185,7 +187,7 @@ def run_benchmark(args):
 
     model_name = "paged-attn-decode"
 
-    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -196,7 +198,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{model_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -238,7 +240,6 @@ def run_benchmark(args):
         flops = (2.0 * BS * HQ * SEQ_LEN * HEAD_DIM) * 2
 
         bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
-        # bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
         tflops = flops / ms * 1e-9
 
         # Return exactly one scalar depending on which metric is active
@@ -251,7 +252,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_paged_attn_decode.run(save_path=".", print_data=True)
+    bench_paged_attn_decode.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -271,7 +272,7 @@ def parse_args():
         + ", ".join(available_models)
         + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
     )
-    parser.add_argument("-model", type=str, default=None, help=model_help)
+    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -280,6 +281,15 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
+    parser.add_argument(
+        "-print_vgpr",
+        action="store_true",
+        default=False,
+        help="Print VGPR usage for Triton kernels.",
+    )
     args = parser.parse_args()
     return args
 
@@ -295,6 +305,11 @@ arg_to_torch_dtype = {
 
 def main():
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(args)
 
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from typing import Optional
@@ -21,4 +21,5 @@ def moe_sorting_fwd(
     unit_size: int,
     local_expert_mask: Optional[torch.Tensor] = None,
     num_local_tokens: Optional[torch.Tensor] = None,
-): ...
+    dispatch_policy: int = 0,
+) -> None: ...

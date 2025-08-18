@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+
 import shutil
 import os
 import subprocess
@@ -16,6 +20,8 @@ import time
 logger = logging.getLogger("aiter")
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
 DEFAULT_GPU_ARCH = (
     subprocess.run(
         "/opt/rocm/llvm/bin/amdgpu-arch", shell=True, capture_output=True, text=True
@@ -150,7 +156,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
             "-DUSE_ROCM",
             "-DENABLE_FP8",
             "-O3",
-            "-std=c++17",
+            "-std=c++20",
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",

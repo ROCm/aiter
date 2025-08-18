@@ -7,6 +7,7 @@ import pytest
 from aiter.ops.triton.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
     decode_attention_fwd_grouped_rope,
+    _get_config,
 )
 from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,
@@ -28,16 +29,31 @@ def input_helper(
     rope_base=10,
     rope_max_seq_len=16324,
     rope_scaling=1.0,
+    equal_seqlens=False,
     is_neox_style=True,
 ):
+    if not equal_seqlens:
+        seqlens = torch.randint(1, S + 1, (B,), dtype=torch.int32, device=device)
+    else:
+        seqlens = torch.full((B,), S, dtype=torch.int32, device=device)
+
+    cu_seqlens = torch.cat(
+        [
+            torch.tensor([0], dtype=torch.int32, device=device),
+            seqlens.cumsum(dim=0, dtype=torch.int32),
+        ]
+    )
+
+    total_seqlen = cu_seqlens[-1]
+
     q = torch.randn(B, H, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device)
     kv_cache = torch.randn(
-        B * S, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
+        total_seqlen, kv_lora_rank + qk_rope_head_dim, dtype=dtype, device=device
     )
 
     # interlancing [batch_start_off, batch_seq_len, batch_start_off, batch_seq_len, ...,]
-    kv_indptr = torch.arange(B + 1, device=device) * S
-    kv_indices = torch.arange(B * S, device=device)
+    kv_indptr = cu_seqlens
+    kv_indices = torch.arange(total_seqlen, device=device)
 
     attn_logits = torch.empty(
         B, H, num_kv_splits, kv_lora_rank + 1, dtype=dtype, device=device
@@ -58,7 +74,9 @@ def input_helper(
         torch.tensor([S], device=device).unsqueeze(0).repeat(B, 1)
     )  # k positions and q position as last
 
-    return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions
+    o = torch.empty(B, H, kv_lora_rank, dtype=dtype, device=device)
+
+    return kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, o
 
 
 def ref_preprocess(kv_cache, kv_lora_rank):
@@ -95,10 +113,30 @@ def ref_compute(
             device
         )
         q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
-        k_pe_t = k_input.view(B, 1, S, -1)[:, :, -1:, kv_lora_rank:]
+
+        # Extract k_pe for each batch item separately to handle variable sequence lengths
+        k_pe_t = torch.empty(
+            B, 1, 1, qk_rope_head_dim, dtype=k_input.dtype, device=device
+        )
+
+        for b in range(B):
+            start_idx = kv_indptr[b].item()
+            end_idx = kv_indptr[b + 1].item()
+            if end_idx > start_idx:  # Check if this batch has any sequence
+                # Get the last token's position for this batch
+                batch_k = k_input[start_idx:end_idx]
+                k_pe_t[b, 0, 0] = batch_k[-1, 0, kv_lora_rank:]
+
         q_pe, k_pe_t = rotary_emb(positions, q_pe.unsqueeze(2), k_pe_t)
         q_pe = q_pe.squeeze()
-        k_input.view(B, 1, S, -1)[:, :, -1:, kv_lora_rank:] = k_pe_t
+
+        # Update k_input with rotated embeddings for each batch
+        for b in range(B):
+            start_idx = kv_indptr[b].item()
+            end_idx = kv_indptr[b + 1].item()
+            if end_idx > start_idx:
+                k_input[end_idx - 1, 0, kv_lora_rank:] = k_pe_t[b, 0, 0]
+
         q_input[..., :kv_lora_rank] = q_nope_out
         q_input[..., kv_lora_rank:] = q_pe
     else:
@@ -153,13 +191,28 @@ def ref_compute_full_fwd(
     )
     q_nope_out, q_pe = q.split([kv_lora_rank, qk_rope_head_dim], dim=-1)
 
-    k_pe_t = k_input.view(B, 1, S, -1)[:, :, -1:, kv_lora_rank:]
+    # Initialize k_pe_t tensor for storing the last position embeddings for each batch
+    k_pe_t = torch.empty(B, 1, 1, qk_rope_head_dim, dtype=k_input.dtype, device=device)
+
+    # Process each batch item separately to handle variable sequence lengths
+    for b in range(B):
+        start_idx = kv_indptr[b].item()
+        end_idx = kv_indptr[b + 1].item()
+        if end_idx > start_idx:  # Check if this batch has any sequence
+            # Get the last token's position embedding for this batch
+            batch_k = k_input[start_idx:end_idx]
+            k_pe_t[b, 0, 0] = batch_k[-1, 0, kv_lora_rank:]
 
     if use_rope:
         q_pe, k_pe_t = rotary_emb(positions, q_pe.unsqueeze(2), k_pe_t)
         q_pe = q_pe.squeeze()
 
-    k_input.view(B, 1, S, -1)[:, :, -1:, kv_lora_rank:] = k_pe_t
+        # Update k_input with rotated embeddings for each batch
+        for b in range(B):
+            start_idx = kv_indptr[b].item()
+            end_idx = kv_indptr[b + 1].item()
+            if end_idx > start_idx:
+                k_input[end_idx - 1, 0, kv_lora_rank:] = k_pe_t[b, 0, 0]
 
     q_input[..., :kv_lora_rank] = q_nope_out
     q_input[..., kv_lora_rank:] = q_pe
@@ -215,9 +268,10 @@ def test_op_fwd_rope(
     logit_cap=0.0,
     device="cuda",
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
             B,
             H,
@@ -255,6 +309,8 @@ def test_op_fwd_rope(
         sm_scale,
         logit_cap,
         use_rope,
+        is_neox_style=True,
+        config=_get_config()["fwd_grouped_kernel_stage1_rope"],
     )
 
     tri_logits = attn_logits
@@ -296,6 +352,7 @@ def test_op_fwd_rope(
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("use_rope", [True])
+@pytest.mark.parametrize("equal_seqlens", [True, False])
 @pytest.mark.parametrize("is_neox_style", [True, False])
 def test_op_fwd_rope_neox(
     B,
@@ -306,15 +363,17 @@ def test_op_fwd_rope_neox(
     rotary_dim,
     dtype,
     use_rope,
+    equal_seqlens,
     is_neox_style,
     num_kv_splits=2,
     sm_scale=1.0,
     logit_cap=0.0,
     device="cuda",
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
             B,
             H,
@@ -326,6 +385,7 @@ def test_op_fwd_rope_neox(
             dtype,
             device,
             is_neox_style=is_neox_style,
+            equal_seqlens=equal_seqlens,
         )
     )
 
@@ -355,6 +415,7 @@ def test_op_fwd_rope_neox(
         logit_cap,
         use_rope,
         is_neox_style=is_neox_style,
+        config=_get_config()["fwd_grouped_kernel_stage1_rope"],
     )
 
     tri_logits = attn_logits
@@ -403,6 +464,7 @@ def test_op_fwd_rope_neox(
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("use_rope", [True, False])
+@pytest.mark.parametrize("equal_seqlens", [True, False])
 @pytest.mark.parametrize("is_neox_style", [True, False])
 def test_op_fwd_rope_integration(
     B,
@@ -413,15 +475,17 @@ def test_op_fwd_rope_integration(
     rotary_dim,
     dtype,
     use_rope,
+    equal_seqlens,
     is_neox_style,
     num_kv_splits=2,
     sm_scale=1.0,
     logit_cap=0.0,
     device="cuda",
 ):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(0)
 
-    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+    kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
         input_helper(
             B,
             H,
@@ -433,6 +497,7 @@ def test_op_fwd_rope_integration(
             dtype,
             device,
             is_neox_style=is_neox_style,
+            equal_seqlens=equal_seqlens,
         )
     )
 

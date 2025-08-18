@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
 from ..jit.core import compile_ops
@@ -17,7 +17,7 @@ def rotary_embedding_fwd(
     sin_cache: Tensor,
     is_neox: bool,
     is_nope_first: bool,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_pos_encoding")
@@ -32,4 +32,4 @@ def batched_rotary_embedding(
     is_nope_first: bool,
     rot_dim: int,
     cos_sin_cache_offsets: Tensor,
-): ...
+) -> None: ...

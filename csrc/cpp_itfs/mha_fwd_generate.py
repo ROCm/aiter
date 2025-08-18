@@ -3,14 +3,29 @@
 # generate kernel instances to speed up compilation
 
 import argparse
+import sys
+import os
 from pathlib import Path
 from typing import Optional
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
+else:
+    AITER_CORE_DIR = os.path.abspath(
+        f"{this_dir}/../../aiter/jit/utils"
+    )  # develop mode
+sys.path.insert(0, AITER_CORE_DIR)
+
+from chip_info import get_gfx_list  # noqa: E402
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder
 
 AITER_API_FILENAME = "mha_fwd.cpp"
 
 AITER_CPP_API = """#include "mha_fwd.h"
+#include <iostream>
 
 namespace aiter {{
 mha_fwd_traits get_mha_fwd_traits(int head_size_q,
@@ -141,11 +156,34 @@ float mha_batch_prefill(mha_batch_prefill_args args,
 
 V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
-V3_API = """t = fmha_fwd_v3(traits, args, stream_config);"""
+V3_MULTI_TARGET_API = """
+    if (get_gpu_arch() == "gfx942") {
+        t = gfx942::fmha_fwd_v3(traits, args, stream_config);
+    } else if (get_gpu_arch() == "gfx950") {
+        t = gfx950::fmha_fwd_v3(traits, args, stream_config);
+    } else {
+        std::cout << "No supported GPU arch found!" << std::endl;
+        return -1;
+    }
+"""
 
-COMBINED_API = """t = fmha_fwd_v3(traits, args, stream_config);
+
+def get_v3_api():
+    gfx_list = get_gfx_list()
+    if len(gfx_list) == 1:
+        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config);"
+    else:
+        return V3_MULTI_TARGET_API
+
+
+V3_API = get_v3_api()
+
+COMBINED_API = (
+    V3_API
+    + """
     if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
 """
+)
 
 API_MAP = {
     1: FMHA_FWD_API.format(F_inner_dispatch=V3_API),
@@ -155,6 +193,7 @@ API_MAP = {
     5: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API)
     + FMHA_FWD_SPLITKV_API
     + FMHA_BATCH_PREFILL_API,
+    6: FMHA_FWD_API.format(F_inner_dispatch=COMBINED_API) + FMHA_FWD_SPLITKV_API,
 }
 
 

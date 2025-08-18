@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 from aiter.test_common import checkAllclose, perftest
@@ -282,7 +282,7 @@ def test_fmoe(
                 and (w1b.dtype == dtypes.fp8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
-                (inter_dim % 320 == 0)
+                (inter_dim % 320 == 0 or inter_dim % 256 == 0)
                 and (w1b.dtype == dtypes.i8 and inter_dim * 2 == w1b.shape[1])
             )
             or (
@@ -331,9 +331,91 @@ parser.add_argument(
     choices=l_test,
     default=None,
     help="""Select test to run.
-    e.g.: -t test_fmoe_16_bit""",
+    e.g.: -t test_fmoe_16_bit
+          or  -t test_fmoe_16_bit
+          or  -t g1u1_no_quant
+          or  -t g1u1_int8quant
+          or  -t g1u1_fp8quant
+          or  -t g1u0_int8smoothquant
+          or  -t g1u1_int8smoothquant
+          or  -t g1u1_fp8smoothquant
+          or  -t g1u1_int4""",
 )
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    nargs="?",
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-m",
+    "--token",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Token Num.
+    e.g.: -m 128""",
+)
+parser.add_argument(
+    "-hd",
+    "--hidden_dim",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Hidden states dim.
+    e.g.: -hd 4096""",
+)
+parser.add_argument(
+    "-id",
+    "--inter_dim",
+    type=int,
+    nargs="*",
+    default=None,
+    help="""Intermediate dim.
+    e.g.: -id 1024""",
+)
+parser.add_argument(
+    "-e",
+    "--expert",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""Number of experts.
+    e.g.: -e 32""",
+)
+parser.add_argument(
+    "-k",
+    "--topk",
+    type=int,
+    nargs="?",
+    default=None,
+    help="""Top-k value.
+    e.g.: -k 5""",
+)
+parser.add_argument(
+    "-a",
+    "--activation",
+    type=str,
+    choices=[
+        "silu",
+        "gelu",
+    ],
+    default="silu",
+    help="""Activation function.
+    e.g.: -a silu
+          or -a gelu
+    """,
+)
+
 args = parser.parse_args()
+
+args.activation = {"gelu": ActivationType.Gelu, "silu": ActivationType.Silu}[
+    args.activation
+]
+
 if args.test is not None:
     l_test = [args.test]
 for test in l_test:
@@ -341,115 +423,183 @@ for test in l_test:
     if test == "test_fmoe_16_bit":
         print("test test_fmoe 16 bit")
         print("\ng1u0 no quant")
-        for dtype in [dtypes.fp16, dtypes.bf16]:
-            for m in [128, 256]:
-                for dim in [4096, 8192]:
-                    for hdim in [1024]:
-                        # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                        test_fmoe(dtype, m, dim, hdim, 32, 5, quant="No")
+        for dtype in (
+            [dtypes.fp16, dtypes.bf16]
+            if args.dtype is None
+            else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128, 256] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
+                        test_fmoe(dtype, m, hdim, idim, expert, topk, quant="No")
     elif test == "g1u1_no_quant":
-        for dtype in [dtypes.fp16, dtypes.bf16]:
-            for m in [128, 256]:
-                for dim in [4096, 8192]:
-                    for hdim in [1024]:
-                        # test_fmoe(dtype, m, dim, hdim, 32, 5)
-                        test_fmoe(dtype, m, dim, hdim, 32, 5, quant="No", use_g1u1=True)
-    elif test == "g1u1_int8quant":
-        for dtype in [dtypes.bf16]:
-            for m in [128, 256]:
-                for dim in [4096, 8192]:
-                    for hdim in [1024]:
+        for dtype in (
+            [dtypes.fp16, dtypes.bf16]
+            if args.dtype is None
+            else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128, 256] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
                         test_fmoe(
                             dtype,
                             m,
-                            dim,
                             hdim,
-                            32,
-                            5,
+                            idim,
+                            expert,
+                            topk,
+                            quant="No",
+                            use_g1u1=True,
+                        )
+    elif test == "g1u1_int8quant":
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128, 256] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
+                        test_fmoe(
+                            dtype,
+                            m,
+                            hdim,
+                            idim,
+                            expert,
+                            topk,
                             #   quant='int8quant', use_g1u1=True, shared_E=0, activation=ActivationType.Gelu)
                             quant="int8quant",
                             use_g1u1=True,
                         )
 
     elif test == "g1u1_fp8quant":
-        for dtype in [dtypes.bf16]:
-            for m in [128, 256]:
-                for dim in [4096, 8192]:
-                    for hdim in [1024]:
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128, 256] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in [1024] if args.inter_dim is None else args.inter_dim:
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
                         test_fmoe(
                             dtype,
                             m,
-                            dim,
                             hdim,
-                            32,
-                            5,
+                            idim,
+                            expert,
+                            topk,
                             quant="fp8quant",
                             use_g1u1=True,
                             shared_E=0,
-                            activation=ActivationType.Gelu,
+                            activation=args.activation,
                         )
                         #   quant='fp8quant', use_g1u1=True)
 
     elif test == "g1u0_int8smoothquant":
-        for dtype in [dtypes.bf16]:
-            for m in [128]:
-                for dim in [4096, 6144, 8192]:
-                    for hdim in [512, 1024]:
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [512, 1024] if args.inter_dim is None else args.inter_dim
+                    ):
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
                         test_fmoe(
                             dtype,
                             m,
-                            dim,
                             hdim,
-                            32,
-                            5,
+                            idim,
+                            expert,
+                            topk,
                             quant="int8smoothquant",
                             use_g1u1=False,
                         )
 
     elif test == "g1u1_int8smoothquant":
-        for dtype in [dtypes.bf16]:
-            for m in [128]:
-                for dim in [4096, 6144, 8192]:
-                    for hdim in [512, 1024, 1280]:
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [512, 1024, 1280, 1536]
+                        if args.inter_dim is None
+                        else args.inter_dim
+                    ):
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
                         test_fmoe(
                             dtype,
                             m,
-                            dim,
                             hdim,
-                            32,
-                            5,
+                            idim,
+                            expert,
+                            topk,
                             quant="int8smoothquant",
                             use_g1u1=True,
                         )
 
     elif test == "g1u1_fp8smoothquant":
-        for dtype in [dtypes.bf16]:
-            for m in [128]:
-                for dim in [4096, 6144, 8192]:
-                    for hdim in [512, 1024, 1280]:
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [128] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 6144, 8192] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [512, 1024, 1280] if args.inter_dim is None else args.inter_dim
+                    ):
+                        expert = 32 if args.expert is None else args.expert
+                        topk = 5 if args.topk is None else args.topk
                         test_fmoe(
                             dtype,
                             m,
-                            dim,
                             hdim,
-                            32,
-                            5,
+                            idim,
+                            expert,
+                            topk,
                             quant="fp8smoothquant",
                             use_g1u1=True,
                         )
     elif test == "g1u1_int4":
-        for dtype in [dtypes.bf16]:
-            for m in [32, 128]:
-                # for dim in [1024]:
-                for dim in [4096, 6144]:
-                    for hdim in [1024, 4096]:
+        for dtype in (
+            [dtypes.bf16] if args.dtype is None else [dtypes.d_dtypes[args.dtype]]
+        ):
+            for m in [32, 128] if args.token is None else args.token:
+                for hdim in (
+                    [4096, 6144] if args.hidden_dim is None else args.hidden_dim
+                ):
+                    for idim in (
+                        [1024, 4096] if args.inter_dim is None else args.inter_dim
+                    ):
+                        expert = 8 if args.expert is None else args.expert
+                        topk = 3 if args.topk is None else args.topk
                         test_fmoe(
                             dtype,
                             m,
-                            dim,
                             hdim,
-                            8,
-                            3,
+                            idim,
+                            expert,
+                            topk,
                             quant="wint4afp8smoothquant",
                             use_g1u1=True,
                         )

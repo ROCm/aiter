@@ -4,10 +4,53 @@
 import torch
 import triton
 import pytest
+import functools
 from aiter.ops.triton.batched_gemm_a8w8 import batched_gemm_a8w8
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
+from typing import Union
+
+
+def generate_batched_gemm_a8w8_inputs(
+    B: int,
+    M: int,
+    N: int,
+    K: int,
+    dtype: Union[torch.dtype, str],
+    output=bool,
+    layout: str = "TN",
+):
+    """
+    Returns:
+        - x: shape (B, M, K)
+        - weight: shape (B, N, K)
+        - x_scale: shape (B, M, 1)
+        - w_scale: shape (B, 1, N)
+    """
+    if isinstance(dtype, str):
+        dtype = str_to_torch_dtype[dtype]
+    if layout[0] == "T":
+        x = torch.randint(-20, 20, (B, M, K), dtype=torch.int8).cuda()
+    else:
+        x = torch.randint(-20, 20, (B, K, M), dtype=torch.int8).cuda().permute(0, 2, 1)
+
+    if layout[1] == "N":
+        weight = torch.randint(-20, 20, (B, N, K), dtype=torch.int8).cuda()
+    else:
+        weight = (
+            torch.randint(-20, 20, (B, K, N), dtype=torch.int8).cuda().permute(0, 2, 1)
+        )
+
+    x_scale = torch.rand([B, M, 1], dtype=torch.float32).cuda() + 1e-6
+    w_scale = torch.rand([B, 1, N], dtype=torch.float32).cuda() + 1e-6
+    bias = torch.rand([B, 1, N], dtype=dtype).cuda() * 10
+
+    y = None
+    if output:
+        y = torch.empty((B, M, N), dtype=dtype, device=x.device)
+
+    return x, weight, x_scale, w_scale, bias, y
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16):
@@ -68,6 +111,16 @@ def get_x_vals():
     return x_vals
 
 
+def minimal_x_vals(num_vals=20):
+    """
+    Returns the num_vals smallest test cases. Useful for generating a subset to quickly test on.
+    """
+    x_vals = get_x_vals()
+    num_ops = [(i, functools.reduce(lambda x, y: x * y, i)) for i in x_vals]
+    sorted_x_vals = sorted(num_ops, key=lambda x: x[1])
+    return [i[0] for i in sorted_x_vals[: min(num_vals, len(sorted_x_vals))]]
+
+
 @pytest.mark.parametrize(
     "dtype, b, m, n, k, output",
     [
@@ -79,18 +132,36 @@ def get_x_vals():
     ],
 )
 def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
+    x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
+        b, m, n, k, dtype, output
+    )
+    a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
 
-    x = torch.randint(-20, 20, (b, m, k), dtype=torch.int8).cuda()
-    weight = torch.randint(-20, 20, (b, n, k), dtype=torch.int8).cuda()
-    x_scale = torch.rand([b, m, 1], dtype=torch.float32).cuda() + 1e-6
-    w_scale = torch.rand([b, 1, n], dtype=torch.float32).cuda() + 1e-6
-    bias = torch.rand([b, 1, n], dtype=dtype).cuda() * 10
+    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
 
-    y = None
-    if output:
-        y = torch.empty((b, m, n), dtype=dtype, device=x.device)
+
+@pytest.mark.parametrize(
+    "dtype, b, m, n, k, layout, output",
+    [
+        (dtype, b, *shape, layout, output)
+        for dtype in ["bf16"]
+        for b in [16]
+        for shape in minimal_x_vals()
+        for output in [True, False]
+        for layout in ["TT", "NN", "NT"]
+    ],
+)
+def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
+    dtype = str_to_torch_dtype[dtype]
+    x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
+        b, m, n, k, dtype, output, layout
+    )
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
 

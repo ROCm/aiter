@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
 import torch.nn.functional as F
@@ -28,14 +28,22 @@ def run_torch(input, weight, eps, residual=None):
 
 
 @perftest()
-def run_ck(input, weight, eps, residual=None):
+def run_ck(input, weight, eps, residual=None, use_model_sensitive_rmsnorm=0):
     if residual is None:
         residual_out = None
-        output = aiter.rms_norm(input, weight, eps)
+        output = aiter.rms_norm(input, weight, eps, use_model_sensitive_rmsnorm)
     else:
         residual_out = torch.empty_like(input)
         output = torch.empty_like(input)
-        aiter.rmsnorm2d_fwd_with_add(output, input, residual, residual_out, weight, eps)
+        aiter.rmsnorm2d_fwd_with_add(
+            output,
+            input,
+            residual,
+            residual_out,
+            weight,
+            eps,
+            use_model_sensitive_rmsnorm,
+        )
     return output, residual_out
 
 
@@ -75,13 +83,19 @@ def test_rmsnorm2d_fuseAdd(dtype, m, n):
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, 1e-5, residual=res)
-    (c, res_c, *_), avg_c = run_cu(input, weight, 1e-5, residual=res)
+    (c, res_c, *_), avg_c = run_ck(
+        input, weight, 1e-5, residual=res, use_model_sensitive_rmsnorm=1
+    )
+    (d, res_d, *_), avg_d = run_cu(input, weight, 1e-5, residual=res)
 
     msg = f"[perf] dim: {str(dim):<20}, dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, cu avg: {avg_c:<8.2f} us,uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, atol=0.03, msg=msg)
-    checkAllclose(res_a, res_b, msg="ck res check")
-    # checkAllclose(a, c, atol=0.03, msg='cu')
-    # checkAllclose(res_a, res_c, atol=0.01, msg='cu res check')
+    checkAllclose(res_a, res_b, msg="ck res check (NO_SPECIFIC_MODEL)")
+
+    checkAllclose(a, c, atol=0.03, msg=msg)
+    checkAllclose(res_a, res_c, msg="ck res check (T5_MODEL_LIKE)")
+    # checkAllclose(a, d, atol=0.03, msg='cu')
+    # checkAllclose(res_a, res_d, atol=0.01, msg='cu res check')
 
 
 # for dtype in [dtypes.fp16, dtypes.bf16]:

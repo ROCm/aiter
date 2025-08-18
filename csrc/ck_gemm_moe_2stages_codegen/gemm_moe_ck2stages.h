@@ -285,6 +285,26 @@ struct MulABScaleExpertWeightWin4
     }
 };
 
+struct MulABScaleExpertWeightA8W8blkscale
+{
+    template <typename E, typename C, typename D2>
+    __host__ __device__ constexpr void operator()(E& e, const C& c, const D2& d2) const;
+    template <>
+    __host__ __device__ constexpr void
+    operator()<F16, float, float>(F16& e, const float& c, const float& d2) const
+    {
+        (void)d2;
+        e = ck::type_convert<F16>(c);
+    }
+    template <>
+    __host__ __device__ constexpr void
+    operator()<B16, float, float>(B16& e, const float& c, const float& d2) const
+    {
+        (void)d2;
+        e = ck::type_convert<B16>(c);
+    }
+};
+
 using MoeKernel = std::function<void(const hipStream_t& stream,
                                      int,
                                      int,

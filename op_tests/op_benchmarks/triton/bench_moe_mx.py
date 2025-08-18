@@ -3,6 +3,7 @@ import sys
 import torch
 import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
+import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
 from op_tests.triton_tests.test_moe import torch_moe_align_block_size_ref
 from op_tests.triton_tests.test_moe_mx import (
@@ -12,6 +13,8 @@ from op_tests.triton_tests.test_moe_mx import (
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     get_model_configs,
+    get_caller_name_no_ext,
+    print_vgpr,
 )
 
 
@@ -45,11 +48,11 @@ def run_benchmark(args):
     a_dtype_str = args.a_dtype
     b_dtype_str = "mxfp4_e2m1"
     swizzle_mx = args.swizzle_mx
-
+    print(f"MoE Benchmark {a_dtype_str} x {b_dtype_str}")
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
-    line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+    line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -60,7 +63,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"MoE Benchmark {a_dtype_str} x {b_dtype_str}",
+        plot_name=get_caller_name_no_ext(),
         args={"a_dtype": a_dtype_str, "swizzle_mx": swizzle_mx},
     )
 
@@ -157,7 +160,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_gemm.run(save_path=".", print_data=True)
+    bench_moe_gemm.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -181,6 +184,7 @@ def parse_args():
     parser.add_argument("-M", type=int, help="M dimension")
     parser.add_argument("--routed-weight", action="store_true")
     parser.add_argument("--swizzle-mx", action="store_true")
+    parser.add_argument("-print_vgpr", action="store_true", default=False)
     parser.add_argument(
         "-A",
         "--a-dtype",
@@ -188,12 +192,24 @@ def parse_args():
         choices=["bf16", "fp16", "fp8_e5m2", "mxfp4_e2m1"],
         default="mxfp4_e2m1",
     )
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
 
 def main():
+    if not (arch_info.is_fp4_avail()):
+        print("MXFP4 not supported on this architecture")
+        sys.exit(0)
+
     args = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args)  # noqa: E731
+        print_vgpr(fun, get_caller_name_no_ext())
+        return 0
     run_benchmark(args)
 
 

@@ -9,6 +9,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 
@@ -171,10 +172,10 @@ def run_benchmark(args):
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
     if print_time:
-        line_names = ["Time (ms)"]
+        line_names = ["Time_(ms)"]
         line_vals = ["time"]
     else:
-        line_names = ["Time (ms)", "TFLOPS", "Bandwidth (GB/s)"]
+        line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
         line_vals = ["time", "tflops", "bandwidth"]
 
     benchmark = triton.testing.Benchmark(
@@ -185,7 +186,7 @@ def run_benchmark(args):
         line_names=line_names,
         styles=[("red", "-"), ("blue", "-"), ("yellow", "-")],
         ylabel="ms / TFLOPS / GB/s",
-        plot_name=f"{kernel_name}-benchmark",
+        plot_name=get_caller_name_no_ext(),
         args={},
     )
 
@@ -245,7 +246,7 @@ def run_benchmark(args):
         else:
             raise ValueError("Unknown metric: " + metric)
 
-    bench_moe_gemm.run(save_path=".", print_data=True)
+    bench_moe_gemm.run(save_path="." if args.o else None, print_data=True)
 
 
 def parse_args():
@@ -285,6 +286,9 @@ def parse_args():
     parser.add_argument("-no_bench_stage2", action="store_false", default=True)
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-fp8_type", default="e5m2fnuz")
+    parser.add_argument(
+        "-o", action="store_true", help="Write performance results to CSV file"
+    )
     args = parser.parse_args()
     return args
 
@@ -298,7 +302,7 @@ def main():
         def fun():
             return run_benchmark(args)
 
-        print_vgpr(fun, "_fused_moe_kernel-benchmark")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)
 
