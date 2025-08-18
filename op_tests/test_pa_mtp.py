@@ -397,7 +397,7 @@ l_dtype = ["bf16"]
 l_num_heads = [(5, 1), (8, 1), (16, 1)][:-1]
 l_qlen = [1, 2, 3, 4]
 l_ctx_len = [7, 26, 57, 66, 109, 128, 257, 282, 4097]
-l_batch_size = [128]
+l_batch_size = [el * i for el in [64, 80] for i in range(1, 20)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -418,7 +418,6 @@ parser.add_argument(
     "-n",
     "--num_heads",
     type=dtypes.str2tuple,
-    choices=l_num_heads,
     default=None,
     help="""Number of heads.
     e.g. -n 8,1""",
