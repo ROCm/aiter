@@ -8,17 +8,11 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from op_tests.triton_tests.test_extend_attention import input_helper
 
 import torch
 import argparse
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-is_hip_ = is_hip()
+from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.test_extend_attention import input_helper
 
 
 def extend_forward(
@@ -153,9 +147,9 @@ def model_benchmark_configs(args):
     x_vals_list = []
 
     for model_name, config in configs.items():
-        HQ = config["num_attention_heads"] // 8  # tp8 mode
-        prefix = args.prefix if args.prefix else 16324
-        extend = args.extend if args.extend else 8192
+        HQ = config["num_attention_heads"]
+        prefix = args.prefix
+        extend = args.extend
         attn_impl = args.attn_impl if args.attn_impl else "non-absorb"
         x_vals_list.append(
             (model_name, batch_size, HQ, prefix, extend, 512, 64, 128, attn_impl)
@@ -165,13 +159,16 @@ def model_benchmark_configs(args):
 
 
 def benchmark(args):
-    dtype = arg_to_torch_dtype[args.dtype]
+    dtype = str_to_torch_dtype[args.dtype]
     torch.set_default_dtype(dtype)
 
     configs = []
 
+    causal = args.causal
+
     if args.model:
         x_names, x_vals_list = model_benchmark_configs(args)
+        causal = True  # Force causal=True for model benchmarks
     else:
         if args.mode == "extend":
             x_names, x_vals_list = get_extend_benchmark_configs()
@@ -230,9 +227,6 @@ def benchmark(args):
             custom_mask,
             mask_indptr,
             max_len_extend,
-            B_Start_Loc,
-            B_Loc,
-            B_Seqlen,
         ) = input_helper(
             B,
             H,
@@ -243,61 +237,32 @@ def benchmark(args):
             v_head_dim,
             dtype,
             device,
+            attn_impl=args.attn_impl,
         )
 
-        if provider == "extend_attention_fwd":
-
-            def extend_attention():
-                return extend_forward(
-                    q_extend,
-                    k_extend,
-                    v_extend,
-                    k_buffer,
-                    v_buffer,
-                    kv_indptr,
-                    kv_indices,
-                    qo_indptr,
-                    custom_mask,
-                    mask_indptr,
-                    max_len_extend,
-                    args.causal,
-                    sm_scale,
-                    logit_cap,
-                )
-
-            def context_attention():
-                return extend_forward(
-                    q_extend,
-                    k_extend,
-                    v_extend,
-                    B_Start_Loc,
-                    B_Seqlen,
-                    max_len_extend,
-                    args.causal,
-                )
-
-            if provider == "extend_attention_fwd":
-                fn = extend_attention
-            elif provider == "context_attention_fwd":
-                assert (
-                    prefix == 0
-                ), "Prefix length must be 0 for context attention. Try setting -mode prefill."
-                fn = context_attention
-            else:
-                raise ValueError(f"Unknown provider: {provider}")
+        def fn():
+            return extend_forward(
+                q_extend,
+                k_extend,
+                v_extend,
+                k_buffer,
+                v_buffer,
+                kv_indptr,
+                kv_indices,
+                qo_indptr,
+                custom_mask,
+                mask_indptr,
+                max_len_extend,
+                causal,
+                sm_scale,
+                logit_cap,
+            )
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
         return ms
 
     bench_MLA.run(save_path="." if args.o else None, print_data=True, show_plots=False)
     return x_vals_list, x_names, line_vals
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
 
 
 def parse_args():
@@ -357,13 +322,6 @@ def parse_args():
         help="Write performance results to CSV file",
     )
     return parser.parse_args()
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-    "fp32": torch.float32,
-}
 
 
 def run_bench(args):
