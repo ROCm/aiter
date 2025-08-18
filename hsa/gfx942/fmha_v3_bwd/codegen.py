@@ -2104,6 +2104,7 @@ def write_blobs(output_dir: Optional[str]) -> None:
         FMHA_BWD_KERNEL_HEADER + FMHA_BWD_API
     )
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog="generate",
