@@ -188,14 +188,15 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @pytest.mark.parametrize("B, M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype):
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
+def test_batched_gemm_afp4_wfp4(B: int, M: int, N: int, K: int, dtype, layout):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     x, w, x_scales, w_scales, out = generate_batched_gemm_afp4wfp4_inputs(
-        B, M, N, K, dtype, output=True
+        B, M, N, K, dtype, layout=layout, output=True
     )
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
