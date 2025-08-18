@@ -1137,7 +1137,9 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_fp16_causal_a32_pssk
         gfx = get_gfx()
         # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (hdim_q == 128 and gfx == "gfx950")
+        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
+            hdim_q == 128 and gfx == "gfx950"
+        )
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
