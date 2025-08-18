@@ -16,6 +16,7 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
+from multiprocessing import Pool
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -59,13 +60,13 @@ if IS_ROCM:
         all_opts_args_build, prebuild_link_param = core.get_args_of_build(
             "all", exclude=exclude_ops
         )
+        os.system(f"rm -rf {core.get_user_jit_dir()}/build")
+        os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
         prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
-        if os.path.exists(prebuild_dir) and os.path.isdir(prebuild_dir):
-            shutil.rmtree(prebuild_dir)
+        core.recopy_ck()
         os.makedirs(prebuild_dir + "/srcs")
 
-        # step 1, build *.cu -> module*.so
-        for one_opt_args in all_opts_args_build:
+        def build_one_module(one_opt_args):
             core.build_module(
                 md_name=one_opt_args["md_name"],
                 srcs=one_opt_args["srcs"],
@@ -81,6 +82,9 @@ if IS_ROCM:
                 torch_exclude=False,
                 prebuild=1,
             )
+        # step 1, build *.cu -> module*.so
+        with Pool(processes=int(0.8 * os.cpu_count())) as pool:
+            pool.map(build_one_module, all_opts_args_build)
 
         ck_batched_gemm_folders = [
             f"{this_dir}/csrc/{name}/include"
