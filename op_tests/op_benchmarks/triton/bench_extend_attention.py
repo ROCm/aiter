@@ -227,6 +227,9 @@ def benchmark(args):
             custom_mask,
             mask_indptr,
             max_len_extend,
+            _,
+            _,
+            _,
         ) = input_helper(
             B,
             H,
