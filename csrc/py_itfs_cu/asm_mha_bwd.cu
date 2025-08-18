@@ -307,7 +307,7 @@ std::vector<at::Tensor> fmha_v3_bwd(const at::Tensor &dout,         // [b, sq, h
         } else {
             // When atomic16, padding dq_accum seqlen to 16x, head dim to 128
             // In this case, dq_accum could have any layout, we set it to be `bhsd`
-            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, 128}, q.dtype());
+            dq_accum = torch::zeros({1, batch_size, num_heads, (seqlen_q + 15) / 16 * 16, 128}, opts.dtype(q_dtype));
         }
     } else {
         const ck_tile::index_t kN0 = head_size_v <= 128 ? 128 : 64;
