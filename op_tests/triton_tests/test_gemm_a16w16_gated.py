@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import triton
 import pytest
 from aiter.ops.triton.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.test_gemm_a16w16 import minimal_x_vals
@@ -13,21 +12,21 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
 
     # TN is default layout
     if layout[0] == "T":
-        x = torch.randn((M, K), dtype=dtype).cuda()
+        x = torch.randn((M, K), dtype=dtype, device="cuda")
     else:
-        x = torch.randn((K, M), dtype=dtype).cuda().T
+        x = torch.randn((K, M), dtype=dtype, device="cuda").T
 
     if layout[1] == "T":
-        weight = torch.randn((K, N), dtype=dtype).cuda().T
+        weight = torch.randn((K, N), dtype=dtype, device="cuda").T
     else:
-        weight = torch.randn((N, K), dtype=dtype).cuda()
+        weight = torch.randn((N, K), dtype=dtype, device="cuda")
 
     weight = weight / K**0.5  # scale down output variance to 1
 
     y = None
     if output:
         assert N % 2 == 0
-        y = torch.empty((M, N // 2), dtype=dtype).cuda()
+        y = torch.empty((M, N // 2), dtype=dtype, device="cuda")
         out_dtype = (None,)
     else:
         out_dtype = dtype
@@ -89,4 +88,4 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activ
     Note: There's a small distinction between Triton and Torch's implementations of silu
     (due to tl.sigmoid() vs torch.sigmoid()). The gated outputs can differ by as much as 3%.
     """
-    triton.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
