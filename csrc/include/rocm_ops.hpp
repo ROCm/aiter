@@ -22,37 +22,39 @@
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
-#define ATTENTION_ASM_MLA_PYBIND           \
-    m.def("mla_decode_stage1_asm_fwd",     \
-          &mla_decode_stage1_asm_fwd,      \
-          "mla_decode_stage1_asm_fwd",     \
-          py::arg("Q"),                    \
-          py::arg("KV"),                   \
-          py::arg("qo_indptr"),            \
-          py::arg("kv_indptr"),            \
-          py::arg("kv_page_indices"),      \
-          py::arg("kv_last_page_lens"),    \
-          py::arg("num_kv_splits_indptr"), \
-          py::arg("work_meta_data"),       \
-          py::arg("work_indptr"),          \
-          py::arg("work_info_set"),        \
-          py::arg("max_seqlen_q"),         \
-          py::arg("softmax_scale"),        \
-          py::arg("splitData"),            \
-          py::arg("splitLse"),             \
-          py::arg("output"));              \
-    m.def("mla_prefill_asm_fwd",           \
-          &mla_prefill_asm_fwd,            \
-          "mla_prefill_asm_fwd",           \
-          py::arg("Q"),                    \
-          py::arg("KV"),                   \
-          py::arg("qo_indptr"),            \
-          py::arg("kv_indptr"),            \
-          py::arg("kv_page_indices"),      \
-          py::arg("kv_last_page_lens"),    \
-          py::arg("max_seqlen_q"),         \
-          py::arg("softmax_scale"),        \
-          py::arg("splitData"),            \
+#define ATTENTION_ASM_MLA_PYBIND                \
+    m.def("mla_decode_stage1_asm_fwd",          \
+          &mla_decode_stage1_asm_fwd,           \
+          "mla_decode_stage1_asm_fwd",          \
+          py::arg("Q"),                         \
+          py::arg("KV"),                        \
+          py::arg("qo_indptr"),                 \
+          py::arg("kv_indptr"),                 \
+          py::arg("kv_page_indices"),           \
+          py::arg("kv_last_page_lens"),         \
+          py::arg("num_kv_splits_indptr"),      \
+          py::arg("work_meta_data"),            \
+          py::arg("work_indptr"),               \
+          py::arg("work_info_set"),             \
+          py::arg("max_seqlen_q"),              \
+          py::arg("softmax_scale"),             \
+          py::arg("splitData"),                 \
+          py::arg("splitLse"),                  \
+          py::arg("output"),                    \
+          py::arg("q_scale")   = std::nullopt,  \
+          py::arg("kv_scale")  = std::nullopt); \
+    m.def("mla_prefill_asm_fwd",                \
+          &mla_prefill_asm_fwd,                 \
+          "mla_prefill_asm_fwd",                \
+          py::arg("Q"),                         \
+          py::arg("KV"),                        \
+          py::arg("qo_indptr"),                 \
+          py::arg("kv_indptr"),                 \
+          py::arg("kv_page_indices"),           \
+          py::arg("kv_last_page_lens"),         \
+          py::arg("max_seqlen_q"),              \
+          py::arg("softmax_scale"),             \
+          py::arg("splitData"),                 \
           py::arg("splitLse"));
 
 #define ATTENTION_ASM_PYBIND                        \

@@ -297,6 +297,8 @@ def mla_decode_fwd(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
+    q_scale=None,
+    kv_scale=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -402,6 +404,8 @@ def mla_decode_fwd(
         logits,
         attn_lse,
         o,
+        q_scale,
+        kv_scale,
     )
 
     aiter.mla_reduce_v1(
@@ -564,6 +568,8 @@ def mla_decode_fwd_dispatch(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
+    q_scale=None,
+    kv_scale=None,
 ):
     if batch_split_table is None:
         return mla_decode_fwd(
@@ -584,6 +590,8 @@ def mla_decode_fwd_dispatch(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
         )
     else:
         return mla_decode_fwd_balenced(

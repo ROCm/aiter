@@ -41,6 +41,10 @@ struct __attribute__((packed)) KernelArgs
     p2 _p19;
 	void* ptr_RP;
 	p2 _p20;
+    void* ptr_QSCALE;
+    p2 _p21;
+    void* ptr_KVSCALE;
+    p2 _p22;
 };
 
 void mla_decode_stage1_asm_fwd(
@@ -59,7 +63,9 @@ void mla_decode_stage1_asm_fwd(
     // following are output
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& splitLse,  //[batch_size, num_kv_splits, num_heads,  1]
-    torch::Tensor& output     //[batch_size, num_heads, v_head_dim]
+    torch::Tensor& output,    //[batch_size, num_heads, v_head_dim]
+    std::optional<torch::Tensor> q_scale  = std::nullopt, //   [1]
+    std::optional<torch::Tensor> kv_scale = std::nullopt  //   [1]
 )
 {
     int batch           = qo_indptr.size(0) - 1;
@@ -183,6 +189,40 @@ void mla_decode_stage1_asm_fwd(
                     "_ZN5aiter39mla_a16w16_qh16_m32x4_n16x1_coex0_mask1E",
                     "/mla/mla_a16w16_qh16_m32x4_n16x1_coex0_mask1.co");
                 impl_ptr = &impl_a16w16_bf16;
+            }
+        }
+    }
+    else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz) // at::ScalarType::Float8_e4m3fnuz in mi300
+    {
+        assert(q_scale.has_value() && kv_scale.has_value());
+        assert(q_scale.value().data_ptr() != nullptr && kv_scale.value().data_ptr() != nullptr);
+        args.ptr_QSCALE  = q_scale.value().data_ptr();
+        args.ptr_KVSCALE = kv_scale.value().data_ptr();
+
+        if(gqa_ratio == 16)
+        {
+            if(max_seqlen_q == 2)
+            {
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "mla_kernel_func",
+                    "/mla/mla_fp8_qh16_m16x4_n16x1_coex0_mask1_mtp2.co");
+                impl_ptr = &impl_fp8;
+            }
+            else if(max_seqlen_q <= 4)
+            {
+                // not support yet
+                assert(false);
+
+                sub_Q = 128;
+                static AiterAsmKernel impl_fp8(
+                    "mla_kernel_func",
+                    "/mla/mla_fp8_qh16_m16x4_n16x1_coex0_mask1.co");
+                impl_ptr = &impl_fp8;
+            }
+            else
+            {
+                assert(false);
             }
         }
     }
