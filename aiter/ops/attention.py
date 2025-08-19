@@ -82,6 +82,7 @@ def paged_attention_rocm(
     fp8_out_scale: Optional[torch.Tensor] = None,
     partition_size: int = 256,
     mtp: int = 1,
+    q_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     paged_attention_rocm_core(
         out,
@@ -104,6 +105,7 @@ def paged_attention_rocm(
         fp8_out_scale,
         partition_size,
         mtp,
+        q_scale,
     )
     return out
 
