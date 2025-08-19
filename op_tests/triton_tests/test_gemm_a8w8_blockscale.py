@@ -3,7 +3,8 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
@@ -31,8 +32,8 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
-    return gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y)
+def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None, impl=None):
+    return impl(x, weight, x_scale, w_scale, dtype, y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -141,7 +142,14 @@ def generate_gemm_a8w8_blockscale_inputs(
         for shape in get_x_vals()
     ],
 )
-def test_gemm(dtype, M, N, K, layout, output):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "gluon",
+        "triton",
+    ]
+)
+def test_gemm(dtype, M, N, K, layout, output, impl: str):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     block_shape_n, block_shape_k = block_shape
@@ -159,6 +167,12 @@ def test_gemm(dtype, M, N, K, layout, output):
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, dtype, y)
+    if impl == "gluon":
+        impl = gluon_gemm_a8w8_blockscale
+    elif impl == "triton":
+        impl = triton_gemm_a8w8_blockscale
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight, x_scale, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
