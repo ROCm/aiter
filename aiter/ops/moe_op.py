@@ -49,7 +49,6 @@ def fmoe(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     topk: int,
-    kernelName: str,
 ) -> None: ...
 
 
