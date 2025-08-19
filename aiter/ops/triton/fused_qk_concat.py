@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton.rope import _get_gptj_rotated_x_1D, _get_neox_rotated_x_1D
-
 # from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 # _LOGGER = AiterTritonLogger()
@@ -27,8 +26,8 @@ def _unit_cat(
     x_out_stride_b,
     x_out_stride_h,
     x_out_stride_d,
+    k_scale, 
     BLOCK_D1: tl.constexpr,
-    K_SCALE: tl.constexpr = 1,
 ):
     x1_offs = b_in * x1_stride_b + h * x1_stride_h + d1_offs * x1_stride_d
     x2_offs = b_in * x2_stride_b + h * x2_stride_h + d2_offs * x2_stride_d
@@ -37,9 +36,8 @@ def _unit_cat(
     x1 = tl.load(x1_ptr + x1_offs)
     x2 = tl.load(x2_ptr + x2_offs)
 
-    if K_SCALE != 1:
-        x1 = x1 * K_SCALE
-        x2 = x2 * K_SCALE
+    x1 = x1 * k_scale
+    x2 = x2 * k_scale
     tl.store(x_out_ptr + x_out_offs + d1_offs * x_out_stride_d, x1)
     tl.store(x_out_ptr + x_out_offs + (d2_offs + BLOCK_D1) * x_out_stride_d, x2)
 
@@ -98,6 +96,7 @@ def _qk_cat_kernel(
         q_out_stride_b,
         q_out_stride_h,
         q_out_stride_d,
+        1,
         BLOCK_D1,
     )
 
@@ -120,6 +119,7 @@ def _qk_cat_kernel(
             k_out_stride_b,
             k_out_stride_h,
             k_out_stride_d,
+            1,
             BLOCK_D1,
         )
 
@@ -208,11 +208,11 @@ def _unit_rope_cat(
     x_out_stride_b,
     x_out_stride_h,
     x_out_stride_d,
+    k_scale,
     IS_NEOX: tl.constexpr,
     BLOCK_D_nope: tl.constexpr,
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
-    K_SCALE: tl.constexpr = 1,
 ):
     x_nope_offs = (
         b_in * x_nope_stride_b + h * x_nope_stride_h + d_nope_offs * x_nope_stride_d
@@ -235,9 +235,8 @@ def _unit_rope_cat(
         )
 
     x_pe = x_pe * cos + x_pe_rotated * sin
-    if K_SCALE != 1:
-        x_pe = x_pe * K_SCALE
-        x_nope = x_nope * K_SCALE
+    x_pe = x_pe * k_scale
+    x_nope = x_nope * k_scale
     x_pe = x_pe.to(x_pe_ptr.dtype.element_ty)
 
     tl.store(x_out_ptr + x_out_offs + d_nope_offs * x_out_stride_d, x_nope)
@@ -330,6 +329,7 @@ def _qk_rope_cat_kernel(
         q_out_stride_b,
         q_out_stride_h,
         q_out_stride_d,
+        1,
         IS_NEOX,
         BLOCK_D_nope,
         BLOCK_D_pe,
@@ -357,6 +357,7 @@ def _qk_rope_cat_kernel(
             k_out_stride_b,
             k_out_stride_h,
             k_out_stride_d,
+            1,
             IS_NEOX,
             BLOCK_D_nope,
             BLOCK_D_pe,
@@ -490,6 +491,7 @@ def _qk_rope_cat_and_cache_mla_kernel(
     kv_cache_stride_b,
     kv_cache_stride_h,
     kv_cache_stride_d,
+    k_scale_ptr,
     QH_PER_KH: tl.constexpr,
     QH: tl.constexpr,
     KH: tl.constexpr,
@@ -499,7 +501,7 @@ def _qk_rope_cat_and_cache_mla_kernel(
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
     OUTPUT_Q_NOPE_ZEROS: tl.constexpr = False,
-    K_SCALE: tl.constexpr = 1,
+    HAS_K_SCALE: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
@@ -550,6 +552,7 @@ def _qk_rope_cat_and_cache_mla_kernel(
             q_out_stride_b,
             q_out_stride_h,
             q_out_stride_d,
+            1,
             IS_NEOX,
             BLOCK_D_nope,
             BLOCK_D_pe,
@@ -557,18 +560,16 @@ def _qk_rope_cat_and_cache_mla_kernel(
         )
 
         if OUTPUT_Q_NOPE_ZEROS:
-            z = tl.zeros((BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
-            tl.store(
-                q_nope_zeros_out_ptr
-                + pid_b * q_nope_zeros_out_stride_b
-                + pid_hq * q_nope_zeros_out_stride_h
-                + d_nope_offs * q_nope_zeros_out_stride_d,
-                z,
-            )
+            z = tl.zeros((BLOCK_D_nope, ), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(q_nope_zeros_out_ptr + pid_b * q_nope_zeros_out_stride_b + pid_hq * q_nope_zeros_out_stride_h + d_nope_offs * q_nope_zeros_out_stride_d, z)
 
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
+                if HAS_K_SCALE:
+                    k_scale = tl.load(k_scale_ptr)
+                else:
+                    k_scale = 1
                 _unit_rope_cat(
                     k_nope_ptr,
                     k_pe_ptr,
@@ -589,11 +590,11 @@ def _qk_rope_cat_and_cache_mla_kernel(
                     kv_cache_stride_b,
                     kv_cache_stride_h,
                     kv_cache_stride_d,
+                    k_scale,
                     IS_NEOX,
                     BLOCK_D_nope,
                     BLOCK_D_pe,
                     BLOCK_D_HALF_pe,
-                    K_SCALE,
                 )
     else:
         pid = pid - B * QH + B * KH
@@ -602,6 +603,10 @@ def _qk_rope_cat_and_cache_mla_kernel(
             pid_hk = pid % KH
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
+                if HAS_K_SCALE:
+                    k_scale = tl.load(k_scale_ptr)
+                else:
+                    k_scale = 1
                 _unit_cat(
                     k_nope_ptr,
                     k_pe_ptr,
@@ -620,8 +625,8 @@ def _qk_rope_cat_and_cache_mla_kernel(
                     kv_cache_stride_b,
                     kv_cache_stride_h,
                     kv_cache_stride_d,
+                    k_scale,
                     BLOCK_D_nope,
-                    K_SCALE,
                 )
 
 
@@ -686,7 +691,8 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
-    assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
+    if isinstance(k_scale, torch.Tensor):
+        assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
 
     q_out = torch.empty(
@@ -724,6 +730,7 @@ def fused_qk_rope_cat_and_cache_mla(
         *q_out.stride(),
         *q_nope_zeros_out.stride(),
         *kv_cache.stride(),
+        k_scale_ptr=k_scale,
         QH_PER_KH=qh // kh,
         QH=qh,
         KH=kh,
@@ -733,7 +740,7 @@ def fused_qk_rope_cat_and_cache_mla(
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
         OUTPUT_Q_NOPE_ZEROS=output_q_nope_zeros,
-        K_SCALE=k_scale.item(),
+        HAS_K_SCALE=(k_scale is not None)
     )
 
     if output_q_nope_zeros:
@@ -854,6 +861,7 @@ def _qk_rope_cat_and_cache_mla_q_per_token_fp8_quant_kernel(
     kv_cache_stride_b,
     kv_cache_stride_h,
     kv_cache_stride_d,
+    k_scale_ptr,
     QH_PER_KH: tl.constexpr,
     QH: tl.constexpr,
     KH: tl.constexpr,
@@ -864,7 +872,7 @@ def _qk_rope_cat_and_cache_mla_q_per_token_fp8_quant_kernel(
     BLOCK_D_HALF_pe: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
     DTYPE_MIN: tl.constexpr,
-    K_SCALE: tl.constexpr = 1,
+    HAS_K_SCALE: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
 
@@ -930,6 +938,10 @@ def _qk_rope_cat_and_cache_mla_q_per_token_fp8_quant_kernel(
         if pid_hq % QH_PER_KH == 0:
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
+                if HAS_K_SCALE:
+                    k_scale = tl.load(k_scale_ptr)
+                else:
+                    k_scale = 1
                 _unit_rope_cat(
                     k_nope_ptr,
                     k_pe_ptr,
@@ -950,11 +962,11 @@ def _qk_rope_cat_and_cache_mla_q_per_token_fp8_quant_kernel(
                     kv_cache_stride_b,
                     kv_cache_stride_h,
                     kv_cache_stride_d,
+                    k_scale,
                     IS_NEOX,
                     BLOCK_D_nope,
                     BLOCK_D_pe,
                     BLOCK_D_HALF_pe,
-                    K_SCALE,
                 )
     else:
         pid = pid - B * QH + B * KH
@@ -963,6 +975,10 @@ def _qk_rope_cat_and_cache_mla_q_per_token_fp8_quant_kernel(
             pid_hk = pid % KH
             pid_slot = tl.load(slot_mapping_ptr + pid_b).to(tl.int64)
             if pid_slot >= 0:
+                if HAS_K_SCALE:
+                    k_scale = tl.load(k_scale_ptr)
+                else:
+                    k_scale = 1
                 _unit_cat(
                     k_nope_ptr,
                     k_pe_ptr,
@@ -981,8 +997,8 @@ def _qk_rope_cat_and_cache_mla_q_per_token_fp8_quant_kernel(
                     kv_cache_stride_b,
                     kv_cache_stride_h,
                     kv_cache_stride_d,
+                    k_scale,
                     BLOCK_D_nope,
-                    K_SCALE,
                 )
 
 
@@ -1048,7 +1064,8 @@ def fused_qk_rope_cat_and_cache_mla_q_per_token_fp8_quant(
     assert (d_freq == d_pe // 2) or (
         d_freq == d_pe
     ), "cos/sin last dim should be the same or half of the qk last dim"
-    assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
+    if isinstance(k_scale, torch.Tensor):
+        assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
 
     q_out = torch.empty((b, qh, d_nope + d_pe), dtype=dtype_quant, device=q_nope.device)
@@ -1085,6 +1102,7 @@ def fused_qk_rope_cat_and_cache_mla_q_per_token_fp8_quant(
         *q_out.stride(),
         *qs_out.stride(),
         *kv_cache.stride(),
+        k_scale_ptr=k_scale,
         QH_PER_KH=qh // kh,
         QH=qh,
         KH=kh,
@@ -1095,7 +1113,7 @@ def fused_qk_rope_cat_and_cache_mla_q_per_token_fp8_quant(
         BLOCK_D_HALF_pe=d_pe // 2,
         DTYPE_MAX=DTYPE_MAX,
         DTYPE_MIN=-DTYPE_MAX,
-        K_SCALE=k_scale.item(),
+        HAS_K_SCALE=(k_scale is not None)
     )
 
     return q_out, qs_out
