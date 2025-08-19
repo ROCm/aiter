@@ -518,7 +518,7 @@ MANUAL_SCHEMA_OPS = [
 NONE_WRAPPED_OP = [
     # "hipb_create_extension",
     # "hipb_destroy_extension",
-    # "getHipblasltKernelName",
+    "getHipblasltKernelName",
     # "rocb_create_extension",
     # "rocb_destroy_extension",
     "get_meta_buffer_ipc_handle",
