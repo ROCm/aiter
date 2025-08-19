@@ -7,7 +7,6 @@ import json
 import os
 import torch
 import triton
-import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
@@ -24,7 +23,7 @@ from triton.experimental.gluon import language as gl
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@gluon.jit
 def _gemm_a8w8_blockscale_kernel(
     # Pointers to matrices
     a_ptr,
@@ -52,20 +51,20 @@ def _gemm_a8w8_blockscale_kernel(
     stride_bscale_k,
     stride_bscale_n,
     # Meta-parameters
-    GROUP_K: tl.constexpr,
-    GROUP_N: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    NUM_KSPLIT: tl.constexpr,
-    SPLITK_BLOCK_SIZE: tl.constexpr,
-    EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    GROUP_K: gl.constexpr,
+    GROUP_N: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_K: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+    NUM_KSPLIT: gl.constexpr,
+    SPLITK_BLOCK_SIZE: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    GRID_MN: gl.constexpr,
+    cache_modifier: gl.constexpr,
 ):
     """
-    Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
+    Note: this is Triton jited function and not meant to be called direcgly. Call gemm_a8w8_blockscale function
     below
 
     Computes the 8 bit matmul C = A x B using the block-scale quantization approach.
@@ -81,26 +80,14 @@ def _gemm_a8w8_blockscale_kernel(
     **scale_n = (N + GROUP_N - 1) // GROUP_N
     """
 
-    tl.assume(stride_am > 0)
-    tl.assume(stride_ak > 0)
-    tl.assume(stride_bk > 0)
-    tl.assume(stride_bn > 0)
-    tl.assume(stride_ck > 0)
-    tl.assume(stride_cm > 0)
-    tl.assume(stride_cn > 0)
-    tl.assume(stride_ascale_m > 0)
-    tl.assume(stride_ascale_k > 0)
-    tl.assume(stride_bscale_k > 0)
-    tl.assume(stride_bscale_n > 0)
-
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
-    pid_unified = tl.program_id(axis=0)
+    pid_unified = gl.program_id(axis=0)
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_m = gl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
         remap_xcd(pid, GRID_MN)
@@ -110,25 +97,34 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(pid_k >= 0)
+    blocked_mk: gl.constexpr = gl.BlockedLayout(size_per_thread=[4, 8], threads_per_warp=[8, 8], warps_per_cta=[8, 1],
+                                                order=[1, 0])
+    blocked_kn: gl.constexpr = gl.BlockedLayout(size_per_thread=[8, 4], threads_per_warp=[8, 8], warps_per_cta=[1, 8],
+                                                order=[0, 1])
+    shared_a: gl.constexpr =  gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
+    shared_b: gl.constexpr =  gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1])
+    # mfma layout is tuned by trial and error to find the fastest one
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 2])
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
-        # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
-        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+        # SPLITK_BLOCK_SIZE = gl.cdiv(K, NUM_KSPLIT)
+        num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         # Create pointers for first block of A and B input matrices
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout = gl.SliceLayout(0, blocked_mk))
+        offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak
+        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout = gl.SliceLayout(1, blocked_kn))
+        offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
+        offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
-            offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
+            offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
         )
         b_ptrs = b_ptr + (
-            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
 
         # Create pointers for the scales
@@ -142,29 +138,29 @@ def _gemm_a8w8_blockscale_kernel(
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
-        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
+        accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                a = gl.load(a_ptrs)
+                b = gl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
+                a = gl.load(
+                    a_ptrs, mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, other=0.0
                 )
-                b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
+                b = gl.load(
+                    b_ptrs, mask=offs_bk[:, None] < K - k * BLOCK_SIZE_K, other=0.0
                 )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+            a_scale = gl.load(a_scale_ptrs)
+            b_scale = gl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
             accumulator += (
-                tl.dot(a, b, input_precision="ieee")
+                gl.dot(a, b, input_precision="ieee")
                 * a_scale[:, None]
                 * b_scale[None, :]
             )
@@ -182,8 +178,8 @@ def _gemm_a8w8_blockscale_kernel(
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M).to(gl.int64)
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N).to(gl.int64)
         c_ptrs = (
             c_ptr
             + stride_cm * offs_cm[:, None]
@@ -191,7 +187,7 @@ def _gemm_a8w8_blockscale_kernel(
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+        gl.store(c_ptrs, c, mask=c_mask)
 
 
 @triton.jit
@@ -205,27 +201,27 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     stride_c_in_n,
     stride_c_out_m,
     stride_c_out_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    ACTUAL_KSPLIT: tl.constexpr,
-    MAX_KSPLIT: tl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    ACTUAL_KSPLIT: gl.constexpr,
+    MAX_KSPLIT: gl.constexpr,
 ):
 
-    tl.assume(stride_c_in_k > 0)
-    tl.assume(stride_c_in_m > 0)
-    tl.assume(stride_c_in_n > 0)
-    tl.assume(stride_c_out_m > 0)
-    tl.assume(stride_c_out_n > 0)
+    gl.assume(stride_c_in_k > 0)
+    gl.assume(stride_c_in_m > 0)
+    gl.assume(stride_c_in_n > 0)
+    gl.assume(stride_c_out_m > 0)
+    gl.assume(stride_c_out_n > 0)
 
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    pid_m = gl.program_id(axis=0)
+    pid_n = gl.program_id(axis=1)
 
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
+    gl.assume(pid_m > 0)
+    gl.assume(pid_n > 0)
 
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, MAX_KSPLIT)
+    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)) % M
+    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = gl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
         + (offs_k[:, None, None] * stride_c_in_k)
@@ -234,10 +230,10 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     )
 
     if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = tl.load(c_in_ptrs)
+        c = gl.load(c_in_ptrs)
     else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
-    c = tl.sum(c, axis=0)
+        c = gl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
+    c = gl.sum(c, axis=0)
 
     c = c.to(c_out_ptr.type.element_ty)
 
@@ -247,7 +243,7 @@ def _gemm_a8w8_blockscale_reduce_kernel(
         + (offs_n[None, :] * stride_c_out_n)
     )
 
-    tl.store(c_out_ptrs, c)
+    gl.store(c_out_ptrs, c)
 
 
 @functools.lru_cache(maxsize=1024)
