@@ -33,14 +33,16 @@ float fmha_fwd_v3(const ck_tile::fmha_fwd_v3_args& args, const ck_tile::stream_c
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            time = ck_tile::launch<ck_tile::get_kernel_t<FmhaFwdFp16, true, false>>(args, config);
+            time = fmha_fwd_v3_dispatch<
+                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::fp16, false>>(args, config);
 #endif
         }
         else
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            time = ck_tile::launch<ck_tile::get_kernel_t<FmhaFwdFp16, true, true>>(args, config);
+            time = fmha_fwd_v3_dispatch<
+                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::fp16, true>>(args, config);
 #endif
         }
     }
@@ -50,14 +52,16 @@ float fmha_fwd_v3(const ck_tile::fmha_fwd_v3_args& args, const ck_tile::stream_c
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            time = ck_tile::launch<ck_tile::get_kernel_t<FmhaFwdBf16, true, false>>(args, config);
+            time = fmha_fwd_v3_dispatch<
+                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::bf16, false>>(args, config);
 #endif
         }
         else
         {
 #if !DEBUG_SINGLE_INST || \
     (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            time = ck_tile::launch<ck_tile::get_kernel_t<FmhaFwdBf16, true, true>>(args, config);
+            time = fmha_fwd_v3_dispatch<
+                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::bf16, true>>(args, config);
 #endif
         }
     }

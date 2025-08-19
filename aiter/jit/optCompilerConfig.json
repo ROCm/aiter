@@ -621,6 +621,10 @@
     "module_fmha_v3_fwd_ck": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/fmha_v3_fwd_ck_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fwd_hd128_fp16.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fwd_hd128_fp16_causal.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fwd_hd128_bf16.cu'",
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/fwd_hd128_bf16_causal.cu'",
             "f'{AITER_CSRC_DIR}/pybind/fmha_v3_fwd_ck_pybind.cu'"
         ],
         "flags_extra_cc": [],

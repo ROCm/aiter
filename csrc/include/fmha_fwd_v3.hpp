@@ -161,3 +161,12 @@ float launch(const fmha_fwd_v3_args& args, const ck_tile::stream_config& config)
 }
 
 } // namespace ck_tile
+
+template <ck_tile::fmha_fwd_v3_args::data_type_enum DataType, bool IsMasking>
+struct type_tag
+{
+};
+
+template <typename Tag>
+float fmha_fwd_v3_dispatch(const ck_tile::fmha_fwd_v3_args& args,
+                           const ck_tile::stream_config& config);
