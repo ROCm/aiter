@@ -89,7 +89,6 @@ def fmoe_g1u1(
     kernelName: str,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
-
 ) -> None: ...
 
 
