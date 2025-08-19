@@ -33,8 +33,8 @@ def bench_gemm_fn(
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w, out_dtype, y = generate_gemm_a16w16_inputs(
-        M, N, K, c_dtype, layout=layout, output=True
+    x, w, bias, out_dtype, y = generate_gemm_a16w16_inputs(
+        M, N, K, c_dtype, layout=layout, output=True, bias=True
     )
     # flops
     flops = 2.0 * M * N * K
