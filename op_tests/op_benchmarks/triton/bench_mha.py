@@ -456,7 +456,7 @@ def run_benchmark(custom, args):
         MAPPING_AITER = 0
         MAPPING_HEAD_FIRST = 1
         MAPPING_TRITON_FA = 2
-        
+
         if varlen:
             if args.fp8:
 
