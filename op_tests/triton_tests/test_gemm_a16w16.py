@@ -37,6 +37,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True):
 
 def get_x_vals():
     x_vals = [(1, 1, 1)]  # minimal case
+    x_vals = [(8, 8, 8)]  # minimal case
     x_vals += [(3, 5, 2)]  # irregular shape
     x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
     x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
