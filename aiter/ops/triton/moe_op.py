@@ -9,6 +9,7 @@ from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -97,6 +98,7 @@ def _fused_moe_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -132,7 +134,6 @@ def _fused_moe_kernel_gptq_awq(
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    NUM_XCDS: tl.constexpr = 8
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
@@ -336,6 +337,7 @@ def _fused_moe_persistent_kernel_gptq_awq(
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -367,7 +369,6 @@ def _fused_moe_persistent_kernel_gptq_awq(
     # Map program ids `pid` to the block of C it should compute.
     # This is done in a grouped ordering to promote L2 data reuse.
     start_pid = tl.program_id(axis=0)
-    NUM_XCDS: tl.constexpr = 8
     # Load tile-invariant runtime constant
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
 
@@ -564,6 +565,7 @@ def _fused_moe_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -599,7 +601,6 @@ def _fused_moe_kernel(
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    NUM_XCDS: tl.constexpr = 8
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
@@ -773,6 +774,7 @@ def _fused_moe_persistent_kernel(
     compute_type: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -804,7 +806,6 @@ def _fused_moe_persistent_kernel(
     # -----------------------------------------------------------
     # Simply compute how many iterations each persistent block needs to do
     start_pid = tl.program_id(axis=0)
-    NUM_XCDS: tl.constexpr = 8
 
     # Load tile-invariant runtime constant
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
@@ -1065,6 +1066,7 @@ def fused_moe(
                 has_zp=B_zp is not None,
                 use_int4_w4a16=use_int4_w4a16,
                 use_int8_w8a16=use_int8_w8a16,
+                NUM_XCDS=get_num_xcds(),
                 **config,
             )
         else:
@@ -1106,6 +1108,7 @@ def fused_moe(
                 has_zp=B_zp is not None,
                 use_int4_w4a16=use_int4_w4a16,
                 use_int8_w8a16=use_int8_w8a16,
+                NUM_XCDS=get_num_xcds(),
                 **config,
             )
 
@@ -1155,6 +1158,7 @@ def fused_moe(
                 compute_type=compute_type,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
+                NUM_XCDS=get_num_xcds(),
                 **config,
             )
         else:
@@ -1195,5 +1199,6 @@ def fused_moe(
                 compute_type=compute_type,
                 use_fp8_w8a8=use_fp8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
+                NUM_XCDS=get_num_xcds(),
                 **config,
             )
