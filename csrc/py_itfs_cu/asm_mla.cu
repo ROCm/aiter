@@ -135,7 +135,9 @@ void mla_decode_stage1_asm_fwd(
     // std::cout << "s_Q_Bs: " << args.s_Q_Bs << std::endl;
     // std::cout << "s_Bs: " << args.s_Bs << std::endl;
     // std::cout << "s_log2_plen: " << args.s_log2_plen << std::endl;
+    // std::cout << "ptr_RP: " << args.ptr_RP << std::endl;
     // std::cout << "ptr_QTP: " << args.ptr_QTP << std::endl;
+    // std::cout << "ptr_STP: " << args.ptr_STP << std::endl;
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -193,10 +195,10 @@ void mla_decode_stage1_asm_fwd(
     }
     else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz) // at::ScalarType::Float8_e4m3fnuz in mi300
     {
-        assert(q_scale.value().data_ptr() != nullptr || kv_scale.value().data_ptr() != nullptr);
+        assert(q_scale.has_value() && kv_scale.has_value());
+        assert(q_scale.value().data_ptr() != nullptr && kv_scale.value().data_ptr() != nullptr);
         args.ptr_QSCALE  = q_scale.value().data_ptr();
         args.ptr_KVSCALE = kv_scale.value().data_ptr();
-
 
         if(gqa_ratio == 16)
         {
@@ -205,15 +207,16 @@ void mla_decode_stage1_asm_fwd(
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
                     "mla_kernel_func",
-                    "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_fp8_mtp2.co");
+                    "/mla/mla_fp8_qh16_m16x4_n16x1_coex0_mask1_mtp2.co");
                 impl_ptr = &impl_fp8;
             }
             else if(max_seqlen_q <= 4)
             {
+                assert(false);
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
                     "mla_kernel_func",
-                    "/mla/mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_fp8.co");
+                    "/mla/mla_fp8_qh16_m16x4_n16x1_coex0_mask1.co");
                 impl_ptr = &impl_fp8;
             }
             else

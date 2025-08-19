@@ -153,7 +153,7 @@ def mla_decode_fwd(
 
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.empty(
+        logits = torch.zeros(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -162,7 +162,7 @@ def mla_decode_fwd(
     elif nhead in [16, 128]:
         MAYBE_FINAL_OUT = True
         num_kv_splits = 80
-        logits = torch.empty(
+        logits = torch.zeros(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -170,10 +170,10 @@ def mla_decode_fwd(
     else:
         assert False, f"{nhead=} not supported"
 
-    attn_lse = torch.empty(
+    attn_lse = torch.zeros(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
     # import pdb;pdb.set_trace()
 
     def ref_masked_attention(
@@ -248,6 +248,7 @@ def mla_decode_fwd(
     #     is_causal=True,
     #     dtype=torch.bfloat16,
     # )
+    # import pdb; pdb.set_trace()
 
     aiter.mla_decode_stage1_asm_fwd(
         q,
@@ -256,9 +257,6 @@ def mla_decode_fwd(
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
-        # num_kv_splits_indptr,
-        # None,
-        # None,
         None,
         work_indptr,
         work_info_set,
@@ -270,7 +268,9 @@ def mla_decode_fwd(
         q_scale,
         kv_scale,
     )
+
     # import pdb; pdb.set_trace()
+
 
     aiter.mla_reduce_v1(
         logits,
@@ -282,33 +282,7 @@ def mla_decode_fwd(
         final_lse,
     )
 
-    # if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
-    #     return logits.view(total_s, nhead, v_head_dim), attn_lse
-    # Lv = v_head_dim
-    # BLOCK_DV = triton.next_power_of_2(Lv)
-    # grid = (bs, nhead)
-    # extra_kargs = {"waves_per_eu": 4}
-    # _fwd_kernel_stage2_asm[grid](
-    #     logits,
-    #     attn_lse,
-    #     o,
-    #     qo_indptr,
-    #     kv_indptr,
-    #     num_kv_splits_indptr,
-    #     attn_lse.stride(0),
-    #     attn_lse.stride(2),
-    #     attn_lse.stride(1),
-    #     o.stride(0),
-    #     o.stride(1),
-    #     MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
-    #     BATCH_NUM=bs,
-    #     BLOCK_DV=BLOCK_DV,
-    #     Lv=Lv,
-    #     mgc=mgc,
-    #     num_warps=4,
-    #     num_stages=2,
-    #     **extra_kargs,
-    # )
+    # import pdb; pdb.set_trace()
     return logits, final_lse
 
 

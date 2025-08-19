@@ -27,12 +27,12 @@ def ref_masked_attention(
     dtype,
     is_causal=True,
     is_fp8=False,
-    q_scale=1.0,
-    kv_scale=1.0,
+    q_scale=None,
+    kv_scale=None,
 ) -> torch.Tensor:
 
     if is_fp8:
-        scale *= q_scale.item() * kv_scale.item()
+        scale *= q_scale * kv_scale
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
@@ -43,14 +43,22 @@ def ref_masked_attention(
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
         attn_bias.to(query.dtype)
         attn_weights += attn_bias
+
     lse = attn_weights.logsumexp(dim=-1)
-    attn_weights = torch.softmax(attn_weights, dim=-1)
+
+    m = attn_weights.max(-1).values
+
+    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1)) 
+
+    l = attn_weights_exp.sum(-1)
 
     if is_fp8:
-        attn_weights_fp8 = attn_weights.to(torch.float8_e4m3fnuz)
-        attn_weights = attn_weights_fp8.to(torch.float)
+        attn_weights_fp8 = attn_weights_exp.to(torch.float8_e4m3fnuz)
+        attn_weights_exp = attn_weights_fp8.to(torch.float)
 
-    out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
+    out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
+
+    out = out / l.transpose(0,1).unsqueeze(-1)
     
     if is_fp8:
         out *= kv_scale
@@ -68,8 +76,8 @@ def torch_mla_extend(
     qk_rope_head_dim,
     dtype,
     is_causal=True,
-    q_scale=1.0,
-    kv_scale=1.0,
+    q_scale=None,
+    kv_scale=None,
 ):
     is_fp8 = q.dtype == torch.float8_e4m3fnuz
 
@@ -192,9 +200,13 @@ def test_mla(
     )
 
     q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
-    kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
     q_scale  = q_scale.to(torch.float)
-    kv_scale = torch.tensor([1.0], dtype=torch.float, device="cuda")
+    # q_fp8 = q.to(torch.float8_e4m3fnuz)
+    # q_scale = torch.ones([1], dtype=torch.float, device="cuda")
+
+    kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+    # kv_scale = torch.ones([batch_size], dtype=torch.float, device="cuda")
+    kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
     out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
         q_fp8,
@@ -211,7 +223,6 @@ def test_mla(
         kv_scale=kv_scale,
     )
 
-    import pdb; pdb.set_trace()
 
     # aiter implementation
     (
@@ -270,7 +281,7 @@ def test_mla(
     err_fp8 = checkAllclose(
         out_ref_fp8,
         out_asm,
-        msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
     return {
         "decode:flops": flops,
@@ -370,7 +381,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(64, 80)], # [41],
+    default=[i for i in range(1, 80)], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
