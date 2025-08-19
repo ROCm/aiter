@@ -281,6 +281,7 @@ def get_trace_perf(prof, num_iters):
     rets = []
 
     for name, d in df.groupby("name", sort=False):
+        print(name)
         kernel_num_per_iter = iter_init
         if str(d["device_type"].iat[0]).split(".")[-1] != "CUDA":
             kernel_num_per_iter = 1

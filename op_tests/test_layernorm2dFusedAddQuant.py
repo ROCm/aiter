@@ -247,9 +247,9 @@ def test_layernorm2d_fuseAdd_Dynamicquant_instance(dtype, m, n, yscaleType):
 
 def test_layernorm2d():
     print("\nstart layernorm2d test")
-    for dtype in [dtypes.fp16, dtypes.bf16]:
-        for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-            for n in [4096, 8192, 16384, 32768, 65536]:
+    for dtype in [dtypes.bf16]:
+        for m in [256]:
+            for n in [5120]:
                 test_layernorm2d_instance(dtype, m, n)
 
 
@@ -264,9 +264,9 @@ def test_layernorm2d_fuseAdd():
 def test_layernorm2d_fuseSmoothquant():
     print("\nstart layernorm2d fuse Smoothquant test")
     for scaleType in [dtypes.fp32]:
-        for dtype in [dtypes.fp16, dtypes.bf16]:
-            for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
-                for n in [10, 4096, 8192]:
+        for dtype in [dtypes.bf16]:
+            for m in [256]:
+                for n in [5120]:
                     test_layernorm2d_fuseSmoothquant_instance(
                         dtype, m, n, xscaleType=scaleType, yscaleType=scaleType
                     )

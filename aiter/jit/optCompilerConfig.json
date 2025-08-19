@@ -363,7 +363,9 @@
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_layernorm.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'--save-temps'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/02_layernorm2d'"
