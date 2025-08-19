@@ -49,3 +49,4 @@ __pycache__
 debug
 aiter_logs
 *.log
+.amd
