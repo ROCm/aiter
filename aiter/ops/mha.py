@@ -1233,7 +1233,7 @@ def _flash_attn_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
+    is_v3_atomic_fp32: Optional[bool] = False,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
@@ -1339,7 +1339,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_v3_atomic_fp32: Optional[bool] = False,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -1584,7 +1584,7 @@ def _flash_attn_varlen_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
+    is_v3_atomic_fp32: Optional[bool] = False,
     how_v3_bf16_cvt: Optional[int] = 1,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
@@ -1758,7 +1758,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         out,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_v3_atomic_fp32: Optional[bool] = False,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
