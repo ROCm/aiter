@@ -145,7 +145,7 @@ def mla_decode_fwd(
 
     if num_kv_splits_indptr is None and work_meta_data is None:
         num_kv_splits, num_kv_splits_indptr, mgc = get_meta_param(
-            None, bs, total_kv, nhead, max_seqlen_q, device
+            None, kv_indptr, nhead, nhead_kv, max_seqlen_q
         )
 
     num_kv_splits = 80

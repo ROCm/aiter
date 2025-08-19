@@ -112,7 +112,6 @@ def torch_mla_extend(
     lse = torch.concat(lses).transpose(0, 1)
     return o, lse
 
-
 @benchmark()
 def test_mla(
     ctx_lens,
@@ -199,67 +198,140 @@ def test_mla(
         dtype=dtype,
     )
 
-    q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
-    q_scale  = q_scale.to(torch.float)
-
-    kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
-    kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
-
-    out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
-        q_fp8,
-        kv_buffer_fp8,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        dtype=dtype,
-        is_causal=True,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
-    )
-
-
     # aiter implementation
-    (
-        work_indptr,
-        work_info_set,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-    ) = aiter.get_mla_metadata_v1(
+    work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
+    work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
+    work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
+    reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
+    reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
+    reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
+    # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
+    
+    meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         nhead // nhead_kv,
         nhead_kv,
         True,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
     )
-    print(work_indptr)
-    print(work_info_set)
 
-    kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
-    out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+    def test_absorb_decode():
+        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-    (attn_logits, attn_lse), us_asm_decode = run_perftest(
-        aiter.mla.mla_decode_fwd,
-        q_fp8,
-        kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
-        out_asm,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_last_page_lens,
-        max_seqlen_qo,
-        sm_scale,
-        q_scale=q_scale,
-        kv_scale=kv_scale,
-        work_indptr=work_indptr,
-        work_info_set=work_info_set,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-    )
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            q,
+            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            sm_scale,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+        )
+
+        # print(f"{out_ref.view(total_q, -1)=}")
+        # print(f"{out_asm.view(total_q, -1)=}")
+        # checkAllclose(logits_ref, attn_logits,
+        #               msg=f'attn_logits [golden vs aiter_asm]')
+        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+        bytes = (
+            total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
+        ) * (torch.finfo(dtype).bits // 8)
+        err = checkAllclose(
+            out_ref,
+            out_asm,
+            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        return err, us_asm_decode
+
+    err = None
+    us_asm_decode = 10000000000
+    err, us_asm_decode = test_absorb_decode()
+
+    def test_absorb_decode_fp8():
+        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
+
+        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        q_scale = q_scale.to(torch.float)
+
+        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+
+        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+            q_fp8,
+            kv_buffer_fp8,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            sm_scale,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            dtype=dtype,
+            is_causal=True,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+
+        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            q_fp8,
+            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+            out_asm,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            sm_scale,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+        )
+
+        # print(f"{out_ref.view(total_q, -1)=}")
+        # print(f"{out_asm.view(total_q, -1)=}")
+        # checkAllclose(logits_ref, attn_logits,
+        #               msg=f'attn_logits [golden vs aiter_asm]')
+        # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
+        flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+        bytes = (
+            total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
+        ) * (torch.finfo(dtype).bits // 8)
+        err = checkAllclose(
+            out_ref,
+            out_asm,
+            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        err_fp8 = checkAllclose(
+            out_ref_fp8,
+            out_asm,
+            msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+        )
+        return err, err_fp8, us_asm_decode
+
+    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -270,24 +342,19 @@ def test_mla(
     bytes = (
         total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
     ) * (torch.finfo(dtype).bits // 8)
-    err = checkAllclose(
-        out_ref,
-        out_asm,
-        msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-    )
-    err_fp8 = checkAllclose(
-        out_ref_fp8,
-        out_asm,
-        msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
-    )
+
     return {
         "decode:flops": flops,
         "decode:bytes": bytes,
-        "decode:err vs float": err,
-        "decode:err vs fp8": err_fp8,
+        "decode:err": err,
         "decode:asm_576": us_asm_decode,
         "decode:TFLOPS": flops / us_asm_decode / 1e6,
         "decode:TB/s": bytes / us_asm_decode / 1e6,
+        "decode_fp8:err vs fp32": err_fp8_fp32,
+        "decode_fp8:err vs fp8": err_fp8_fp8,
+        "decode_fp8:asm_576": us_asm_decode_fp8,
+        "decode_fp8:TFLOPS": flops / us_asm_decode_fp8 / 1e6,
+        "decode_fp8:TB/s": bytes / us_asm_decode_fp8 / 1e6,
     }
 
 

@@ -387,23 +387,8 @@ def test_mla(
     #         msg=f"mla_decode-absorb    [golden vs    triton]:{us_torch_decode:>8.2f} us vs {us_ref:>8.2f} us......",
     #     )
 
-
     def test_absorb_decode():
         # aiter implementation
-        (
-            work_indptr,
-            work_info_set,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-        ) = aiter.get_mla_metadata_v1(
-            qo_indptr,
-            kv_indptr,
-            nhead // nhead_kv,
-            nhead_kv,
-            True,
-        )
-
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
@@ -418,11 +403,6 @@ def test_mla(
             kv_last_page_lens,
             max_seqlen_qo,
             sm_scale,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")
@@ -437,7 +417,7 @@ def test_mla(
         )
         return err, us_asm_decode
 
-    err, us_asm_decode = test_absorb_prefill()
+    err, us_asm_decode = test_absorb_decode()
 
     def test_absorb_decode_fp8():
         q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
@@ -461,22 +441,6 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-
-        # aiter implementation
-        (
-            work_indptr,
-            work_info_set,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-        ) = aiter.get_mla_metadata_v1(
-            qo_indptr,
-            kv_indptr,
-            nhead // nhead_kv,
-            nhead_kv,
-            True,
-        )
-
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
@@ -493,11 +457,6 @@ def test_mla(
             sm_scale,
             q_scale=q_scale,
             kv_scale=kv_scale,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
         )
         err = checkAllclose(
             out_ref,
@@ -512,7 +471,7 @@ def test_mla(
 
         return err, err_fp8, us_asm_decode
 
-    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_prefill()
+    err_fp8_fp32, err_fp8_fp8, us_asm_decode_fp8 = test_absorb_decode_fp8()
 
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
