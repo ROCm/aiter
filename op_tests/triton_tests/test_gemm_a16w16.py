@@ -4,7 +4,6 @@
 import torch
 import torch.nn.functional as F
 import pytest
-import functools
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
@@ -72,18 +71,8 @@ def get_x_vals():
     return x_vals
 
 
-def minimal_x_vals(num_vals=20):
-    """
-    Returns the num_vals smallest test cases. Useful for generating a subset to quickly test on.
-    """
-    x_vals = get_x_vals()
-    num_ops = [(i, functools.reduce(lambda x, y: x * y, i)) for i in x_vals]
-    sorted_x_vals = sorted(num_ops, key=lambda x: x[1])
-    return [i[0] for i in sorted_x_vals[: min(num_vals, len(sorted_x_vals))]]
-
-
 @pytest.mark.parametrize("activation", ["gelu", "gelu_tanh", "silu", "silu_exp2"])
-@pytest.mark.parametrize("M, N, K", minimal_x_vals())
+@pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_activation(M: int, N: int, K: int, dtype, output, activation):
@@ -142,7 +131,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, dtype, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", minimal_x_vals())
+@pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
@@ -183,7 +172,7 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, dtype, output):
     torch.testing.assert_close(triton_out, torch_out, atol=1e-1, rtol=1e-1)
 
 
-@pytest.mark.parametrize("M, N, K", minimal_x_vals())
+@pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("layout", ["TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
