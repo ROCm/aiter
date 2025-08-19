@@ -402,16 +402,17 @@ CK_TILE_DEVICE void GenerateWork(
     int32_t remaining_kv_len = kv_len;
     int32_t kv_start_local = 0;
 
+    const int32_t kv_len_limit_floor =
+        ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), 16);
     const auto [cid_top, accum_cost_top] = get_cost_top(p_cost_heap, num_clusters);
-    const int32_t remaining_capability_top = cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q);
+    const int32_t remaining_capability_top =
+        ck_tile::max(cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q), kv_len_limit_floor);
     const int32_t num_splits_estimated =
         ck_tile::integer_divide_ceil(remaining_kv_len, remaining_capability_top);
     // For the case of #splits==2, make sure that the tailing tile is smaller than Traits::kSplitTolerance.
     const bool split_kv = (num_splits_estimated == 2) ?
         ((remaining_kv_len - remaining_capability_top) > Traits::kSplitTolerance) :
                                                             (num_splits_estimated > 1);
-    const int32_t kv_len_limit_floor =
-        ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), 16);
 
     do
     {
@@ -593,12 +594,12 @@ __global__ void kn_get_mla_metadata_v1(
     const int32_t workload_limit_global =
     [&]() {
         const int32_t avg_workload = ck_tile::max(ck_tile::integer_divide_ceil(sum_workload, num_clusters), 1);
-        // TODO: The following code just follow FlashInfer. Further tune may be required for AMD GPU.
+        const int32_t avg_kv_len = cal_kv_len(avg_workload, cluster_len_q);
         int32_t limit;
-        if (avg_workload <= 8) limit = 32;
-        else if (avg_workload <= 16) limit = 64;
-        else if (avg_workload <= 32) limit = 128;
-        else if (avg_workload <= 64) limit = 192;
+        if (avg_kv_len <= 8) limit = cal_cost(cluster_len_q, 32);
+        else if (avg_kv_len <= 16) limit = cal_cost(cluster_len_q, 64);
+        else if (avg_kv_len <= 32) limit = cal_cost(cluster_len_q, 128);
+        else if (avg_kv_len <= 64) limit = cal_cost(cluster_len_q, 192);
         else limit = ck_tile::integer_least_multiple(avg_workload, 16);
         return limit;
     }();
