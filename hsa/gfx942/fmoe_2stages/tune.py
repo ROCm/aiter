@@ -1092,6 +1092,7 @@ def go(
     blockMs = [32, 64, 128]
 
     args = [
+        "cu_num",
         "token",
         "model_dim",
         "inter_dim",
@@ -1114,6 +1115,7 @@ def go(
     in_data = []
     for line in untunedf[args].values:
         (
+            cu_num,
             token,
             model_dim,
             inter_dim,
@@ -1173,7 +1175,6 @@ def go(
             str(q_type).split(".")[-1].lower(),
             not doweight_stage1,
         )
-        print("q_type_w: ", q_dtype_w)
         for blockM in blockMs:
             if use_g1u1 and q_dtype_w != torch.int4:
                 for el in asm_kernels.get(blockM, []):
@@ -1419,7 +1420,7 @@ def go(
                         {},
                         (None),
                         0.01,
-                        0.5,
+                        1,
                         True,
                     )
                 )
@@ -1447,6 +1448,7 @@ def go(
     grouped_results = grouped_rets.items()
     for key, rets in grouped_results:
         (
+            cu_num,
             token,
             model_dim,
             inter_dim,
@@ -1467,6 +1469,7 @@ def go(
             profileDF.append(
                 [
                     stage,
+                    cu_num,
                     token,
                     model_dim,
                     inter_dim,
@@ -1525,6 +1528,7 @@ def go(
             stage1_profileDF,
             stage2_profileDF,
             on=[
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
@@ -1542,7 +1546,6 @@ def go(
             how="inner",
         )
         profileDF["run_1stage"] = 0
-
         profileDF = pd.concat([profileDF, asm_1stage_profileDF], axis=0)
         if profileDF.shape[0] == 0:
             print("no moe solution can pass for ", key)
@@ -1618,13 +1621,44 @@ if __name__ == "__main__":
         if os.path.exists(args.tune_file):
             old_tunedf = pd.read_csv(args.tune_file)
         else:
-            old_tunedf = None
+            old_tunedf = pd.DataFrame(
+                columns=[
+                    "cu_num",
+                    "token",
+                    "model_dim",
+                    "inter_dim",
+                    "expert",
+                    "topk",
+                    "act_type",
+                    "dtype",
+                    "q_dtype_a",
+                    "q_dtype_w",
+                    "q_type",
+                    "use_g1u1",
+                    "doweight_stage1",
+                    "block_m",
+                    "ksplit",
+                    "us1",
+                    "kernelName1",
+                    "err1",
+                    "us2",
+                    "kernelName2",
+                    "err2",
+                    "total_us",
+                    "run_1stage",
+                ]
+            )
     else:
         old_tunedf = None
 
     if args.last:
         untunedf = untunedf.iloc[-1:]
+
     elif old_tunedf is not None and not args.all:
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        untunedf["cu_num"] = cu_num
         untunedf_cols = untunedf.columns
         mask = untunedf.apply(tuple, axis=1).isin(
             old_tunedf[untunedf_cols].apply(tuple, axis=1)
@@ -1639,6 +1673,7 @@ if __name__ == "__main__":
     if tunedf is not None:
         tunedf = tunedf.astype(str).drop_duplicates(
             subset=[
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
