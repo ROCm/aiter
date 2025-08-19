@@ -16,6 +16,7 @@ _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -97,16 +98,34 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    blocked_mk: gl.constexpr = gl.BlockedLayout(size_per_thread=[4, 8], threads_per_warp=[8, 8], warps_per_cta=[8, 1],
-                                                order=[1, 0])
-    blocked_kn: gl.constexpr = gl.BlockedLayout(size_per_thread=[8, 4], threads_per_warp=[8, 8], warps_per_cta=[1, 8],
-                                                order=[0, 1])
-    shared_a: gl.constexpr =  gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
-    shared_b: gl.constexpr =  gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1])
+    blocked_mk: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[4, 8],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[8, 1],
+        order=[1, 0],
+    )
+    blocked_kn: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[8, 4],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[1, 8],
+        order=[0, 1],
+    )
+    shared_a: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=2, max_phase=8, order=[1, 0]
+    )
+    shared_b: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=8, per_phase=2, max_phase=8, order=[0, 1]
+    )
     # mfma layout is tuned by trial and error to find the fastest one
-    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 2])
-    dot_a_layout: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
-    dot_b_layout: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 2]
+    )
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfma_layout, k_width=8
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfma_layout, k_width=8
+    )
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
 
@@ -114,9 +133,9 @@ def _gemm_a8w8_blockscale_kernel(
         num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
         # Create pointers for first block of A and B input matrices
-        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout = gl.SliceLayout(0, blocked_mk))
+        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
         offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak
-        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout = gl.SliceLayout(1, blocked_kn))
+        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
         offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
         offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)) % N

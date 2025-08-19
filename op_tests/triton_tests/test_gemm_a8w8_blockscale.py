@@ -3,8 +3,12 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale
+from aiter.ops.triton.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+)
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
@@ -147,7 +151,7 @@ def generate_gemm_a8w8_blockscale_inputs(
     [
         "gluon",
         "triton",
-    ]
+    ],
 )
 def test_gemm(dtype, M, N, K, layout, output, impl: str):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
