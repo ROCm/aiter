@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
-AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
 else:
