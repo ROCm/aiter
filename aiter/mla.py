@@ -124,13 +124,14 @@ def mla_decode_fwd(
     logit_cap=0.0,
     num_kv_splits=None,  # for experts only!!!
     num_kv_splits_indptr=None,  # for experts only!!!
+    work_meta_data=None,
     work_indptr=None,
     work_info_set=None,
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
-    q_scale=None,    # default 1.0 with fp32 dirctly cast to fp8
-    kv_scale=None,   # default 1.0 with fp32 dirctly cast to fp8
+    q_scale=None,
+    kv_scale=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -142,18 +143,15 @@ def mla_decode_fwd(
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
-    if num_kv_splits is None:
+    if num_kv_splits_indptr is None and work_meta_data is None:
         num_kv_splits, num_kv_splits_indptr, mgc = get_meta_param(
-            num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q
+            None, bs, total_kv, nhead, max_seqlen_q, device
         )
-    else:
-        assert (
-            num_kv_splits_indptr is not None
-        ), "num_kv_splits_indptr must be provided when num_kv_splits is specified"
 
+    num_kv_splits = 80
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -161,8 +159,7 @@ def mla_decode_fwd(
         MAYBE_FINAL_OUT = False
     elif nhead in [16, 128]:
         MAYBE_FINAL_OUT = True
-        num_kv_splits = 80
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -170,85 +167,59 @@ def mla_decode_fwd(
     else:
         assert False, f"{nhead=} not supported"
 
-    attn_lse = torch.zeros(
+    attn_lse = torch.empty(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
-    # import pdb;pdb.set_trace()
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    
+    if num_kv_splits_indptr is not None:
+        if num_kv_splits == 1 and not (max_seqlen_q == 1 and nhead == 16):
+            return logits.view(total_s, nhead, v_head_dim), attn_lse
+        Lv = v_head_dim
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        grid = (bs, nhead)
+        extra_kargs = {"waves_per_eu": 4}
 
-    def ref_masked_attention(
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        scale: float,
-        dtype,
-        is_causal=True,
-    ) -> torch.Tensor:
-        attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
-        if is_causal:
-            s_q = query.shape[0]
-            s_k = key.shape[0]
-            attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
-            temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-            attn_bias.to(query.dtype)
-            attn_weights += attn_bias
-        lse = attn_weights.logsumexp(dim=-1)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+        aiter.mla_decode_stage1_asm_fwd(
+            q,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            num_kv_splits_indptr,
+            None,
+            None,
+            None,
+            max_seqlen_q,
+            sm_scale,
+            logits,
+            attn_lse,
+            o,
+        )
 
-        out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
-        return out.to(dtype), lse
-
-    def torch_mla_extend(
-        q,  # [total_q, nheads, headdim_q]
-        kvc_cache,  # [num_page * page_size, nhead_kv, qk_head_dim]
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        sm_scale,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        dtype,
-        is_causal=True,
-    ):
-        qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
-        kvc = torch.index_select(kvc_cache, 0, kv_indices)
-
-
-
-        kvs = torch.tensor_split(kvc, kv_indptr.tolist()[:])
-        bs = qo_indptr.shape[0] - 1
-
-        os = []
-        lses = []
-        for i in range(bs):
-            kvc = kvs[1]
-            q = qs[i]
-            k = kvc
-            v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-            o, lse = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
-            os.append(o)
-            lses.append(lse)
-        o = torch.concat(os)
-        lse = torch.concat(lses)
-        return o, lse.transpose(0, 1)
-
-    # kv_indptr[0] = 192
-    # kv_indptr[1] = 384
-
-    # out_ref, lse_ref = torch_mla_extend(
-    #     q,
-    #     kv_buffer.reshape(-1, 1, 576),
-    #     qo_indptr,
-    #     kv_indptr,
-    #     kv_indices,
-    #     sm_scale,
-    #     512,
-    #     64,
-    #     is_causal=True,
-    #     dtype=torch.bfloat16,
-    # )
-    # import pdb; pdb.set_trace()
+        _fwd_kernel_stage2_asm[grid](
+            logits,
+            attn_lse,
+            o,
+            qo_indptr,
+            kv_indptr,
+            num_kv_splits_indptr,
+            attn_lse.stride(0),
+            attn_lse.stride(2),
+            attn_lse.stride(1),
+            o.stride(0),
+            o.stride(1),
+            MAYBE_FINAL_OUT=MAYBE_FINAL_OUT,
+            BATCH_NUM=bs,
+            BLOCK_DV=BLOCK_DV,
+            Lv=Lv,
+            mgc=mgc,
+            num_warps=4,
+            num_stages=2,
+            **extra_kargs,
+        )
+        return logits, final_lse
 
     aiter.mla_decode_stage1_asm_fwd(
         q,
@@ -257,7 +228,8 @@ def mla_decode_fwd(
         kv_indptr,
         kv_indices,
         kv_last_page_lens,
-        None,
+        num_kv_splits_indptr,
+        work_meta_data,
         work_indptr,
         work_info_set,
         max_seqlen_q,
@@ -269,9 +241,6 @@ def mla_decode_fwd(
         kv_scale,
     )
 
-    # import pdb; pdb.set_trace()
-
-
     aiter.mla_reduce_v1(
         logits,
         attn_lse,
@@ -282,7 +251,6 @@ def mla_decode_fwd(
         final_lse,
     )
 
-    # import pdb; pdb.set_trace()
     return logits, final_lse
 
 

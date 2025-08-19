@@ -251,6 +251,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size, num_heads, v_head_dim]
     q_scale: Optional[torch.Tensor] = None,
     kv_scale: Optional[torch.Tensor] = None,
+    # [1] pertensor
 ): ...
 
 
