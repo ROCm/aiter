@@ -120,8 +120,6 @@ def mla_decode_fwd(
     kv_indices,
     kv_last_page_lens,
     max_seqlen_q,
-    q_scale=1.0,    # default 1.0 with fp32 dirctly cast to fp8
-    kv_scale=1.0,   # default 1.0 with fp32 dirctly cast to fp8
     sm_scale=None,  # 1.0 / (qk_head_dim**0.5)
     logit_cap=0.0,
     num_kv_splits=None,  # for experts only!!!
@@ -131,6 +129,8 @@ def mla_decode_fwd(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
+    q_scale=None,    # default 1.0 with fp32 dirctly cast to fp8
+    kv_scale=None,   # default 1.0 with fp32 dirctly cast to fp8
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -153,7 +153,7 @@ def mla_decode_fwd(
 
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -162,7 +162,7 @@ def mla_decode_fwd(
     elif nhead in [16, 128]:
         MAYBE_FINAL_OUT = True
         num_kv_splits = 80
-        logits = torch.zeros(
+        logits = torch.empty(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -170,10 +170,10 @@ def mla_decode_fwd(
     else:
         assert False, f"{nhead=} not supported"
 
-    attn_lse = torch.zeros(
+    attn_lse = torch.empty(
         (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.zeros((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
     # import pdb;pdb.set_trace()
 
     def ref_masked_attention(
@@ -267,6 +267,8 @@ def mla_decode_fwd(
         logits,
         attn_lse,
         o,
+        q_scale,
+        kv_scale,
     )
     # import pdb; pdb.set_trace()
 

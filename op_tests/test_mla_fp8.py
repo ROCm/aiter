@@ -32,7 +32,7 @@ def ref_masked_attention(
 ) -> torch.Tensor:
 
     if is_fp8:
-        scale *= q_scale * kv_scale
+        scale *= q_scale.item() * kv_scale.item()
 
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
@@ -141,9 +141,9 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
 
-    # seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
-    #     12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
-    # seq_lens_kv = seq_lens_kv[:batch_size]
+    seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
+        12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
+    seq_lens_kv = seq_lens_kv[:batch_size]
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -193,7 +193,8 @@ def test_mla(
 
     q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
     kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
-    kv_scale = 1.0
+    q_scale  = q_scale.to(torch.float)
+    kv_scale = torch.tensor([1.0], dtype=torch.float, device="cuda")
 
     out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
         q_fp8,
@@ -266,12 +267,16 @@ def test_mla(
         out_asm,
         msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
+    err_fp8 = checkAllclose(
+        out_ref_fp8,
+        out_asm,
+        msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+    )
     return {
-        "prefill:ck_192": us_aiter,
-        "prefill:asm_576": us_asm,
         "decode:flops": flops,
         "decode:bytes": bytes,
-        "decode:err": err,
+        "decode:err vs float": err,
+        "decode:err vs fp8": err_fp8,
         "decode:asm_576": us_asm_decode,
         "decode:TFLOPS": flops / us_asm_decode / 1e6,
         "decode:TB/s": bytes / us_asm_decode / 1e6,
@@ -365,7 +370,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)], # [41],
+    default=[i for i in range(64, 80)], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )

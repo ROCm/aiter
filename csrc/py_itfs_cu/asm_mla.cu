@@ -62,9 +62,9 @@ void mla_decode_stage1_asm_fwd(
     // following are output
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& splitLse,  //[batch_size, num_kv_splits, num_heads,  1]
-    torch::Tensor& output     //[batch_size, num_heads, v_head_dim]
+    torch::Tensor& output,    //[batch_size, num_heads, v_head_dim]
     std::optional<torch::Tensor>& q_scale,            //   [1]
-    std::optional<torch::Tensor>& kv_scale,           //   [1]
+    std::optional<torch::Tensor>& kv_scale           //   [1]
 )
 {
     int batch           = qo_indptr.size(0) - 1;
@@ -191,12 +191,12 @@ void mla_decode_stage1_asm_fwd(
             }
         }
     }
-    else if(Q.dtype() == at::ScalarType::Float8_e4m3fn) // at::ScalarType::Float8_e4m3fnuz or at::ScalarType::Float8_e4m3fn ?
+    else if(Q.dtype() == at::ScalarType::Float8_e4m3fnuz) // at::ScalarType::Float8_e4m3fnuz in mi300
     {
+        assert(q_scale.value().data_ptr() != nullptr || kv_scale.value().data_ptr() != nullptr);
         args.ptr_QSCALE  = q_scale.value().data_ptr();
         args.ptr_KVSCALE = kv_scale.value().data_ptr();
 
-        assert(work_indptr.value().data_ptr() != nullptr && work_info_set.value().data_ptr() != nullptr);
 
         if(gqa_ratio == 16)
         {
