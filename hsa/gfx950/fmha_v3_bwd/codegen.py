@@ -558,7 +558,7 @@ float fmha_bwd_v3_(const ck_tile::stream_config& s, fmha_bwd_args a)
                                       FmhaBwdV3Ts<dq_dk_dv_v3_traits_>::ts_kv}};
 
     static thread_local fmha_bwd_v3_kernel impl(FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name, FmhaBwdV3Buf<dq_dk_dv_v3_traits_>::bwd_v3_buf); // static here is for thread safety.
-    
+
     if (a.hdim_q > 64 && a.hdim_q <=128) {{
         if(s.log_level_ > 0)
             std::cout << ", " << "fmha_bwd_bf16_dq_shuffle" << std::flush;
