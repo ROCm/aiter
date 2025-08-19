@@ -456,6 +456,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
     inter_dim *= model_dim / gate.size(2);
     int sub_X_cnt = sorted_expert_ids.size(0);
     static std::unordered_map<std::string, std::unique_ptr<FMoeKernel>> impl_ptr_map;
+    const char* enable_vskip = std::getenv("AITER_ENABLE_VSKIP");
     if(gate.dtype() == at::ScalarType::UInt32 || gate.dtype() == at::ScalarType::Int)
     {
         int selectedTile = get_heuristic_tile(
@@ -623,6 +624,11 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
             {192, {"fmoe_fp8_g1u1_subGU_192", "fmoe/silu/fmoe_fp8_g1u1_subGU_192.co", 192}},
             {128, {"fmoe_fp8_g1u1_subGU_128", "fmoe/silu/fmoe_fp8_g1u1_subGU_128.co", 128}}};
 
+        static std::unordered_map<int, FMoeKernelConfig> silu_kernel_fp8_vs_configs = {
+            {256,
+             {"_ZN5aiter45fmoe_bf16_pertokenFp8_g1u1_silu_vs_1tg_32x256E",
+              "fmoe/silu/fmoe_bf16_pertokenFp8_g1u1_silu_vs_1tg_32x256.co",
+              256}}};
         static std::unordered_map<int, FMoeKernelConfig> gelu_kernel_fp8_configs = {
             {512,
              {"fmoe_fp8_g1u1_subGU_512_gelu", "fmoe/gelu/fmoe_fp8_g1u1_subGU_512_gelu.co", 512}},
@@ -653,7 +659,18 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
         }
         else if(activation == ActivationType::Silu)
         {
-            config_map = &silu_kernel_fp8_configs;
+            if(enable_vskip != nullptr && strcmp(enable_vskip, "1") == 0)
+            {
+                if(inter_dim % 256 == 0)
+                {
+                    config_map   = &silu_kernel_fp8_vs_configs;
+                    selectedTile = 256;
+                }
+                else
+                    TORCH_CHECK(false, __func__, "Only supports inter_dim divisible by 256.");
+            }
+            else
+                config_map = &silu_kernel_fp8_configs;
         }
 
         if(config_map)
