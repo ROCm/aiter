@@ -82,6 +82,7 @@ if IS_ROCM:
                 torch_exclude=False,
                 prebuild=1,
             )
+
         # step 1, build *.cu -> module*.so
         with Pool(processes=int(0.8 * os.cpu_count())) as pool:
             pool.map(build_one_module, all_opts_args_build)
