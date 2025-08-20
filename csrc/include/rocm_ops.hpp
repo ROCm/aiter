@@ -706,6 +706,7 @@
           py::arg("input_scale"),                                                             \
           py::arg("fc1_scale"),                                                               \
           py::arg("fc2_scale"),                                                               \
+          py::arg("kernel_name"),                                                             \
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \
           py::arg("activation")       = ActivationType::Silu);                                      \
     m.def("fmoe_g1u1_tkw1",                                                                   \
@@ -722,6 +723,7 @@
           py::arg("input_scale"),                                                             \
           py::arg("fc1_scale"),                                                               \
           py::arg("fc2_scale"),                                                               \
+          py::arg("kernel_name"),                                                             \
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \
           py::arg("activation")       = ActivationType::Silu);                                      \
     m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                                         \
@@ -755,6 +757,7 @@
           py::arg("input_scale"),                                                             \
           py::arg("fc1_scale"),                                                               \
           py::arg("fc2_scale"),                                                               \
+          py::arg("kernel_name"),                                                             \
           py::arg("fc_scale_blkn")    = 128,                                                  \
           py::arg("fc_scale_blkk")    = 128,                                                  \
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \

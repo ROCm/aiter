@@ -79,6 +79,7 @@ void fmoe_g1u1(
     torch::Tensor& input_scale,                                   // [token_cnt, 1]
     torch::Tensor& fc1_scale,                                     // [expert, 1, hidden_dim]
     torch::Tensor& fc2_scale,                                     // [expert, 1, dim]
+    std::string& kernel_name,
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt, // [expert, 1, hidden_dim]
     ActivationType activation                     = ActivationType::Silu);
 
@@ -95,6 +96,7 @@ void fmoe_g1u1_tkw1(
     torch::Tensor& input_scale,                                   // [token_cnt, 1]
     torch::Tensor& fc1_scale,                                     // [expert, 1, hidden_dim]
     torch::Tensor& fc2_scale,                                     // [expert, 1, dim]
+    std::string& kernel_name,
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt, // [expert, 1, hidden_dim]
     ActivationType activation                     = ActivationType::Silu);
 
@@ -140,6 +142,7 @@ void fmoe_fp8_blockscale_g1u1(
     torch::Tensor& input_scale,                                   // [expert, 1, dim]
     torch::Tensor& fc1_scale,                                     // [expert, 1, inter_dim]
     torch::Tensor& fc2_scale,                                     // [expert, 1, dim]
+    std::string& kernel_name,
     int fc_scale_blkn                             = 128,          // = 128,
     int fc_scale_blkk                             = 128,          // = 128
     std::optional<torch::Tensor> fc2_smooth_scale = std::nullopt, // [expert, 1, inter_dim]

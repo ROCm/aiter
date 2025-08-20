@@ -278,7 +278,23 @@ def fused_moe_1stage(
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
         else:
-            fmoe_func = aiter.fmoe_int8_g1u0
+            aiter.fmoe_int8_g1u0(
+                moe_buf,
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            return moe_buf
 
         fmoe_func(
             moe_buf,
@@ -293,6 +309,7 @@ def fused_moe_1stage(
             a1_scale,
             w1_scale,
             w2_scale,
+            "",
             fc2_smooth_scale=None,
             activation=activation,
         )
@@ -375,6 +392,7 @@ def get_2stage_cfgs(
         cfg_2stages = pd.read_csv(tune_file)
         cfg_2stages = cfg_2stages.set_index(
             [
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
@@ -398,7 +416,9 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
+    cu_num = get_cu_num()
     keys = (
+        cu_num,
         token,
         model_dim,
         inter_dim,
@@ -435,7 +455,6 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
-
     if cfg is None:
         ksplit = 0
         kernelName1 = ""
