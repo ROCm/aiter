@@ -46,6 +46,7 @@ struct mha_bwd_traits : public fmha_bwd_traits
 
 using mha_bwd_args = fmha_bwd_args;
 
+// FIXME: use aiter mha_args
 __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      const ck_tile::stream_config& stream_config,
                                                      std::string q_dtype_str,
@@ -57,7 +58,9 @@ __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      bool deterministic,
                                                      bool use_ext_asm,
                                                      bool is_v3_atomic_fp32,
-                                                     int how_v3_bf16_cvt);
+                                                     int how_v3_bf16_cvt,
+                                                     const void* seqlen_q_padded = nullptr,
+                                                     const void* seqlen_k_padded = nullptr);
 
 struct __attribute__((packed)) fmha_bwd_v3_args
 {

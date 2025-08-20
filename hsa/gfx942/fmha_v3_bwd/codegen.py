@@ -710,7 +710,7 @@ float fmha_bwd_v3_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
 }}
 
 template <typename dot_do_o_trait_, typename dq_dk_dv_v3_traits_, typename convert_dq_trait_>
-float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a)
+float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a, const void* seqlen_q_padded = nullptr, const void* seqlen_k_padded = nullptr)
 {{
     if(s.log_level_ > 0)
         std::cout << ", " << fmha_bwd_dot_do_o_get_name_<dot_do_o_trait_>() << ", " << FmhaBwdV3Name<dq_dk_dv_v3_traits_>::bwd_v3_name << ", " << fmha_bwd_convert_dq_get_name_<convert_dq_trait_>() << std::flush;
@@ -831,7 +831,11 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
     );
 }}
 
-float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_config& s){{
+float fmha_bwd_v3(mha_bwd_traits t,
+                  fmha_bwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqlen_q_padded = nullptr,
+                  const void* seqlen_k_padded = nullptr){{
     float r = -1;
 
     if (t.use_ext_asm == true){{
@@ -2045,15 +2049,15 @@ float fmha_bwd_v3(mha_bwd_traits t, fmha_bwd_args a, const ck_tile::stream_confi
                                 using convert_dq_trait_ = fmha_bwd_convert_dq_traits_<64, FmhaBwdBf16, true, true, false, false>;
                                 if(t.how_v3_bf16_cvt == 0){{
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 0, true, false, GPUArch::gfx942, true>;
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }}
                                 else if(t.how_v3_bf16_cvt == 1){{
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 1, true, false, GPUArch::gfx942, true>;
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }}
                                 else{{
                                     using dq_dk_dv_v3_traits_ = fmha_bwd_dq_dk_dv_v3_traits_<64, FmhaBwdBf16, true, true, 2, true, false, GPUArch::gfx942, true>;
-                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a);
+                                    r = fmha_bwd_v3_group_<dot_do_o_trait_, dq_dk_dv_v3_traits_, convert_dq_trait_>(s, a, seqlen_q_padded, seqlen_k_padded);
                                 }}
                                 return r;
                             }}
