@@ -86,7 +86,7 @@ def run_gemm_asm(
 @benchmark()
 def test_gemm(dtype, M, N, K):
     from aiter.jit.utils.chip_info import get_gfx
-
+    print("================flag1================")
     if get_gfx() not in ["gfx950"]:
         return
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
@@ -154,7 +154,7 @@ def test_gemm(dtype, M, N, K):
     err_e = checkAllclose(a, e[:M], msg="ck            ")
     tflops_e = M * N * K * 2 / avg_e / 1e6
     tbs_e = (x.nbytes + w.nbytes) / avg_e / 1e6
-
+    print("================flag2================")
     return {
         "triton": avg_b,
         "asm no splitK": avg_c,
@@ -172,122 +172,125 @@ def test_gemm(dtype, M, N, K):
         "ck TB/s": tbs_e,
     }
 
+def create_argument_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-mnk",
+        "--shape",
+        type=dtypes.str2tuple,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Shape of mnk.
+        e.g. -mnk 1280,8192,1024""",
+    )
+    return parser
 
-l_dtype = ["bf16"]
-l_mnk = [
-    # pure_compute
-    (256, 2048, 8192),
-    (2048, 8192, 8192),
-    (16384, 16384, 16384),
-    (32768, 106496, 16384),
-    (32768, 16384, 53248),
-    (32768, 18432, 16384),
-    (32768, 16384, 16384),
-    (128, 106496, 16384),
-    (128, 16384, 53248),
-    (128, 18432, 16384),
-    (128, 16384, 16384),
-    (64, 106496, 16384),
-    (64, 16384, 53248),
-    (64, 18432, 16384),
-    (64, 16384, 16384),
-    (64, 106496, 16384),
-    (32, 106496, 16384),
-    (32, 16384, 53248),
-    (32, 18432, 16384),
-    (32, 16384, 16384),
-    # qkv_proj
-    (1, 1280, 8192),
-    (64, 1280, 8192),
-    (127, 1280, 8192),
-    (129, 1280, 8192),
-    (65, 1280, 8192),
-    (32, 1280, 8192),
-    (64, 1280, 8192),
-    (128, 1280, 8192),
-    (192, 1280, 8192),
-    (256, 1280, 8192),
-    (320, 1280, 8192),
-    (512, 1280, 8192),
-    (1024, 1280, 8192),
-    (2048, 1280, 8192),
-    (4096, 1280, 8192),
-    (8192, 1280, 8192),
-    # attn_out
-    (1, 8192, 1024),
-    (32, 8192, 1024),
-    (64, 8192, 1024),
-    (128, 8192, 1024),
-    (192, 8192, 1024),
-    (256, 8192, 1024),
-    (320, 8192, 1024),
-    (512, 8192, 1024),
-    (1024, 8192, 1024),
-    (2048, 8192, 1024),
-    (4096, 8192, 1024),
-    (8192, 8192, 1024),
-    (16384, 8192, 1024),
-    # tune
-    (1552, 8192, 8192),
-    (1664, 8192, 8192),
-    (1792, 8192, 8192),
-    (1920, 8192, 8192),
-    (3072, 8192, 8192),
-    (1552, 10240, 8192),
-    (1664, 10240, 8192),
-    (1792, 10240, 8192),
-    (1920, 10240, 8192),
-    (3072, 10240, 8192),
-    (1552, 57344, 8192),
-    (1664, 57344, 8192),
-    (1792, 57344, 8192),
-    (1920, 57344, 8192),
-    (3072, 57344, 8192),
-    (1552, 8192, 28672),
-    (1664, 8192, 28672),
-    (1792, 8192, 28672),
-    (1920, 8192, 28672),
-    (3072, 8192, 28672),
-]
+if __name__ == "__main__":
+    l_dtype = ["bf16"]
+    l_mnk = [
+        # pure_compute
+        (256, 2048, 8192),
+        (2048, 8192, 8192),
+        (16384, 16384, 16384),
+        (32768, 106496, 16384),
+        (32768, 16384, 53248),
+        (32768, 18432, 16384),
+        (32768, 16384, 16384),
+        (128, 106496, 16384),
+        (128, 16384, 53248),
+        (128, 18432, 16384),
+        (128, 16384, 16384),
+        (64, 106496, 16384),
+        (64, 16384, 53248),
+        (64, 18432, 16384),
+        (64, 16384, 16384),
+        (64, 106496, 16384),
+        (32, 106496, 16384),
+        (32, 16384, 53248),
+        (32, 18432, 16384),
+        (32, 16384, 16384),
+        # qkv_proj
+        (1, 1280, 8192),
+        (64, 1280, 8192),
+        (127, 1280, 8192),
+        (129, 1280, 8192),
+        (65, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        # attn_out
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+        # tune
+        (1552, 8192, 8192),
+        (1664, 8192, 8192),
+        (1792, 8192, 8192),
+        (1920, 8192, 8192),
+        (3072, 8192, 8192),
+        (1552, 10240, 8192),
+        (1664, 10240, 8192),
+        (1792, 10240, 8192),
+        (1920, 10240, 8192),
+        (3072, 10240, 8192),
+        (1552, 57344, 8192),
+        (1664, 57344, 8192),
+        (1792, 57344, 8192),
+        (1920, 57344, 8192),
+        (3072, 57344, 8192),
+        (1552, 8192, 28672),
+        (1664, 8192, 28672),
+        (1792, 8192, 28672),
+        (1920, 8192, 28672),
+        (3072, 8192, 28672),
+    ]
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-mnk",
-    "--shape",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Shape of mnk.
-    e.g. -mnk 1280,8192,1024""",
-)
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    if args.shape is not None:
+        l_mnk = [args.shape]
 
-args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.shape is not None:
-    l_mnk = [args.shape]
-
-df = []
-for dtype in l_dtype:
-    for m, n, k in l_mnk:
-        ret = test_gemm(dtype, m, n, k)
-        df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
+    df = []
+    for dtype in l_dtype:
+        for m, n, k in l_mnk:
+            ret = test_gemm(dtype, m, n, k)
+            df.append(ret)
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"summary:\n{df}")

@@ -17,10 +17,19 @@ from aiter import dtypes
 from pathlib import Path
 from typing import Dict, List, Any
 from dataclasses import dataclass
+import argparse
+
+import sys
+from op_tests.test_gemm_a8w8 import test_gemm as test_gemm_a8w8
+from op_tests.test_gemm_a4w4 import test_gemm as test_gemm_a4w4
+from op_tests.test_gemm import test_gemm as test_gemm
+from aiter.jit.utils.chip_info import get_gfx
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+M = [1, 4, 8, 16, 32, 64, 128, 256]
 
 @dataclass
 class TestConfig:
@@ -31,9 +40,6 @@ class TestConfig:
     -----------
     model_name : str
         Name of the model (e.g., "DeepSeek-R1", "Qwen3-235B-A22B")
-
-    tp_size : int
-        Tensor Parallel size (e.g., 8 for TP8, 4 for TP4)
 
     dim : str
         Model dimensions in format "hidden_dim,moe_intermediate_dim"
@@ -46,40 +52,17 @@ class TestConfig:
         Number of top experts to use for each token
     """
     model_name: str
-    tp_size: int
     attention_head: int
     kv_head: int
     head_dim: int
     intermediate_size: int
 
-    def __str__(self):
-        return f"{self.model_name}.tp{self.tp_size}.head_dim{self.head_dim}.intermediate_size{self.intermediate_size}"
-
-TEST_CONFIGS = [
-    # #       model_name,        tp_size,   attention_head,   kv_head,   head_dim,  intermediate_size
-    # # Qwen3-32B -- TP8
-    # TestConfig("Qwen3-32B",       8,         64,          8,         80,         25600),
-    # # Qwen3-32B -- TP4
-    # TestConfig("Qwen3-32B",       4,         64,          8,         80,         25600),
-    # # Qwen3-32B -- TP1
-    # TestConfig("Qwen3-32B",       1,         64,          8,         80,         25600),
-
-    # Llama3-70B -- TP8
-    TestConfig("Llama3-70B",        8,         64,          8,         128,         28672),
-    # # Llama3-70B -- TP4
-    # TestConfig("Llama3-70B",      4,         64,          8,         128,         28672),
-    # # Llama3-70B -- TP1
-    # TestConfig("Llama3-70B",      1,         64,          8,         128,         28672),
-
-    # # Llama3-405B -- TP8
-    # TestConfig("Llama3-405B",     8,         128,         8,         128,         53248),
-    # # Llama3-405B -- TP4
-    # TestConfig("Llama3-405B",     4,         128,         8,         128,         53248),
-    # # Llama3-405B -- TP1
-    # TestConfig("Llama3-405B",     1,         128,         8,         128,         53248),
-]
-import sys
-from op_tests.test_gemm_a8w8 import test_gemm
+TEST_CONFIGS = {
+    # model,                    model_name,   attention_head,   kv_head,   head_dim,  intermediate_size
+    # "Qwen3-32B"   : TestConfig("Qwen3-32B",         64,          8,         80,         25600),
+    "Llama3-70B"  : TestConfig("Llama3-70B",        64,          8,         128,        28672),
+    "Llama3-405B" : TestConfig("Llama3-405B",       128,         8,         128,        53248),
+}
 
 
 @dataclass
@@ -98,33 +81,26 @@ class FusedmoeTestRunner:
     def __init__(self):
         return
     
-    def get_gemm_shape(self, config: TestConfig):
-        
+    def get_gemm_shape(self, config: TestConfig, TP_list):        
         test_name = str(config)
         logger.info(f"Running test: {test_name}")
-            
-        M = [1, 4, 8, 16, 32, 64, 128, 256]
-        # M = [1]
-        hidden_size = config.attention_head * config.head_dim
-            
-        QKV_K = hidden_size
-        QKV_N = (config.attention_head // config.tp_size + 2 * ((config.kv_head + config.tp_size - 1) // config.tp_size)) * config.head_dim
-
-        Out_K = (config.attention_head // config.tp_size) * config.head_dim
-        Out_N = hidden_size
-
-        Up_Gate_K = hidden_size
-        Up_Gate_N = config.intermediate_size * 2 // config.tp_size
-
-        Down_K = config.intermediate_size // config.tp_size
-        Down_N = hidden_size
-
+        
         records = []
-        for m in M:
-            records.append(Record(M=m, N=QKV_N, K=QKV_K, TP=config.tp_size))
-            records.append(Record(M=m, N=Out_N, K=Out_K, TP=config.tp_size))
-            records.append(Record(M=m, N=Up_Gate_N, K=Up_Gate_K, TP=config.tp_size))
-            records.append(Record(M=m, N=Down_N, K=Down_K, TP=config.tp_size))
+        for tp in TP_list:
+            hidden_size = config.attention_head * config.head_dim                    
+            QKV_K = hidden_size
+            QKV_N = (config.attention_head // tp + 2 * ((config.kv_head + tp - 1) // tp)) * config.head_dim
+            Out_K = (config.attention_head // tp) * config.head_dim
+            Out_N = hidden_size
+            Up_Gate_K = hidden_size
+            Up_Gate_N = config.intermediate_size * 2 // tp
+            Down_K = config.intermediate_size // tp
+            Down_N = hidden_size
+            for m in M:
+                records.append(Record(M=m, N=QKV_N, K=QKV_K, TP=tp))
+                records.append(Record(M=m, N=Out_N, K=Out_K, TP=tp))
+                records.append(Record(M=m, N=Up_Gate_N, K=Up_Gate_K, TP=tp))
+                records.append(Record(M=m, N=Down_N, K=Down_K, TP=tp))
         return records
 
     def calculate_throughput(self, m, n, k, latency):
@@ -135,52 +111,71 @@ class FusedmoeTestRunner:
         bandwidth = (m * k * sys.getsizeof(in_dtype) + k * n * sys.getsizeof(wei_dtype) + m * n * sys.getsizeof(out_dtype)) / latency / 1e6
         return bandwidth
 
-    def test_gemm_a8w8_pertoken_quant(self, l_dtype, l_quantDtype, records):
+    def benchmark_gemm(self, l_dtype, l_quantDtype, records):
         df = []
         metrics = []
-        for dtype in l_dtype:
-            for quantDtype in l_quantDtype:
+
+        for quantDtype in l_quantDtype:
+            for dtype in l_dtype:
                 for idx, record in enumerate(records):
                     print("dtype={}".format(dtype))
                     print("quantDtype={}".format(quantDtype))
-                    ret = test_gemm(dtype, record.M, record.N, record.K, quantDtype)
-                    print("--ret={}".format(ret))
-                    ck_time=ret['ck us']
-                    ck_bpreshuffle_time=ret['ck bpreshuffle us']
-                    asm_time=ret['asm us']
-                    latency = min(ck_time, ck_bpreshuffle_time)
-                    if asm_time is not None:
-                        latency = min(latency, asm_time)
+                    print("quantDtype1={}".format("fp4x2"))
+                    
+                    latency = float('inf')
+                    if quantDtype == dtypes.d_dtypes["fp8"]:
+                        ret = test_gemm_a8w8(dtype, record.M, record.N, record.K, quantDtype)
+                        print("--ret={}".format(ret))
+                        ck_time=ret['ck us']
+                        ck_bpreshuffle_time=ret['ck bpreshuffle us']
+                        asm_time=ret['asm us']
+                        print("ck_time={}".format(ck_time))
+                        print("ck_time={}".format(ck_time))
+
+                        if ck_time is not None:
+                            latency = min(latency, ck_time)
+                        if ck_time is not None:
+                            latency = min(latency, ck_bpreshuffle_time)
+                        if asm_time is not None:
+                            latency = min(latency, asm_time)
+                    elif quantDtype == dtypes.d_dtypes["fp4x2"]:
+                        print("---------test_gemm_a4w4")
+                        ret = test_gemm_a4w4(dtype, record.M, record.N, record.K)
+                        asm_no_splitK_time = ret["asm no splitK"]
+                        asm_splitK_time = ret["asm splitK"]
+                        ck_time=ret["ck"]
+                        if ck_time is not None:
+                            latency = min(latency, ck_time)
+                        if asm_no_splitK_time is not None:
+                            latency = min(latency, asm_no_splitK_time)
+                        if asm_splitK_time is not None:
+                            latency = min(latency, asm_splitK_time)
+                    else:
+                        print("---------test_gemm_bf16")
+                        ret = test_gemm(dtypes.bf16, record.M, record.N, record.K, otype=dtypes.bf16)
+                        latency = ret['ck us']
+
+                   
                     print("---latency={}".format(latency))
                     records[idx].latency = latency
                     records[idx].quant_type = quantDtype
                     records[idx].output_type = dtype
                     records[idx].throughput = self.calculate_throughput(record.M, record.N, record.K, latency)
                     records[idx].bandwidth = self.calculate_bandwidth(record.M, record.N, record.K, latency, quantDtype, quantDtype, dtype)
-            
+
         # df = pd.DataFrame(df)
         # print("df={}".format(df))
         # aiter.logger.info(f"summary:\n{df}")
 
-
-    def run_single_test(self, config: TestConfig, timeout: int = 1000) -> Dict[str, Any]:
-        """Run a single test with given configuration"""        
-        records = self.get_gemm_shape(config)
-        self.test_gemm_a8w8_pertoken_quant([dtypes.d_dtypes["bf16"]], [dtypes.d_dtypes["fp8"]], records)
-        print("--records={}".format(records))
-        return records
-
     def save_structs_to_csv(self, records, csv_file, fieldnames):
         import csv
-        from dataclasses import dataclass, asdict
+        from dataclasses import asdict
         with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for rec in records:
                 writer.writerow(asdict(rec))
-
         print(f"data write to {csv_file} success!!")
-
 
     def save_to_csv(self, records, csv_file_name):
         self.save_structs_to_csv(
@@ -189,24 +184,112 @@ class FusedmoeTestRunner:
             ["M", "N", "K", "TP", "quant_type", "output_type", "latency", "throughput", "bandwidth"],
         )
 
-    def run_all_tests(self) -> List[Dict[str, Any]]:
+    def extract_configuration(self, args):
+        print("-------TEST_CONFIGS={}".format(TEST_CONFIGS))
+        models = []
+        if args.model is None:
+            for key, value in TEST_CONFIGS.items():
+                models.append(value)
+        else:
+            models.append(TEST_CONFIGS[args.model])
+
+        if args.tensor_parallel is None:
+            TP_list = [1, 4, 8]
+        else:
+            TP_list = [args.tensor_parallel]
+
+        if args.dtype is None:
+            output_types = [dtypes.d_dtypes["bf16"]]
+        else:
+            output_types = [dtypes.d_dtypes[args.dtype]]
+        
+        if args.quantDtype is None:
+            quant_type = [dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]]
+            if get_gfx() in ["gfx950"]:
+                quant_type.append(dtypes.d_dtypes["fp4x2"])
+        else:
+            quant_type = [dtypes.d_dtypes[args.quantDtype]]
+            print("*********quant_type={}".format(quant_type))
+        
+        return models, TP_list, output_types, quant_type
+
+    def run_single_test(self, config, TP_list, output_types, quant_type):
+        """Run a single test with given configuration"""   
+       
+        records = self.get_gemm_shape(config, TP_list)
+        self.benchmark_gemm(output_types, quant_type, records)
+        print("--records={}".format(records))
+        return records
+    
+    
+    def run_all_tests(self, args) -> List[Dict[str, Any]]:
         """Run all defined tests"""
         logger.info("Starting all MoE 2-stage tests...")
         logger.info(f"Total tests: {len(TEST_CONFIGS)}")
-        records = self.run_single_test(TEST_CONFIGS[0])
-        self.save_to_csv(records, TEST_CONFIGS[0].model_name)
+        
+        models, TP_list, output_types, quant_type = self.extract_configuration(args)
+
+        print("==========configs={}".format(models))
+        for model in models:
+            records = self.run_single_test(model, TP_list, output_types, quant_type)
+            self.save_to_csv(records, model.model_name)
 
 
-def main():
-    """Main function - runs all tests directly"""
-    # Initialize and run tests
-    runner = FusedmoeTestRunner()
-    results = runner.run_all_tests()
-    # runner.print_summary(results)
 
-    # Exit with appropriate code
-    #failed_count = sum(1 for r in results if r['status'] in ['FAIL', 'ERROR'])
-    #sys.exit(1 if failed_count > 0 else 0)
+
+def create_argument_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=["bf16", "fp16"],
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-q",
+        "--quantDtype",
+        type=str,
+        choices=["fp4x2", "fp8", "bf16"],
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Date type of quantization.
+        e.g.: -q fp8""",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        choices=["Llama3-70B", "Qwen3-32B", "Llama3-405B"],
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Supported model.
+        e.g. -m Llama3-70B""",
+    )
+    parser.add_argument(
+        "-tp",
+        "--tensor-parallel",
+        type=int,
+        choices=[1, 4, 8],
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Tenosr Parallel size.
+        e.g. -tp 8""",
+    )
+    return parser
 
 if __name__ == "__main__":
-    main()
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    runner = FusedmoeTestRunner()
+    results = runner.run_all_tests(args)

@@ -332,6 +332,7 @@ def create_argument_parser():
         help="""Shape of mnk.
         e.g. -mnk 1280,8192,1024""",
     )
+    return parser
 
 
 if __name__ == "__main__":
