@@ -79,8 +79,8 @@ def _ff_a16w16_fused_gated(
 
     # Create pointers for first block of x and w1 input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_xm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    x_ptrs = x_ptr + (offs_xm[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    offs_m = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
 
     acc_dtype = tl.float32 if y_ptr.type.element_ty != tl.int8 else tl.int32
 
@@ -108,7 +108,7 @@ def _ff_a16w16_fused_gated(
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         if EVEN_K:
-            x = tl.load(x_ptrs, mask=offs_xm[:, None] < M)
+            x = tl.load(x_ptrs, mask=offs_m[:, None] < M)
             w1n0 = tl.load(
                 w1n0_ptrs,
                 mask=offs_w1n0[None, :] < (N // 2),
@@ -122,7 +122,7 @@ def _ff_a16w16_fused_gated(
         else:
             x = tl.load(
                 x_ptrs,
-                mask=(offs_xm[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
             w1n0 = tl.load(
@@ -154,14 +154,13 @@ def _ff_a16w16_fused_gated(
     acc_gated = acc0 * acc1
     acc_gated = acc_gated.to(w2_ptr.type.element_ty)
 
-    offs_w2n = pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(
-        0, BLOCK_SIZE_N // 2
-    )
+    offs_w2n = (
+        pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
+    ) % (N // 2)
 
     w2_ptrs = w2_ptr + (offs_w2n[:, None] * stride_w2n + offs_k[None, :] * stride_w2k)
 
-    offs_ym = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    y_ptrs = y_ptr + (offs_ym[:, None] * stride_ym + offs_k[None, :] * stride_yk)
+    y_ptrs = y_ptr + (offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk)
 
     # Stagger k-loop start position based on N block index (to minimize contention)
     k_cyclic_offset = pid_n % tl.cdiv(K, BLOCK_SIZE_K)
@@ -172,19 +171,17 @@ def _ff_a16w16_fused_gated(
         if EVEN_K:
             w2 = tl.load(
                 w2_ptrs,
-                mask=offs_w2n[:, None] < (N // 2),
             )
         else:
             w2 = tl.load(
                 w2_ptrs,
-                mask=(offs_w2n[:, None] < (N // 2))
-                & ((offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K),
+                mask=(offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K,
                 other=0.0,
             )
         partial_sum_y = tl.dot(acc_gated, w2)
         # tl.device_print("w2:", w2)
         # tl.device_print("partial y:", partial_sum_y)
-        y_mask = (offs_ym[:, None] < M) & (
+        y_mask = (offs_m[:, None] < M) & (
             (offs_k[None, :] + BLOCK_SIZE_K * k_cyclic_offset) < K
         )
         tl.atomic_add(y_ptrs, partial_sum_y, mask=y_mask, sem="relaxed", scope="gpu")

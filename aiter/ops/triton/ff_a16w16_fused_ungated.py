@@ -79,34 +79,34 @@ def _ff_a16w16_fused_ungated(
 
     # Create pointers for first block of x and w1 input matrices
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    offs_xm = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    x_ptrs = x_ptr + (offs_xm[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    offs_m = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
 
     acc_dtype = tl.float32 if y_ptr.type.element_ty != tl.int8 else tl.int32
 
-    offs_w1n = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    w1_ptrs = w1_ptr + (offs_k[:, None] * stride_w1k + offs_w1n[None, :] * stride_w1n)
+    offs_n = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    w1_ptrs = w1_ptr + (offs_k[:, None] * stride_w1k + offs_n[None, :] * stride_w1n)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         if EVEN_K:
-            x = tl.load(x_ptrs, mask=offs_xm[:, None] < M)
+            x = tl.load(x_ptrs, mask=offs_m[:, None] < M)
             w1 = tl.load(
                 w1_ptrs,
-                mask=offs_w1n[None, :] < N,
+                mask=offs_n[None, :] < N,
                 cache_modifier=cache_modifier,
             )
         else:
             x = tl.load(
                 x_ptrs,
-                mask=(offs_xm[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
             w1 = tl.load(
                 w1_ptrs,
-                mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_w1n[None, :] < N),
+                mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_n[None, :] < N),
                 other=0.0,
                 cache_modifier=cache_modifier,
             )
@@ -122,9 +122,9 @@ def _ff_a16w16_fused_ungated(
 
     acc = acc.to(w2_ptr.type.element_ty)
 
-    offs_w2n = pid_n.to(tl.int64) * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_n = offs_n % N  # Avoid load masking when possible
 
-    w2_ptrs = w2_ptr + (offs_w2n[:, None] * stride_w2n + offs_k[None, :] * stride_w2k)
+    w2_ptrs = w2_ptr + (offs_n[:, None] * stride_w2n + offs_k[None, :] * stride_w2k)
 
     offs_ym = pid_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     y_ptrs = y_ptr + (offs_ym[:, None] * stride_ym + offs_k[None, :] * stride_yk)
@@ -138,13 +138,11 @@ def _ff_a16w16_fused_ungated(
         if EVEN_K:
             w2 = tl.load(
                 w2_ptrs,
-                mask=offs_w2n[:, None] < N,
             )
         else:
             w2 = tl.load(
                 w2_ptrs,
-                mask=(offs_w2n[:, None] < N)
-                & ((offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K),
+                mask=(offs_k[None, :] + k_cyclic_offset * BLOCK_SIZE_K) < K,
                 other=0.0,
             )
         partial_sum_y = tl.dot(acc, w2)
