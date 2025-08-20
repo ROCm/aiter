@@ -201,7 +201,7 @@ void mla_decode_stage1_asm_fwd(
 
         if(gqa_ratio == 16)
         {
-            if(max_seqlen_q == 2)
+            if(max_seqlen_q <= 2)
             {
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
