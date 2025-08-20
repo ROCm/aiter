@@ -215,7 +215,6 @@ def benchmark(args):
     ):
         warmup = 25
         rep = 100
-
         (
             q_extend,
             k_extend,
@@ -228,6 +227,9 @@ def benchmark(args):
             custom_mask,
             mask_indptr,
             max_len_extend,
+            _,
+            _,
+            _,
         ) = input_helper(
             B,
             H,
@@ -260,7 +262,6 @@ def benchmark(args):
             )
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-
         return ms
 
     bench_MLA.run(save_path="." if args.o else None, print_data=True, show_plots=False)
