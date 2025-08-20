@@ -19,6 +19,19 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 # setup_seed(1)
 
+
+def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -> None:
+    x, y = x.double(), y.double()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    amax_diff = (x - y).abs().max().item()
+    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    if use_fp8:
+        assert cos_diff < 3e-2
+    else:
+        assert cos_diff < 1e-5
+
+
 def ref_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -152,6 +165,7 @@ def test_mla(
     # seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
     #     12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
     # seq_lens_kv = seq_lens_kv[:batch_size]
+
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
@@ -274,7 +288,7 @@ def test_mla(
     )
     # out_asm = out_asm[:total_q]
 
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -295,6 +309,8 @@ def test_mla(
         out_asm,
         msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
+
+    cal_diff(out_ref, out_asm, "out", True)
     return {
         "decode:flops": flops,
         "decode:bytes": bytes,
@@ -313,7 +329,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 1)]
+list_nhead = [(16, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -384,7 +400,8 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[512, 1023, 4888, 12800], #
+    # default=[28, 512, 1023, 4888, 12800], #
+    default=[4096, 8192, 16384], #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -393,7 +410,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(64, 80)], # [41],
+    # default=[i for i in range(64, 80)], # [41],
+    default=[64], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
