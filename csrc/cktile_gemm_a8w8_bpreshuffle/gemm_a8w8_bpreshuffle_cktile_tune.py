@@ -11,6 +11,7 @@ from aiter.ops.shuffle import shuffle_weight
 from gemm_a8w8_bpreshuffle_cktile_common import kernels_list
 import argparse
 from aiter.utility.mp_tuner import mp_tuner
+from aiter.jit.utils.chip_info import get_gfx
 
 
 def checkClose(a, b, rtol=1e-3, atol=0.01):
@@ -73,7 +74,12 @@ def generate_data(m, n, k):
     weight = torch.randn((n, k), dtype=dtypes.fp16, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=dtypes.fp8)
-    weight_shuffle = shuffle_weight(weight, layout=(16, 16))
+    if get_gfx() == "gfx942":
+        weight_shuffle = shuffle_weight(weight, layout=(16, 16))
+    else:
+        weight_shuffle = weight.view(n // 16, 16, k // 128, 4, 32)
+        weight_shuffle = weight_shuffle.permute(0, 2, 3, 1, 4).contiguous()
+        weight_shuffle = weight_shuffle.view(n, -1)
     out = torch.empty(m, n, dtype=dtypes.fp16, device="cuda")
     return x, weight_shuffle, x_scale, w_scale, out, weight
 
