@@ -109,7 +109,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     {
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
-           ((cfg.splitK == log2_k_split_en) || !log2_k_split_en))
+           ((cfg.splitK == log2_k_split_en) || !log2_k_split.has_value()))
         {
             if((N % cfg.tile_N) == 0)
             {
