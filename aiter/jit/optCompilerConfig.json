@@ -621,10 +621,11 @@
     "module_fmha_v3_fwd_ck": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/fmha_v3_fwd_ck_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/instances/fwd_hd128_fp16.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/instances/fwd_hd128_fp16_causal.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/instances/fwd_hd128_bf16.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_ck/instances/fwd_hd128_bf16_causal.cu'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/fmha_fwd_v3.cpp'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fwd_hd128_fp16.cu'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fwd_hd128_fp16_causal.cu'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fwd_hd128_bf16.cu'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fwd_hd128_bf16_causal.cu'",
             "f'{AITER_CSRC_DIR}/pybind/fmha_v3_fwd_ck_pybind.cu'"
         ],
         "flags_extra_cc": [],
@@ -635,7 +636,8 @@
         ],
         "extra_ldflags": "None",
         "extra_include": [
-            "f'{CK_DIR}/example/ck_tile/01_fmha'"
+            "f'{CK_DIR}/example/ck_tile/01_fmha'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3'"
         ],
         "verbose": "False",
         "blob_gen_cmd": []

@@ -8,68 +8,10 @@
 #include <utility>
 
 #include "fmha_fwd_v3.hpp"
-
-#define DEBUG_DTYPE_FP16 0
-#define DEBUG_DTYPE_BF16 1
-#define DEBUG_MASK_NONE 0
-#define DEBUG_MASK_CAUSAL 1
-
-#define DEBUG_SINGLE_INST 0
-#define DEBUG_SINGLE_INST_DTYPE DEBUG_DTYPE_BF16
-#define DEBUG_SINGLE_INST_MASK DEBUG_MASK_NONE
+#include "mask.hpp"
 
 namespace aiter {
 namespace torch_itfs {
-namespace {
-
-float fmha_fwd_v3(const ck_tile::fmha_fwd_v3_args& args, const ck_tile::stream_config& config)
-{
-    float time = 0.0;
-
-    // TODO: compile fp16/bf16, masking=true/false kernels separately
-    if(args.data_type == ck_tile::fmha_fwd_v3_args::data_type_enum::fp16)
-    {
-        if(args.mask_type == static_cast<int>(mask_enum::no_mask))
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            time = fmha_fwd_v3_dispatch<
-                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::fp16, false>>(args, config);
-#endif
-        }
-        else
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_FP16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            time = fmha_fwd_v3_dispatch<
-                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::fp16, true>>(args, config);
-#endif
-        }
-    }
-    else if(args.data_type == ck_tile::fmha_fwd_v3_args::data_type_enum::bf16)
-    {
-        if(args.mask_type == static_cast<int>(mask_enum::no_mask))
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_NONE)
-            time = fmha_fwd_v3_dispatch<
-                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::bf16, false>>(args, config);
-#endif
-        }
-        else
-        {
-#if !DEBUG_SINGLE_INST || \
-    (DEBUG_SINGLE_INST_DTYPE == DEBUG_DTYPE_BF16 && DEBUG_SINGLE_INST_MASK == DEBUG_MASK_CAUSAL)
-            time = fmha_fwd_v3_dispatch<
-                type_tag<ck_tile::fmha_fwd_v3_args::data_type_enum::bf16, true>>(args, config);
-#endif
-        }
-    }
-
-    return 0.0;
-}
-} // namespace
-//////////////////////////////////////////////////////////////////////////////////////
 
 std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
                                        const at::Tensor& k, // [b, sk, hk, d]
@@ -195,7 +137,7 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
     auto stream = at::cuda::getCurrentHIPStream().stream();
     ck_tile::stream_config stream_config{stream};
 
-    fmha_fwd_v3(args, stream_config);
+    ck_tile::fmha_fwd_v3(args, stream_config);
 
     return {out};
 }
