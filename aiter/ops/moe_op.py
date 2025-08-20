@@ -294,6 +294,67 @@ def ck_moe_stage2(
 ) -> None: ...
 
 
+@compile_ops("module_moe_cktile2stages",  fc_name="cktile_moe_gemm1")
+def moe_cktile2stages_gemm1_ck(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+) -> Tensor: ...
+
+def moe_cktile2stages_gemm1(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+):
+    return moe_cktile2stages_gemm1_ck(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, block_m)
+
+@compile_ops("module_moe_cktile2stages",  fc_name="cktile_moe_gemm2")
+def moe_cktile2stages_gemm2_ck(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+) -> Tensor: ...
+
+def moe_cktile2stages_gemm2(
+    XQ                  : Tensor,
+    WQ                  : Tensor,
+    Y                   : Tensor,
+    sorted_ids          : Tensor,
+    sorted_expert_ids   : Tensor,
+    max_token_ids       : Tensor,
+    topk                : int,
+    topk_weight         : Optional[Tensor] = None,
+    x_scale             : Optional[Tensor] = None,
+    w_scale             : Optional[Tensor] = None,
+    block_m             : Optional[int] = 32,
+):
+    return moe_cktile2stages_gemm2_ck(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, block_m)
+
+
 dtype2str_dict = {
     dtypes.fp16: "f16",
     dtypes.bf16: "b16",
