@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-import triton
 import aiter
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.triton.rmsnorm import (
@@ -17,8 +16,8 @@ from aiter.ops.triton.rmsnorm import (
 
 
 def generate_rmsnorm_inputs(M, N, dtype):
-    x = torch.randn((M, N), dtype=dtype).cuda()
-    weight = torch.randn(N, dtype=dtype).cuda()
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+    weight = torch.randn(N, dtype=dtype, device="cuda")
 
     return x, weight
 
@@ -165,9 +164,9 @@ def test_rmsnorm(M, N, in_dtype_str):
         y_torch.dtype == out_dtype
     ), f"y_torch has dtype={y_torch.dtype}, expected {out_dtype}"
 
-    triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
-    triton.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -215,10 +214,10 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
         y_torch.dtype == out_dtype
     ), f"y_torch has dtype={y_torch.dtype}, expected {out_dtype}"
 
-    triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
-    triton.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(dg_triton, dg_torch, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -245,8 +244,8 @@ def test_rmsnorm_smoothquant(M, N, in_dtype_str, scale_dtype_str):
         x, weight, 1e-5, x_scale=x_scale, y_scale_dtype=scale_dtype
     )
 
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -272,8 +271,8 @@ def test_rmsnorm_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
         x, weight, 1e-5, y_scale_dtype=scale_dtype
     )
 
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -301,9 +300,9 @@ def test_rmsnorm_fused_add_smoothquant(M, N, in_dtype_str, scale_dtype_str):
         x, weight, 1e-5, residual=res, x_scale=x_scale, y_scale_dtype=scale_dtype
     )
 
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
-    triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -330,9 +329,9 @@ def test_rmsnorm_fused_add_dynamicquant(M, N, in_dtype_str, scale_dtype_str):
         x, weight, 1e-5, residual=res, y_scale_dtype=scale_dtype
     )
 
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
-    triton.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(res_triton, res_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(yscale_triton, yscale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("B", [1, 4, 8])

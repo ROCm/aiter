@@ -1,9 +1,9 @@
-import argparse
 import sys
 import torch
 import triton
 import math
 from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+from aiter.ops.triton.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.test_gemm_a16w16 import generate_gemm_a16w16_inputs
 from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
@@ -14,10 +14,22 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
+    print_vgpr,
+    get_caller_name_no_ext,
 )
+from typing import Optional
 
 
-def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, model_name=None):
+def bench_gemm_fn(
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    atomic: bool = False,
+    activation: Optional[str] = None,
+    **kwargs,
+):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
     x, w, out_dtype, y = generate_gemm_a16w16_inputs(
@@ -25,14 +37,30 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, model_name=N
     )
     # flops
     flops = 2.0 * M * N * K
+    if activation is not None:
+        flops += M * N  # elementwise ops on the GEMM output
     # memory transfer
     mem_read = (M * K) * x.element_size() + (N * K) * w.element_size()
     mem_write = (M * N) * x.element_size()
     mem = mem_read + mem_write
 
-    ms = triton.testing.do_bench(
-        lambda: gemm_a16w16(x, w, c_dtype, y), warmup=25, rep=100  # noqa: E731
-    )
+    if atomic:
+        # Accumulation in bf16/fp16 leads to precision loss, cast y to fp32 to prevent that
+        assert (
+            activation is None
+        ), "Atomic kernel does not currently support fused activation"
+        y = y.to(torch.float32).zero_()
+        ms = triton.testing.do_bench(
+            lambda: gemm_a16w16_atomic(x, w, torch.float32, y),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
+    else:
+        ms = triton.testing.do_bench(
+            lambda: gemm_a16w16(x, w, c_dtype, y, activation=activation),
+            warmup=25,
+            rep=100,  # noqa: E731
+        )
 
     # Return exactly one scalar depending on which metric is active
     if metric == "time":
@@ -51,12 +79,10 @@ def run_model_benchmark(args):
     """
     Runs benchmark given a --model argument.
     """
-    benchmark = get_model_benchmark_object("GEMM A16W16 Benchmark", args)
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(
-        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
-    ):
+    def bench_gemm_a16w16(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
         """
         Fc1:
              M      K                  K           N          M       N
@@ -81,7 +107,9 @@ def run_model_benchmark(args):
             K = math.ceil(K / args.tp)
         # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
 
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, atomic=args.atomic, activation=args.activation
+        )
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -90,13 +118,13 @@ def run_shape_benchmark(args):
     """
     Runs a benchmark with given tensor shapes.
     """
-    benchmark = get_shape_benchmark_object("GEMM A16W16 Benchmark", args)
+    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
-    def bench_gemm_a16w16(M, N, K, metric, model_name=None, **kwargs):
+    def bench_gemm_a16w16(M, N, K, metric, **kwargs):
         # Divide N by tensor parallel
         N = math.ceil(N / args.tp)
-        return bench_gemm_fn(M, N, K, metric, args.layout)
+        return bench_gemm_fn(M, N, K, metric, args.layout, atomic=args.atomic)
 
     bench_gemm_a16w16.run(save_path="." if args.o else None, print_data=True)
 
@@ -130,11 +158,28 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser(kernel_name="A16W16 GEMM")
     parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "--atomic",
+        action="store_true",
+        default=False,
+        help="Use the atomic kernel (split-k with atomic_add) instead of the standard a16w16 kernel.",
+    )
+    parser.add_argument(
+        "--activation",
+        type=str,
+        default=None,
+        help="Activation function to apply to the output. One of ('gelu', 'gelu_tanh', 'silu', 'silu_exp2', 'relu').",
+    )
     return get_ff_args(parser)
 
 
 def main():
     args, defaults = parse_args()
+    if args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        print_vgpr(fun, "GEMM")
+        return 0
     run_benchmark(args, defaults)
 
 

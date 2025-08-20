@@ -11,6 +11,10 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.activation import _get_activation_from_str
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -42,6 +46,8 @@ def _gemm_a16_w16_kernel(
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    activation: tl.constexpr,
+    use_activation: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -99,6 +105,8 @@ def _gemm_a16_w16_kernel(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 
+    if use_activation:
+        accumulator = activation(accumulator)
     c = accumulator.to(c_ptr.type.element_ty)
 
     # Write back the block of the output matrix C with masks.
@@ -134,10 +142,12 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    if M < 128 and "small" in _get_config._config_dict[key]:
-        return _get_config._config_dict[key]["small"]
+    bounds = [64, 128, 256, 512, 2048]
+    for bound in bounds:
+        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
     else:
-        return _get_config._config_dict[key]["any"]
+        return _get_config._config_dict[key]["M_GEQ_4096"]
 
 
 def gemm_a16w16(
@@ -146,6 +156,7 @@ def gemm_a16w16(
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
     config: Optional[dict] = None,
+    activation: Optional[str] = None,
 ):
     """
     Computes the 16 bit matmul Y = X x W
@@ -154,11 +165,18 @@ def gemm_a16w16(
     - X: Matrix X with shape (M, K).
     - W: Matrix W with shape (N, K).
     - dtype: Optional parameter to specifcy bf16 or fp16 datatype. Default is bf16
-    - Y: Output Matrix Y with shape (M, N). If this is none, then it's created by this API and returned as output
+    - Y: Output Matrix Y with shape (M, N).
+    If this is none, then it's created by this API and returned as output.
+    - activation: Optional activation function to apply to the output.
+    One of ("gelu", "gelu_tanh", "silu", "silu_exp2", "relu"). Default is None.
 
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+
+    _LOGGER.info(f"GEMM_A16W16: x={tuple(x.shape)} w={tuple(w.shape)}")
+    # Shape checks
+    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
 
     M, K = x.shape
     N, K = w.shape
@@ -186,6 +204,8 @@ def gemm_a16w16(
         w.stride(1),
         y.stride(0),
         y.stride(1),
+        activation=_get_activation_from_str(activation) if activation else "",
+        use_activation=activation is not None,
         **config,
     )
 

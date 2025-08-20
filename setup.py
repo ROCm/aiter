@@ -55,6 +55,7 @@ if IS_ROCM:
             "module_mha_bwd",
             "module_mha_varlen_bwd",
         ]
+
         all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
         # remove pybind, because there are already duplicates in rocm_opt
         new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
@@ -98,8 +99,7 @@ class NinjaBuildExtension(BuildExtension):
             free_memory_gb = psutil.virtual_memory().available / (
                 1024**3
             )  # free memory in GB
-            # each JOB peak memory cost is ~8-9GB when threads = 4
-            max_num_jobs_memory = int(free_memory_gb / 0.5)
+            max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
@@ -120,7 +120,7 @@ if PREBUILD_KERNELS == 1:
 setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
-    packages=["aiter_meta", "aiter", "csrc"],
+    packages=["aiter_meta", "aiter"],
     include_package_data=True,
     package_data={
         "": ["*"],

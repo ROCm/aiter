@@ -1,5 +1,5 @@
 from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
+from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import ctypes
 import math
 
@@ -71,6 +71,7 @@ def paged_attention_v1(
     fp8_out_scale=None,
     partition_size: int = 256,
     mtp: int = 1,
+    q_scale=None,
 ):
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
@@ -199,7 +200,11 @@ def paged_attention_v1(
         kv_seq_stride,
         torch.cuda.current_stream(),
     )
-
+    q_scale_ptr = (
+        ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if q_scale is not None
+        else ctypes.POINTER(ctypes.c_float)()
+    )
     func(
         out_ptr,
         workspace_buffer_ptr,
@@ -210,6 +215,7 @@ def paged_attention_v1(
         cu_query_lens_ptr,
         context_lens_ptr,
         alibi_slopes_ptr,
+        q_scale_ptr,
         ctypes.cast(k_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
         ctypes.cast(v_scale.data_ptr(), ctypes.POINTER(ctypes.c_float)),
         fp8_out_scale_ptr,
@@ -241,7 +247,8 @@ if __name__ == "__main__":
     parser.add_argument("--fp8_kv_dtype", type=str, required=True)
     parser.add_argument("--out_dtype", type=str, required=True)
     parser.add_argument("--block_size", type=int, required=True)
-    parser.add_argument("--alibi_enabled", type=str, required=True)
+    parser.add_argument("--alibi_enabled", type=str_to_bool, required=True)
+    parser.add_argument("--logits_soft_cap_enabled", type=str_to_bool, required=True)
     parser.add_argument("--mtp", type=int, default=1)
     parser.add_argument("--folder", type=str, default=None)
     args = parser.parse_args()

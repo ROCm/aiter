@@ -8,6 +8,9 @@ from typing import Any, Dict, Optional
 
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -621,6 +624,11 @@ def e2e_moe(
     """
     #TODO: Add doc
     """
+    _LOGGER.info(
+        f"MOE_E2E:  A={tuple(A.shape)}  W1={tuple(W1.shape)}  W2={tuple(W2.shape)}  topk_weights={tuple(topk_weights.shape)}"
+        + f" sorted_token_ids={tuple(sorted_token_ids.shape)} expert_ids={tuple(expert_ids.shape)}"
+        + f" num_tokens_post_padded={tuple(num_tokens_post_padded.shape)} top_k={top_k} "
+    )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 

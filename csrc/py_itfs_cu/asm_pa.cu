@@ -88,8 +88,9 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      std::optional<torch::Tensor> out_      = std::nullopt,
                      std::optional<torch::Tensor> qo_indptr = std::nullopt,
                      std::optional<int> high_precision      = 1,
-                     std::string kernelName                 = "")
+                     std::optional<std::string> kernelName_  = std::nullopt)
 {
+    std::string kernelName = kernelName_.value_or("");
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
     // int max_num_blocks = block_tables.size(1);
