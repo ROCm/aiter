@@ -392,16 +392,43 @@ def gen_mha_varlen_fwd_fake_tensor(
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
 ) -> List[torch.Tensor]:
-    return common_mha_fwd_fake_tensors(
-        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
-    )
+    device = q.device
+    dtype = q.dtype
+
+    total_q = q.size(0)
+    num_heads = q.size(1)
+    head_size_v = v.size(-1)
+
+    if out is not None:
+        out_tensor = out
+    else:
+        out_shape = (total_q, num_heads, head_size_v)
+        out_tensor = torch.empty(out_shape, device=device, dtype=dtype)
+
+    if return_softmax_lse:
+        softmax_lse_shape = (num_heads, total_q)
+        softmax_lse_tensor = torch.empty(
+            softmax_lse_shape, device=device, dtype=torch.float32
+        )
+    else:
+        softmax_lse_tensor = torch.empty((0,), device=device, dtype=torch.float32)
+
+    if return_dropout_randval:
+        p_shape = (num_heads, total_q, max_seqlen_k)
+        p_tensor = torch.empty(p_shape, device=device, dtype=torch.uint8)
+    else:
+        p_tensor = torch.empty((0,), device=device)
+
+    rng_state_tensor = torch.empty((2,), device=device, dtype=torch.int64)
+
+    return [out_tensor, softmax_lse_tensor, p_tensor, rng_state_tensor]
 
 
 @compile_ops(
     "module_mha_varlen_fwd",
     fc_name="mha_varlen_fwd",
     gen_func=cmdGenFunc_mha_varlen_fwd,
-    gen_fake=gen_mha_fwd_fake_tensors,
+    gen_fake=gen_mha_varlen_fwd_fake_tensor,
 )
 def mha_varlen_fwd(
     q: torch.Tensor,
