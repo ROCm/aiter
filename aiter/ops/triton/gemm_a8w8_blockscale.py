@@ -78,6 +78,8 @@ def _gemm_a8w8_blockscale_kernel(
 
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
+
+    For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
     tl.assume(stride_am > 0)
@@ -117,10 +119,11 @@ def _gemm_a8w8_blockscale_kernel(
 
         # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+        # ^ Number of K blocks within our split-K partition
 
         # Create pointers for first block of A and B input matrices
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
+        offs_k = tl.arange(0, BLOCK_SIZE_K) 
+        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k # Our block within our split-K partition
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
@@ -131,7 +134,7 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K # Starting point along K dim on scales
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_ks * stride_ascale_k
         )
@@ -321,7 +324,7 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"]) # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
@@ -340,6 +343,8 @@ def gemm_a8w8_blockscale(
     # TODO: need a better way to pass scale block sizes around
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0])) # scale_block_size_k
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1])) # scale_block_size_n
+
+    assert config["GROUP_K"] == config["BLOCK_SIZE_K"], "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
