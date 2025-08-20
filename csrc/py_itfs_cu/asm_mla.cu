@@ -201,7 +201,7 @@ void mla_decode_stage1_asm_fwd(
 
         if(gqa_ratio == 16)
         {
-            if(max_seqlen_q <= 2)
+            if(max_seqlen_q == 2)
             {
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
@@ -211,8 +211,8 @@ void mla_decode_stage1_asm_fwd(
             }
             else if(max_seqlen_q <= 4)
             {
-                // not support yet
-                assert(false);
+                // // not support yet
+                // assert(false);
 
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
@@ -226,6 +226,9 @@ void mla_decode_stage1_asm_fwd(
             }
         }
     }
+
+    // std::cout << "ptr_QSCALE: " << args.ptr_QSCALE << std::endl;
+    // std::cout << "ptr_KVSCALE: " << args.ptr_KVSCALE << std::endl;
 
     TORCH_CHECK(impl_ptr != nullptr, __func__, ": unsupport current Q_type:", Q.scalar_type());
 

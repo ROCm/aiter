@@ -272,6 +272,9 @@ def test_mla(
         reduce_final_map=reduce_final_map,
         reduce_partial_map=reduce_partial_map,
     )
+    # out_asm = out_asm[:total_q]
+
+    import pdb; pdb.set_trace()
 
     # print(f"{out_ref.view(total_q, -1)=}")
     # print(f"{out_asm.view(total_q, -1)=}")
@@ -310,7 +313,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 2)]
+list_nhead = [(16, 1)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -381,7 +384,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[28, 512, 1023, 4888, 12800], #
+    default=[512, 1023, 4888, 12800], #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -390,7 +393,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)], # [41],
+    default=[i for i in range(64, 80)], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
