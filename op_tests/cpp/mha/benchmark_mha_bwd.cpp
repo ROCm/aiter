@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include "mha_bwd.h"
 #include "ck_tile/host.hpp"
+#include "mha_bwd.h"
 #include "utils.hpp"
 
 #include <array>
@@ -95,7 +95,7 @@ auto create_args(int argc, char* argv[])
                 "will not be used")
         .insert("bwd_v3", "0", "if set to 1, some cases will call the bwd v3 dqdkdv kernel")
         .insert(
-            "v3_atomic_fp32",
+            "atomic_fp32",
             "1",
             "if set to 0 will use atomic fp16/bf16(w/o convert_dq kernel) when bwd_v3 is set to 1")
         .insert("v3_bf16_cvt",
@@ -126,6 +126,18 @@ auto get_elimit<FmhaBwdBf16>(ck_tile::index_t hdim_q, ck_tile::index_t hdim_v)
         atol = 3.2e-2;
     }
     return ck_tile::make_tuple(rtol, atol);
+}
+
+ck_tile::index_t get_bit_ceil(const ck_tile::index_t& dim_value)
+{
+    unsigned un = static_cast<unsigned>(dim_value);
+    un |= un >> 1;
+    un |= un >> 2;
+    un |= un >> 4;
+    un |= un >> 8;
+    un |= un >> 16;
+    un++;
+    return static_cast<ck_tile::index_t>(un);
 }
 
 template <typename DataTypeConfig>
@@ -200,13 +212,15 @@ bool run(const ck_tile::ArgParser& arg_parser)
         seed.reset();
     }
 
-    int stream_warmup   = arg_parser.get_int("warmup");
-    int stream_repeat   = arg_parser.get_int("repeat");
-    bool kname          = arg_parser.get_bool("kname");
-    bool deterministic  = arg_parser.get_bool("deterministic");
-    bool bwd_v3         = arg_parser.get_bool("bwd_v3");
-    bool v3_atomic_fp32 = arg_parser.get_bool("v3_atomic_fp32");
-    int v3_bf16_cvt     = arg_parser.get_int("v3_bf16_cvt");
+    int stream_warmup  = arg_parser.get_int("warmup");
+    int stream_repeat  = arg_parser.get_int("repeat");
+    bool kname         = arg_parser.get_bool("kname");
+    bool deterministic = arg_parser.get_bool("deterministic");
+    bool bwd_v3        = arg_parser.get_bool("bwd_v3");
+    bool atomic_fp32   = arg_parser.get_bool("atomic_fp32");
+    int v3_bf16_cvt    = arg_parser.get_int("v3_bf16_cvt");
+
+    bool ck_atomic_fp16 = !(bwd_v3 || atomic_fp32);
 
     ck_tile::stream_config stream_config{nullptr,
                                          true,
@@ -286,12 +300,27 @@ bool run(const ck_tile::ArgParser& arg_parser)
             return std::array<ck_tile::index_t, 4>{b, s, h, d};
     };
 
+    // for dq_acc padding in ck atomic b16
+    constexpr ck_tile::index_t seqlen_dq_acc_tile_size = 16;
+    const ck_tile::index_t hdim_q_pad                  = ck_tile::max(get_bit_ceil(hdim_q), 32);
+    const ck_tile::index_t hdim_q_dq_acc               = ck_atomic_fp16 ? hdim_q_pad : hdim_q;
+    const ck_tile::index_t max_seqlen_q_aligned =
+        ck_tile::integer_least_multiple(max_seqlen_q, seqlen_dq_acc_tile_size);
+
     // host memory for storing all the tensor elements
     const ck_tile::index_t shape_batch = (mode == mode_enum::batch ? batch : 1);
     const ck_tile::index_t shape_seqlen_q =
         (mode == mode_enum::batch ? seqlen_q : seqstart_q_host.back());
     const ck_tile::index_t shape_seqlen_k =
         (mode == mode_enum::batch ? seqlen_k : seqstart_k_host.back());
+    const ck_tile::index_t shape_seqlen_dq_acc_batch_mode =
+        ck_atomic_fp16 ? ck_tile::integer_least_multiple(seqlen_q, seqlen_dq_acc_tile_size)
+                       : seqlen_q;
+    const ck_tile::index_t shape_seqlen_dq_acc_group_mode =
+        ck_atomic_fp16 ? max_seqlen_q_aligned * batch : seqstart_q_host.back();
+    const ck_tile::index_t shape_seqlen_dq_acc =
+        (mode == mode_enum::batch ? shape_seqlen_dq_acc_batch_mode
+                                  : shape_seqlen_dq_acc_group_mode);
     const ck_tile::index_t kN0 = (hdim_q <= 128) ? 128 : 64;
     const ck_tile::index_t nsplits =
         deterministic ? ck_tile::integer_divide_ceil(max_seqlen_k, kN0) : 1;
@@ -332,8 +361,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
         use_dbias
             ? get_lengths(i_perm, shape_batch, nhead, shape_seqlen_q, max_seqlen_k)
             : std::array<ck_tile::index_t, 4>{1, 1, 1, 1} /* dummy shape for simplifying code */);
-    ck_tile::HostTensor<AccDataType> dq_acc_host(
-        std::array<ck_tile::index_t, 5>{nsplits, shape_batch, nhead, shape_seqlen_q, hdim_q});
+    ck_tile::HostTensor<AccDataType> dq_acc_host(std::array<ck_tile::index_t, 5>{
+        nsplits, shape_batch, nhead, shape_seqlen_dq_acc, hdim_q_dq_acc});
 
     if(init_method == 0)
     {
@@ -439,7 +468,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                   << " MByte memory workspace allocated" << std::endl;
     }
 
-    auto fmha_args   = [&]() {
+    auto fmha_args = [&]() {
         assert(nhead % nhead_k == 0);
         /// NOTE: we broadcast bias from [1, 1, seqlen_q, seqlen_k] to [batch, nhead, seqlen_q,
         ///       seqlen_k] in this example, hence both the 'batch_stride_bias' &
@@ -452,7 +481,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t stride_o       = (o_perm ? hdim_v : nhead * hdim_v);
         const ck_tile::index_t stride_randval = (max_seqlen_k);
         const ck_tile::index_t stride_do      = (o_perm ? hdim_v : nhead * hdim_v);
-        const ck_tile::index_t stride_dq_acc  = hdim_q;
+        const ck_tile::index_t stride_dq_acc  = hdim_q_dq_acc;
         const ck_tile::index_t stride_dk      = (i_perm ? hdim_q : nhead * hdim_q);
         const ck_tile::index_t stride_dv      = (i_perm ? hdim_v : nhead * hdim_v);
         const ck_tile::index_t stride_dbias   = (i_perm ? max_seqlen_k : nhead * max_seqlen_k);
@@ -465,7 +494,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t nhead_stride_randval = (shape_seqlen_q * max_seqlen_k);
         const ck_tile::index_t nhead_stride_do      = (o_perm ? shape_seqlen_q * hdim_v : hdim_v);
         const ck_tile::index_t nhead_stride_lsed    = shape_seqlen_q;
-        const ck_tile::index_t nhead_stride_dq_acc  = shape_seqlen_q * hdim_q;
+        const ck_tile::index_t nhead_stride_dq_acc  = shape_seqlen_dq_acc * hdim_q_dq_acc;
         const ck_tile::index_t nhead_stride_dbias =
             (i_perm ? shape_seqlen_q * max_seqlen_k : max_seqlen_k);
         // setup batch_stride_* arguments
@@ -480,8 +509,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
         const ck_tile::index_t batch_stride_dk      = (nhead * shape_seqlen_k * hdim_q);
         const ck_tile::index_t batch_stride_dv      = (nhead * shape_seqlen_k * hdim_v);
         const ck_tile::index_t batch_stride_dbias   = (nhead * shape_seqlen_q * max_seqlen_k);
+        const ck_tile::index_t batch_stride_dq_acc  = (nhead * shape_seqlen_dq_acc * hdim_q_dq_acc);
         const ck_tile::index_t split_stride_dq_acc =
-            (shape_batch * nhead * shape_seqlen_q * hdim_q);
+            (shape_batch * nhead * shape_seqlen_dq_acc * hdim_q_dq_acc);
 
         const auto drop_seed_offset = [&]() -> decltype(fmha_bwd_args::drop_seed_offset) {
             if(drop_prefs)
@@ -499,7 +529,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              k_buf.GetDeviceBuffer(),
                              v_buf.GetDeviceBuffer(),
                              bias.type == bias_enum::alibi ? alibi_slope_buf.GetDeviceBuffer()
-                                                             : bias_buf.GetDeviceBuffer(),
+                                                           : bias_buf.GetDeviceBuffer(),
                              o_buf.GetDeviceBuffer(),
                              lse_buf.GetDeviceBuffer(),
                              do_buf.GetDeviceBuffer(),
@@ -518,6 +548,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              batch,
                              max_seqlen_q,
                              max_seqlen_k,
+                             max_seqlen_q_aligned,
                              hdim_q,
                              hdim_v,
                              nhead,
@@ -527,7 +558,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              stride_k,
                              stride_v,
                              bias.type == bias_enum::alibi ? (bias.rank_info == 0 ? 0 : nhead)
-                                                             : stride_bias,
+                                                           : stride_bias,
                              stride_o,
                              stride_randval,
                              stride_do,
@@ -557,8 +588,8 @@ bool run(const ck_tile::ArgParser& arg_parser)
                              batch_stride_randval,
                              batch_stride_do,
                              batch_stride_lsed,
-                             batch_stride_q, // batch_stride_dq_acc
-                             batch_stride_q, // batch_stride_dq
+                             batch_stride_dq_acc, // batch_stride_dq_acc
+                             batch_stride_q,      // batch_stride_dq
                              batch_stride_dk,
                              batch_stride_dv,
                              batch_stride_dbias,
@@ -581,7 +612,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                                     s_randval,
                                     deterministic,
                                     bwd_v3,
-                                    v3_atomic_fp32,
+                                    atomic_fp32,
                                     v3_bf16_cvt);
     if(ave_time < 0)
     {
@@ -829,7 +860,7 @@ bool run(const ck_tile::ArgParser& arg_parser)
                    s_randval,
                    deterministic,
                    bwd_v3,
-                   v3_atomic_fp32,
+                   atomic_fp32,
                    v3_bf16_cvt);
 
     dq_buf.FromDevice(dq_host.data());

@@ -475,6 +475,7 @@
           py::arg("window_size_left"),            \
           py::arg("window_size_right"),           \
           py::arg("deterministic"),               \
+          py::arg("is_atomic_fp32"),              \
           py::arg("dq")           = std::nullopt, \
           py::arg("dk")           = std::nullopt, \
           py::arg("dv")           = std::nullopt, \
@@ -540,6 +541,7 @@
           py::arg("window_size_left"),            \
           py::arg("window_size_right"),           \
           py::arg("deterministic"),               \
+          py::arg("is_atomic_fp32"),              \
           py::arg("dq")           = std::nullopt, \
           py::arg("dk")           = std::nullopt, \
           py::arg("dv")           = std::nullopt, \
