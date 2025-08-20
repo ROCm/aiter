@@ -67,8 +67,8 @@ get_configs_for_dhead() {
     fi
 }
 MAPPING_MODES=(
-#    "0:true"   # aiter_fa with remap
-#    "0:false"  # aiter_fa without remap
+    "0:true"   # aiter_fa with remap
+    "0:false"  # aiter_fa without remap
     "1:false"  # head_first without remap
 #    "2:false"  # triton_fa without remap
 )
