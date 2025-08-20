@@ -559,6 +559,7 @@ def cmdGenFunc_mha_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
+    is_atomic_fp32: bool,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
@@ -613,10 +614,14 @@ def cmdGenFunc_mha_bwd(
         md_name += "_deterministic"
         filter2 += "_deterministic*"
         filter3 += "_deterministic*"
+    elif is_atomic_fp32:
+        md_name += "_atomic32"
+        filter2 += "_atomic32*"
+        filter3 += "_atomic32*"
     else:
-        md_name += "_ndeterministic"
-        filter2 += "_ndeterministic*"
-        filter3 += "_ndeterministic*"
+        md_name += "_atomic16"
+        filter2 += "_atomic16*"
+        filter3 += "_atomic16*"
 
     filter = f"{filter1}@{filter2}@{filter3}"
 
@@ -708,6 +713,7 @@ def gen_mha_bwd_fake_tensors(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
+    is_atomic_fp32: bool,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
@@ -739,6 +745,7 @@ def mha_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
+    is_atomic_fp32: bool,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
@@ -820,6 +827,7 @@ def cmdGenFunc_mha_varlen_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
+    is_atomic_fp32: bool,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
@@ -863,10 +871,14 @@ def cmdGenFunc_mha_varlen_bwd(
         md_name += "_deterministic"
         filter2 += "_deterministic*"
         filter3 += "_deterministic*"
+    elif is_atomic_fp32:
+        md_name += "_atomic32"
+        filter2 += "_atomic32*"
+        filter3 += "_atomic32*"
     else:
-        md_name += "_ndeterministic"
-        filter2 += "_ndeterministic*"
-        filter3 += "_ndeterministic*"
+        md_name += "_atomic16"
+        filter2 += "_atomic16*"
+        filter3 += "_atomic16*"
     filter = f"{filter1}@{filter2}@{filter3}"
 
     blob_gen_cmd = [
@@ -981,6 +993,7 @@ def mha_varlen_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
+    is_atomic_fp32: bool,
     dq: Optional[Tensor] = None,
     dk: Optional[Tensor] = None,
     dv: Optional[Tensor] = None,
@@ -1350,7 +1363,7 @@ def _flash_attn_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
+    is_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
 ) -> torch.Tensor:
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
@@ -1374,7 +1387,7 @@ def _flash_attn_backward(
         bias,
         alibi_slopes,
         deterministic,
-        is_v3_atomic_fp32,
+        is_atomic_fp32,
     )
 
     # dq, dk, dv are allocated by us so they should already be contiguous
@@ -1398,7 +1411,7 @@ def _flash_attn_backward(
             window_size_left,
             window_size_right,
             deterministic,
-            is_v3_atomic_fp32,
+            is_atomic_fp32,
             how_v3_bf16_cvt,
             dq,
             dk,
@@ -1426,6 +1439,7 @@ def _flash_attn_backward(
             window_size_left,
             window_size_right,
             deterministic,
+            is_atomic_fp32,
             dq,
             dk,
             dv,
@@ -1456,7 +1470,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -1494,7 +1508,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
             ctx.head_size_q_og = head_size_q_og
-            ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
+            ctx.is_atomic_fp32 = is_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
         out = out_padded[..., :head_size_v_og]
 
@@ -1537,7 +1551,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state,
-            ctx.is_v3_atomic_fp32,
+            ctx.is_atomic_fp32,
             ctx.how_v3_bf16_cvt,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
@@ -1761,7 +1775,7 @@ def _flash_attn_varlen_backward(
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
+    is_atomic_fp32: Optional[bool] = True,
     how_v3_bf16_cvt: Optional[int] = 1,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
@@ -1801,7 +1815,7 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_fp16_a32_pssk_group
         # bwd_hd128_fp16_causal_a32_pssk_group
         ret = (
-            is_v3_atomic_fp32 == True
+            is_atomic_fp32 == True
         )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q == 64 or hdim_q == 128
         ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
@@ -1818,7 +1832,7 @@ def _flash_attn_varlen_backward(
         # bwd_hd128_fp16_a32_psskddv_group
         # bwd_hd128_fp16_causal_a32_psskddv_group
         ret = (
-            is_v3_atomic_fp32 == True
+            is_atomic_fp32 == True
         )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
         ret &= hdim_q >= 64 and hdim_q <= 192
         ret &= nmask  # TODO: or (mask and mask_type == mask_enum::mask_top_left)
@@ -1868,7 +1882,7 @@ def _flash_attn_varlen_backward(
             window_size_left,
             window_size_right,
             deterministic,
-            is_v3_atomic_fp32,
+            is_atomic_fp32,
             how_v3_bf16_cvt,
             dq,
             dk,
@@ -1901,6 +1915,7 @@ def _flash_attn_varlen_backward(
             window_size_left,
             window_size_right,
             deterministic,
+            is_atomic_fp32,
             dq,
             dk,
             dv,
@@ -1937,7 +1952,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         out,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
+        is_atomic_fp32: Optional[bool] = True,
         how_v3_bf16_cvt: Optional[int] = 1,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -1988,7 +2003,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
             ctx.head_size_q_og = head_size_q_og
-            ctx.is_v3_atomic_fp32 = is_v3_atomic_fp32
+            ctx.is_atomic_fp32 = is_atomic_fp32
             ctx.how_v3_bf16_cvt = how_v3_bf16_cvt
 
         out = out_padded[..., :head_size_v_og]
@@ -2044,7 +2059,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state=rng_state,
-            is_v3_atomic_fp32=ctx.is_v3_atomic_fp32,
+            is_atomic_fp32=ctx.is_atomic_fp32,
             how_v3_bf16_cvt=ctx.how_v3_bf16_cvt,
         )
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
