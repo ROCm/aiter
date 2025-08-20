@@ -17,6 +17,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 
 
@@ -85,7 +86,7 @@ def run_benchmark(args, defaults):
 
 
 def run_model_benchmark(args):
-    benchmark = get_model_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(M, hidden_dim, intermediate_dim, metric, layer, **kwargs):
@@ -107,7 +108,7 @@ def run_model_benchmark(args):
 
 
 def run_shape_benchmark(args):
-    benchmark = get_shape_benchmark_object("GEMM MXFP4 x MXFP4 Benchmark", args)
+    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
 
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4(M, N, K, metric, **kwargs):
@@ -127,7 +128,7 @@ def main():
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
-        print_vgpr(fun, "GEMM")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)
 
