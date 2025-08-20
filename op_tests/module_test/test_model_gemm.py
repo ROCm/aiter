@@ -106,9 +106,20 @@ class FusedmoeTestRunner:
     def calculate_throughput(self, m, n, k, latency):
         throughput = 2 * m * n * k / 1e6 / latency # TFlops
         return throughput
-
+    
     def calculate_bandwidth(self, m, n, k, latency, in_dtype, wei_dtype, out_dtype):
-        bandwidth = (m * k * sys.getsizeof(in_dtype) + k * n * sys.getsizeof(wei_dtype) + m * n * sys.getsizeof(out_dtype)) / latency / 1e6
+        typesize = {
+            dtypes.d_dtypes["fp4x2"] : 0.5,
+            dtypes.d_dtypes["fp8"] : 1,
+            dtypes.d_dtypes["bf16"] : 2,
+        }
+        print("in_dtype={}".format(in_dtype))
+        print("wei_dtype={}".format(wei_dtype))
+        print("out_dtype={}".format(out_dtype))
+        print("----insize={}".format(typesize[in_dtype]))
+        print("----weisize={}".format(typesize[wei_dtype]))
+        print("----outsize={}".format(typesize[out_dtype]))
+        bandwidth = (m * k * typesize[in_dtype] + k * n * typesize[wei_dtype] + m * n * typesize[out_dtype]) / latency / 1e6
         return bandwidth
 
     def benchmark_gemm(self, l_dtype, l_quantDtype, records):
