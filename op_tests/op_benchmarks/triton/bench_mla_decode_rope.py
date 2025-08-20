@@ -2,6 +2,7 @@ import triton
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 import torch
 import sys
@@ -93,7 +94,6 @@ def create_benchmark_configs(args: argparse.Namespace):
     x_names = ["BATCH", "H", "S", "kv_lora_rank", "qk_rope_head_dim", "rotary_dim"]
 
     configs = []
-    plot_name = "MLA-decode-RoPE"
     extra_args = {
         "dtype": dtype,
         "use_rope": not args.no_rope,
@@ -102,7 +102,6 @@ def create_benchmark_configs(args: argparse.Namespace):
 
     if args.model:
         x_vals_list = model_benchmark_configs(args)
-        plot_name += f"-{args.model}"
     else:
         x_vals_list = nonvarlen_benchmark_configs(args)
 
@@ -125,7 +124,7 @@ def create_benchmark_configs(args: argparse.Namespace):
             line_names=line_vals,
             styles=[("red", "-"), ("green", "-"), ("yellow", "-")],
             ylabel=unit,
-            plot_name=plot_name,
+            plot_name=get_caller_name_no_ext(),
             args=extra_args,
         )
     )
@@ -163,7 +162,7 @@ def run_benchmark(args: argparse.Namespace):
         Right now q_heads == kv_heads).
         """
 
-        kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions = (
+        kv_indptr, kv_indices, q, kv_cache, attn_logits, rotary_emb, positions, _ = (
             input_helper(
                 BATCH,
                 H,
@@ -348,10 +347,7 @@ def main():
         def fun():
             return run_benchmark(args)
 
-        plot_name = "MLA-decode-RoPE"
-        if args.model:
-            plot_name += f"-{args.model}"
-        print_vgpr(fun, plot_name)
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
 
     # print(args)
