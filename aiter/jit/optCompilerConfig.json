@@ -622,10 +622,10 @@
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/fmha_v3_fwd_ck_kernels.cu'",
             "f'{CK_DIR}/example/ck_tile/40_fmha_v3/fmha_fwd_v3.cpp'",
-            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_bf16_mask.cu'",
-            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_bf16_nmask.cu'",
-            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_fp16_mask.cu'",
-            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_fp16_nmask.cu'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_bf16_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_bf16_nmask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_fp16_mask.cpp'",
+            "f'{CK_DIR}/example/ck_tile/40_fmha_v3/instances/fmha_fwd_v3_d128_fp16_nmask.cpp'",
             "f'{AITER_CSRC_DIR}/pybind/fmha_v3_fwd_ck_pybind.cu'"
         ],
         "flags_extra_cc": [],
