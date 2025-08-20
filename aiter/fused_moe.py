@@ -118,7 +118,7 @@ def fused_moe(
     q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
 
     metadata = get_2stage_cfgs(
-        min(1024, M),  # consider token_num > 1024 as prefill
+        get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -345,6 +345,23 @@ fused_moe_1stage_dict = {
 quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
 
 
+def nextPow2(n):
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def get_padded_M(M):
+    padded_m = M
+    if M >= 1 and M <= 16:
+        padded_m = 16
+    elif M < 1024:
+        padded_m = nextPow2(padded_m)
+    else:
+        padded_m = 1024
+    return padded_m
+
+
 @dataclass
 class MOEMetadata:
     stage1: Callable
@@ -375,6 +392,7 @@ def get_2stage_cfgs(
         cfg_2stages = pd.read_csv(tune_file)
         cfg_2stages = cfg_2stages.set_index(
             [
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
@@ -399,6 +417,7 @@ def get_2stage_cfgs(
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
     keys = (
+        get_cu_num(),
         token,
         model_dim,
         inter_dim,
@@ -562,7 +581,7 @@ def fused_moe_2stages(
     device = hidden_states.device
 
     metadata = get_2stage_cfgs(
-        min(1024, token_num),  # consider token_num > 1024 as prefill
+        get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,

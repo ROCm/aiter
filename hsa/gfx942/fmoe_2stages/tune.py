@@ -26,6 +26,7 @@ from aiter.int4_utils import (
 )
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
+from aiter.jit.utils.chip_info import get_cu_num
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -505,6 +506,7 @@ def go(
             profileDF.append(
                 [
                     stage,
+                    get_cu_num(),
                     token,
                     model_dim,
                     inter_dim,
@@ -526,7 +528,10 @@ def go(
             )
         profileDF = pd.DataFrame(
             profileDF,
-            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
+            columns=["stage"]
+            + ["cu_num"]
+            + args
+            + ["block_m", "ksplit", "us", "kernelName", "err"],
         )
         prorfiles.append(profileDF)
         profileDF = profileDF.sort_values("us").drop_duplicates(
@@ -548,6 +553,7 @@ def go(
             stage1_profileDF,
             stage2_profileDF,
             on=[
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
@@ -654,6 +660,7 @@ if __name__ == "__main__":
     if tunedf is not None:
         tunedf = tunedf.astype(str).drop_duplicates(
             subset=[
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
