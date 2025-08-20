@@ -25,6 +25,14 @@
 #include <type_traits>
 
 #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
+
+#if defined(__gfx950__)
+#define FP8_E4M3_TYPE __hip_fp8_e4m3_fn
+#define FP8_E5M2_TYPE __hip_fp8_e5m2_fn
+#else
+#define FP8_E4M3_TYPE __hip_fp8_e4m3_fnuz
+#define FP8_E5M2_TYPE __hip_fp8_e5m2_fnuz
+#endif
 /*
 Hacky workaround for the error below:
 
@@ -117,11 +125,11 @@ struct vec_cast<half, float>
 template <typename T>
 constexpr inline __attribute__((always_inline)) __device__ int get_exponent_bits()
 {
-    if constexpr(std::is_same_v<T, __hip_fp8_e4m3_fnuz>)
+    if constexpr(std::is_same_v<T, FP8_E4M3_TYPE>)
     {
         return 4;
     }
-    else if constexpr(std::is_same_v<T, __hip_fp8_e5m2_fnuz>)
+    else if constexpr(std::is_same_v<T, FP8_E5M2_TYPE>)
     {
         return 5;
     }
@@ -138,11 +146,11 @@ constexpr inline __attribute__((always_inline)) __device__ int get_exponent_bits
 template <typename T>
 constexpr inline __attribute__((always_inline)) __device__ int get_mantissa_bits()
 {
-    if constexpr(std::is_same_v<T, __hip_fp8_e4m3_fnuz>)
+    if constexpr(std::is_same_v<T, FP8_E4M3_TYPE>)
     {
         return 3;
     }
-    else if constexpr(std::is_same_v<T, __hip_fp8_e5m2_fnuz>)
+    else if constexpr(std::is_same_v<T, FP8_E5M2_TYPE>)
     {
         return 2;
     }
@@ -168,7 +176,7 @@ template <typename fp8_dtype, typename fp16_dtype>
 __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output)
 {
     uint32_t q = *input;
-    if constexpr(std::is_same_v<fp8_dtype, __hip_fp8_e5m2_fnuz> && std::is_same_v<fp16_dtype, half>)
+    if constexpr(std::is_same_v<fp8_dtype, FP8_E5M2_TYPE> && std::is_same_v<fp16_dtype, half>)
     {
         output->x = __byte_perm(0U, q, 0x5140);
         output->y = __byte_perm(0U, q, 0x7362);
@@ -218,11 +226,11 @@ __device__ void fast_dequant_f8f16x4(uint32_t* input, uint2* output)
 }
 
 template <>
-struct vec_cast<__hip_bfloat16, __hip_fp8_e4m3_fnuz>
+struct vec_cast<__hip_bfloat16, FP8_E4M3_TYPE>
 {
     template <size_t vec_size>
-    inline __attribute__((always_inline)) __device__ static void
-    cast(__hip_bfloat16* dst, const __hip_fp8_e4m3_fnuz* src)
+    inline __attribute__((always_inline)) __device__ static void cast(__hip_bfloat16* dst,
+                                                                      const FP8_E4M3_TYPE* src)
     {
         if constexpr(vec_size == 1)
         {
@@ -239,19 +247,19 @@ struct vec_cast<__hip_bfloat16, __hip_fp8_e4m3_fnuz>
 #pragma unroll
             for(uint32_t i = 0; i < vec_size / 4; ++i)
             {
-                fast_dequant_f8f16x4<__hip_fp8_e4m3_fnuz, __hip_bfloat16>((uint32_t*)&src[i * 4],
-                                                                          (uint2*)&dst[i * 4]);
+                fast_dequant_f8f16x4<FP8_E4M3_TYPE, __hip_bfloat16>((uint32_t*)&src[i * 4],
+                                                                    (uint2*)&dst[i * 4]);
             }
         }
     }
 };
 
 template <>
-struct vec_cast<__hip_bfloat16, __hip_fp8_e5m2_fnuz>
+struct vec_cast<__hip_bfloat16, FP8_E5M2_TYPE>
 {
     template <size_t vec_size>
-    inline __attribute__((always_inline)) __device__ static void
-    cast(__hip_bfloat16* dst, const __hip_fp8_e5m2_fnuz* src)
+    inline __attribute__((always_inline)) __device__ static void cast(__hip_bfloat16* dst,
+                                                                      const FP8_E5M2_TYPE* src)
     {
         if constexpr(vec_size == 1)
         {
@@ -268,8 +276,8 @@ struct vec_cast<__hip_bfloat16, __hip_fp8_e5m2_fnuz>
 #pragma unroll
             for(uint32_t i = 0; i < vec_size / 4; ++i)
             {
-                fast_dequant_f8f16x4<__hip_fp8_e5m2_fnuz, __hip_bfloat16>((uint32_t*)&src[i * 4],
-                                                                          (uint2*)&dst[i * 4]);
+                fast_dequant_f8f16x4<FP8_E5M2_TYPE, __hip_bfloat16>((uint32_t*)&src[i * 4],
+                                                                    (uint2*)&dst[i * 4]);
             }
         }
     }
@@ -336,16 +344,16 @@ __device__ uint16_t convert_f16x2_to_e4m3x2(__half2 x)
 #endif
 
 template <>
-struct vec_cast<__hip_fp8_e4m3_fnuz, half>
+struct vec_cast<FP8_E4M3_TYPE, half>
 {
     template <size_t vec_size>
-    inline __attribute__((always_inline)) __device__ static void cast(__hip_fp8_e4m3_fnuz* dst,
+    inline __attribute__((always_inline)) __device__ static void cast(FP8_E4M3_TYPE* dst,
                                                                       const half* src)
     {
 #ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
         if constexpr(vec_size == 1)
         {
-            dst[0] = __hip_fp8_e4m3_fnuz(src[0]);
+            dst[0] = FP8_E4M3_TYPE(src[0]);
         }
         else
         {
@@ -363,7 +371,7 @@ struct vec_cast<__hip_fp8_e4m3_fnuz, half>
 #pragma unroll
         for(size_t i = 0; i < vec_size; ++i)
         {
-            dst[i] = __hip_fp8_e4m3_fnuz(src[i]);
+            dst[i] = FP8_E4M3_TYPE(src[i]);
         }
 #endif // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     }
@@ -418,16 +426,16 @@ __device__ uint16_t convert_f16x2_to_e5m2x2(uint32_t x)
 #endif
 
 template <>
-struct vec_cast<__hip_fp8_e5m2_fnuz, half>
+struct vec_cast<FP8_E5M2_TYPE, half>
 {
     template <size_t vec_size>
-    inline __attribute__((always_inline)) __device__ static void cast(__hip_fp8_e5m2_fnuz* dst,
+    inline __attribute__((always_inline)) __device__ static void cast(FP8_E5M2_TYPE* dst,
                                                                       const half* src)
     {
 #ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
         if constexpr(vec_size == 1)
         {
-            dst[0] = __hip_fp8_e5m2_fnuz(src[0]);
+            dst[0] = FP8_E5M2_TYPE(src[0]);
         }
         else
         {
@@ -444,7 +452,7 @@ struct vec_cast<__hip_fp8_e5m2_fnuz, half>
 #pragma unroll
         for(size_t i = 0; i < vec_size; ++i)
         {
-            dst[i] = __hip_fp8_e5m2_fnuz(src[i]);
+            dst[i] = FP8_E5M2_TYPE(src[i]);
         }
 #endif // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
     }
@@ -489,11 +497,11 @@ __device__ uint32_t convert_e4m3x2_to_f16x2(uint16_t x)
 #endif
 
 template <>
-struct vec_cast<half, __hip_fp8_e4m3_fnuz>
+struct vec_cast<half, FP8_E4M3_TYPE>
 {
     template <size_t vec_size>
-    inline __attribute__((always_inline)) __device__ static void
-    cast(half* dst, const __hip_fp8_e4m3_fnuz* src)
+    inline __attribute__((always_inline)) __device__ static void cast(half* dst,
+                                                                      const FP8_E4M3_TYPE* src)
     {
 #ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
         if constexpr(vec_size == 1)
@@ -527,8 +535,8 @@ struct vec_cast<half, __hip_fp8_e4m3_fnuz>
 #pragma unroll
             for(uint32_t i = 0; i < vec_size / 4; ++i)
             {
-                fast_dequant_f8f16x4<__hip_fp8_e4m3_fnuz, half>((uint32_t*)&src[i * 4],
-                                                                (uint2*)&dst[i * 4]);
+                fast_dequant_f8f16x4<FP8_E4M3_TYPE, half>((uint32_t*)&src[i * 4],
+                                                          (uint2*)&dst[i * 4]);
             }
         }
 #endif // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
@@ -574,11 +582,11 @@ __device__ uint32_t convert_e5m2x2_to_f16x2(uint16_t x)
 #endif
 
 template <>
-struct vec_cast<half, __hip_fp8_e5m2_fnuz>
+struct vec_cast<half, FP8_E5M2_TYPE>
 {
     template <size_t vec_size>
-    inline __attribute__((always_inline)) __device__ static void
-    cast(half* dst, const __hip_fp8_e5m2_fnuz* src)
+    inline __attribute__((always_inline)) __device__ static void cast(half* dst,
+                                                                      const FP8_E5M2_TYPE* src)
     {
 #ifdef FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
         if constexpr(vec_size == 1)
@@ -612,8 +620,8 @@ struct vec_cast<half, __hip_fp8_e5m2_fnuz>
 #pragma unroll
             for(uint32_t i = 0; i < vec_size / 4; ++i)
             {
-                fast_dequant_f8f16x4<__hip_fp8_e5m2_fnuz, half>((uint32_t*)&src[i * 4],
-                                                                (uint2*)&dst[i * 4]);
+                fast_dequant_f8f16x4<FP8_E5M2_TYPE, half>((uint32_t*)&src[i * 4],
+                                                          (uint2*)&dst[i * 4]);
             }
         }
 #endif // FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED
@@ -731,30 +739,29 @@ cast_store_impl(tgt_float_t* dst_ptr, const vec_t<src_float_t, vec_size>& src)
     }
 }
 
-/******************* vec_t<__hip_fp8_e4m3_fnuz> *******************/
+/******************* vec_t<FP8_E4M3_TYPE> *******************/
 
-// __hip_fp8_e4m3_fnuz x 1
+// FP8_E4M3_TYPE x 1
 template <>
-struct vec_t<__hip_fp8_e4m3_fnuz, 1>
+struct vec_t<FP8_E4M3_TYPE, 1>
 {
-    __hip_fp8_e4m3_fnuz data;
+    FP8_E4M3_TYPE data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e4m3_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E4M3_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((const FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e4m3_fnuz*>(&data);
+        return reinterpret_cast<FP8_E4M3_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e4m3_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e4m3_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e4m3_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E4M3_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E4M3_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E4M3_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 1>& src)
     {
@@ -771,56 +778,55 @@ struct vec_t<__hip_fp8_e4m3_fnuz, 1>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E4M3_TYPE* dst,
+                                                                        const FP8_E4M3_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 1>::fill(__hip_fp8_e4m3_fnuz val)
+vec_t<FP8_E4M3_TYPE, 1>::fill(FP8_E4M3_TYPE val)
 {
     data = val;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 1>::load(const __hip_fp8_e4m3_fnuz* ptr)
+vec_t<FP8_E4M3_TYPE, 1>::load(const FP8_E4M3_TYPE* ptr)
 {
     data = *ptr;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 1>::store(__hip_fp8_e4m3_fnuz* ptr) const
+vec_t<FP8_E4M3_TYPE, 1>::store(FP8_E4M3_TYPE* ptr) const
 {
     *ptr = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 1>::memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src)
+vec_t<FP8_E4M3_TYPE, 1>::memcpy(FP8_E4M3_TYPE* dst, const FP8_E4M3_TYPE* src)
 {
     *dst = *src;
 }
 
-// __hip_fp8_e4m3_fnuz x 2
+// FP8_E4M3_TYPE x 2
 template <>
-struct vec_t<__hip_fp8_e4m3_fnuz, 2>
+struct vec_t<FP8_E4M3_TYPE, 2>
 {
     __hip_fp8x2_e4m3_fnuz data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e4m3_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E4M3_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((const FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e4m3_fnuz*>(&data);
+        return reinterpret_cast<FP8_E4M3_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e4m3_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e4m3_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e4m3_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E4M3_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E4M3_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E4M3_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 2>& src)
     {
@@ -836,57 +842,56 @@ struct vec_t<__hip_fp8_e4m3_fnuz, 2>
     {
         cast_store_impl(ptr, *this);
     }
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E4M3_TYPE* dst,
+                                                                        const FP8_E4M3_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 2>::fill(__hip_fp8_e4m3_fnuz val)
+vec_t<FP8_E4M3_TYPE, 2>::fill(FP8_E4M3_TYPE val)
 {
     data.__x = (__hip_fp8x2_storage_t(val.__x) << 8) | __hip_fp8x2_storage_t(val.__x);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 2>::load(const __hip_fp8_e4m3_fnuz* ptr)
+vec_t<FP8_E4M3_TYPE, 2>::load(const FP8_E4M3_TYPE* ptr)
 {
     data = *((__hip_fp8x2_e4m3_fnuz*)ptr);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 2>::store(__hip_fp8_e4m3_fnuz* ptr) const
+vec_t<FP8_E4M3_TYPE, 2>::store(FP8_E4M3_TYPE* ptr) const
 {
     *((__hip_fp8x2_e4m3_fnuz*)ptr) = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 2>::memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src)
+vec_t<FP8_E4M3_TYPE, 2>::memcpy(FP8_E4M3_TYPE* dst, const FP8_E4M3_TYPE* src)
 {
     *((__hip_fp8x2_e4m3_fnuz*)dst) = *((__hip_fp8x2_e4m3_fnuz*)src);
 }
 
-// __hip_fp8_e4m3_fnuz x 4
+// FP8_E4M3_TYPE x 4
 
 template <>
-struct vec_t<__hip_fp8_e4m3_fnuz, 4>
+struct vec_t<FP8_E4M3_TYPE, 4>
 {
     __hip_fp8x4_e4m3_fnuz data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e4m3_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E4M3_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((const FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e4m3_fnuz*>(&data);
+        return reinterpret_cast<FP8_E4M3_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e4m3_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e4m3_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e4m3_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E4M3_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E4M3_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E4M3_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 4>& src)
     {
@@ -903,58 +908,57 @@ struct vec_t<__hip_fp8_e4m3_fnuz, 4>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E4M3_TYPE* dst,
+                                                                        const FP8_E4M3_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 4>::fill(__hip_fp8_e4m3_fnuz val)
+vec_t<FP8_E4M3_TYPE, 4>::fill(FP8_E4M3_TYPE val)
 {
     data.__x = (__hip_fp8x4_storage_t(val.__x) << 24) | (__hip_fp8x4_storage_t(val.__x) << 16) |
                (__hip_fp8x4_storage_t(val.__x) << 8) | __hip_fp8x4_storage_t(val.__x);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 4>::load(const __hip_fp8_e4m3_fnuz* ptr)
+vec_t<FP8_E4M3_TYPE, 4>::load(const FP8_E4M3_TYPE* ptr)
 {
     data = *((__hip_fp8x4_e4m3_fnuz*)ptr);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 4>::store(__hip_fp8_e4m3_fnuz* ptr) const
+vec_t<FP8_E4M3_TYPE, 4>::store(FP8_E4M3_TYPE* ptr) const
 {
     *((__hip_fp8x4_e4m3_fnuz*)ptr) = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 4>::memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src)
+vec_t<FP8_E4M3_TYPE, 4>::memcpy(FP8_E4M3_TYPE* dst, const FP8_E4M3_TYPE* src)
 {
     *((__hip_fp8x4_e4m3_fnuz*)dst) = *((__hip_fp8x4_e4m3_fnuz*)src);
 }
 
-// __hip_fp8_e4m3_fnuz x 8
+// FP8_E4M3_TYPE x 8
 
 template <>
-struct vec_t<__hip_fp8_e4m3_fnuz, 8>
+struct vec_t<FP8_E4M3_TYPE, 8>
 {
     uint2 data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e4m3_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E4M3_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e4m3_fnuz*)(&data))[i];
+        return ((const FP8_E4M3_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e4m3_fnuz*>(&data);
+        return reinterpret_cast<FP8_E4M3_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e4m3_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e4m3_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e4m3_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E4M3_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E4M3_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E4M3_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 8>& src)
     {
@@ -971,12 +975,12 @@ struct vec_t<__hip_fp8_e4m3_fnuz, 8>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E4M3_TYPE* dst,
+                                                                        const FP8_E4M3_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 8>::fill(__hip_fp8_e4m3_fnuz val)
+vec_t<FP8_E4M3_TYPE, 8>::fill(FP8_E4M3_TYPE val)
 {
     ((__hip_fp8x4_e4m3_fnuz*)(&data.x))->__x =
         (__hip_fp8x4_storage_t(val.__x) << 24) | (__hip_fp8x4_storage_t(val.__x) << 16) |
@@ -987,43 +991,42 @@ vec_t<__hip_fp8_e4m3_fnuz, 8>::fill(__hip_fp8_e4m3_fnuz val)
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 8>::load(const __hip_fp8_e4m3_fnuz* ptr)
+vec_t<FP8_E4M3_TYPE, 8>::load(const FP8_E4M3_TYPE* ptr)
 {
     data = *((uint2*)ptr);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 8>::store(__hip_fp8_e4m3_fnuz* ptr) const
+vec_t<FP8_E4M3_TYPE, 8>::store(FP8_E4M3_TYPE* ptr) const
 {
     *((uint2*)ptr) = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e4m3_fnuz, 8>::memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src)
+vec_t<FP8_E4M3_TYPE, 8>::memcpy(FP8_E4M3_TYPE* dst, const FP8_E4M3_TYPE* src)
 {
     *((uint2*)dst) = *((uint2*)src);
 }
 
-// __hip_fp8_e4m3_fnuz x 16 or more
+// FP8_E4M3_TYPE x 16 or more
 template <size_t vec_size>
-struct vec_t<__hip_fp8_e4m3_fnuz, vec_size>
+struct vec_t<FP8_E4M3_TYPE, vec_size>
 {
     uint4 data[vec_size / 16];
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e4m3_fnuz*)data)[i];
+        return ((FP8_E4M3_TYPE*)data)[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e4m3_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E4M3_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e4m3_fnuz*)data)[i];
+        return ((const FP8_E4M3_TYPE*)data)[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e4m3_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E4M3_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e4m3_fnuz*>(&data);
+        return reinterpret_cast<FP8_E4M3_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e4m3_fnuz val)
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E4M3_TYPE val)
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1042,7 +1045,7 @@ struct vec_t<__hip_fp8_e4m3_fnuz, vec_size>
                 (__hip_fp8x4_storage_t(val.__x) << 8) | __hip_fp8x4_storage_t(val.__x);
         }
     }
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e4m3_fnuz* ptr)
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E4M3_TYPE* ptr)
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1050,7 +1053,7 @@ struct vec_t<__hip_fp8_e4m3_fnuz, vec_size>
             data[i] = ((uint4*)ptr)[i];
         }
     }
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e4m3_fnuz* ptr) const
+    inline __attribute__((always_inline)) __device__ void store(FP8_E4M3_TYPE* ptr) const
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1074,8 +1077,8 @@ struct vec_t<__hip_fp8_e4m3_fnuz, vec_size>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e4m3_fnuz* dst, const __hip_fp8_e4m3_fnuz* src)
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E4M3_TYPE* dst,
+                                                                        const FP8_E4M3_TYPE* src)
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1085,30 +1088,29 @@ struct vec_t<__hip_fp8_e4m3_fnuz, vec_size>
     }
 };
 
-/******************* vec_t<__hip_fp8_e5m2_fnuz> *******************/
+/******************* vec_t<FP8_E5M2_TYPE> *******************/
 
-// __hip_fp8_e5m2_fnuz x 1
+// FP8_E5M2_TYPE x 1
 template <>
-struct vec_t<__hip_fp8_e5m2_fnuz, 1>
+struct vec_t<FP8_E5M2_TYPE, 1>
 {
-    __hip_fp8_e5m2_fnuz data;
+    FP8_E5M2_TYPE data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e5m2_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E5M2_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((const FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e5m2_fnuz*>(&data);
+        return reinterpret_cast<FP8_E5M2_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e5m2_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e5m2_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e5m2_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E5M2_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E5M2_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E5M2_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 1>& src)
     {
@@ -1125,56 +1127,55 @@ struct vec_t<__hip_fp8_e5m2_fnuz, 1>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E5M2_TYPE* dst,
+                                                                        const FP8_E5M2_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 1>::fill(__hip_fp8_e5m2_fnuz val)
+vec_t<FP8_E5M2_TYPE, 1>::fill(FP8_E5M2_TYPE val)
 {
     data = val;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 1>::load(const __hip_fp8_e5m2_fnuz* ptr)
+vec_t<FP8_E5M2_TYPE, 1>::load(const FP8_E5M2_TYPE* ptr)
 {
     data = *ptr;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 1>::store(__hip_fp8_e5m2_fnuz* ptr) const
+vec_t<FP8_E5M2_TYPE, 1>::store(FP8_E5M2_TYPE* ptr) const
 {
     *ptr = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 1>::memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src)
+vec_t<FP8_E5M2_TYPE, 1>::memcpy(FP8_E5M2_TYPE* dst, const FP8_E5M2_TYPE* src)
 {
     *dst = *src;
 }
 
-// __hip_fp8_e5m2_fnuz x 2
+// FP8_E5M2_TYPE x 2
 template <>
-struct vec_t<__hip_fp8_e5m2_fnuz, 2>
+struct vec_t<FP8_E5M2_TYPE, 2>
 {
     __hip_fp8x2_e5m2_fnuz data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e5m2_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E5M2_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((const FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e5m2_fnuz*>(&data);
+        return reinterpret_cast<FP8_E5M2_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e5m2_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e5m2_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e5m2_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E5M2_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E5M2_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E5M2_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 2>& src)
     {
@@ -1191,57 +1192,56 @@ struct vec_t<__hip_fp8_e5m2_fnuz, 2>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E5M2_TYPE* dst,
+                                                                        const FP8_E5M2_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 2>::fill(__hip_fp8_e5m2_fnuz val)
+vec_t<FP8_E5M2_TYPE, 2>::fill(FP8_E5M2_TYPE val)
 {
     data.__x = (__hip_fp8x2_storage_t(val.__x) << 8) | __hip_fp8x2_storage_t(val.__x);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 2>::load(const __hip_fp8_e5m2_fnuz* ptr)
+vec_t<FP8_E5M2_TYPE, 2>::load(const FP8_E5M2_TYPE* ptr)
 {
     data = *((__hip_fp8x2_e5m2_fnuz*)ptr);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 2>::store(__hip_fp8_e5m2_fnuz* ptr) const
+vec_t<FP8_E5M2_TYPE, 2>::store(FP8_E5M2_TYPE* ptr) const
 {
     *((__hip_fp8x2_e5m2_fnuz*)ptr) = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 2>::memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src)
+vec_t<FP8_E5M2_TYPE, 2>::memcpy(FP8_E5M2_TYPE* dst, const FP8_E5M2_TYPE* src)
 {
     *((__hip_fp8x2_e5m2_fnuz*)dst) = *((__hip_fp8x2_e5m2_fnuz*)src);
 }
 
-// __hip_fp8_e5m2_fnuz x 4
+// FP8_E5M2_TYPE x 4
 
 template <>
-struct vec_t<__hip_fp8_e5m2_fnuz, 4>
+struct vec_t<FP8_E5M2_TYPE, 4>
 {
     __hip_fp8x4_e5m2_fnuz data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e5m2_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E5M2_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((const FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e5m2_fnuz*>(&data);
+        return reinterpret_cast<FP8_E5M2_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e5m2_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e5m2_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e5m2_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E5M2_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E5M2_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E5M2_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 4>& src)
     {
@@ -1258,58 +1258,57 @@ struct vec_t<__hip_fp8_e5m2_fnuz, 4>
         cast_store_impl(ptr, *this);
     }
 
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E5M2_TYPE* dst,
+                                                                        const FP8_E5M2_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 4>::fill(__hip_fp8_e5m2_fnuz val)
+vec_t<FP8_E5M2_TYPE, 4>::fill(FP8_E5M2_TYPE val)
 {
     data.__x = (__hip_fp8x4_storage_t(val.__x) << 24) | (__hip_fp8x4_storage_t(val.__x) << 16) |
                (__hip_fp8x4_storage_t(val.__x) << 8) | __hip_fp8x4_storage_t(val.__x);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 4>::load(const __hip_fp8_e5m2_fnuz* ptr)
+vec_t<FP8_E5M2_TYPE, 4>::load(const FP8_E5M2_TYPE* ptr)
 {
     data = *((__hip_fp8x4_e5m2_fnuz*)ptr);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 4>::store(__hip_fp8_e5m2_fnuz* ptr) const
+vec_t<FP8_E5M2_TYPE, 4>::store(FP8_E5M2_TYPE* ptr) const
 {
     *((__hip_fp8x4_e5m2_fnuz*)ptr) = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 4>::memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src)
+vec_t<FP8_E5M2_TYPE, 4>::memcpy(FP8_E5M2_TYPE* dst, const FP8_E5M2_TYPE* src)
 {
     *((__hip_fp8x4_e5m2_fnuz*)dst) = *((__hip_fp8x4_e5m2_fnuz*)src);
 }
 
-// __hip_fp8_e5m2_fnuz x 8
+// FP8_E5M2_TYPE x 8
 
 template <>
-struct vec_t<__hip_fp8_e5m2_fnuz, 8>
+struct vec_t<FP8_E5M2_TYPE, 8>
 {
     uint2 data;
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e5m2_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E5M2_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e5m2_fnuz*)(&data))[i];
+        return ((const FP8_E5M2_TYPE*)(&data))[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e5m2_fnuz*>(&data);
+        return reinterpret_cast<FP8_E5M2_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e5m2_fnuz val);
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e5m2_fnuz* ptr);
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e5m2_fnuz* ptr) const;
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E5M2_TYPE val);
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E5M2_TYPE* ptr);
+    inline __attribute__((always_inline)) __device__ void store(FP8_E5M2_TYPE* ptr) const;
     template <typename T>
     inline __attribute__((always_inline)) __device__ void cast_from(const vec_t<T, 8>& src)
     {
@@ -1325,12 +1324,12 @@ struct vec_t<__hip_fp8_e5m2_fnuz, 8>
     {
         cast_store_impl(ptr, *this);
     }
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src);
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E5M2_TYPE* dst,
+                                                                        const FP8_E5M2_TYPE* src);
 };
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 8>::fill(__hip_fp8_e5m2_fnuz val)
+vec_t<FP8_E5M2_TYPE, 8>::fill(FP8_E5M2_TYPE val)
 {
     ((__hip_fp8x4_e5m2_fnuz*)(&data.x))->__x =
         (__hip_fp8x4_storage_t(val.__x) << 24) | (__hip_fp8x4_storage_t(val.__x) << 16) |
@@ -1341,44 +1340,43 @@ vec_t<__hip_fp8_e5m2_fnuz, 8>::fill(__hip_fp8_e5m2_fnuz val)
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 8>::load(const __hip_fp8_e5m2_fnuz* ptr)
+vec_t<FP8_E5M2_TYPE, 8>::load(const FP8_E5M2_TYPE* ptr)
 {
     data = *((uint2*)ptr);
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 8>::store(__hip_fp8_e5m2_fnuz* ptr) const
+vec_t<FP8_E5M2_TYPE, 8>::store(FP8_E5M2_TYPE* ptr) const
 {
     *((uint2*)ptr) = data;
 }
 
 inline __attribute__((always_inline)) __device__ void
-vec_t<__hip_fp8_e5m2_fnuz, 8>::memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src)
+vec_t<FP8_E5M2_TYPE, 8>::memcpy(FP8_E5M2_TYPE* dst, const FP8_E5M2_TYPE* src)
 {
     *((uint2*)dst) = *((uint2*)src);
 }
 
-// __hip_fp8_e5m2_fnuz x 16 or more
+// FP8_E5M2_TYPE x 16 or more
 
 template <size_t vec_size>
-struct vec_t<__hip_fp8_e5m2_fnuz, vec_size>
+struct vec_t<FP8_E5M2_TYPE, vec_size>
 {
     uint4 data[vec_size / 16];
 
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz& operator[](size_t i)
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE& operator[](size_t i)
     {
-        return ((__hip_fp8_e5m2_fnuz*)data)[i];
+        return ((FP8_E5M2_TYPE*)data)[i];
     }
-    inline __attribute__((always_inline)) __device__ const __hip_fp8_e5m2_fnuz&
-    operator[](size_t i) const
+    inline __attribute__((always_inline)) __device__ const FP8_E5M2_TYPE& operator[](size_t i) const
     {
-        return ((const __hip_fp8_e5m2_fnuz*)data)[i];
+        return ((const FP8_E5M2_TYPE*)data)[i];
     }
-    inline __attribute__((always_inline)) __device__ __hip_fp8_e5m2_fnuz* ptr()
+    inline __attribute__((always_inline)) __device__ FP8_E5M2_TYPE* ptr()
     {
-        return reinterpret_cast<__hip_fp8_e5m2_fnuz*>(&data);
+        return reinterpret_cast<FP8_E5M2_TYPE*>(&data);
     }
-    inline __attribute__((always_inline)) __device__ void fill(__hip_fp8_e5m2_fnuz val)
+    inline __attribute__((always_inline)) __device__ void fill(FP8_E5M2_TYPE val)
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1397,7 +1395,7 @@ struct vec_t<__hip_fp8_e5m2_fnuz, vec_size>
                 (__hip_fp8x4_storage_t(val.__x) << 8) | __hip_fp8x4_storage_t(val.__x);
         }
     }
-    inline __attribute__((always_inline)) __device__ void load(const __hip_fp8_e5m2_fnuz* ptr)
+    inline __attribute__((always_inline)) __device__ void load(const FP8_E5M2_TYPE* ptr)
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1405,7 +1403,7 @@ struct vec_t<__hip_fp8_e5m2_fnuz, vec_size>
             data[i] = ((uint4*)ptr)[i];
         }
     }
-    inline __attribute__((always_inline)) __device__ void store(__hip_fp8_e5m2_fnuz* ptr) const
+    inline __attribute__((always_inline)) __device__ void store(FP8_E5M2_TYPE* ptr) const
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
@@ -1428,8 +1426,8 @@ struct vec_t<__hip_fp8_e5m2_fnuz, vec_size>
     {
         cast_store_impl(ptr, *this);
     }
-    inline __attribute__((always_inline)) __device__ static void
-    memcpy(__hip_fp8_e5m2_fnuz* dst, const __hip_fp8_e5m2_fnuz* src)
+    inline __attribute__((always_inline)) __device__ static void memcpy(FP8_E5M2_TYPE* dst,
+                                                                        const FP8_E5M2_TYPE* src)
     {
 #pragma unroll
         for(size_t i = 0; i < vec_size / 16; ++i)
