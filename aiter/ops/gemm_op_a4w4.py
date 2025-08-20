@@ -92,6 +92,9 @@ def gemm_a4w4(
     ):
         splitK = 0 if splitK is None else splitK
         return gemm_a4w4_blockscale(A, B, A_scale, B_scale, out, splitK=splitK)
+    assert (
+        out.shape[0] % 32 == 0
+    ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
     if splitK is not None and splitK > 0:
         out.zero_()
     return gemm_a4w4_asm(
