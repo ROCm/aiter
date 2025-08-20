@@ -22,7 +22,7 @@ jobs:
       - name: Clone sglang repo
         run: |
           git clone https://github.com/sgl-project/sglang.git
-        
+
       # TODO: Currently, we use PAT, it should be replaced by repo token
       - name: Make authenticated API request
         run: |
@@ -41,7 +41,7 @@ jobs:
         env:
           GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
           GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
-            
+
       - name: Start CI container
         run: |
           echo "Clean up containers..."
@@ -66,7 +66,7 @@ jobs:
           sglang_aiter_test:ci
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-      
+
       - name: Install wget
         run: sudo apt-get update && sudo apt-get install -y wget
 
@@ -85,7 +85,7 @@ jobs:
           bash scripts/ci/amd_ci_exec.sh -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
           bash scripts/ci/amd_ci_exec.sh python3 test_eval_fp8_accuracy.py
           bash scripts/ci/amd_ci_exec.sh python3 models/test_qwen_models.py
-        
+
       # TODO: Clean up because some dependencies are installed under root user which can't be removed by runner, these dependencies should be installed as a non-root user
       - name: Clean Up
         if: always()
