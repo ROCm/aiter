@@ -1,13 +1,28 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#define ACTIVATION_PYBIND                                                               \
-    m.def("silu_and_mul", &aiter::silu_and_mul, "Activation function used in SwiGLU."); \
-    m.def("scaled_silu_and_mul",                                                        \
-          &aiter::scaled_silu_and_mul,                                                  \
-          "Activation function used in scaled SwiGLU.");                                \
-    m.def("gelu_and_mul", &aiter::gelu_and_mul, "Activation function used in GELU.");   \
-    m.def("gelu_tanh_and_mul", &aiter::gelu_tanh_and_mul, "Activation function used in GELU tanh.");
+#define ACTIVATION_PYBIND                               \
+    m.def("silu_and_mul",                               \
+          &aiter::silu_and_mul,                         \
+          "Activation function used in SwiGLU.",        \
+          py::arg("out"),                               \
+          py::arg("input"));                            \
+    m.def("scaled_silu_and_mul",                        \
+          &aiter::scaled_silu_and_mul,                  \
+          "Activation function used in scaled SwiGLU.", \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("scale"));                            \
+    m.def("gelu_and_mul",                               \
+          &aiter::gelu_and_mul,                         \
+          "Activation function used in GELU.",          \
+          py::arg("out"),                               \
+          py::arg("input"));                            \
+    m.def("gelu_tanh_and_mul",                          \
+          &aiter::gelu_tanh_and_mul,                    \
+          "Activation function used in GELU tanh.",     \
+          py::arg("out"),                               \
+          py::arg("input"));
 
 #define AITER_OPERATOR_PYBIND                                                   \
     m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
@@ -59,7 +74,7 @@
           py::arg("V"),                             \
           py::arg("block_tables"),                  \
           py::arg("context_lens"),                  \
-          py::arg("max_num_blocks"),                \
+          py::arg("block_tables_stride0"),          \
           py::arg("max_qlen")       = 1,            \
           py::arg("K_QScale")       = std::nullopt, \
           py::arg("V_QScale")       = std::nullopt, \
