@@ -107,8 +107,8 @@ def fp8_assert_close(
 @pytest.mark.parametrize(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
-@pytest.mark.parametrize("CAUSAL", [(False)])
-@pytest.mark.parametrize("FP8", [(False)])
+@pytest.mark.parametrize("CAUSAL", [False])
+@pytest.mark.parametrize("FP8", [False])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -181,5 +181,3 @@ def test_mha(
         )
     else:
         torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
-
-

@@ -19,6 +19,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(os.path.dirname(current_dir))
 sys.path.append(parent_dir)
 
+
 def mha_varlen_input_helper(
     Z, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, dtype, equal_seqlens=False, requires_grad=True
 ):
@@ -520,7 +521,7 @@ def run_benchmark(custom, args):
                 do = torch.randn_like(o)
                 fn = lambda: o.backward(do, retain_graph=True)  # noqa: E731
 
-        #ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+        # ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
         ms = triton.testing.single_run_bench(fn)
 
         total_flops = 2 * flops_per_matmul
