@@ -29,7 +29,7 @@ from aiter.jit.utils.chip_info import get_gfx
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-M = [1, 4, 8, 16, 32, 64, 128, 256]
+M = [1, 4, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096, 8192, 16384]
 
 @dataclass
 class TestConfig:
