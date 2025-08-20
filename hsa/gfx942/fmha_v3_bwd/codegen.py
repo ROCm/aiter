@@ -717,36 +717,41 @@ float fmha_bwd_v3_group_(const ck_tile::stream_config& s, fmha_bwd_args a, const
 
     fmha_bwd_v3_group_args args;
     auto seqstart_k = reinterpret_cast<const int32_t*>(a.seqstart_k_ptr);
-    args.ptr_dq   = a.dq_acc_ptr;
-    args.ptr_dk   = a.dk_ptr;
-    args.ptr_dv   = a.dv_ptr;
-    args.ptr_q    = a.q_ptr;
-    args.ptr_k    = a.k_ptr;
-    args.ptr_v    = a.v_ptr;
-    args.ptr_do   = a.do_ptr;
-    args.ptr_lse  = a.lse_ptr;
-    args.ptr_d    = a.d_ptr;
-
-    args.scalar   = a.scale;
-    args.log2e    = ck_tile::log2e_v<float>;
-    args.ratio    = a.nhead_q / a.nhead_k;
-    args.Hs_lsed = a.nhead_stride_lsed * 4;
-    args.seqlen_k = seqstart_k[a.batch];
-    args.Hs_q     = a.nhead_stride_q * 2;
-    args.Seqs_q   = a.stride_q * 2;
-    args.Hs_k     = a.nhead_stride_k * 2;
-    args.Seqs_k   = a.stride_k * 2;
-    args.Hs_v     = a.nhead_stride_v * 2;
-    args.Seqs_v   = a.stride_v * 2;
-    args.Hs_do    = a.nhead_stride_do * 2;
-    args.Seqs_do  = a.stride_do * 2;
-    args.Hs_dk    = a.nhead_stride_dk * 2;
-    args.Seqs_dk  = a.stride_dk * 2;
-    args.Hs_dv    = a.nhead_stride_dv * 2;
-    args.Seqs_dv  = a.stride_dv * 2;
-    args.ptr_qseq = a.seqstart_q_ptr;
-    args.ptr_kseq = a.seqstart_k_ptr;
-    args.head_dim = a.hdim_q;
+    args.ptr_dq             = a.dq_acc_ptr;
+    args.ptr_dk             = a.dk_ptr;
+    args.ptr_dv             = a.dv_ptr;
+    args.ptr_q              = a.q_ptr;
+    args.ptr_k              = a.k_ptr;
+    args.ptr_v              = a.v_ptr;
+    args.ptr_do             = a.do_ptr;
+    args.ptr_lse            = a.lse_ptr;
+    args.ptr_d              = a.d_ptr;
+    args.ptr_qseq           = a.seqstart_q_ptr;
+    args.ptr_kseq           = a.seqstart_k_ptr;
+    args.ptr_qseq_padded    = seqlen_q_padded == nullptr
+                            ? a.seqstart_q_ptr
+                            : seqlen_q_padded;
+    args.ptr_kseq_padded    = seqlen_k_padded == nullptr
+                            ? a.seqstart_k_ptr
+                            : seqlen_k_padded;
+    args.scalar             = a.scale;
+    args.log2e              = ck_tile::log2e_v<float>;
+    args.ratio              = a.nhead_q / a.nhead_k;
+    args.Hs_lsed            = a.nhead_stride_lsed * 4;
+    args.seqlen_k           = seqstart_k[a.batch];
+    args.Hs_q               = a.nhead_stride_q * 2;
+    args.Seqs_q             = a.stride_q * 2;
+    args.Hs_k               = a.nhead_stride_k * 2;
+    args.Seqs_k             = a.stride_k * 2;
+    args.Hs_v               = a.nhead_stride_v * 2;
+    args.Seqs_v             = a.stride_v * 2;
+    args.Hs_do              = a.nhead_stride_do * 2;
+    args.Seqs_do            = a.stride_do * 2;
+    args.Hs_dk              = a.nhead_stride_dk * 2;
+    args.Seqs_dk            = a.stride_dk * 2;
+    args.Hs_dv              = a.nhead_stride_dv * 2;
+    args.Seqs_dv            = a.stride_dv * 2;
+    args.head_dim           = a.hdim_q;
 
     auto traits = fmha_bwd_v3_traits{{ a.batch,
                                        a.nhead_q,
@@ -834,8 +839,8 @@ float fmha_bwd_v3_swa_genl_(const ck_tile::stream_config& s, fmha_bwd_args a)
 float fmha_bwd_v3(mha_bwd_traits t,
                   fmha_bwd_args a,
                   const ck_tile::stream_config& s,
-                  const void* seqlen_q_padded = nullptr,
-                  const void* seqlen_k_padded = nullptr){{
+                  const void* seqlen_q_padded,
+                  const void* seqlen_k_padded){{
     float r = -1;
 
     if (t.use_ext_asm == true){{

@@ -70,8 +70,8 @@ float mha_bwd(mha_bwd_args args,
               bool use_ext_asm,
               bool is_v3_atomic_fp32,
               int how_v3_bf16_cvt,
-              const void* seqlen_q_padded = nullptr,
-              const void* seqlen_k_padded = nullptr)
+              const void* seqlen_q_padded,
+              const void* seqlen_k_padded)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;

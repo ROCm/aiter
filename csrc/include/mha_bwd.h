@@ -232,6 +232,8 @@ struct __attribute__((packed)) fmha_bwd_v3_group_args
     const void* ptr_d;
     const void* ptr_qseq;
     const void* ptr_kseq;
+    const void* ptr_qseq_padded;
+    const void* ptr_kseq_padded;
     float scalar;
     p1 _p0;
     float log2e;
@@ -393,7 +395,11 @@ template <typename fmha_bwd_dq_dk_dv_v3_traits_>
 struct FmhaBwdV3Ts;
 
 namespace gfx942 {
-float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
+float fmha_bwd_v3(mha_bwd_traits t,
+                  mha_bwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqlen_q_padded = nullptr,
+                  const void* seqlen_k_padded = nullptr);
 }
 
 namespace gfx950 {
