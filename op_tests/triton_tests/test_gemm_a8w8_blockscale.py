@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
@@ -162,4 +161,4 @@ def test_gemm(dtype, M, N, K, layout, output):
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     b = run_triton(x, weight, x_scale, w_scale, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
