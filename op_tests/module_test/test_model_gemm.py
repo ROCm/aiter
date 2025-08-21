@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MoE 2-Stage Test Runner
-Manages test parameters and executes test_moe_2stage.py with user-defined argument combinations
+Gemm 2-Stage Test Runner
+Manages test parameters and executes test_gemm.py/test_gemm_a4w4.py/test_gemm_a8w8.py with user-defined argument combinations
 """
 
 import subprocess
@@ -35,21 +35,18 @@ M = [1, 4, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096, 8192, 16384]
 class TestConfig:
     """
     Test configuration data class
-
     Parameters:
     -----------
     model_name : str
         Name of the model (e.g., "DeepSeek-R1", "Qwen3-235B-A22B")
-
-    dim : str
-        Model dimensions in format "hidden_dim,moe_intermediate_dim"
-        Examples: "6144,4096", "8192,4096", "4096,2048"
-
-    expert : int
-        Number of experts in the MoE layer
-
-    topk : int
-        Number of top experts to use for each token
+    attention_head : int
+        Number of attention heads
+    kv_head : int
+        Number of the kv attention heads
+    head_dim : int
+        feature dimention per head
+    intermediate_size : int
+        feature dimention in MLP module
     """
     model_name: str
     attention_head: int
@@ -59,11 +56,10 @@ class TestConfig:
 
 TEST_CONFIGS = {
     # model,                    model_name,   attention_head,   kv_head,   head_dim,  intermediate_size
-    # "Qwen3-32B"   : TestConfig("Qwen3-32B",         64,          8,         80,         25600),
+    "Qwen3-32B"   : TestConfig("Qwen3-32B",         64,          8,         80,         25600),
     "Llama3-70B"  : TestConfig("Llama3-70B",        64,          8,         128,        28672),
     "Llama3-405B" : TestConfig("Llama3-405B",       128,         8,         128,        53248),
 }
-
 
 @dataclass
 class Record():
@@ -77,7 +73,7 @@ class Record():
     bandwidth: float = 0.0
     throughput: float = 0.0
 
-class FusedmoeTestRunner:
+class GemmTestRunner:
     def __init__(self):
         return
     
@@ -87,6 +83,9 @@ class FusedmoeTestRunner:
         
         records = []
         for tp in TP_list:
+            # for Qwen3-32B, the dim is not dividable by 32 with tp 8, we skip this case
+            if config.model_name == "Qwen3-32B" and tp == 8:
+                continue
             hidden_size = config.attention_head * config.head_dim                    
             QKV_K = hidden_size
             QKV_N = (config.attention_head // tp + 2 * ((config.kv_head + tp - 1) // tp)) * config.head_dim
@@ -113,35 +112,20 @@ class FusedmoeTestRunner:
             dtypes.d_dtypes["fp8"] : 1,
             dtypes.d_dtypes["bf16"] : 2,
         }
-        print("in_dtype={}".format(in_dtype))
-        print("wei_dtype={}".format(wei_dtype))
-        print("out_dtype={}".format(out_dtype))
-        print("----insize={}".format(typesize[in_dtype]))
-        print("----weisize={}".format(typesize[wei_dtype]))
-        print("----outsize={}".format(typesize[out_dtype]))
         bandwidth = (m * k * typesize[in_dtype] + k * n * typesize[wei_dtype] + m * n * typesize[out_dtype]) / latency / 1e6
         return bandwidth
 
     def benchmark_gemm(self, l_dtype, l_quantDtype, records):
         df = []
-        metrics = []
-
         for quantDtype in l_quantDtype:
             for dtype in l_dtype:
-                for idx, record in enumerate(records):
-                    print("dtype={}".format(dtype))
-                    print("quantDtype={}".format(quantDtype))
-                    print("quantDtype1={}".format("fp4x2"))
-                    
+                for idx, record in enumerate(records): 
                     latency = float('inf')
                     if quantDtype == dtypes.d_dtypes["fp8"]:
                         ret = test_gemm_a8w8(dtype, record.M, record.N, record.K, quantDtype)
-                        print("--ret={}".format(ret))
                         ck_time=ret['ck us']
                         ck_bpreshuffle_time=ret['ck bpreshuffle us']
                         asm_time=ret['asm us']
-                        print("ck_time={}".format(ck_time))
-                        print("ck_time={}".format(ck_time))
 
                         if ck_time is not None:
                             latency = min(latency, ck_time)
@@ -150,7 +134,6 @@ class FusedmoeTestRunner:
                         if asm_time is not None:
                             latency = min(latency, asm_time)
                     elif quantDtype == dtypes.d_dtypes["fp4x2"]:
-                        print("---------test_gemm_a4w4")
                         ret = test_gemm_a4w4(dtype, record.M, record.N, record.K)
                         asm_no_splitK_time = ret["asm no splitK"]
                         asm_splitK_time = ret["asm splitK"]
@@ -162,21 +145,16 @@ class FusedmoeTestRunner:
                         if asm_splitK_time is not None:
                             latency = min(latency, asm_splitK_time)
                     else:
-                        print("---------test_gemm_bf16")
                         ret = test_gemm(dtypes.bf16, record.M, record.N, record.K, otype=dtypes.bf16)
                         latency = ret['ck us']
-
-                   
-                    print("---latency={}".format(latency))
                     records[idx].latency = latency
                     records[idx].quant_type = quantDtype
                     records[idx].output_type = dtype
                     records[idx].throughput = self.calculate_throughput(record.M, record.N, record.K, latency)
                     records[idx].bandwidth = self.calculate_bandwidth(record.M, record.N, record.K, latency, quantDtype, quantDtype, dtype)
 
-        # df = pd.DataFrame(df)
-        # print("df={}".format(df))
-        # aiter.logger.info(f"summary:\n{df}")
+        df = pd.DataFrame(df)
+        aiter.logger.info(f"summary:\n{df}")
 
     def save_structs_to_csv(self, records, csv_file, fieldnames):
         import csv
@@ -196,7 +174,6 @@ class FusedmoeTestRunner:
         )
 
     def extract_configuration(self, args):
-        print("-------TEST_CONFIGS={}".format(TEST_CONFIGS))
         models = []
         if args.model is None:
             for key, value in TEST_CONFIGS.items():
@@ -220,33 +197,24 @@ class FusedmoeTestRunner:
                 quant_type.append(dtypes.d_dtypes["fp4x2"])
         else:
             quant_type = [dtypes.d_dtypes[args.quantDtype]]
-            print("*********quant_type={}".format(quant_type))
-        
+
         return models, TP_list, output_types, quant_type
 
     def run_single_test(self, config, TP_list, output_types, quant_type):
         """Run a single test with given configuration"""   
-       
         records = self.get_gemm_shape(config, TP_list)
         self.benchmark_gemm(output_types, quant_type, records)
-        print("--records={}".format(records))
         return records
     
     
-    def run_all_tests(self, args) -> List[Dict[str, Any]]:
+    def run_all_tests(self, args):
         """Run all defined tests"""
-        logger.info("Starting all MoE 2-stage tests...")
-        logger.info(f"Total tests: {len(TEST_CONFIGS)}")
-        
+        logger.info("Starting all GEMM Benchmark from Models...")
         models, TP_list, output_types, quant_type = self.extract_configuration(args)
-
-        print("==========configs={}".format(models))
+        logger.info(f"Total tests: {len(models)}")
         for model in models:
             records = self.run_single_test(model, TP_list, output_types, quant_type)
             self.save_to_csv(records, model.model_name)
-
-
-
 
 def create_argument_parser():
     parser = argparse.ArgumentParser(
@@ -302,5 +270,5 @@ def create_argument_parser():
 if __name__ == "__main__":
     parser = create_argument_parser()
     args = parser.parse_args()
-    runner = FusedmoeTestRunner()
+    runner = GemmTestRunner()
     results = runner.run_all_tests(args)
