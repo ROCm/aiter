@@ -567,9 +567,9 @@ def generate_schema(func) -> str:
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
-        is_mutates = False
-        if name in mutates_args:
-            is_mutates = True
+        is_mutates = True
+        # if name in mutates_args:
+        #     is_mutates = True
 
         if param_type is torch.Tensor:
             if is_mutates:
@@ -640,6 +640,19 @@ def generate_schema(func) -> str:
         and get_args(return_annotation)[0] is torch.Tensor
     ):
         return_type = "Tensor[]"
+    elif get_origin(return_annotation) is tuple:
+        args = get_args(return_annotation)
+        type_strings = []
+        for arg in args:
+            if arg is torch.Tensor:
+                type_strings.append("Tensor")
+            elif arg is int:
+                type_strings.append("int")
+            elif arg is float:
+                type_strings.append("float")
+            elif arg is bool:
+                type_strings.append("bool")
+        return_type = f"({', '.join(type_strings)})"
     else:
         return_type = "Any"
 
@@ -858,6 +871,7 @@ def compile_ops(
             else:
                 sig = inspect.signature(func)
                 mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
+                mutates_args = "unknown"
                 if hasattr(torch.library, "infer_schema"):
                     sig = torch.library.infer_schema(func, mutates_args=mutates_args)
                 else:

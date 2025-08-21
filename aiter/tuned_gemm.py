@@ -17,15 +17,39 @@
 
 import os
 from pathlib import Path
-import functools
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
 from aiter import rocb_create_extension, rocb_mm
 from aiter import logger, dtypes
+from aiter.jit.utils.torch_guard import torch_compile_guard
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+bestsols = {}
+
+
+@torch_compile_guard()
+def load_best_sols_custom(tune_path: str) -> bool:
+    global bestsols
+    if tune_path is not None and Path(tune_path).is_file():
+        bestsols = pd.read_csv(tune_path)
+        if len(bestsols) > 0 and "kernelName" in bestsols.columns:
+            hipblasltKernelNames = bestsols.apply(
+                lambda s: (
+                    getHipblasltKernelName(s.solidx) if s.libtype == "hipblaslt" else "rocblas"
+                ),
+                axis=1,
+            )
+            pd.set_option("display.max_colwidth", 100)
+            assert hipblasltKernelNames.equals(bestsols["kernelName"].fillna("")), (
+                "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
+                + f"differece:\n{pd.concat([bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != bestsols['kernelName'].fillna('')]}"
+            )
+            return True
+
+    return False
 
 
 class TunedGemm:
@@ -61,7 +85,7 @@ class TunedGemm:
                     lambda s: (
                         getHipblasltKernelName(s.solidx)
                         if s.libtype == "hipblaslt"
-                        else "rocblas"
+                        else ""
                     ),
                     axis=1,
                 )
@@ -100,7 +124,7 @@ class TunedGemm:
             self.apply_skinny,
         ]
 
-    @functools.lru_cache(maxsize=4096)
+    # @functools.lru_cache(maxsize=4096)
     def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
         # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
         #     if n > 8 and 0 < m <= 4:
