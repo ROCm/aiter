@@ -1043,6 +1043,7 @@ def _flash_attn_forward(
         o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
     if is_varlen:
         # Layout for q,k,v is thd ie [total_tokens, num_head, head_dim(_v)]
+        # TODO: double check if this comment is correct ^^^
         batch, seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
@@ -1055,6 +1056,7 @@ def _flash_attn_forward(
         o_strides = (0, o.stride(1), o.stride(0), o.stride(2))
     else:
         # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim(_v)]
+        # TODO: double check if this comment is correct ^^^
         batch, seqlen_q, num_q_heads = q.shape[:-1]
         seqlen_k = k.shape[1]
         num_k_heads = k.shape[2]
