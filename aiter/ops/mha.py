@@ -1162,10 +1162,11 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_bf16_causal_a32_rtz_pssk
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
-        ret = (
-            is_v3_atomic_fp32 == True
-        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q == 64
+        gfx = get_gfx()
+        # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
+            hdim_q == 128 and gfx == "gfx950"
+        )
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
@@ -1267,7 +1268,7 @@ def _flash_attn_backward(
         logger.warning(
             "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
         )
-
+        how_v3_bf16_cvt = 0
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
         dout,
