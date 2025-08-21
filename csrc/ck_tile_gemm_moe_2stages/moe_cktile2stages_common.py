@@ -101,14 +101,14 @@ a8w8_gemm2_kernels_list_gfx950= {
 a8w8_gemm2_kernels_list= {
     #  kernel:           stage| BLOCK_SIZE|MPerBLOCK|  NPerBLOCK| KPerBLOCK| WAVE_TILE_M| WAVE_TILE_N| WAVE_TILE_K| WAVE_MAP_M| WAVE_MAP_N|
     # 0: kernelInstance(       2,        256,       32,         64,       256,           16,         16,          64,          1,        4,),
-    1: kernelInstance(       2,        256,       64,         64,       256,           16,         16,          64,          1,        4,),
+    # 1: kernelInstance(       2,        256,       64,         64,       256,           16,         16,          64,          1,        4,),
     # 2: kernelInstance(       2,        256,      128,         64,       128,           16,         16,          64,          1,        4,),
     # 3: kernelInstance(       2,        256,      256,         64,       128,           16,         16,          64,          1,        4,),
     # 4: kernelInstance(       2,        256,       64,        128,       256,           16,         16,         128,          1,        4,),
     # 5: kernelInstance(       2,        256,      128,        128,       128,           16,         16,          64,          1,        4,),
     # 6: kernelInstance(       2,        256,      256,        128,       128,           16,         16,          64,          1,        4,),
     # 7: kernelInstance(       2,        256,       32,         64,       128,           16,         16,          64,          1,        4,),
-    # 8: kernelInstance(       2,        256,       64,        128,       128,           16,         16,          64,          1,        4,),
+    8: kernelInstance(       2,        256,       64,        128,       128,           16,         16,          64,          1,        4,),
 }
 
 # gemm2 out:bf16/fp16 AB:bf16/fp4

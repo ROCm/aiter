@@ -33,22 +33,21 @@ torch::Tensor
     torch::Tensor& sorted_ids,
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
-    int expert,
     int topk,
     std::optional<torch::Tensor> topk_weight  = std::nullopt,
     std::optional<torch::Tensor> x_scale      = std::nullopt,
     std::optional<torch::Tensor> w_scale      = std::nullopt)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
-    int NumTokens = XQ.size(0){" / topk" if k.stage == 2 else ""};
-    int M = (NumTokens * topk + {k.MPerBlock} - 1) / {k.MPerBlock} * {k.MPerBlock};
-    int N = WQ.size(0) / expert; //gate+up
+    int NumTokens = XQ.size(0);
+    int M = reinterpret_cast<const ck_tile::index_t*>(max_token_ids.data_ptr())[0];
+    int N = WQ.size(1);
     int K = XQ.size(-1);
-    // int E = WQ.size(0);
+    int E = WQ.size(0);
     int KBatch = 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = N / {3 - k.stage};
+    int stride_C = N / {3 - k.stage}; //gemm1 gate+up need / 2.
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}
@@ -62,8 +61,8 @@ torch::Tensor
         wptr = "nulptr"
         if (k.QuantType == "per_tenser"):
             scaleGran = "0"
-            xptr = "static_cast<float>(x_scale.value().data_ptr())"
-            wptr = "static_cast<float>(w_scale.value().data_ptr())"
+            xptr = "static_cast<float>(x_scale.value().data_ptr()[0])"
+            wptr = "static_cast<float>(w_scale.value().data_ptr()[0])"
         elif (k.QuantType == "per_token"):
             scaleGran = "1"
             xptr = "static_cast<float*>(x_scale.value().data_ptr())"
@@ -80,7 +79,7 @@ torch::Tensor
                 reinterpret_cast<const void*>(WQ.data_ptr()),
                 reinterpret_cast<void*>(Y.data_ptr()),
                 NumTokens,
-                expert,
+                E,
                 topk,
                 1, // k_batch
                 M,
@@ -140,7 +139,6 @@ template torch::Tensor
     torch::Tensor& sorted_ids,
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
-    int expert,
     int topk,
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
@@ -229,7 +227,6 @@ torch::Tensor
     torch::Tensor& sorted_ids,
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
-    int expert,
     int topk,
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,

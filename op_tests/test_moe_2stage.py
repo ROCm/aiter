@@ -129,7 +129,6 @@ def cktile_moe_stage1(
     w1_scale,
     a1_scale,
     dtype,
-    expert,
     topk,
     block_size=32,
     Activation=ActivationType.Silu,
@@ -143,7 +142,7 @@ def cktile_moe_stage1(
     if w1.dtype is torch.uint32:
         D = D * 8
     out = torch.empty((token_num, topk, D), dtype=dtype)
-    print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[0] // expert, hidden_states.shape[1], topk, expert))
+    print("Run cktile_moe_stage1: M=%d, N(N*2)=%d, K=%d, topk=%d, expert=%d"%(token_num, w1.shape[1], hidden_states.shape[1], topk, w1.shape[0]))
     aiter.moe_cktile2stages_gemm1(
         hidden_states,
         w1,
@@ -151,7 +150,6 @@ def cktile_moe_stage1(
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
-        expert,
         topk,
         sorted_weights,
         a1_scale,
@@ -170,7 +168,6 @@ def cktile_moe_stage2(
     w2_scale,
     a2_scale,
     dtype,
-    expert,
     topk,
     block_size=32,
     Activation=ActivationType.Silu,
@@ -186,7 +183,7 @@ def cktile_moe_stage2(
         dtype=dtype,
         device=hidden_states.device,
     )
-    print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(token_num, w2.shape[1] // expert, hidden_states.shape[1], topk, expert))
+    print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(hidden_states.shape[0]*hidden_states.shape[1], w2.shape[1], hidden_states.shape[2], topk, w2.shape[0]))
     aiter.moe_cktile2stages_gemm2(
         hidden_states,
         w2,
@@ -194,7 +191,6 @@ def cktile_moe_stage2(
         sorted_token_ids,
         sorted_expert_ids,
         num_valid_ids,
-        expert,
         topk,
         sorted_weights,
         a2_scale,
@@ -235,7 +231,8 @@ def test_fmoe(
 
     M, _ = topk_ids.shape
 
-    BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
+    # BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
+    BLOCK_SIZE_M = 64
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
@@ -301,11 +298,30 @@ def test_fmoe(
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
-    a1_qt.fill_(1)
-    a1_scale.fill_(1)
+    # a1_qt.fill_(1)
+    # a1_scale.fill_(1)
+    # print(a1_scale, "a1_scale")
 
-    w1_scale = w1_scale.fill_(1)
-    # w1_qt_aiter.fill_(0.5)
+    # w1_scale = w1_scale.fill_(1)
+    # w1_qt.fill_(1)
+    # w1_qt = torch.cat([ torch.full((w1_qt.shape[1],w1_qt.shape[2]), 1, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 2, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 3, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 4, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 5, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 6, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 7, dtype=AQDType),
+    #                     torch.full((w1_qt.shape[1],w1_qt.shape[2]), 8, dtype=AQDType),
+    #                    ]).reshape(*w1_qt.shape)
+    # w1_qt_aiter = w1_qt
+    # print(num_valid_ids, "num_valid_ids")
+    # print(sorted_ids[0:64])
+    # print("36:", sorted_ids[36*64:37*64])
+    # print("37:", sorted_ids[37*64:38*64])
+    # print("38:", sorted_ids[38*64:39*64])
+    # print("39:", sorted_ids[39*64:2560], sorted_ids.shape, "sorted_ids")
+    # print(sorted_expert_ids, sorted_expert_ids.shape, "sorted_expert_ids")
+
     # w1_qt.fill_(0.5)
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -335,17 +351,8 @@ def test_fmoe(
     elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
-        # w1_shuffle_weight = w1_qt_aiter.view(-1, w1_qt_aiter.shape[-2] // 16, 16, w1_qt_aiter.shape[-1] // 64, 4, 16)
-        # w1_shuffle_weight = w1_shuffle_weight.permute(0, 1, 3, 4, 2, 5).contiguous()
-        # w1_qt_aiter = w1_shuffle_weight.view(*w1_qt_aiter.shape)
-        # w1_qt_aiter = w1_shuffle_weight.view(-1, w1_qt_aiter.shape[2])
-        w1_qt_aiter = w1_qt_aiter.view(-1, w1_qt_aiter.shape[2])
-    print(w1_qt, "w1_qt")
-    print(w1_qt_aiter, "w1_qt_aiter")
     # # ######################## ck stage 1 start ###########
     a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
-    a1_qt.fill_(1)
-    a1_scale.fill_(1)
     out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
     # out1_ck, us = run_perftest(
     #     ck_moe_stage1,
@@ -378,7 +385,6 @@ def test_fmoe(
         w1_scale,
         a1_scale,
         dtype,
-        E,
         topk,
         BLOCK_SIZE_M,
         actType,
@@ -478,31 +484,32 @@ def test_fmoe(
     # )
 
     # # cktil2stage
-    # out2_ck, us = run_perftest(
-    #     ck_moe_stage2,
-    #     a2_qt,
-    #     w1_qt_aiter,
-    #     w2_qt_aiter,
-    #     sorted_ids,
-    #     sorted_expert_ids,
-    #     num_valid_ids,
-    #     w2_scale,
-    #     a2_scale,
-    #     dtype,
-    #     E,
-    #     topk,
-    #     BLOCK_SIZE_M,
-    #     actType,
-    #     quant_type,
-    #     sorted_weights if not doweight_stage1 else None,
-    # )
+    out2_ck, us = run_perftest(
+        cktile_moe_stage2,
+        a2_qt,
+        w1_qt_aiter,
+        w2_qt_aiter,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        w2_scale,
+        a2_scale,
+        dtype,
+        topk,
+        BLOCK_SIZE_M,
+        actType,
+        quant_type,
+        sorted_weights if not doweight_stage1 else None,
+        num_iters=2,
+        num_warmup=0,
+    )
 
 
-    # checkAllclose(
-    #     out2_ref,
-    #     out2_ck,
-    #     msg=f"[perf]  ck_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
-    # )
+    checkAllclose(
+        out2_ref,
+        out2_ck,
+        msg=f"[perf]  ck_moe_stage2:{us:>8.2f} us, {token*model_dim*inter_dim*topk*2/us/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+    )
     # ######################## stage 2 end ###########
 
     # # ######################## fused 2 stage #########
@@ -553,10 +560,10 @@ def test_fmoe(
 
 
 l_dtype = ["bf16", "fp16"][:1]
-# l_dim = [(6144, 4096)]
-l_dim = [(128, 128)]
+l_dim = [(6144, 4096)]
+# l_dim = [(128, 128)]
 l_tokenNum = [
-    1,
+    # 1,
     # 3,
     # 5,
     # 16,
@@ -564,7 +571,7 @@ l_tokenNum = [
     # 64,
     # 128,
     # 256,
-    # 1024,
+    1024,
     # 4096,
     # 163840,
 ]
