@@ -134,13 +134,13 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K # Starting point along K dim on scales
+        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K # our K block corresponds to one scale element along K axis.
         a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_ks * stride_ascale_k
+            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_bsn = offs_bn // GROUP_N
+        offs_b_scale_n = offs_bn // GROUP_N
         b_scale_ptrs = (
-            b_scale_ptr + offs_ks * stride_bscale_k + offs_bsn * stride_bscale_n
+            b_scale_ptr + offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
