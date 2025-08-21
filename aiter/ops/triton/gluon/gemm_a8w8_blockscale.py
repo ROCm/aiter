@@ -101,16 +101,22 @@ def _gemm_a8w8_blockscale_kernel(
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[4, 8],
         threads_per_warp=[8, 8],
-        warps_per_cta=[8, 1],
+        warps_per_cta=[4, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[8, 4],
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, 8],
+        warps_per_cta=[1, 4],
         order=[0, 1],
     )
-    blocked_c: gl.constexpr = blocked_mk
+    blocked_mn: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[4, 4],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[2, 2],
+        order=[1, 0],
+    )
+    blocked_c: gl.constexpr = blocked_mn
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[1, 0]
@@ -126,7 +132,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
     # mfma layout is tuned by trial and error to find the fastest one
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=False, warps_per_cta=[4, 2]
+        version=4, instr_shape=[16, 16], transposed=False, warps_per_cta=[2, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -206,7 +212,7 @@ def _gemm_a8w8_blockscale_kernel(
         accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
         offs_ks_step = BLOCK_SIZE_K // GROUP_K # could be replaced by a constant 1
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
             # Advance the ptrs to the next K block.
             offs_a += BLOCK_SIZE_K * stride_ak
             offs_b += BLOCK_SIZE_K * stride_bk
@@ -230,8 +236,8 @@ def _gemm_a8w8_blockscale_kernel(
                                                cache=cache_modifier)
             cur_a = smem_a.load(layout=dot_a_layout)
             cur_b = smem_b.load(layout=dot_b_layout)
-            cur_a_scale = smem_a.load(layout=gl.SliceLayout(1, blocked_mk))
-            cur_b_scale = smem_b.load(layout=gl.SliceLayout(0, blocked_kn))
+            cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, blocked_mn))
+            cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, blocked_mn))
             if EVEN_K:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                              cache=cache_modifier)
@@ -241,37 +247,26 @@ def _gemm_a8w8_blockscale_kernel(
                                              other=0.0,
                                              cache=cache_modifier)
             accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
-            accumulator *= cur_a_scale[:, None] * cur_b_scale[None, :]
-            smem_a.store(a)
-            smem_scale_a.store(a_scale)
+            # accumulator *= cur_a_scale[:, None] * cur_b_scale[None, :]
+            # smem_a.store(a)
+            # smem_scale_a.store(a_scale)
 
-            # Perform dot operation and apply scale
-            accumulator += (
-                gl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+        # c = accumulator.to(c_ptr.type.element_ty)
+        # c = gl.convert_layout(c, layout=blocked_c)
 
-            # k_cur = k * BLOCK_SIZE_K // GROUP_K
-            # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
-            # offs_ks = k_nxt - k_cur
-
-        c = accumulator.to(c_ptr.type.element_ty)
-        c = gl.convert_layout(c, layout=blocked_c)
-
-        # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
-                                                   layout=gl.SliceLayout(1, blocked_c)).to(gl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
-                                                   layout=gl.SliceLayout(0, blocked_c)).to(gl.int64)
-        c_offs = (
-            stride_cm * offs_cm[:, None]
-            + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
-        )
-        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs,
-                                   mask=c_mask)
+        # # Write back the block of the output matrix C with masks.
+        # offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
+        #                                            layout=gl.SliceLayout(1, blocked_c))
+        # offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
+        #                                            layout=gl.SliceLayout(0, blocked_c))
+        # c_offs = (
+        #     stride_cm * offs_cm[:, None]
+        #     + stride_cn * offs_cn[None, :]
+        #     + pid_k * stride_ck
+        # )
+        # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        # gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs,
+        #                            mask=c_mask)
 
 
 @triton.jit
