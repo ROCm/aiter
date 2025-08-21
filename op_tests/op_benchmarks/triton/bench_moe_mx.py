@@ -2,14 +2,11 @@ import argparse
 import sys
 import torch
 import triton
-from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
-from op_tests.triton_tests.test_moe import torch_moe_align_block_size_ref
-from op_tests.triton_tests.test_moe_mx import (
-    alloc_rand,
-    torch_dynamic_mxfp4_quant,
-)
+from aiter.ops.triton.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
+from op_tests.triton_tests.test_moe_mx import input_helper
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
     get_model_configs,
@@ -21,7 +18,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 def model_benchmark_configs(args):
     config_file = args.model_configs
     configs = get_model_configs(
-        config_path=config_file, models="mistral" if args.model is None else args.model
+        config_path=config_file, models="mixtral" if args.model is None else args.model
     )
     moe_configs = []
     M = args.M if args.M else 128  # check size
@@ -48,7 +45,9 @@ def run_benchmark(args):
     a_dtype_str = args.a_dtype
     b_dtype_str = "mxfp4_e2m1"
     swizzle_mx = args.swizzle_mx
+    silu_fused = args.silu_fused
     print(f"MoE Benchmark {a_dtype_str} x {b_dtype_str}")
+
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "M", "N", "K", "E", "top_k"]
 
@@ -69,48 +68,24 @@ def run_benchmark(args):
 
     @triton.testing.perf_report([benchmark])
     def bench_moe_gemm(M, N, K, E, top_k, metric, a_dtype, swizzle_mx, model=None):
-        is_a_mixed_input = a_dtype_str.startswith("mx")
-        is_b_mixed_input = b_dtype_str.startswith("mx")
-        a_dtype = str_to_torch_dtype[a_dtype_str]
-        c_dtype = torch.bfloat16 if is_a_mixed_input else a_dtype
-        fp16_dtype = torch.float16 if a_dtype_str == "fp16" else torch.bfloat16
-        a_tri = alloc_rand((M, K), dtype=fp16_dtype, device="cuda", requires_grad=False)
-        b_tri = alloc_rand(
-            (E, N, K), dtype=fp16_dtype, device="cuda", requires_grad=False
-        )
-        c_tri = torch.zeros(
-            (M, top_k, N), dtype=c_dtype, device="cuda", requires_grad=False
-        )
-        a_scale = torch.tensor([1.00], dtype=torch.float32, device="cuda")
-        b_scale = torch.tensor([1.00] * E, dtype=torch.float32, device="cuda")
 
-        config = {
-            "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": 256,
-            "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 4,
-            "num_warps": 8,
-            "num_stages": 2,
-            "waves_per_eu": 0,
-            "matrix_instr_nonkdim": 16,
-            "kpack": 1,
-        }
-
-        values = torch.randn(M, E, dtype=torch.float16, device="cuda")
-        softmax_vals = torch.softmax(values, dim=1)
-        topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
-
-        sorted_token_ids, expert_ids, num_tokens_post_padded = (
-            torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
-        )
-
-        if is_a_mixed_input:
-            a_tri, a_mx_scales = torch_dynamic_mxfp4_quant(a_tri)
-        else:
-            a_mx_scales = None
-
-        if is_b_mixed_input:
-            b_tri, b_mx_scales = torch_dynamic_mxfp4_quant(b_tri)
+        (
+            a_tri,
+            b_tri,
+            c_tri,
+            c_tri_silu,
+            a_scale,
+            b_scale,
+            a_mx_scales,
+            b_mx_scales,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k,
+            config,
+        ) = input_helper(M, N, K, top_k, E, a_dtype_str, b_dtype_str)
         # (M, K) * (top_k, N, K) -> (M, top_k, N). 2 for multiplication and accumulation
         flops = 2.0 * M * top_k * K * N
         # The weight is applied on the gemm product which has the shape of (M, top_k, N)
@@ -122,12 +97,22 @@ def run_benchmark(args):
             a_tri.numel() * a_tri.element_size() + b_tri.numel() * b_tri.element_size()
         )
         mem_write = c_tri.numel() * c_tri.element_size()
+
+        if silu_fused:
+            mem = mem_read + (mem_write // 2)
+            flops += M * top_k * N
+        else:
+            mem = mem_read + mem_write
+
         mem = mem_read + mem_write
 
-        fn = lambda: fused_moe_mxfp4(  # noqa: E731
+        fused_moe = fused_moe_mxfp4_silu if silu_fused else fused_moe_mxfp4
+        output_tensor = c_tri_silu if silu_fused else c_tri
+
+        fn = lambda: fused_moe(  # noqa: E731
             a_tri,
             b_tri,
-            c_tri,
+            output_tensor,
             a_scale,
             b_scale,
             a_mx_scales,
@@ -184,6 +169,7 @@ def parse_args():
     parser.add_argument("-M", type=int, help="M dimension")
     parser.add_argument("--routed-weight", action="store_true")
     parser.add_argument("--swizzle-mx", action="store_true")
+    parser.add_argument("-silu_fused", action="store_true", default=False)
     parser.add_argument("-print_vgpr", action="store_true", default=False)
     parser.add_argument(
         "-A",

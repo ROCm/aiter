@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -93,6 +94,7 @@ def e2e_moe_kernel(
     GRID_MN: tl.constexpr,
     atomic_num_stages: tl.constexpr,
     dtype: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -140,8 +142,6 @@ def e2e_moe_kernel(
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-
-    NUM_XCDS: tl.constexpr = 8
 
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
@@ -395,6 +395,7 @@ def e2e_moe_persistent_kernel(
     BLOCK_SIZE_K1: tl.constexpr,  # original block_size_k
     BLOCK_SIZE_K2: tl.constexpr,  # outputs (EM, BLOCK_SIZE_K2)
     NUM_SMS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     start_m = tl.program_id(axis=0)
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
@@ -721,6 +722,7 @@ def e2e_moe(
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             NUM_SMS=NUM_SMS,
+            NUM_XCDS=get_num_xcds(),
             **config,
         )
 
@@ -769,6 +771,7 @@ def e2e_moe(
             use_int8_w8a16=use_int8_w8a16,
             atomic_num_stages=atomic_num_stages,
             dtype=torch_to_triton_dtype[dtype],
+            NUM_XCDS=get_num_xcds(),
             **config,
         )
 
