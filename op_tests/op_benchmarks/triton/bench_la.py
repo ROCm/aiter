@@ -79,14 +79,14 @@ configs.append(
                 8192,
                 [8192],
                 128,
-                304,
+                912,
                 torch.float16,
                 128,
                 64,
                 2,
                 4,
             ),  # Causal=1,
-            (True, 2, 64, 2048, [2048, 2048], 128, 304, torch.float16, 128, 64, 2, 4),
+            (True, 2, 64, 2048, [2048, 2048], 128, 608, torch.float16, 128, 64, 2, 4),
         ],
         line_arg="provider",
         line_vals=["triton"],
@@ -160,6 +160,7 @@ def bench_lean_attention(
     Op = torch.empty((total_programs, n_ctx_q, d), device=q.device, dtype=torch.float32)
 
     locks = torch.zeros((total_programs,), device=q.device, dtype=torch.int32)
+    XCD_REMAP = True
 
     # Triton LeanAttention output
     fn = lambda: _persistent_lean_attention(  # noqa: E731
@@ -174,6 +175,7 @@ def bench_lean_attention(
         total_programs,
         BLOCK_M,
         BLOCK_N,
+        XCD_REMAP,
         causal,
         batch,
         sm_scale,

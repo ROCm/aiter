@@ -15,6 +15,7 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_shape_benchmark_object,
     batched_model_benchmark_shapes,
     print_vgpr,
+    get_caller_name_no_ext,
 )
 from aiter.ops.triton.batched_gemm_a8w8 import (
     batched_gemm_a8w8 as batched_gemm_a8w8,
@@ -59,7 +60,7 @@ def bench_gemm_fn(batch: int, M: int, N: int, K: int, metric: str, layout: str):
 
 def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
-        plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
+        plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
@@ -89,13 +90,13 @@ def run_model_benchmark(args):
 
 def run_shape_benchmark(args):
     benchmark = get_shape_benchmark_object(
-        plot_name="Batched GEMM MXFP4 x MXFP4 Benchmark",
+        plot_name=get_caller_name_no_ext(),
         args=args,
         x_names=["batch", "M", "N", "K"],
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_a8w8(batch, M, N, K, metric, provider):
+    def bench_batched_gemm_a8w8(batch, M, N, K, metric, **kwargs):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
     bench_batched_gemm_a8w8.run(save_path="." if args.o else None, print_data=True)
@@ -130,7 +131,7 @@ def run_benchmark(args, defaults):
 
 
 def parse_args():
-    parser = get_parser("Batched Int8 x Int8 GEMM")
+    parser = get_parser("Batched A8W8 GEMM")
     parser = add_argparse_ff(parser)
     parser.add_argument(
         "-B",
@@ -146,7 +147,7 @@ def main():
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
         fun = lambda: run_benchmark(args, defaults)  # noqa: E731
-        print_vgpr(fun, "Batched GEMM")
+        print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)
 

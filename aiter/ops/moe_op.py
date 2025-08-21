@@ -85,6 +85,7 @@ def fmoe_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
+    kernelName: str,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
 ) -> None: ...
@@ -104,6 +105,7 @@ def fmoe_g1u1_tkw1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
+    kernelName: str,
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[Enum] = ActivationType.Silu.value,
 ) -> None: ...
@@ -160,6 +162,7 @@ def fmoe_fp8_blockscale_g1u1(
     input_scale: Tensor,
     fc1_scale: Tensor,
     fc2_scale: Tensor,
+    kernelName: str,
     fc_scale_blkn: int = 128,
     fc_scale_blkk: int = 128,
     fc2_smooth_scale: Optional[Tensor] = None,
@@ -301,6 +304,7 @@ dtype2str_dict = {
     dtypes.i8: "i8",
     torch.uint8: "fp4x2",
     torch.uint32: "i4",
+    torch.int4: "i4",
 }
 
 

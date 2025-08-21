@@ -53,7 +53,7 @@ def torch_moe_test(
     )
 
 
-@perftest(num_warmup=5, num_iters=20)
+@perftest()
 def asm_moe_test(
     hidden_states,
     w1,
@@ -113,14 +113,14 @@ def test_fmoe_ep(
     # )
     expert_mask = torch.zeros((E + shared_E + 1,), dtype=dtypes.i32, device="cuda")
     expert_mask[ep_id * (E // ep) : (ep_id + 1) * E // ep] = 1
+    # # Get local expert Number in this gpu
+    local_E = torch.sum(expert_mask).item()
     # The last expert
     fake_expertid = expert_mask.numel() - 1
     # Ensure fake expert to be masked
     expert_mask[-1] = 0
     # Ensure shared expert not to be masked
     expert_mask[E:-1] = 1
-    # # Get local expert Number in this gpu
-    local_E = torch.sum(expert_mask).item()
 
     quantAlgoId = quant_algo.index(quant)
     if quantAlgoId not in [0, 3] and not use_g1u1:
@@ -240,8 +240,8 @@ def test_fmoe_ep(
         w1, fc1_scale = pertoken_quant(w1, quant_dtype=quant_dtype)
         w2, fc2_scale = pertoken_quant(w2, quant_dtype=quant_dtype)
 
-        sp1 = (E + shared_E, inter_dim)
-        sp2 = (E + shared_E, model_dim)
+        sp1 = (local_E + shared_E, inter_dim)
+        sp2 = (local_E + shared_E, model_dim)
 
         if not use_smooth:
             fc1_smooth_scale = None

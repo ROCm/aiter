@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
@@ -133,15 +132,16 @@ def generate_gemm_a8w8_blockscale_inputs(
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K, output",
+    "dtype, M, N, K, layout, output",
     [
-        (dtype, *shape, output)
+        (dtype, *shape, layout, output)
         for output in [True, False]
         for dtype in ["bf16"]
+        for layout in ["TN", "TT", "NN", "NT"]
         for shape in get_x_vals()
     ],
 )
-def test_gemm(dtype, M, N, K, output):
+def test_gemm(dtype, M, N, K, layout, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     block_shape_n, block_shape_k = block_shape
@@ -154,10 +154,11 @@ def test_gemm(dtype, M, N, K, output):
         block_shape_n,
         block_shape_k,
         dtype=dtype,
+        layout=layout,
         output=output,
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     b = run_triton(x, weight, x_scale, w_scale, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

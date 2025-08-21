@@ -4,6 +4,7 @@
 import torch
 from torch import Tensor
 from ..jit.core import compile_ops
+from typing import Optional
 
 MD_NAME = "module_rmsnorm"
 
@@ -101,6 +102,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     yscale: Tensor,
     weight: Tensor,
     epsilon: float,
+    out_before_quant: Optional[Tensor] = None,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None: ...
 
