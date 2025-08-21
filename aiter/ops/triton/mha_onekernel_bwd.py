@@ -538,6 +538,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     BLK_SLICE_FACTOR: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
+    PE_HEAD_DIM: tl.constexpr,
+    ACTUAL_PE_HEAD_DIM: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_ALIBI: tl.constexpr,
@@ -1161,6 +1163,8 @@ def bwd_kernel_noncausal(
     BLK_SLICE_FACTOR: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,
+    PE_HEAD_DIM: tl.constexpr,
+    ACTUAL_PE_HEAD_DIM: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_ALIBI: tl.constexpr,
@@ -1609,12 +1613,12 @@ def flash_attn_onekernel_backward(
 
     # get strides and shape
     if IS_VARLEN:
-        # Layout for q,k,v is thd ie [total tokens, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = (
+        # Layout for q,k,v is thd ie [total tokens, num_head, head_dim(v)]
+        # TODO: double check if this comment is correct ^^^
+        batch, seqlen_q, num_q_heads = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
-            q.shape[2],
         )
         _, num_k_heads = max_seqlen_k, k.shape[1]
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
@@ -1627,8 +1631,9 @@ def flash_attn_onekernel_backward(
         dv_strides = (0, dv.stride(1), dv.stride(0), dv.stride(2))
         do_strides = (0, do.stride(1), do.stride(0), do.stride(2))
     else:
-        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = q.shape
+        # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim(v)]
+        # TODO: double check if this comment is correct ^^^
+        batch, seqlen_q, num_q_heads = q.shape[:-1]
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))
@@ -1639,10 +1644,16 @@ def flash_attn_onekernel_backward(
         dv_strides = (dv.stride(0), dv.stride(2), dv.stride(1), dv.stride(3))
         do_strides = (do.stride(0), do.stride(2), do.stride(1), do.stride(3))
 
+    qk_head_dim = q.shape[-1]
+    v_head_dim = v.shape[-1]
+    pe_head_dim = qk_head_dim - v_head_dim
     # BLOCK_D_MODEL, BLOCK_D_MODEL_POW2
     # padding for head_dim. Power of 2 or 16
-    BLOCK_D_MODEL_POW2 = triton.next_power_of_2(head_sz)
+    BLOCK_D_MODEL_POW2 = triton.next_power_of_2(v_head_dim)
     BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
+    BLOCK_D_MODEL_PE_POW2 = triton.next_power_of_2(pe_head_dim)
+    if BLOCK_D_MODEL_PE_POW2 > 0:
+        BLOCK_DMODEL_PE_POW2 = max(BLOCK_DMODEL_PE_POW2, 16)
 
     # Configs
     if config is None:
@@ -1675,7 +1686,7 @@ def flash_attn_onekernel_backward(
         max_seqlen_q,
         descale_do,
         BLOCK_M=config["preprocess_kernel"]["PRE_BLOCK"],
-        BLOCK_D_MODEL=head_sz,
+        BLOCK_D_MODEL=v_head_dim,
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
         IS_FP8=IS_FP8,
@@ -1742,8 +1753,10 @@ def flash_attn_onekernel_backward(
             descale_k,
             descale_v,
             descale_do,
-            HEAD_DIM=head_sz,
+            HEAD_DIM=v_head_dim,
             ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
+            PE_HEAD_DIM=pe_head_dim,
+            ACTUAL_PE_HEAD_DIM=BLOCK_D_MODEL_PE_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_ALIBI=use_alibi,
@@ -1795,8 +1808,10 @@ def flash_attn_onekernel_backward(
             descale_k,
             descale_v,
             descale_do,
-            HEAD_DIM=head_sz,
+            HEAD_DIM=v_head_dim,
             ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
+            PE_HEAD_DIM=pe_head_dim,
+            ACTUAL_PE_HEAD_DIM=BLOCK_D_MODEL_PE_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_ALIBI=use_alibi,
