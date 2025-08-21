@@ -209,7 +209,8 @@ def _gemm_a8w8_blockscale_kernel(
         smem_scale_a.store(a_scale)
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
-        accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
+        accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=blocked_mn)
+        mfma_acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout)
         offs_ks_step = BLOCK_SIZE_K // GROUP_K # could be replaced by a constant 1
 
         for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
@@ -246,27 +247,39 @@ def _gemm_a8w8_blockscale_kernel(
                                              mask=offs_bk[:, None] < K - k * BLOCK_SIZE_K,
                                              other=0.0,
                                              cache=cache_modifier)
-            accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
-            # accumulator *= cur_a_scale[:, None] * cur_b_scale[None, :]
-            # smem_a.store(a)
-            # smem_scale_a.store(a_scale)
+            mfma_acc = gl.amd.cdna4.mfma(cur_a, cur_b, mfma_acc)
+            accumulator += gl.convert_layout(mfma_acc, layout=blocked_mn) * cur_a_scale[:, None] * cur_b_scale[None, :]
+            smem_a.store(a)
+            smem_scale_a.store(a_scale)
+            mfma_acc *= 0.0
 
-        # c = accumulator.to(c_ptr.type.element_ty)
+        # ======= Epilogue ========
+        smem_b.store(b) # see if it's faster to just convert layout
+        smem_scale_b.store(b_scale)
+        cur_a = smem_a.load(layout=dot_a_layout)
+        cur_b = smem_b.load(layout=dot_b_layout)
+        cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, blocked_mn))
+        cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, blocked_mn))
+
+        mfma_acc = gl.amd.cdna4.mfma(cur_a, cur_b, mfma_acc)
+        accumulator += gl.convert_layout(mfma_acc, layout=blocked_mn) * cur_a_scale[:, None] * cur_b_scale[None, :]
+
+        c = accumulator.to(c_ptr.type.element_ty)
         # c = gl.convert_layout(c, layout=blocked_c)
 
         # # Write back the block of the output matrix C with masks.
-        # offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
-        #                                            layout=gl.SliceLayout(1, blocked_c))
-        # offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
-        #                                            layout=gl.SliceLayout(0, blocked_c))
-        # c_offs = (
-        #     stride_cm * offs_cm[:, None]
-        #     + stride_cn * offs_cn[None, :]
-        #     + pid_k * stride_ck
-        # )
-        # c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        # gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs,
-        #                            mask=c_mask)
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
+                                                   layout=gl.SliceLayout(1, blocked_c))
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
+                                                   layout=gl.SliceLayout(0, blocked_c))
+        c_offs = (
+            stride_cm * offs_cm[:, None]
+            + stride_cn * offs_cn[None, :]
+            + pid_k * stride_ck
+        )
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs,
+                                   mask=c_mask)
 
 
 @triton.jit
