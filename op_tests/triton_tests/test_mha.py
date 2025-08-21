@@ -302,12 +302,10 @@ def test_mha_int64_strides(
 @pytest.mark.parametrize(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, False, False), (0.2, True, True)]
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)]
-)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(False)])
+@pytest.mark.parametrize("FP8", [False])
 def test_mha_varlen_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
@@ -326,9 +324,15 @@ def test_mha_varlen_with_pe(
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device="cuda", dtype=dtype)
-    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device="cuda", dtype=dtype)
-    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device="cuda", dtype=dtype)
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device="cuda", dtype=dtype
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device="cuda", dtype=dtype
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device="cuda", dtype=dtype
+    )
     query_padding_mask = generate_random_padding_mask(
         SEQLEN_Q, BATCH, "cuda", mode="random"
     )
