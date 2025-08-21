@@ -795,8 +795,8 @@ void get_mla_metadata_v1_device(
     const bool           is_causal,
     const bool           no_redundant,
     torch::Tensor&       work_metadata_ptrs,
-    torch::Tensor&       work_indptr,
     torch::Tensor&       work_info_set,
+    torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map)
@@ -1155,16 +1155,16 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
 // Returns
 //   [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
 //                                               work_info.
-//   [1] work_indptr:        (#cu_part + 1),     The IDs of work handled by each cu_part.
-//   [2] work_info           (#work, 8)
-//   [2.0] bs_index:         (#work),            The index of batch handled by each work.
-//   [2.1] partial_index:    (#work),            The index of tile in output buffer when splits. -1 means no split.
-//   [2.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
+//   [1] work_info           (#work, 8)
+//   [1.0] bs_index:         (#work),            The index of batch handled by each work.
+//   [1.1] partial_index:    (#work),            The index of tile in output buffer when splits. -1 means no split.
+//   [1.2] q_start:          (#work),            The global index in seq where q/o starts. Use global index here can
 //                                               reduce memory access count in kernel.
-//   [2.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
-//   [2.4] kv_start:         (#work),            The global index in seq where k/v starts.
-//   [2.5] kv_end:           (#work),            The global index in seq where k/v ends (not included).
-//   [2.6] pad               (#work, 2),         Pad to 8 DWs.
+//   [1.3] q_end:            (#work),            The global index in seq where q/o ends (not included).
+//   [1.4] kv_start:         (#work),            The global index in seq where k/v starts.
+//   [1.5] kv_end:           (#work),            The global index in seq where k/v ends (not included).
+//   [1.6] pad               (#work, 2),         Pad to 8 DWs.
+//   [2] work_indptr:        (#cu_part + 1),     The IDs of work handled by each cu_part.
 //   [3] reduce_indptr:      (sum(qo_seqlen_blk_count) + 1),
 //                                               The IDs in reduce_partial_map indicates the tiles should be merged
 //                                               together.
@@ -1180,8 +1180,8 @@ void get_mla_metadata_v1(
     const int32_t        num_heads_k,
     const bool           is_causal,
     torch::Tensor&       work_metadata_ptrs,
-    torch::Tensor&       work_indptr,
     torch::Tensor&       work_info_set,
+    torch::Tensor&       work_indptr,
     torch::Tensor&       reduce_indptr,
     torch::Tensor&       reduce_final_map,
     torch::Tensor&       reduce_partial_map)
@@ -1202,8 +1202,8 @@ void get_mla_metadata_v1(
         is_causal,
         false,
         work_metadata_ptrs,
-        work_indptr,
         work_info_set,
+        work_indptr,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map);

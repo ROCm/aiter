@@ -45,8 +45,8 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          const int32_t num_heads_k,
                          const bool is_causal,
                          torch::Tensor& work_metadata_ptrs,
-                         torch::Tensor& work_indptr,
                          torch::Tensor& work_info,
+                         torch::Tensor& work_indptr,
                          torch::Tensor& reduce_indptr,
                          torch::Tensor& reduce_final_map,
                          torch::Tensor& reduce_partial_map);
