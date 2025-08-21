@@ -19,6 +19,19 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 # setup_seed(1)
 
+
+def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -> None:
+    x, y = x.double(), y.double()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    amax_diff = (x - y).abs().max().item()
+    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    if use_fp8:
+        assert cos_diff < 3e-2
+    else:
+        assert cos_diff < 1e-5
+
+
 def ref_masked_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -309,6 +322,8 @@ def test_mla(
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
         )
+
+        cal_diff(out_ref, out_asm, "out", True)
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
