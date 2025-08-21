@@ -542,7 +542,8 @@ SPECIAL_OPS_MUTATES_ARGS = {
     "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
     "moe_fused_gate": ["topk_weights", "topk_ids"],
     "grouped_topk": ["topk_weights", "topk_ids"],
-    "mha_varlen_fwd": ["out"],
+    "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
+    "rotary_embedding_fwd": ["query", "key"],
 }
 
 
