@@ -78,6 +78,7 @@ class TunedGemm:
         for i in range(len(df)):
             ds = df.iloc[i]
             key = (
+                ds["cu_num"],
                 ds["M"],
                 ds["N"],
                 ds["K"],
@@ -123,9 +124,10 @@ class TunedGemm:
 
         if soltype is None:
             soltype, solidx = self.solids.get(
-                (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+                (self.cu_count,m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
             )
         solution_name = self.solMap[soltype]
+
         logger.info(
             f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
         )
