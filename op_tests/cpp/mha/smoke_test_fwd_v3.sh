@@ -64,8 +64,6 @@ run_gfx942_fwd_v3_new() {
     done
     done
     done
-    done
-    done
 }
 
 while getopts ":a:h" opt; do
