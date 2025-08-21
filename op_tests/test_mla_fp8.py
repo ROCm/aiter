@@ -27,9 +27,9 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -
     amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
-        return cos_diff < 3e-2
+        assert cos_diff < 3e-2
     else:
-        return cos_diff < 1e-5
+        assert cos_diff < 1e-5
 
 
 def ref_masked_attention(
@@ -313,8 +313,7 @@ def test_mla(
         msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
 
-    if cal_diff(out_ref, out_asm, "out", True) is not True:
-        import pdb; pdb.set_trace()
+    cal_diff(out_ref, out_asm, "out", True)
 
     return {
         "decode:flops": flops,
