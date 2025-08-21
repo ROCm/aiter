@@ -962,7 +962,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
             args.seqlen_k_ptr = ((mode == mode_enum::batch && use_kvcache) || 0 <= k_paddings_[0]
                                      ? seqlen_k_buf.GetDeviceBuffer()
                                      : nullptr);
-
             args.seqlen_k     = shape_seqlen_k; // unused in group mode (or kvcache enabled)
             args.max_seqlen_q = max_seqlen_q;
 
@@ -1005,6 +1004,9 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 {
                     args.drop_seed_offset = std::make_pair(drop_seed, drop_offset);
                 }
+                // todo 
+                args.seqstart_q_padding_ptr = (mode == mode_enum::group ? seqstart_q.GetDeviceBuffer() : nullptr);
+                args.seqstart_k_padding_ptr = (mode == mode_enum::group ? seqstart_k.GetDeviceBuffer() : nullptr);
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
             {

@@ -1006,11 +1006,8 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (seqlen_q == seqlen_k)
-        ret = ret and (seqlen_q >= 384)
         ret = ret and (hdim_q == hdim_v)
         ret = ret and (hdim_q == 128)
-        ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and ((return_lse and gfx == "gfx950") or (gfx == "gfx942"))
