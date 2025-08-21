@@ -99,12 +99,12 @@ std::vector<at::Tensor> fmha_v3_fwd_ck(const at::Tensor& q, // [b, sq, hq, d]
     args.batch    = batch_size;
     args.seqlen_q = seqlen_q;
     args.seqlen_k = seqlen_k;
-    args.hdim_q   = head_size_q;
+    args.hdim_qk  = head_size_q;
     args.hdim_v   = head_size_v;
     args.nhead_q  = num_heads;
-    args.nhead_k  = num_heads_k;
+    args.nhead_kv = num_heads_k;
 
-    args.scale_s = softmax_scale;
+    args.softmax_scale = softmax_scale;
 
     args.window_size_left  = mask.left;
     args.window_size_right = mask.right;
