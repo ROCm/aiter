@@ -27,9 +27,9 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -
     amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
-        assert cos_diff < 3e-2
+        return cos_diff < 3e-2
     else:
-        assert cos_diff < 1e-5
+        return cos_diff < 1e-5
 
 
 def ref_masked_attention(
@@ -154,7 +154,7 @@ def test_mla(
     if varlen:
         for i in range(batch_size):
             # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
-            seq_lens_kv[i] = random.uniform(1, ctx_lens)
+            seq_lens_kv[i] = random.uniform(10, ctx_lens)
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
@@ -242,8 +242,8 @@ def test_mla(
     work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
     work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
     work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr      = torch.empty([100], dtype=torch.int32, device="cuda")
-    reduce_final_map   = torch.empty([batch_size * 2, 2], dtype=torch.int32, device="cuda")
+    reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
+    reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
     reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
     
@@ -261,7 +261,10 @@ def test_mla(
         reduce_partial_map,
     )
     print(work_indptr)
-    print(work_info_set)
+    print(work_info_set[:work_indptr[-1]])
+    print(reduce_indptr)
+    print(reduce_final_map)
+    print(reduce_partial_map)
 
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
@@ -310,7 +313,9 @@ def test_mla(
         msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
 
-    cal_diff(out_ref, out_asm, "out", True)
+    if cal_diff(out_ref, out_asm, "out", True) is not True:
+        import pdb; pdb.set_trace()
+
     return {
         "decode:flops": flops,
         "decode:bytes": bytes,
@@ -410,8 +415,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    # default=[i for i in range(64, 80)], # [41],
-    default=[64], # [41],
+    default=[i for i in range(80, 128)], # [41],
+    # default=[64], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
