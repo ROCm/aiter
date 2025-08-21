@@ -86,7 +86,7 @@ def run_gemm_asm(
 @benchmark()
 def test_gemm(dtype, M, N, K):
     from aiter.jit.utils.chip_info import get_gfx
-    print("================flag1================")
+
     if get_gfx() not in ["gfx950"]:
         return
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
@@ -154,7 +154,6 @@ def test_gemm(dtype, M, N, K):
     err_e = checkAllclose(a, e[:M], msg="ck            ")
     tflops_e = M * N * K * 2 / avg_e / 1e6
     tbs_e = (x.nbytes + w.nbytes) / avg_e / 1e6
-    print("================flag2================")
     return {
         "triton": avg_b,
         "asm no splitK": avg_c,
@@ -171,6 +170,7 @@ def test_gemm(dtype, M, N, K):
         "asm splitK TB/s": tbs_d,
         "ck TB/s": tbs_e,
     }
+
 
 def create_argument_parser():
     parser = argparse.ArgumentParser(
@@ -199,6 +199,7 @@ def create_argument_parser():
         e.g. -mnk 1280,8192,1024""",
     )
     return parser
+
 
 if __name__ == "__main__":
     l_dtype = ["bf16"]
