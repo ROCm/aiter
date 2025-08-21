@@ -3,7 +3,7 @@
 
 Here is the introduction of key operators benchmarking for real scenairos in LLM workloads. The operators now includes:
 * Gemm
- 
+
 
 ## Gemm kernel benchmark at workload level
 
@@ -23,9 +23,9 @@ Users can use the following command to get the benchmark results for all workloa
 python3 -u test_model_gemm.py
 ```
 #### Benchmark Gemm in specified configuration
-Users can also specify the model and the corresponding configuration they need. The following example indicates Gemm kernel will be benchmark using the shapes in `Llama3-70B` with tensor parallel size equaling to 8, input and weight in FP8 quantization datatype and output in BF16 datatype. 
+Users can also specify the model and the corresponding configuration they need. The following example indicates Gemm kernel will be benchmark using the shapes in `Llama3-70B` with tensor parallel size equaling to 8, input and weight in FP8 quantization datatype and output in BF16 datatype.
 ```
-python3 -u test_model_gemm.py -m Llama3-70B -tp 8 -d bf16 -q fp8
+python3 -u test_model_gemm.py -m "Llama3-70B" -tp 8 -d bf16 -q fp8
 ```
 
-                                                                                                                             
+
