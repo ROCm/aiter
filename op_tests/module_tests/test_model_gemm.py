@@ -131,6 +131,7 @@ class GemmTestRunner:
 
     def benchmark_gemm(self, l_dtype, l_quantDtype, records):
         df = []
+        records_result = []
         for quantDtype in l_quantDtype:
             for dtype in l_dtype:
                 for idx, record in enumerate(records):
@@ -165,13 +166,10 @@ class GemmTestRunner:
                             dtypes.bf16, record.M, record.N, record.K, otype=dtypes.bf16
                         )
                         latency = ret["ck us"]
-                    records[idx].latency = latency
-                    records[idx].quant_type = quantDtype
-                    records[idx].output_type = dtype
-                    records[idx].throughput = self.calculate_throughput(
+                    throughput = self.calculate_throughput(
                         record.M, record.N, record.K, latency
                     )
-                    records[idx].bandwidth = self.calculate_bandwidth(
+                    bandwidth = self.calculate_bandwidth(
                         record.M,
                         record.N,
                         record.K,
@@ -180,8 +178,22 @@ class GemmTestRunner:
                         quantDtype,
                         dtype,
                     )
+                    records_result.append(
+                        Record(
+                            M=record.M,
+                            N=record.N,
+                            K=record.K,
+                            TP=record.TP,
+                            quant_type=quantDtype,
+                            output_type=dtype,
+                            latency=latency,
+                            throughput=throughput,
+                            bandwidth=bandwidth,
+                        )
+                    )
 
         df = pd.DataFrame(df)
+        return records_result
         # aiter.logger.info(f"summary:\n{df}")
 
     def save_structs_to_csv(self, records, csv_file, fieldnames):
@@ -231,27 +243,27 @@ class GemmTestRunner:
             output_types = [dtypes.d_dtypes[args.dtype]]
 
         if args.quantDtype is None:
-            quant_type = [dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]]
+            quant_types = [dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]]
             if get_gfx() in ["gfx950"]:
-                quant_type.append(dtypes.d_dtypes["fp4x2"])
+                quant_types.append(dtypes.d_dtypes["fp4x2"])
         else:
-            quant_type = [dtypes.d_dtypes[args.quantDtype]]
+            quant_types = [dtypes.d_dtypes[args.quantDtype]]
 
-        return models, TP_list, output_types, quant_type
+        return models, TP_list, output_types, quant_types
 
-    def run_single_test(self, config, TP_list, output_types, quant_type):
+    def run_single_test(self, config, TP_list, output_types, quant_types):
         """Run a single test with given configuration"""
         records = self.get_gemm_shape(config, TP_list)
-        self.benchmark_gemm(output_types, quant_type, records)
-        return records
+        records_result = self.benchmark_gemm(output_types, quant_types, records)
+        return records_result
 
     def run_all_tests(self, args):
         """Run all defined tests"""
         logger.info("Starting all GEMM Benchmark from Models...")
-        models, TP_list, output_types, quant_type = self.extract_configuration(args)
+        models, TP_list, output_types, quant_types = self.extract_configuration(args)
         logger.info(f"Total tests: {len(models)}")
         for model in models:
-            records = self.run_single_test(model, TP_list, output_types, quant_type)
+            records = self.run_single_test(model, TP_list, output_types, quant_types)
             self.save_to_csv(records, model.model_name)
 
 
