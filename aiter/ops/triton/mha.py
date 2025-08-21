@@ -244,7 +244,9 @@ def _attn_fwd_inner(
 
     # loop over k, v, and update accumulator
 
-    num_stages: tl.constexpr = None if ENABLE_PIPELINING else 1  # Set num_stages==1 if we want to disable pipelining
+    num_stages: tl.constexpr = (
+        None if ENABLE_PIPELINING else 1
+    )  # Set num_stages==1 if we want to disable pipelining
     for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=num_stages):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
@@ -256,8 +258,18 @@ def _attn_fwd_inner(
         k = _load_fn(k_ptrs, k_offs_k, k_offs_n, BLOCK_DMODEL, seqlen_k)
 
         if BLOCK_DMODEL_PE > 0:
-            k_offs_pe = None if not PADDED_PE else (BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE_POW2))
-            k_pe = _load_fn(k_pe_ptrs, k_offs_pe, k_offs_n, (BLOCK_DMODEL + BLOCK_DMODEL_PE), seqlen_k)
+            k_offs_pe = (
+                None
+                if not PADDED_PE
+                else (BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE_POW2))
+            )
+            k_pe = _load_fn(
+                k_pe_ptrs,
+                k_offs_pe,
+                k_offs_n,
+                (BLOCK_DMODEL + BLOCK_DMODEL_PE),
+                seqlen_k,
+            )
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -1024,7 +1036,9 @@ def _flash_attn_forward(
     is_varlen = True if cu_seqlens_q is not None else False
 
     if IS_FP8:
-        o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device)
+        o = torch.zeros(
+            (q.shape[:-1] + v.shape[-1:]), dtype=torch.float32, device=q.device
+        )
     else:
         o = torch.zeros((q.shape[:-1] + v.shape[-1:]), dtype=q.dtype, device=q.device)
     if is_varlen:
@@ -1050,7 +1064,7 @@ def _flash_attn_forward(
         o_strides = (o.stride(0), o.stride(2), o.stride(1), o.stride(3))
 
     qk_head_dim = q.shape[-1]
-    v_head_dim  = v.shape[-1]
+    v_head_dim = v.shape[-1]
     pe_head_dim = qk_head_dim - v_head_dim
     # padding for head_dim. Power of 2 or 16
     BLOCK_DMODEL_POW2 = triton.next_power_of_2(v_head_dim)
