@@ -63,11 +63,11 @@ def run_gemm_asm(
     bpreshuffle=True,
     log2_k_split=None,
 ):
-    if log2_k_split is not None and log2_k_split > 0:
-        out_reset = torch.zeros(
-            (out.shape[0] + 255) // 256 * 256, out.shape[1], dtype=dtype
-        )
-        out = out_reset
+    # if log2_k_split is not None and log2_k_split > 0:
+    #     out_reset = torch.zeros(
+    #         (out.shape[0] + 31) // 32 * 32, out.shape[1], dtype=dtype
+    #     )
+    #     out = out_reset
 
     aiter.gemm_a4w4_asm(
         x,
@@ -98,8 +98,8 @@ def test_gemm(dtype, M, N, K):
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     wshuffle = shuffle_weight(w, layout=(16, 16))
     out1 = torch.empty(M, N, dtype=dtype)
-    out2 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
-    out3 = torch.empty((M + 255) // 256 * 256, N, dtype=dtype)
+    out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
+    out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     bias_f32 = None
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)

@@ -155,6 +155,7 @@ def asm_moe_test(
         a1_scale,
         fc1_scale,
         fc2_scale,
+        "",
         scale_blk_n,
         scale_blk_k,
         None,

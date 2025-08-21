@@ -221,6 +221,8 @@ def test_persistent_lean_attention(
         init_dtype,
     )
 
+    XCD_REMAP = True
+
     # Triton LeanAttention output
     la_out, ms = _persistent_lean_attention(
         q,
@@ -234,6 +236,7 @@ def test_persistent_lean_attention(
         total_programs,
         BLOCK_M,
         BLOCK_N,
+        XCD_REMAP,
         causal,
         batch,
         sm_scale,
@@ -363,6 +366,7 @@ def main():
     init_dtype = torch.float16
     BLOCK_M = 128
     BLOCK_N = 64
+    XCD_REMAP = True
     waves_per_eu = 2
     num_warps = 4
     assert batch == len(n_ctx)
@@ -413,6 +417,7 @@ def main():
         total_programs,
         BLOCK_M,
         BLOCK_N,
+        XCD_REMAP,
         causal,
         batch,
         sm_scale,
@@ -430,7 +435,7 @@ def main():
         torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
     except AssertionError:
         print("Assertion failed! Showing mismatches:")
-        print_mismatches(ref_out, la_out, atol, rtol)
+        # print_mismatches(ref_out, la_out, atol, rtol)
         raise  # Re-raise the exception after printing mismatches
 
     # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)

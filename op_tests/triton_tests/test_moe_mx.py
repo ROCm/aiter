@@ -5,9 +5,12 @@ import pytest
 import torch
 
 from aiter.ops.triton.moe_op_mxfp4 import fused_moe_mxfp4
+from aiter.ops.triton.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
 from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from op_tests.triton_tests.test_moe import torch_moe_ref, torch_moe_align_block_size_ref
 import aiter.ops.triton.utils.arch_info as arch_info
+from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
+from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
 
 DEBUG_MODE = False
 
@@ -183,6 +186,72 @@ def alloc_rand(shape, device, dtype, requires_grad=True):
     return torch.randn(shape, device=device, dtype=dtype, requires_grad=requires_grad)
 
 
+def input_helper(
+    M: int, N: int, K: int, top_k: int, E: int, a_dtype_str: str, b_dtype_str: str
+):
+
+    is_a_mixed_input = a_dtype_str.startswith("mx")
+    is_b_mixed_input = b_dtype_str.startswith("mx")
+    a_dtype = str_to_torch_dtype[a_dtype_str]
+    c_dtype = torch.bfloat16 if is_a_mixed_input else a_dtype
+    fp16_dtype = torch.float16 if a_dtype_str == "fp16" else torch.bfloat16
+    a_tri = alloc_rand((M, K), dtype=fp16_dtype, device="cuda", requires_grad=False)
+    b_tri = alloc_rand((E, N, K), dtype=fp16_dtype, device="cuda", requires_grad=False)
+    c_tri = torch.zeros(
+        (M, top_k, N), dtype=c_dtype, device="cuda", requires_grad=False
+    )
+    c_tri_silu = torch.zeros((M * top_k, N // 2), dtype=c_dtype, device="cuda")
+
+    a_scale = torch.tensor([1.00], dtype=torch.float32, device="cuda")
+    b_scale = torch.tensor([1.00] * E, dtype=torch.float32, device="cuda")
+
+    # Reference inputs
+    moe_config_func = get_optimal_moe_config_func(
+        fp16_dtype, use_mxfp4=is_a_mixed_input and is_b_mixed_input
+    )
+
+    config = moe_config_func(M)
+
+    values = torch.randn(M, E, dtype=torch.float16, device="cuda")
+    softmax_vals = torch.softmax(values, dim=1)
+    topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = (
+        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
+    )
+    if is_a_mixed_input:
+        # a_ref = a_tri
+
+        # swizzle_axis = 0 if swizzle_mx_scale else None  # TODO Add Swizzle support
+        a_tri, a_mx_scales = torch_dynamic_mxfp4_quant(a_tri)
+    else:
+        a_mx_scales = None
+    # Downcast b tensor to mxfp4 and upcast back for reference
+    if is_b_mixed_input:
+        # b_ref = b_tri
+
+        # swizzle_axis = 1 if swizzle_mx_scale else None  # TODO Add Swizzle support
+        b_tri, b_mx_scales = torch_dynamic_mxfp4_quant(b_tri)
+
+    return (
+        a_tri,
+        b_tri,
+        c_tri,
+        c_tri_silu,
+        a_scale,
+        b_scale,
+        a_mx_scales,
+        b_mx_scales,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        config,
+    )
+
+
 # Note: Eventually all these combinations will be supported
 # Hardware native OCP
 # ("fp8_e5m2", "mxfp4_e2m1"),
@@ -217,6 +286,7 @@ def alloc_rand(shape, device, dtype, requires_grad=True):
         ("mxfp4_e2m1", "mxfp4_e2m1"),  # TODO Add support for other types
     ],
 )
+@pytest.mark.parametrize("silu_fused", [False, True])
 @pytest.mark.parametrize("routed_weight", [False, True])
 @pytest.mark.parametrize("swizzle_mx_scale", [False])  # TODO Add support for swizzle
 def test_fused_moe(
@@ -227,58 +297,41 @@ def test_fused_moe(
     E: int,
     a_dtype_str: str,
     b_dtype_str: str,
+    silu_fused: bool,
     routed_weight: bool,
     swizzle_mx_scale: bool,
 ):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.manual_seed(20)
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
         pytest.skip("MXFP4 not supported on this architecture")
 
+    (
+        a_tri,
+        b_tri,
+        c_tri,
+        c_silu_tri,
+        a_scale,
+        b_scale,
+        a_mx_scales,
+        b_mx_scales,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        config,
+    ) = input_helper(M, N, K, top_k, E, a_dtype_str, b_dtype_str)
+
+    a_ref, b_ref, c_ref = a_tri.clone(), b_tri.clone(), c_tri.clone()
     is_a_mixed_input = a_dtype_str.startswith("mx")
     is_b_mixed_input = b_dtype_str.startswith("mx")
-    a_dtype = str_to_torch_dtype[a_dtype_str]
-    c_dtype = torch.bfloat16 if is_a_mixed_input else a_dtype
     fp16_dtype = torch.float16 if a_dtype_str == "fp16" else torch.bfloat16
-    a_tri = alloc_rand((M, K), dtype=fp16_dtype, device="cuda", requires_grad=False)
-    b_tri = alloc_rand((E, N, K), dtype=fp16_dtype, device="cuda", requires_grad=False)
-    c_tri = torch.zeros(
-        (M, top_k, N), dtype=c_dtype, device="cuda", requires_grad=False
-    )
-    a_scale = torch.tensor([1.00], dtype=torch.float32, device="cuda")
-    b_scale = torch.tensor([1.00] * E, dtype=torch.float32, device="cuda")
-
-    # Reference inputs
-    a_ref, b_ref, c_ref = a_tri.clone(), b_tri.clone(), c_tri.clone()
-
-    # Try fixed config for now
-    config = {
-        "BLOCK_SIZE_M": 128,
-        "BLOCK_SIZE_N": 128,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 4,
-        "num_warps": 8,
-        "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "kpack": 1,
-    }
-
-    values = torch.randn(M, E, dtype=torch.float16, device="cuda")
-    softmax_vals = torch.softmax(values, dim=1)
-    topk_weights, topk_ids = torch.topk(softmax_vals, k=top_k, dim=1)
-
-    sorted_token_ids, expert_ids, num_tokens_post_padded = (
-        torch_moe_align_block_size_ref(topk_ids, config["BLOCK_SIZE_M"], E)
-    )
 
     # Downcast a tensor to mxfp4 and upcast back for reference
     if is_a_mixed_input:
-        # a_ref = a_tri
-
-        # swizzle_axis = 0 if swizzle_mx_scale else None  # TODO Add Swizzle support
-        a_tri, a_mx_scales = torch_dynamic_mxfp4_quant(a_tri)
-
         # TODO Add Upcast support
         # a_ref = torch_upcast_from_mxfp(
         #    a_tri, a_mx_scales, fp16_dtype, axis=1, swizzle_axis=swizzle_axisv
@@ -286,14 +339,8 @@ def test_fused_moe(
         a_ref = torch_mxfp4_to_fp32(a_tri, a_mx_scales)
     else:
         a_ref = a_ref.to(fp16_dtype)
-        a_mx_scales = None
     # Downcast b tensor to mxfp4 and upcast back for reference
     if is_b_mixed_input:
-        # b_ref = b_tri
-
-        # swizzle_axis = 1 if swizzle_mx_scale else None  # TODO Add Swizzle support
-        b_tri, b_mx_scales = torch_dynamic_mxfp4_quant(b_tri)
-
         # TODO Add Upcast support
         # b_ref = torch_upcast_from_mxfp(
         #    b_tri, b_mx_scales, fp16_dtype, axis=2, swizzle_axis=swizzle_axis
@@ -304,10 +351,15 @@ def test_fused_moe(
         )
 
     # Triton
-    fused_moe_mxfp4(
+    if silu_fused:
+        fused_moe_fn = fused_moe_mxfp4_silu
+    else:
+        fused_moe_fn = fused_moe_mxfp4
+
+    fused_moe_fn(
         a_tri,
         b_tri,
-        c_tri,
+        c_silu_tri if silu_fused else c_tri,
         a_scale,
         b_scale,
         a_mx_scales,
@@ -348,5 +400,10 @@ def test_fused_moe(
         int8_w8a16=False,
         int4_w4a16=False,
     )
-
-    torch.testing.assert_close(c_tri.to(fp16_dtype), c_ref.to(fp16_dtype))
+    if silu_fused:
+        c_ref = torch_silu_and_mul_ref(c_ref.view(-1, N))
+        torch.testing.assert_close(
+            c_silu_tri.to(fp16_dtype), c_ref.to(fp16_dtype), atol=1e-1, rtol=1e-1
+        )
+    else:
+        torch.testing.assert_close(c_tri.to(fp16_dtype), c_ref.to(fp16_dtype))
