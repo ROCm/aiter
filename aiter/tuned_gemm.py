@@ -55,6 +55,7 @@ class TunedGemm:
     def load_best_sols(self):
         if self.tune_path is not None and Path(self.tune_path).is_file():
             self.bestsols = pd.read_csv(self.tune_path)
+            self.bestsols = self.bestsols[self.bestsols["cu_num"] == self.cu_count]
             if len(self.bestsols) > 0 and "kernelName" in self.bestsols.columns:
                 hipblasltKernelNames = self.bestsols.apply(
                     lambda s: (
@@ -78,7 +79,6 @@ class TunedGemm:
         for i in range(len(df)):
             ds = df.iloc[i]
             key = (
-                ds["cu_num"],
                 ds["M"],
                 ds["N"],
                 ds["K"],
@@ -121,10 +121,9 @@ class TunedGemm:
                 and k <= 256
             ):
                 soltype, solidx = 3, 2
-
         if soltype is None:
             soltype, solidx = self.solids.get(
-                (self.cu_count,m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+                (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
             )
         solution_name = self.solMap[soltype]
 
