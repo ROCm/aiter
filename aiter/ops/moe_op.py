@@ -312,6 +312,7 @@ def get_moe_stage_module(
     activation,
     quant_type,
     mul_routed_weight_stage,
+    mode="===",
 ):
     if isinstance(activation, int):
         activation = ActivationType(activation)
@@ -328,21 +329,26 @@ def get_moe_stage_module(
     act = str(activation).split(".")[-1].lower()
     quant_type = str(quant_type).split(".")[-1].lower()
 
-    md_name = ("_").join(
-        [
-            "module_moe_ck2stages",
-            Adtype,
-            Bdtype,
-            Cdtype,
-            act,
-            quant_type,
-            f"mulWeightStage{mul_routed_weight_stage}",
+    if mode == "JIT":
+        md_name = ("_").join(
+            [
+                "module_moe_ck2stages",
+                Adtype,
+                Bdtype,
+                Cdtype,
+                act,
+                quant_type,
+                f"mulWeightStage{mul_routed_weight_stage}",
+            ]
+        )
+        blob_gen_cmd = [
+            f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -w {{}}"
         ]
-    )
-
-    blob_gen_cmd = [
-        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -w {{}}"
-    ]
+    else:
+        md_name = "module_moe_ck2stages"
+        blob_gen_cmd = [
+            f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -w {{}}"
+        ]
 
     return md_name, blob_gen_cmd
 
