@@ -46,7 +46,6 @@ if IS_ROCM:
         exclude_ops = [
             "libmha_fwd",
             "libmha_bwd",
-            "module_moe_ck2stages",
             "module_fmha_v3_fwd",
             "module_mha_fwd",
             "module_mha_varlen_fwd",
