@@ -104,7 +104,9 @@ def bench_fn(
         if activation is not None:
             flops += batch * intermediate_dim
     else:
-        flops = 4.0 * batch * hidden_dim * intermediate_dim
+        flops_gemm1 = 2.0 * batch * hidden_dim * intermediate_dim
+        flops_gemm2 = 2.0 * batch * intermediate_dim * hidden_dim
+        flops = flops_gemm1 + flops_gemm2
         if activation is not None:
             flops += batch * intermediate_dim
 
