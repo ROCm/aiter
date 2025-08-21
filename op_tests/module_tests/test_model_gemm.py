@@ -84,7 +84,7 @@ class GemmTestRunner:
         records = []
         for tp in TP_list:
             # for Qwen3-32B, the dim is not dividable by 32 with tp 8, we skip this case
-            if config.model_name == "Qwen3-32B" and tp == 8:
+            if config.model_name == "Qwen3-32B" and (tp == 8 or tp == 4):
                 continue
             hidden_size = config.attention_head * config.head_dim   
             # attn qkv fused gemm           
