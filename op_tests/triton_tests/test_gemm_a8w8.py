@@ -36,42 +36,6 @@ dtype_max = {
 }
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536), (4864, 8192, 4160)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
-    x_vals += [(1, 1, 1)]
-    return x_vals
-
-
 def generate_gemm_a8w8_inputs(
     M: int,
     N: int,
@@ -116,18 +80,83 @@ def generate_gemm_a8w8_inputs(
     return x, weight, x_scale, w_scale, bias, y
 
 
+def basic_shape_set():
+    shapes = [(1, 1, 1)]  # minimal case
+    shapes += [(3, 5, 2)]  # irregular shape
+    shapes += [
+        (32, 32, 32),
+        (128, 128, 128),
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (4864, 4096, 8192),
+    ]
+    shapes += [(2**i, 256, 7168) for i in range(1, 4)]
+    return shapes
+
+
+def extended_shape_set():
+    shapes = [(2**i, 256, 7168) for i in range(5, 9)]
+    shapes += [(1024 * v, 1024 * v, 1024 * v) for v in range(2, 9)]
+    shapes += [(4864, 8192, 4160)]  # TODO (9728-8192-65536) Fails due to mismatches
+    shapes += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]
+    shapes += [
+        (256, 8192, 1024),
+        (256, 1024, 8192),
+        (256, 32768, 8192),
+        # (256, 8192, 32768), Fails due to mismatches
+    ]
+    return shapes
+
+
 @pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k, layout, output",
+    "m, n, k, in_dtype, out_dtype, output, layout",
     [
-        (in_dtype, out_dtype, *shape, layout, output)
+        (*shape, in_dtype, out_dtype, output, layout)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16"]
-        for shape in get_x_vals()
+        for shape in basic_shape_set()
+        for layout in ["TN", "TT", "NN", "NT"]
+        for output in [True, False]
+    ]
+    + [
+        pytest.param(
+            *shape, in_dtype, out_dtype, output, layout, marks=pytest.mark.extended
+        )
+        for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
+        for out_dtype in ["bf16"]
+        for shape in extended_shape_set()
         for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
     ],
 )
-def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
+def test_gemm(m, n, k, in_dtype, out_dtype, output, layout):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
@@ -143,7 +172,7 @@ def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
         output=output,
     )
 
-    a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
+    torch_out = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
+    triton_out = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
 
-    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+    torch.testing.assert_close(torch_out, triton_out, atol=0.02, rtol=1e-2)

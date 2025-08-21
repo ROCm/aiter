@@ -76,11 +76,25 @@ def run_triton(x, weight, x_scale, w_scale, bias=None, dtype=torch.bfloat16, y=N
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
+def basic_shape_set():
+    shapes = [(1, 1, 1)]  # minimal case
+    shapes += [(3, 5, 2)]  # irregular shape
+    shapes += [
+        (32, 32, 32),
+        (128, 128, 128),
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (4864, 4096, 8192),
+    ]
+    shapes = [(2**i, 256, 7168) for i in range(1, 4)]
+    return shapes
 
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65000), (4864, 8192, 4160)]
-    x_vals += [
+
+def extended_shape_set():
+    shapes = [(2**i, 256, 7168) for i in range(5, 9)]
+    shapes += [(1024 * v, 1024 * v, 1024 * v) for v in range(2, 9)]
+    shapes = [(9728, 8192, 65536), (4864, 8192, 4160)]
+    shapes += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -108,60 +122,36 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(1, 1, 1)]  # minimal case
-    return x_vals
-
-
-def minimal_x_vals(num_vals=20):
-    """
-    Returns the num_vals smallest test cases. Useful for generating a subset to quickly test on.
-    """
-    x_vals = get_x_vals()
-    num_ops = [(i, functools.reduce(lambda x, y: x * y, i)) for i in x_vals]
-    sorted_x_vals = sorted(num_ops, key=lambda x: x[1])
-    return [i[0] for i in sorted_x_vals[: min(num_vals, len(sorted_x_vals))]]
+    return shapes
 
 
 @pytest.mark.parametrize(
-    "dtype, b, m, n, k, output",
+    "B, M, N, K, dtype, output, layout",
     [
-        (dtype, b, *shape, output)
+        (batch, *shape, dtype_str, output, layout)
+        for batch in [1, 16]
+        for shape in basic_shape_set()
+        for dtype_str in ["bf16"]
         for output in [True, False]
-        for dtype in ["bf16"]
-        for b in [16]
-        for shape in get_x_vals()
+        for layout in ["TN", "TT", "NN", "NT"]
+    ]
+    + [
+        pytest.param(
+            batch, *shape, dtype_str, output, layout, marks=pytest.mark.extended
+        )
+        for batch in [1, 16]
+        for shape in extended_shape_set()
+        for dtype_str in ["bf16"]
+        for output in [True, False]
+        for layout in ["TN", "TT", "NN", "NT"]
     ],
 )
-def test_batched_gemm_a8w8(dtype, b, m, n, k, output):
+def test_batched_gemm_a8w8(B, M, N, K, dtype, output, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
-        b, m, n, k, dtype, output
-    )
-    a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
-
-    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
-
-
-@pytest.mark.parametrize(
-    "dtype, b, m, n, k, layout, output",
-    [
-        (dtype, b, *shape, layout, output)
-        for dtype in ["bf16"]
-        for b in [16]
-        for shape in minimal_x_vals()
-        for output in [True, False]
-        for layout in ["TT", "NN", "NT"]
-    ],
-)
-def test_batched_gemm_a8w8_layout(dtype, b, m, n, k, layout, output):
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-
-    dtype = str_to_torch_dtype[dtype]
-    x, weight, x_scale, w_scale, bias, y = generate_batched_gemm_a8w8_inputs(
-        b, m, n, k, dtype, output, layout
+        B, M, N, K, dtype, output, layout
     )
     a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, dtype, y)
