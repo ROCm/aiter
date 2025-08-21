@@ -5,7 +5,6 @@ Manages test parameters and executes test_gemm.py/test_gemm_a4w4.py/test_gemm_a8
 """
 
 import logging
-import aiter
 import pandas as pd
 from aiter import dtypes
 from dataclasses import dataclass
@@ -183,7 +182,7 @@ class GemmTestRunner:
                     )
 
         df = pd.DataFrame(df)
-        aiter.logger.info(f"summary:\n{df}")
+        # aiter.logger.info(f"summary:\n{df}")
 
     def save_structs_to_csv(self, records, csv_file, fieldnames):
         import csv
