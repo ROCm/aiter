@@ -110,6 +110,8 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, 8],
         order=[0, 1],
     )
+    blocked_c: gl.constexpr = blocked_mk
+
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[1, 0]
     )
@@ -152,11 +154,11 @@ def _gemm_a8w8_blockscale_kernel(
         offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
         offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
 
-        smem_scale_a = gl.allocate_shared_memory(a_scale_ptr.element_ty,
+        smem_scale_a = gl.allocate_shared_memory(a_scale_ptr.type.element_ty,
                                                  [BLOCK_SIZE_M],
                                                  layout=shared_a_scale)
         
-        smem_scale_b = gl.allocate_shared_memory(b_scale_ptr.element_ty,
+        smem_scale_b = gl.allocate_shared_memory(b_scale_ptr.type.element_ty,
                                                  [BLOCK_SIZE_N],
                                                  layout=shared_b_scale)
     
@@ -169,36 +171,36 @@ def _gemm_a8w8_blockscale_kernel(
 
         # Create pointers for the scales
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
-        a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
-        )
+        offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
 
         if EVEN_K:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
-                                        cache_modifier=cache_modifier)
-            a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr, offsets=offs_a,
-                                        cache_modifier=cache_modifier)
+                                        cache=cache_modifier)
         else:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                          mask=offs_ak[None, :] < K, other=0.0,
-                                        cache_modifier=cache_modifier)
+                                        cache=cache_modifier)
+        a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
+                                            offsets=offs_a_scale,
+                                            cache=cache_modifier)
         offs_b = (
             offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
         offs_bsn = offs_bn // GROUP_N
-        b_scale_ptrs = (
-            b_scale_ptr + offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
-        )
+        offs_b_scale = offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
 
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
-                                        cache_modifier=cache_modifier)
+                                        cache=cache_modifier)
         else:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                         mask=offs_bk[:, None] < K, other=0.0,
-                                        cache_modifier=cache_modifier)
-
+                                        cache=cache_modifier)
+        b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
+                                            offsets=offs_b_scale,
+                                            cache=cache_modifier)
         smem_a.store(a)
+        smem_scale_a.store(a_scale)
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
         accumulator = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -208,36 +210,40 @@ def _gemm_a8w8_blockscale_kernel(
             # Advance the ptrs to the next K block.
             offs_a += BLOCK_SIZE_K * stride_ak
             offs_b += BLOCK_SIZE_K * stride_bk
+            offs_a_scale += offs_ks_step * stride_ascale_k
+            offs_b_scale += offs_ks_step * stride_bscale_k
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
+            smem_b.store(b)
+            smem_scale_b.store(b_scale)
             if EVEN_K:
-                smem_b.store(b)
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
-                                             cache_modifier=cache_modifier)
-                cur_a = smem_a.load(layout=dot_a_layout)
-                cur_b = smem_b.load(layout=dot_b_layout)
-                b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
-                                             cache_modifier=cache_modifier)
-                accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
-                smem_a.store(a)
+                                             cache=cache_modifier)
             else:
-                smem_b.store(b)
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                              mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, 
                                              other=0.0,
-                                             cache_modifier=cache_modifier)
-                cur_a = smem_a.load(layout=dot_a_layout)
-                cur_b = smem_b.load(layout=dot_b_layout)
+                                             cache=cache_modifier)
+            a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
+                                               offsets=offs_a_scale,
+                                               cache=cache_modifier)
+            cur_a = smem_a.load(layout=dot_a_layout)
+            cur_b = smem_b.load(layout=dot_b_layout)
+            cur_a_scale = smem_a.load(layout=gl.SliceLayout(1, blocked_mk))
+            cur_b_scale = smem_b.load(layout=gl.SliceLayout(0, blocked_kn))
+            if EVEN_K:
+                b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
+                                             cache=cache_modifier)
+            else:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                              mask=offs_bk[:, None] < K - k * BLOCK_SIZE_K,
                                              other=0.0,
-                                             cache_modifier=cache_modifier)
-                accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
-                smem_a.store(a)
-
-            a_scale = gl.load(a_scale_ptrs)
-            b_scale = gl.load(b_scale_ptrs)
+                                             cache=cache_modifier)
+            accumulator = gl.amd.cdna4.mfma(cur_a, cur_b, accumulator)
+            accumulator *= cur_a_scale[:, None] * cur_b_scale[None, :]
+            smem_a.store(a)
+            smem_scale_a.store(a_scale)
 
             # Perform dot operation and apply scale
             accumulator += (
@@ -249,22 +255,23 @@ def _gemm_a8w8_blockscale_kernel(
             # k_cur = k * BLOCK_SIZE_K // GROUP_K
             # k_nxt = (k + 1) * BLOCK_SIZE_K // GROUP_K
             # offs_ks = k_nxt - k_cur
-            a_scale_ptrs += offs_ks_step * stride_ascale_k
-            b_scale_ptrs += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
+        c = gl.convert_layout(c, layout=blocked_c)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M).to(gl.int64)
-        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N).to(gl.int64)
-        c_ptrs = (
-            c_ptr
-            + stride_cm * offs_cm[:, None]
+        offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
+                                                   layout=gl.SliceLayout(1, blocked_c)).to(gl.int64)
+        offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
+                                                   layout=gl.SliceLayout(0, blocked_c)).to(gl.int64)
+        c_offs = (
+            stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        gl.store(c_ptrs, c, mask=c_mask)
+        gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs,
+                                   mask=c_mask)
 
 
 @triton.jit
