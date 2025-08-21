@@ -39,8 +39,8 @@ torch::Tensor
     std::optional<torch::Tensor> w_scale      = std::nullopt)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
-    int NumTokens = XQ.size(0);
-    int M = sorted_ids.size(0);
+    int NumTokens = XQ.size(0){" / topk" if k.stage == 2 else ""};
+    int M = (NumTokens * topk + {k.MPerBlock} - 1) / {k.MPerBlock} * {k.MPerBlock};
     int N = WQ.size(1); //gate+up
     int K = XQ.size(-1);
     int E = WQ.size(0);
