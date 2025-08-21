@@ -33,6 +33,7 @@ torch::Tensor
     torch::Tensor& sorted_ids,
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
+    int expert,
     int topk,
     std::optional<torch::Tensor> topk_weight  = std::nullopt,
     std::optional<torch::Tensor> x_scale      = std::nullopt,
@@ -41,9 +42,9 @@ torch::Tensor
     // The smallest kernel we have available. Works well for memory bound shapes.
     int NumTokens = XQ.size(0){" / topk" if k.stage == 2 else ""};
     int M = (NumTokens * topk + {k.MPerBlock} - 1) / {k.MPerBlock} * {k.MPerBlock};
-    int N = WQ.size(1); //gate+up
+    int N = WQ.size(0) / expert; //gate+up
     int K = XQ.size(-1);
-    int E = WQ.size(0);
+    // int E = WQ.size(0);
     int KBatch = 1;
     int stride_A = K;
     int stride_B = K;
@@ -79,7 +80,7 @@ torch::Tensor
                 reinterpret_cast<const void*>(WQ.data_ptr()),
                 reinterpret_cast<void*>(Y.data_ptr()),
                 NumTokens,
-                E,
+                expert,
                 topk,
                 1, // k_batch
                 M,
@@ -139,6 +140,7 @@ template torch::Tensor
     torch::Tensor& sorted_ids,
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
+    int expert,
     int topk,
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
@@ -227,6 +229,7 @@ torch::Tensor
     torch::Tensor& sorted_ids,
     torch::Tensor& sorted_expert_ids,
     torch::Tensor& max_token_ids,
+    int expert,
     int topk,
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,

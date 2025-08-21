@@ -10,7 +10,7 @@ using MoeKernel = std::function<
     torch::Tensor(torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &,
                   torch::Tensor &, torch::Tensor &,
-                  int, std::optional<torch::Tensor>,
+                  int, int, std::optional<torch::Tensor>,
                   std::optional<torch::Tensor>, std::optional<torch::Tensor>)>;
 
                   template <typename ABDataType, typename AccDataType, typename CDataType, int stage>
@@ -18,7 +18,7 @@ MoeKernel moe_heuristic_dispatch(int M, int N, int K, int block_m)
 {
   // Apply shape heuristics to find a suitable kernel implementation.
   if (stage == 1){
-    return moe_cktile2stages_gemm1_256x64x64x256_2x2_16x16x64_per_token_silu<ABDataType, AccDataType, CDataType>;
+    return moe_cktile2stages_gemm1_256x64x128x128_1x4_16x16x64_per_token_silu<ABDataType, AccDataType, CDataType>;
   }
   else{
     return moe_cktile2stages_gemm2_256x64x64x256_1x4_16x16x64_per_token_MulRoutedWeight<ABDataType, AccDataType, CDataType>;
@@ -79,6 +79,7 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                         torch::Tensor& sorted_ids,
                         torch::Tensor& sorted_expert_ids,
                         torch::Tensor& max_token_ids,
+                        int expert,
                         int topk,
                         std::optional<torch::Tensor> topk_weight,
                         std::optional<torch::Tensor> x_scale,
@@ -97,15 +98,12 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
 
     
     int NumTokens = XQ.size(0);
-    int M = sorted_ids.size(0);
-    int N = WQ.size(1); //gate+up
+    int N = WQ.size(0) / expert; //gate+up
     int K = XQ.size(-1);
-    int E = WQ.size(0);
-    int KBatch = 1;
-    int stride_A = K;
-    int stride_B = N;
-    int stride_C = N / 2;
+    // int E = WQ.size(0);
     int MPerBlock = block_m.value();
+    int M = (NumTokens * topk + MPerBlock - 1) / MPerBlock * MPerBlock;
+    printf("BeforeDispatch: Token: %d, (MNK)=(%d,%d,%d), Expert=%d.\n", NumTokens, M, N, K, expert);
 
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Y));
@@ -120,11 +118,11 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     {
         if (Y.dtype() == at::ScalarType::Half)
         {
-           moe_dispatch<fp8, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+           moe_dispatch<fp8, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, expert, topk, topk_weight, x_scale, w_scale); 
         }
         else if (Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+            moe_dispatch<fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, expert, topk, topk_weight, x_scale, w_scale); 
         }
     }
     else
@@ -140,6 +138,7 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                         torch::Tensor& sorted_ids,
                         torch::Tensor& sorted_expert_ids,
                         torch::Tensor& max_token_ids,
+                        int expert,
                         int topk,
                         std::optional<torch::Tensor> topk_weight,
                         std::optional<torch::Tensor> x_scale,
@@ -147,16 +146,12 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                         std::optional<int> block_m)
 {
      
-    int NumTokens = XQ.size(0);
-    int M = sorted_ids.size(0);
-    int N = WQ.size(1);
+    int NumTokens = XQ.size(0) / topk;
+    int N = WQ.size(0) / expert;
     int K = XQ.size(-1);
-    int E = WQ.size(0);
-    int KBatch = 1;
-    int stride_A = K;
-    int stride_B = N;
-    int stride_C = N;
+    // int E = WQ.size(0);
     int MPerBlock = block_m.value();
+    int M = (NumTokens * topk + MPerBlock - 1) / MPerBlock * MPerBlock;
 
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(Y));
@@ -171,11 +166,11 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     {
         if (Y.dtype() == at::ScalarType::Half)
         {
-           moe_dispatch<fp8, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+           moe_dispatch<fp8, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, expert, topk, topk_weight, x_scale, w_scale); 
         }
         else if (Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+            moe_dispatch<fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, expert, topk, topk_weight, x_scale, w_scale); 
         }
     }
     else
