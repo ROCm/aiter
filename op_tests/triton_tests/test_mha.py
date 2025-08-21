@@ -663,6 +663,9 @@ def test_mha_backward(
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
+    # Test is working with a Triton compiler from Aug-13.
+    # Commit: a9d79a6f3be95ddfa1ac4097470477eb3c71a151
+    # pytest.skip("Backward accuracy issues due to Triton compiler")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
     mha_set_use_fused_bwd_kernel(FUSED)
@@ -801,6 +804,9 @@ def test_mha_backward_varlen(
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
+    # Test is working with a Triton compiler from Aug-13.
+    # Commit: a9d79a6f3be95ddfa1ac4097470477eb3c71a151
+    # pytest.skip("Backward accuracy issues due to Triton compiler")
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
 
