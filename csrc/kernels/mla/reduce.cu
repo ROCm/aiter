@@ -335,8 +335,6 @@ void mla_reduce_v1(
     const bool output_lse = final_lse.has_value();
     const int32_t num_reduce_tile = reduce_indptr.size(0) - 1;
     const int32_t num_heads = partial_output.size(-2);
-    TORCH_CHECK(num_reduce_tile == reduce_final_map.size(0),
-                __func__, ": Invalid size of reduce_indptr or reduce_final_map!");
 
     if (num_reduce_tile > 0)
     {

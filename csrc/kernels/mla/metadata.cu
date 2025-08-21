@@ -374,6 +374,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        num_batches;
     int32_t        num_heads;
     int32_t        num_cu;
+    int32_t        reduce_indptr_size;
     bool           is_causal;
 };
 
@@ -758,6 +759,13 @@ __global__ void kn_get_mla_metadata_v1(
         }
     }
 
+    // reduce_indptr may be larger than #clusters.
+    const int32_t num_reduce_tiles = scan_base;
+    for (int32_t idx = max_qo_tiles + 1 + lane_idx; idx < params.reduce_indptr_size; idx += ck_tile::get_warp_size())
+    {
+        params.p_reduce_indptr[idx] = num_reduce_tiles;
+    }
+
     // Step.7. Fill metadata pointers for MLA kernel and the 1st element of reduce_indptr.
     if (lane_idx == 0)
     {
@@ -866,6 +874,7 @@ void get_mla_metadata_v1_device(
     params.num_batches          = num_batches;
     params.num_heads            = num_heads_per_head_k * num_heads_k;
     params.num_cu               = num_cu;
+    params.reduce_indptr_size   = reduce_indptr.size(0);
     params.is_causal            = is_causal;
 
     // launch kernel
