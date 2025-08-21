@@ -247,6 +247,9 @@ def _gemm_a8w8_blockscale_kernel(
                                              mask=offs_bk[:, None] < K - k * BLOCK_SIZE_K,
                                              other=0.0,
                                              cache=cache_modifier)
+            b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
+                                                offsets=offs_b_scale,
+                                                cache=cache_modifier)
             mfma_acc = gl.amd.cdna4.mfma(cur_a, cur_b, mfma_acc)
             accumulator += gl.convert_layout(mfma_acc, layout=blocked_mn) * cur_a_scale[:, None] * cur_b_scale[None, :]
             smem_a.store(a)
