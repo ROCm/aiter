@@ -65,7 +65,7 @@ run_group_mode_tests() {
     for hdim in 64 80 96 120 128 144 160 192; do
     for mask in 0 1 ; do
     for v3_bf16_cvt in 0 1 2 ; do #valid for bf16. Pls set CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT in config.hpp to the corresponding value and re-test if a small number of slight mimatchs occurred
-    
+
     if [ $prec = "fp16" ] && [ $v3_bf16_cvt -gt 0 ]; then
         echo "skip fp16 with bf16_convert cases"
         continue
