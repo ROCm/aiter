@@ -255,6 +255,7 @@ def run_benchmark(custom, args):
                     dropout,
                     causal,
                     args.fp8,
+                    fused_backward,
                     dtype,
                 )
                 print("Backward test passed!")
@@ -284,6 +285,7 @@ def run_benchmark(custom, args):
                     dropout,
                     causal,
                     args.fp8,
+                    fused_backward,
                     dtype,
                 )
                 print("Backward test passed!")
