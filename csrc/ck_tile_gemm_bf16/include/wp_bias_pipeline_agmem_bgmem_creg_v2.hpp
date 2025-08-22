@@ -727,7 +727,7 @@ struct WeightPreshufflePipelineAGmemBGmemCRegV2_bias
             sweep_tile(c_block_tile, [&](auto idx) {
                 // compute x = bias + x
                 constexpr auto j_idx = make_tuple(idx[number<1>{}]);
-                c_block_tile(idx)             += type_convert<float>(bias[j_idx]) ;
+                c_block_tile(idx)             += type_convert<float>(bias[j_idx]);
                 
             });
 
