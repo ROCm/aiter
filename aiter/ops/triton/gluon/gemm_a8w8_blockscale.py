@@ -113,7 +113,7 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=2, max_phase=8, order=[1, 0]
+        vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
     shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=2, max_phase=8, order=[0]
@@ -122,11 +122,10 @@ def _gemm_a8w8_blockscale_kernel(
         vec=8, per_phase=2, max_phase=8, order=[0]
     )
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=2, max_phase=8, order=[0, 1]
+        vec=16, per_phase=2, max_phase=8, order=[0, 1]
     )
-    # mfma layout is tuned by trial and error to find the fastest one
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=False, warps_per_cta=[2, 2]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=8
@@ -136,7 +135,6 @@ def _gemm_a8w8_blockscale_kernel(
     )
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
-
         # SPLITK_BLOCK_SIZE = gl.cdiv(K, NUM_KSPLIT)
         num_k_iter = gl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
 
@@ -180,7 +178,6 @@ def _gemm_a8w8_blockscale_kernel(
                 ptr=a_ptr,
                 offsets=offs_a,
                 mask=offs_am[:, None] < M,
-                #  other=other_a,
                 cache=cache_modifier,
             )
         else:
@@ -189,14 +186,11 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_a,
                 mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
                 & (offs_am[:, None] < M),
-                #  other=other_a,
                 cache=cache_modifier,
             )
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
-            #    mask=offs_am < M,
-            #    other=other_a_scale,
             cache=cache_modifier,
         )
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
@@ -208,7 +202,6 @@ def _gemm_a8w8_blockscale_kernel(
                 ptr=b_ptr,
                 offsets=offs_b,
                 mask=offs_bn[None, :] < N,
-                # other=other_b,
                 cache=cache_modifier,
             )
         else:
@@ -217,14 +210,11 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_b,
                 mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
                 & (offs_bn[None, :] < N),
-                # other=other_b,
                 cache=cache_modifier,
             )
         b_scale = gl.amd.cdna4.buffer_load(
             ptr=b_scale_ptr,
             offsets=offs_b_scale,
-            #    mask=offs_bn < N,
-            #    other=other_b_scale,
             cache=cache_modifier,
         )
         smem_a.store(a)
@@ -255,7 +245,6 @@ def _gemm_a8w8_blockscale_kernel(
                     ptr=a_ptr,
                     offsets=offs_a,
                     mask=offs_am[:, None] < M,
-                    #  other=other_a,
                     cache=cache_modifier,
                 )
             else:
@@ -264,14 +253,11 @@ def _gemm_a8w8_blockscale_kernel(
                     offsets=offs_a,
                     mask=(offs_ak[None, :] < K - (k + 1) * BLOCK_SIZE_K)
                     & (offs_am[:, None] < M),
-                    #  other=other_a,
                     cache=cache_modifier,
                 )
             a_scale = gl.amd.cdna4.buffer_load(
                 ptr=a_scale_ptr,
                 offsets=offs_a_scale,
-                #    mask=offs_am < M,
-                #    other=other_a_scale,
                 cache=cache_modifier,
             )
             cur_a = smem_a.load(layout=dot_a_layout)
@@ -283,7 +269,6 @@ def _gemm_a8w8_blockscale_kernel(
                     ptr=b_ptr,
                     offsets=offs_b,
                     mask=offs_bn[None, :] < N,
-                    #  other=other_b,
                     cache=cache_modifier,
                 )
             else:
@@ -292,14 +277,11 @@ def _gemm_a8w8_blockscale_kernel(
                     offsets=offs_b,
                     mask=(offs_bk[:, None] < K - (k + 1) * BLOCK_SIZE_K)
                     & (offs_bn[None, :] < N),
-                    #  other=other_b,
                     cache=cache_modifier,
                 )
             b_scale = gl.amd.cdna4.buffer_load(
                 ptr=b_scale_ptr,
                 offsets=offs_b_scale,
-                # mask=offs_bn < N,
-                # other=other_b_scale,
                 cache=cache_modifier,
             )
             mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
@@ -326,7 +308,6 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         c = acc.to(c_ptr.type.element_ty)
-        # c = gl.convert_layout(c, layout=blocked_c)
 
         # # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
