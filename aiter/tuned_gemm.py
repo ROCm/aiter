@@ -38,7 +38,9 @@ def load_best_sols_custom(tune_path: str) -> bool:
         if len(bestsols) > 0 and "kernelName" in bestsols.columns:
             hipblasltKernelNames = bestsols.apply(
                 lambda s: (
-                    getHipblasltKernelName(s.solidx) if s.libtype == "hipblaslt" else "rocblas"
+                    getHipblasltKernelName(s.solidx)
+                    if s.libtype == "hipblaslt"
+                    else "rocblas"
                 ),
                 axis=1,
             )
@@ -77,24 +79,9 @@ class TunedGemm:
             self.tuned_df = None
 
     def load_best_sols(self):
-        if self.tune_path is not None and Path(self.tune_path).is_file():
-            self.bestsols = pd.read_csv(self.tune_path)
-            if len(self.bestsols) > 0 and "kernelName" in self.bestsols.columns:
-                hipblasltKernelNames = self.bestsols.apply(
-                    lambda s: (
-                        getHipblasltKernelName(s.solidx)
-                        if s.libtype == "hipblaslt"
-                        else ""
-                    ),
-                    axis=1,
-                )
-                pd.set_option("display.max_colwidth", 100)
-                assert hipblasltKernelNames.equals(
-                    self.bestsols["kernelName"].fillna("")
-                ), (
-                    "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
-                    + f"differece:\n{pd.concat([self.bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != self.bestsols['kernelName'].fillna('')]}"
-                )
+        if load_best_sols_custom(self.tune_path):
+            global bestsols
+            self.bestsols = bestsols
 
     def create_ds(self):
         df: pd.DataFrame = self.bestsols
