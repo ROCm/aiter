@@ -290,6 +290,8 @@ def test_mha_int64_strides(
         dropout_p=DROPOUT,
         causal=CAUSAL,
         return_lse=True,
+        mapping_mode=1,
+        use_remap=False,
     )
     if test_backward:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
