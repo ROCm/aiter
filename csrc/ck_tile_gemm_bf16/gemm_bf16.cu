@@ -38,7 +38,7 @@
 
 
 using GemmConfig = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
-
+//#include "run_gemm_example.inc"
 
 template <typename ADataType,
           typename BDataType,
@@ -73,6 +73,24 @@ static constexpr inline auto is_row_major(Layout layout_)
 }
 
 
+template <typename GemmConfig>
+torch::Tensor shuffle_b(torch::Tensor& WQ) {
+    TORCH_CHECK(WQ.dim() == 2, "Input tensor must be 2-dimensional");
+    
+    const int64_t n = WQ.size(0);  // 列数
+    const int64_t k = WQ.size(1);  // 行数
+    
+    constexpr int n_warp = GemmConfig::N_Warp_Tile;
+    constexpr int k_warp = GemmConfig::K_Warp_Tile;
+    constexpr int divisor = (n_warp == 32) ? 2 : 4;
+    
+    return WQ.view({n / n_warp,    // n_tiles
+                              n_warp,        // n_warp
+                              k / k_warp,    // k_tiles
+                              divisor,       // divisor
+                              k_warp / divisor})  // k_tile
+           .permute({0, 2, 3, 1, 4}).contiguous();  // [n_tiles, k_tiles, divisor, n_warp, k_tile]
+}
 torch::Tensor ck_tile_gemm_bf16(
                         torch::Tensor& XQ,
                         torch::Tensor& WQ,
@@ -236,16 +254,14 @@ template <typename ADataType,
 float gemm_calc_dipatch(const ck_tile::GemmHostArgs_bias& args, const ck_tile::stream_config& s)
 {
     using GemmTileShapeConfig_ = GemmTileShapeConfig<kM, kN, MaxK>;
-    // using GemmConfig           = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
+    using GemmConfig           = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
   
- 
     // GemmConfigPreshufle_2<ck_tile::fp8_t> GemmConfig;
     const bool pad_M = !(args.M % GemmTileShapeConfig_::M_Tile == 0);
     const bool pad_N = !(args.N % GemmTileShapeConfig_::N_Tile == 0);
     const bool pad_K = !(args.K % GemmTileShapeConfig_::K_Tile == 0);
     float ave_time{0};
     
-    // printf("%d,%d,%d \n",GemmTileShapeConfig_::M_Tile,GemmTileShapeConfig_::N_Tile,GemmTileShapeConfig_::K_Tile);
     BOOL_SWITCH_3(
         pad_M,
         padM_,
@@ -255,7 +271,6 @@ float gemm_calc_dipatch(const ck_tile::GemmHostArgs_bias& args, const ck_tile::s
         padK_,
         [&]{
             
-            // printf("%d,%d,%d,%d,%d,%d\n",GemmTileShapeConfig_::M_Tile, GemmTileShapeConfig_::N_Tile,GemmTileShapeConfig_::K_Tile,GemmTileShapeConfig_::M_Warp,GemmTileShapeConfig_::N_Warp,GemmTileShapeConfig_::K_Warp);
             using GemmShape = ck_tile::TileGemmShape_bias<
             ck_tile::sequence<GemmTileShapeConfig_::M_Tile, GemmTileShapeConfig_::N_Tile, GemmTileShapeConfig_::K_Tile>,
             ck_tile::sequence<GemmTileShapeConfig_::M_Warp, GemmTileShapeConfig_::N_Warp, GemmTileShapeConfig_::K_Warp>,

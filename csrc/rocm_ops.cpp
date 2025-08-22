@@ -32,6 +32,7 @@
 #include "quick_all_reduce.h"
 #include "ck_tile_gemm_bf16.h"
 #include "quick_all_reduce.h"
+#include "ck_tile_gemm_bf16.h"
 #include "rmsnorm.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
