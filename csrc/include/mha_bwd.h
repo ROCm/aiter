@@ -403,6 +403,10 @@ float fmha_bwd_v3(mha_bwd_traits t,
 }
 
 namespace gfx950 {
-float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
+float fmha_bwd_v3(mha_bwd_traits t,
+                  mha_bwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqlen_q_padded = nullptr,
+                  const void* seqlen_k_padded = nullptr);
 }
 } // namespace aiter
