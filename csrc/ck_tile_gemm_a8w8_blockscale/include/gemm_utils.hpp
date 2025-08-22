@@ -27,7 +27,7 @@
 #define UNIVERSAL_GEMM_PIPELINE ck_tile::BaseGemmPipelineAgBgCrMem
 #define GEMM_PIPELINE_SCHEDULER ck_tile::GemmPipelineScheduler::Interwave
 #elif(CK_TILE_PIPELINE_DEFAULT == CK_TILE_PIPELINE_COMPUTE_V3)
-#define GEMM_PIPELINE ck_tile::GemmPipelineAgBgCrComp_blcok_quant
+#define GEMM_PIPELINE ck_tile::GemmPipelineAgBgCrComp_block_quant
 #define UNIVERSAL_GEMM_PIPELINE ck_tile::BaseGemmPipelineAgBgCrComp_block_quant
 #define GEMM_PIPELINE_SCHEDULER ck_tile::GemmPipelineScheduler::Intrawave
 #elif(CK_TILE_PIPELINE_DEFAULT == CK_TILE_PIPELINE_COMPUTE_V4)
