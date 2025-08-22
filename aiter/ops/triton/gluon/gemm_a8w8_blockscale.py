@@ -285,10 +285,7 @@ def _gemm_a8w8_blockscale_kernel(
                 cache=cache_modifier,
             )
             mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-            acc += (mfma_out
-                * cur_a_scale[:, None]
-                * cur_b_scale[None, :]
-            )
+            acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
             smem_a.store(a)
             smem_scale_a.store(a_scale)
 
@@ -301,11 +298,7 @@ def _gemm_a8w8_blockscale_kernel(
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, mfma_layout))
 
         mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-        acc += (
-            mfma_out
-            * cur_a_scale[:, None]
-            * cur_b_scale[None, :]
-        )
+        acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
         c = acc.to(c_ptr.type.element_ty)
 
