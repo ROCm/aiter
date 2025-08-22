@@ -111,7 +111,21 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
-
+    linear_mk: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8]],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]],
+        warp_bases=[[8, 0], [16, 0], [32, 0], [64, 0]],
+        block_bases=[],
+        shape=[32, 128]
+    )
+    linear_kn: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]],
+        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]],
+        warp_bases=[[0, 8], [0, 16], [0, 32], [0, 64]],
+        block_bases=[],
+        shape=[128, 32]
+    )
+    
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
@@ -181,23 +195,6 @@ def _gemm_a8w8_blockscale_kernel(
 
         offs_a_scale = gl.convert_layout(offs_a_scale, layout=gl.SliceLayout(1, mfma_layout))
         offs_b_scale = gl.convert_layout(offs_b_scale, layout=gl.SliceLayout(0, mfma_layout))
-        
-        # offs_a_scale = gl.convert_layout(offs_a_scale, layout= # 16, 8, 1
-        #                                  gl.DistributedLinearLayout(
-        #                                     reg_bases=[[1], [2], [4], [8]],
-        #                                     lane_bases=[[16], [32], [64]],
-        #                                     warp_bases=[],
-        #                                     block_bases=[],
-        #                                     shape=[128]
-        #                                  ))
-        # offs_b_scale = gl.convert_layout(offs_b_scale, layout= # 16, 8, 1
-        #                                  gl.DistributedLinearLayout(
-        #                                     reg_bases=[[1], [2], [4], [8]],
-        #                                     lane_bases=[[16], [32], [64]],
-        #                                     warp_bases=[],
-        #                                     block_bases=[],
-        #                                     shape=[128]
-        #                                  ))
         
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
@@ -278,9 +275,14 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_b_scale,
                 cache=cache_modifier,
             )
-            prod = a_scale[:, None] * b_scale[None, :]
-            mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-            acc += mfma_out * prod
+            # prod = a_scale[:, None] * b_scale[None, :]
+            # mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+            # acc += mfma_out * prod
+            a_scale_mfma = gl.convert_layout(a_scale[:, None], linear_mk)
+            b_scale_mfma = gl.convert_layout(b_scale[None, :], linear_kn)
+            acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale_mfma, "e4m3",
+                                           cur_b, b_scale_mfma, "e4m3",
+                                           acc)
             smem_a.store(a)
 
             a_scale_ptr += offs_ks_step * stride_ascale_k
