@@ -46,7 +46,7 @@ def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return F.linear(x, weight, bias).to(otype)
 
     
-@perftest(num_iters=101, num_warmup=50,needTrace=True)
+@perftest(num_iters=101, num_warmup=50, needTrace=True)
 def run_gemm_b(x, weight, bias, otype=dtypes.bf16):
     return aiter.gemm_bf16_ck_tile(x, weight, bias, otype)
 
