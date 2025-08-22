@@ -1650,15 +1650,15 @@ if __name__ == "__main__":
             )
     else:
         old_tunedf = None
-
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    untunedf["cu_num"] = cu_num
     if args.last:
         untunedf = untunedf.iloc[-1:]
 
     elif old_tunedf is not None and not args.all:
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
-        untunedf["cu_num"] = cu_num
+
         untunedf_cols = untunedf.columns
         mask = untunedf.apply(tuple, axis=1).isin(
             old_tunedf[untunedf_cols].apply(tuple, axis=1)
