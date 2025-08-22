@@ -453,7 +453,7 @@ def mha_varlen_fwd(
     bias: Optional[torch.Tensor] = None,
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+) -> List[torch.Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(
