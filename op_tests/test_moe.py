@@ -331,7 +331,15 @@ parser.add_argument(
     choices=l_test,
     default=None,
     help="""Select test to run.
-    e.g.: -t test_fmoe_16_bit""",
+    e.g.: -t test_fmoe_16_bit
+          or  -t test_fmoe_16_bit
+          or  -t g1u1_no_quant
+          or  -t g1u1_int8quant
+          or  -t g1u1_fp8quant
+          or  -t g1u0_int8smoothquant
+          or  -t g1u1_int8smoothquant
+          or  -t g1u1_fp8smoothquant
+          or  -t g1u1_int4""",
 )
 parser.add_argument(
     "-d",
@@ -387,8 +395,27 @@ parser.add_argument(
     help="""Top-k value.
     e.g.: -k 5""",
 )
+parser.add_argument(
+    "-a",
+    "--activation",
+    type=str,
+    choices=[
+        "silu",
+        "gelu",
+    ],
+    default="silu",
+    help="""Activation function.
+    e.g.: -a silu
+          or -a gelu
+    """,
+)
 
 args = parser.parse_args()
+
+args.activation = {"gelu": ActivationType.Gelu, "silu": ActivationType.Silu}[
+    args.activation
+]
+
 if args.test is not None:
     l_test = [args.test]
 for test in l_test:
@@ -476,7 +503,7 @@ for test in l_test:
                             quant="fp8quant",
                             use_g1u1=True,
                             shared_E=0,
-                            activation=ActivationType.Gelu,
+                            activation=args.activation,
                         )
                         #   quant='fp8quant', use_g1u1=True)
 

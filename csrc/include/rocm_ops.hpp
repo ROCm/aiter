@@ -1,13 +1,28 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-#define ACTIVATION_PYBIND                                                               \
-    m.def("silu_and_mul", &aiter::silu_and_mul, "Activation function used in SwiGLU."); \
-    m.def("scaled_silu_and_mul",                                                        \
-          &aiter::scaled_silu_and_mul,                                                  \
-          "Activation function used in scaled SwiGLU.");                                \
-    m.def("gelu_and_mul", &aiter::gelu_and_mul, "Activation function used in GELU.");   \
-    m.def("gelu_tanh_and_mul", &aiter::gelu_tanh_and_mul, "Activation function used in GELU tanh.");
+#define ACTIVATION_PYBIND                               \
+    m.def("silu_and_mul",                               \
+          &aiter::silu_and_mul,                         \
+          "Activation function used in SwiGLU.",        \
+          py::arg("out"),                               \
+          py::arg("input"));                            \
+    m.def("scaled_silu_and_mul",                        \
+          &aiter::scaled_silu_and_mul,                  \
+          "Activation function used in scaled SwiGLU.", \
+          py::arg("out"),                               \
+          py::arg("input"),                             \
+          py::arg("scale"));                            \
+    m.def("gelu_and_mul",                               \
+          &aiter::gelu_and_mul,                         \
+          "Activation function used in GELU.",          \
+          py::arg("out"),                               \
+          py::arg("input"));                            \
+    m.def("gelu_tanh_and_mul",                          \
+          &aiter::gelu_tanh_and_mul,                    \
+          "Activation function used in GELU tanh.",     \
+          py::arg("out"),                               \
+          py::arg("input"));
 
 #define AITER_OPERATOR_PYBIND                                                   \
     m.def("add", &aiter_add, "apply for add with transpose and broadcast.");    \
@@ -59,14 +74,14 @@
           py::arg("V"),                             \
           py::arg("block_tables"),                  \
           py::arg("context_lens"),                  \
-          py::arg("max_num_blocks"),                \
+          py::arg("block_tables_stride0"),          \
           py::arg("max_qlen")       = 1,            \
           py::arg("K_QScale")       = std::nullopt, \
           py::arg("V_QScale")       = std::nullopt, \
           py::arg("out_")           = std::nullopt, \
           py::arg("qo_indptr")      = std::nullopt, \
           py::arg("high_precision") = 1,            \
-          py::arg("kernelName")     = "");
+          py::arg("kernelName")     = std::nullopt);
 
 #define ATTENTION_CK_PYBIND            \
     m.def("pa_fwd_naive",              \
@@ -558,7 +573,7 @@
           py::arg("num_valid_ids"),                 \
           py::arg("out"),                           \
           py::arg("topk"),                          \
-          py::arg("kernelName")     = "",           \
+          py::arg("kernelName")     = std::nullopt, \
           py::arg("w1_scale")       = std::nullopt, \
           py::arg("a1_scale")       = std::nullopt, \
           py::arg("block_m")        = 32,           \
@@ -576,7 +591,7 @@
           py::arg("num_valid_ids"),                 \
           py::arg("out"),                           \
           py::arg("topk"),                          \
-          py::arg("kernelName")     = "",           \
+          py::arg("kernelName")     = std::nullopt, \
           py::arg("w2_scale")       = std::nullopt, \
           py::arg("a2_scale")       = std::nullopt, \
           py::arg("block_m")        = 32,           \
@@ -645,7 +660,7 @@
           py::arg("num_expert_group"),                                                        \
           py::arg("topk_grp"),                                                                \
           py::arg("need_renorm"),                                                             \
-          py::arg("scoring_func")          = "softmax",                                       \
+          py::arg("scoring_func")          = true,                                            \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
           "Apply grouped topk softmax/sigmodd to the gating outputs.");                       \
     m.def("biased_grouped_topk",                                                              \
@@ -706,6 +721,7 @@
           py::arg("input_scale"),                                                             \
           py::arg("fc1_scale"),                                                               \
           py::arg("fc2_scale"),                                                               \
+          py::arg("kernel_name"),                                                             \
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \
           py::arg("activation")       = ActivationType::Silu);                                      \
     m.def("fmoe_g1u1_tkw1",                                                                   \
@@ -722,6 +738,7 @@
           py::arg("input_scale"),                                                             \
           py::arg("fc1_scale"),                                                               \
           py::arg("fc2_scale"),                                                               \
+          py::arg("kernel_name"),                                                             \
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \
           py::arg("activation")       = ActivationType::Silu);                                      \
     m.def("fmoe_int8_g1u0_a16", &fmoe_int8_g1u0_a16);                                         \
@@ -755,6 +772,7 @@
           py::arg("input_scale"),                                                             \
           py::arg("fc1_scale"),                                                               \
           py::arg("fc2_scale"),                                                               \
+          py::arg("kernel_name"),                                                             \
           py::arg("fc_scale_blkn")    = 128,                                                  \
           py::arg("fc_scale_blkk")    = 128,                                                  \
           py::arg("fc2_smooth_scale") = std::nullopt,                                         \
@@ -910,7 +928,15 @@
           py::arg("weight"),                                                                       \
           py::arg("epsilon"),                                                                      \
           py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
-    m.def("rmsnorm2d_fwd_with_smoothquant", &rmsnorm2d_with_smoothquant);                          \
+    m.def("rmsnorm2d_fwd_with_smoothquant",                                                        \
+          &rmsnorm2d_with_smoothquant,                                                             \
+          py::arg("out"),                                                                          \
+          py::arg("input"),                                                                        \
+          py::arg("xscale"),                                                                       \
+          py::arg("yscale"),                                                                       \
+          py::arg("weight"),                                                                       \
+          py::arg("epsilon"),                                                                      \
+          py::arg("use_model_sensitive_rmsnorm") = 0);                                             \
     m.def("rmsnorm2d_fwd_with_add_smoothquant",                                                    \
           &rmsnorm2d_with_add_smoothquant,                                                         \
           py::arg("out"),                                                                          \

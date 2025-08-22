@@ -326,7 +326,9 @@ class GroupCoordinator:
             with maybe_pynccl_context:
                 yield graph_capture_context
 
-    def all_reduce(self, input_: torch.Tensor, open_fp8_quant: bool) -> torch.Tensor:
+    def all_reduce(
+        self, input_: torch.Tensor, open_fp8_quant: bool = False
+    ) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.

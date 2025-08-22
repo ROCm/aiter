@@ -1,6 +1,5 @@
 import torch
 import pytest
-import triton
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
@@ -35,4 +34,4 @@ def test_softmax(M, N, dtype):
         # float32 typically can be tighter
         atol, rtol = 1e-5, 1e-5
 
-    triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)

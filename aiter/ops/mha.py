@@ -5,6 +5,7 @@ from torch import Tensor, Generator
 from typing import List, Optional, Tuple, Any
 from ..jit.core import compile_ops, CK_DIR, AITER_CSRC_DIR, logger
 from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 import torch
 
@@ -154,7 +155,12 @@ def gen_mha_fwd_fake_tensors(
     )
 
 
-@compile_ops("module_mha_fwd", fc_name="mha_fwd", gen_fake=gen_mha_fwd_fake_tensors)
+@compile_ops(
+    "module_mha_fwd",
+    fc_name="mha_fwd",
+    gen_func=cmdGenFunc_mha_fwd,
+    gen_fake=gen_mha_fwd_fake_tensors,
+)
 def mha_fwd(
     q: Tensor,
     k: Tensor,
@@ -386,16 +392,43 @@ def gen_mha_varlen_fwd_fake_tensor(
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
 ) -> List[torch.Tensor]:
-    return common_mha_fwd_fake_tensors(
-        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
-    )
+    device = q.device
+    dtype = q.dtype
+
+    total_q = q.size(0)
+    num_heads = q.size(1)
+    head_size_v = v.size(-1)
+
+    if out is not None:
+        out_tensor = out
+    else:
+        out_shape = (total_q, num_heads, head_size_v)
+        out_tensor = torch.empty(out_shape, device=device, dtype=dtype)
+
+    if return_softmax_lse:
+        softmax_lse_shape = (num_heads, total_q)
+        softmax_lse_tensor = torch.empty(
+            softmax_lse_shape, device=device, dtype=torch.float32
+        )
+    else:
+        softmax_lse_tensor = torch.empty((0,), device=device, dtype=torch.float32)
+
+    if return_dropout_randval:
+        p_shape = (num_heads, total_q, max_seqlen_k)
+        p_tensor = torch.empty(p_shape, device=device, dtype=torch.uint8)
+    else:
+        p_tensor = torch.empty((0,), device=device)
+
+    rng_state_tensor = torch.empty((2,), device=device, dtype=torch.int64)
+
+    return [out_tensor, softmax_lse_tensor, p_tensor, rng_state_tensor]
 
 
 @compile_ops(
     "module_mha_varlen_fwd",
     fc_name="mha_varlen_fwd",
     gen_func=cmdGenFunc_mha_varlen_fwd,
-    gen_fake=gen_mha_fwd_fake_tensors,
+    gen_fake=gen_mha_varlen_fwd_fake_tensor,
 )
 def mha_varlen_fwd(
     q: torch.Tensor,
@@ -931,8 +964,13 @@ def fmha_v3_varlen_bwd(
 ) -> None: ...
 
 
-def maybe_contiguous(x):
+@torch_compile_guard()
+def maybe_contiguous_custom_op(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def maybe_contiguous(x):
+    return maybe_contiguous_custom_op(x)
 
 
 def _flash_attn_forward(
@@ -964,16 +1002,16 @@ def _flash_attn_forward(
         # basic
         gfx = get_gfx()
         ret = alibi_slopes is None
-        ret &= bias is None
-        ret &= dropout_p == 0.0
-        ret &= seqlen_q == seqlen_k
-        ret &= seqlen_q >= 384
-        ret &= hdim_q == hdim_v
-        ret &= hdim_q == 128
-        ret &= nhead_q % nhead_k == 0
-        ret &= not swa
-        ret &= q.dtype == dtypes.bf16
-        ret &= (return_lse and gfx == "gfx950") or (gfx == "gfx942")
+        ret = ret and (bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (seqlen_q == seqlen_k)
+        ret = ret and (seqlen_q >= 384)
+        ret = ret and (hdim_q == hdim_v)
+        ret = ret and (hdim_q == 128)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and ((return_lse and gfx == "gfx950") or (gfx == "gfx942"))
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1015,34 +1053,24 @@ def _flash_attn_forward(
     return out, softmax_lse, S_dmask, rng_state
 
 
-def _flash_attn_backward(
+@torch_compile_guard()
+def can_impl_fmha_v3_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
     dk: Optional[torch.Tensor],
     dv: Optional[torch.Tensor],
     dbias: Optional[torch.Tensor],
     dropout_p: float,
-    softmax_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
     bias: Optional[torch.Tensor],
     alibi_slopes: Optional[torch.Tensor],
     deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
     is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
-) -> torch.Tensor:
-    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
-        logger.warning(
-            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
-        )
-
+) -> bool:
     (_, seqlen_q, nhead_q, hdim_q) = q.shape
     (_, seqlen_k, nhead_k, hdim_v) = v.shape
 
@@ -1134,10 +1162,11 @@ def _flash_attn_backward(
         # bwd_hd64_bf16_causal_a32_rtz_pssk
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
-        ret = (
-            is_v3_atomic_fp32 == True
-        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q == 64
+        gfx = get_gfx()
+        # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
+            hdim_q == 128 and gfx == "gfx950"
+        )
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
@@ -1199,22 +1228,69 @@ def _flash_attn_backward(
 
         return ret
 
-    def can_impl_fmha_v3_bwd():
-        # basic
-        ret = alibi_slopes is None
-        ret &= bias is None
-        ret &= dbias is None
-        ret &= dropout_p == 0.0
-        ret &= deterministic == False
-        ret &= hdim_q == hdim_v
-        ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
-        ret &= np() or pssk() or pddv() or psskddv()
-        return ret
+    # basic
+    ret = alibi_slopes is None
+    ret &= bias is None
+    ret &= dbias is None
+    ret &= dropout_p == 0.0
+    ret &= not deterministic
+    ret &= hdim_q == hdim_v
+    ret &= nhead_q % nhead_k == 0
+    ret &= hdim_q >= 64 and hdim_q <= 192 and hdim_q % 8 == 0
+    ret &= np() or pssk() or pddv() or psskddv()
+    return ret
+
+
+def _flash_attn_backward(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    dq: Optional[torch.Tensor],
+    dk: Optional[torch.Tensor],
+    dv: Optional[torch.Tensor],
+    dbias: Optional[torch.Tensor],
+    dropout_p: float,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    alibi_slopes: Optional[torch.Tensor],
+    deterministic: bool,
+    rng_state: Optional[torch.Tensor] = None,
+    is_v3_atomic_fp32: Optional[bool] = True,
+    how_v3_bf16_cvt: Optional[int] = 1,
+) -> torch.Tensor:
+    if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
+        logger.warning(
+            "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
+        )
+        how_v3_bf16_cvt = 0
+    # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
+    can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
+        dout,
+        q,
+        k,
+        v,
+        dk,
+        dv,
+        dbias,
+        dropout_p,
+        causal,
+        window_size_left,
+        window_size_right,
+        bias,
+        alibi_slopes,
+        deterministic,
+        is_v3_atomic_fp32,
+    )
 
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    if can_impl_fmha_v3_bwd():
+    if can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,
@@ -1319,6 +1395,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_softmax=return_softmax and dropout_p > 0,
         )
         if is_grad:
+            assert return_lse
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
@@ -1745,6 +1822,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             out=out,
         )
         if is_grad:
+            assert return_lse
             ctx.save_for_backward(
                 q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
             )
