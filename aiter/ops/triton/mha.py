@@ -242,7 +242,7 @@ def _attn_fwd_inner(
 
     # loop over k, v, and update accumulator
 
-    for start_n in range(block_min, block_max, BLOCK_N, num_stages=num_stages):
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=num_stages):
         # For padded blocks, we will overrun the tensor size if
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
