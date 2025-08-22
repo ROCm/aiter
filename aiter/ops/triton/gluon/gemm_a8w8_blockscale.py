@@ -111,15 +111,29 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
-
+    linear_mk: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8]],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]],
+        warp_bases=[[8, 0], [16, 0]],
+        block_bases=[],
+        shape=[32, 128]
+    )
+    linear_kn: gl.constexpr = gl.DistributedLinearLayout(
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]],
+        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]],
+        warp_bases=[[0, 8], [0, 16]],
+        block_bases=[],
+        shape=[128, 32]
+    )
+    
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
     shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=2, max_phase=8, order=[0]
+        vec=16, per_phase=2, max_phase=8, order=[0]
     )
     shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=8, per_phase=2, max_phase=8, order=[0]
+        vec=16, per_phase=2, max_phase=8, order=[0]
     )
     shared_b: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0, 1]
@@ -224,17 +238,15 @@ def _gemm_a8w8_blockscale_kernel(
         acc = gl.zeros(
             (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
         )
-        zeros = gl.zeros(
-            (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
-        )
+
         offs_ks_step = BLOCK_SIZE_K // GROUP_K  # could be replaced by a constant 1
 
         for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
             # Advance the ptrs to the next K block.
             offs_a += BLOCK_SIZE_K * stride_ak
             offs_b += BLOCK_SIZE_K * stride_bk
-            offs_a_scale += offs_ks_step * stride_ascale_k
-            offs_b_scale += offs_ks_step * stride_bscale_k
+            a_scale_ptr += offs_ks_step * stride_ascale_k
+            b_scale_ptr += offs_ks_step * stride_bscale_k
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
@@ -255,12 +267,12 @@ def _gemm_a8w8_blockscale_kernel(
                     & (offs_am[:, None] < M),
                     cache=cache_modifier,
                 )
+            cur_a = smem_a.load(layout=dot_a_layout)
             a_scale = gl.amd.cdna4.buffer_load(
                 ptr=a_scale_ptr,
                 offsets=offs_a_scale,
                 cache=cache_modifier,
             )
-            cur_a = smem_a.load(layout=dot_a_layout)
             cur_b = smem_b.load(layout=dot_b_layout)
             cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, mfma_layout))
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, mfma_layout))
@@ -284,8 +296,11 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_b_scale,
                 cache=cache_modifier,
             )
-            mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-            acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
+            a_scale_mfma = gl.convert_layout(cur_a_scale[:, None], linear_mk)
+            b_scale_mfma = gl.convert_layout(cur_b_scale[None, :], linear_kn)
+            acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale_mfma, "e4m3",
+                                           cur_b, b_scale_mfma, "e4m3",
+                                           acc)
             smem_a.store(a)
             smem_scale_a.store(a_scale)
 
@@ -297,8 +312,11 @@ def _gemm_a8w8_blockscale_kernel(
         cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, mfma_layout))
         cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, mfma_layout))
 
-        mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-        acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
+        a_scale_mfma = gl.convert_layout(cur_a_scale[:, None], linear_mk)
+        b_scale_mfma = gl.convert_layout(cur_b_scale[None, :], linear_kn)
+        acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale_mfma, "e4m3",
+                                       cur_b, b_scale_mfma, "e4m3",
+                                       acc)
 
         c = acc.to(c_ptr.type.element_ty)
 
