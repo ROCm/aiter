@@ -179,7 +179,7 @@ __device__ constexpr auto get_kv_block_gemm()
                                                       typename Traits::Gemm1WarpTile>>;
 
     auto warp_gemm = [&]() {
-        return ck_tile::WarpGemmMfmaDispatcher<
+        return ck_tile::WarpGemmDispatcher<
             scalar_t,
             scalar_t,
             acc_t,
@@ -278,7 +278,7 @@ __device__ constexpr auto get_kv_block_gemm_backup()
                                                       typename Traits::Gemm1WarpTile>>;
 
     auto warp_gemm = [&]() {
-        return ck_tile::WarpGemmMfmaDispatcher<
+        return ck_tile::WarpGemmDispatcher<
             scalar_t,
             scalar_t,
             acc_t,

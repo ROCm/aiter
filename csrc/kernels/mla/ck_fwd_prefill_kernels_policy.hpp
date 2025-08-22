@@ -245,13 +245,13 @@ struct CkMlaPrefillPolicy
             }
             else
             {
-                return ck_tile::WarpGemmMfmaDispatcher<InOutType,
-                                                       InOutType,
-                                                       AccType,
-                                                       Traits::KVWarpTile::at(ck_tile::number<0>{}),
-                                                       Traits::KVWarpTile::at(ck_tile::number<1>{}),
-                                                       Traits::KVWarpTile::at(ck_tile::number<2>{}),
-                                                       true>{};
+                return ck_tile::WarpGemmDispatcher<InOutType,
+                                                   InOutType,
+                                                   AccType,
+                                                   Traits::KVWarpTile::at(ck_tile::number<0>{}),
+                                                   Traits::KVWarpTile::at(ck_tile::number<1>{}),
+                                                   Traits::KVWarpTile::at(ck_tile::number<2>{}),
+                                                   true>{};
             }
         }();
 
