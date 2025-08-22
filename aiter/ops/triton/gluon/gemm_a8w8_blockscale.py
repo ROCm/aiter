@@ -11,6 +11,7 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from triton import language as tl
 
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
@@ -169,7 +170,7 @@ def _gemm_a8w8_blockscale_kernel(
                                                  layout=shared_b_scale)
     
         offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)))
-        offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))) % N
+        offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)))
         
         offs_a = (
             offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
@@ -179,31 +180,44 @@ def _gemm_a8w8_blockscale_kernel(
         offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
 
+        other_a = tl.cast(0.0, a_ptr.dtype.element_ty)
+        other_a_scale = tl.cast(0.0, dtype=a_scale_ptr.type.element_ty)
         if EVEN_K:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
+                                         mask=offs_am[:, None] < M,
+                                         other=other_a,
                                         cache=cache_modifier)
         else:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
-                                         mask=offs_ak[None, :] < K - pid_k * num_k_iter * BLOCK_SIZE_K,
+                                         mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K)) & (offs_am[:, None] < M),
+                                         other=other_a,
                                         cache=cache_modifier)
         a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
                                            offsets=offs_a_scale,
-                                            cache=cache_modifier)
+                                           mask=offs_am < M,
+                                           other=other_a_scale,
+                                           cache=cache_modifier)
         offs_b = (
             offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
         offs_bsn = offs_bn // GROUP_N
         offs_b_scale = offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
-
+        other_b = tl.cast(0.0, dtype=b_ptr.type.element_ty)
+        other_b_scale = tl.cast(0.0, dtype=b_scale_ptr.type.element_ty)
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
+                                         mask=offs_bn[None, :] < N,
+                                        other=other_b,
                                         cache=cache_modifier)
         else:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
-                                        mask=offs_bk[:, None] < K - pid_k * num_k_iter * BLOCK_SIZE_K,
+                                        mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K)) & (offs_bn[None, :] < N),
+                                        other=other_b,
                                         cache=cache_modifier)
         b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
                                            offsets=offs_b_scale,
+                                           mask=offs_bn < N,
+                                           other=other_b_scale,
                                            cache=cache_modifier)
         smem_a.store(a)
         smem_scale_a.store(a_scale)
@@ -226,13 +240,18 @@ def _gemm_a8w8_blockscale_kernel(
             smem_scale_b.store(b_scale)
             if EVEN_K:
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
+                                             mask=offs_am[:, None] < M,
+                                             other=other_a,
                                              cache=cache_modifier)
             else:
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
-                                             mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, 
+                                             mask=(offs_ak[None, :] < K - (k+1) * BLOCK_SIZE_K) & (offs_am[:, None] < M),
+                                             other=other_a,
                                              cache=cache_modifier)
             a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
                                                offsets=offs_a_scale,
+                                               mask=offs_am < M,
+                                               other=other_a_scale,
                                                cache=cache_modifier)
             cur_a = smem_a.load(layout=dot_a_layout)
             cur_b = smem_b.load(layout=dot_b_layout)
@@ -240,13 +259,18 @@ def _gemm_a8w8_blockscale_kernel(
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, blocked_mn))
             if EVEN_K:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
+                                             mask=offs_bn[None, :] < N,
+                                             other=other_b,
                                              cache=cache_modifier)
             else:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
-                                             mask=offs_bk[:, None] < K - k * BLOCK_SIZE_K,
+                                             mask=(offs_bk[:, None] < K - (k+1) * BLOCK_SIZE_K) & (offs_bn[None, :] < N),
+                                             other=other_b,
                                              cache=cache_modifier)
             b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
                                                 offsets=offs_b_scale,
+                                                mask=offs_bn < N,
+                                                other=other_b_scale,
                                                 cache=cache_modifier)
             mfma_acc = gl.amd.cdna4.mfma(cur_a, cur_b, mfma_acc)
             accumulator += gl.convert_layout(mfma_acc, layout=blocked_mn) * cur_a_scale[:, None] * cur_b_scale[None, :]
@@ -302,8 +326,8 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     pid_m = gl.program_id(axis=0)
     pid_n = gl.program_id(axis=1)
 
-    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)) % N
+    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M))
+    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N))
     offs_k = gl.arange(0, MAX_KSPLIT)
     c_in_ptrs = (
         c_in_ptr
@@ -419,6 +443,8 @@ def gemm_a8w8_blockscale(
     # TODO: need a better way to pass scale block sizes around
     config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
+
+    assert config["GROUP_K"] == config["BLOCK_SIZE_K"], "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
