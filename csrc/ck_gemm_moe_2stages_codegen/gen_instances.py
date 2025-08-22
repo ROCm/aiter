@@ -7,7 +7,6 @@ from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-{DefinedHead}
 #include "gemm_moe_ck2stages_common{quanttype}.cuh"
 
 using A0DataType = {A0DataType};
@@ -20,7 +19,6 @@ const bool PerTensorQuant = {Quant} == static_cast<int>(QuantType::per_Tensor);
 const bool MulRoutedWeight = {MulRoutedWeight};
 const int ActOP = {ActOP};
 CK_MOE_STAGE{Stage}_GEMM_DEFINE({BlockSize}, {MPerBlock}, {NPerBlock}, {KPerBlock}, {MWaves}, {NWaves}, V{PipelineVer})
-{DefinedEnd}
 """
 
 
@@ -545,7 +543,6 @@ class ck_moe_2stage_gemm_codegen:
                 if not os.path.exists(f_instance):
                     with open(f_instance, "a") as f_ins:
                         stage_instance = STG_INSTANCE_IMPL.format(
-                            DefinedHead="ifdef __Float4_e2m1fn_x2" if self.a_dtype == "FP4X2" else ""
                             quanttype=quanttype,
                             A0DataType=self.a_dtype,
                             B0DataType=self.b_dtype,
@@ -570,7 +567,6 @@ class ck_moe_2stage_gemm_codegen:
                             MulRoutedWeight=str(
                                 self.mul_routed_weight_stage == kernel.stage
                             ).lower(),
-                            DefinedEnd="#endif" if self.a_dtype == "FP4X2" else ""
                         )
                         f_ins.write(stage_instance)
 
@@ -599,7 +595,7 @@ class ck_moe_2stage_gemm_codegen:
                 )
                 f_lookup.write(lookup_ele)
 
-        f_gemm1_heuristic_dispatch = os.path.join(ifdef __Float4_e2m1fn_x2
+        f_gemm1_heuristic_dispatch = os.path.join(
             self.working_path, "ck2stages_moe_stage1_heuristic_dispatch.hpp"
         )
         gemm1_heuristic_dispatch, gemm2_heuristic_dispatch = heuristic_dispatch_dict[
