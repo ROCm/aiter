@@ -746,7 +746,7 @@ struct Block_quant_GemmKernel
                                        const index_t block_idx_n)
     {   
         
-        const float* b_per_blcok_scale=b_scale_ptr+(block_idx_n)/ScaleBlockN*((kargs.K+ScaleBlockK-1)/ScaleBlockK);
+        const float* b_per_block_scale = b_scale_ptr + (block_idx_n) / ScaleBlockN * ((kargs.K + ScaleBlockK - 1) / ScaleBlockK);
       
         // Create Gemm tensor views, pad views and tile windows
         const auto& gemm_tensor_views_tuple =
