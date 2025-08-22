@@ -61,7 +61,7 @@ class TunedGemm:
                     lambda s: (
                         getHipblasltKernelName(s.solidx)
                         if s.libtype == "hipblaslt"
-                        else ""
+                        else "rocblas"
                     ),
                     axis=1,
                 )
@@ -121,12 +121,12 @@ class TunedGemm:
                 and k <= 256
             ):
                 soltype, solidx = 3, 2
-
         if soltype is None:
             soltype, solidx = self.solids.get(
                 (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
             )
         solution_name = self.solMap[soltype]
+
         logger.info(
             f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
         )
