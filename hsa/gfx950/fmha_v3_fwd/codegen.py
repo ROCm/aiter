@@ -38,6 +38,12 @@ template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      
 template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx950, true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_group"; };
 template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx950, true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_group"; };
 
+// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        kIsGroupMode_ |
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_group"; }};
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_group"; }};
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_group"; }};
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_group"; }};
+
 // #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch
 template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx950>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; };
 template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx950>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; };
@@ -53,6 +59,12 @@ template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0
 template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx950, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_group.co"; };
 template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx950, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_group.co"; };
 template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx950, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_group.co"; };
+
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        kIsGroupMode_ |
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_group.co"; }};
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_group.co"; }};
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_group.co"; }};
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx950, true>> {{ static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_group.co"; }};
 
 // ####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch
 template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx950>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 64; };
@@ -161,7 +173,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a,
     args.s_o_Hs = a.nhead_stride_o * 2;
     args.s_o_Bs = a.batch_stride_o * 2;
     
-    args.s_lse_Hs = a.nhead_stride_lse * 2;
+    args.s_lse_Hs = a.nhead_stride_lse * 4;
     args.ptr_qseq = a.seqstart_q_ptr;
     args.ptr_kseq = a.seqstart_k_ptr;
     args.ptr_qseq_padding = seqstart_q_padding_ptr == nullptr ? a.seqstart_q_ptr : seqstart_q_padding_ptr;

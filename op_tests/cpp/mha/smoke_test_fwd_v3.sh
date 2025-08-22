@@ -50,9 +50,9 @@ run_gfx942_fwd_v3() {
 run_gfx942_fwd_v3_new() {
     echo "Start smoke test for gfx 942"
     for perm in 0 1 ; do
-    for mask in 0 1 ; do
+    for mask in 0 2 ; do
     for lse in 0 1 ; do
-    for seqlen in 127 256 384 512 783 1023 ; do
+    for seqlen in 94 127 256 384 512 600 783 900 1023 ; do
     for mode in 0 1 ; do
 
     $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
@@ -89,7 +89,7 @@ fi
 
 case "$mode" in
     "gfx942")
-        run_gfx942_fwd_v3
+        run_gfx942_fwd_v3_new
         ;;
     "gfx950")
         run_gfx950_fwd_v3

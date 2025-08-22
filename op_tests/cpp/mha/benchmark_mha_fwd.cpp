@@ -1004,9 +1004,6 @@ bool run(const ck_tile::ArgParser& arg_parser)
                 {
                     args.drop_seed_offset = std::make_pair(drop_seed, drop_offset);
                 }
-                // todo 
-                args.seqstart_q_padding_ptr = (mode == mode_enum::group ? seqstart_q.GetDeviceBuffer() : nullptr);
-                args.seqstart_k_padding_ptr = (mode == mode_enum::group ? seqstart_k.GetDeviceBuffer() : nullptr);
             }
             else if constexpr(std::is_same_v<fmha_fwd_splitkv_args, std::decay_t<decltype(args)>>)
             {

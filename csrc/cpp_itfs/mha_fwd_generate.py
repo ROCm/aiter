@@ -85,7 +85,9 @@ float mha_fwd(mha_fwd_args args,
               mask_enum mask_type,
               bias_enum bias_type,
               bool has_lse,
-              bool use_ext_asm)
+              bool use_ext_asm,
+              const void* seqstart_q_padding_ptr,
+              const void* seqstart_k_padding_ptr)
 {{
     int head_size_q = args.hdim_q;
     int head_size_v = args.hdim_v;
@@ -158,9 +160,9 @@ V2_API = """t = fmha_fwd(traits, args, stream_config);"""
 
 V3_MULTI_TARGET_API = """
     if (get_gpu_arch() == "gfx942") {
-        t = gfx942::fmha_fwd_v3(traits, args, stream_config);
+        t = gfx942::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
     } else if (get_gpu_arch() == "gfx950") {
-        t = gfx950::fmha_fwd_v3(traits, args, stream_config);
+        t = gfx950::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
     } else {
         std::cout << "No supported GPU arch found!" << std::endl;
         return -1;

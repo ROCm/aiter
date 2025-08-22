@@ -133,9 +133,7 @@ mha_fwd_args get_asm_fmha_fwd_args(bool has_lse,
                          0,
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset,
-                         nullptr, // seqstart_q_padding
-                         nullptr};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor> fmha_v3_fwd(at::Tensor &q, // [b, sq, hq, d]

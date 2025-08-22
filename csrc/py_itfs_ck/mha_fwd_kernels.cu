@@ -133,9 +133,7 @@ mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          0,
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset,
-                         nullptr,
-                         nullptr};
+                         drop_seed_offset};
 }
 
 std::vector<at::Tensor>

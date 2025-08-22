@@ -142,9 +142,7 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          min_seqlen_q,
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset,
-                         nullptr,
-                         nullptr}; // todo mmd add param
+                         drop_seed_offset};
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,

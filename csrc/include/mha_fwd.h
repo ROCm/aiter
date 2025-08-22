@@ -64,13 +64,7 @@ struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
     }
 };
 
-struct mha_fwd_args : public fmha_fwd_args
-{
-    const void* seqstart_q_padding_ptr;
-    const void* seqstart_k_padding_ptr;
-};
-// using mha_fwd_args           = fmha_fwd_args;
-
+using mha_fwd_args           = fmha_fwd_args;
 using mha_fwd_splitkv_args   = fmha_fwd_splitkv_args;
 using mha_batch_prefill_args = fmha_batch_prefill_args;
 
@@ -81,7 +75,9 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      mask_enum mask_type,
                                                      bias_enum bias_type,
                                                      bool has_lse,
-                                                     bool use_ext_asm);
+                                                     bool use_ext_asm,
+                                                     const void* seqstart_q_padding_ptr = nullptr,
+                                                     const void* seqstart_k_padding_ptr = nullptr);
 
 __attribute__((visibility("default"))) float
 mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -103,44 +99,6 @@ mha_batch_prefill(mha_batch_prefill_args args,
                   bool use_ext_asm);
 
 struct __attribute__((packed)) fmha_fwd_v3_args
-{
-    void* ptr_o;
-    p2 _p0;
-    const void* ptr_q;
-    p2 _p1;
-    const void* ptr_k;
-    p2 _p2;
-    const void* ptr_v;
-    p2 _p3;
-    void* ptr_lse;
-    p2 _p4;
-    float scalar;
-    p3 _p5;
-    unsigned int seq_len;
-    p3 _p6;
-    unsigned int Seqs;
-    p3 _p7;
-    unsigned int Ts;
-    p3 _p8;
-    unsigned int Hs;
-    p3 _p9;
-    unsigned int BAs;
-    p3 _p10;
-    unsigned int gqa;
-    p3 _p11;
-    unsigned int Seqs_kv;
-    p3 _p12;
-    unsigned int Hs_kv;
-    p3 _p13;
-    unsigned int BAs_kv;
-    p3 _p14;
-    unsigned int opt;
-    p3 _p15;
-    unsigned int s_lse;
-    p3 _p16;
-};
-
-struct __attribute__((packed)) fmha_fwd_v3_args_gfx942
 {
     void *ptr_o;
     p2 _p0;
@@ -248,10 +206,14 @@ template <typename fmha_fwd_kernel_selector>
 struct FmhaFwdV3Ts;
 
 namespace gfx942 {
-float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config& s);
+float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config& s,
+                  const void* seqstart_q_padding_ptr = nullptr,
+                  const void* seqstart_k_padding_ptr = nullptr);
 }
 
 namespace gfx950 {
-float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config& s);
+float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config& s,
+                  const void* seqstart_q_padding_ptr = nullptr,
+                  const void* seqstart_k_padding_ptr = nullptr);
 }
 } // namespace aiter
