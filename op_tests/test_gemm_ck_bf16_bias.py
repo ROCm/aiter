@@ -18,7 +18,7 @@ if 1:
     from aiter.tuned_gemm import tgemm
 
 
-@perftest(num_iters=101, num_warmup=50,needTrace=True)
+@perftest(num_iters=101, num_warmup=50, needTrace=True)
 def run_torch(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     # if x.dtype == dtypes.fp8:
     #     if scaleA is None:
