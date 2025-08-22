@@ -217,7 +217,6 @@ if __name__ == "__main__":
         seqlens: Tuple[int, ...]
         head_sizes: Tuple[int, ...]
 
-    causal = False
     local = False
     profile = True
     seed = 0
@@ -235,8 +234,8 @@ if __name__ == "__main__":
         ProblemSize(1, (40,), (37200,), (128,)),
     ]
 
-    for dtype, problem_size in itertools.product(
-        [dtypes.fp16, dtypes.bf16], problem_sizes
+    for causal, dtype, problem_size in itertools.product(
+        [False, True], [dtypes.fp16, dtypes.bf16], problem_sizes
     ):
         batch_size = problem_size.batch_size
         nheads, nheads_k = (
