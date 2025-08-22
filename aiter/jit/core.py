@@ -553,6 +553,8 @@ SPECIAL_OPS_MUTATES_ARGS = {
     "grouped_topk": ["topk_weights", "topk_ids"],
     "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
     "rotary_embedding_fwd": ["query", "key"],
+    "reshape_and_cache": ["key_cache", "value_cache"],
+    "reshape_and_cache_with_pertoken_quant": ["key_cache", "value_cache"],
 }
 
 
@@ -567,9 +569,9 @@ def generate_schema(func) -> str:
     for idx, (name, param) in enumerate(sig.parameters.items()):
         param_type = param.annotation
         flag = True
-        is_mutates = True
-        # if name in mutates_args:
-        #     is_mutates = True
+        is_mutates = False
+        if name in mutates_args:
+            is_mutates = True
 
         if param_type is torch.Tensor:
             if is_mutates:
@@ -871,7 +873,6 @@ def compile_ops(
             else:
                 sig = inspect.signature(func)
                 mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
-                mutates_args = "unknown"
                 if hasattr(torch.library, "infer_schema"):
                     sig = torch.library.infer_schema(func, mutates_args=mutates_args)
                 else:
