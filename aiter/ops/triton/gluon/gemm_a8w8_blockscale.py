@@ -168,7 +168,7 @@ def _gemm_a8w8_blockscale_kernel(
                                                  [BLOCK_SIZE_N],
                                                  layout=shared_b_scale)
     
-        offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk))) % M
+        offs_am = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)))
         offs_bn = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn))) % N
         
         offs_a = (
@@ -184,10 +184,10 @@ def _gemm_a8w8_blockscale_kernel(
                                         cache=cache_modifier)
         else:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
-                                         mask=offs_ak[None, :] < K, other=0.0,
+                                         mask=offs_ak[None, :] < K - pid_k * num_k_iter * BLOCK_SIZE_K,
                                         cache=cache_modifier)
         a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
-                                            offsets=offs_a_scale,
+                                           offsets=offs_a_scale,
                                             cache=cache_modifier)
         offs_b = (
             offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
@@ -200,11 +200,11 @@ def _gemm_a8w8_blockscale_kernel(
                                         cache=cache_modifier)
         else:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
-                                        mask=offs_bk[:, None] < K, other=0.0,
+                                        mask=offs_bk[:, None] < K - pid_k * num_k_iter * BLOCK_SIZE_K,
                                         cache=cache_modifier)
         b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
-                                            offsets=offs_b_scale,
-                                            cache=cache_modifier)
+                                           offsets=offs_b_scale,
+                                           cache=cache_modifier)
         smem_a.store(a)
         smem_scale_a.store(a_scale)
 
@@ -230,7 +230,6 @@ def _gemm_a8w8_blockscale_kernel(
             else:
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                              mask=offs_ak[None, :] < K - k * BLOCK_SIZE_K, 
-                                             other=0.0,
                                              cache=cache_modifier)
             a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
                                                offsets=offs_a_scale,
@@ -245,7 +244,6 @@ def _gemm_a8w8_blockscale_kernel(
             else:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                              mask=offs_bk[:, None] < K - k * BLOCK_SIZE_K,
-                                             other=0.0,
                                              cache=cache_modifier)
             b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
                                                 offsets=offs_b_scale,
@@ -281,8 +279,7 @@ def _gemm_a8w8_blockscale_kernel(
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs,
-                                   mask=c_mask)
+        gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask)
 
 
 @triton.jit
@@ -302,17 +299,8 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     MAX_KSPLIT: gl.constexpr,
 ):
 
-    gl.assume(stride_c_in_k > 0)
-    gl.assume(stride_c_in_m > 0)
-    gl.assume(stride_c_in_n > 0)
-    gl.assume(stride_c_out_m > 0)
-    gl.assume(stride_c_out_n > 0)
-
     pid_m = gl.program_id(axis=0)
     pid_n = gl.program_id(axis=1)
-
-    gl.assume(pid_m > 0)
-    gl.assume(pid_n > 0)
 
     offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)) % M
     offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)) % N
@@ -350,7 +338,7 @@ def _get_config(
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_BLOCKSCALE.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict["default"] = config
@@ -358,7 +346,7 @@ def _get_config(
     key = f"{N}_{K}"
     if key not in _get_config._config_dict.keys():
         dev = arch_info.get_device()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
             with open(fpath, "r") as file:
                 config = json.load(file)
