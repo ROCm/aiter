@@ -109,7 +109,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     {
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
-           ((cfg.splitK == log2_k_split_en) || !log2_k_split_en))
+           ((cfg.splitK == log2_k_split_en) || !log2_k_split.has_value()))
         {
             if((N % cfg.tile_N) == 0)
             {
@@ -257,6 +257,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
         if(cfg.splitK == 1)
         {
+            out.zero_();
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");

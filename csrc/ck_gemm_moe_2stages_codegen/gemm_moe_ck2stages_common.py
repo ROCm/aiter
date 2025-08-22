@@ -307,7 +307,11 @@ def get_gemm1_kernels_list(
             tag = "a8w8_gfx950"
         else:
             tag = "a8w8"
-    elif Adtype in bit8_list and Bdtype in bit4_list and Adtype == "F8":
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit4_list
+        and (Adtype == "F8" or Adtype == "f8")
+    ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
         tag = "a4w4"
@@ -337,6 +341,7 @@ def get_gemm2_kernels_list(
     Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, MulRoutedWeight: bool
 ) -> list:
     arch = get_gfx()
+
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
             tag = "a16w16_gfx950"
@@ -354,7 +359,11 @@ def get_gemm2_kernels_list(
             tag = "a8w8_gfx950"
         else:
             tag = "a8w8"
-    elif Adtype in bit8_list and Bdtype in bit4_list and Adtype == "F8":
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit4_list
+        and (Adtype == "F8" or Adtype == "f8")
+    ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
         tag = "a4w4"
