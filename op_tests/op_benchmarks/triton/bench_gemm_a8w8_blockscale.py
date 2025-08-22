@@ -1,8 +1,12 @@
 import sys
 import torch
 import triton
-from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale
+from aiter.ops.triton.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+)
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 from op_tests.triton_tests.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
 )
@@ -37,9 +41,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, impl: callab
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: impl(
-            x, weight, x_scale, w_scale, c_dtype, y
-        ),  # noqa: E731
+        lambda: impl(x, weight, x_scale, w_scale, c_dtype, y),  # noqa: E731
         warmup=25,
         rep=100,
     )
@@ -141,7 +143,11 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser(kernel_name="A8W8 GEMM Blockscale")
     parser = add_argparse_ff(parser)
-    parser.add_argument("-gluon", action="store_true", help="Use Gluon implementation (experimental, requires latest Triton from main)")
+    parser.add_argument(
+        "-gluon",
+        action="store_true",
+        help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
     return get_ff_args(parser)
 
 
