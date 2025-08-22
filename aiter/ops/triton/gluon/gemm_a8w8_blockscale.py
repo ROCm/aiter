@@ -182,6 +182,23 @@ def _gemm_a8w8_blockscale_kernel(
         offs_a_scale = gl.convert_layout(offs_a_scale, layout=gl.SliceLayout(1, mfma_layout))
         offs_b_scale = gl.convert_layout(offs_b_scale, layout=gl.SliceLayout(0, mfma_layout))
         
+        # offs_a_scale = gl.convert_layout(offs_a_scale, layout= # 16, 8, 1
+        #                                  gl.DistributedLinearLayout(
+        #                                     reg_bases=[[1], [2], [4], [8]],
+        #                                     lane_bases=[[16], [32], [64]],
+        #                                     warp_bases=[],
+        #                                     block_bases=[],
+        #                                     shape=[128]
+        #                                  ))
+        # offs_b_scale = gl.convert_layout(offs_b_scale, layout= # 16, 8, 1
+        #                                  gl.DistributedLinearLayout(
+        #                                     reg_bases=[[1], [2], [4], [8]],
+        #                                     lane_bases=[[16], [32], [64]],
+        #                                     warp_bases=[],
+        #                                     block_bases=[],
+        #                                     shape=[128]
+        #                                  ))
+        
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
                 ptr=b_ptr,
