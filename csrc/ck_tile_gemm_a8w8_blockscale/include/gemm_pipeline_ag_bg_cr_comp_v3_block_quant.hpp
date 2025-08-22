@@ -102,7 +102,7 @@ struct BaseGemmPipelineAgBgCrComp_block_quant
 // LocalPreFetchStages: 1
 // LocalSharedMemoryBuffer: 1
 template <typename Problem, typename Policy = UniversalGemmPipelineAgBgCrPolicy_block_quant>
-struct GemmPipelineAgBgCrComp_blcok_quant : public BaseGemmPipelineAgBgCrComp_block_quant<Problem>
+struct GemmPipelineAgBgCrComp_block_quant : public BaseGemmPipelineAgBgCrComp_block_quant<Problem>
 {
     using Base             = BaseGemmPipelineAgBgCrComp_block_quant<Problem>;
     using PipelineImplBase = GemmPipelineAgBgCrImplBase<Problem, Policy>;
