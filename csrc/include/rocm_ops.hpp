@@ -344,6 +344,16 @@
           py::arg("Out"),           \
           py::arg("splitK") = 0);
 
+
+#define CK_TILE_GEMM_BF16_PYBIND     \
+    m.def("ck_tile_gemm_bf16",       \
+          &ck_tile_gemm_bf16,        \
+          "ck tile bf16  gemm",        \
+          py::arg("XQ"),                 \
+          py::arg("WQ"),                 \
+          py::arg("bias"),                 \
+          py::arg("Out"));
+
 #define GEMM_A8W8_BLOCKSCALE_PYBIND \
     m.def("gemm_a8w8_blockscale",   \
           &gemm_a8w8_blockscale,    \
