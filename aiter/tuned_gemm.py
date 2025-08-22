@@ -18,6 +18,7 @@
 import os
 from pathlib import Path
 import pandas as pd
+import functools
 import torch
 import torch.nn.functional as F
 from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
@@ -55,6 +56,39 @@ def load_best_sols_custom(tune_path: str) -> bool:
             return True
 
     return False
+
+
+@functools.lru_cache(maxsize=4096)
+def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
+    # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+    #     if n > 8 and 0 < m <= 4:
+    #         return 3, 0
+    #     elif n % 4 == 0 and m == 1 and k <= 8192:
+    #         return 3, 1
+    soltype = None
+    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+        if (
+            (
+                (m == 1 and n <= 2 * self.cu_count)
+                or (m > 1 and m <= 4 and n <= self.cu_count)
+            )
+            and k <= 9216
+            or (m > 4 and m <= 8 and n <= self.cu_count)
+            and k <= 5120
+            or (m > 8 and m <= 16 and n <= self.cu_count)
+            and k <= 256
+        ):
+            soltype, solidx = 3, 2
+    if soltype is None:
+        soltype, solidx = self.solids.get(
+            (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+        )
+    solution_name = self.solMap[soltype]
+
+    logger.info(
+        f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
+    )
+    return soltype, solidx
 
 
 class TunedGemm:
@@ -112,38 +146,6 @@ class TunedGemm:
             self.apply_rocb_mm,
             self.apply_skinny,
         ]
-
-    # @functools.lru_cache(maxsize=4096)
-    def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
-        # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-        #     if n > 8 and 0 < m <= 4:
-        #         return 3, 0
-        #     elif n % 4 == 0 and m == 1 and k <= 8192:
-        #         return 3, 1
-        soltype = None
-        if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-            if (
-                (
-                    (m == 1 and n <= 2 * self.cu_count)
-                    or (m > 1 and m <= 4 and n <= self.cu_count)
-                )
-                and k <= 9216
-                or (m > 4 and m <= 8 and n <= self.cu_count)
-                and k <= 5120
-                or (m > 8 and m <= 16 and n <= self.cu_count)
-                and k <= 256
-            ):
-                soltype, solidx = 3, 2
-        if soltype is None:
-            soltype, solidx = self.solids.get(
-                (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
-            )
-        solution_name = self.solMap[soltype]
-
-        logger.info(
-            f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
-        )
-        return soltype, solidx
 
     def apply_skinny(
         self,
@@ -303,7 +305,8 @@ class TunedGemm:
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None
-        soltype, solidx = self.query_sol(
+        soltype, solidx = query_sol(
+            self,
             m=m,
             n=n,
             k=k,
