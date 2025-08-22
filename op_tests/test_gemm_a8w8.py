@@ -7,7 +7,7 @@ import random
 import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.test_common import checkAllclose, perftest
 import pandas as pd
 import argparse
 
@@ -296,6 +296,47 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
+<<<<<<< HEAD
+=======
+
+def create_argument_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-q",
+        "--quantDtype",
+        type=str,
+        choices=l_quantDtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Date type of quantization.
+        e.g.: -q fp8""",
+    )
+    parser.add_argument(
+        "-mnk",
+        type=dtypes.str2tuple,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Shape of mnk.
+        e.g. -mnk 1280,8192,1024""",
+    )
+    return parser
+>>>>>>> d58c5603 (Refine two a8w8 cases)
 
 l_dtype = ["bf16", "fp16"]
 l_quantDtype = ["i8", "fp8"]
@@ -366,6 +407,7 @@ parser.add_argument(
     e.g. -mnk 1280,8192,1024""",
 )
 
+<<<<<<< HEAD
 args = parser.parse_args()
 if args.dtype is None:
     l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
@@ -380,3 +422,20 @@ if args.mnk is not None:
 
 test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
 test_skinny_gemm_a8w8_pertoken_quant()
+=======
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    if args.quantDtype is None:
+        l_quantDtype = [dtypes.d_dtypes[key] for key in l_quantDtype]
+    else:
+        l_quantDtype = [dtypes.d_dtypes[args.quantDtype]]
+
+    if args.mnk is not None:
+        l_mnk_nm = [args.mnk]
+    test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+    # test_skinny_gemm_a8w8_pertoken_quant()
+>>>>>>> d58c5603 (Refine two a8w8 cases)
