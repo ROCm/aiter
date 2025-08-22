@@ -18,6 +18,7 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _is_fp8,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -1078,7 +1079,7 @@ def _flash_attn_forward(
         FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
         BATCH=batch,
-        NUM_XCD=8,
+        NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         **config,
     )

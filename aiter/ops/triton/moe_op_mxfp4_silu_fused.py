@@ -8,7 +8,7 @@ from typing import Any, Dict
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.arch_info import get_num_xcds
+from aiter.ops.triton.activation import _silu_exp2
 
 _LOGGER = AiterTritonLogger()
 
@@ -31,7 +31,7 @@ def get_scaled_dot_format_string(dtype: tl.dtype):
     }
 )
 @triton.jit
-def _fused_moe_kernel_mxfp4(
+def _fused_moe_kernel_mxfp4_silu(
     # Pointers to matrices
     a_ptr,
     b_ptr,
@@ -73,7 +73,6 @@ def _fused_moe_kernel_mxfp4(
     compute_type: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
-    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -139,6 +138,7 @@ def _fused_moe_kernel_mxfp4(
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    NUM_XCDS: tl.constexpr = 8
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
@@ -176,11 +176,20 @@ def _fused_moe_kernel_mxfp4(
         )
         return
 
+    BLOCK_SIZE_HALF: tl.constexpr = BLOCK_SIZE_N // 2
+    i = tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    # [0, 0, 1, 1, ..., BLOCK_SIZE_HALF - 1, BLOCK_SIZE_HALF - 1]
+    i_floor = i // 2
+    offs_half = ((pid_n * (BLOCK_SIZE_N // 2) + i_floor) % (N // 2)).to(tl.int64)
+    # (i % 2): [0, 1, 0, 1,...] (alternating)
+    # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
+    # So offs_bn now takes element from the first BLOCK_SIZE_HALF half and the second BLOCK_SIZE_HALF half in an alternating way (This allows us to do reshape without permute)
+    offs_b_n = ((offs_half + (i % 2) * (N // 2)) % N).to(tl.int64)
+
     # Load a_scale, b_scale
     a_scale = tl.load(a_scale_ptr)
     b_scale = tl.load(b_scale_ptr + off_expert)
     # Set offsets of B on dim N
-    offs_b_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     offs_b_n = tl.max_contiguous(
         tl.multiple_of(offs_b_n % N, BLOCK_SIZE_N), BLOCK_SIZE_N
     )
@@ -361,15 +370,22 @@ def _fused_moe_kernel_mxfp4(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
     accumulator = accumulator.to(compute_type)
+
+    silu_acc, mul_acc = (
+        accumulator.to(tl.float32).reshape(BLOCK_SIZE_M, BLOCK_SIZE_HALF, 2).split()
+    )
+
+    silu_acc = _silu_exp2(silu_acc)
+    accumulator = (silu_acc * mul_acc).to(compute_type)
     # -----------------------------------------------------------
     # Write back the block of the output
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_cn = pid_n * BLOCK_SIZE_HALF + tl.arange(0, BLOCK_SIZE_HALF)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N // 2)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-def fused_moe_mxfp4(
+def fused_moe_mxfp4_silu(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
@@ -426,7 +442,7 @@ def fused_moe_mxfp4(
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )
-    _fused_moe_kernel_mxfp4[grid](
+    _fused_moe_kernel_mxfp4_silu[grid](
         A,
         B,
         C,
@@ -447,8 +463,8 @@ def fused_moe_mxfp4(
         B.stride(0),
         B.stride(2),
         B.stride(1),
+        C.stride(0),
         C.stride(1),
-        C.stride(2),
         A_mx_scale_strid_m,
         A_mx_scale_strid_k,
         B_mx_scale.stride(0),
@@ -459,6 +475,5 @@ def fused_moe_mxfp4(
         compute_type=compute_type,
         SWIZZLE_MX_A=swizzle_mx_a,  # TODO add swizzle support
         SWIZZLE_MX_B=swizzle_mx_b,  # TODO add swizzle support
-        NUM_XCDS=get_num_xcds(),
         **config,
     )

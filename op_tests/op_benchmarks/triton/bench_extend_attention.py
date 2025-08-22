@@ -285,7 +285,7 @@ def parse_args():
     model_help = (
         "Model name to benchmark. Select from: ["
         + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as --model \"llama3,mistral_7B\""
+        + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as --model \"llama3,mixtral_7B\""
     )
     parser.add_argument("--model", type=str, default="", help=model_help)
     parser.add_argument("-b", type=int, default=0, help="Batch size")

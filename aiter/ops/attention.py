@@ -45,12 +45,12 @@ def gen_pa_fwd_native_fake(
 
 
 def gen_pa_fwd_asm(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
-    max_num_blocks: int,
+    block_tables_stride0: int,
     max_qlen: int = 1,
     K_QScale: Optional[torch.Tensor] = None,
     V_QScale: Optional[torch.Tensor] = None,
@@ -64,7 +64,7 @@ def gen_pa_fwd_asm(
     if out_ is not None:
         return out_
     else:
-        return torch.empty_like(query)
+        return torch.empty_like(Q)
 
 
 @compile_ops("module_attention", gen_fake=gen_pa_fwd_native_fake)
@@ -94,12 +94,12 @@ def pa_fwd_naive(
 
 @compile_ops("module_attention_asm", gen_fake=gen_pa_fwd_asm)
 def pa_fwd_asm(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
-    max_num_blocks: int,
+    block_tables_stride0: int,
     max_qlen: int = 1,
     K_QScale: Optional[torch.Tensor] = None,
     V_QScale: Optional[torch.Tensor] = None,

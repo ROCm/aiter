@@ -27,8 +27,8 @@
 #if defined(__HIPCC__) || (defined(__clang__) && defined(__HIP__)) || defined(__HIPCC_RTC__)
 
 #if defined(__gfx950__)
-#define FP8_E4M3_TYPE __hip_fp8_e4m3_fn
-#define FP8_E5M2_TYPE __hip_fp8_e5m2_fn
+#define FP8_E4M3_TYPE __hip_fp8_e4m3
+#define FP8_E5M2_TYPE __hip_fp8_e5m2
 #else
 #define FP8_E4M3_TYPE __hip_fp8_e4m3_fnuz
 #define FP8_E5M2_TYPE __hip_fp8_e5m2_fnuz

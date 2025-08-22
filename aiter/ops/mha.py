@@ -392,16 +392,43 @@ def gen_mha_varlen_fwd_fake_tensor(
     alibi_slopes: Optional[torch.Tensor] = None,
     gen: Optional[torch.Generator] = None,
 ) -> List[torch.Tensor]:
-    return common_mha_fwd_fake_tensors(
-        q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
-    )
+    device = q.device
+    dtype = q.dtype
+
+    total_q = q.size(0)
+    num_heads = q.size(1)
+    head_size_v = v.size(-1)
+
+    if out is not None:
+        out_tensor = out
+    else:
+        out_shape = (total_q, num_heads, head_size_v)
+        out_tensor = torch.empty(out_shape, device=device, dtype=dtype)
+
+    if return_softmax_lse:
+        softmax_lse_shape = (num_heads, total_q)
+        softmax_lse_tensor = torch.empty(
+            softmax_lse_shape, device=device, dtype=torch.float32
+        )
+    else:
+        softmax_lse_tensor = torch.empty((0,), device=device, dtype=torch.float32)
+
+    if return_dropout_randval:
+        p_shape = (num_heads, total_q, max_seqlen_k)
+        p_tensor = torch.empty(p_shape, device=device, dtype=torch.uint8)
+    else:
+        p_tensor = torch.empty((0,), device=device)
+
+    rng_state_tensor = torch.empty((2,), device=device, dtype=torch.int64)
+
+    return [out_tensor, softmax_lse_tensor, p_tensor, rng_state_tensor]
 
 
 @compile_ops(
     "module_mha_varlen_fwd",
     fc_name="mha_varlen_fwd",
     gen_func=cmdGenFunc_mha_varlen_fwd,
-    gen_fake=gen_mha_fwd_fake_tensors,
+    gen_fake=gen_mha_varlen_fwd_fake_tensor,
 )
 def mha_varlen_fwd(
     q: torch.Tensor,
@@ -1137,10 +1164,11 @@ def can_impl_fmha_v3_bwd(
         # bwd_hd64_bf16_causal_a32_rtz_pssk
         # bwd_hd64_fp16_a32_pssk
         # bwd_hd64_fp16_causal_a32_pssk
-        ret = (
-            is_v3_atomic_fp32 == True
-        )  # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
-        ret &= hdim_q == 64
+        gfx = get_gfx()
+        # nhead_stride_dq_acc >= stride_dq_acc must be guaranteed
+        ret = (hdim_q == 64 and gfx == "gfx942" and is_v3_atomic_fp32 == True) or (
+            hdim_q == 128 and gfx == "gfx950"
+        )
         ret &= nmask or (
             mask and seqlen_q == seqlen_k
         )  # TODO: or (seqlen_q != seqlen_k and mask_type == top_left)
@@ -1242,7 +1270,7 @@ def _flash_attn_backward(
         logger.warning(
             "Rounding mode RTNA & RTZ are deprecated in gfx950, ignore option `how_v3_bf16_cvt`"
         )
-
+        how_v3_bf16_cvt = 0
     # can_impl_fmha_v3_bwd should before maybe_contiguous to get pure dout, q, k, v, out
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd(
         dout,
