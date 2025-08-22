@@ -16,10 +16,7 @@
 #include "aiter_enum.h"
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
 #include "py_itfs_common.h"
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <hip/hip_runtime.h>
-#include <torch/all.h>
 #include <torch/torch.h>
 
 template <ck::index_t... Is>
@@ -55,7 +52,7 @@ struct CK_DTypeVisitor
     at::ScalarType operator()(F8) { return torch_fp8; }
     at::ScalarType operator()(F32) { return torch::kFloat; }
     // f4 packed
-    at::ScalarType operator()(FP4X2) { return torch::kFloat4_e2m1fn_x2; }
+    at::ScalarType operator()(FP4X2) { return torch_fp4x2; }
 };
 
 template <typename T>
@@ -68,15 +65,6 @@ template <typename CK_Dtype>
 struct dtype_checker
 {
     bool operator()(at::ScalarType t) { return t == getTypeValue<CK_Dtype>(); }
-};
-
-template <>
-struct dtype_checker<FP4X2>
-{
-    bool operator()(at::ScalarType t)
-    {
-        return t == getTypeValue<FP4X2>() || t == torch::kUInt8 /*8bits fallback*/;
-    }
 };
 
 struct TypeCast
