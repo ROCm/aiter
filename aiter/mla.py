@@ -9,7 +9,6 @@ from aiter import dtypes
 import triton
 import triton.language as tl
 import functools
-from aiter.jit.utils.chip_info import get_cu_num
 
 
 @triton.jit
@@ -95,37 +94,13 @@ def _fwd_kernel_stage2_asm(
             )
 
 
-@functools.lru_cache(maxsize=1)
-def get_kv_splits_indptr(num_kv_splits, bs, device):
-    """
-    Returns the kv_splits_indptr tensor for the given number of kv splits.
-    """
-    num_kv_splits = min(16, max(1, num_kv_splits))
-    kv_splits_indptr = torch.arange(
-        0, (bs + 1) * num_kv_splits, num_kv_splits, device=device, dtype=torch.int32
-    )
-    return kv_splits_indptr
-
-
 @functools.lru_cache()
-def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, device):
+def get_meta_param(num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q):
     if num_kv_splits is None:
-        cu_num = get_cu_num()
-        avg_kv = total_kv / bs
-        overhead = 84.1
-        tmp = [
-            (
-                bs
-                * i
-                / ((bs * i + cu_num - 1) // cu_num * cu_num)
-                * avg_kv
-                / (avg_kv + overhead * i),
-                i,
-            )
-            for i in range(1, 17)
-        ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
-        # num_kv_splits = min(16, max(1, cu_num // bs))
+        (kv_splits_indptr, max_splits) = aiter.get_mla_metadata_v0(
+            kv_indptr, nhead // nhead_kv, nhead_kv
+        )
+        num_kv_splits = max_splits.item()
 
     get_mgc = {16: 16, 128: 16}
 
@@ -133,7 +108,7 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, device):
     mgc = get_mgc[nhead]
     if max_seqlen_q == 1 and nhead == 16:
         mgc = 64
-    return num_kv_splits, get_kv_splits_indptr(num_kv_splits, bs, device), mgc
+    return num_kv_splits, kv_splits_indptr, mgc
 
 
 def mla_decode_fwd(
@@ -160,9 +135,127 @@ def mla_decode_fwd(
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
 
+    test_v1 = True
+    if test_v1:
+        use_test_data = True
+        if use_test_data:
+            kv_seqlens_test_data = [
+                3819,
+                9978,
+                784,
+                530,
+                8062,
+                1390,
+                287,
+                1008,
+                5090,
+                5304,
+                7396,
+                2288,
+                2104,
+                4063,
+                3644,
+                5091,
+                6470,
+                4732,
+                7237,
+                430,
+                2777,
+                956,
+                1357,
+                5478,
+                1292,
+                521,
+                6802,
+                1347,
+                2388,
+                5062,
+                443,
+                8560,
+                5049,
+                7235,
+                927,
+                9580,
+                623,
+                4913,
+                2511,
+                8120,
+                1638,
+                4859,
+                600,
+                7289,
+                8278,
+                6693,
+                136,
+                1021,
+                1465,
+                5859,
+                1278,
+                7123,
+                7839,
+                2459,
+                1090,
+                6333,
+                812,
+                9358,
+                6345,
+                8616,
+                2313,
+                6115,
+                6059,
+                4963,
+            ]
+            kv_seqlens_test = torch.tensor(
+                kv_seqlens_test_data, dtype=torch.int, device="cuda"
+            )
+            batch_size = len(kv_seqlens_test_data)
+            qo_seqlens_test_data = []
+            for i in range(batch_size):
+                qo_seqlens_test_data.append(i % 4 + 1)
+            qo_seqlens_test = torch.tensor(
+                qo_seqlens_test_data, dtype=torch.int, device="cuda"
+            )
+            qo_indptr_test = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
+            kv_indptr_test = torch.zeros(batch_size + 1, dtype=torch.int, device="cuda")
+            qo_indptr_test[1 : batch_size + 1] = torch.cumsum(qo_seqlens_test, dim=0)
+            kv_indptr_test[1 : batch_size + 1] = torch.cumsum(kv_seqlens_test, dim=0)
+        else:
+            qo_indptr_test = qo_indptr
+            kv_indptr_test = kv_indptr
+        print("qo_indptr_test:")
+        print(qo_indptr_test)
+        print("kv_indptr_test:")
+        print(kv_indptr_test)
+        (
+            work_indptr,
+            work_info_set,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        ) = aiter.get_mla_metadata_v1(
+            qo_indptr_test, kv_indptr_test, nhead // nhead_kv, nhead_kv, True
+        )
+        print("work_indptr:")
+        print(work_indptr)
+        print("work_info_set:")
+        print(work_info_set)
+        print("reduce_indptr:")
+        print(reduce_indptr)
+        print("reduce_final_map:")
+        print(reduce_final_map)
+        print("reduce_partial_map:")
+        print(reduce_partial_map)
+
+        aiter.mla_reduce_v1(
+            q, q, reduce_indptr, reduce_final_map, reduce_partial_map, o, o
+        )
+
+        if use_test_data:
+            exit()
+
     if num_kv_splits is None:
         num_kv_splits, num_kv_splits_indptr, mgc = get_meta_param(
-            num_kv_splits, bs, total_kv, nhead, max_seqlen_q, device
+            num_kv_splits, kv_indptr, nhead, nhead_kv, max_seqlen_q
         )
     else:
         assert (
