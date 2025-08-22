@@ -100,19 +100,19 @@ def _gemm_a8w8_blockscale_kernel(
         pid_n = pid % num_pid_n
 
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 8],
+        size_per_thread=[8, 8], # 128 * 128
         threads_per_warp=[8, 8],
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[8, 4],
+        size_per_thread=[8, 8],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
     blocked_mn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 4],
+        size_per_thread=[8, 8],
         threads_per_warp=[8, 8],
         warps_per_cta=[2, 2],
         order=[1, 0],
@@ -185,17 +185,17 @@ def _gemm_a8w8_blockscale_kernel(
         if EVEN_K:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                          mask=offs_am[:, None] < M,
-                                         other=other_a,
+                                        #  other=other_a,
                                         cache=cache_modifier)
         else:
             a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                          mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K)) & (offs_am[:, None] < M),
-                                         other=other_a,
+                                        #  other=other_a,
                                         cache=cache_modifier)
         a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
                                            offsets=offs_a_scale,
-                                           mask=offs_am < M,
-                                           other=other_a_scale,
+                                        #    mask=offs_am < M,
+                                        #    other=other_a_scale,
                                            cache=cache_modifier)
         offs_b = (
             offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
@@ -207,17 +207,17 @@ def _gemm_a8w8_blockscale_kernel(
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                          mask=offs_bn[None, :] < N,
-                                        other=other_b,
+                                        # other=other_b,
                                         cache=cache_modifier)
         else:
             b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                         mask=(offs_bk[:, None] < K - (pid_k * num_k_iter * BLOCK_SIZE_K)) & (offs_bn[None, :] < N),
-                                        other=other_b,
+                                        # other=other_b,
                                         cache=cache_modifier)
         b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
                                            offsets=offs_b_scale,
-                                           mask=offs_bn < N,
-                                           other=other_b_scale,
+                                        #    mask=offs_bn < N,
+                                        #    other=other_b_scale,
                                            cache=cache_modifier)
         smem_a.store(a)
         smem_scale_a.store(a_scale)
@@ -241,17 +241,17 @@ def _gemm_a8w8_blockscale_kernel(
             if EVEN_K:
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                              mask=offs_am[:, None] < M,
-                                             other=other_a,
+                                            #  other=other_a,
                                              cache=cache_modifier)
             else:
                 a = gl.amd.cdna4.buffer_load(ptr=a_ptr, offsets=offs_a,
                                              mask=(offs_ak[None, :] < K - (k+1) * BLOCK_SIZE_K) & (offs_am[:, None] < M),
-                                             other=other_a,
+                                            #  other=other_a,
                                              cache=cache_modifier)
             a_scale = gl.amd.cdna4.buffer_load(ptr=a_scale_ptr,
                                                offsets=offs_a_scale,
-                                               mask=offs_am < M,
-                                               other=other_a_scale,
+                                            #    mask=offs_am < M,
+                                            #    other=other_a_scale,
                                                cache=cache_modifier)
             cur_a = smem_a.load(layout=dot_a_layout)
             cur_b = smem_b.load(layout=dot_b_layout)
@@ -260,17 +260,17 @@ def _gemm_a8w8_blockscale_kernel(
             if EVEN_K:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                              mask=offs_bn[None, :] < N,
-                                             other=other_b,
+                                            #  other=other_b,
                                              cache=cache_modifier)
             else:
                 b = gl.amd.cdna4.buffer_load(ptr=b_ptr, offsets=offs_b,
                                              mask=(offs_bk[:, None] < K - (k+1) * BLOCK_SIZE_K) & (offs_bn[None, :] < N),
-                                             other=other_b,
+                                            #  other=other_b,
                                              cache=cache_modifier)
             b_scale = gl.amd.cdna4.buffer_load(ptr=b_scale_ptr,
                                                 offsets=offs_b_scale,
-                                                mask=offs_bn < N,
-                                                other=other_b_scale,
+                                                # mask=offs_bn < N,
+                                                # other=other_b_scale,
                                                 cache=cache_modifier)
             mfma_acc = gl.amd.cdna4.mfma(cur_a, cur_b, mfma_acc)
             accumulator += gl.convert_layout(mfma_acc, layout=blocked_mn) * cur_a_scale[:, None] * cur_b_scale[None, :]
@@ -339,7 +339,7 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c = gl.load(c_in_ptrs)
     else:
-        c = gl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
+        c = gl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT)#, other=0.0)
     c = gl.sum(c, axis=0)
 
     c = c.to(c_out_ptr.type.element_ty)
@@ -445,6 +445,9 @@ def gemm_a8w8_blockscale(
     config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
 
     assert config["GROUP_K"] == config["BLOCK_SIZE_K"], "GROUP_K must equal BLOCK_SIZE_K"
+    assert config["BLOCK_SIZE_M"] == 128, "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
+    assert config["BLOCK_SIZE_N"] == 128, "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
+    assert config["BLOCK_SIZE_K"] == 128, "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731

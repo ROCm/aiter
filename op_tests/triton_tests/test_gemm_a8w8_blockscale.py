@@ -26,8 +26,8 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
     x = x.to(x_scale.dtype) * x_scale[:m, :k]
     x = x.view(m, k)
-    w_scale = w_scale.repeat_interleave(block_shape_k, dim=0)
-    w_scale = w_scale.repeat_interleave(block_shape_n, dim=1)
+    w_scale = w_scale.repeat_interleave(block_shape_n, dim=0)
+    w_scale = w_scale.repeat_interleave(block_shape_k, dim=1)
     w_scale = w_scale[:n, :k]
     weight = weight.to(w_scale.dtype) * w_scale
 
