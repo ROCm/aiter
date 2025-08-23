@@ -159,6 +159,7 @@ def test_mha(
             causal=CAUSAL,
             return_lse=RETURN_LSE,
             return_attn_probs=RETURN_SOFTMAX,
+            mapping_mode=0,
         )
 
     if RETURN_LSE:
@@ -290,8 +291,7 @@ def test_mha_int64_strides(
         dropout_p=DROPOUT,
         causal=CAUSAL,
         return_lse=True,
-        mapping_mode=1,
-        use_remap=False,
+        mapping_mode=0,
     )
     if test_backward:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
