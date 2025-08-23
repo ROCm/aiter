@@ -452,11 +452,6 @@ def run_benchmark(custom, args):
                     2.0 * BATCH * HQ * N_CTX_Q * N_CTX_K * (D_HEAD + D_HEAD_V)
                 )
 
-        # Benchmark mode
-        MAPPING_AITER = 0
-        MAPPING_HEAD_FIRST = 1
-        MAPPING_TRITON_FA = 2
-
         if varlen:
             if args.fp8:
 
