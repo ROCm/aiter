@@ -4,6 +4,13 @@
 import sys
 import pytest
 import torch
+from typing import Union, List
+from aiter.ops.triton.lean_atten import (
+    _persistent_lean_attention,
+    persistent_lean_attention,
+    _get_config,
+)
+import aiter.ops.triton.utils.arch_info as arch_info
 
 from aiter.ops.triton.lean_atten import persistent_lean_attention
 

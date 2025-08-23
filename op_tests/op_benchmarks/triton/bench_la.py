@@ -5,7 +5,10 @@ import sys
 import torch
 import triton
 
-from aiter.ops.triton.lean_atten import persistent_lean_attention
+from aiter.ops.triton.lean_atten import (
+    _persistent_lean_attention,
+)
+
 
 configs = []
 configs.append(
