@@ -129,10 +129,10 @@ gemm2_kernels_dict = {
 }
 
 
-bit8_list = ["F8", "I8", "f8", "i8"]
-bit16_list = ["B16", "F16", "b16", "f16"]
-bit4_list = ["I4", "i4", "FP4X2", "fp4x2"]
-QuantType_list = ["per_1x128", "per_1x32"]
+bit8_list = ["f8", "i8", "fp8"]
+bit16_list = ["b16", "f16"]
+bit4_list = ["i4", "fp4x2"]
+QuantType_list = ["no", "per_tensor", "per_token", "per_1x128", "per_1x32"]
 
 
 def get_gemm1_kernels_list(
@@ -143,7 +143,7 @@ def get_gemm1_kernels_list(
     MulRoutedWeight: bool = False,
 ) -> list:
     arch = get_gfx()
-    if Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
+    if Adtype.lower() in bit8_list and Bdtype.lower() in bit8_list and Adtype == Bdtype:
         if arch == "gfx950":
             tag = "a8w8_gfx950"
         else:

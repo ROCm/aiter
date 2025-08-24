@@ -10,14 +10,35 @@ import pandas as pd
 from moe_cktile2stages_common import kernelInstance, get_gemm1_kernels_list, get_gemm2_kernels_list
 
 class cktile_moe_2stage_gemm_codegen:
-    def __init__(self, working_path, istune=False):
-        self.working_path = working_path
-        self.impl_path = os.path.join(working_path, "impl")
+    def __init__(
+        self, 
+        working_path, 
+        ab_dtype,
+        acc_dtype,
+        c_dtype,
+        quant_type,
+        activation,
+        mul_routed_weight_stage,
+        istune=False):
+        self.working_path   = working_path
+        self.impl_path      = os.path.join(working_path, "impl")
         self.instances_path = os.path.join(working_path, "instances")
-        self.istune = istune
-        # self.a_dtype = a_dtype.upper()
-        # self.b_dtype = b_dtype.upper()
-        # self.c_dtype = c_dtype.upper()
+        self.istune         = istune
+        self.ab_dtype       = ab_dtype.lower()
+        self.acc_dtype      = acc_dtype.lower()
+        self.c_dtype        = c_dtype.lower()
+        self.quant_type     = quant_type
+        self.activation     = activation
+        self.mul_routed_weight_stage = mul_routed_weight_stage
+        
+    def get_suffix(self, stage: int) -> str:
+        return ("_").join(element for element in 
+            [
+                self.quant_type,
+                "MulRoutedWeight" if self.mul_routed_weight_stage == stage else "",
+                "" if (stage == 2) else self.activation,
+            ] if element != ""
+        )
 
     def gen_instance(self, k: kernelInstance):
         INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
@@ -153,6 +174,18 @@ template torch::Tensor
         #         os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")
         #     ).write_text(INSTANCE_abI8_dBF16_eBF16)
         # else:
+        # for CDtype in ["bf16", "fp16"]:
+        #     for ABDtype in ["fp8"]: #"bf16", "fp16", 
+        #         for AccDtype in ["float"]:
+        # intsance = INSTANCE_template.format(
+        #     name=k.name, dtypes=f"{self.ab_dtype}, {self.acc_dtype}, {self.c_dtype}"
+        # )
+        # Path(
+        #     os.path.join(
+        #         self.instances_path,
+        #         f"{k.name}_ab{self.ab_dtype}_acc{self.acc_dtype}_C{self.c_dtype}.cpp",
+        #     )
+        # ).write_text(intsance)
         for CDtype in ["bf16", "fp16"]:
             for ABDtype in ["fp8"]: #"bf16", "fp16", 
                 for AccDtype in ["float"]:
@@ -165,6 +198,75 @@ template torch::Tensor
                             f"{k.name}_ab{ABDtype}_acc{AccDtype}_C{CDtype}.cpp",
                         )
                     ).write_text(intsance)
+
+    '''genarete heuristic dispatch'''
+    def gen_heuristic_dispatch(self):
+        HEURISTIC_template = f"""#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include "moe_cktile2stages.h"
+
+template <typename ABDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
+{{
+    // Apply shape heuristics to find a suitable kernel implementation.
+    //if (block_m == 32)
+    //{{
+    //    return moe_cktile2stages_gemm1_256x32x64x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //}}
+    if (block_m == 64)
+    {{
+        return moe_cktile2stages_gemm1_256x64x128x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    }}
+    //else if (block_m == 128)
+    //{{
+    //    return moe_cktile2stages_gemm1_256x128x128x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //}}
+    //else if (block_m == 256)
+    //{{
+    //    return moe_cktile2stages_gemm1_256x256x128x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //}}
+    else
+    {{
+        TORCH_CHECK(
+            false,
+            "Unsupported block_m value for moe_geem1 heuristic dispatch: ",
+            block_m);
+    }}
+}}
+
+template <typename ABDataType, typename AccDataType, typename CDataType>
+MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
+{{
+    // Apply shape heuristics to find a suitable kernel implementation.
+    //if (block_m == 32)
+    //{{
+    //    return moe_cktile2stages_gemm2_256x32x64x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //}}
+    if (block_m == 64)
+    {{
+        return moe_cktile2stages_gemm2_256x64x128x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    }}
+    //else if (block_m == 128)
+    //{{
+    //    return moe_cktile2stages_gemm2_256x128x128x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //}}
+    //else if (block_m == 256)
+    //{{
+    //    return moe_cktile2stages_gemm2_256x256x128x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //}}
+    else
+    {{
+        TORCH_CHECK(
+            false,
+            "Unsupported block_m value for moe_gemm2 heuristic dispatch: ",
+            block_m);
+    }}
+}}
+"""
+        with open(os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"), "w") as f:
+            f.write(HEURISTIC_template)
+
 
     '''generate lookup.h linking MNK/datatype to specific instance'''
     def gen_lookup_dict(self, kernels_dict):
@@ -257,6 +359,7 @@ torch::Tensor
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)
+        self.gen_heuristic_dispatch()
 
 
 # def get_tune_dict(tune_dict_csv):
@@ -406,22 +509,36 @@ if __name__ == "__main__":
     #         )
     #         codegen.generate_instance_and_lookUpTable()
     # else:
+
+
+    #single UT
+    ab_type = "fp8"
+    acc_type = "float"
+    c_type ="bf16"
+    quant_type = "per_token"
+    act_type = "silu"
     codegen = cktile_moe_2stage_gemm_codegen(
         args.working_path,
-        False,
+        ab_type,
+        acc_type,
+        c_type,
+        quant_type,
+        act_type,
+        2,
+        False
     )
     #gen all instances for gemm1 and gemm2
     _, gemm1_kernel_list = get_gemm1_kernels_list(
-        "f8",
-        "f8",
-        "per_token",
-        "silu",
+        ab_type,
+        ab_type,
+        quant_type,
+        act_type,
         False,
     )
     tag, gemm2_kernel_list = get_gemm2_kernels_list(
-        "f8",
-        "f8",
-        "per_token",
+        ab_type,
+        ab_type,
+        quant_type,
         "",
         True,
     )

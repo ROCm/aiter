@@ -81,7 +81,7 @@ template <typename FlatmmConfig,
 void moe_gemm(const ck_tile::MoeFlatmmHostArgs<ScaleM, ScaleN>& args,
                const ck_stream_config& s)
 {
-    using CodegenFlatmmShape = ck_tile::TileGemmShape<
+        using CodegenFlatmmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<FlatmmConfig::M_Tile, FlatmmConfig::N_Tile, FlatmmConfig::K_Tile>,
         ck_tile::sequence<FlatmmConfig::M_Warp, FlatmmConfig::N_Warp, FlatmmConfig::K_Warp>,
         ck_tile::sequence<FlatmmConfig::M_Warp_Tile,
@@ -114,14 +114,24 @@ void moe_gemm(const ck_tile::MoeFlatmmHostArgs<ScaleM, ScaleN>& args,
                                                                FlatmmConfig::NumWaveGroups,
                                                                true>; // Preshuffle_
 
-    if constexpr(moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
+    constexpr bool MXFP4_Pipeline = std::is_same_v<BDataType, ck_tile::pk_fp4_t>;
+
+    if constexpr(!MXFP4_Pipeline && moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)
     {
         static_assert(
             FlatmmConfig::N_Tile % (FlatmmConfig::N_Warp * FlatmmConfig::N_Warp_Tile * 2) == 0,
             "requires NRepeat is multiple of 2 for FFN_gemm1_gate_up");
     }
-    using GemmPipelineProblem =
-        ck_tile::GemmPipelineProblem<ADataType, BDataType, AccDataType, CodegenFlatmmShape, Traits>;
+
+    using ComputeDataType = ADataType;
+    static_assert(sizeof(ComputeDataType) >= sizeof(BDataType),
+                  "mixed_prec_flatmm requires ADataType is a wider type than BDataType");
+
+    using GemmPipelineProblem = ck_tile::GemmPipelineProblem<ComputeDataType,
+                                                             ComputeDataType,
+                                                             AccDataType,
+                                                             CodegenFlatmmShape,
+                                                             Traits>;
 
     using BaseGemmPipeline = ck_tile::BaseFlatmmPipelineAGmemBGmemCRegV1<GemmPipelineProblem>;
 
@@ -140,18 +150,30 @@ void moe_gemm(const ck_tile::MoeFlatmmHostArgs<ScaleM, ScaleN>& args,
         constexpr auto scheduler        = FlatmmConfig::Scheduler;
         constexpr auto memory_operation = memory_operation_.value;
 
-        using CodegenPipelineProblem = ck_tile::FlatmmPipelineProblem<ADataType,
+        using CodegenPipelineProblem =
+            std::conditional_t<MXFP4_Pipeline,
+                               ck_tile::F16xMXF4FlatmmPipelineProblem<ADataType,
                                                                       BDataType,
                                                                       AccDataType,
                                                                       CodegenFlatmmShape,
                                                                       CodegenGemmTraits,
                                                                       scheduler,
                                                                       has_hot_loop_v,
-                                                                      tail_number_v>;
+                                                                      tail_number_v>,
+                               ck_tile::FlatmmPipelineProblem<ADataType,
+                                                              BDataType,
+                                                              AccDataType,
+                                                              CodegenFlatmmShape,
+                                                              CodegenGemmTraits,
+                                                              scheduler,
+                                                              has_hot_loop_v,
+                                                              tail_number_v>>;
+
+        constexpr int BlockedXDLN_PerWarp = (MXFP4_Pipeline || (moe_kind == ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up)) ? 2 : 1; // determined by scale shuffle pattern
 
         using GemmEpilogue = ck_tile::CShuffleEpilogue<
-            ck_tile::CShuffleEpilogueProblem<ADataType,
-                                             BDataType,
+            ck_tile::CShuffleEpilogueProblem<ComputeDataType,
+                                             ComputeDataType,
                                              DsDatatype,
                                              AccDataType,
                                              CDataType,
@@ -171,10 +193,13 @@ void moe_gemm(const ck_tile::MoeFlatmmHostArgs<ScaleM, ScaleN>& args,
                                              FlatmmConfig::NumWaveGroups,
                                              false,
                                              1,
-                                             FlatmmConfig::TiledMMAPermuteN>>;
+                                             FlatmmConfig::TiledMMAPermuteN,
+                                             BlockedXDLN_PerWarp>>;
 
-        using CodegenFlatmmPipeline =
-            ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>;
+        using CodegenFlatmmPipeline = std::conditional_t<
+            MXFP4_Pipeline,
+            ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
+            ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
         using Kernel = ck_tile::
             MoeFlatmmKernel<TilePartitioner, CodegenFlatmmPipeline, GemmEpilogue, moe_kind>;

@@ -16,6 +16,12 @@
 #include <torch/all.h>
 #include <torch/extension.h>
 
+using MoeKernel = std::function<
+    torch::Tensor(torch::Tensor &, torch::Tensor &,
+                  torch::Tensor &, torch::Tensor &,
+                  torch::Tensor &, torch::Tensor &,
+                  int, std::optional<torch::Tensor>,
+                  std::optional<torch::Tensor>, std::optional<torch::Tensor>)>;
 using ck_stream_config      = ck_tile::stream_config;
 using row_major             = ck_tile::tensor_layout::gemm::RowMajor;
 using col_major             = ck_tile::tensor_layout::gemm::ColumnMajor;
