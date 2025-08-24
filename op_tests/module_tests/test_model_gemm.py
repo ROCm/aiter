@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gemm 2-Stage Test Runner
+Gemm Test Runner at Model Level
 Manages test parameters and executes test_gemm.py/test_gemm_a4w4.py/test_gemm_a8w8.py with user-defined argument combinations
 """
 
@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 M = [1, 4, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096, 8192, 16384, 32768]
 
-
 @dataclass
 class TestConfig:
     """
@@ -31,11 +30,11 @@ class TestConfig:
     Parameters:
     -----------
     model_name : str
-        Name of the model (e.g., "DeepSeek-R1", "Qwen3-235B-A22B")
+        Name of the model (e.g., "Qwen3-32B", "Llama3-70B")
     attention_head : int
         Number of attention heads
     kv_head : int
-        Number of the kv attention heads
+        Number of the kv heads
     head_dim : int
         feature dimention per head
     intermediate_size : int
@@ -193,8 +192,8 @@ class GemmTestRunner:
                     )
 
         df = pd.DataFrame(df)
-        return records_result
         # aiter.logger.info(f"summary:\n{df}")
+        return records_result
 
     def save_structs_to_csv(self, records, csv_file, fieldnames):
         import csv
