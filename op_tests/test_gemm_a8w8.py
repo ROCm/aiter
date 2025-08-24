@@ -7,7 +7,7 @@ import random
 import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest, benchmark
 import pandas as pd
 import argparse
 
@@ -296,91 +296,87 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
-def create_argument_parser():
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter,
-        description="config input of test",
-    )
-    parser.add_argument(
-        "-d",
-        "--dtype",
-        type=str,
-        choices=l_dtype,
-        nargs="?",
-        const=None,
-        default=None,
-        help="""Data type.
-        e.g.: -d bf16""",
-    )
-    parser.add_argument(
-        "-q",
-        "--quantDtype",
-        type=str,
-        choices=l_quantDtype,
-        nargs="?",
-        const=None,
-        default=None,
-        help="""Date type of quantization.
-        e.g.: -q fp8""",
-    )
-    parser.add_argument(
-        "-mnk",
-        type=dtypes.str2tuple,
-        nargs="?",
-        const=None,
-        default=None,
-        help="""Shape of mnk.
-        e.g. -mnk 1280,8192,1024""",
-    )
-    return parser
 
-if __name__ == "__main__":
-    l_dtype = ["bf16", "fp16"]
-    l_quantDtype = ["i8", "fp8"]
-    l_mnk_nm = [
-        # qkv_proj
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        # attn_out
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-    ]
+l_dtype = ["bf16", "fp16"]
+l_quantDtype = ["i8", "fp8"]
+l_mnk_nm = [
+    # qkv_proj
+    (1, 1280, 8192),
+    (32, 1280, 8192),
+    (64, 1280, 8192),
+    (128, 1280, 8192),
+    (192, 1280, 8192),
+    (256, 1280, 8192),
+    (320, 1280, 8192),
+    (512, 1280, 8192),
+    (1024, 1280, 8192),
+    (2048, 1280, 8192),
+    (4096, 1280, 8192),
+    (8192, 1280, 8192),
+    (16384, 1280, 8192),
+    # attn_out
+    (1, 8192, 1024),
+    (32, 8192, 1024),
+    (64, 8192, 1024),
+    (128, 8192, 1024),
+    (192, 8192, 1024),
+    (256, 8192, 1024),
+    (320, 8192, 1024),
+    (512, 8192, 1024),
+    (1024, 8192, 1024),
+    (2048, 8192, 1024),
+    (4096, 8192, 1024),
+    (8192, 8192, 1024),
+    (16384, 8192, 1024),
+]
 
-    parser = create_argument_parser()
-    args = parser.parse_args()
-    if args.dtype is None:
-        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-    else:
-        l_dtype = [dtypes.d_dtypes[args.dtype]]
-    if args.quantDtype is None:
-        l_quantDtype = [dtypes.d_dtypes[key] for key in l_quantDtype]
-    else:
-        l_quantDtype = [dtypes.d_dtypes[args.quantDtype]]
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=str,
+    choices=l_dtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-q",
+    "--quantDtype",
+    type=str,
+    choices=l_quantDtype,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Date type of quantization.
+    e.g.: -q fp8""",
+)
+parser.add_argument(
+    "-mnk",
+    type=dtypes.str2tuple,
+    nargs="?",
+    const=None,
+    default=None,
+    help="""Shape of mnk.
+    e.g. -mnk 1280,8192,1024""",
+)
 
-    if args.mnk is not None:
-        l_mnk_nm = [args.mnk]
+args = parser.parse_args()
+if args.dtype is None:
+    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+else:
+    l_dtype = [dtypes.d_dtypes[args.dtype]]
+if args.quantDtype is None:
+    l_quantDtype = [dtypes.d_dtypes[key] for key in l_quantDtype]
+else:
+    l_quantDtype = [dtypes.d_dtypes[args.quantDtype]]
+if args.mnk is not None:
+    l_mnk_nm = [args.mnk]
 
-    test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
-    test_skinny_gemm_a8w8_pertoken_quant()
+test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+test_skinny_gemm_a8w8_pertoken_quant()
