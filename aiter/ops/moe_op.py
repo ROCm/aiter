@@ -343,9 +343,14 @@ def get_moe_stage_module(
             f"mulWeightStage{mul_routed_weight_stage}",
         ]
     )
-
     blob_gen_cmd = [
         f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} -w {{}}"
+    ]
+
+    md_name = "module_moe_ck2stages"
+
+    blob_gen_cmd = [
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -w {{}}"
     ]
 
     return md_name, blob_gen_cmd
