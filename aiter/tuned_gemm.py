@@ -60,7 +60,7 @@ class TunedGemm:
                     lambda s: (
                         getHipblasltKernelName(s.solidx)
                         if s.libtype == "hipblaslt"
-                        else ""
+                        else "rocblas"
                     ),
                     axis=1,
                 )
@@ -99,14 +99,14 @@ class TunedGemm:
             self.apply_skinny,
         ]
 
-    @functools.lru_cache(maxsize=1024)
+    @functools.lru_cache(maxsize=4096)
     def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
         # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
         #     if n > 8 and 0 < m <= 4:
         #         return 3, 0
         #     elif n % 4 == 0 and m == 1 and k <= 8192:
         #         return 3, 1
-
+        soltype = None
         if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
             if (
                 (
@@ -119,12 +119,15 @@ class TunedGemm:
                 or (m > 8 and m <= 16 and n <= self.cu_count)
                 and k <= 256
             ):
-                return 3, 2
-        soltype, solidx = self.solids.get(
-            (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
-        )
+                soltype, solidx = 3, 2
+        if soltype is None:
+            soltype, solidx = self.solids.get(
+                (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+            )
+        solution_name = self.solMap[soltype]
+
         logger.info(
-            f"using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
+            f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
         )
         return soltype, solidx
 
@@ -300,6 +303,8 @@ class TunedGemm:
         )
         if batched:
             out = out.view(*inp.shape[:-1], weights.shape[0])
+        if otype is not None:
+            out = out.to(otype)
         return out
 
 

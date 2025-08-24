@@ -385,7 +385,7 @@ def run_aiter_asm(
     num_kv_heads,
     scale,
     alibi_slopes,
-    max_num_blocks,
+    block_tables_stride0,
     k_scale=None,
     v_scale=None,
     high_precision=0,
@@ -396,7 +396,7 @@ def run_aiter_asm(
         v_cache,
         block_tables,
         seq_lens,
-        max_num_blocks,
+        block_tables_stride0,
         K_QScale=k_scale,
         V_QScale=v_scale,
         out_=None,
@@ -577,7 +577,7 @@ def test_paged_attention(
             num_kv_heads,
             scale,
             alibi_slopes,
-            max_num_blocks_per_seq,
+            block_tables.stride(0),
         )
 
         checkAllclose(
@@ -687,7 +687,7 @@ def test_paged_attention(
                 num_kv_heads,
                 scale,
                 alibi_slopes,
-                max_num_blocks_per_seq,
+                block_tables.stride(0),
                 k_scale_asm,
                 v_scale_asm,
             )
@@ -718,7 +718,7 @@ def test_paged_attention(
                         num_kv_heads,
                         scale,
                         alibi_slopes,
-                        max_num_blocks_per_seq,
+                        block_tables.stride(0),
                         k_scale_asm,
                         v_scale_asm,
                         high_precision,

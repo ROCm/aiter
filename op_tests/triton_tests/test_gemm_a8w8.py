@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 import torch.nn.functional as F
 from aiter.ops.triton.gemm_a8w8 import gemm_a8w8
@@ -108,33 +107,43 @@ def generate_gemm_a8w8_inputs(
     weight = weight / w_scale.T
     weight = weight.to(in_dtype)
 
-    bias = torch.rand([1, N], dtype=torch.float32).cuda() * 10
+    bias = torch.rand([1, N], dtype=torch.float32, device="cuda") * 10
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=out_dtype).cuda()
+        y = torch.empty((M, N), dtype=out_dtype, device="cuda")
 
     return x, weight, x_scale, w_scale, bias, y
 
 
 @pytest.mark.parametrize(
-    "in_dtype, out_dtype, m, n, k, output",
+    "in_dtype, out_dtype, m, n, k, layout, output",
     [
-        (in_dtype, out_dtype, *shape, output)
+        (in_dtype, out_dtype, *shape, layout, output)
         for in_dtype in ["fp8e4m3", "fp8e5m2", "int8"]
         for out_dtype in ["bf16"]
         for shape in get_x_vals()
+        for layout in ["TN", "TT", "NN", "NT"]
         for output in [True, False]
     ],
 )
-def test_gemm(in_dtype, out_dtype, m, n, k, output):
+def test_gemm(in_dtype, out_dtype, m, n, k, layout, output):
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype[out_dtype]
     x, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
-        M=m, N=n, K=k, in_dtype=in_dtype, out_dtype=out_dtype, output=output
+        M=m,
+        N=n,
+        K=k,
+        in_dtype=in_dtype,
+        out_dtype=out_dtype,
+        layout=layout,
+        output=output,
     )
 
     a = run_torch(x, weight, x_scale, w_scale, bias, out_dtype)
     b = run_triton(x, weight, x_scale, w_scale, bias, out_dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)

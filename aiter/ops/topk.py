@@ -3,8 +3,8 @@
 
 # user interface
 
+from typing import List
 import torch
-from torch import Tensor
 from ..jit.core import (
     compile_ops,
 )
@@ -14,10 +14,10 @@ from ..jit.utils.chip_info import get_cu_num
 
 @compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
 def biased_grouped_topk_hip(
-    gating_output: Tensor,
-    correction_bias: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_grp: int,
     need_renorm: bool,
@@ -27,34 +27,56 @@ def biased_grouped_topk_hip(
 
 @compile_ops("module_moe_asm")
 def grouped_topk(
-    gating_output: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
-    scoring_func: str = "softmax",
-    scale_factor: float = 1.0,
-): ...
+    scoring_func: bool = True,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
 
 
-@compile_ops("module_moe_asm")
-def moe_fused_gate(
-    input: Tensor,
-    bias: Tensor,
+def gen_moe_fused_gate_fake_tensor(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     topk: int,
     n_share_experts_fusion: int,
-    scale_factor: float = 1.0,
-): ...
+    routed_scaling_factor: float = 1.0,
+) -> List[torch.Tensor]:
+    output = torch.empty_like(
+        topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
+    )
+
+    indices = torch.empty_like(topk_ids, dtype=topk_ids.dtype, device=topk_ids.device)
+
+    return [output, indices]
+
+
+@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
+def moe_fused_gate(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> List[torch.Tensor]: ...
 
 
 def biased_grouped_topk(
-    gating_output: Tensor,
-    correction_bias: Tensor,
-    topk_weights: Tensor,
-    topk_ids: Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
@@ -62,7 +84,7 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     cu_num = get_cu_num()
-    if token_num >= cu_num * 16:
+    if token_num <= cu_num * 16 or not topk_ids.is_contiguous():
         return biased_grouped_topk_hip(
             gating_output,
             correction_bias,
@@ -79,11 +101,13 @@ def biased_grouped_topk(
         return moe_fused_gate(
             gating_output,
             correction_bias,
+            topk_weights,
+            topk_ids,
             num_expert_group,
             topk_group,
             topk,
             n_share_experts_fusion=0,
-            scale_factor=routed_scaling_factor,
+            routed_scaling_factor=routed_scaling_factor,
         )
 
 
