@@ -171,7 +171,9 @@ _CKGEMM_CONFIG_CACHE = None
 
 
 @torch_compile_guard()
-def get_CKGEMM_config_(tuned_file: str = "a8w8_tuned_gemm.csv") -> None:
+def get_CKGEMM_config_(tuned_file: str = None) -> None:
+    if tuned_file is None:
+        tuned_file = "a8w8_tuned_gemm.csv"
     global _CKGEMM_CONFIG_CACHE
 
     if _CKGEMM_CONFIG_CACHE is None:

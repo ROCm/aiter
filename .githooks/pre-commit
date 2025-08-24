@@ -58,7 +58,7 @@ done
 if command -v clang-format >/dev/null; then
     for file in $files; do
     [[ -L $file ]] && continue
-       if [[ -e $file ]] && echo $file | grep -Eq '\.c$|\.h$|\.hpp$|\.cpp$|\.cl$|\.h\.in$|\.hpp\.in$|\.cpp\.in$'; then
+       if [[ -e $file ]] && echo $file | grep -Eq '\.c$|\.h$|\.cuh$|\.hpp$|\.cpp$|\.cl$|\.h\.in$|\.hpp\.in$|\.cpp\.in$'; then
             echo "clang-format $file"
             clang-format -i -style=file "$file"
             git add -u "$file"

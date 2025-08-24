@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
 import triton.language as tl
 import torch
 import pytest
@@ -246,7 +245,7 @@ def test_paged_attn(
         torch_output, query, key_cache, value_cache, block_tables, context_lens
     )
 
-    triton.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
+    torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
 @pytest.mark.parametrize("B", [1, 4, 57, 64])
@@ -374,4 +373,4 @@ def test_paged_attn_per_token_quant(
     if DEBUG_MODE:
         print(f"torch_output={torch_output}")
 
-    triton.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)
+    torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)

@@ -222,7 +222,7 @@ def asm_mla_decode_fwd(
             attn_lse.stride(2),
             output.stride(0),
             output.stride(1),
-            torch.cuda.current_stream(),
+            torch.cuda.current_stream(q.device),
         )
     )
     if num_kv_splits == 1 and num_heads == 128:

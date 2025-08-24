@@ -81,19 +81,19 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
                      torch::Tensor& V, //   [num_blocks, num_kv_heads, block_size/X, head_size, X]
                      torch::Tensor& block_tables, //   [num_seqs, max_num_blocks_per_seq]
                      torch::Tensor& context_lens, //   [num_seqs]
-                     int max_num_blocks,
+                     int block_tables_stride0,
                      int max_qlen                           = 1,
                      std::optional<torch::Tensor> K_QScale  = std::nullopt,
                      std::optional<torch::Tensor> V_QScale  = std::nullopt,
                      std::optional<torch::Tensor> out_      = std::nullopt,
                      std::optional<torch::Tensor> qo_indptr = std::nullopt,
                      std::optional<int> high_precision      = 1,
-                     std::optional<std::string> kernelName_  = std::nullopt)
+                     std::optional<std::string> kernelName_ = std::nullopt)
 {
     std::string kernelName = kernelName_.value_or("");
     torch::Tensor output = out_.value_or(torch::empty_like(Q));
     int batch            = context_lens.size(0);
-    // int max_num_blocks = block_tables.size(1);
+    // int block_tables_stride0 = block_tables.size(1);
     int num_heads       = Q.size(1);
     int head_size       = Q.size(2);
     int num_kv_heads    = K.size(1);
@@ -128,7 +128,7 @@ torch::Tensor pa_fwd(torch::Tensor& Q, //   [num_seqs, num_heads, head_size]
         args.ptr_VQ = nullptr;
     }
     args.sclg2e    = k_scalar;
-    args.mblk      = max_num_blocks;
+    args.mblk      = block_tables_stride0;
     args.kv_nheads = num_kv_heads;
     args.Qs        = stride_Q;
     args.Bs        = stride_KV_blk;

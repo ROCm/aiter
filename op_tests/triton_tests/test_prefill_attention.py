@@ -16,17 +16,15 @@ def input_helper(BATCH, SEQLEN, H, HEAD_DIM, dtype, absorb=False):
         k = torch.randn((BATCH * SEQLEN, H, HEAD_DIM), device="cuda", dtype=dtype)
         v = torch.randn((BATCH * SEQLEN, H, HEAD_DIM), device="cuda", dtype=dtype)
 
-    b_seq_len = torch.ones((BATCH,), dtype=torch.int32) * SEQLEN
-    b_start_loc = torch.zeros((BATCH,), dtype=torch.int32)
+    b_seq_len = torch.ones((BATCH,), dtype=torch.int32, device="cuda") * SEQLEN
+    b_start_loc = torch.zeros((BATCH,), dtype=torch.int32, device="cuda")
 
     b_start_loc = torch.cat(
         [
-            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32, device="cuda"),
             b_seq_len.cumsum(dim=0, dtype=torch.int32),
         ]
     )
-    b_start_loc = b_start_loc.to(device="cuda")
-    b_seq_len = b_seq_len.to(device="cuda")
 
     return q, k, v, b_seq_len, b_start_loc[:BATCH]
 
@@ -36,16 +34,20 @@ def varlen_input_helper(
 ):
     if not equal_seqlens:
         max_seqlens = SEQLEN // BATCH
-        seqlens = torch.randint(1, max_seqlens + 1, (BATCH,), dtype=torch.int32)
+        seqlens = torch.randint(
+            1, max_seqlens + 1, (BATCH,), dtype=torch.int32, device="cuda"
+        )
     else:
-        seqlens = torch.full((BATCH,), SEQLEN // BATCH)
+        seqlens = torch.full((BATCH,), SEQLEN // BATCH, device="cuda")
 
     # Calculate cumulative sequence lengths
     cu_seqlens = torch.cat(
-        [torch.tensor([0], dtype=torch.int32), seqlens.cumsum(dim=0, dtype=torch.int32)]
+        [
+            torch.tensor([0], dtype=torch.int32, device="cuda"),
+            seqlens.cumsum(dim=0, dtype=torch.int32),
+        ]
     )
-    cu_seqlens = cu_seqlens.to(device="cuda")
-    seqlens = seqlens.to(device="cuda")
+
     # Initialize q, k, v with variable lengths
     total_seq = cu_seqlens[-1].item()
 

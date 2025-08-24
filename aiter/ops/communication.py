@@ -12,7 +12,8 @@ from ..dist.parallel_state import (
     destroy_model_parallel,
     destroy_distributed_environment,
 )
-from ..dist.utils import get_open_port, get_distributed_init_method, get_ip
+
+# from ..dist.utils import get_open_port, get_distributed_init_method, get_ip
 import aiter
 import logging
 
@@ -24,20 +25,20 @@ def init_dist_env(world_size, rankID):
     init_distributed_environment(
         world_size=world_size,
         rank=rankID,
-        distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        # distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
         backend="cpu:gloo,cuda:nccl",
+        local_rank=rankID,
     )
     ensure_model_parallel_initialized(world_size, 1)
 
-    # hack custom_allreduce
-    tp_grp = get_tp_group()
-    ca_comm = tp_grp.ca_comm
-
-    # signal
-    signal = torch.zeros(world_size * 64, dtype=torch.int64, device=rankID)
-
-    ca_comm.signal = signal
-    ca_comm.register_buffer(signal)
+    if world_size > 1:
+        # hack custom_allreduce
+        tp_grp = get_tp_group()
+        ca_comm = tp_grp.ca_comm
+        # signal
+        signal = torch.zeros(world_size * 64, dtype=torch.int64, device=rankID)
+        ca_comm.signal = signal
+        ca_comm.register_buffer(signal)
     logger.debug(f"RANK: {rankID}/{world_size} init_dist_env...")
 
 

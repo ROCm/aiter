@@ -8,6 +8,7 @@ from typing import Any, Dict
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -72,6 +73,7 @@ def _fused_moe_kernel_mxfp4(
     compute_type: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -137,7 +139,6 @@ def _fused_moe_kernel_mxfp4(
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    NUM_XCDS: tl.constexpr = 8
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
@@ -458,5 +459,6 @@ def fused_moe_mxfp4(
         compute_type=compute_type,
         SWIZZLE_MX_A=swizzle_mx_a,  # TODO add swizzle support
         SWIZZLE_MX_B=swizzle_mx_b,  # TODO add swizzle support
+        NUM_XCDS=get_num_xcds(),
         **config,
     )

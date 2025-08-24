@@ -244,9 +244,8 @@ def post_process_data(df, num_iters, warm_iter=1):
     out_range_num = len(out_range_idx)
 
     indices = {idx for i in out_range_idx for idx in sum_df.iloc[i]["index"]}
-    indices_to_add = [
-        idx for i in range(warm_iter) for idx in grouped_kernel_df.at[i, "index"]
-    ]
+    index_sublists = grouped_kernel_df["index"].head(warm_iter).tolist()
+    indices_to_add = [idx for sublist in index_sublists for idx in sublist]
     indices.update(indices_to_add)
     if int(os.environ.get("AITER_LOG_MORE", 0)):
         logger.info(f"abnormal data indices: {indices}")

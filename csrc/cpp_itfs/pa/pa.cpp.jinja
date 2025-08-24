@@ -20,6 +20,7 @@
                       const int kv_block_stride,        \
                       const int kv_head_stride,         \
                       const float* alibi_slopes_ptr,    \
+                      const float* q_scale_ptr,         \
                       const float* k_scale_ptr,         \
                       const float* v_scale_ptr,         \
                       const float* fp8_out_scale_ptr,   \
@@ -77,7 +78,8 @@ FUNCTION_DEFINE
                                     kv_head_stride,                             
                                     exp_sums_ptr,                   
                                     max_logits_ptr,                 
-                                    tmp_out_ptr,                                               
+                                    tmp_out_ptr,
+                                    q_scale_ptr,                                               
                                     k_scale_ptr,                    
                                     v_scale_ptr);
 

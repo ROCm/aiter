@@ -118,7 +118,7 @@ def fused_moe(
     q_dtype_a = dtypes.fp4x2 if quant_type == QuantType.per_1x32 else q_dtype_a
 
     metadata = get_2stage_cfgs(
-        min(1024, M),  # consider token_num > 1024 as prefill
+        get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -278,7 +278,23 @@ def fused_moe_1stage(
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
         else:
-            fmoe_func = aiter.fmoe_int8_g1u0
+            aiter.fmoe_int8_g1u0(
+                moe_buf,
+                a1,
+                w1,
+                w2,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                a1_scale,
+                w1_scale,
+                w2_scale,
+                fc2_smooth_scale=None,
+                activation=activation,
+            )
+            return moe_buf
 
         fmoe_func(
             moe_buf,
@@ -293,6 +309,7 @@ def fused_moe_1stage(
             a1_scale,
             w1_scale,
             w2_scale,
+            "",
             fc2_smooth_scale=None,
             activation=activation,
         )
@@ -345,6 +362,23 @@ fused_moe_1stage_dict = {
 quant_remap = {QuantType.per_128x128: QuantType.per_1x128}
 
 
+def nextPow2(n):
+    if n <= 0:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def get_padded_M(M):
+    padded_m = M
+    if M >= 1 and M <= 16:
+        padded_m = 16
+    elif M < 1024:
+        padded_m = nextPow2(padded_m)
+    else:
+        padded_m = 1024
+    return padded_m
+
+
 @dataclass
 class MOEMetadata:
     stage1: Callable
@@ -375,6 +409,7 @@ def get_2stage_cfgs(
         cfg_2stages = pd.read_csv(tune_file)
         cfg_2stages = cfg_2stages.set_index(
             [
+                "cu_num",
                 "token",
                 "model_dim",
                 "inter_dim",
@@ -398,7 +433,9 @@ def get_2stage_cfgs(
     profile_file = os.path.join(config_path, "profile_fmoe.csv")
     if cfg_2stages is None:
         cfg_2stages = get_cfg_2stages(tune_file)
+    cu_num = get_cu_num()
     keys = (
+        cu_num,
         token,
         model_dim,
         inter_dim,
@@ -435,7 +472,6 @@ def get_2stage_cfgs(
         cfg = cfg_2stages.get(keys, None)
         if cfg is None:
             logger.warning(f"Fmoe tuning not support for {keys}")
-
     if cfg is None:
         ksplit = 0
         kernelName1 = ""
@@ -562,7 +598,7 @@ def fused_moe_2stages(
     device = hidden_states.device
 
     metadata = get_2stage_cfgs(
-        min(1024, token_num),  # consider token_num > 1024 as prefill
+        get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,

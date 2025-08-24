@@ -46,6 +46,7 @@ struct mha_bwd_traits : public fmha_bwd_traits
 
 using mha_bwd_args = fmha_bwd_args;
 
+// FIXME: use aiter mha_args
 __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      const ck_tile::stream_config& stream_config,
                                                      std::string q_dtype_str,
@@ -57,7 +58,9 @@ __attribute__((visibility("default"))) float mha_bwd(mha_bwd_args args,
                                                      bool deterministic,
                                                      bool use_ext_asm,
                                                      bool is_v3_atomic_fp32,
-                                                     int how_v3_bf16_cvt);
+                                                     int how_v3_bf16_cvt,
+                                                     const void* seqlen_q_padded = nullptr,
+                                                     const void* seqlen_k_padded = nullptr);
 
 struct __attribute__((packed)) fmha_bwd_v3_args
 {
@@ -229,6 +232,8 @@ struct __attribute__((packed)) fmha_bwd_v3_group_args
     const void* ptr_d;
     const void* ptr_qseq;
     const void* ptr_kseq;
+    const void* ptr_qseq_padded;
+    const void* ptr_kseq_padded;
     float scalar;
     p1 _p0;
     float log2e;
@@ -336,23 +341,36 @@ struct __attribute__((packed)) fmha_bwd_v3_swa_genl_args
 
 struct __attribute__((packed)) fmha_bwd_dq_shuffle_args
 {
-    void* ptr_dq;
+    void* ptr_dq_acc;
     p2 _p0;
+    void* ptr_dq;
+    p2 _p1;
     unsigned int Ts;
-    p3 _p1;
-    unsigned int Hs;
     p3 _p2;
-    unsigned int BAs;
+    unsigned int Hs_dq_acc;
     p3 _p3;
-    unsigned int Seqs;
+    unsigned int BAs_dq_acc;
     p3 _p4;
+    unsigned int Seqs_dq_acc;
+    p3 _p5;
+    unsigned int Hs_dq;
+    p3 _p6;
+    unsigned int BAs_dq;
+    p3 _p7;
+    unsigned int Seqs_dq;
+    p3 _p8;
+    unsigned int seqlen_q;
+    p3 _p9;
+    unsigned int head_dim;
+    p3 _p10;
 };
 
 struct fmha_bwd_v3_traits
 {
     int b;
     int h;
-    int s;
+    int sq;
+    int sk;
     int d;
 
     int mask;
@@ -390,10 +408,18 @@ template <typename fmha_bwd_dq_dk_dv_v3_traits_>
 struct FmhaBwdV3Ts;
 
 namespace gfx942 {
-float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
+float fmha_bwd_v3(mha_bwd_traits t,
+                  mha_bwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqlen_q_padded = nullptr,
+                  const void* seqlen_k_padded = nullptr);
 }
 
 namespace gfx950 {
-float fmha_bwd_v3(mha_bwd_traits t, mha_bwd_args a, const ck_tile::stream_config& s);
+float fmha_bwd_v3(mha_bwd_traits t,
+                  mha_bwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqlen_q_padded = nullptr,
+                  const void* seqlen_k_padded = nullptr);
 }
 } // namespace aiter

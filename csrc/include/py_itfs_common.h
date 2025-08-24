@@ -32,6 +32,12 @@ const constexpr auto torch_fp8 = at::ScalarType::Float8_e4m3fnuz;
 const auto torch_fp8 = isGPUArch({"gfx94"}) ? at::ScalarType::Float8_e4m3fnuz : at::ScalarType::Float8_e4m3fn;
 #endif
 
+#ifdef TORCH_Float4_e2m1fn_x2
+const constexpr auto torch_fp4x2 = torch::kFloat4_e2m1fn_x2;
+#else
+const constexpr auto torch_fp4x2  = torch::kUInt8;
+#endif
+
 // clang-format off
 template <typename T> struct t2ck;
 template <> struct t2ck<float> { using type = ck_tile::fp32_t; };

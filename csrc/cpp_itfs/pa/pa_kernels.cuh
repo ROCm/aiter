@@ -298,7 +298,7 @@ __inline__ __device__ void _paged_attention_kernel(
     {
         // multiply by k_scale if fp8 kv cache
         scale2 *= *k_scale_ptr;
-        scale2 /= q_scale;
+        scale2 *= q_scale;
     }
 
     const auto variant_params = [&] {
