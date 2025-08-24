@@ -1,31 +1,45 @@
-# Operators benchmark for real cases in LLM workloads
+# aiter
+![image](https://github.com/user-attachments/assets/9457804f-77cd-44b0-a088-992e4b9971c6)
 
 
-Here is the introduction of key operators benchmarking for real scenairos in LLM workloads. The operators now includes:
-* Gemm
+AITER is AMD’s centralized repository that support various of high performance AI operators for AI workloads acceleration, where a good unified place for all the customer operator-level requests, which can match different customers' needs. Developers can focus on operators, and let the customers integrate this op collection into their own private/public/whatever framework.
  
 
-## Gemm kernel benchmark at workload level
+Some summary of the features:
+* C++ level API
+* Python level API
+* The underneath kernel could come from triton/ck/asm
+* Not just inference kernels, but also training kernels and GEMM+communication kernels—allowing for workarounds in any kernel-framework combination for any architecture limitation.
 
-#### Enviroment Setup
+
+
+## Installation
 ```
 git clone --recursive https://github.com/ROCm/aiter.git
 cd aiter
 python3 setup.py develop
-export PYTHON=/path_to_aiter/
-cd aiter/op_tests/module_tests
 ```
 
-#### Benchmark all Gemm cases
-The test_model_gemm.py now supports Gemm benchmark for cases in `Qwen3-32B`, `Llama3-70B` and `Llama3-405B`.
-Users can use the following command to get the benchmark results for all workloads. For each workload, a csv file will be generated. Taking `Llama3-70B` for example, a csv file named as `Llama3-405B.csv` will be generated in currect folder. The result contains `attn qkv fused gemm`, `attn output gemm`, `mlp up-gate fused gemm`, `mlp up-gate non-fused gemm`, `mlp down gemm` considering different Tensor Parallel sizes in the list of [1, 4, 8]. By defalut, the script will benchmark all the FP8, BF16 and FP4 (if supported by the platform) if user does not specify the datatype.
+If you happen to forget the `--recursive` during `clone`, you can use the following command after `cd aiter`
 ```
-python3 -u test_model_gemm.py
-```
-#### Benchmark Gemm in specified configuration
-Users can also specify the model and the corresponding configuration they need. The following example indicates Gemm kernel will be benchmark using the shapes in `Llama3-70B` with tensor parallel size equaling to 8, input and weight in FP8 quantization datatype and output in BF16 datatype. 
-```
-python3 -u test_model_gemm.py -m Llama3-70B -tp 8 -d bf16 -q fp8
+git submodule sync && git submodule update --init --recursive
 ```
 
-                                                                                                                             
+## Run operators supported by aiter
+
+There are number of op test, you can run them with: `python3 op_tests/test_layernorm2d.py`
+|  **Ops**                      | **Description**                                                                                                                                                   |
+|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|ELEMENT WISE                   | ops: + - * /                                                                                                                                                      |
+|SIGMOID                        | (x) = 1 / (1 + e^-x)                                                                                                                                              |
+|AllREDUCE                      | Reduce + Broadcast                                                                                                                                                |
+|KVCACHE                        | W_K W_V                                                                                                                                                           |
+|MHA                            | Multi-Head Attention                                                                                                                                              |
+|MLA                            | Multi-head Latent Attention with [KV-Cache layout](https://docs.flashinfer.ai/tutorials/kv_layout.html#page-table-layout )                                        |
+|PA                             | Paged Attention                                                                                                                                                   |
+|FusedMoe                       | Mixture of Experts                                                                                                                                                |
+|QUANT                          | BF16/FP16 -> FP8/INT4                                                                                                                                             |
+|RMSNORM                        | root mean square                                                                                                                                                  |
+|LAYERNORM                      | x = (x - u) / (σ2 + ϵ) e*0.5                                                                                                                                      |
+|ROPE                           | Rotary Position Embedding                                                                                                                                         |
+|GEMM                           | D=αAβB+C                                                                                                                                                          |
