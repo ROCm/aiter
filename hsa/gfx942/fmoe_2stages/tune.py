@@ -29,7 +29,6 @@ from aiter.int4_utils import (
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx
-import functools
 from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
@@ -1491,7 +1490,10 @@ def go(
             )
         profileDF = pd.DataFrame(
             profileDF,
-            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
+            columns=["stage"]
+            + ["cu_num"]
+            + args
+            + ["block_m", "ksplit", "us", "kernelName", "err"],
         )
         prorfiles.append(profileDF)
         profileDF = profileDF.sort_values("us").drop_duplicates(

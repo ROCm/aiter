@@ -1,6 +1,5 @@
 import argparse
 import sys
-import torch
 import triton
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 import aiter.ops.triton.utils.arch_info as arch_info
