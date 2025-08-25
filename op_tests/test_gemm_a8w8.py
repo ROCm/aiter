@@ -7,7 +7,7 @@ import random
 import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
+from aiter.test_common import checkAllclose, perftest
 import pandas as pd
 import argparse
 
@@ -50,7 +50,7 @@ def run_gemm_skinny(
     return out.to(dtype)
 
 
-#@benchmark()
+# @benchmark()
 def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
@@ -296,6 +296,7 @@ def test_skinny_gemm_a8w8_pertoken_quant():
                     test_skinny_gemm(dtype, m, n, k, quant_dtype, cu_count)
                     # test_gemm(dtype, m, n, k, quant_dtype)
 
+
 def create_argument_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -384,4 +385,3 @@ if __name__ == "__main__":
         l_mnk_nm = [args.mnk]
         test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
         test_skinny_gemm_a8w8_pertoken_quant()
-
