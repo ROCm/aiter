@@ -99,31 +99,19 @@ def _gemm_a8w8_blockscale_kernel(
         pid_m = pid // num_pid_n
         pid_n = pid % num_pid_n
 
-    blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16],  # 128 * 128
-        threads_per_warp=[8, 8],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
-    blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],
-        threads_per_warp=[8, 8],
-        warps_per_cta=[1, 4],
-        order=[0, 1],
-    )
     linear_mk: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8]],
-        lane_bases=[[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]],
-        warp_bases=[[8, 0], [16, 0], [32, 0], [64, 0]],
+        reg_bases=[[0, 1], [0, 2], [0, 4], [0, 8], [1, 0], [2, 0]],
+        lane_bases=[[0, 16], [0, 32], [0, 64], [4, 0], [8, 0], [16, 0]],
+        warp_bases=[[32, 0], [64, 0]],
         block_bases=[],
-        shape=[32, 128]
+        shape=[128, 128]
     )
     linear_kn: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0]],
-        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]],
-        warp_bases=[[0, 8], [0, 16], [0, 32], [0, 64]],
+        reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]],
+        lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]],
+        warp_bases=[[0, 32], [0, 64]],
         block_bases=[],
-        shape=[128, 32]
+        shape=[128, 128]
     )
     
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
@@ -155,16 +143,16 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for first block of A and B input matrices
-        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, blocked_mk))
+        offs_ak = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(0, linear_mk))
         offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak
-        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, blocked_kn))
+        offs_bk = gl.arange(0, BLOCK_SIZE_K, layout=gl.SliceLayout(1, linear_kn))
         offs_bk_split = pid_k * SPLITK_BLOCK_SIZE + offs_bk
 
         offs_am = pid_m * BLOCK_SIZE_M + gl.arange(
-            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, blocked_mk)
+            0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, linear_mk)
         )
         offs_bn = pid_n * BLOCK_SIZE_N + gl.arange(
-            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, blocked_kn)
+            0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, linear_kn)
         )
 
         offs_a = offs_am[:, None] * stride_am + offs_ak_split[None, :] * stride_ak
@@ -192,9 +180,6 @@ def _gemm_a8w8_blockscale_kernel(
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         offs_bsn = offs_bn // GROUP_N
         offs_b_scale = offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
-
-        offs_a_scale = gl.convert_layout(offs_a_scale, layout=gl.SliceLayout(1, mfma_layout))
-        offs_b_scale = gl.convert_layout(offs_b_scale, layout=gl.SliceLayout(0, mfma_layout))
         
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
@@ -218,9 +203,7 @@ def _gemm_a8w8_blockscale_kernel(
         acc = gl.zeros(
             (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
         )
-        zeros = gl.zeros(
-            (BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout
-        )
+
         offs_ks_step = BLOCK_SIZE_K // GROUP_K  # could be replaced by a constant 1
 
         for k in range(pid_k * num_k_iter, ((pid_k + 1) * num_k_iter) - 1):
@@ -275,13 +258,9 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_b_scale,
                 cache=cache_modifier,
             )
-            # prod = a_scale[:, None] * b_scale[None, :]
-            # mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-            # acc += mfma_out * prod
-            a_scale_mfma = gl.convert_layout(a_scale[:, None], linear_mk)
-            b_scale_mfma = gl.convert_layout(b_scale[None, :], linear_kn)
-            acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale_mfma, "e4m3",
-                                           cur_b, b_scale_mfma, "e4m3",
+
+            acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale[:, None], "e4m3",
+                                           cur_b, b_scale[None, :], "e4m3",
                                            acc)
             smem_a.store(a)
 
@@ -303,8 +282,9 @@ def _gemm_a8w8_blockscale_kernel(
             cache=cache_modifier,
         )
 
-        mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-        acc += mfma_out * a_scale[:, None] * b_scale[None, :]
+        acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale[:, None], "e4m3",
+                                        cur_b, b_scale[None, :], "e4m3",
+                                        acc)
 
         c = acc.to(c_ptr.type.element_ty)
 
