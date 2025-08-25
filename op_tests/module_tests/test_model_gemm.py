@@ -39,6 +39,8 @@ class TestConfig:
         feature dimention per head
     intermediate_size : int
         feature dimention in MLP module
+    is_moe : bool
+        is the moe model or not
     """
 
     model_name: str
@@ -46,13 +48,16 @@ class TestConfig:
     kv_head: int
     head_dim: int
     intermediate_size: int
+    is_moe : bool
 
 
 TEST_CONFIGS = {
-    # model,                    model_name,   attention_head,   kv_head,   head_dim,  intermediate_size
-    "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 25600),
-    "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672),
-    "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248),
+    # model,                  model_name,   attention_head,   kv_head,   head_dim,  intermediate_size    is_moe
+    "Qwen3-32B":   TestConfig("Qwen3-32B",         64,           8,          80,         25600,          false),
+    "Qwen3-32B":   TestConfig("Qwen3-30B",         16,           16,         128,        6144,           true),
+    "Qwen3-235B":  TestConfig("Qwen3-235B",        32,           32,         128,        12288,          true),
+    "Llama3-70B":  TestConfig("Llama3-70B",        64,           8,          128,        28672,          false),
+    "Llama3-405B": TestConfig("Llama3-405B",       128,          8,          128,        53248,          false),
 }
 
 
@@ -73,15 +78,21 @@ class GemmTestRunner:
     def __init__(self):
         return
 
+    def get_model_in_single_card(self, config):
+        # for Qwen3-32B or Qwen3-30B, the dim is not dividable by 32 with tp 8, we skip this case
+        if (config.model_name == "Qwen3-32B" or config.model_name == "Qwen3-30B"):
+            return true
+        return false
+
     def get_gemm_shape(self, config: TestConfig, TP_list):
         test_name = str(config)
         logger.info(f"Running test: {test_name}")
 
         records = []
         for tp in TP_list:
-            # for Qwen3-32B, the dim is not dividable by 32 with tp 8, we skip this case
-            if config.model_name == "Qwen3-32B" and (tp == 8 or tp == 4):
+            if self.get_model_in_single_card and (tp == 8 or tp == 4):
                 continue
+
             hidden_size = config.attention_head * config.head_dim
             # attn qkv fused gemm
             QKV_K = hidden_size
@@ -91,20 +102,24 @@ class GemmTestRunner:
             # attn output gemm
             Out_K = (config.attention_head // tp) * config.head_dim
             Out_N = hidden_size
-            # mlp up-gate fused gemm
-            Up_Gate_K = hidden_size
-            Up_Gate_N = config.intermediate_size * 2 // tp
-            # mlp up-gate non-fused gemm
-            Up_N = config.intermediate_size // tp
-            # mlp down gemm
-            Down_K = config.intermediate_size // tp
-            Down_N = hidden_size
+
+            if not config.is_moe:
+                # mlp up-gate fused gemm
+                Up_Gate_K = hidden_size
+                Up_Gate_N = config.intermediate_size * 2 // tp
+                # mlp up-gate non-fused gemm
+                Up_N = config.intermediate_size // tp
+                # mlp down gemm
+                Down_K = config.intermediate_size // tp
+                Down_N = hidden_size
+
             for m in M:
                 records.append(Record(M=m, N=QKV_N, K=QKV_K, TP=tp))
                 records.append(Record(M=m, N=Out_N, K=Out_K, TP=tp))
-                records.append(Record(M=m, N=Up_Gate_N, K=Up_Gate_K, TP=tp))
-                records.append(Record(M=m, N=Up_N, K=Up_Gate_K, TP=tp))
-                records.append(Record(M=m, N=Down_N, K=Down_K, TP=tp))
+                if not config.is_moe:
+                    records.append(Record(M=m, N=Up_Gate_N, K=Up_Gate_K, TP=tp))
+                    records.append(Record(M=m, N=Up_N, K=Up_Gate_K, TP=tp))
+                    records.append(Record(M=m, N=Down_N, K=Down_K, TP=tp))
         return records
 
     def calculate_throughput(self, m, n, k, latency):
@@ -297,7 +312,7 @@ def create_argument_parser():
         "-m",
         "--model",
         type=str,
-        choices=["Llama3-70B", "Qwen3-32B", "Llama3-405B"],
+        choices=["Qwen3-32B", "Qwen3-30B", "Qwen3-235B", "Llama3-70B", "Llama3-405B"],
         nargs="?",
         const=None,
         default=None,
