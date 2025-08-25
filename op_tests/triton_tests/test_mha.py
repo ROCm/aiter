@@ -959,3 +959,127 @@ def test_mha_backward_varlen(
     torch.testing.assert_close(
         triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
+
+
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(4096, 4096)],
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
+def test_mha_backward_with_pe(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ_QK: int,
+    HEAD_SZ_V: int,
+):
+    device: str = "cuda"
+    dtype: torch.dtype = torch.float16
+    CAUSAL: bool = True
+    DROPOUT: float = 0
+    dropout_mask = None
+    FUSED: bool = False
+
+    DEBUG_SHAPES: bool = True
+    DEBUG_TENSORS: bool = False
+    DEBUG: bool = DEBUG_SHAPES or DEBUG_TENSORS
+
+    def debug(x_desc: str, x: torch.Tensor) -> None:
+        if DEBUG_SHAPES:
+            print(f"{x_desc}.shape = {x.shape}")
+        if DEBUG_TENSORS:
+            print(f"{x_desc} = {x}")
+
+    mha_set_use_fused_bwd_kernel(FUSED)
+
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device=device, dtype=dtype
+    )
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+
+    do = torch.randn_like(q)
+
+    if DEBUG:
+        print("--------------Triton----------------")
+        debug("q", q)
+        debug("k", k)
+        debug("v", v)
+        debug("do", do)
+
+    with torch.enable_grad():
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=True,
+            return_attn_probs=True,
+        )
+
+    assert len(triton_out) == 3
+    triton_out, triton_lse, triton_sd_mask = triton_out
+
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        triton_out, (q, k, v), do.clone()
+    )
+
+    if DEBUG:
+        debug("triton_out", triton_out)
+        debug("triton_lse", triton_lse)
+        debug("triton_sd_mask", triton_sd_mask)
+        debug("triton_dq", triton_dq)
+        debug("triton_dk", triton_dk)
+        debug("triton_dv", triton_dv)
+
+    if DEBUG:
+        print("--------------Torch----------------")
+        debug("q", q)
+        debug("k", k)
+        debug("v", v)
+        debug("do", do)
+
+    with torch.enable_grad():
+        torch_out = attention_ref(
+            q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
+        )
+    torch_out, torch_attn_scores = torch_out
+
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+
+    if DEBUG:
+        debug("torch_out", torch_out)
+        debug("torch_attn_scores", torch_attn_scores)
+        debug("torch_dq", torch_dq)
+        debug("torch_dk", torch_dk)
+        debug("torch_dv", torch_dv)
+
+    # dQ isn't implemented!
+    # torch.testing.assert_close(
+    #     triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    # )
+    torch.testing.assert_close(
+        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
