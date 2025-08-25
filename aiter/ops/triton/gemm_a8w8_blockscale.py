@@ -123,9 +123,7 @@ def _gemm_a8w8_blockscale_kernel(
 
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
-        offs_k_split = (
-            pid_k * SPLITK_BLOCK_SIZE + offs_k
-        )  # Our block within our split-K partition
+        offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
@@ -136,9 +134,7 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_k_scale = (
-            pid_k * SPLITK_BLOCK_SIZE
-        ) // GROUP_K  # our K block corresponds to one scale element along K axis.
+        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
@@ -188,7 +184,7 @@ def _gemm_a8w8_blockscale_kernel(
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
-
+        c = gl.convert_layout(c, layout=c_layout)
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)

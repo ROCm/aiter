@@ -293,7 +293,7 @@ def _gemm_a8w8_blockscale_kernel(
             smem_scale_a.store(a_scale)
 
         # ======= Epilogue ========
-        smem_b.store(b)  # see if it's faster to just convert layout
+        smem_b.store(b)
         smem_scale_b.store(b_scale)
         cur_a = smem_a.load(layout=dot_a_layout)
         cur_b = smem_b.load(layout=dot_b_layout)
