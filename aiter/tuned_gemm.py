@@ -55,6 +55,7 @@ class TunedGemm:
     def load_best_sols(self):
         if self.tune_path is not None and Path(self.tune_path).is_file():
             self.bestsols = pd.read_csv(self.tune_path)
+            self.bestsols = self.bestsols[self.bestsols["cu_num"] == self.cu_count]
             if len(self.bestsols) > 0 and "kernelName" in self.bestsols.columns:
                 hipblasltKernelNames = self.bestsols.apply(
                     lambda s: (
