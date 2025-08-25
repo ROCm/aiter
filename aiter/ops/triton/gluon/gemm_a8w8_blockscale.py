@@ -100,13 +100,13 @@ def _gemm_a8w8_blockscale_kernel(
         pid_n = pid % num_pid_n
 
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 16],  # 128 * 128
+        size_per_thread=[4, 16],  # 128 * 128
         threads_per_warp=[8, 8],
         warps_per_cta=[4, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1],
+        size_per_thread=[16, 4],
         threads_per_warp=[8, 8],
         warps_per_cta=[1, 4],
         order=[0, 1],
@@ -115,23 +115,23 @@ def _gemm_a8w8_blockscale_kernel(
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
+    shared_b: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=2, max_phase=8, order=[0, 1]
+    )
     shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0]
     )
     shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[0]
     )
-    shared_b: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=16, per_phase=2, max_phase=8, order=[0, 1]
-    )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfma_layout, k_width=8
+        operand_index=0, parent=mfma_layout, k_width=16
     )
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfma_layout, k_width=8
+        operand_index=1, parent=mfma_layout, k_width=16
     )
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
@@ -239,9 +239,6 @@ def _gemm_a8w8_blockscale_kernel(
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
-            smem_b.store(b)
-            smem_scale_b.store(b_scale)
-            cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, mfma_layout))
             if EVEN_K:
                 a = gl.amd.cdna4.buffer_load(
                     ptr=a_ptr,
@@ -257,13 +254,15 @@ def _gemm_a8w8_blockscale_kernel(
                     & (offs_am[:, None] < M),
                     cache=cache_modifier,
                 )
+            smem_b.store(b)
+            smem_scale_b.store(b_scale)
             cur_a = smem_a.load(layout=dot_a_layout)
+            cur_a_scale = smem_scale_a.load(layout=gl.SliceLayout(1, mfma_layout))
             a_scale = gl.amd.cdna4.buffer_load(
                 ptr=a_scale_ptr,
                 offsets=offs_a_scale,
                 cache=cache_modifier,
             )
-            cur_b = smem_b.load(layout=dot_b_layout)
             cur_b_scale = smem_scale_b.load(layout=gl.SliceLayout(0, mfma_layout))
             if EVEN_K:
                 b = gl.amd.cdna4.buffer_load(
@@ -285,10 +284,10 @@ def _gemm_a8w8_blockscale_kernel(
                 offsets=offs_b_scale,
                 cache=cache_modifier,
             )
+            cur_b = smem_b.load(layout=dot_b_layout)
 
-            zeros = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
-            acc += zeros * cur_a_scale[:, None] * cur_b_scale[None, :]
-            zeros *= 0
+            mfma_out = gl.amd.cdna4.mfma(cur_a, cur_b, zeros)
+            acc += mfma_out * cur_a_scale[:, None] * cur_b_scale[None, :]
 
             smem_a.store(a)
             smem_scale_a.store(a_scale)
@@ -319,6 +318,7 @@ def _gemm_a8w8_blockscale_kernel(
             + pid_k * stride_ck
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
         gl.amd.cdna4.buffer_store(
             stored_value=c, ptr=c_ptr, offsets=c_offs, mask=c_mask
         )
