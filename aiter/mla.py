@@ -297,6 +297,8 @@ def mla_decode_fwd(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
+    q_scale=None,
+    kv_scale=None,
 ):
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -316,7 +318,7 @@ def mla_decode_fwd(
     num_kv_splits = 80
     if nhead == 16 and max_seqlen_q == 1:
         # special case for 16 heads and max_seqlen_q == 1
-        logits = torch.empty(
+        logits = torch.zeros(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -324,7 +326,7 @@ def mla_decode_fwd(
         MAYBE_FINAL_OUT = False
     elif nhead in [16, 128]:
         MAYBE_FINAL_OUT = True
-        logits = torch.empty(
+        logits = torch.zeros(
             (total_s, num_kv_splits, nhead, v_head_dim),
             dtype=dtypes.fp32,
             device=device,
@@ -402,7 +404,11 @@ def mla_decode_fwd(
         logits,
         attn_lse,
         o,
+        q_scale,
+        kv_scale,
     )
+
+    # import pdb; pdb.set_trace()
 
     aiter.mla_reduce_v1(
         logits,
@@ -564,6 +570,8 @@ def mla_decode_fwd_dispatch(
     reduce_indptr=None,
     reduce_final_map=None,
     reduce_partial_map=None,
+    q_scale=None,
+    kv_scale=None,
 ):
     if batch_split_table is None:
         return mla_decode_fwd(
@@ -584,6 +592,8 @@ def mla_decode_fwd_dispatch(
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
         )
     else:
         return mla_decode_fwd_balenced(
