@@ -183,7 +183,6 @@ def run_ck(
 @pytest.mark.parametrize("dropout_p", [0.0, 0.17])
 @pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("return_lse", [False, True])
-@pytest.mark.parametrize("return_attn_probs", [False, True])
 @pytest.mark.parametrize("nheads", [9])
 @pytest.mark.parametrize(
     "d,d_v",
@@ -233,7 +232,6 @@ def test_flash_attn_varlen_func(
     mha_type,
     dtype,
     return_lse,
-    return_attn_probs,
 ):
     torch.random.manual_seed(0)
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
@@ -302,8 +300,12 @@ def test_flash_attn_varlen_func(
         requires_grad=True,
     )
 
+    # return_attn_probs is just for host verification (to produce same dropout mask)
+    # no need to use in actual case
     if dropout_p > 0:
         return_attn_probs = True
+    else:
+        return_attn_probs = False
 
     out, dropout_mask, dq, dk, dv = run_ck(
         q,
@@ -443,7 +445,7 @@ if __name__ == "__main__":
         "--min_seqlen_q",
         type=int,
         nargs="?",
-        default=1,
+        default=0,
         help="""Minimum sequence length of query.
     e.g. -msq 1""",
     )
@@ -500,19 +502,10 @@ if __name__ == "__main__":
         "-rlse",
         "--return_lse",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="""return logsumexp, default is False.
     -rlse or --return_lse    # enable return logsumexp
     --no-return_lse          # disable return logsumexp""",
-    )
-    parser.add_argument(
-        "-rap",
-        "--return_attn_probs",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="""return attention probabilities, default is False.
-    -rap or --return_attn_probs    # enable return attention probabilities
-    --no-return_attn_probs        # disable return attention probabilities""",
     )
 
     args = parser.parse_args()
@@ -535,5 +528,4 @@ if __name__ == "__main__":
         args.mha_type,
         dtype,
         args.return_lse,
-        args.return_attn_probs,
     )

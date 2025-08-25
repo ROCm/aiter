@@ -69,46 +69,40 @@ def run_gemm_a8w8_bpreshuffle(x, weight, x_scale, w_scale, out, kernel_id, split
     return out
 
 
-def generate_data(m, n, k):
-    x = torch.randn((m, k), dtype=dtypes.fp16, device="cuda")
-    weight = torch.randn((n, k), dtype=dtypes.fp16, device="cuda")
+def generate_data(m, n, k, seed, device="cuda"):
+    torch.manual_seed(seed)
+    x = torch.randn((m, k), dtype=dtypes.fp16, device=device)
+    weight = torch.randn((n, k), dtype=dtypes.fp16, device=device)
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
     weight, w_scale = aiter.pertoken_quant(weight, quant_dtype=dtypes.fp8)
     weight_shuffle = shuffle_weight(weight, layout=(16, 16))
-    out = torch.empty(m, n, dtype=dtypes.fp16, device="cuda")
+    out = torch.empty(m, n, dtype=dtypes.fp16, device=device)
     return x, weight_shuffle, x_scale, w_scale, out, weight
 
 
 def tune_gemm_list(
-    untunedf,
-    tunedf,
-    issorted=False,
-    useSplitK=False,
-    mp_num=1,
-    shape_grouped=False,
-    forced=False,
+    untunedf, tunedf, issorted=False, useSplitK=False, mp_num=1, shape_grouped=False
 ):
     gpu = torch.cuda.current_device()
     device_properties = torch.cuda.get_device_properties(gpu)
     cu_num = device_properties.multi_processor_count
     task = []
     tasks_data = []  # [(kernel_nums, datas)]
+    seed = 10000
     for i in range(len(untunedf)):
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
         K = untunedf.loc[i, "K"]
         kernels_num = len(kernels_list)
-        if (
-            tunedf[
-                (tunedf["M"] == M)
-                & (tunedf["N"] == N)
-                & (tunedf["K"] == K)
-                & (tunedf["cu_num"] == cu_num)
-            ].empty
-            or forced
-        ):
-            input_datas = generate_data(M, N, K)
-
+        gemm_a8w8_idx = [0, 1, 2, 3, 4]
+        ref_data_idx = [0, 5, 2, 3]
+        if tunedf[
+            (tunedf["M"] == M)
+            & (tunedf["N"] == N)
+            & (tunedf["K"] == K)
+            & (tunedf["cu_num"] == cu_num)
+        ].empty:
+            seed = seed + 1
             total_kernel_nums = 0
             for i in range(kernels_num):
                 kernel = kernels_list[i]
@@ -124,23 +118,18 @@ def tune_gemm_list(
                     task.append(
                         (
                             info,
+                            generate_data,
+                            (M, N, K, seed),
                             run_gemm_a8w8_bpreshuffle,
                             (
-                                input_datas[0],
-                                input_datas[1],
-                                input_datas[2],
-                                input_datas[3],
-                                input_datas[4],
+                                gemm_a8w8_idx,
                                 i,
                                 splitK,
                             ),
                             {},
                             run_torch,
                             (
-                                input_datas[0],
-                                input_datas[5],
-                                input_datas[2],
-                                input_datas[3],
+                                ref_data_idx,
                                 None,
                                 dtypes.fp16,
                             ),
@@ -153,6 +142,10 @@ def tune_gemm_list(
                     total_kernel_nums = total_kernel_nums + 1
 
             tasks_data.append((total_kernel_nums, ()))
+        else:
+            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
+            print()
+            print()
     if task:
         ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
         for el in ret:
@@ -174,14 +167,8 @@ def tune_gemm_list(
                     "kernelName": [kernelName],
                 }
             )
-            tunedf = pd.concat([tunedf, temp], ignore_index=True).drop_duplicates(
-                subset=["M", "N", "K", "cu_num"], keep="last"
-            )
+            tunedf = pd.concat([tunedf, temp], ignore_index=True)
 
-        else:
-            print(f"M:{M}, N:{N}, K{K} is in tuned gemm, skip!!!")
-        print()
-        print()
     issorted = True
     if issorted:
         tunedf = tunedf.sort_values(by=["cu_num", "M", "N", "K"])
@@ -229,17 +216,17 @@ if __name__ == "__main__":
         required=False,
         help="Arranged according to the M N K size",
     )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        required=False,
-        help="force to tune all kernels, even if they are already tuned",
-    )
 
     args = parser.parse_args()
     untunedf = get_untuned_gemm_list(args.untune_file)
     tunedf = get_tuned_gemm_list(args.tune_file)
     tunedf = tune_gemm_list(
-        untunedf, tunedf, args.sort, args.splitK, args.mp, forced=args.force
+        untunedf,
+        tunedf,
+        issorted=args.sort,
+        useSplitK=args.splitK,
+        mp_num=args.mp,
+        shape_grouped=True,
     )
+
     tunedf.to_csv(args.tune_file, index=False)

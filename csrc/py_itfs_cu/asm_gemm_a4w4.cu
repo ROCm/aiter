@@ -65,7 +65,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 {
 
 #if defined(__Float4_e2m1fn_x2)
-    if((inp.dtype() == torch::kFloat4_e2m1fn_x2 || inp.dtype() == torch::kUInt8) &&
+    if(inp.dtype() == torch_fp4x2 &&
        out.scalar_type() == at::ScalarType::BFloat16)
 #else
     if((inp.dtype() == torch::kUInt8) && out.scalar_type() == at::ScalarType::BFloat16)
@@ -109,7 +109,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     {
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
-           ((cfg.splitK == log2_k_split_en) || !log2_k_split_en))
+           ((cfg.splitK == log2_k_split_en) || !log2_k_split.has_value()))
         {
             if((N % cfg.tile_N) == 0)
             {
@@ -155,7 +155,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
 
 // A4W4 asm gemm kernel
 // D=A*B*alpha+beta*C
-void gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
+torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                             torch::Tensor& B,       // B:[N, K/2] f4x2
                             torch::Tensor& A_scale, // A_scale:[M, K/32] e8m0 paded
                             torch::Tensor& B_scale, // B_scale:[N, K/32] e8m0 paded
@@ -257,6 +257,7 @@ void gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
         if(cfg.splitK == 1)
         {
+            out.zero_();
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");
@@ -287,5 +288,5 @@ void gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
                              1,   // bdy
                              1,   // bdz
                              stream});
-    // return out;
+    return out;
 }

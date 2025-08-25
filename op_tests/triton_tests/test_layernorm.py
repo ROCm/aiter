@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
 import torch
 import torch.nn.functional as F
 import pytest
@@ -162,10 +161,10 @@ def test_layernorm(M, N, dtype_str, eps=1e-5):
         # float32 typically can be tighter
         atol, rtol = 1e-5, 1e-5
 
-    triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
-    triton.testing.assert_close(db_triton, db_torch, rtol=rtol, atol=atol)
-    triton.testing.assert_close(dw_triton, dw_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(db_triton, db_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(dw_triton, dw_torch, rtol=rtol, atol=atol)
 
 
 # pytest
@@ -205,11 +204,11 @@ def test_fused_add_layernorm(M, N, dtype_str, eps=1e-5):
         # float32 typically can be tighter
         atol, rtol = 1e-5, 1e-5
 
-    triton.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
-    triton.testing.assert_close(db_triton, db_torch, rtol=rtol, atol=atol)
-    triton.testing.assert_close(dw_triton, dw_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(y_triton, y_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(dx_triton, dx_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(db_triton, db_torch, rtol=rtol, atol=atol)
+    torch.testing.assert_close(dw_triton, dw_torch, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
@@ -248,9 +247,9 @@ def test_layernorm_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1e-5):
         atol = 1e-2
         rtol = 1e-2
 
-    triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
@@ -285,9 +284,9 @@ def test_layernorm_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=1e-3):
         atol = 1e-2
         rtol = 1e-2
 
-    triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
@@ -327,10 +326,10 @@ def test_layernorm_fused_add_smoothquant(M, N, dtype_str, scale_dtype_str, eps=1
         atol = 1e-2
         rtol = 1e-2
 
-    triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize("dtype_str", ["fp32", "fp16", "bf16"])
@@ -370,7 +369,7 @@ def test_layernorm_fused_add_dynamicquant(M, N, dtype_str, scale_dtype_str, eps=
         atol = 1e-2
         rtol = 1e-2
 
-    triton.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
-    triton.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
-    triton.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
-    triton.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(xq_dequant, ref_xq_dequant, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_triton, y_torch, atol=1, rtol=0)
+    torch.testing.assert_close(res_triton, res_torch, atol=atol, rtol=rtol)
+    torch.testing.assert_close(y_scale_triton, y_scale_torch, atol=1e-3, rtol=1e-3)
