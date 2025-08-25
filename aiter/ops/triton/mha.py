@@ -1551,31 +1551,6 @@ def flash_attn_fp8_func(
         result.append(S_dmask)
     return result[0] if len(result) == 1 else tuple(result)
 
-def fp8_example():
-    BATCH = 2
-    SEQLEN = 1024
-    NUM_HEADS = 2
-    HEAD_DIM = 128
-    
-    # forward inputs
-    q_fp32 = torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_DIM)
-    k_fp32 = torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_DIM)
-    v_fp32 = torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_DIM)
-    fp8_dtype = arch_info.get_fp8_e4m3_dtype()
-    q_fp8, q_descale = _cast_to_fp8(q_fp32, fp8_dtype, "bshd")
-    k_fp8, k_descale = _cast_to_fp8(k_fp32, fp8_dtype, "bshd")
-    v_fp8, v_descale = _cast_to_fp8(v_fp32, fp8_dtype, "bshd")
-
-    # emulate fa v3. See https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_attn_interface.py
-    out_fp32 = flash_attn_fp8_func(q_fp8,
-                        k_fp8,
-                        v_fp8,
-                        q_descale,
-                        k_descale,
-                        v_descale)
-
-    # backward with fp8 is not supported in fa v3. See https://github.com/Dao-AILab/flash-attention/blob/3c51f15dc04c05e97cae1cfbd494e1f02962516a/hopper/test_flash_attn.py#L221
-    # dq_fp32, dk_fp32, dv_fp32 = torch.autograd.grad(out_fp32, (q_fp8, k_fp8, v_fp8), do_fp32)
 
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
