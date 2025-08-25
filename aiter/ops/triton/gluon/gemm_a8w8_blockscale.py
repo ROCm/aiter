@@ -111,7 +111,7 @@ def _gemm_a8w8_blockscale_kernel(
         warps_per_cta=[1, 4],
         order=[0, 1],
     )
-    
+
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
