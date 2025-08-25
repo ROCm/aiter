@@ -81,7 +81,7 @@ class TestConfig:
 TEST_CONFIGS = {
     # model,                  model_name,   attention_head,   kv_head,   head_dim,  intermediate_size    is_moe
     "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 25600, False),
-    "Qwen3-32B": TestConfig("Qwen3-30B", 16, 16, 128, 6144, True),
+    "Qwen3-30B": TestConfig("Qwen3-30B", 16, 16, 128, 6144, True),
     "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
     "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
     "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
@@ -108,8 +108,8 @@ class GemmTestRunner:
     def get_model_in_single_card(self, config):
         # for Qwen3-32B or Qwen3-30B, the dim is not dividable by 32 with tp 8, we skip this case
         if config.model_name == "Qwen3-32B" or config.model_name == "Qwen3-30B":
-            return true
-        return false
+            return True
+        return False
 
     def get_gemm_shape(self, config: TestConfig, TP_list):
         test_name = str(config)
