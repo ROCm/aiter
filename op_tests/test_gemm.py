@@ -355,6 +355,7 @@ def test_skinny_gemm():
                 for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
                     test_gemm(dtype, m, n, k, otype=otype)
 
+
 if __name__ == "__main__":
-    # test_normal_gemm()
+    test_normal_gemm()
     test_skinny_gemm()
