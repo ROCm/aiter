@@ -104,16 +104,16 @@ def _gemm_a8w8_blockscale_kernel(
         lane_bases=[[0, 16], [0, 32], [0, 64], [4, 0], [8, 0], [16, 0]],
         warp_bases=[[32, 0], [64, 0]],
         block_bases=[],
-        shape=[128, 128]
+        shape=[128, 128],
     )
     linear_kn: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [0, 1], [0, 2]],
         lane_bases=[[16, 0], [32, 0], [64, 0], [0, 4], [0, 8], [0, 16]],
         warp_bases=[[0, 32], [0, 64]],
         block_bases=[],
-        shape=[128, 128]
+        shape=[128, 128],
     )
-    
+
     shared_a: gl.constexpr = gl.SwizzledSharedLayout(
         vec=16, per_phase=2, max_phase=8, order=[1, 0]
     )
@@ -180,7 +180,7 @@ def _gemm_a8w8_blockscale_kernel(
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         offs_bsn = offs_bn // GROUP_N
         offs_b_scale = offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
-        
+
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
                 ptr=b_ptr,
@@ -210,7 +210,7 @@ def _gemm_a8w8_blockscale_kernel(
             # Advance the ptrs to the next K block.
             a_ptr += BLOCK_SIZE_K * stride_ak
             b_ptr += BLOCK_SIZE_K * stride_bk
-            # Note that we increment the base pointers instead of the offsets to do 
+            # Note that we increment the base pointers instead of the offsets to do
             # a scalar addition instead of a broadcasted matrix one.
 
             # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -259,9 +259,9 @@ def _gemm_a8w8_blockscale_kernel(
                 cache=cache_modifier,
             )
 
-            acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale[:, None], "e4m3",
-                                           cur_b, b_scale[None, :], "e4m3",
-                                           acc)
+            acc = gl.amd.cdna4.mfma_scaled(
+                cur_a, a_scale[:, None], "e4m3", cur_b, b_scale[None, :], "e4m3", acc
+            )
             smem_a.store(a)
 
             a_scale_ptr += offs_ks_step * stride_ascale_k
@@ -282,9 +282,9 @@ def _gemm_a8w8_blockscale_kernel(
             cache=cache_modifier,
         )
 
-        acc = gl.amd.cdna4.mfma_scaled(cur_a, a_scale[:, None], "e4m3",
-                                        cur_b, b_scale[None, :], "e4m3",
-                                        acc)
+        acc = gl.amd.cdna4.mfma_scaled(
+            cur_a, a_scale[:, None], "e4m3", cur_b, b_scale[None, :], "e4m3", acc
+        )
 
         c = acc.to(c_ptr.type.element_ty)
 
