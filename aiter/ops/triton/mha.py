@@ -566,7 +566,7 @@ def _attn_fwd(
         tl.assume(stride_alibi_z_in >= 0)
         tl.assume(stride_alibi_h_in >= 0)
 
-        # NOTE: philox offset is need in dropout pointer calculations
+    # NOTE: philox offset is need in dropout pointer calculations
     tl.assume(philox_offset_base_in >= 0)
     tl.assume(stride_sd_z_in >= 0)
     tl.assume(stride_sd_h_in >= 0)
