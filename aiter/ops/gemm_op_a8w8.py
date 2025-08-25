@@ -69,6 +69,14 @@ def gemm_a8w8_bpreshuffle_ck(
     Out: torch.Tensor,
 ) -> torch.Tensor: ...
 
+@compile_ops("module_ck_tile_gemm_bf16", fc_name="ck_tile_gemm_bf16")
+def ck_tile_gemm_bf16(
+    XQ: Tensor,
+    WQ: Tensor,
+    bias:Tensor,
+    Out: Tensor,
+)-> torch.Tensor: ...
+
 
 def gen_gemm_a8w8_asm_fake_tensors(
     XQ: Tensor,  # A:[M, K] i8
@@ -348,6 +356,20 @@ def gemm_a8w8_bpreshuffle(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
 
+
+def gemm_bf16_ck_tile(
+    XQ: Tensor, WQ: Tensor,bias:Tensor, dtype=dtypes.bf16
+):
+    assert dtype in [
+        dtypes.bf16,
+        dtypes.fp16,
+    ], f"Output {dtype=} is currently not supported in gemm_bf16"
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    # WQ_=permute_weight(WQ)
+  
+    return ck_tile_gemm_bf16(XQ, WQ,bias, Y)
 
 def gemm_a8w8_blockscale(
     XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, dtype=dtypes.bf16
