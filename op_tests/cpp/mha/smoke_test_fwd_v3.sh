@@ -34,7 +34,7 @@ run_gfx950_fwd_v3() {
     done
 }
 
-run_gfx942_fwd_v3_new() {
+run_gfx942_fwd_v3() {
     echo "Start smoke test for gfx 942"
     for mode in 0 1 ; do
     for perm in 0 1 ; do
