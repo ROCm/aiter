@@ -21,7 +21,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-M = [1, 4, 8, 16, 32, 64, 128, 256, 1024, 2048, 4096, 8192, 16384, 32768]
+M = [
+    1,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    160,
+    192,
+    224,
+    256,
+    288,
+    320,
+    352,
+    384,
+    416,
+    448,
+    480,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+]
+
 
 @dataclass
 class TestConfig:
@@ -48,16 +75,16 @@ class TestConfig:
     kv_head: int
     head_dim: int
     intermediate_size: int
-    is_moe : bool
+    is_moe: bool
 
 
 TEST_CONFIGS = {
     # model,                  model_name,   attention_head,   kv_head,   head_dim,  intermediate_size    is_moe
-    "Qwen3-32B":   TestConfig("Qwen3-32B",         64,           8,          80,         25600,          false),
-    "Qwen3-32B":   TestConfig("Qwen3-30B",         16,           16,         128,        6144,           true),
-    "Qwen3-235B":  TestConfig("Qwen3-235B",        32,           32,         128,        12288,          true),
-    "Llama3-70B":  TestConfig("Llama3-70B",        64,           8,          128,        28672,          false),
-    "Llama3-405B": TestConfig("Llama3-405B",       128,          8,          128,        53248,          false),
+    "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 25600, False),
+    "Qwen3-32B": TestConfig("Qwen3-30B", 16, 16, 128, 6144, True),
+    "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
+    "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
+    "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
 }
 
 
@@ -80,7 +107,7 @@ class GemmTestRunner:
 
     def get_model_in_single_card(self, config):
         # for Qwen3-32B or Qwen3-30B, the dim is not dividable by 32 with tp 8, we skip this case
-        if (config.model_name == "Qwen3-32B" or config.model_name == "Qwen3-30B"):
+        if config.model_name == "Qwen3-32B" or config.model_name == "Qwen3-30B":
             return true
         return false
 
@@ -157,7 +184,6 @@ class GemmTestRunner:
                         ck_time = ret["ck us"]
                         ck_bpreshuffle_time = ret["ck bpreshuffle us"]
                         asm_time = ret["asm us"]
-
                         if ck_time is not None:
                             latency = min(latency, ck_time)
                         if ck_time is not None:
@@ -205,7 +231,6 @@ class GemmTestRunner:
                             bandwidth=bandwidth,
                         )
                     )
-
         df = pd.DataFrame(df)
         # aiter.logger.info(f"summary:\n{df}")
         return records_result
