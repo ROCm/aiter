@@ -1,5 +1,6 @@
 from jinja2 import Template
 from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
+from csrc.cpp_itfs.torch_utils import get_gpu_stream, get_warp_size_for_device
 import ctypes
 import math
 
@@ -76,7 +77,7 @@ def paged_attention_v1(
     import torch
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
-    warpSize = torch.cuda.get_device_properties(out.device).warp_size
+    warpSize = get_warp_size_for_device(out.device)
     if kv_cache_dtype == "auto":
         if query.dtype == torch.bfloat16:
             dtype = "__hip_bfloat16"
@@ -198,7 +199,7 @@ def paged_attention_v1(
         kv_block_stride,
         kv_head_stride,
         kv_seq_stride,
-        torch.cuda.current_stream(),
+        get_gpu_stream(),
     )
     q_scale_ptr = (
         ctypes.cast(q_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
