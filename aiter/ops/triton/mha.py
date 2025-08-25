@@ -1375,21 +1375,17 @@ class _FlashAttnFP8Func(torch.autograd.Function):
                 config=config,
             )
         )
-        # out = out_padded[..., :head_size_og]
 
-        o_fp8, descale_o = _cast_to_fp8(out, q_fp8.dtype, "bshd")
         if is_grad:
             ctx.save_for_backward(
                 q_fp8,
                 k_fp8,
                 v_fp8,
-                o_fp8,
                 out,
                 softmax_lse,
                 descale_q,
                 descale_k,
                 descale_v,
-                descale_o
             )
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
@@ -1398,8 +1394,15 @@ class _FlashAttnFP8Func(torch.autograd.Function):
             ctx.causal = causal
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
- 
-        return ((o_fp8, descale_o), softmax_lse, S_dmask)
+
+        # out = out_padded[..., :head_size_og]
+        result = [out]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_softmax:
+            result.append(S_dmask)
+
+        return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
     def backward(ctx, do_fp8, descale_do, *args):
@@ -1524,8 +1527,7 @@ def flash_attn_fp8_func(
     _LOGGER.info(
         f"FLASH_ATTN_FP8:  q={tuple(q_fp8.shape)}  k={tuple(k_fp8.shape)}  v={tuple(v_fp8.shape)}"
     )
-
-    o_fp32, softmax_lse, S_dmask = _FlashAttnFP8Func.apply(
+    return _FlashAttnFP8Func.apply(
         q_fp8,
         k_fp8,
         v_fp8,
@@ -1543,14 +1545,6 @@ def flash_attn_fp8_func(
         v_descale,
         config,
     )
-
-    result = [o_fp32]
-    if return_lse:
-        result.append(softmax_lse)
-    if return_attn_probs:
-        result.append(S_dmask)
-    return result[0] if len(result) == 1 else tuple(result)
-
 
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
