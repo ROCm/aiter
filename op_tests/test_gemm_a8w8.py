@@ -52,7 +52,6 @@ def run_gemm_skinny(
 
 # @benchmark()
 def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
-    dim = (m, n, k)
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")
     x, x_scale = aiter.pertoken_quant(x, quant_dtype=quantDtype)
