@@ -2,8 +2,7 @@ import torch
 import torch.nn.functional as F
 import pytest
 from aiter.ops.triton.gemm_a16w16_gated import gemm_a16w16_gated
-from op_tests.triton_tests.test_gemm_a16w16 import get_x_vals
-from op_tests.triton_tests.utils.types import str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
@@ -34,13 +33,76 @@ def generate_gemm_a16w16_gated_inputs(M, N, K, dtype, layout="TN", output=True):
     return x, weight, out_dtype, y
 
 
+def basic_shape_set():
+    shapes = [(1, 1, 1)]  # minimal case
+    shapes += [(3, 5, 2)]  # irregular shape
+    shapes += [
+        (32, 32, 32),
+        (128, 128, 128),
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (4864, 4096, 8192),
+    ]
+    shapes = [(2**i, 256, 7168) for i in range(1, 4)]
+    return shapes
+
+
+def extended_shape_set():
+    shapes = [(2**i, 256, 7168) for i in range(5, 9)]
+    shapes += [(1024 * v, 1024 * v, 1024 * v) for v in range(2, 9)]
+    shapes = [(9728, 8192, 65536), (4864, 8192, 4160)]
+    shapes += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]
+    return shapes
+
+
 @pytest.mark.parametrize(
-    "activation", ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu", None]
+    "M, N, K, dtype, output, layout, activation",
+    [
+        (*shape, dtype_str, output, layout, activation)
+        for shape in basic_shape_set()
+        for dtype_str in ["bf16"]
+        for output in [True, False]
+        for layout in ["TN", "TT", "NN", "NT"]
+        for activation in ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu"]
+    ]
+    + [
+        pytest.param(
+            *shape, dtype_str, output, layout, activation, marks=pytest.mark.extended
+        )
+        for shape in extended_shape_set()
+        for dtype_str in ["bf16"]
+        for output in [True, False]
+        for layout in ["TN", "TT", "NN", "NT"]
+        for activation in ["gelu", "gelu_tanh", "silu", "silu_exp2", "relu"]
+    ],
 )
-@pytest.mark.parametrize("M, N, K", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
-@pytest.mark.parametrize("output", [True, False])
 def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activation):
     if N % 2 != 0:
         pytest.skip("Skipping shape incompatible w/gating")

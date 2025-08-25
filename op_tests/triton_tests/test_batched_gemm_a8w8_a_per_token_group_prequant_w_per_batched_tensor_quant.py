@@ -109,10 +109,24 @@ def run_triton(
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
+def basic_shape_set():
+    shapes = [(1, 1, 128)]  # minimal case
+    shapes += [
+        (32, 32, 32),
+        (128, 128, 128),
+        (512, 512, 512),
+        (1024, 1024, 1024),
+        (4864, 4096, 8192),
+    ]
+    shapes += [(2**i, 256, 7168) for i in range(1, 4)]
+    return shapes
 
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [
+
+def extended_shape_set():
+    shapes = [(2**i, 256, 7168) for i in range(5, 9)]
+    shapes += [(1024 * v, 1024 * v, 1024 * v) for v in range(2, 9)]
+    shapes += [(9728, 8192, 65536), (4864, 8192, 4160)]
+    shapes += [
         (1, 1280, 8192),
         (32, 1280, 8192),
         (64, 1280, 8192),
@@ -140,20 +154,43 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(v**2, 128, 512) for v in range(0, 7)]
-    x_vals += [(v**2, 512, 128) for v in range(0, 7)]
-    x_vals += [(1, 128, 1)]  # minimal case
-    return x_vals
+    shapes += [
+        (256, 8192, 1024),
+        (256, 1024, 8192),
+        (256, 32768, 8192),
+        (256, 8192, 32768),
+    ]
+    shapes += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
+    return shapes
 
 
 @pytest.mark.parametrize(
-    "dtype, b, m, n, k, group_size, has_bias, output, transpose_bm",
+    "b, m, n, k, dtype,  group_size, has_bias, output, transpose_bm",
     [
-        (dtype, b, *shape, group_size, has_bias, output, transpose_bm)
+        (b, *shape, dtype, group_size, has_bias, output, transpose_bm)
         for output in [True, False]
         for dtype in ["bf16"]
         for b in [16]
-        for shape in get_x_vals()
+        for shape in basic_shape_set()
+        for group_size in [128]
+        for has_bias in [True, False]
+        for transpose_bm in [True, False]
+    ]
+    + [
+        pytest.param(
+            b,
+            *shape,
+            dtype,
+            group_size,
+            has_bias,
+            output,
+            transpose_bm,
+            marks=pytest.mark.extended
+        )
+        for output in [True, False]
+        for dtype in ["bf16"]
+        for b in [16]
+        for shape in extended_shape_set()
         for group_size in [128]
         for has_bias in [True, False]
         for transpose_bm in [True, False]

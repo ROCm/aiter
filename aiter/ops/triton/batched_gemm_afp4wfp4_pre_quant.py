@@ -343,7 +343,7 @@ def batched_gemm_afp4wfp4_pre_quant(
     - W_scales: Matrix with shape (B, N, K // 32)
 
     Returns:
-    - Y: The output matrix with shape (M, N).
+    - Y: The output matrix with shape (B, M, N).
     """
     _LOGGER.info(
         f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
@@ -353,6 +353,8 @@ def batched_gemm_afp4wfp4_pre_quant(
 
     Bx, M, K = x.shape
     Bw, N, K = w.shape
+    if y is None:
+        y = torch.empty((Bx, M, N), dtype=dtype, device=x.device)
     By, _, _ = y.shape
     assert Bx == Bw == By
     Batch = Bx

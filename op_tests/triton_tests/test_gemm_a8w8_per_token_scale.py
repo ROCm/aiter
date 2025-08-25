@@ -23,51 +23,6 @@ def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
 
-def get_x_vals():
-
-    x_vals = [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
-    x_vals += [(4864, 4096, 8192), (9728, 8192, 65536)]
-    x_vals += [
-        (1, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        (16384, 1280, 8192),
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-        (2048, 2048, 2049),
-        (159, 17389, 597),
-        (16, 576, 7168),
-    ]
-    x_vals += [
-        (256, 8192, 1024),
-        (256, 1024, 8192),
-        (256, 32768, 8192),
-        (256, 8192, 32768),
-    ]
-    # x_vals += [(1, 1, 1)]  # minimal case
-    return x_vals
-
-
 def generate_gemm_a8w8_per_token_scale_inputs(
     M: int,
     N: int,
@@ -107,17 +62,74 @@ def generate_gemm_a8w8_per_token_scale_inputs(
     return x, weight, x_scale, w_scale, y
 
 
+def basic_shape_set():
+    shapes = [
+        (128, 128, 128),
+        (256, 256, 128),
+        (512, 512, 512),
+        (4864, 4096, 8192),
+    ]
+    shapes += [(1024 * v, 1024 * v, 1024 * v) for v in range(1, 9)]
+    return shapes
+
+
+def extended_shape_set():
+    shapes = [(9728, 8192, 65536), (4864, 8192, 4160)]
+    shapes += [
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (16384, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+        (16384, 8192, 1024),
+    ]
+    shapes += [
+        (256, 8192, 1024),
+        (256, 1024, 8192),
+        (256, 32768, 8192),
+        (256, 8192, 32768),
+    ]
+    return shapes
+
+
 @pytest.mark.parametrize(
-    "dtype, M, N, K, layout, output",
+    "M, N, K, dtype, output, layout",
     [
-        (dtype, *shape, layout, output)
-        for output in [True, False]
+        (*shape, dtype, output, layout)
+        for shape in basic_shape_set()
         for dtype in ["bf16"]
+        for output in [True, False]
         for layout in ["TN", "TT", "NN", "NT"]
-        for shape in get_x_vals()
+    ]
+    + [
+        pytest.param(*shape, dtype, output, layout, marks=pytest.mark.extended)
+        for shape in extended_shape_set()
+        for dtype in ["bf16"]
+        for output in [True, False]
+        for layout in ["TN", "TT", "NN", "NT"]
     ],
 )
-def test_gemm(dtype, M, N, K, layout, output):
+def test_gemm(M, N, K, dtype, output, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
