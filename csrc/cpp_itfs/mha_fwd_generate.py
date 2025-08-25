@@ -173,7 +173,7 @@ V3_MULTI_TARGET_API = """
 def get_v3_api():
     gfx_list = get_gfx_list()
     if len(gfx_list) == 1:
-        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config);"
+        return f"t = {gfx_list[0]}::fmha_fwd_v3(traits, args, stream_config, seqstart_q_padding_ptr, seqstart_k_padding_ptr);"
     else:
         return V3_MULTI_TARGET_API
 
@@ -183,7 +183,13 @@ V3_API = get_v3_api()
 COMBINED_API = (
     V3_API
     + """
-    if (t == -1) { t = fmha_fwd(traits, args, stream_config); }
+    if (t == -1) { 
+        if (seqstart_q_padding_ptr == nullptr && seqstart_k_padding_ptr == nullptr) {
+            t = fmha_fwd(traits, args, stream_config);
+        } else {
+            std::cout << "this two args(seqstart_q_padding and seqstart_k_padding) currently not support on ck side" << std::endl;
+        }
+    }
 """
 )
 

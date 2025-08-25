@@ -78,7 +78,7 @@ class fmha_fwd_v3_kernel
     {
         int length = strlen(name);
         std::string kernel_func_name = "_ZN5aiter" + std::to_string(length) + name + "E";
-        std::string AITER_ASM_DIR = "{F_AITER_ASM_DIR}";
+        std::string AITER_ASM_DIR = std::string(std::getenv("AITER_ASM_DIR")) + "fmha_v3_fwd/";
         uint32_t cu_num = get_num_cu_func();
         if (cu_num == 304) {
             AITER_ASM_DIR += "MI300/";
@@ -166,7 +166,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a,
     args.s_o_Hs = a.nhead_stride_o * 2;
     args.s_o_Bs = a.batch_stride_o * 2;
     
-    args.s_lse_Hs = a.nhead_stride_lse * 2;
+    args.s_lse_Hs = a.nhead_stride_lse * 4;
     args.ptr_qseq = a.seqstart_q_ptr;
     args.ptr_kseq = a.seqstart_k_ptr;
     args.ptr_qseq_padding = seqstart_q_padding_ptr == nullptr ? a.seqstart_q_ptr : seqstart_q_padding_ptr;
@@ -261,12 +261,9 @@ def write_blobs(output_dir: Optional[str]) -> None:
         output_dir = Path(output_dir) / GEN_DIR
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    forward_kernel = FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API.format(
-        F_AITER_ASM_DIR=this_dir + "/",
+    (output_dir / FMHA_FWD_API_FILENAME).write_text(
+        FMHA_FWD_KERNEL_HEADER + FMHA_FWD_API
     )
-
-    (output_dir / FMHA_FWD_API_FILENAME).write_text(forward_kernel)
 
 
 if __name__ == "__main__":
