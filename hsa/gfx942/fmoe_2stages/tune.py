@@ -29,7 +29,6 @@ from aiter.int4_utils import (
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx
-import functools
 from aiter.utility import fp4_utils
 import torch.nn.functional as F
 from einops import rearrange
@@ -1491,7 +1490,10 @@ def go(
             )
         profileDF = pd.DataFrame(
             profileDF,
-            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
+            columns=["stage"]
+            + ["cu_num"]
+            + args
+            + ["block_m", "ksplit", "us", "kernelName", "err"],
         )
         prorfiles.append(profileDF)
         profileDF = profileDF.sort_values("us").drop_duplicates(
@@ -1650,15 +1652,15 @@ if __name__ == "__main__":
             )
     else:
         old_tunedf = None
-
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+    untunedf["cu_num"] = cu_num
     if args.last:
         untunedf = untunedf.iloc[-1:]
 
     elif old_tunedf is not None and not args.all:
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
-        untunedf["cu_num"] = cu_num
+
         untunedf_cols = untunedf.columns
         mask = untunedf.apply(tuple, axis=1).isin(
             old_tunedf[untunedf_cols].apply(tuple, axis=1)

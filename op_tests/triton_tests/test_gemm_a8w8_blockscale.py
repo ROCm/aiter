@@ -75,7 +75,7 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
         (16, 16, 128),
-        # (2048, 2048, 2049),
+        (2048, 2048, 2049),
         (159, 17389, 597),
         (16, 576, 7168),
     ]
@@ -156,6 +156,7 @@ def generate_gemm_a8w8_blockscale_inputs(
 )
 def test_gemm(dtype, M, N, K, layout, output, impl: str):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.cuda.synchronize()
 
     block_shape_n, block_shape_k = block_shape
     if K % block_shape_k != 0:

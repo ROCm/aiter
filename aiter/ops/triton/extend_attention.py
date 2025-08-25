@@ -31,6 +31,7 @@ import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -77,9 +78,9 @@ def _fwd_kernel(
     NUM_Q_HEADS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BATCH: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     workgroup_id = tl.program_id(0)  # workgroup index
-    NUM_XCDS: tl.constexpr = 8  # number of XCDs on mi3xx series GPUs
     # Doing the round robin over heads ensures load balancing
     # (because NUM_Q_HEADS is usually a multiple of the round robin length, i.e. NUM_XCDS)
     cur_head = workgroup_id % NUM_Q_HEADS
@@ -423,6 +424,7 @@ def extend_attention_fwd(
         NUM_Q_HEADS=head_num,
         NUM_BLOCKS=num_blocks,
         BATCH=batch_size,
+        NUM_XCDS=get_num_xcds(),
         # num_warps=num_warps,
         # num_stages=num_stages,
         **config,
