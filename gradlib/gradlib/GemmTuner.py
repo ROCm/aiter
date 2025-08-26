@@ -420,11 +420,15 @@ class GemmTuner:
 
         tuned_file_path = Path(tuned_file)
         if tuned_file_path.exists():
-            self.tuned_shapes = pd.read_csv(tuned_file) if tuned_file_path.is_file() else None
+            self.tuned_shapes = (
+                pd.read_csv(tuned_file) if tuned_file_path.is_file() else None
+            )
         else:
             self.tuned_shapes = None
             with open(tuned_file, "w") as tf:
-                tf.write("M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName\n")
+                tf.write(
+                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName\n"
+                )
 
         gpu = torch.cuda.current_device()
         device_properties = torch.cuda.get_device_properties(gpu)
@@ -491,8 +495,10 @@ class GemmTuner:
             )
 
             with open(self.tuned_file, "a") as tf:
-                tf.write(f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
-                         f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{soltimes},{kernal_name}\n")
+                tf.write(
+                    f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
+                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{soltimes},{kernal_name}\n"
+                )
 
             del gemmobj
             torch.cuda.empty_cache()
