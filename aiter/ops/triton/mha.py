@@ -1507,6 +1507,9 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         )
 
 
+# emulate fa v3. See https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_attn_interface.py.
+# backward with fp8 is not supported in fa v3. See https://github.com/Dao-AILab/flash-attention/blob/3c51f15dc04c05e97cae1cfbd494e1f02962516a/hopper/test_flash_attn.py#L221
+# need to figure out how to do it
 def flash_attn_fp8_func(
     q_fp8,
     k_fp8,
