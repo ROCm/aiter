@@ -227,8 +227,8 @@ parser.add_argument(
     "--padding",
     type=int,
     default=None,
-    help="""Number of padding token.
-    e.g.: -t 0""",
+    help="""Padding token.
+    e.g.: -p 0""",
 )
 parser.add_argument(
     "-dp",
@@ -238,8 +238,8 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""Number of padding token.
-    e.g.: -t 0""",
+    help="""Dispatch policy.
+    e.g.: -dp 0""",
 )
 parser.add_argument(
     "-em",

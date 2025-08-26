@@ -9,6 +9,9 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.heuristics(
@@ -204,6 +207,7 @@ def batched_gemm_bf16(
     Returns:
     - YQ: The output batch tensor with shape (B, M, N).
     """
+    _LOGGER.info(f"BATCHED_GEMM_BF16: x={tuple(XQ.shape)} w={tuple(WQ.shape)}")
 
     # Make sure XQ and WQ are contiguous in memory
     XQ = XQ.contiguous()
@@ -216,7 +220,7 @@ def batched_gemm_bf16(
         torch.bfloat16,
         torch.float16,
     ], f"Output {dtype=} is currently not supported in batched_gemm_bf16"
-    assert splitK == None, "Currently, there isn't any support for splitK on Triton"
+    assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
     # Transpose N and K dimensions of WQ: (B, N, K) -> (B, K, N)
     WQ = WQ.transpose(1, 2)

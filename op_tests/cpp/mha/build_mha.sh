@@ -19,7 +19,7 @@ echo "######## linking mha fwd"
 /opt/rocm/bin/hipcc  -I$TOP_DIR/3rdparty/composable_kernel/include \
                      -I$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/ \
                      -I$TOP_DIR/csrc/include \
-                     -std=c++17 -O3 \
+                     -std=c++20 -O3 \
                      -DUSE_ROCM=1 \
                      -DCK_TILE_FMHA_FWD_SPLITKV_API=1 \
                      --offload-arch=native \
@@ -32,7 +32,7 @@ echo "######## linking mha bwd"
 /opt/rocm/bin/hipcc  -I$TOP_DIR/3rdparty/composable_kernel/include \
                      -I$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/ \
                      -I$TOP_DIR/csrc/include \
-                     -std=c++17 -O3 \
+                     -std=c++20 -O3 \
                      -DUSE_ROCM=1 \
                      --offload-arch=native \
                      -L $SCRIPT_DIR -lmha_bwd \

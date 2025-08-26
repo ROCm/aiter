@@ -17,6 +17,10 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
     _is_fp8,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
+
+_LOGGER = AiterTritonLogger()
 
 global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
@@ -1075,7 +1079,7 @@ def _flash_attn_forward(
         FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
         BATCH=batch,
-        NUM_XCD=8,
+        NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         **config,
     )
@@ -1161,8 +1165,6 @@ class _FlashAttnFunc(torch.autograd.Function):
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-        print("Using fused backward kernel:", _USE_FUSED_BWD_KERNEL)
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
@@ -1298,7 +1300,9 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-
+    _LOGGER.info(
+        f"FLASH_ATTN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnFunc.apply(
         q,
         k,
@@ -1512,6 +1516,9 @@ def flash_attn_fp8_func(
     return_attn_probs=False,
     config: Optional[dict[str, any]] = None,
 ):
+    _LOGGER.info(
+        f"FLASH_ATTN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnFP8Func.apply(
         q,
         k,
@@ -1771,6 +1778,10 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+
+    _LOGGER.info(
+        f"FLASH_ATTN_VARLEN:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -1998,6 +2009,9 @@ def flash_attn_varlen_fp8_func(
     block_table=None,
     config: Optional[dict[str, any]] = None,
 ):
+    _LOGGER.info(
+        f"FLASH_ATTN_VARLEN_FP8:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
+    )
     return _FlashAttnVarlenFP8Func.apply(
         q,
         k,

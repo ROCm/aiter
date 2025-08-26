@@ -10,6 +10,9 @@ import triton.language as tl
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
@@ -348,11 +351,15 @@ def gemm_a8wfp4(
     - Every 32 consecutive elements in the K dimension of W share one e8m0 scale
     - X uses per-row scaling (not per-group scaling)
     """
+    _LOGGER.info(
+        f"GEMM_A8FP4: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)}  "
+    )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
+
     M, K = x.shape
     N, K_packed = w.shape
     w = w.T
-
-    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     assert (
         K_packed == K // 2

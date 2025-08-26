@@ -235,7 +235,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
     static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG),
                   "BYTES_PER_LDG must be power of 2");
-    static_assert(BYTES_PER_LDG <= 16, "BYTES_PER_LDG must be leq 16");
+    static_assert(BYTES_PER_LDG <= 32, "BYTES_PER_LDG must be leq 32");
 
     // Number of bytes each thread pulls in per load
     static constexpr int ELTS_PER_LDG    = BYTES_PER_LDG / sizeof(DTYPE);
@@ -315,30 +315,20 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             vec_thread_read_ptr[ii * THREADS_PER_ROW]);
     }
 
-    // First, we perform a max reduce within the thread. We can do the max in fp16 safely (I think)
-    // and just convert to float afterwards for the exp + sum reduction.
-    float thread_max = row_chunk[0];
+    // First, do an in-thread max reduction to get the max value and its index.
+    float thread_max      = row_chunk[0];
     int first_topk_expert = first_elt_read_by_thread;
 #pragma unroll
     for(int ii = 1; ii < VPT; ++ii)
     {
-        if (thread_max < row_chunk[ii])
+        if(thread_max < row_chunk[ii])
         {
-            thread_max = row_chunk[ii];
+            thread_max        = row_chunk[ii];
             first_topk_expert = first_elt_read_by_thread + ii;
         }
-        // thread_max = max(thread_max, row_chunk[ii]);
     }
 
-    // Now, we find the max within the thread group and distribute among the threads. We use a
-    // butterfly reduce. #pragma unroll
-    //     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-    //     {
-    //         thread_max = max(thread_max, VLLM_SHFL_XOR_SYNC_WIDTH(thread_max, mask,
-    //         THREADS_PER_ROW));
-    //     }
-    // thread_max =
-    //     multithread_reduce(thread_max, [](float a, float b) { return max(a, b); }, THREADS_PER_ROW);
+    // Now, we find the max within the thread group and distribute among the threads.
     auto arg_max = [](const kvp& a, const kvp& b) {
         if(a.value > b.value || (a.value == b.value && a.key < b.key))
         {
@@ -346,46 +336,14 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
         }
         return b;
     };
-    kvp thread_kvp = {first_topk_expert, thread_max};
-    thread_kvp     = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
+    kvp thread_kvp    = {first_topk_expert, thread_max};
+    thread_kvp        = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
     thread_max        = thread_kvp.value;
     first_topk_expert = thread_kvp.key;
 
     // From this point, thread max in all the threads have the max within the row.
-    // Now, we subtract the max from each element in the thread and take the exp. We also compute
-    // the thread local sum.
-    float row_sum = 0;
-#pragma unroll
-    for(int ii = 0; ii < VPT; ++ii)
-    {
-        row_chunk[ii] = expf(row_chunk[ii] - thread_max);
-        row_sum += row_chunk[ii];
-    }
-
-    // Now, we perform the sum reduce within each thread group. Similar to the max reduce, we use a
-    // bufferfly pattern. #pragma unroll
-    //     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-    //     {
-    //         row_sum += VLLM_SHFL_XOR_SYNC_WIDTH(row_sum, mask, THREADS_PER_ROW);
-    //     }
-    row_sum = multithread_reduce(row_sum, [](float a, float b) { return a + b; }, THREADS_PER_ROW);
-
-    // From this point, all threads have the max and the sum for their rows in the thread_max and
-    // thread_sum variables respectively. Finally, we can scale the rows for the softmax.
-    // Technically, for top-k gating we don't need to compute the entire softmax row. We can likely
-    // look at the maxes and only compute for the top-k values in the row. However, this kernel will
-    // likely not be a bottle neck and it seems better to closer match torch and find the argmax
-    // after computing the softmax.
-    const float reciprocal_row_sum = 1.f / row_sum;
-
-#pragma unroll
-    for(int ii = 0; ii < VPT; ++ii)
-    {
-        row_chunk[ii] = row_chunk[ii] * reciprocal_row_sum;
-    }
-
-    // Now, softmax_res contains the softmax of the row chunk. Now, I want to find the topk elements
-    // in each row, along with the max index.
+    // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
+    // full row.
     int start_col                           = first_elt_read_by_thread;
     static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
 
@@ -394,26 +352,27 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
     {
         float max_val;
         int expert;
-        if (k_idx == 0)
+        if(k_idx == 0)
         {
-            max_val  = reciprocal_row_sum;
-            expert   = first_topk_expert;
+            max_val = thread_max;
+            expert  = first_topk_expert;
         }
         else
         {
             // First, each thread does the local argmax
             max_val = row_chunk[0];
-            expert    = start_col;
+            expert  = start_col;
 #pragma unroll
-            for(int ldg = 0, col = start_col; ldg < LDG_PER_THREAD; ++ldg, col += COLS_PER_GROUP_LDG)
+            for(int ldg = 0, col = start_col; ldg < LDG_PER_THREAD;
+                ++ldg, col += COLS_PER_GROUP_LDG)
             {
 #pragma unroll
                 for(int ii = 0; ii < ELTS_PER_LDG; ++ii)
                 {
                     float val = row_chunk[ldg * ELTS_PER_LDG + ii];
 
-                    // No check on the experts here since columns with the smallest index are processed
-                    // first and only updated if > (not >=)
+                    // No check on the experts here since columns with the smallest index are
+                    // processed first and only updated if > (not >=)
                     if(val > max_val)
                     {
                         max_val = val;
@@ -422,23 +381,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
                 }
             }
 
-            // Now, we perform the argmax reduce. We use the butterfly pattern so threads reach
-            // consensus about the max. This will be useful for K > 1 so that the threads can agree on
-            // "who" had the max value. That thread can then blank out their max with -inf and the warp
-            // can run more iterations... #pragma unroll
-            //         for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-            //         {
-            //             float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
-            //             int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
-
-            //             // We want lower indices to "win" in every thread so we break ties this way
-            //             if (other_max > max_val || (other_max == max_val && other_expert < expert))
-            //             {
-            //                 max_val = other_max;
-            //                 expert = other_expert;
-            //             }
-            //         }
-
+            // Now, we perform the argmax reduce.
             kvp thread_kvp = {expert, max_val};
             thread_kvp     = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
             max_val        = thread_kvp.value;
@@ -456,20 +399,16 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
-            output[output_idx]    = max_val;
+            const float numer     = expf(max_val - thread_max);
+            output[output_idx]    = numer;
             indices[indices_idx]  = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
             source_rows[idx]      = k_idx * num_rows + thread_row;
 
             // Accumulate renorm scalar
-            if constexpr(need_renorm)
-            {
-                renorm_value += max_val;
-            }
+            renorm_value += numer;
         }
 
-        // Finally, we clear the value in the thread with the current max if there is another
-        // iteration to run.
-        if(k_idx + 1 < k)
+        // Finally, we clear the value in the thread with the current max
         {
             const int ldg_group_for_expert     = expert / COLS_PER_GROUP_LDG;
             const int thread_to_clear_in_group = (expert / ELTS_PER_LDG) % THREADS_PER_ROW;
@@ -479,8 +418,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             if(thread_group_idx == thread_to_clear_in_group)
             {
                 const int offset_for_expert = expert % ELTS_PER_LDG;
-                // Safe to set to any negative value since row_chunk values must be between 0 and 1.
-                row_chunk[ldg_group_for_expert * ELTS_PER_LDG + offset_for_expert] = -10000.f;
+                row_chunk[ldg_group_for_expert * ELTS_PER_LDG + offset_for_expert] = -INFINITY;
             }
         }
     }
@@ -494,6 +432,31 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__
             {
                 int64_t const idx = output_stride * thread_row + k_idx;
                 output[idx] *= renorm_value;
+            }
+        }
+    }
+    else
+    {
+        float thread_sum_rest = 0.f;
+#pragma unroll
+        for(int ii = 0; ii < VPT; ++ii)
+        {
+            thread_sum_rest += expf(row_chunk[ii] - thread_max);
+        }
+        float row_sum_rest = multithread_reduce(
+            thread_sum_rest, [](float a, float b) { return a + b; }, THREADS_PER_ROW);
+
+        if(thread_group_idx == 0)
+        {
+            const float Z = renorm_value + row_sum_rest;
+            if(Z != 0.f)
+            {
+                const float scale = 1.f / Z;
+                for(int k_idx = 0; k_idx < k; ++k_idx)
+                {
+                    const int out_idx = output_stride * thread_row + k_idx;
+                    output[out_idx] *= scale;
+                }
             }
         }
     }
@@ -530,7 +493,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const bool need_renorm,
                                      cudaStream_t stream)
 {
-    static constexpr std::size_t MAX_BYTES_PER_LDG = 16;
+    static constexpr std::size_t MAX_BYTES_PER_LDG = 32;
 
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(DTYPE) * EXPERTS);
     using Constants                    = detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;

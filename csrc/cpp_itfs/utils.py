@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+
 import shutil
 import os
 import subprocess
@@ -151,8 +155,8 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         cxxflags += [
             "-DUSE_ROCM",
             "-DENABLE_FP8",
-            "-O3",
-            "-std=c++17",
+            "-O3" if not AITER_DEBUG else "-O0",
+            "-std=c++20",
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
             "-D__HIP_PLATFORM_HCC__=1",
@@ -169,7 +173,13 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         ]
 
         if AITER_DEBUG:
-            cxxflags += ["-g", "-fverbose-asm", "--save-temps", "-Wno-gnu-line-marker"]
+            cxxflags += [
+                "-g",
+                "-ggdb",
+                "-fverbose-asm",
+                "--save-temps",
+                "-Wno-gnu-line-marker",
+            ]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()

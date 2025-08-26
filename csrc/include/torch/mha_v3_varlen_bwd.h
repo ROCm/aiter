@@ -1,6 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include <torch/extension.h>
 
 namespace aiter {
@@ -14,6 +14,10 @@ fmha_v3_varlen_bwd(const at::Tensor& dout,         // [total_q, hq, d_v]
                    const at::Tensor& softmax_lse,  // [b, hq, sq]
                    const at::Tensor& cu_seqlens_q, // [b+1]
                    const at::Tensor& cu_seqlens_k, // [b+1]
+                   // FIXME: this two args currently not support on ck side
+                   //        and has no host code on aiter side
+                   //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
+                   //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
                    const int max_seqlen_q,
                    const int max_seqlen_k,
                    const float p_dropout,

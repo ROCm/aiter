@@ -188,6 +188,7 @@ def test_grouped_topk(
     w_ref = w_ref * scale_factor
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
+    is_softmax = True if scoring_func == "softmax" else False
     _, us_aiter = run_perftest(
         aiter.grouped_topk,
         gating_output,
@@ -196,7 +197,7 @@ def test_grouped_topk(
         group,
         topk_group,
         need_renorm,
-        scoring_func,
+        is_softmax,
         scale_factor,
     )
     id_ref, _ref = torch.sort(id_ref)

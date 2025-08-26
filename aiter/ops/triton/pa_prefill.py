@@ -10,6 +10,9 @@
 import torch
 import triton
 import triton.language as tl
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 BASE_BLOCK = 64
 NUM_WARPS = 4
@@ -62,6 +65,7 @@ if triton.__version__ >= "2.1.0":
         BLOCK_DMODEL_PADDED: tl.constexpr,  # head size padded to a power of 2
         BLOCK_N: tl.constexpr,
         SLIDING_WINDOW: tl.constexpr,
+        SKIP_DECODE: tl.constexpr,
     ):
         """
         #TODO: Add Doc
@@ -78,6 +82,9 @@ if triton.__version__ >= "2.1.0":
         cur_batch_in_all_stop_index = tl.load(B_Start_Loc + cur_batch + 1)
         cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
         cur_batch_ctx_len = cur_batch_seq_len - cur_batch_query_len
+
+        if SKIP_DECODE and cur_batch_query_len == 1:
+            return
 
         # start position inside of the query
         # generally, N goes over kv, while M goes over query_len
@@ -340,6 +347,7 @@ if triton.__version__ >= "2.1.0":
         BLOCK_DMODEL: tl.constexpr,  # head size
         BLOCK_DMODEL_PADDED: tl.constexpr,  # head size padded to a power of 2
         BLOCK_N: tl.constexpr,
+        SKIP_DECODE: tl.constexpr,
     ):
         """
         #TODO: Add Doc
@@ -360,6 +368,9 @@ if triton.__version__ >= "2.1.0":
         cur_batch_in_all_stop_index = tl.load(B_Start_Loc + cur_batch + 1)
         cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
         cur_batch_ctx_len = cur_batch_seq_len - cur_batch_query_len
+
+        if SKIP_DECODE and cur_batch_query_len == 1:
+            return
 
         block_start_loc = BLOCK_M * start_m
 
@@ -597,11 +608,15 @@ if triton.__version__ >= "2.1.0":
         alibi_slopes=None,
         sliding_window=None,
         sm_scale=None,
+        skip_decode=False,
     ):
         """
         #TODO: Add Doc
         """
 
+        _LOGGER.info(
+            f"PA_PREFILL: q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}"
+        )
         q_dtype_is_f32 = q.dtype is torch.float32
         # need to reduce num. blocks when using fp32
         # due to increased use of GPU shared memory
@@ -610,27 +625,9 @@ if triton.__version__ >= "2.1.0":
 
         IN_PRECISION = None
 
-        # Conversion of FP8 Tensor from uint8 storage to
-        # appropriate torch.dtype for interpretation by Triton
-        if "fp8" in kv_cache_dtype:
-            assert k_cache.dtype == torch.uint8
-            assert v_cache.dtype == torch.uint8
-
-            if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-                target_dtype = torch.float8_e4m3fnuz
-            elif kv_cache_dtype == "fp8_e5m2":
-                target_dtype = torch.float8_e5m2
-            else:
-                raise ValueError("Unsupported FP8 dtype:", kv_cache_dtype)
-
-            k_cache = k_cache.view(target_dtype)
-            v_cache = v_cache.view(target_dtype)
-
         if (
-            k_cache.dtype == torch.uint8
-            or v_cache.dtype == torch.uint8
-            and kv_cache_dtype == "auto"
-        ):
+            torch.finfo(k_cache.dtype).bits == 8 or torch.finfo(v_cache.dtype).bits == 8
+        ) and kv_cache_dtype == "auto":
             raise ValueError(
                 "kv_cache_dtype='auto' unsupported for\
                 FP8 KV Cache prefill kernel"
@@ -702,6 +699,7 @@ if triton.__version__ >= "2.1.0":
                 BLOCK_DMODEL=Lk,
                 BLOCK_DMODEL_PADDED=Lk_padded,
                 BLOCK_N=BLOCK,
+                SKIP_DECODE=skip_decode,
                 num_warps=NUM_WARPS,
                 num_stages=1,
             )
@@ -752,6 +750,7 @@ if triton.__version__ >= "2.1.0":
             BLOCK_DMODEL_PADDED=Lk_padded,
             BLOCK_N=BLOCK,
             SLIDING_WINDOW=sliding_window,
+            SKIP_DECODE=skip_decode,
             num_warps=NUM_WARPS,
             num_stages=1,
         )

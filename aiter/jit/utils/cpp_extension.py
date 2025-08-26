@@ -229,9 +229,10 @@ COMMON_HIPCC_FLAGS = [
     "-fno-unique-section-names",
     "-ffunction-sections",
     "-fdata-sections",
-    "-fvisibility=hidden",
-    "-fvisibility-inlines-hidden",
 ]
+
+if not int(os.environ.get("AITER_SYMBOL_VISIBLE", "0")):
+    COMMON_HIPCC_FLAGS.extend(["-fvisibility=hidden", "-fvisibility-inlines-hidden"])
 
 JIT_EXTENSION_VERSIONER = ExtensionVersioner()
 
@@ -379,7 +380,7 @@ class BuildExtension(build_ext):
     A custom :mod:`setuptools` build extension .
 
     This :class:`setuptools.build_ext` subclass takes care of passing the
-    minimum required compiler flags (e.g. ``-std=c++17``) as well as mixed
+    minimum required compiler flags (e.g. ``-std=c++20``) as well as mixed
     C++/CUDA compilation (and support for CUDA files in general).
 
     When using :class:`BuildExtension`, it is allowed to supply a dictionary
@@ -491,7 +492,7 @@ class BuildExtension(build_ext):
                 "/{}:" if self.compiler.compiler_type == "msvc" else "-{}="
             )
             cpp_flag_prefix = cpp_format_prefix.format("std")
-            cpp_flag = cpp_flag_prefix + "c++17"
+            cpp_flag = cpp_flag_prefix + "c++20"
             if not any(flag.startswith(cpp_flag_prefix) for flag in cflags):
                 cflags.append(cpp_flag)
 
@@ -1569,7 +1570,7 @@ def _write_ninja_file_to_build_library(
     common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
     common_cflags += [f"-isystem {shlex.quote(include)}" for include in system_includes]
 
-    cflags = common_cflags + ["-fPIC", "-std=c++17"] + extra_cflags
+    cflags = common_cflags + ["-fPIC", "-std=c++20"] + extra_cflags
 
     if with_cuda and IS_HIP_EXTENSION:
         cuda_flags = ["-DWITH_HIP"] + cflags + COMMON_HIP_FLAGS + COMMON_HIPCC_FLAGS

@@ -338,12 +338,12 @@ parser.add_argument(
     e.g.: -k 1024""",
 )
 parser.add_argument(
-    "-d",
-    "--d",
+    "-qk",
+    "--d_qk",
     type=int,
     default=128,
     help="""Dimension of query and key. Default is 128.
-    e.g.: -d 256""",
+    e.g.: -qk 256""",
 )
 parser.add_argument(
     "-v",
@@ -399,7 +399,7 @@ parser.add_argument(
     e.g.: -m mha""",
 )
 parser.add_argument(
-    "-dtype",
+    "-d",
     "--dtype",
     type=str,
     default="bf16",
@@ -414,7 +414,7 @@ if __name__ == "__main__":
         args.nheads,
         args.seqlen_q,
         args.seqlen_k,
-        args.d,
+        args.d_qk,
         args.d_v,
         args.dropout_p,
         args.causal,

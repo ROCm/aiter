@@ -1,0 +1,3 @@
+knl_name,knl_file,atm,vskip,smf,tg_num_perCU,ps,subGU_m,subGU_n
+_ZN5aiter51fmoe_fp16_noquantFp16_g1u0_atm_inlv_gelu_1tg_32x512E,fmoe_fp16_noquantFp16_g1u0_atm_inlv_gelu_1tg_32x512.co,2,0,0,1,0,32,512
+_ZN5aiter54fmoe_fp16_noquantFp16_g1u0_atm_inlv_gelu_1tg_ps_32x512E,fmoe_fp16_noquantFp16_g1u0_atm_inlv_gelu_1tg_ps_32x512.co,2,0,0,1,1,32,512

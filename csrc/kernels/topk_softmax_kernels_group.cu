@@ -467,12 +467,11 @@ void grouped_topk(
     int num_expert_group,
     int topk_grp,
     bool need_renorm,
-    std::string scoring_func = "softmax",
+    bool scoring_func = true,
     const float routed_scaling_factor = 1.)
 {
-    TORCH_CHECK((scoring_func == "softmax") || (scoring_func == "sigmoid"), "grouped_topk scoring_func only suppot softmax or sigmoid");
     const bool isBiased = false;
-    bool isSoftmax = scoring_func == "softmax" ? true : false;
+    bool isSoftmax = scoring_func;
     int num_tokens = gating_output.size(0);
     int num_experts = gating_output.size(1);
     int topk = topk_ids.size(1);

@@ -2,6 +2,9 @@ import torch
 import triton
 import triton.language as tl
 from typing import Optional
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -70,6 +73,10 @@ def fused_mul_add(
     Returns:
     - out: same shape as x
     """
+    _LOGGER.info(
+        f"FUSED_MUL_ADD: x={tuple(x.shape)} a={tuple(a.shape) if isinstance(a, torch.Tensor) else a} "
+        + f"b={tuple(b.shape) if isinstance(b, torch.Tensor) else b}"
+    )
 
     N = x.numel()
     assert x.is_contiguous(), "x should be contiguous"

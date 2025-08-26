@@ -79,7 +79,7 @@ def generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout="TN", output=True):
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype).cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
         out_dtype = (None,)
     else:
         out_dtype = dtype
@@ -132,6 +132,7 @@ def get_x_vals():
     # x_vals = [(128, 1024, 4096)]
     x_vals += [(16, 16384, 3328 * 2), (128, 16384, 3328 * 2)]
     x_vals += [(256, 3584, 2112)]
+    x_vals += [(7, 4608, 7168), (7, 7168, 2304)]
     x_vals += [(1, 1, 32)]  # minimal case
     return x_vals
 
@@ -185,10 +186,13 @@ def run_torch(x, w, x_scales, w_scales, dtype):
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
+def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, layout, output):
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     if TRITON_HIP_PRESHUFFLE_SCALES:
         if N % 32 > 0:
@@ -200,9 +204,16 @@ def test_gemm_afp4_wfp4(M: int, N: int, K: int, dtype, output):
                 f"K = {K} is not divisible by 256, skip this test for preshuffled scales tests"
             )
 
-    x, w, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype, y = (
-        generate_gemm_afp4wfp4_inputs(M, N, K, dtype, output=output)
-    )
+    (
+        x,
+        w,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output)
 
     torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 

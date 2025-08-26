@@ -1,9 +1,38 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+
 import torch
 import ctypes
 from torch.library import Library
 from typing import Callable, Optional, Tuple
-from csrc.cpp_itfs.utils import AITER_LOG_MORE
-from aiter.test_common import log_args
+from csrc.cpp_itfs.utils import AITER_LOG_MORE, logger
+
+
+def log_args(func, *args, **kwargs):
+    import inspect
+
+    callargs = inspect.getcallargs(func, *args, **kwargs)
+
+    prefix = f"calling {func.__name__}("
+    blanks = " " * (len(prefix))
+
+    def getTensorInfo(el):
+        if isinstance(el, torch.Tensor):
+            return f"{el.shape} {el.dtype} {el.device} {hex(el.data_ptr())}"
+        elif isinstance(el, tuple):
+            viewNum = 5
+            if len(el) > viewNum:
+                el = list(el[:viewNum]) + ["..."]
+            return f'\n{" "*(len(prefix)+31)}'.join(
+                ["("] + [f" {getTensorInfo(e)}" for e in el] + [")"]
+            )
+        return el
+
+    info = [f"{el:<28} = {getTensorInfo(callargs[el])}" for el in callargs]
+    info = f",\n{blanks}".join(info)
+    logger.info(f"\n{prefix}{info})")
+    return callargs
 
 
 ctypes_map = {
