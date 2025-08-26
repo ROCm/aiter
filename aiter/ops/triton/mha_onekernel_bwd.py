@@ -711,7 +711,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         if HAS_PE:
             dk_pe = tl.zeros([BLOCK_N1, PE_HEAD_DIM], dtype=tl.float32)
         else:
-            dk_pe = None
+            # Couldn't assign None to dk_pe because _bwd_dkdv_inner can't return None.
+            dk_pe = dk
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
         # q > k: diretcly skip all the way until the start of causal block
@@ -1434,7 +1435,7 @@ def bwd_kernel_noncausal(
             num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
             dk, _, dv = _bwd_dkdv_inner(
                 dk,
-                None,
+                dk,  # dk_pe: Couldn't assign None to dk_pe because _bwd_dkdv_inner can't return None.
                 dv,  # output tensors
                 Q_ptr,
                 k,
