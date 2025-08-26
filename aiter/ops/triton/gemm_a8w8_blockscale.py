@@ -184,7 +184,7 @@ def _gemm_a8w8_blockscale_kernel(
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
-        c = gl.convert_layout(c, layout=c_layout)
+
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
