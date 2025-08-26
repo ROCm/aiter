@@ -121,7 +121,7 @@ def to_record(
     bandwidth_triton=None,
     throughput_triton=None,
 ):
-    if latency_triton == None:
+    if latency_triton is None:
         return Record(
             M,
             N,
