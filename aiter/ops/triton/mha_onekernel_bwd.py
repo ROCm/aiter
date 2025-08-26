@@ -162,7 +162,6 @@ def _bwd_dkdv_inner(
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     PADDED_PE_HEAD: tl.constexpr = ACTUAL_PE_HEAD_DIM != PE_HEAD_DIM
-
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M)  # start_m + (0, 15)
     offs_n = start_n + tl.arange(0, BLOCK_N)  # start_m + (0, 127)
@@ -674,7 +673,6 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     bid = tl.program_id(2)
     if DEBUG_TRITON:
         print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
-
     # figure out varlen start and end
     q_start = 0
     k_start = 0
@@ -694,13 +692,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         print(f"delta_qk = {delta_qk}")  # noqa: E701
 
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
-    offs_d = tl.arange(0, HEAD_DIM)
-
     HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
     PADDED_PE_HEAD: tl.constexpr = ACTUAL_PE_HEAD_DIM != PE_HEAD_DIM
+    offs_d = tl.arange(0, HEAD_DIM)
     if HAS_PE:
         offs_d_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
-
     GROUP_SIZE: tl.constexpr = HQ // HK
 
     # align the delta_qk
