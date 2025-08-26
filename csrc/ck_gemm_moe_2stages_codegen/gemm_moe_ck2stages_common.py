@@ -17,8 +17,11 @@ class kernelInstanceGEMM1:
     MulRoutedWeight: bool = False
     ActOP: bool = False
     CDEElementOp: str = "TypeCast"
-    QuantType: str = "per_tensor"
+    QuantType: int = 1
     stage: int = 1
+    Adtype: str = ""
+    Bdtype: str = ""
+    Cdtype: str = ""
 
     @property
     def name(self) -> str:
@@ -40,9 +43,12 @@ class kernelInstanceGEMM1:
                 self.CDEElementOp,
                 f"v{self.GemmPipelineVersion}",
                 "Nswizzle" + str(int(self.Nswizzle)),
-                self.QuantType,
+                "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
                 "silu" if self.ActOP else "gelu",
+                self.Adtype,
+                self.Bdtype,
+                self.Cdtype,
             ]
         )
 
@@ -59,7 +65,7 @@ class kernelInstanceGEMM2:
     Nswizzle: bool = False
     MulRoutedWeight: bool = True
     CDEElementOp: str = "TypeCast"
-    QuantType: str = "per_tensor"
+    QuantType: int = 1
     stage: int = 2
 
     @property
@@ -82,8 +88,11 @@ class kernelInstanceGEMM2:
                 self.CDEElementOp,
                 f"v{self.GemmPipelineVersion}",
                 "Nswizzle" + str(int(self.Nswizzle)),
-                self.QuantType,
+                "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
+                self.Adtype,
+                self.Bdtype,
+                self.Cdtype,
             ]
         )
 
@@ -115,7 +124,7 @@ a16w16_gemm1_kernels_list= {
      4: kernelInstanceGEMM1(       256,       128,        64,        64,     1,       4,        1,),
 
      5: kernelInstanceGEMM1(       256,        64,       128,       128,     1,       4,        3,),
-    #  6: kernelInstanceGEMM1(       256,        64,       128,        64,     1,       4,        3,),
+     6: kernelInstanceGEMM1(       256,        64,       128,        64,     1,       4,        3,),
      7: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
      8: kernelInstanceGEMM1(       256,       128,       128,        64,     1,       4,        3,),
      9: kernelInstanceGEMM1(      256,       256,       128,        64,     1,       4,        3,),
@@ -144,7 +153,7 @@ a8w8_gemm1_kernels_list= {
      4: kernelInstanceGEMM1(       256,      128,         64,       128,     1,       4,        1,),
 
      5: kernelInstanceGEMM1(       256,        64,       128,       256,     1,       4,        3,),
-    #  6: kernelInstanceGEMM1(       256,        64,       128,       128,     1,       4,        3,),
+     6: kernelInstanceGEMM1(       256,        64,       128,       128,     1,       4,        3,),
      7: kernelInstanceGEMM1(       256,       128,       128,       256,     1,       4,        3,),
      8: kernelInstanceGEMM1(       256,       128,       128,       128,     1,       4,        3,),
      9: kernelInstanceGEMM1(      256,       256,       128,       128,     1,       4,        3,),
@@ -278,12 +287,13 @@ gemm2_kernels_dict = {
 bit8_list = ["F8", "I8", "f8", "i8"]
 bit16_list = ["B16", "F16", "b16", "f16"]
 bit4_list = ["I4", "i4", "FP4X2", "fp4x2"]
-QuantType_list = ["per_1x128", "per_1x32"]
+QuantType_list = [3, 4]
 
 
 def get_gemm1_kernels_list(
     Adtype: str,
     Bdtype: str,
+    Cdtype: str,
     Nswizzle: bool,
     QuantType: str,
     ActOP: bool,
@@ -307,7 +317,11 @@ def get_gemm1_kernels_list(
             tag = "a8w8_gfx950"
         else:
             tag = "a8w8"
-    elif Adtype in bit8_list and Bdtype in bit4_list and Adtype == "F8":
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit4_list
+        and (Adtype == "F8" or Adtype == "f8")
+    ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
         tag = "a4w4"
@@ -319,6 +333,10 @@ def get_gemm1_kernels_list(
         kernel.ActOP = ActOP
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
+        kernel.Adtype = Adtype
+        kernel.Bdtype = Bdtype
+        kernel.Cdtype = Cdtype
+
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleWint4"
         elif tag == "a8w8blkscale":
@@ -334,9 +352,15 @@ def get_gemm1_kernels_list(
 
 
 def get_gemm2_kernels_list(
-    Adtype: str, Bdtype: str, Nswizzle: bool, QuantType: str, MulRoutedWeight: bool
+    Adtype: str,
+    Bdtype: str,
+    Cdtype: str,
+    Nswizzle: bool,
+    QuantType: str,
+    MulRoutedWeight: bool,
 ) -> list:
     arch = get_gfx()
+
     if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
         if arch == "gfx950":
             tag = "a16w16_gfx950"
@@ -354,7 +378,11 @@ def get_gemm2_kernels_list(
             tag = "a8w8_gfx950"
         else:
             tag = "a8w8"
-    elif Adtype in bit8_list and Bdtype in bit4_list and Adtype == "F8":
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit4_list
+        and (Adtype == "F8" or Adtype == "f8")
+    ):
         tag = "a8w4"
     elif Adtype in bit4_list and Bdtype in bit4_list:
         tag = "a4w4"
@@ -365,6 +393,10 @@ def get_gemm2_kernels_list(
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
+        kernel.Adtype = Adtype
+        kernel.Bdtype = Bdtype
+        kernel.Cdtype = Cdtype
+
         if tag == "a8w4":
             kernel.CDEElementOp = "MulABScaleExpertWeightWin4"
         elif tag == "a8w8blkscale":

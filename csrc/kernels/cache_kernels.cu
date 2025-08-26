@@ -322,7 +322,7 @@ template <typename scalar_t,
           typename cache_t,
           typename dequant_scale_t,
           bool asmLayout = false,
-          int wg_size    = 256>
+          int wg_size    = 64>
 __global__ void reshape_and_cache_with_per_token_quant_kernel(
     const scalar_t* __restrict__ key,   // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value, // [num_tokens, num_heads, head_size]
@@ -406,14 +406,16 @@ __global__ void reshape_and_cache_with_per_token_quant_kernel(
     }();
     float v_max = wave_reduce(v_local_max, f_max_f32);
 
-    float k_token_scale = k_max / dtypeMax;
-    float v_token_scale = v_max / dtypeMax;
+    float k_token_scale          = k_max / dtypeMax;
+    float v_token_scale          = v_max / dtypeMax;
+    float k_token_scale_inverted = 1.0 / k_token_scale;
+    float v_token_scale_inverted = 1.0 / v_token_scale;
 
 #pragma unroll
     for(int i_d = 0; i_d < local_dim_elems; i_d++)
     {
-        k_local_dim[i_d] = k_local_dim[i_d] / k_token_scale;
-        v_local_dim[i_d] = v_local_dim[i_d] / v_token_scale;
+        k_local_dim[i_d] = k_local_dim[i_d] * k_token_scale_inverted;
+        v_local_dim[i_d] = v_local_dim[i_d] * v_token_scale_inverted;
     }
 
     // store the scale
@@ -1253,12 +1255,13 @@ void reshape_and_cache_with_pertoken_quant(
     int block_size    = key_cache.size(3);
     int x             = key_cache.size(4);
     int max_kv_tokens = k_dequant_scales.size(1);
+    TORCH_CHECK(head_size <= 512, __func__, " Unsupported head_size: ", head_size);
 
     int key_stride   = key.stride(0);
     int value_stride = value.stride(0);
 
-    dim3 grid((num_tokens + 3) / 4, num_heads);
-    dim3 block(256);
+    dim3 grid(num_tokens, num_heads);
+    dim3 block(64);
     const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

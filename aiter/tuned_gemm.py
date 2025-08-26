@@ -55,12 +55,13 @@ class TunedGemm:
     def load_best_sols(self):
         if self.tune_path is not None and Path(self.tune_path).is_file():
             self.bestsols = pd.read_csv(self.tune_path)
+            self.bestsols = self.bestsols[self.bestsols["cu_num"] == self.cu_count]
             if len(self.bestsols) > 0 and "kernelName" in self.bestsols.columns:
                 hipblasltKernelNames = self.bestsols.apply(
                     lambda s: (
                         getHipblasltKernelName(s.solidx)
                         if s.libtype == "hipblaslt"
-                        else ""
+                        else "rocblas"
                     ),
                     axis=1,
                 )
@@ -106,7 +107,7 @@ class TunedGemm:
         #         return 3, 0
         #     elif n % 4 == 0 and m == 1 and k <= 8192:
         #         return 3, 1
-
+        soltype = None
         if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
             if (
                 (
@@ -119,12 +120,15 @@ class TunedGemm:
                 or (m > 8 and m <= 16 and n <= self.cu_count)
                 and k <= 256
             ):
-                return 3, 2
-        soltype, solidx = self.solids.get(
-            (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
-        )
+                soltype, solidx = 3, 2
+        if soltype is None:
+            soltype, solidx = self.solids.get(
+                (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+            )
+        solution_name = self.solMap[soltype]
+
         logger.info(
-            f"using {soltype=}, {solidx=} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
+            f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
         )
         return soltype, solidx
 
