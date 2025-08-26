@@ -227,7 +227,7 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     return latency, latency_triton
 
 
-def run_a4w4_gemm(dtype, record):
+def run_a4w4_gemm(dtype, record, run_triton=False):
     from op_tests.test_gemm_a4w4 import test_gemm
 
     ret = test_gemm(dtype, record.M, record.N, record.K)
