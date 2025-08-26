@@ -13,8 +13,11 @@ from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 import torch.nn.functional as F
 
+import aiter.ops.triton.utils.arch_info as arch_info
+
 
 block_shape = (128, 128)
+DEVICE_ARCH = arch_info.get_device()
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -163,6 +166,11 @@ def test_gemm(dtype, M, N, K, layout, output, impl: str):
         pytest.skip(
             "Latest upstream compiler as of Aug 22 (necessary for Gluon) causes"
             " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
+        )
+
+    if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
         )
 
     dtype = str_to_torch_dtype[dtype]
