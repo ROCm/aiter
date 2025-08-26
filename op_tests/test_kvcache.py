@@ -3,10 +3,12 @@
 
 import torch
 import aiter
-from aiter.test_common import checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import dtypes
 from typing import Tuple
 import argparse
+import itertools
+import pandas as pd
 
 MAX_TOKEN_SUPPORTED = 16384
 
@@ -116,22 +118,28 @@ def run_aiter(
     return k_cache, v_cache, k_scale, v_scale
 
 
+@benchmark()
 def test_reshape_and_cache(
     ctx_lens: int,
     bs: int,
     num_heads: Tuple[int, int],
     head_size: int,
     block_size: int,
-    DTyoe_KV: torch.dtype,
-    DTyoe_KVCache: torch.dtype,
-    quantCfg: dict = {},
+    DType_KV: torch.dtype,
+    DType_KVCache: torch.dtype,
 ):
+    ret = {}
+    quantCfg = (
+        {}
+        if DType_KVCache in [dtypes.bf16, dtypes.fp16]
+        else {"quant_dtype": DType_KVCache}
+    )
     asm_layout = True
     qhead, kvhead = num_heads
     num_blocks = (MAX_TOKEN_SUPPORTED + block_size - 1) // block_size
     # num_blocks = (ctx_lens+1+block_size-1)//block_size
     max_token_num_support = num_blocks * block_size
-    x = 16 // DTyoe_KVCache.itemsize
+    x = 16 // DType_KVCache.itemsize
     if asm_layout:
         k_cache_shape = (bs * num_blocks, kvhead, head_size // x, block_size, x)
         v_cache_shape = (bs * num_blocks, kvhead, block_size // x, head_size, x)
@@ -143,12 +151,12 @@ def test_reshape_and_cache(
 
     # ##################################################### prefill part
     qkv = torch.randn(
-        bs * ctx_lens, qhead + 2 * kvhead, head_size, dtype=DTyoe_KV, device="cuda"
+        bs * ctx_lens, qhead + 2 * kvhead, head_size, dtype=DType_KV, device="cuda"
     )
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
     device = key.device
-    k_cache = torch.empty(k_cache_shape, dtype=DTyoe_KVCache, device=device)
-    v_cache = torch.empty(v_cache_shape, dtype=DTyoe_KVCache, device=device)
+    k_cache = torch.empty(k_cache_shape, dtype=DType_KVCache, device=device)
+    v_cache = torch.empty(v_cache_shape, dtype=DType_KVCache, device=device)
     if quantCfg:
         k_scale = torch.empty(kv_scale_shape, device=key.device)
         v_scale = torch.empty_like(k_scale)
@@ -192,6 +200,7 @@ def test_reshape_and_cache(
         asm_layout,
         quantCfg,
     )
+    ret["us_prefill"] = us_a
 
     print(f"prefill part: ref vs aiter {us_ref:>8.2f}us vs {us_a:>8.2f}us")
     names = ["k_cache", "v_cache", "k_scale", "v_scale"]
@@ -205,7 +214,7 @@ def test_reshape_and_cache(
         )
 
     # ##################################################### decode part
-    qkv = torch.randn(bs, qhead + 2 * kvhead, head_size, dtype=DTyoe_KV, device="cuda")
+    qkv = torch.randn(bs, qhead + 2 * kvhead, head_size, dtype=DType_KV, device="cuda")
     _, key, value = torch.split(qkv, [qhead, kvhead, kvhead], dim=1)
 
     if quantCfg:
@@ -245,6 +254,7 @@ def test_reshape_and_cache(
         asm_layout,
         quantCfg,
     )
+    ret["us_decode"] = us_a
 
     print(f"decode part: ref vs aiter {us_ref:>8.2f}us vs {us_a:>8.2f}us")
     names = ["k_cache", "v_cache", "k_scale", "v_scale"]
@@ -257,8 +267,9 @@ def test_reshape_and_cache(
             msg=f"{names[i]} {el.shape}",
         )
     print(
-        f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DTyoe_KV=} {DTyoe_KVCache=}"
+        f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DType_KV=} {DType_KVCache=}"
     )
+    return ret
 
 
 parser = argparse.ArgumentParser(
@@ -269,51 +280,85 @@ parser.add_argument(
     "-t",
     "--test",
     type=str,
-    choices=["fp16tofp8", "fp16toi8", "bf16toi8"],
-    default=["fp16tofp8", "fp16toi8", "bf16toi8"],
+    choices=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
+    default=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
     nargs="*",
     help="""select which test to run, default is all
     e.g.: -t fp16tofp8""",
 )
+parser.add_argument(
+    "-b",
+    "--batch_size",
+    type=int,
+    nargs="*",
+    default=[64, 128, 257],
+    help="""Batch size. Default is 2.
+    e.g.: -b 16""",
+)
+parser.add_argument(
+    "-c",
+    "--ctx",
+    type=int,
+    nargs="*",
+    default=[4097, 12800],
+    help="""num of context lenth.
+    e.g.: -c 32""",
+)
 
 args = parser.parse_args()
-test_reshape_and_cache(4097, 128, (8, 1), 128, 16, dtypes.bf16, dtypes.bf16)
-for test in args.test:
-    if test == "fp16tofp8":
-        print("\nstart quant fp16->fp8")
-        test_reshape_and_cache(
-            4097,
+df = []
+for (
+    test,
+    bs,
+    ctx,
+) in itertools.product(args.test, args.batch_size, args.ctx):
+    if test == "bf16tobf16":
+        print("\nstart quant bf16->bf16")
+        ret = test_reshape_and_cache(
+            ctx,
+            bs,
+            (8, 1),
             128,
+            16,
+            dtypes.bf16,
+            dtypes.bf16,
+        )
+    elif test == "fp16tofp8":
+        print("\nstart quant fp16->fp8")
+        ret = test_reshape_and_cache(
+            ctx,
+            bs,
             (8, 1),
             128,
             16,
             dtypes.fp16,
             dtypes.fp8,
-            quantCfg={"quant_dtype": dtypes.fp8},
         )
     elif test == "fp16toi8":
         print("\nstart quant fp16->i8")
-        test_reshape_and_cache(
-            4097,
-            128,
+        ret = test_reshape_and_cache(
+            ctx,
+            bs,
             (8, 1),
             128,
             16,
             dtypes.fp16,
             dtypes.i8,
-            quantCfg={"quant_dtype": dtypes.i8},
         )
     elif test == "bf16toi8":
         print("\nstart quant bf16->i8")
-        test_reshape_and_cache(
-            4097,
-            128,
-            (8, 1),
+        ret = test_reshape_and_cache(
+            ctx,
+            bs,
+            (10, 1),
             128,
             16,
             dtypes.bf16,
             dtypes.i8,
-            quantCfg={"quant_dtype": dtypes.i8},
         )
     else:
         raise ValueError(f"Unknown test type: {test}")
+    df.append(ret)
+df = pd.DataFrame(df)
+# df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
+aiter.logger.info(f"summary:\n{df}")

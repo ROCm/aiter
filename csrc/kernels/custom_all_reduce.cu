@@ -176,7 +176,7 @@ std::vector<at::Tensor> get_graph_buffer_ipc_meta(
       torch::empty({static_cast<int64_t>(handle_bytes.size())}, options);
   std::memcpy(handles.data_ptr(), handle_bytes.data(), handle_bytes.size());
 
-  torch::Tensor offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64).clone();
+  torch::Tensor offset_tensor = torch::from_blob(offsets.data(), {static_cast<int64_t>(offsets.size())}, torch::kInt64);
   return {handles, offset_tensor};
 }
 
