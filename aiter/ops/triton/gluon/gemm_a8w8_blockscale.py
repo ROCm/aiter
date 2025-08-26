@@ -404,8 +404,18 @@ def _get_config(
         else:
             key = "default"  # fall back to default config
 
-    return _get_config._config_dict[key]["any"]
+    # Config keys should be named M_LEQ_<bound> or "any"
+    bounds = []
+    for setting in _get_config._config_dict[key].keys():
+        potential_block_m = setting.replace("M_LEQ_", "")
+        if potential_block_m.isnumeric():
+            bounds.append(int(potential_block_m))
 
+    for bound in bounds:
+        if M <= bound and f"M_LEQ_{bound}" in _get_config._config_dict[key]:
+            return _get_config._config_dict[key][f"M_LEQ_{bound}"]
+    else:
+        return _get_config._config_dict[key]["any"]
 
 def gemm_a8w8_blockscale(
     x: torch.Tensor,
@@ -473,15 +483,6 @@ def gemm_a8w8_blockscale(
     assert (
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
     ), "GROUP_K must equal BLOCK_SIZE_K"
-    assert (
-        config["BLOCK_SIZE_M"] == 128
-    ), "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
-    assert (
-        config["BLOCK_SIZE_N"] == 128
-    ), "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
-    assert (
-        config["BLOCK_SIZE_K"] == 128
-    ), "Before modifying the hparams, also make sure to modify the Gluon layouts. Afterwards, modify this assert."
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
