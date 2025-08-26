@@ -9,6 +9,6 @@
     "waves_per_eu": 2,
     "matrix_instr_nonkdim": 16,
     "cache_modifier": ".ca",
-    "NUM_KSPLIT": 1
+    "NUM_KSPLIT": 4
   }
 }
