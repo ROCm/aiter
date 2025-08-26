@@ -887,12 +887,6 @@ def _attn_fwd_persistent_vanilla(
     USE_INT64_STRIDES: tl.constexpr,
     NUM_WGS: tl.constexpr,
 ):
-    """
-    cu_tilecounts_q: [NUM_BLOCKS] number of tiles per tile range across sequences. 
-    For example, with sequence lengths [300, 100, 200], and tile size 100, we have NUM_BLOCKS = 3, 
-    tilecounts_q = [3, 2, 1], i.e. 3 sequences in the batch are >= 0, 2 sequences are >= 100, and 1 sequence is >= 200. 
-    to get cu_tilecounts_q we do a cumsum and add 0 in front.
-    """
     # max num blocks along seqlen
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -1003,16 +997,22 @@ def _attn_fwd_persistent_vanilla(
     # offsets
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+    offs_m = tl.arange(0, BLOCK_M)
+    
+    q_dtype = q_ptr.type.element_ty
+    
+    # preallocate both the query tensors, current tile and next tile
+    q0 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
+    q1 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
 
+    # current query load
     tile_id0 = workgroup_id
-
-    # current tile load
     off_q_head0 = tile_id0 % NUM_Q_HEADS
     start_m0 = tile_id0 // NUM_Q_HEADS % NUM_BLOCKS
     off_z0 = tile_id0 // (NUM_Q_HEADS * NUM_BLOCKS)
-    offs_m0 = start_m0 * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m0 = start_m0 * BLOCK_M + offs_m
 
-    # check validity of the tile
+    # check validity of the current tile
     continue_condition0, seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0 = _check_validity(
             offs_m0,
             offs_d,
@@ -1040,77 +1040,82 @@ def _attn_fwd_persistent_vanilla(
             VARLEN
         )
 
-    q0 = _load_query(
-        q_ptr,
-        offs_m0,
-        offs_d,
-        seqlen_q0,
-        cu_seqlens_q_start0,
-        off_z0,
-        off_q_head0,
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qk,
-        BLOCK_DMODEL,
-        BLOCK_DMODEL_POW2,
-    )
+    if continue_condition0: # load current query if valid
+        q0 = _load_query(
+            q_ptr,
+            offs_m0,
+            offs_d,
+            seqlen_q0,
+            cu_seqlens_q_start0,
+            off_z0,
+            off_q_head0,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+        )
 
-    q1 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q0.dtype)
+    continue_condition1 = False
 
-    for tile_id1 in tl.range(workgroup_id + NUM_WGS, num_tiles, step=NUM_WGS, flatten=True):
-        # pipeline the next tile load
+    for tile_id in tl.range(workgroup_id + NUM_WGS, num_tiles, step=NUM_WGS):
+        # next query load
+        tile_id1 = tile_id + NUM_WGS
         off_q_head1 = tile_id1 % NUM_Q_HEADS
         start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
         off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
-        offs_m1 = start_m0 * BLOCK_M + tl.arange(0, BLOCK_M)
-    
-        # check validity of the tile
-        continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = _check_validity(
-            offs_m1,
-            offs_d,
-            start_m1,
-            off_z1,
-            off_q_head1,
-            out_ptr,
-            softmax_lse_ptr,
-            stride_oz,
-            stride_oh,
-            stride_om,
-            stride_on,
-            stride_lse_z,
-            stride_lse_h,
-            stride_lse_m,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            SEQLEN_Q,
-            SEQLEN_K,
-            IS_CAUSAL,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            VARLEN
-        )
-
-        if continue_condition1:
-            q1 = _load_query(
-                    q_ptr,
-                    offs_m1,
-                    offs_d,
-                    seqlen_q1,
-                    cu_seqlens_q_start1,
-                    off_z1,
-                    off_q_head1,
-                    stride_qz,
-                    stride_qh,
-                    stride_qm,
-                    stride_qk,
-                    BLOCK_DMODEL,
-                    BLOCK_DMODEL_POW2,
-                )
-
-        if continue_condition0:
+        offs_m1 = start_m1 * BLOCK_M + offs_m
+        if tile_id1 < num_tiles: # (only if there is a next tile)
+            # check validity of the next tile
+            continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = _check_validity(
+                offs_m1,
+                offs_d,
+                start_m1,
+                off_z1,
+                off_q_head1,
+                out_ptr,
+                softmax_lse_ptr,
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,
+                stride_lse_z,
+                stride_lse_h,
+                stride_lse_m,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                SEQLEN_Q,
+                SEQLEN_K,
+                IS_CAUSAL,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_DMODEL,
+                BLOCK_DMODEL_POW2,
+                VARLEN
+            )
+            if continue_condition1: # pipeline the next tile's query load if next tile is valid
+                q1 = _load_query(
+                        q_ptr,
+                        offs_m1,
+                        offs_d,
+                        seqlen_q1,
+                        cu_seqlens_q_start1,
+                        off_z1,
+                        off_q_head1,
+                        stride_qz,
+                        stride_qh,
+                        stride_qm,
+                        stride_qk,
+                        BLOCK_DMODEL,
+                        BLOCK_DMODEL_POW2,
+                    )
+        else:
+            continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = False, 0, 0, 0, 0, 0
+        
+        
+        
+        if continue_condition0: # process current query if valid
             _process_query(q0,
                        offs_m0,
                        offs_n,
@@ -1170,6 +1175,7 @@ def _attn_fwd_persistent_vanilla(
                        FP8_MAX,
                     )
         
+        # make next tile current
         continue_condition0, seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0 =  continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 
         off_q_head0, start_m0, off_z0, offs_m0, q0 = off_q_head1, start_m1, off_z1, offs_m1, q1
         q0 = q1
@@ -1309,7 +1315,7 @@ def _flash_attn_forward(
         config = _get_config(enable_dropout, True, q.dtype)
     
 
-    NUM_WGS = torch.cuda.get_device_properties("cuda").multi_processor_count # launch a persistent workgroup per CU
+    NUM_WGS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2 # launch a persistent workgroup per CU
     NUM_XCDS = 8
 
 
