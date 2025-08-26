@@ -850,7 +850,8 @@ def torch_moe_stage1(
         hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
         w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
-        a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
+        if a1_scale: #a16w4
+            a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
     else:
         hidden_states = hidden_states.to(ctype)
         w1 = w1.to(ctype)
@@ -883,9 +884,10 @@ def torch_moe_stage1(
         w1 = w1.view(w1_shape)
 
         a1_shape = hidden_states.shape
-        a1_scale = a1_scale[: a1_shape[0]]
         hidden_states = hidden_states.view(a1_shape[0], a1_shape[1] // 32, 32)
-        hidden_states = hidden_states * a1_scale.view(a1_shape[0], a1_shape[1] // 32, 1)
+        if a1_scale:
+            a1_scale = a1_scale[: a1_shape[0]]
+            hidden_states = hidden_states * a1_scale.view(a1_shape[0], a1_shape[1] // 32, 1)
         hidden_states = hidden_states.view(a1_shape)
     else:
         assert False, f"Unsupported quant_type: {quant_type}"
@@ -936,7 +938,8 @@ def torch_moe_stage2(
         hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
         w2 = fp4_utils.mxfp4_to_f32(w2)
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
-        a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
+        if a2_scale:
+            a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
     else:
         hidden_states = hidden_states.to(ctype)
         w2 = w2.to(ctype)
@@ -961,11 +964,12 @@ def torch_moe_stage2(
         w2 = w2.view(w2_shape)
     elif quant_type == QuantType.per_1x32:
         a2_shape = hidden_states.shape
-        a2_scale = a2_scale[: a2_shape[0] * topk]
-        a2_scale = a2_scale.view(token_num, topk, inter_dim // 32, 1)
-        hidden_states = (
-            hidden_states.view(token_num, topk, inter_dim // 32, 32) * a2_scale
-        )
+        if a2_scale:
+            a2_scale = a2_scale[: a2_shape[0] * topk]
+            a2_scale = a2_scale.view(token_num, topk, inter_dim // 32, 1)
+            hidden_states = (
+                hidden_states.view(token_num, topk, inter_dim // 32, 32) * a2_scale
+            )
         hidden_states = hidden_states.view(a2_shape)
 
         w2_shape = w2.shape

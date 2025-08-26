@@ -4,10 +4,8 @@ import os
 import argparse
 from pathlib import Path
 import shutil
-import itertools
-import torch
-import pandas as pd
 from moe_cktile2stages_common import kernelInstance, get_gemm1_kernels_list, get_gemm2_kernels_list
+from aiter.jit.utils.chip_info import get_gfx
 
 class cktile_moe_2stage_gemm_codegen:
     def __init__(
@@ -45,7 +43,7 @@ class cktile_moe_2stage_gemm_codegen:
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages_common.cuh"
 
-template <typename ABDataType, typename AccDataType, typename CDataType>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
 torch::Tensor
 {k.name}(
     torch::Tensor& XQ,
@@ -112,7 +110,7 @@ torch::Tensor
                 per_a_scale_dev_ptr,
                 per_b_scale_dev_ptr
     }};
-    using TileConfig = MoeFlatmmConfig<ABDataType,
+    using TileConfig = MoeFlatmmConfig<ADataType,
         {k.MPerBlock},
         {k.NPerBlock},
         {k.KPerBlock},
@@ -124,8 +122,8 @@ torch::Tensor
     // Run kernel instance.
     auto stream_config = ck_stream_config{{at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()}};
     moe_gemm<TileConfig, 
-                ABDataType, 
-                ABDataType, 
+                ADataType, 
+                BDataType, 
                 ck_tile::tuple<>, 
                 AccDataType, 
                 CDataType, 
@@ -174,30 +172,42 @@ template torch::Tensor
         #         os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")
         #     ).write_text(INSTANCE_abI8_dBF16_eBF16)
         # else:
-        # for CDtype in ["bf16", "fp16"]:
-        #     for ABDtype in ["fp8"]: #"bf16", "fp16", 
-        #         for AccDtype in ["float"]:
-        # intsance = INSTANCE_template.format(
-        #     name=k.name, dtypes=f"{self.ab_dtype}, {self.acc_dtype}, {self.c_dtype}"
-        # )
-        # Path(
-        #     os.path.join(
-        #         self.instances_path,
-        #         f"{k.name}_ab{self.ab_dtype}_acc{self.acc_dtype}_C{self.c_dtype}.cpp",
-        #     )
-        # ).write_text(intsance)
-        for CDtype in ["bf16", "fp16"]:
-            for ABDtype in ["fp8"]: #"bf16", "fp16", 
-                for AccDtype in ["float"]:
-                    intsance = INSTANCE_template.format(
-                        name=k.name, dtypes=f"{ABDtype}, {AccDtype}, {CDtype}"
-                    )
-                    Path(
-                        os.path.join(
-                            self.instances_path,
-                            f"{k.name}_ab{ABDtype}_acc{AccDtype}_C{CDtype}.cpp",
-                        )
-                    ).write_text(intsance)
+        def fill_template(name, ab_type, acc_type, c_type):
+            nonlocal self
+            intsance = INSTANCE_template.format(
+                name=name, dtypes=f"{ab_type}, {acc_type}, {c_type}"
+            )
+            Path(
+                os.path.join(
+                    self.instances_path,
+                    f"{name}_ab{ab_type}_acc{acc_type}_C{c_type}.cpp",
+                )
+            ).write_text(intsance)
+        if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
+            print("gen instance with ab: %s, acc: %s, c: %s."%(self.ab_dtype, self.acc_dtype, self.c_dtype))
+            intsance = INSTANCE_template.format(
+                name=k.name, dtypes=f"{self.ab_dtype}, {self.acc_dtype}, {self.c_dtype}"
+            )
+            Path(
+                os.path.join(
+                    self.instances_path,
+                    f"{k.name}_ab{self.ab_dtype}_acc{self.acc_dtype}_C{self.c_dtype}.cpp",
+                )
+            ).write_text(intsance)
+        else:
+            for CDtype in ["bf16", "fp16"]:
+                for ABDtype in ["fp8"]: #"bf16", "fp16", 
+                    for AccDtype in ["float"]:
+                        fill_template(k.name, ABDtype, AccDtype, CDtype)
+                        # intsance = INSTANCE_template.format(
+                        #     name=k.name, dtypes=f"{ABDtype}, {AccDtype}, {CDtype}"
+                        # )
+                        # Path(
+                        #     os.path.join(
+                        #         self.instances_path,
+                        #         f"{k.name}_ab{ABDtype}_acc{AccDtype}_C{CDtype}.cpp",
+                        #     )
+                        # ).write_text(intsance)
 
     '''genarete heuristic dispatch'''
     def gen_heuristic_dispatch(self):
@@ -212,19 +222,19 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     // Apply shape heuristics to find a suitable kernel implementation.
     //if (block_m == 32)
     //{{
-    //    return moe_cktile2stages_gemm1_256x32x64x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x32x64x128_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
     //}}
     if (block_m == 64)
     {{
-        return moe_cktile2stages_gemm1_256x64x128x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+        return moe_cktile2stages_gemm1_256x64x128x256_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
     }}
     //else if (block_m == 128)
     //{{
-    //    return moe_cktile2stages_gemm1_256x128x128x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x128x128x128_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
     //}}
     //else if (block_m == 256)
     //{{
-    //    return moe_cktile2stages_gemm1_256x256x128x128_1x4_16x16x64_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x256x128x128_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
     //}}
     else
     {{
@@ -241,19 +251,19 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
     // Apply shape heuristics to find a suitable kernel implementation.
     //if (block_m == 32)
     //{{
-    //    return moe_cktile2stages_gemm2_256x32x64x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x32x64x128_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
     //}}
     if (block_m == 64)
     {{
-        return moe_cktile2stages_gemm2_256x64x128x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+        return moe_cktile2stages_gemm2_256x64x128x256_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
     }}
     //else if (block_m == 128)
     //{{
-    //    return moe_cktile2stages_gemm2_256x128x128x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x128x128x128_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
     //}}
     //else if (block_m == 256)
     //{{
-    //    return moe_cktile2stages_gemm2_256x256x128x128_1x4_16x16x64_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x256x128x128_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
     //}}
     else
     {{
@@ -265,7 +275,13 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
 }}
 """
         with open(os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"), "w") as f:
-            f.write(HEURISTIC_template)
+            arch = get_gfx()
+            inst_k = "32" if self.quant_type == "1x32" else ("128" if arch == "gfx950" else "64")
+            f.write(
+                HEURISTIC_template.format(
+                    inst_k=inst_k,
+                )
+            )
 
 
     '''generate lookup.h linking MNK/datatype to specific instance'''
@@ -440,6 +456,8 @@ if __name__ == "__main__":
         choices=[
             "per_tensor",
             "per_token",
+            "1x32",
+            "128x128",
             "no",
         ],
         help="select quant_type",
@@ -512,14 +530,16 @@ if __name__ == "__main__":
 
 
     #single UT
-    ab_type = "fp8"
+    # ab_type = "fp8"
+    a_type = "fp16"
+    b_type = "fp4"
     acc_type = "float"
-    c_type ="bf16"
-    quant_type = "per_token"
+    c_type ="fp16"
+    quant_type = "1x32" #"per_token"
     act_type = "silu"
     codegen = cktile_moe_2stage_gemm_codegen(
         args.working_path,
-        ab_type,
+        a_type,
         acc_type,
         c_type,
         quant_type,
@@ -529,15 +549,15 @@ if __name__ == "__main__":
     )
     #gen all instances for gemm1 and gemm2
     _, gemm1_kernel_list = get_gemm1_kernels_list(
-        ab_type,
-        ab_type,
+        a_type,
+        b_type,
         quant_type,
         act_type,
         False,
     )
     tag, gemm2_kernel_list = get_gemm2_kernels_list(
-        ab_type,
-        ab_type,
+        a_type,
+        b_type,
         quant_type,
         "",
         True,

@@ -7,21 +7,7 @@
 #include <cmath>
 #include "py_itfs_common.h"
 
-// template <typename ABDataType, typename AccDataType, typename CDataType>
-// MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
-// {
-//   // Apply shape heuristics to find a suitable kernel implementation.
-//   return moe_cktile2stages_gemm1_256x64x128x128_1x4_16x16x64_per_token_silu<ABDataType, AccDataType, CDataType>;
-// }
-
-// template <typename ABDataType, typename AccDataType, typename CDataType>
-// MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
-// {
-//   // Apply shape heuristics to find a suitable kernel implementation.
-//   return moe_cktile2stages_gemm2_256x64x128x128_1x4_16x16x64_per_token_MulRoutedWeight<ABDataType, AccDataType, CDataType>;
-// }
-
-template <typename ABDataType, typename AccDataType, typename CDataType, int stage = 1>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType, int stage = 1>
 MoeKernel moe_dispatch(int M, int N, int K, int block_m)
 {
   // For a given shape, either find the best kernel via lookup or heuristic.
@@ -63,10 +49,10 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m)
   // }
   // Otherwise, use heuristics.
   if (stage == 1){
-    return moe_gemm1_heuristic_dispatch<ABDataType, AccDataType, CDataType>(M, N, K, block_m);
+    return moe_gemm1_heuristic_dispatch<ADataType, BDataType, AccDataType, CDataType>(M, N, K, block_m);
   }
   else{
-    return moe_gemm2_heuristic_dispatch<ABDataType, AccDataType, CDataType>(M, N, K, block_m);
+    return moe_gemm2_heuristic_dispatch<ADataType, BDataType, AccDataType, CDataType>(M, N, K, block_m);
   }
 }
 
@@ -110,11 +96,22 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     {
         if (Y.dtype() == at::ScalarType::Half)
         {
-           moe_dispatch<fp8, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+           moe_dispatch<fp8, fp8, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
         }
         else if (Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+            moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+        }
+    }
+    else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
+    {
+        if (Y.dtype() == at::ScalarType::Half)
+        {
+           moe_dispatch<fp16, pk_fp4, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+        }
+        else if (Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
         }
     }
     else
@@ -153,11 +150,22 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     {
         if (Y.dtype() == at::ScalarType::Half)
         {
-           moe_dispatch<fp8, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+           moe_dispatch<fp8, fp8, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
         }
         else if (Y.dtype() == at::ScalarType::BFloat16)
         {
-            moe_dispatch<fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+            moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+        }
+    }
+    else if ((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) && (WQ.dtype() == at::ScalarType::Byte)) //a16w4
+    {
+        if (Y.dtype() == at::ScalarType::Half)
+        {
+           moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
+        }
+        else if (Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale); 
         }
     }
     else

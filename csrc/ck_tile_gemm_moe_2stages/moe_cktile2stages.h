@@ -28,6 +28,7 @@ using col_major             = ck_tile::tensor_layout::gemm::ColumnMajor;
 using bf16                  = ck_tile::bf16_t;
 using fp16                  = ck_tile::half_t;
 using fp8                   = ck_tile::fp8_t;
+using pk_fp4                = ck_tile::pk_fp4_t,
 
 __attribute__((visibility("default"))) torch::Tensor
 cktile_moe_gemm1(torch::Tensor& XQ,
