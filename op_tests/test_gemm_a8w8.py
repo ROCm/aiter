@@ -119,6 +119,8 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
+    return {"us": avg_b}
+
 
 def get_boundary_test_cases(cu_count, aligned_k):
     """

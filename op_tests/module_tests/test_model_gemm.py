@@ -5,14 +5,11 @@ Manages test parameters and executes test_gemm.py/test_gemm_a4w4.py/test_gemm_a8
 """
 
 import logging
-import pandas as pd
 from aiter import dtypes
 from dataclasses import dataclass
 import argparse
+import torch
 
-from op_tests.test_gemm_a8w8 import test_gemm as test_gemm_a8w8
-from op_tests.test_gemm_a4w4 import test_gemm as test_gemm_a4w4
-from op_tests.test_gemm import test_gemm as test_gemm
 from aiter.jit.utils.chip_info import get_gfx
 from utils.gemm_utils import save_gemm_benchmark_result, save_untuned_gemm_csv
 
@@ -95,11 +92,153 @@ class Record:
     N: int
     K: int
     TP: int
-    quant_type: str = "torch.bfloat16"
     output_type: str = "torch.bfloat16"
+    quant_type: str = "torch.bfloat16"
+    quant_method: str = "default"
     latency: float = 0.0
     bandwidth: float = 0.0
     throughput: float = 0.0
+
+
+class TritonRecord(Record):
+    latency_triton: float = 0.0
+    bandwidth_triton: float = 0.0
+    throughput_triton: float = 0.0
+
+
+def to_record(
+    M,
+    N,
+    K,
+    TP,
+    output_type,
+    quant_type,
+    quant_method,
+    latency,
+    bandwidth,
+    throughput,
+    latency_triton=None,
+    bandwidth_triton=None,
+    throughput_triton=None,
+):
+    if latency_triton == None:
+        return Record(
+            M,
+            N,
+            K,
+            TP,
+            output_type,
+            quant_type,
+            quant_method,
+            latency,
+            bandwidth,
+            throughput,
+        )
+    else:
+        return TritonRecord(
+            M,
+            N,
+            K,
+            TP,
+            output_type,
+            quant_type,
+            quant_method,
+            latency,
+            bandwidth,
+            throughput,
+            latency_triton,
+            bandwidth_triton,
+            throughput_triton,
+        )
+
+
+##### Wrapper and unified the test_gemm API for CK/ASM/Triton Kernels #####
+def run_a16w16_gemm(dtype, record, run_triton=False):
+    print("--run_triton={}".format(run_triton))
+    from op_tests.test_gemm import test_gemm
+
+    ret = test_gemm(dtype, record.M, record.N, record.K, otype=dtype)
+    latency = ret["ck us"]
+    print("--latency={}".format(latency))
+
+    latency_triton = None
+    if run_triton:
+        from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import bench_gemm_fn
+
+        latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
+    return latency, latency_triton
+
+
+def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
+    if fp8_quant_method == "per_tensor":
+        from op_tests.test_gemm_a8w8 import test_skinny_gemm as test_gemm
+
+        cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
+        ret = test_gemm(dtype, record.M, record.N, record.K, quantDtype=dtypes.fp8)
+        latency = ret["us"]
+    elif fp8_quant_method == "per_token":
+        from op_tests.test_gemm_a8w8 import test_gemm
+
+        ret = test_gemm(dtype, record.M, record.N, record.K, dtypes.fp8)
+        ck_time = ret["ck us"]
+        ck_bpreshuffle_time = ret["ck bpreshuffle us"]
+        asm_time = ret["asm us"]
+        latency = float("inf")
+        if ck_time is not None:
+            latency = min(latency, ck_time)
+        if ck_bpreshuffle_time is not None:
+            latency = min(latency, ck_bpreshuffle_time)
+        if asm_time is not None:
+            latency = min(latency, asm_time)
+    elif fp8_quant_method == "per_block":
+        from op_tests.test_gemm_a8w8_blockscale import test_gemm
+
+        ret = test_gemm(dtype, record.M, record.N, record.K)
+        latency = ret["us"]
+    else:
+        raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
+
+    latency_triton = None
+    if run_triton:
+        os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
+        if fp8_quant_method == "per_tensor":
+            from op_tests.op_benchmarks.triton.bench_gemm_a8w8 import bench_gemm_fn
+        elif fp8_quant_method == "per_token":
+            from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
+                bench_gemm_fn,
+            )
+        elif fp8_quant_method == "per_block":
+            from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
+                bench_gemm_fn,
+            )
+        else:
+            raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
+        latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
+    return latency, latency_triton
+
+
+def run_a4w4_gemm(dtype, record):
+    from op_tests.test_gemm_a4w4 import test_gemm
+
+    ret = test_gemm(dtype, record.M, record.N, record.K)
+    asm_no_splitK_time = ret["asm no splitK"]
+    asm_splitK_time = ret["asm splitK"]
+    ck_time = ret["ck"]
+    latency = float("inf")
+    if ck_time is not None:
+        latency = min(latency, ck_time)
+    if asm_no_splitK_time is not None:
+        latency = min(latency, asm_no_splitK_time)
+    if asm_splitK_time is not None:
+        latency = min(latency, asm_splitK_time)
+
+    latency_triton = None
+    if run_triton:
+        from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import bench_gemm_fn
+
+        latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
+
+    return latency, latency_triton
 
 
 class GemmTestRunner:
@@ -171,71 +310,53 @@ class GemmTestRunner:
         )  # TB/s
         return bandwidth
 
-    def benchmark_gemm(self, l_dtype, l_quantDtype, records):
-        df = []
-        records_result = []
-        for quantDtype in l_quantDtype:
-            for dtype in l_dtype:
-                for idx, record in enumerate(records):
-                    latency = float("inf")
-                    if quantDtype == dtypes.d_dtypes["fp8"]:
-                        ret = test_gemm_a8w8(
-                            dtype, record.M, record.N, record.K, quantDtype
-                        )
-                        ck_time = ret["ck us"]
-                        ck_bpreshuffle_time = ret["ck bpreshuffle us"]
-                        asm_time = ret["asm us"]
-                        if ck_time is not None:
-                            latency = min(latency, ck_time)
-                        if ck_time is not None:
-                            latency = min(latency, ck_bpreshuffle_time)
-                        if asm_time is not None:
-                            latency = min(latency, asm_time)
-                    elif quantDtype == dtypes.d_dtypes["fp4x2"]:
-                        ret = test_gemm_a4w4(dtype, record.M, record.N, record.K)
-                        asm_no_splitK_time = ret["asm no splitK"]
-                        asm_splitK_time = ret["asm splitK"]
-                        ck_time = ret["ck"]
-                        if ck_time is not None:
-                            latency = min(latency, ck_time)
-                        if asm_no_splitK_time is not None:
-                            latency = min(latency, asm_no_splitK_time)
-                        if asm_splitK_time is not None:
-                            latency = min(latency, asm_splitK_time)
-                    else:
-                        ret = test_gemm(
-                            dtypes.bf16, record.M, record.N, record.K, otype=dtypes.bf16
-                        )
-                        latency = ret["ck us"]
-                    throughput = self.calculate_throughput(
-                        record.M, record.N, record.K, latency
-                    )
-                    bandwidth = self.calculate_bandwidth(
-                        record.M,
-                        record.N,
-                        record.K,
-                        latency,
-                        quantDtype,
-                        quantDtype,
-                        dtype,
-                    )
-                    records_result.append(
-                        Record(
-                            M=record.M,
-                            N=record.N,
-                            K=record.K,
-                            TP=record.TP,
-                            quant_type=quantDtype,
-                            output_type=dtype,
-                            latency=latency,
-                            throughput=throughput,
-                            bandwidth=bandwidth,
-                        )
-                    )
-                    df.append(ret)
-        df = pd.DataFrame(df)
-        # aiter.logger.info(f"summary:\n{df}")
-        return records_result
+    def get_metrics(slef, latency, latency_triton, record, dtype, quant_dtype):
+        throughput = self.calculate_throughput(record.M, record.N, record.K, latency)
+        bandwidth = self.calculate_bandwidth(
+            record.M,
+            record.N,
+            record.K,
+            latency,
+            quant_dtype,
+            quant_dtype,
+            dtype,
+        )
+        throughput_triton = None
+        bandwidth_triton = None
+        if latency_triton is not None:
+            throughput_triton = self.calculate_throughput(
+                record.M, record.N, record.K, latency_triton
+            )
+            bandwidth_triton = self.calculate_bandwidth(
+                record.M,
+                record.N,
+                record.K,
+                latency_triton,
+                quant_dtype,
+                quant_dtype,
+                dtype,
+            )
+        return throughput, bandwidth, throughput_triton, bandwidth_triton
+
+    def run_gemm(self, record, quant_dtype, fp8_quant_method, dtype, run_triton):
+        if quant_dtype == dtypes.d_dtypes["fp8"]:
+            latency, latency_triton = run_a8w8_gemm(
+                dtype, record, fp8_quant_method, run_triton
+            )
+        elif quant_dtype == dtypes.d_dtypes["fp4x2"]:
+            latency, latency_triton = run_a4w4_gemm(dtype, record, run_triton)
+        else:
+            print("---run_bf16_gemm---")
+            latency, latency_triton = run_a16w16_gemm(dtype, record, run_triton)
+
+        return (
+            latency,
+            throughput,
+            bandwidth,
+            latency_triton,
+            throughput_triton,
+            bandwidth_triton,
+        )
 
     def extract_configuration(self, args):
         models = []
@@ -255,29 +376,90 @@ class GemmTestRunner:
         else:
             output_types = [dtypes.d_dtypes[args.dtype]]
 
-        if args.quantDtype is None:
+        if args.quant_dtype is None:
             quant_types = [dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]]
             if get_gfx() in ["gfx950"]:
                 quant_types.append(dtypes.d_dtypes["fp4x2"])
         else:
-            quant_types = [dtypes.d_dtypes[args.quantDtype]]
+            quant_types = [dtypes.d_dtypes[args.quant_dtype]]
 
-        return models, TP_list, output_types, quant_types
+        if args.fp8_quant_method is None:
+            fp8_quant_methods = ["per_tensor", "per_token", "per_block"]
+        else:
+            fp8_quant_methods = [args.fp8_quant_method]
 
-    def run_single_test(self, config, TP_list, output_types, quant_types):
+        return models, TP_list, output_types, quant_types, fp8_quant_methods
+
+    def run_single_test(
+        self,
+        config,
+        TP_list,
+        fp8_quant_methods,
+        output_types,
+        quant_types,
+        bench_triton,
+    ):
         """Run a single test with given configuration"""
         records = self.get_gemm_shape(config, TP_list)
-        records_result = self.benchmark_gemm(output_types, quant_types, records)
+
+        records_result = []
+        for quant_dtype in quant_types:
+            if quant_dtype == dtypes.d_dtypes["fp8"]:
+                quant_methods = fp8_quant_methods
+            else:
+                quant_methods = ["default"]
+            print("---l_quant_dtype={}".format(quant_dtype))
+            print("---l_quant_method={}".format(quant_methods))
+
+            for quant_method in quant_methods:
+                for dtype in output_types:
+                    for idx, record in enumerate(records):
+                        (
+                            latency,
+                            throughput,
+                            bandwidth,
+                            latency_triton,
+                            throughput_triton,
+                            bandwidth_triton,
+                        ) = self.run_gemm(
+                            record, quant_dtype, quant_method, dtype, bench_triton
+                        )
+                        records_result.append(
+                            to_record(
+                                M=record.M,
+                                N=record.N,
+                                K=record.K,
+                                TP=record.TP,
+                                quant_method=quant_method,
+                                quant_type=quant_dtype,
+                                output_type=dtype,
+                                latency=latency,
+                                throughput=throughput,
+                                bandwidth=bandwidth,
+                                latency_triton=latency_triton,
+                                throughput_triton=throughput_triton,
+                                bandwidth_triton=bandwidth_triton,
+                            )
+                        )
         return records_result
 
     def run_all_tests(self, args):
         """Run all defined tests"""
         logger.info("Starting all GEMM Benchmark from Models...")
-        models, TP_list, output_types, quant_types = self.extract_configuration(args)
+        models, TP_list, output_types, quant_types, fp8_quant_methods = (
+            self.extract_configuration(args)
+        )
         logger.info(f"Total tests: {len(models)}")
         for model in models:
-            records = self.run_single_test(model, TP_list, output_types, quant_types)
-            save_gemm_benchmark_result(records, model.model_name)
+            records = self.run_single_test(
+                model,
+                TP_list,
+                fp8_quant_methods,
+                output_types,
+                quant_types,
+                args.triton,
+            )
+            save_gemm_benchmark_result(records, model.model_name, args.triton)
             if args.save_untuned_gemm:
                 save_untuned_gemm_csv(
                     f"{model.model_name}.csv", f"{model.model_name}_untuned_gemm"
@@ -302,7 +484,7 @@ def create_argument_parser():
     )
     parser.add_argument(
         "-q",
-        "--quantDtype",
+        "--quant_dtype",
         type=str,
         choices=["fp4x2", "fp8", "bf16"],
         nargs="?",
@@ -310,6 +492,17 @@ def create_argument_parser():
         default=None,
         help="""Date type of quantization.
         e.g.: -q fp8""",
+    )
+    parser.add_argument(
+        "-qm",
+        "--fp8_quant_method",
+        type=str,
+        choices=["per_tensor", "per_token", "per_block"],
+        nargs="?",
+        const=None,
+        default=None,
+        help="""fp8 quantization method.
+        e.g.: -qm per_token""",
     )
     parser.add_argument(
         "-m",
@@ -332,6 +525,11 @@ def create_argument_parser():
         default=None,
         help="""Tenosr Parallel size.
         e.g. -tp 8""",
+    )
+    parser.add_argument(
+        "--triton",
+        action="store_true",
+        help="benchmark triton kernel",
     )
     parser.add_argument(
         "--save-untuned-gemm",

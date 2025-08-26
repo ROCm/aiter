@@ -37,22 +37,38 @@ def to_record(
     )
 
 
-def save_gemm_benchmark_result(records, csv_file_name):
+def save_gemm_benchmark_result(records, csv_file_name, has_triton):
     import csv
     from dataclasses import asdict
 
     csv_file = f"{csv_file_name}.csv"
-    fieldnames = [
-        "M",
-        "N",
-        "K",
-        "TP",
-        "quant_type",
-        "output_type",
-        "latency",
-        "throughput",
-        "bandwidth",
-    ]
+    if has_triton:
+        fieldnames = [
+            "M",
+            "N",
+            "K",
+            "TP",
+            "quant_type",
+            "output_type",
+            "latency (us)",
+            "throughput (TFlops)",
+            "bandwidth (TB/s)",
+            "latency triton (us)",
+            "throughput triton (TFlops)",
+            "bandwidth triton (TB/s)",
+        ]
+    else:
+        fieldnames = [
+            "M",
+            "N",
+            "K",
+            "TP",
+            "quant_type",
+            "output_type",
+            "latency(us)",
+            "throughput(TFlops)",
+            "bandwidth(TB/s)",
+        ]
 
     with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
