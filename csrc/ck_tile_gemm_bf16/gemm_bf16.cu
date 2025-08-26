@@ -36,6 +36,12 @@
 #include "gemm_bias_kernel.hpp"
 
 //#include "run_gemm_example.inc"
+#if defined(CK_GFX950_SUPPORT)
+    using GemmConfig = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
+#else
+    // 默认通用配置
+    using GemmConfig = GemmConfigComputeV3<ck_tile::bf16_t>;
+#endif
 
 template <typename ADataType,
           typename BDataType,
@@ -266,7 +272,7 @@ template <typename ADataType,
 float gemm_calc_dipatch(const ck_tile::GemmHostArgs_bias& args, const ck_tile::stream_config& s)
 {
     using GemmTileShapeConfig_ = GemmTileShapeConfig<kM, kN, MaxK>;
-    using GemmConfig           = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
+    // using GemmConfig           = GemmConfigPreshuffle_2<ck_tile::bf16_t>;
   
  
     // GemmConfigPreshufle_2<ck_tile::fp8_t> GemmConfig;
