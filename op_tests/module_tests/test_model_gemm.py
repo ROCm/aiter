@@ -232,6 +232,7 @@ class GemmTestRunner:
                             bandwidth=bandwidth,
                         )
                     )
+                    df.append(ret)
         df = pd.DataFrame(df)
         # aiter.logger.info(f"summary:\n{df}")
         return records_result
