@@ -3,9 +3,6 @@ from typing import Literal
 import triton
 import triton.language as tl
 import torch
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -42,42 +39,15 @@ def _gelu_tanh(x):
 
 
 @triton.jit
-def _relu(x):
-    return tl.maximum(0.0, x)
-
-# solution 1
-try:
-    @triton.constexpr_function
-    def _get_activation_from_str(activation: str):
-        mapping = {
-            "gelu": _gelu,
-            "gelu_tanh": _gelu_tanh,
-            "silu": _silu,
-            "silu_exp2": _silu_exp2,
-            "relu": _relu,
-        }
-        return mapping[activation]
-except:
-    @tl.constexpr_function
-    def _get_activation_from_str(activation: str):
-        mapping = {
-            "gelu": _gelu,
-            "gelu_tanh": _gelu_tanh,
-            "silu": _silu,
-            "silu_exp2": _silu_exp2,
-            "relu": _relu,
-        }
-        return mapping[activation]
-
-# solution 2
-# @triton.jit
-# def _get_activation_from_str(x, ACTIVATION: tl.constexpr):
-#     if ACTIVATION == "gelu": return _gelu(x)
-#     elif ACTIVATION == "gelu_tanh": return _gelu_tanh(x)
-#     elif ACTIVATION == "silu": return _silu(x)
-#     elif ACTIVATION == "silu_exp2": return _silu_exp2(x)
-#     elif ACTIVATION == "relu": return _relu(x)
-#     return x
+def _apply_activation_from_str(x, activation: tl.constexpr):
+    if activation == "gelu":
+        return _gelu(x)
+    elif activation == "gelu_tanh":
+        return _gelu_tanh(x)
+    elif activation == "silu":
+        return _silu(x)
+    else:
+        return x  # No activation if it is not recognized
 
 
 @triton.heuristics(
@@ -144,11 +114,7 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
                 x_ptr + x_offs + stride_x_n * N, mask=x_mask, cache_modifier=".cg"
             ).to(tl.float32)
 
-        # solution 1
-        x = _get_activation_from_str(ACTIVATION)(a) * b
-        
-        # solution 2
-        # x = _get_activation_from_str(a, ACTIVATION) * b
+        x = _apply_activation_from_str(a, ACTIVATION) * b
 
         out_tensor, bs_e8m0 = _mxfp4_quant_op(
             x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
@@ -233,7 +199,6 @@ def act_mul_and_mxfp4_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
-    _LOGGER.info(f"ACT_MUL_MXFP4_QUANT: x={tuple(x.shape)} activation={activation}")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
