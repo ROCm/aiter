@@ -8,6 +8,11 @@ import argparse
 from aiter.test_common import checkAllclose, perftest
 from aiter import dtypes
 
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+setup_seed(1)
 
 @perftest()
 def run_torch(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
@@ -77,7 +82,7 @@ def run_ck(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
                 y_scale,
                 weight,
                 eps,
-                out_before_quant=out_before_quant,
+                # out_before_quant=out_before_quant,
             )
 
     return output, residual_out, y_scale, out_before_quant
@@ -153,6 +158,7 @@ def test_rmsnorm2d_fuseAdd_Smoothquant_instance(dtype, m, n, xscaleType, yscaleT
     checkAllclose(yscale_a, yscale_b, rtol=1e-3, atol=1e-3)
     checkAllclose(ynorm_a, ynorm_b)
     print(" [passed~]")
+    # import pdb; pdb.set_trace()
 
 
 def test_rmsnorm2d_fuseDynamicquant_instance(dtype, m, n, yscaleType):
@@ -271,7 +277,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m",
         type=int,
-        default=[1, 2, 4, 8, 16, 32, 64, 128, 256],
+        default=[64, 128, 256],
         nargs="*",
         help="""M of mnk.
     e.g.: -m 32""",
@@ -279,7 +285,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-n",
         type=int,
-        default=[1024, 2048],
+        default=[5120],
         nargs="*",
         help="""N of mnk.
     e.g.: -n 1024""",

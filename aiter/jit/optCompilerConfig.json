@@ -392,7 +392,9 @@
             "f'{AITER_CSRC_DIR}/pybind/rmsnorm_pybind.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": [
+            "'-fast-math'"
+        ],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{CK_DIR}/example/ck_tile/10_rmsnorm2d'"
