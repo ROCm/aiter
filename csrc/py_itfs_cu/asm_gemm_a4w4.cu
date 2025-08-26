@@ -65,7 +65,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 {
 
 #if defined(__Float4_e2m1fn_x2)
-    if((inp.dtype() == torch::kFloat4_e2m1fn_x2 || inp.dtype() == torch::kUInt8) &&
+    if(inp.dtype() == torch_fp4x2 &&
        out.scalar_type() == at::ScalarType::BFloat16)
 #else
     if((inp.dtype() == torch::kUInt8) && out.scalar_type() == at::ScalarType::BFloat16)

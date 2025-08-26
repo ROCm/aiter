@@ -4,7 +4,6 @@
 import sys
 import pytest
 import torch
-from bisect import bisect_right
 from typing import Union, List
 from aiter.ops.triton.lean_atten import (
     _persistent_lean_attention,

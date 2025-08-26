@@ -579,8 +579,7 @@ void fmoe_g1u1(torch::Tensor& out,                            // [token_cnt, dim
     }
 
 #if defined(__Float4_e2m1fn_x2)
-    else if(input.dtype() == gate.dtype() &&
-            (input.dtype() == torch::kFloat4_e2m1fn_x2 || input.dtype() == torch::kUInt8)) // fp4
+    else if(input.dtype() == gate.dtype() && input.dtype() ==  torch_fp4x2) // fp4
     {
         if(out.dtype() == at::ScalarType::Half && activation == ActivationType::Silu)
             config_map = &cfg_fmoe_fp16_pertokenMXfp4_g1u1_silu;
