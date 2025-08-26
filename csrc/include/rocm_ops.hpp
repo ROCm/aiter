@@ -200,12 +200,15 @@
           "                        float k_scale, float v_scale) -> ()");           \
     m.def("reshape_and_cache_with_pertoken_quant",                                  \
           &aiter::reshape_and_cache_with_pertoken_quant,                            \
-          "reshape_and_cache_with_pertoken_quant(Tensor key, Tensor value,"         \
-          "                        Tensor! key_cache,"                              \
-          "                        Tensor! value_cache,"                            \
-          "                        Tensor! k_dequant_scales,"                       \
-          "                        Tensor! v_dequant_scales,"                       \
-          "                        Tensor slot_mapping) -> ()");                    \
+          "reshape_and_cache_with_pertoken_quant",                                  \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("k_dequant_scales"),                                              \
+          py::arg("v_dequant_scales"),                                              \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("asm_layout"));                                                   \
     m.def("reshape_and_cache_with_block_quant",                                     \
           &aiter::reshape_and_cache_with_block_quant,                               \
           "reshape_and_cache_with_block_quant(Tensor key, Tensor value,"            \

@@ -944,6 +944,8 @@ def fmha_v3_varlen_bwd(
     softmax_lse: Tensor,
     cu_seqlens_q: Tensor,
     cu_seqlens_k: Tensor,
+    # cu_seqlens_q_padded: Tensor,
+    # cu_seqlens_k_padded: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -1602,6 +1604,10 @@ def _flash_attn_varlen_backward(
     dv: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
+    #  FIXME: this two args currently not support on ck side
+    # and has no host code on aiter side
+    # cu_seqlens_q_padded: Tensor,
+    # cu_seqlens_k_padded: Tensor,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
@@ -1708,6 +1714,8 @@ def _flash_attn_varlen_backward(
             softmax_lse,
             cu_seqlens_q,
             cu_seqlens_k,
+            # cu_seqlens_q_padded,
+            # cu_seqlens_k_padded,
             max_seqlen_q,
             max_seqlen_k,
             dropout_p,
