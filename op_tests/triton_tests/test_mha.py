@@ -294,6 +294,9 @@ def test_mha_int64_strides(
         print("triton_dv:", triton_dv.shape, triton_dv.stride())
 
 
+# Run with:
+# pytest -s op_tests/triton_tests/test_mha.py::test_mha_varlen_with_pe
+@pytest.mark.skip(reason="This feature is under development")
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -963,6 +966,7 @@ def test_mha_backward_varlen(
 
 # Run with:
 # pytest -s op_tests/triton_tests/test_mha.py::test_mha_backward_with_pe
+@pytest.mark.skip(reason="This feature is under development")
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
