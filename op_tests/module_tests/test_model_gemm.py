@@ -320,7 +320,7 @@ class GemmTestRunner:
         )  # TB/s
         return bandwidth
 
-    def get_metrics(slef, latency, latency_triton, record, dtype, quant_dtype):
+    def get_metrics(self, latency, latency_triton, record, dtype, quant_dtype):
         throughput = self.calculate_throughput(record.M, record.N, record.K, latency)
         bandwidth = self.calculate_bandwidth(
             record.M,
