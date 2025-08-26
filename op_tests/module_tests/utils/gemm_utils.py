@@ -37,6 +37,31 @@ def to_record(
     )
 
 
+def save_gemm_benchmark_result(records, csv_file_name):
+    import csv
+    from dataclasses import asdict
+
+    csv_file = f"{csv_file_name}.csv"
+    fieldnames = [
+        "M",
+        "N",
+        "K",
+        "TP",
+        "quant_type",
+        "output_type",
+        "latency",
+        "throughput",
+        "bandwidth",
+    ]
+
+    with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(asdict(rec))
+    print(f"data write to {csv_file} success!!")
+
+
 def excel_to_struct_list(excel_file, sheet_name):
     wb = openpyxl.load_workbook(excel_file, data_only=True)
     if sheet_name not in wb.sheetnames:

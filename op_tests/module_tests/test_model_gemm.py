@@ -14,7 +14,7 @@ from op_tests.test_gemm_a8w8 import test_gemm as test_gemm_a8w8
 from op_tests.test_gemm_a4w4 import test_gemm as test_gemm_a4w4
 from op_tests.test_gemm import test_gemm as test_gemm
 from aiter.jit.utils.chip_info import get_gfx
-from utils import save_untuned_gemm_csv
+from utils.gemm_utils import save_gemm_benchmark_result, save_untuned_gemm_csv
 
 # Setup logging
 logging.basicConfig(
@@ -236,34 +236,6 @@ class GemmTestRunner:
         # aiter.logger.info(f"summary:\n{df}")
         return records_result
 
-    def save_structs_to_csv(self, records, csv_file, fieldnames):
-        import csv
-        from dataclasses import asdict
-
-        with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for rec in records:
-                writer.writerow(asdict(rec))
-        print(f"data write to {csv_file} success!!")
-
-    def save_to_csv(self, records, csv_file_name):
-        self.save_structs_to_csv(
-            records,
-            f"{csv_file_name}.csv",
-            [
-                "M",
-                "N",
-                "K",
-                "TP",
-                "quant_type",
-                "output_type",
-                "latency",
-                "throughput",
-                "bandwidth",
-            ],
-        )
-
     def extract_configuration(self, args):
         models = []
         if args.model is None:
@@ -304,7 +276,7 @@ class GemmTestRunner:
         logger.info(f"Total tests: {len(models)}")
         for model in models:
             records = self.run_single_test(model, TP_list, output_types, quant_types)
-            self.save_to_csv(records, model.model_name)
+            save_gemm_benchmark_result(records, model.model_name)
             if args.save_untuned_gemm:
                 save_untuned_gemm_csv(
                     f"{model.model_name}.csv", f"{model.model_name}_untuned_gemm"
