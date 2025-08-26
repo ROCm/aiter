@@ -107,9 +107,10 @@ def get_asm_dir():
 
 @functools.lru_cache(maxsize=1)
 def get_user_jit_dir():
-    if "JIT_WORKSPACE_DIR" in os.environ:
-        path = os.getenv("JIT_WORKSPACE_DIR")
+    if "AITER_JIT_DIR" in os.environ:
+        path = os.getenv("AITER_JIT_DIR")
         os.makedirs(path, exist_ok=True)
+        sys.path.insert(0, path)
         return path
     else:
         if os.access(this_dir, os.W_OK):
@@ -225,7 +226,10 @@ __mds = {}
 def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
-        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        if "AITER_JIT_DIR" in os.environ:
+            __mds[md_name] = importlib.import_module(md_name)
+        else:
+            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return
 
 
