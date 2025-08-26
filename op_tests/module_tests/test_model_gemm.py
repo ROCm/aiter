@@ -174,7 +174,14 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
         from op_tests.test_gemm_a8w8 import test_skinny_gemm as test_gemm
 
         cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-        ret = test_gemm(dtype, record.M, record.N, record.K, quantDtype=dtypes.fp8)
+        ret = test_gemm(
+            dtype,
+            record.M,
+            record.N,
+            record.K,
+            quantDtype=dtypes.fp8,
+            cu_count=cu_count,
+        )
         latency = ret["us"]
     elif fp8_quant_method == "per_token":
         from op_tests.test_gemm_a8w8 import test_gemm
@@ -200,7 +207,10 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
 
     latency_triton = None
     if run_triton:
-        os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
+        import os
+
+        pre_shuffle_scales = os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "1")
+        print("--pre_shuffle_scales={}".format(pre_shuffle_scales))
         if fp8_quant_method == "per_tensor":
             from op_tests.op_benchmarks.triton.bench_gemm_a8w8 import bench_gemm_fn
         elif fp8_quant_method == "per_token":
