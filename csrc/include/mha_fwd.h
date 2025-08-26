@@ -21,6 +21,7 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    bool has_lse,
                    bool has_dropout,
                    bool use_ext_asm,
+                   int how_v3_bf16_cvt,
                    bool skip_min_seqlen_q)
         : fmha_fwd_traits{head_size_q,
                           head_size_v,
@@ -34,10 +35,12 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           has_dropout,
                           false, // do_fp8_static_quant
                           skip_min_seqlen_q},
-          use_ext_asm(use_ext_asm)
+          use_ext_asm(use_ext_asm),
+          how_v3_bf16_cvt(how_v3_bf16_cvt)
     {
     }
     bool use_ext_asm;
+    int how_v3_bf16_cvt;
 };
 
 struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
@@ -76,6 +79,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      bias_enum bias_type,
                                                      bool has_lse,
                                                      bool use_ext_asm,
+                                                     int how_v3_bf16_cvt = 1,
                                                      const void* seqstart_q_padding_ptr = nullptr,
                                                      const void* seqstart_k_padding_ptr = nullptr);
 
@@ -185,6 +189,7 @@ template <typename DataType_,
           bool kIsHDPad_,
           int kStoreLSE_,
           GPUArch GPUArch_,
+          ck_tile::index_t BF16Cvt_ = 1,
           bool kIsGroupMode_ = false>
 struct fmha_fwd_kernel_selector
 {
@@ -195,6 +200,7 @@ struct fmha_fwd_kernel_selector
     static constexpr bool kIsHDPad             = kIsHDPad_;
     static constexpr int kStoreLSE =
         kStoreLSE_; // kStoreLSE_ won't affect kernel selection, but will pass in kernel args
+    static constexpr ck_tile::index_t BF16Cvt = BF16Cvt_;
     static constexpr bool kIsGroupMode        = kIsGroupMode_;
 };
 

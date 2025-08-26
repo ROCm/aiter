@@ -22,53 +22,89 @@ FMHA_FWD_API = """#include <hip/hip_fp16.h>
 
 namespace aiter {
 
-// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16"; };
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16"; };
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal"; };
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal"; };
-// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16"; };
-// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16"; };
-// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16_causal"; };
-// template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_fp16_causal"; };
+// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        BF16Cvt |
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtne"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtna"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtz";  };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtne"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtna"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtz"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtne"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtna"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtz";  };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtne"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtna"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtz";  };
 
-// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        kIsGroupMode_ |
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_group"; };
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_group"; };
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_group"; };
-template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_group"; };
+// ######################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        BF16Cvt | kIsGroupMode_ |
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtne_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtna_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtz_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtne_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtna_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_rtz_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtne_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtna_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtz_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtne_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtna_group"; };
+template<> struct FmhaFwdV3Name<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_name = "fmha_fwd_hd128_bf16_causal_rtz_group"; };
 
-// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
-// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16.co"; };
-// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16.co"; };
-// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16_causal.co"; };
-// template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1,          GPUArch::gfx942>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_fp16_causal.co"; };
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch        BF16Cvt |
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal.co"; };
 
-// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        kIsGroupMode_ |
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_group.co"; };
-template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_group.co"; };
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        BF16Cvt | kIsGroupMode_ |
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtne_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtna_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_rtz._group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtne_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtna_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtz_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtne_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtna_group.co"; };
+template<> struct FmhaFwdV3Buf<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr const char * fwd_v3_buf = "fwd_hd128_bf16_causal_rtz_group.co"; };
 
-// ####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     0,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      0,      false,      false,     1,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     0,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-// template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdFp16, 128,      1,      false,      false,     1,          GPUArch::gfx942>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch        BF16Cvt |
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
 
-// ####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        kIsGroupMode_ |
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
-template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+// #####################################################| DataType | HDim | MaskType | kIsSEQPad | kIsHDPad | kStoreLSE | GPUArch |        BF16Cvt | kIsGroupMode_ |
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      0,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 0,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 1,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     0,          GPUArch::gfx942, 2,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 0,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 1,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
+template<> struct FmhaFwdV3Ts<fmha_fwd_kernel_selector<FmhaFwdBf16, 128,      1,      false,      false,     1,          GPUArch::gfx942, 2,        true>> { static constexpr int ts_qo = 256; static constexpr int ts_kv = 32; };
 
 namespace gfx942{
 class fmha_fwd_v3_kernel
@@ -133,7 +169,7 @@ float fmha_fwd_v3_dispatcher(const ck_tile::stream_config& s, mha_fwd_args a,
 {
     if(s.log_level_ > 0)
         std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
-
+    std::cout << ", " << FmhaFwdV3Name<fmha_fwd_kernel_selector>::fwd_v3_name << std::flush;
     int tune_opt = 5;
 
     fmha_fwd_v3_args args;
@@ -194,53 +230,157 @@ float fmha_fwd_v3(mha_fwd_traits t, mha_fwd_args a, const ck_tile::stream_config
                     (a.hdim_q == 128) && (a.hdim_q == a.hdim_v)) {
                 if (t.is_group_mode == false) {
                     if (t.mask_type == mask_enum::mask_bottom_right) {
-                        if (t.has_lse == false) {
-                            using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942>;
-                            r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
-                        }
-                        else {
-                            if (a.batch_stride_lse >= a.nhead_stride_lse) {
-                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942>;
+                        if (t.how_v3_bf16_cvt == 0) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 0>;
                                 r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
                             }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, 0>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 1) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 1>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, 1>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 2) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 2>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, 2>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }                        
                         }
                     }
                     else if (t.mask_type == mask_enum::no_mask) {
-                        if (t.has_lse == false) {
-                            using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942>;
-                            r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
-                        }
-                        else {
-                            if (a.batch_stride_lse >= a.nhead_stride_lse) {
-                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942>;
+                        if (t.how_v3_bf16_cvt == 0) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, 0>;
                                 r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, 0>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 1) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, 1>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, 1>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 2) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, 2>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, 2>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
                             }
                         }
                     }
                 }
                 else {
                     if (t.mask_type == mask_enum::mask_bottom_right) {
-                        if (t.has_lse == false) {
-                            using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, true>;
-                            r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
-                        }
-                        else {
-                            if (a.batch_stride_lse >= a.nhead_stride_lse) {
-                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, true>;
+                        if (t.how_v3_bf16_cvt == 0) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 0, true>;
                                 r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
                             }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, 0, true>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 1) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 1, true>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, 1, true>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 2) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 0, GPUArch::gfx942, 2, true>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 1, false, false, 1, GPUArch::gfx942, 2, true>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }                        
                         }
                     }
                     else if (t.mask_type == mask_enum::no_mask) {
-                        if (t.has_lse == false) {
-                            using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, true>;
-                            r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
-                        }
-                        else {
-                            if (a.batch_stride_lse >= a.nhead_stride_lse) {
-                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, true>;
+                        if (t.how_v3_bf16_cvt == 0) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, 0, true>;
                                 r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
                             }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, 0, true>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 1) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, 1, true>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, 1, true>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }
+                        }
+                        else if(t.how_v3_bf16_cvt == 2) {
+                            if (t.has_lse == false) {
+                                using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 0, GPUArch::gfx942, 2, true>;
+                                r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                            }
+                            else {
+                                if (a.batch_stride_lse >= a.nhead_stride_lse) {
+                                    using fmha_fwd_kernel = fmha_fwd_kernel_selector<FmhaFwdBf16, 128, 0, false, false, 1, GPUArch::gfx942, 2, true>;
+                                    r = fmha_fwd_v3_dispatcher<fmha_fwd_kernel>(s, a, seqstart_q_padding_ptr, seqstart_k_padding_ptr);
+                                }
+                            }                        
                         }
                     }                
                 }

@@ -41,11 +41,13 @@ run_gfx942_fwd_v3() {
     for mask in 0 2 ; do
     for lse in 0 1 ; do
     for seqlen in 94 127 256 384 512 600 783 900 1023 ; do
+    for v3_bf16_cvt in 0 1 2; do
 
-    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
-    $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=2 -h=4 -h_k=2 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=1 -h=3 -h_k=1 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
+    $EXE -prec=bf16 -b=1 -h=1 -h_k=1 -d=128 -s=$seqlen -iperm=$perm -operm=$perm -mask=$mask -lse=$lse -fwd_v3=1 -v3_bf16_cvt=$v3_bf16_cvt -mode=$mode -kname=$KNAME $COMMON_ARGS
 
+    done
     done
     done
     done
