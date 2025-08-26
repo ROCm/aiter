@@ -334,8 +334,10 @@ def _bwd_dkdv_inner(
 # the main inner-loop logic for computing dQ
 @triton.jit
 def _bwd_dq_inner(
-    dq,  # output
+    dq,
+    dq_pe,  # output
     q,
+    q_pe,
     K,
     V,
     do,
@@ -358,6 +360,8 @@ def _bwd_dq_inner(
     BLOCK_N2: tl.constexpr,  #
     HEAD_DIM: tl.constexpr,
     ACTUAL_HEAD_DIM: tl.constexpr,  #
+    PE_HEAD_DIM: tl.constexpr,
+    ACTUAL_PE_HEAD_DIM: tl.constexpr,
     dropout_p,
     philox_seed,
     batch_philox_offset,
@@ -383,15 +387,21 @@ def _bwd_dq_inner(
 ):
     # if HEAD_DIM is padded
     PADDED_HEAD: tl.constexpr = ACTUAL_HEAD_DIM != HEAD_DIM
+    HAS_PE: tl.constexpr = PE_HEAD_DIM > 0
+    PADDED_PE_HEAD: tl.constexpr = ACTUAL_PE_HEAD_DIM != PE_HEAD_DIM
     delta_qk = seqlen_q - seqlen_k
     offs_m = start_m + tl.arange(0, BLOCK_M2)
     offs_n = start_n + tl.arange(0, BLOCK_N2)
     offs_k = tl.arange(0, HEAD_DIM)
+    if HAS_PE:
+        offs_k_pe = HEAD_DIM + tl.arange(0, PE_HEAD_DIM)
 
     # mask to make sure not OOB of seqlen_q
     mask_m = offs_m < seqlen_q
 
     kT_ptrs = K + offs_n[None, :] * stride_kn + offs_k[:, None] * stride_kk
+    if HAS_PE:
+        kT_pe_ptrs = K + offs_n[None, :] * stride_kn + offs_k_pe[:, None] * stride_kk
     vT_ptrs = V + offs_n[None, :] * stride_vn + offs_k[:, None] * stride_vk
     # D (= delta) is pre-divided by ds_scale.
     Di = tl.load(Delta + offs_m * stride_deltam, mask=mask_m, other=0.0)
@@ -423,6 +433,14 @@ def _bwd_dq_inner(
         kT = tl.load(kT_ptrs, mask=mask_kT, other=0.0)
         vT = tl.load(vT_ptrs, mask=mask_kT, other=0.0)
 
+        if HAS_PE:
+            if PADDED_PE_HEAD:
+                mask_kT_pe = mask_kT & (offs_k_pe[:, None] < (HEAD_DIM + PE_HEAD_DIM))
+                # ^^^ TODO: should we use ACTUAL_HEAD_DIM + ACTUAL_PE_HEAD_DIM?
+            else:
+                mask_kT_pe = mask_kT
+            kT_pe = tl.load(kT_pe_ptrs, mask=mask_kT_pe, other=0.0)
+
         if ENABLE_DROPOUT:
             # NOTE: dropout is transposed because it is used to mask pT
             philox_offs = (
@@ -443,8 +461,12 @@ def _bwd_dq_inner(
 
         if IS_FP8:
             qk = tl.dot(q, kT) * descale_q * descale_k
+            if HAS_PE:
+                qk += tl.dot(q_pe, kT_pe) * descale_q * descale_k
         else:
             qk = tl.dot(q, kT)
+            if HAS_PE:
+                qk += tl.dot(q_pe, kT_pe)
         qk_scaled = qk * sm_scale
 
         if USE_ALIBI:
@@ -482,13 +504,23 @@ def _bwd_dq_inner(
                 * descale_ds
                 * descale_k
             )
+            if HAS_PE:
+                dq_pe += (
+                    tl.dot((ds * scale_ds).to(kT_pe.type.element_ty), tl.trans(kT_pe))
+                    * descale_ds
+                    * descale_k
+                )
         else:
             dq += tl.dot(ds.to(kT.type.element_ty), tl.trans(kT))
+            if HAS_PE:
+                dq_pe += tl.dot(ds.to(kT_pe.type.element_ty), tl.trans(kT_pe))
         # Increment pointers.
         curr_n += step_n
         kT_ptrs += step_n * stride_kn
+        if HAS_PE:
+            kT_pe_ptrs += step_n * stride_kn
         vT_ptrs += step_n * stride_vn
-    return dq
+    return dq, dq_pe
 
 
 @triton.jit
@@ -991,7 +1023,16 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         if PADDED_HEAD:
             mask_d = offs_d < ACTUAL_HEAD_DIM
             mask_q &= mask_d[None, :]
+        if HAS_PE:
+            if PADDED_PE_HEAD:
+                mask_d_pe = offs_d_pe < (HEAD_DIM + PE_HEAD_DIM)
+                # ^^^ TODO: should we use ACTUAL_HEAD_DIM + ACTUAL_PE_HEAD_DIM?
+                mask_q_pe = mask_q & mask_d_pe[None, :]
+            else:
+                mask_q_pe = mask_q
         offs_q = offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        if HAS_PE:
+            offs_q_pe = offs_m[:, None] * stride_qm + offs_d_pe[None, :] * stride_qd
         offs_do = offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod
         # NOTE: don't assume that the strides for k and v are the same!
         K += bid * stride_kb + hkid * stride_kh + k_start * stride_kn
@@ -1032,6 +1073,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                     Dropout_mask + bid * stride_dropoutb + hqid * stride_dropouth
                 )
             q = tl.load(Q + adj_q + offs_q, mask=mask_q, other=0.0)
+            if HAS_PE:
+                q_pe = tl.load(Q + adj_q + offs_q_pe, mask=mask_q_pe, other=0.0)
+            else:
+                q_pe = None
             do = tl.load(DO + adj_do + offs_do, mask=mask_q, other=0.0)
             m = tl.load(M + adj_delta + offs_m * stride_deltam, mask=offs_m < seqlen_q)
             m = m[:, None]
@@ -1050,9 +1095,15 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 descale_q, descale_k, descale_v, descale_do = 1.0, 1.0, 1.0, 1.0
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-            dq = _bwd_dq_inner(
+            if HAS_PE:
+                dq_pe = tl.zeros([BLOCK_M2, PE_HEAD_DIM], dtype=tl.float32)
+            else:
+                dq_pe = dq  # Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
+            dq, dq_pe = _bwd_dq_inner(
                 dq,
+                dq_pe,
                 q,
+                q_pe,
                 K,
                 V,
                 do,
@@ -1074,6 +1125,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 MASK_BLOCK_N2,
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,
+                PE_HEAD_DIM,
+                ACTUAL_PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -1103,9 +1156,11 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
                 )  # noqa: E701
-            dq = _bwd_dq_inner(
+            dq, dq_pe = _bwd_dq_inner(
                 dq,
+                dq_pe,
                 q,
+                q_pe,
                 K,
                 V,
                 do,
@@ -1127,6 +1182,8 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 BLOCK_N2,
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,
+                PE_HEAD_DIM,
+                ACTUAL_PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
@@ -1154,6 +1211,12 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
             offs_dq = offs_m[:, None] * stride_dqm + offs_d[None, :] * stride_dqd
             dq *= sm_scale
             tl.store(DQ + adj_dq + offs_dq, dq, mask=mask_q)
+            if HAS_PE:
+                offs_dq_pe = (
+                    offs_m[:, None] * stride_dqm + offs_d_pe[None, :] * stride_dqd
+                )
+                dq_pe *= sm_scale
+                tl.store(DQ + adj_dq + offs_dq_pe, dq_pe, mask=mask_q_pe)
             # end of GQA/MQA of dq
 
 
@@ -1435,7 +1498,7 @@ def bwd_kernel_noncausal(
                 dv,  # output tensors
                 Q_ptr,
                 k,
-                None,
+                None,  # k_pe
                 v,
                 DO_ptr,
                 M_ptr,
@@ -1548,9 +1611,11 @@ def bwd_kernel_noncausal(
             num_steps = tl.cdiv(seqlen_k, BLOCK_N2)
 
             dq = tl.zeros([BLOCK_M2, HEAD_DIM], dtype=tl.float32)
-            dq = _bwd_dq_inner(
+            dq, _ = _bwd_dq_inner(
                 dq,
+                dq,  # dq_pe: Couldn't assign None to dq_pe because _bwd_dq_inner can't return None.
                 q,
+                None,  # q_pe
                 K,
                 V,
                 do,
@@ -1572,6 +1637,8 @@ def bwd_kernel_noncausal(
                 BLOCK_N2,
                 HEAD_DIM,
                 ACTUAL_HEAD_DIM,
+                PE_HEAD_DIM,
+                ACTUAL_PE_HEAD_DIM,
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
