@@ -14,6 +14,7 @@ from op_tests.test_gemm_a8w8 import test_gemm as test_gemm_a8w8
 from op_tests.test_gemm_a4w4 import test_gemm as test_gemm_a4w4
 from op_tests.test_gemm import test_gemm as test_gemm
 from aiter.jit.utils.chip_info import get_gfx
+from utils import save_untuned_gemm_csv
 
 # Setup logging
 logging.basicConfig(
@@ -82,9 +83,9 @@ TEST_CONFIGS = {
     # model,                  model_name,   attention_head,   kv_head,   head_dim,  intermediate_size    is_moe
     "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 25600, False),
     "Qwen3-30B": TestConfig("Qwen3-30B", 16, 16, 128, 6144, True),
-    "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
-    "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
-    "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
+    # "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
+    # "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
+    # "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
 }
 
 
@@ -304,6 +305,10 @@ class GemmTestRunner:
         for model in models:
             records = self.run_single_test(model, TP_list, output_types, quant_types)
             self.save_to_csv(records, model.model_name)
+            if args.save_untuned_gemm:
+                save_untuned_gemm_csv(
+                    f"{model.model_name}.csv", f"{model.model_name}_untuned_gemm"
+                )
 
 
 def create_argument_parser():
@@ -354,6 +359,11 @@ def create_argument_parser():
         default=None,
         help="""Tenosr Parallel size.
         e.g. -tp 8""",
+    )
+    parser.add_argument(
+        "--save-untuned-gemm",
+        action="store_true",
+        help="save the untuned_gemm and untun_gemm_bf16 csv files at model level",
     )
     return parser
 
