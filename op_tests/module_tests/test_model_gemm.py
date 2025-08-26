@@ -348,6 +348,9 @@ class GemmTestRunner:
         else:
             print("---run_bf16_gemm---")
             latency, latency_triton = run_a16w16_gemm(dtype, record, run_triton)
+        throughput, bandwidth, throughput_triton, bandwidth_triton = self.get_metrics(
+            latency, latency_triton, record, dtype, quant_dtype
+        )
 
         return (
             latency,
