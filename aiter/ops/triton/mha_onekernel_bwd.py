@@ -111,6 +111,7 @@ def _bwd_preprocess(
 @triton.jit
 def _bwd_dkdv_inner(
     dk,
+    dk_pe,
     dv,  # output
     Q,
     k,
@@ -312,25 +313,23 @@ def _bwd_dkdv_inner(
                 * descale_dsT
                 * descale_q
             )
-            # Error: Cannot make_shape_compatible: incompatible dimensions at index 1: 128 and 64
-            # if HAS_PE:
-            #     dk += (
-            #         tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT_pe))
-            #         * descale_dsT
-            #         * descale_q
-            #     )
+            if HAS_PE:
+                dk_pe += (
+                    tl.dot((dsT * scale_dsT).to(qT_pe.type.element_ty), tl.trans(qT_pe))
+                    * descale_dsT
+                    * descale_q
+                )
         else:
             dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
-            # Error: Cannot make_shape_compatible: incompatible dimensions at index 1: 128 and 64
-            # if HAS_PE:
-            #     dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT_pe))
+            if HAS_PE:
+                dk_pe += tl.dot(dsT.to(qT_pe.type.element_ty), tl.trans(qT_pe))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
         if HAS_PE:
             qT_pe_ptrs += step_m * stride_qm
         do_ptrs += step_m * stride_dom
-    return dk, dv
+    return dk, dk_pe, dv
 
 
 # the main inner-loop logic for computing dQ
@@ -709,6 +708,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
     if start_n < seqlen_k:
         # This section does dk and dv
         dk = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
+        if HAS_PE:
+            dk_pe = tl.zeros([BLOCK_N1, PE_HEAD_DIM], dtype=tl.float32)
+        else:
+            dk_pe = None
         dv = tl.zeros([BLOCK_N1, HEAD_DIM], dtype=tl.float32)
 
         # q > k: diretcly skip all the way until the start of causal block
@@ -845,8 +848,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 print(
                     f"Masked: start_n: {start_n}; start_m: {start_m}, num_steps: {num_steps}"
                 )  # noqa: E701
-            dk, dv = _bwd_dkdv_inner(
+            dk, dk_pe, dv = _bwd_dkdv_inner(
                 dk,
+                dk_pe,
                 dv,  # output tensors
                 Q_ptr,
                 k,
@@ -906,8 +910,9 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
                 )  # noqa: E701
             if DEBUG_TRITON:
                 print("unMasked")  # noqa: E701
-            dk, dv = _bwd_dkdv_inner(
+            dk, dk_pe, dv = _bwd_dkdv_inner(
                 dk,
+                dk_pe,
                 dv,  # output tensors
                 Q_ptr,
                 k,
@@ -963,6 +968,10 @@ def bwd_kernel_causal(  # grid = (tl.cdiv(max_seqlen_q // BLOCK_M2), batch, nhea
         offs_dk = offs_n[:, None] * stride_dkn + offs_d[None, :] * stride_dkd
         dk *= sm_scale
         tl.store(DK + adj_dk + offs_dk, dk, mask=mask_kv)
+        if HAS_PE:
+            offs_dk_pe = offs_n[:, None] * stride_dkn + offs_d_pe[None, :] * stride_dkd
+            dk_pe *= sm_scale
+            tl.store(DK + adj_dk + offs_dk_pe, dk_pe, mask=mask_kv_pe)
 
     # This part does dq
     start_m = pid * BLOCK_M2
@@ -1423,8 +1432,9 @@ def bwd_kernel_noncausal(
             # because there is no causal, we always start from the beginning
             start_m = 0
             num_steps = tl.cdiv(seqlen_q, BLOCK_M1)
-            dk, dv = _bwd_dkdv_inner(
+            dk, _, dv = _bwd_dkdv_inner(
                 dk,
+                None,
                 dv,  # output tensors
                 Q_ptr,
                 k,
