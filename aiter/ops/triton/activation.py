@@ -46,6 +46,8 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _gelu_tanh(x)
     elif activation == "silu":
         return _silu(x)
+    elif activation == "silu_exp2":
+        return _silu_exp2(x)
     else:
         return x  # No activation if it is not recognized
 
