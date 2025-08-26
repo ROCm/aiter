@@ -393,7 +393,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-fast-math'"
+            "'--save-temps'",
+            "'-ffast-math'"
         ],
         "extra_ldflags": "None",
         "extra_include": [

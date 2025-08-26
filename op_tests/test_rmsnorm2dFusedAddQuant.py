@@ -82,7 +82,7 @@ def run_ck(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
                 y_scale,
                 weight,
                 eps,
-                # out_before_quant=out_before_quant,
+                out_before_quant=out_before_quant,
             )
 
     return output, residual_out, y_scale, out_before_quant
