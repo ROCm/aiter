@@ -961,6 +961,8 @@ def test_mha_backward_varlen(
     )
 
 
+# Run with:
+# pytest -s op_tests/triton_tests/test_mha.py::test_mha_backward_with_pe
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -990,7 +992,7 @@ def test_mha_backward_with_pe(
 
     def debug(x_desc: str, x: torch.Tensor) -> None:
         if DEBUG_SHAPES:
-            print(f"{x_desc}.shape = {x.shape}")
+            print(f"{x_desc}.shape = {x.shape if x is not None else None}")
         if DEBUG_TENSORS:
             print(f"{x_desc} = {x}")
 
@@ -1060,6 +1062,7 @@ def test_mha_backward_with_pe(
         )
     torch_out, torch_attn_scores = torch_out
 
+    # Forward is failing!
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
@@ -1077,9 +1080,11 @@ def test_mha_backward_with_pe(
     # torch.testing.assert_close(
     #     triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     # )
+    # Cascading failure related to forward failure.
     torch.testing.assert_close(
         triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
+    # Cascading failure related to forward failure.
     torch.testing.assert_close(
         triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )

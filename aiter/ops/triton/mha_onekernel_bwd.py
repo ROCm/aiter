@@ -312,16 +312,18 @@ def _bwd_dkdv_inner(
                 * descale_dsT
                 * descale_q
             )
-            if HAS_PE:
-                dk += (
-                    tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT_pe))
-                    * descale_dsT
-                    * descale_q
-                )
+            # Error: Cannot make_shape_compatible: incompatible dimensions at index 1: 128 and 64
+            # if HAS_PE:
+            #     dk += (
+            #         tl.dot((dsT * scale_dsT).to(qT.type.element_ty), tl.trans(qT_pe))
+            #         * descale_dsT
+            #         * descale_q
+            #     )
         else:
             dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT))
-            if HAS_PE:
-                dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT_pe))
+            # Error: Cannot make_shape_compatible: incompatible dimensions at index 1: 128 and 64
+            # if HAS_PE:
+            #     dk += tl.dot(dsT.to(qT.type.element_ty), tl.trans(qT_pe))
         # Increment pointers.
         curr_m += step_m
         qT_ptrs += step_m * stride_qm
