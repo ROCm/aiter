@@ -1713,7 +1713,7 @@ def flash_attn_onekernel_backward(
     BLOCK_D_MODEL_POW2 = max(BLOCK_D_MODEL_POW2, 16)
     BLOCK_D_MODEL_PE_POW2 = triton.next_power_of_2(pe_head_dim)
     if BLOCK_D_MODEL_PE_POW2 > 0:
-        BLOCK_DMODEL_PE_POW2 = max(BLOCK_DMODEL_PE_POW2, 16)
+        BLOCK_D_MODEL_PE_POW2 = max(BLOCK_D_MODEL_PE_POW2, 16)
 
     # Configs
     if config is None:
