@@ -289,7 +289,7 @@ def _attn_fwd_inner(
         if IS_CAUSAL:
             causal_boundary = start_n + offs_n_causal
             causal_mask = OFFS_M[:, None] >= causal_boundary[None, :]
-            mask = mask and causal_mask
+            mask = mask & causal_mask
 
         qk = tl.where(mask, qk, float("-inf"))
 
@@ -913,9 +913,9 @@ def _flash_attn_forward(
     max_seqlen_k: int,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -1036,9 +1036,9 @@ def _flash_attn_forward(
         q,
         k,
         v,
-        descale_q,
-        descale_k,
-        descale_v,
+        q_descale,
+        k_descale,
+        v_descale,
         o,
         alibi_slopes,
         s_dmask,
@@ -1047,9 +1047,9 @@ def _flash_attn_forward(
         *q_strides,
         *k_strides,
         *v_strides,
-        descale_q.stride(0) if descale_q is not None else 0,
-        descale_k.stride(0) if descale_k is not None else 0,
-        descale_v.stride(0) if descale_v is not None else 0,
+        q_descale.stride(0) if q_descale is not None else 0,
+        k_descale.stride(0) if k_descale is not None else 0,
+        v_descale.stride(0) if v_descale is not None else 0,
         *o_strides,
         alibi_slopes.stride(0) if alibi_slopes is not None else 0,
         alibi_slopes.stride(1) if alibi_slopes is not None else 0,
@@ -1160,7 +1160,7 @@ class _FlashAttnFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
-        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
         head_size_v_og = do.size(3)
         do_padded = do
         if head_size_v_og % 8 != 0:
@@ -1337,9 +1337,10 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        descale_q,
-        descale_k,
-        descale_v,
+        q_descale,
+        k_descale,
+        v_descale,
+        use_fp8_backward=False,  # Flag to control backward precision
         config=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q_fp8, k_fp8, v_fp8])
@@ -1369,24 +1370,36 @@ class _FlashAttnFP8Func(torch.autograd.Function):
                 max_seqlen_k=k_fp8.shape[1],
                 cu_seqlens_q=None,
                 cu_seqlens_k=None,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
                 config=config,
             )
         )
 
         if is_grad:
-            ctx.save_for_backward(
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                out,
-                softmax_lse,
-                descale_q,
-                descale_k,
-                descale_v,
-            )
+            ctx.use_fp8_backward = use_fp8_backward
+            
+            if use_fp8_backward:
+                # FP8 backward not supported, will raise error in backward
+                raise NotImplementedError(
+                    "FP8 backward pass is not currently supported. "
+                    "Please use the default FP32 backward (use_fp8_backward=False)."
+                )
+            else:
+                # For FP32 backward: convert back to FP32 and save
+                # descale factors are already shape [batch, 1, heads, 1] from _cast_to_fp8
+                q_fp32 = q_fp8.float() * q_descale
+                k_fp32 = k_fp8.float() * k_descale
+                v_fp32 = v_fp8.float() * v_descale
+                ctx.save_for_backward(
+                    q_fp32,
+                    k_fp32,
+                    v_fp32,
+                    out,  # Already FP32
+                    softmax_lse,
+                )
+            
             ctx.philox_seed = philox_seed
             ctx.philox_offset = philox_offset
             ctx.dropout_p = dropout_p
@@ -1395,7 +1408,7 @@ class _FlashAttnFP8Func(torch.autograd.Function):
             ctx.window_size = window_size
             ctx.alibi_slopes = alibi_slopes
 
-        # out = out_padded[..., :head_size_og]
+        # Return FP32 output for compatibility with PyTorch autograd
         result = [out]
         if return_lse:
             result.append(softmax_lse)
@@ -1405,79 +1418,70 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         return result[0] if len(result) == 1 else tuple(result)
 
     @staticmethod
-    def backward(ctx, do_fp8, descale_do, *args):
-        q_fp8, k_fp8, v_fp8, o_fp8, softmax_lse, descale_q, descale_k, descale_v, descale_o = (
-            ctx.saved_tensors
-        )
+    def backward(ctx, do, *args):
+        if ctx.use_fp8_backward:
+            # FP8 backward is not yet supported due to numerical stability concerns
+            raise NotImplementedError(
+                "FP8 backward pass is not currently supported. "
+                "Please use the default FP32 backward (use_fp8_backward=False). "
+                "FP8 backward may be added in future versions after thorough testing."
+            )
+        else:
+            # FP32 backward path (default/stable)
+            q, k, v, out, softmax_lse = ctx.saved_tensors
+            
+            # Allocate FP32 gradient tensors
+            dq = torch.zeros_like(q)
+            dk = torch.zeros_like(k)
+            dv = torch.zeros_like(v)
         
-        # head_size_v_og = do_fp8.size(3)
-        # do_padded = do
-        # if head_size_v_og % 8 != 0:
-        #     do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-
-        # result in fp32 currently
-        dq, dk, dv = (
-            torch.zeros_like(q_fp8, dtype=torch.float32),
-            torch.zeros_like(k_fp8, dtype=torch.float32),
-            torch.zeros_like(v_fp8, dtype=torch.float32),
-        )
+        # FP32 backward kernel calls (only path supported)
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
-                do_fp8,
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                o_fp8,
+                do,
+                q,
+                k,
+                v,
+                out,
                 softmax_lse,
                 dq,
                 dk,
                 dv,
-                None,
+                None,  # dbias
                 ctx.softmax_scale,
                 ctx.alibi_slopes,
                 ctx.causal,
-                None,
-                None,
-                max_seqlen_q=q_fp8.shape[1],
-                max_seqlen_k=k_fp8.shape[1],
+                None,  # cu_seqlens_q
+                None,  # cu_seqlens_k
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=k.shape[1],
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_o=descale_o,
-                descale_do=descale_do,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
             flash_attn_onekernel_backward(
-                do_fp8,
-                q_fp8,
-                k_fp8,
-                v_fp8,
-                o_fp8,
+                do,
+                q,
+                k,
+                v,
+                out,
                 softmax_lse,
                 dq,
                 dk,
                 dv,
-                None,
+                None,  # dbias
                 ctx.softmax_scale,
                 ctx.alibi_slopes,
                 ctx.causal,
-                None,
-                None,
-                max_seqlen_q=q_fp8.shape[1],
-                max_seqlen_k=k_fp8.shape[1],
+                None,  # cu_seqlens_q
+                None,  # cu_seqlens_k
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=k.shape[1],
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_o=descale_o,
-                descale_do=descale_do,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
 
@@ -1485,25 +1489,25 @@ class _FlashAttnFP8Func(torch.autograd.Function):
         # dk = dk[..., : k_fp8.shape[-1]]
         # dv = dv[..., : v_fp8.shape[-1]]
 
-        dq_fp8, descale_dq = _cast_to_fp8(dq, q_fp8.dtype, "bshd")
-        dk_fp8, descale_dk = _cast_to_fp8(dk, k_fp8.dtype, "bshd")
-        dv_fp8, descale_dv = _cast_to_fp8(dv, v_fp8.dtype, "bshd")
-
+        # Return FP32 gradients for compatibility
         return (
-            (dq_fp8, descale_dq),
-            (dk_fp8, descale_dk),
-            (dv_fp8, descale_dv),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            dq,  # gradient for q_fp8
+            dk,  # gradient for k_fp8  
+            dv,  # gradient for v_fp8
+            None,  # gradient for dropout_p
+            None,  # gradient for softmax_scale
+            None,  # gradient for causal
+            None,  # gradient for window_size
+            None,  # gradient for alibi_slopes
+            None,  # gradient for deterministic
+            None,  # gradient for return_lse
+            None,  # gradient for return_softmax
+            None,  # gradient for is_grad_enabled
+            None,  # gradient for descale_q
+            None,  # gradient for descale_k
+            None,  # gradient for descale_v
+            None,  # gradient for use_fp8_backward
+            None,  # gradient for config
         )
 
 
@@ -1525,6 +1529,7 @@ def flash_attn_fp8_func(
     deterministic=False,
     return_lse=False,
     return_attn_probs=False,
+    use_fp8_backward=False,  # Default to FP32 backward for stability
     config: Optional[dict[str, any]] = None,
 ):
     _LOGGER.info(
@@ -1546,6 +1551,7 @@ def flash_attn_fp8_func(
         q_descale,
         k_descale,
         v_descale,
+        use_fp8_backward,
         config,
     )
 
@@ -1631,7 +1637,7 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
-        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
         head_size_og = do.size(2)
@@ -1854,9 +1860,9 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
 
         # cast input to fp8
         fp8_dtype = arch_info.get_fp8_e4m3_dtype()
-        q_fp8, descale_q = _cast_varlen_to_fp8(q, fp8_dtype, cu_seqlens=cu_seqlens_q)
-        k_fp8, descale_k = _cast_varlen_to_fp8(k, fp8_dtype, cu_seqlens=cu_seqlens_k)
-        v_fp8, descale_v = _cast_varlen_to_fp8(v, fp8_dtype, cu_seqlens=cu_seqlens_k)
+        q_fp8, q_descale = _cast_varlen_to_fp8(q, fp8_dtype, cu_seqlens=cu_seqlens_q)
+        k_fp8, k_descale = _cast_varlen_to_fp8(k, fp8_dtype, cu_seqlens=cu_seqlens_k)
+        v_fp8, v_descale = _cast_varlen_to_fp8(v, fp8_dtype, cu_seqlens=cu_seqlens_k)
 
         out_padded, softmax_lse, S_dmask, philox_seed, philox_offset = (
             _flash_attn_forward(
@@ -1876,9 +1882,9 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
                 max_seqlen_k=max_seqlen_k,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
                 config=config,
             )
         )
@@ -1891,9 +1897,9 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
                 softmax_lse,
                 cu_seqlens_q,
                 cu_seqlens_k,
-                descale_q,
-                descale_k,
-                descale_v,
+                q_descale,
+                k_descale,
+                v_descale,
             )
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -1924,9 +1930,9 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
             softmax_lse,
             cu_seqlens_q,
             cu_seqlens_k,
-            descale_q,
-            descale_k,
-            descale_v,
+            q_descale,
+            k_descale,
+            v_descale,
         ) = ctx.saved_tensors
         dq, dk, dv = (
             torch.zeros_like(q_fp8, dtype=torch.float32),
@@ -1964,10 +1970,10 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                descale_do=descale_do,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                do_descale=descale_do,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
         else:
@@ -1992,9 +1998,9 @@ class _FlashAttnVarlenFP8Func(torch.autograd.Function):
                 dropout_p=ctx.dropout_p,
                 philox_seed=ctx.philox_seed,
                 philox_offset=ctx.philox_offset,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
+                descale_q=q_descale,
+                descale_k=k_descale,
+                descale_v=v_descale,
                 descale_do=descale_do,
                 USE_INT64_STRIDES=_USE_INT64_STRIDES,
             )
