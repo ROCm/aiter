@@ -59,11 +59,7 @@ def excel_to_struct_list(excel_file, sheet_name):
 def csv_to_struct_list(csv_file):
     import csv
 
-    filename = "/home/hatwu/aiter/op_tests/module_tests/Qwen3-30B.csv"
-    # with open(csv_file, mode="r", newline="", encoding="utf-8-sig") as f:
-    #     reader = csv.DictReader(f, fieldnames=fieldnames)
-    #     print("-----reader={}".format(reader))
-    with open(filename, mode="r", encoding="utf-8-sig") as file:
+    with open(csv_file, mode="r", encoding="utf-8-sig") as file:
         reader = csv.reader(file)
         baseRecords = []
         for idx, row in enumerate(reader):

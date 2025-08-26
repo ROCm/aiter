@@ -83,9 +83,9 @@ TEST_CONFIGS = {
     # model,                  model_name,   attention_head,   kv_head,   head_dim,  intermediate_size    is_moe
     "Qwen3-32B": TestConfig("Qwen3-32B", 64, 8, 80, 25600, False),
     "Qwen3-30B": TestConfig("Qwen3-30B", 16, 16, 128, 6144, True),
-    # "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
-    # "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
-    # "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
+    "Qwen3-235B": TestConfig("Qwen3-235B", 32, 32, 128, 12288, True),
+    "Llama3-70B": TestConfig("Llama3-70B", 64, 8, 128, 28672, False),
+    "Llama3-405B": TestConfig("Llama3-405B", 128, 8, 128, 53248, False),
 }
 
 
