@@ -32,3 +32,9 @@ The benchmark result is in the file of `Llama3-70B.csv`. The unit of latency is 
 |**M**|**N**|**K**|**TP**|  **quant_type**   |**output_type**|**latency**|**throughput**|**bandwidth**|
 |-----|-----|-----|------|-------------------|---------------|-----------|--------------|-------------|
 |1    |1280 |8192 |   8  |torch.float8_e4m3fn| torch.bfloat16|xxxxxxxx   |xxxxxxxx      |xxxxxxxx     |
+
+#### Save CSV for furhter performance tuning
+Users can further save the gemm_untuned csv files for futher performance tuning with using `--save-untuned-gemm` as the following command. Two CSV files named as `Llama3-70B_untuned_gemm.csv` and `Llama3-70B_untuned_gemm_bf16.csv` are generated. Then follow the [Quickly Gemm Performance Tuning for Popular Models](https://github.com/ROCm/aiter/blob/main/aiter/configs/model_configs/README.md) to tune Gemm performance .
+```
+python3 -u test_model_gemm.py -m Llama3-70B -tp 8 -d bf16 -q fp8 --save-untuned-gemm
+```
