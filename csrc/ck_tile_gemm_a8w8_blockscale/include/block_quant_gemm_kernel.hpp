@@ -155,7 +155,7 @@ struct Block_quant_GemmKernel
     using BLayout                            = remove_cvref_t<typename GemmPipeline::BLayout>;
     using CLayout                            = remove_cvref_t<typename GemmPipeline::CLayout>;
     static constexpr index_t KernelBlockSize = GemmPipeline::BlockSize;
-
+    static constexpr index_t kBlockSize = GemmPipeline::BlockSize;
     static constexpr index_t ScaleBlockM = 1;
     static constexpr index_t ScaleBlockN = 128;
     static constexpr index_t ScaleBlockK = 128;
@@ -203,16 +203,29 @@ struct Block_quant_GemmKernel
      */
     CK_TILE_HOST static auto MaxOccupancyGridSize(const stream_config& s) -> dim3
     {
+       
         using Kernel      = Block_quant_GemmKernel<TilePartitioner, GemmPipeline, EpiloguePipeline>;
-        const auto kernel = kentry<KernelBlockSize, 1, Kernel, Block_quant_GemmKernelArgs>;
+        const auto kernel = kentry<1, Kernel, Block_quant_GemmKernelArgs>;
         int occupancy;
         hip_check_error(
-            hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, KernelBlockSize, 0));
+            hipOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, BlockSize().x, 0));
+
         const int grid_size = get_available_compute_units(s) * occupancy;
         return dim3(grid_size, 1, 1);
     }
-
-    CK_TILE_HOST static constexpr auto BlockSize() { return dim3(KernelBlockSize); }
+    
+    CK_TILE_HOST static auto BlockSize()
+    {
+        if(ck_tile::is_wave32())
+        {
+            return dim3(kBlockSize / 2);
+        }
+        else
+        {
+            return dim3(kBlockSize);
+        }
+    }
+    // CK_TILE_HOST static constexpr auto BlockSize() { return dim3(KernelBlockSize); }
 
     CK_TILE_HOST static constexpr Block_quant_GemmKernelArgs MakeKernelArgs(const Block_quant_GemmHostArgs& hostArgs)
     {   
@@ -765,7 +778,7 @@ struct Block_quant_GemmKernel
         const auto& a_scale_block_window = gemm_tile_windows.at(I3);
         (void)a_scale_block_window;
         const auto& c_block_tile = GemmPipeline{}.template operator()(
-            a_block_window, b_block_window,a_scale_block_window,b_per_blcok_scale, num_loop,  smem_ptr_0);
+            a_block_window, b_block_window,a_scale_block_window,b_per_block_scale, num_loop,  smem_ptr_0);
 
         // Run Epilogue Pipeline
         auto& c_block_window = gemm_tile_windows.at(I2);

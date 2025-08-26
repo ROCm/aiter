@@ -287,7 +287,6 @@ float gemm_calc_dipatch(const ck_tile::Block_quant_GemmHostArgs& args, const ck_
                                                         ck_tile::tuple<>,
                                                         CLayout,
                                                         ck_tile::element_wise::PassThrough,
-                                                        GemmPipelineProblem::kBlockSize,
                                                         TilePartitioner::MPerBlock,
                                                         TilePartitioner::NPerBlock,
                                                         GemmTileShapeConfig_::M_Warp,
@@ -311,7 +310,7 @@ float gemm_calc_dipatch(const ck_tile::Block_quant_GemmHostArgs& args, const ck_
                     {
                         grids = Kernel::GridSize(args.M, args.N, args.k_batch);
                     }
-                    constexpr dim3 blocks = Kernel::BlockSize();
+                    dim3 blocks = Kernel::BlockSize();
 
                     if(!Kernel::IsSupportedArgument(kargs))
                     {
@@ -358,18 +357,16 @@ float gemm_calc_dipatch(const ck_tile::Block_quant_GemmHostArgs& args, const ck_
                                 hipGetErrorString(hipMemsetAsync(
                                     args.c_ptr, 0, args.M * args.N * sizeof(CDataType), s.stream_id_));
                         };
-                        ave_time = ck_tile::launch_kernel_preprocess(
+                        ave_time = ck_tile::launch_kernel_time_mask(
                             s,
                             run_flush_cache,
-                            ck_tile::make_kernel<blocks.x, GemmConfig::kBlockPerCu>(
-                                Kernel{}, grids, blocks, 0, kargs));
+                            ck_tile::make_kernel<GemmConfig::kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
                     }
                     else
                     {
-                        ave_time =
-                            ck_tile::launch_kernel(s,
-                                                ck_tile::make_kernel<blocks.x, GemmConfig::kBlockPerCu>(
-                                                    Kernel{}, grids, blocks, 0, kargs));
+                        ave_time = ck_tile::launch_kernel(
+                            s,
+                            ck_tile::make_kernel<GemmConfig::kBlockPerCu>(Kernel{}, grids, blocks, 0, kargs));
                     }
                     return ave_time;
                 };

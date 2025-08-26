@@ -693,7 +693,7 @@ struct UniversalGemmPipelineAgBgCrPolicy_block_quant
     {
         using BlockWarps      = typename Problem::BlockGemmShape::BlockWarps;
         using WarpTile        = typename Problem::BlockGemmShape::WarpTile;
-        using WarpGemm        = WarpGemmMfmaDispatcher<typename Problem::ComputeDataType,
+        using WarpGemm        = WarpGemmDispatcher<typename Problem::ComputeDataType,
                                                 typename Problem::ComputeDataType,
                                                 typename Problem::CDataType,
                                                 WarpTile::at(I0),
