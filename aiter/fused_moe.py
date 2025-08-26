@@ -846,12 +846,14 @@ def torch_moe_stage1(
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     if quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
-
-        hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
         w1 = fp4_utils.mxfp4_to_f32(w1)
         w1_scale = fp4_utils.e8m0_to_f32(w1_scale)
-        if a1_scale: #a16w4
+        if a1_scale: #skip a16w4
+            hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a1_scale = fp4_utils.e8m0_to_f32(a1_scale)
+        else: #a16w4
+            hidden_states = hidden_states.to(ctype)
+
     else:
         hidden_states = hidden_states.to(ctype)
         w1 = w1.to(ctype)
@@ -935,11 +937,13 @@ def torch_moe_stage2(
     if quant_type == QuantType.per_1x32:
         from aiter.utility import fp4_utils
 
-        hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
         w2 = fp4_utils.mxfp4_to_f32(w2)
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
         if a2_scale:
+            hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
+        else: #a16w4
+            hidden_states = hidden_states.to(ctype)
     else:
         hidden_states = hidden_states.to(ctype)
         w2 = w2.to(ctype)

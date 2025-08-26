@@ -130,8 +130,8 @@ gemm2_kernels_dict = {
 
 
 bit8_list = ["f8", "i8", "fp8"]
-bit16_list = ["b16", "f16"]
-bit4_list = ["i4", "fp4x2"]
+bit16_list = ["b16", "f16", "bf16", "fp16"]
+bit4_list = ["i4", "fp4x2", "fp4"]
 QuantType_list = ["no", "per_tensor", "per_token", "per_1x128", "per_1x32"]
 
 
@@ -148,6 +148,8 @@ def get_gemm1_kernels_list(
             tag = "a8w8_gfx950"
         else:
             tag = "a8w8"
+    elif Adtype in bit16_list and Bdtype in bit4_list:
+        tag = "a16w4_gfx950"
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]

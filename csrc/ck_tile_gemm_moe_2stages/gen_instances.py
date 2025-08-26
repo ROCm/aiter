@@ -75,20 +75,28 @@ torch::Tensor
 
 """     
         #default no quant
-        scaleGran = "-1"
-        xptr = "nulptr"
-        wptr = "nulptr"
+        scaleGranA = "-1"
+        scaleGranB = "-1"
+        xptr = "nullptr"
+        wptr = "nullptr"
         if (k.QuantType == "per_tenser"):
-            scaleGran = "0"
+            scaleGranA = "0"
+            scaleGranB = "0"
             xptr = "static_cast<float>(x_scale.value().data_ptr()[0])"
             wptr = "static_cast<float>(w_scale.value().data_ptr()[0])"
         elif (k.QuantType == "per_token"):
-            scaleGran = "1"
+            scaleGranA = "1"
+            scaleGranB = "1"
             xptr = "static_cast<float*>(x_scale.value().data_ptr())"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
+        elif (k.QuantType == "1x32"):
+            scaleGranA = "-1"
+            scaleGranB = "1, 32"
+            xptr = "nullptr"
+            wptr = "static_cast<float*>(w_scale.value().data_ptr())"
 
-        INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGran}>{{{xptr}}};
-    auto per_b_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGran}>{{{wptr}}};
+        INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
+    auto per_b_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranB}>{{{wptr}}};
     ck_tile::MoeFlatmmHostArgs<decltype(per_a_scale_dev_ptr), decltype(per_b_scale_dev_ptr)> kernel_args{{
                 reinterpret_cast<const ck_tile::index_t*>(sorted_ids.data_ptr()),
                 sorted_weights_ptr,
@@ -172,35 +180,26 @@ template torch::Tensor
         #         os.path.join(self.instances_path, f"{k.name}_abI8_dB16_eB16.cpp")
         #     ).write_text(INSTANCE_abI8_dBF16_eBF16)
         # else:
-        def fill_template(name, ab_type, acc_type, c_type):
+        def fill_template(name, a_type, b_type, acc_type, c_type):
             nonlocal self
             intsance = INSTANCE_template.format(
-                name=name, dtypes=f"{ab_type}, {acc_type}, {c_type}"
+                name=name, dtypes=f"{a_type}, {b_type}, {acc_type}, {c_type}"
             )
             Path(
                 os.path.join(
                     self.instances_path,
-                    f"{name}_ab{ab_type}_acc{acc_type}_C{c_type}.cpp",
+                    f"{name}_a{a_type}_b{b_type}_acc{acc_type}_C{c_type}.cpp",
                 )
             ).write_text(intsance)
         if (k.QuantType == "1x32") and (self.ab_dtype in ["bf16", "fp16"]):
-            print("gen instance with ab: %s, acc: %s, c: %s."%(self.ab_dtype, self.acc_dtype, self.c_dtype))
-            intsance = INSTANCE_template.format(
-                name=k.name, dtypes=f"{self.ab_dtype}, {self.acc_dtype}, {self.c_dtype}"
-            )
-            Path(
-                os.path.join(
-                    self.instances_path,
-                    f"{k.name}_ab{self.ab_dtype}_acc{self.acc_dtype}_C{self.c_dtype}.cpp",
-                )
-            ).write_text(intsance)
+            fill_template(k.name, self.ab_dtype, "pk_fp4", self.acc_dtype, self.c_dtype)
         else:
             for CDtype in ["bf16", "fp16"]:
                 for ABDtype in ["fp8"]: #"bf16", "fp16", 
                     for AccDtype in ["float"]:
-                        fill_template(k.name, ABDtype, AccDtype, CDtype)
+                        fill_template(k.name, ABDtype, ABDtype, AccDtype, CDtype)
                         # intsance = INSTANCE_template.format(
-                        #     name=k.name, dtypes=f"{ABDtype}, {AccDtype}, {CDtype}"
+                        #     name=k.name, dtypes=f"{ABDtype},  {AccDtype}, {CDtype}"
                         # )
                         # Path(
                         #     os.path.join(
@@ -211,30 +210,30 @@ template torch::Tensor
 
     '''genarete heuristic dispatch'''
     def gen_heuristic_dispatch(self):
-        HEURISTIC_template = f"""#pragma once
+        HEURISTIC_template = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 #include "moe_cktile2stages.h"
 
-template <typename ABDataType, typename AccDataType, typename CDataType>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
 MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     //if (block_m == 32)
     //{{
-    //    return moe_cktile2stages_gemm1_256x32x64x128_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x32x64x128_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     if (block_m == 64)
     {{
-        return moe_cktile2stages_gemm1_256x64x128x256_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+        return moe_cktile2stages_gemm1_256x64x128x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
     }}
     //else if (block_m == 128)
     //{{
-    //    return moe_cktile2stages_gemm1_256x128x128x128_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x128x128x128_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     //else if (block_m == 256)
     //{{
-    //    return moe_cktile2stages_gemm1_256x256x128x128_1x4_16x16x{inst_k}_{self.get_suffix(1)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x256x128x128_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     else
     {{
@@ -245,25 +244,25 @@ MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
     }}
 }}
 
-template <typename ABDataType, typename AccDataType, typename CDataType>
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
 MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
     //if (block_m == 32)
     //{{
-    //    return moe_cktile2stages_gemm2_256x32x64x128_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x32x64x128_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     if (block_m == 64)
     {{
-        return moe_cktile2stages_gemm2_256x64x128x256_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+        return moe_cktile2stages_gemm2_256x64x128x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
     }}
     //else if (block_m == 128)
     //{{
-    //    return moe_cktile2stages_gemm2_256x128x128x128_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x128x128x128_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     //else if (block_m == 256)
     //{{
-    //    return moe_cktile2stages_gemm2_256x256x128x128_1x4_16x16x{inst_k}_{self.get_suffix(2)}<ABDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x256x128x128_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     else
     {{
@@ -280,6 +279,8 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
             f.write(
                 HEURISTIC_template.format(
                     inst_k=inst_k,
+                    suffix1 = self.get_suffix(1),
+                    suffix2 = self.get_suffix(2)
                 )
             )
 
@@ -336,7 +337,7 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
 #include <torch/extension.h>
 """
         MAINFEST_template = """
-template <typename ABDataType, typename DDataType, typename EDataType>
+template <typename ADataType, typename BDataType, typename DDataType, typename EDataType>
 torch::Tensor
 {kernel_name}(
     torch::Tensor& XQ,
@@ -531,10 +532,10 @@ if __name__ == "__main__":
 
     #single UT
     # ab_type = "fp8"
-    a_type = "fp16"
+    a_type = "bf16"
     b_type = "fp4"
     acc_type = "float"
-    c_type ="fp16"
+    c_type ="bf16"
     quant_type = "1x32" #"per_token"
     act_type = "silu"
     codegen = cktile_moe_2stage_gemm_codegen(

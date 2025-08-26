@@ -136,7 +136,9 @@ def cktile_moe_stage1(
     sorted_weights=None,  # [max_num_tokens_padded]
 ):
     token_num = hidden_states.shape[0]
-    D = w2.shape[-1]
+    _, n1, k1 = w1.shape
+    _, k2, n2 = w2.shape
+    D = n2 if k2 == k1 else n2*2 #bit4 format
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size
 
     if w1.dtype is torch.uint32:
@@ -205,9 +207,10 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     src: shape [experts_cnt, N, K_pk], where K_pk = K // 2
     Returns: shuffled tensor of shape [experts_cnt, N0*2, K0, KLane, NLane, KPack]
     """
-    experts_cnt = src.shape[0]
-    N = src.shape[1]
-    K_pk = src.shpae[2]
+    print("gemm shape:", src.shape)
+    experts_cnt, N, K_pk = src.shape
+    if gate_up:
+        N = N // 2
     K = K_pk * 2
     KPack = 16
     NLane = NLane
@@ -220,10 +223,9 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
 
         # Step 2:reorder to [experts_cnt, N0, K0, KLane, NLane, KPack, 2]
         x = x.permute(0, 2, 4, 5, 3, 6, 1)  # → [e, N0, K0, KLane, NLane, KPack, 2]
-
         #  split gate and up
-        gate_part = x[:, 0]  # [e, N0, NLane, K0, KLane, KPack]
-        up_part   = x[:, 1]  # [e, N0, NLane, K0, KLane, KPack]
+        gate_part = x[:,:,:,:,:,:,0]  # [e, N0, NLane, K0, KLane, KPack]
+        up_part   = x[:,:,:,:,:,:,1]  # [e, N0, NLane, K0, KLane, KPack]
 
         # reorder: [e, N0, NLane, K0, KLane, KPack] -> [e, N0, K0, KLane, NLane, KPack]
         gate_reshaped = gate_part.permute(0, 1, 3, 4, 2, 5).contiguous()
@@ -231,24 +233,41 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
 
         # Interleave on N0 to [e, N0*2, K0, KLane, NLane, KPack]
         interleaved = torch.stack([gate_reshaped, up_reshaped], dim=2)  # [e, N0, 2, K0, KLane, NLane, KPack]
-        interleaved = interleaved.view(experts_cnt, N0 * 2, K0, KLane, NLane, KPack)
+        interleaved = interleaved.view(experts_cnt, N0 * 2, K0, KLane, NLane, KPack).view(*src.shape)
     else:
         src_reshaped = src.view(experts_cnt, N0, NLane, K0, KLane, KPack)
-        interleaved = src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous()
-    return interleaved
+        interleaved = src_reshaped.permute(0, 1, 3, 4, 2, 5).contiguous().view(*src.shape)
+    # print("interleaved shape:", interleaved.shape)
+    return interleaved.contiguous()
 
-def shuffle_mxfp4_scale(src: torch.Tensor, gate_up: bool) -> torch.Tensor:
-    # Reverse permute
+def shuffle_mxfp4_scale(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> torch.Tensor:
+    n_experts, k_ = src.shape
+    n_ = n_experts // experts_cnt
+    # MXFP4 constants
+    K_Pack = 2
+    N_Pack = 2
+    N_Lane = 16
+    K_Lane = 64 // N_Lane  # 4
+
+    # Basic dimensions
+    K1 = k_ // K_Pack // K_Lane  # k_ // 8
+    N1 = n_ // N_Lane // N_Pack        # n_ // 32
+    real_k =32 * k_ * K_Pack * K_Lane # 1x32 quant
+    assert real_k >= 256, f"K {real_k} must be larger than Tile_K(256)"
+    print("src shape", src.shape)
+    # Reshape based on moe_kind
     if gate_up:
-        # From [E, N1, K1, K_Lane, NLane, K_Pack, N_Pack]
-        # To   [E, K1, K_Pack, K_Lane, N_Pack, N1, NLane]
-        scale = src.permute(0, 2, 5, 3, 6, 1, 4)
+        # Reshape to: [E, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane]
+        shfl_scale = src.view(experts_cnt, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane)
+        # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
+        shfl_scale = shfl_scale.permute(0, 2, 4, 6, 3, 5, 1).contiguous()
     else:
-        # To   [E, K1, K_Pack, K_Lane, N1, N_Pack, NLane]
-        scale = src.permute(0, 2, 5, 3, 1, 6, 4)
-
-    return scale.reshape(*src.shpae)
-
+        # Reshape to: [E, K1, K_Pack, K_Lane, N1, N_Pack, N_Lane]
+        shfl_scale = src.view(experts_cnt, N1, N_Pack, N_Lane, K1, K_Pack, K_Lane)
+        # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
+        shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
+    # print("shf_scale shape:", shfl_scale.shape)
+    return shfl_scale.view(*src.shape).contiguous()
 
 @benchmark()
 def test_fmoe(
@@ -346,7 +365,7 @@ def test_fmoe(
         )
         a1_qt = a1_qt.view(token, model_dim)
         a1_scale = a1_scale.squeeze(-1)
-    elif qType == aiter.QuantType.per_1x32 and (AQDType in ["bf16", "fp16"]):
+    elif qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]):
         a1_qt = input
         a1_scale = None
     else:
@@ -391,6 +410,8 @@ def test_fmoe(
         doweight=doweight_stage1,
     )
 
+    print("out1_ref shape:", out1_ref.shape)
+
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     if WQDType == torch.int4:  # int4 w quant
@@ -404,17 +425,17 @@ def test_fmoe(
                 shuffle_weight(w2_qt_aiter, (16, 16), use_int4=True)
             )
         )
-    elif (AQDType in ["bf16", "fp16"]) and WQDType == dtypes.fp4x2: #a16w4
+    elif (AQDType in [dtypes.bf16, dtypes.fp16]) and WQDType == dtypes.fp4x2: #a16w4
         w1_qt_aiter = shuffle_mxfp4_weight(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_mxfp4_scale(w1_scale, True)
+        w1_scale_aiter = shuffle_mxfp4_scale(w1_scale, E, True)
         w2_qt_aiter = shuffle_mxfp4_weight(w2_qt_aiter, 16, False)
-        w2_scale_aiter = shuffle_mxfp4_scale(w2_scale, False)
+        w2_scale_aiter = shuffle_mxfp4_scale(w2_scale, E, False)
     elif WQDType != dtypes.fp4x2:
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
     
     # # ######################## ck stage 1 start ###########
-    if qType == aiter.QuantType.per_1x32 and (AQDType in ["bf16", "fp16"]):
+    if qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]):
         a1_qt = input
         a1_scale = None
     else:
@@ -460,7 +481,7 @@ def test_fmoe(
         num_iters=2,
         num_warmup=0,
     )
-
+    print("out1_ck shape:", out1_ck.shape)
     checkAllclose(
         out1_ref,
         out1_ck,
@@ -504,6 +525,9 @@ def test_fmoe(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
         )
         a2_scale = a2_scale.view(token, topk, -1)
+    if qType == aiter.QuantType.per_1x32 and (AQDType in [dtypes.bf16, dtypes.fp16]):
+        a2_qt = out1_ref
+        a2_scale = None
     else:
         a2_qt, a2_scale = torch_quant(out1_ref, quant_dtype=AQDType)
     a2_qt = a2_qt.view(token, topk, -1)
@@ -627,7 +651,7 @@ def test_fmoe(
 
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
-l_dim = [(128, 128)]
+l_dim = [(512, 256)]
 l_tokenNum = [
     1,
     # 3,

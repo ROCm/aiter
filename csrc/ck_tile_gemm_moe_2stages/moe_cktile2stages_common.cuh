@@ -36,7 +36,7 @@ struct MoeFlatmmConfig
 {
     static constexpr ck_tile::index_t M_Tile = M_Tile_;
     static constexpr ck_tile::index_t N_Tile = N_Tile_;
-    static constexpr ck_tile::index_t K_Tile = K_Tile_ / sizeof(DataType);
+    static constexpr ck_tile::index_t K_Tile = K_Tile_;
 
     static constexpr ck_tile::index_t M_Warp = M_Warp_;
     static constexpr ck_tile::index_t N_Warp = N_Warp_;
