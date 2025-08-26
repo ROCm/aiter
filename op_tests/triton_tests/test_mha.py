@@ -1012,7 +1012,7 @@ def test_mha_backward_with_pe(
     k.requires_grad = True
     v.requires_grad = True
 
-    do = torch.randn_like(q)
+    do = torch.randn((q.shape[:-1] + v.shape[-1:]), dtype=dtype, device=device)
 
     if DEBUG:
         print("--------------Triton----------------")
