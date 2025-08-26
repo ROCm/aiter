@@ -302,16 +302,17 @@ if __name__ == "__main__":
             False,
         )
 
-    # for (dtype, b, s, h_q, page_block_size, varlen, causal) in itertools.product(
+    # for (dtype, b, s, h_q, page_block_size, nope_rope_separate, varlen, causal) in itertools.product(
     #     (torch.float16, torch.bfloat16)[1:],
     #     [1, 3, 5, 16, 32, 64, 128, 256][3:4],
     #     [21, 64, 256, 512, 1200, 3200, 5200, 8192][:],
     #     (16, 64, 128)[:1],
     #     (1, 16, 64)[:1],
+    #     (False, True)[:],
     #     (False, True)[:1],
     #     (False, True)[1:]
     # ):
-    #     test_ck_mla(dtype, b, s, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, False, True)
+    #     test_ck_mla(dtype, b, s, s, h_q, h_kv, d, dv, page_block_size, causal, varlen, nope_rope_separate, False, True)
 
     # rope/nope separation
     # test_ck_mla(torch.bfloat16, 32, 6001, 6001, 1, 1, d, dv, 64, True, False, True, True, True)
