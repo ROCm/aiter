@@ -7,8 +7,9 @@ import torch
 def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
     x_type = x.dtype
-    if x_type == torch.float4_e2m1fn_x2:
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
         x = x.view(torch.uint8)
+
     IN, IK = layout
     BK = IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
