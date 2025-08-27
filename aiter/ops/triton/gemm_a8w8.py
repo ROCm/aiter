@@ -10,6 +10,7 @@ import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 
 _LOGGER = AiterTritonLogger()
@@ -53,6 +54,7 @@ def _gemm_a8w8_kernel(
     GROUP_SIZE_M: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 function
@@ -71,8 +73,6 @@ def _gemm_a8w8_kernel(
     - B_scale: Second scale tensor with shape (1, N).
     - Bias: Bias tensor with shape (1, N).
     """
-
-    NUM_XCDS: tl.constexpr = 8
 
     tl.assume(stride_am > 0)
     tl.assume(stride_ak > 0)
@@ -261,6 +261,7 @@ def gemm_a8w8(
         y.stride(0),
         y.stride(1),
         bias is not None,
+        NUM_XCDS=get_num_xcds(),
         **config,
     )
 

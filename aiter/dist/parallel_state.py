@@ -392,6 +392,7 @@ class GroupCoordinator:
                 ca_fp8_quant=ca_fp8_quant,
             )
 
+
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_

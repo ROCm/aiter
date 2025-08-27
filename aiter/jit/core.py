@@ -107,9 +107,10 @@ def get_asm_dir():
 
 @functools.lru_cache(maxsize=1)
 def get_user_jit_dir():
-    if "JIT_WORKSPACE_DIR" in os.environ:
-        path = os.getenv("JIT_WORKSPACE_DIR")
+    if "AITER_JIT_DIR" in os.environ:
+        path = os.getenv("AITER_JIT_DIR")
         os.makedirs(path, exist_ok=True)
+        sys.path.insert(0, path)
         return path
     else:
         if os.access(this_dir, os.W_OK):
@@ -225,7 +226,10 @@ __mds = {}
 def get_module_custom_op(md_name: str) -> None:
     global __mds
     if md_name not in __mds:
-        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        if "AITER_JIT_DIR" in os.environ:
+            __mds[md_name] = importlib.import_module(md_name)
+        else:
+            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
     return
 
 
@@ -329,6 +333,11 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
+
+        import torch
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -547,7 +556,8 @@ SPECIAL_OPS_MUTATES_ARGS = {
     "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
     "moe_fused_gate": ["topk_weights", "topk_ids"],
     "grouped_topk": ["topk_weights", "topk_ids"],
-    "mha_varlen_fwd": ["out"],
+    "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
+    "rotary_embedding_fwd": ["query", "key"],
 }
 
 

@@ -18,6 +18,7 @@ from aiter.ops.triton.utils.mha_kernel_utils import (
     _is_fp8,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -1078,7 +1079,7 @@ def _flash_attn_forward(
         FP8_MAX=FP8_MAX,
         VARLEN=is_varlen,
         BATCH=batch,
-        NUM_XCD=8,
+        NUM_XCD=get_num_xcds(),
         USE_INT64_STRIDES=_USE_INT64_STRIDES,
         **config,
     )
@@ -1164,8 +1165,6 @@ class _FlashAttnFunc(torch.autograd.Function):
         do_padded = do
         if head_size_v_og % 8 != 0:
             do_padded = torch.nn.functional.pad(do, [0, 8 - head_size_v_og % 8])
-
-        print("Using fused backward kernel:", _USE_FUSED_BWD_KERNEL)
 
         if _USE_FUSED_BWD_KERNEL:
             flash_attn_fused_backward(
