@@ -37,39 +37,31 @@ def to_record(
     )
 
 
-def save_gemm_benchmark_result(records, csv_file_name, has_triton):
+def save_gemm_benchmark_result(records, csv_file_name):
     import csv
     from dataclasses import asdict
 
     csv_file = f"{csv_file_name}.csv"
-    if has_triton:
-        fieldnames = [
-            "M",
-            "N",
-            "K",
-            "TP",
-            "quant_type",
-            "output_type",
-            "latency (us)",
-            "throughput (TFlops)",
-            "bandwidth (TB/s)",
-            "latency triton (us)",
-            "throughput triton (TFlops)",
-            "bandwidth triton (TB/s)",
-        ]
-    else:
-        fieldnames = [
-            "M",
-            "N",
-            "K",
-            "TP",
-            "quant_type",
-            "output_type",
-            "latency(us)",
-            "throughput(TFlops)",
-            "bandwidth(TB/s)",
-        ]
+    fieldnames = [
+        "M",
+        "N",
+        "K",
+        "TP",
+        "quant_method",
+        "quant_type",
+        "output_type",
+        "latency",
+        "throughput",
+        "bandwidth",
+        "latency_asm",
+        "throughput_asm",
+        "bandwidth_asm",
+        "latency_triton",
+        "throughput_triton",
+        "bandwidth_triton",
+    ]
 
+    print("====records={}".format(records))
     with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -163,8 +155,19 @@ def create_argument_parser():
 
 def save_untuned_gemm_csv(input_file, output_name):
     mnkrecords = csv_to_struct_list(input_file)
-    records = [to_record(mnk) for mnk in mnkrecords]
-    save_structs_to_csv(mnkrecords, f"{output_name}.csv", ["M", "N", "K"])
+    records_base = []
+    records = []
+    for mnk in mnkrecords:
+        if mnk not in records_base:
+            records_base.append(mnk)
+
+        record = to_record(mnk)
+        print("----record={}".format(record))
+        print("----records={}".format(records))
+        if record not in records:
+            records.append(record)
+
+    save_structs_to_csv(records_base, f"{output_name}.csv", ["M", "N", "K"])
     save_structs_to_csv(
         records,
         f"{output_name}_bf16.csv",

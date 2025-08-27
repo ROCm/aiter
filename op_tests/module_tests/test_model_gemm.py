@@ -3,12 +3,13 @@
 Gemm Test Runner at Model Level
 Manages test parameters and executes test_gemm.py/test_gemm_a4w4.py/test_gemm_a8w8.py with user-defined argument combinations
 """
-
+import os
 import logging
 from aiter import dtypes
 from dataclasses import dataclass
 import argparse
 import torch
+
 
 from aiter.jit.utils.chip_info import get_gfx
 from utils.gemm_utils import save_gemm_benchmark_result, save_untuned_gemm_csv
@@ -19,34 +20,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-M = [
-    1,
-    4,
-    8,
-    16,
-    32,
-    64,
-    128,
-    160,
-    192,
-    224,
-    256,
-    288,
-    320,
-    352,
-    384,
-    416,
-    448,
-    480,
-    512,
-    1024,
-    2048,
-    4096,
-    8192,
-    16384,
-    32768,
-]
-
+# M = [
+#     1,
+#     4,
+#     8,
+#     16,
+#     32,
+#     64,
+#     128,
+#     160,
+#     192,
+#     224,
+#     256,
+#     288,
+#     320,
+#     352,
+#     384,
+#     416,
+#     448,
+#     480,
+#     512,
+#     1024,
+#     2048,
+#     4096,
+#     8192,
+#     16384,
+#     32768,
+# ]
+M = [1]
 
 @dataclass
 class TestConfig:
@@ -98,9 +99,9 @@ class Record:
     latency: float = 0.0
     bandwidth: float = 0.0
     throughput: float = 0.0
-
-
-class TritonRecord(Record):
+    latency_asm: float = 0.0
+    bandwidth_asm: float = 0.0
+    throughput_asm: float = 0.0
     latency_triton: float = 0.0
     bandwidth_triton: float = 0.0
     throughput_triton: float = 0.0
@@ -117,39 +118,32 @@ def to_record(
     latency,
     bandwidth,
     throughput,
-    latency_triton=None,
-    bandwidth_triton=None,
-    throughput_triton=None,
+    latency_asm,
+    bandwidth_asm,
+    throughput_asm,
+    latency_triton,
+    bandwidth_triton,
+    throughput_triton,
 ):
-    if latency_triton is None:
-        return Record(
-            M,
-            N,
-            K,
-            TP,
-            output_type,
-            quant_type,
-            quant_method,
-            latency,
-            bandwidth,
-            throughput,
-        )
-    else:
-        return TritonRecord(
-            M,
-            N,
-            K,
-            TP,
-            output_type,
-            quant_type,
-            quant_method,
-            latency,
-            bandwidth,
-            throughput,
-            latency_triton,
-            bandwidth_triton,
-            throughput_triton,
-        )
+    return Record(
+        M,
+        N,
+        K,
+        TP,
+        output_type,
+        quant_type,
+        quant_method,
+        latency,
+        bandwidth,
+        throughput,
+        latency_asm,
+        bandwidth_asm,
+        throughput_asm,
+        latency_triton,
+        bandwidth_triton,
+        throughput_triton,
+    )
+
 
 
 ##### Wrapper and unified the test_gemm API for CK/ASM/Triton Kernels #####
@@ -161,18 +155,20 @@ def run_a16w16_gemm(dtype, record, run_triton=False):
     latency = ret["ck us"]
     print("--latency={}".format(latency))
 
-    latency_triton = None
+    latency_asm = 0.0
+    latency_triton = 0.0
     if run_triton:
         from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import bench_gemm_fn
 
         latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-    return latency, latency_triton
+    return latency, latency_asm, latency_triton
 
 
 def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
+    latency_asm = 0.0
     if fp8_quant_method == "per_tensor":
         from op_tests.test_gemm_a8w8 import test_skinny_gemm as test_gemm
-
+        print("----run per_tensor gemm")
         cu_count = torch.cuda.get_device_properties(device="cuda").multi_processor_count
         ret = test_gemm(
             dtype,
@@ -185,7 +181,7 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
         latency = ret["us"]
     elif fp8_quant_method == "per_token":
         from op_tests.test_gemm_a8w8 import test_gemm
-
+        print("----run per_token gemm")
         ret = test_gemm(dtype, record.M, record.N, record.K, dtypes.fp8)
         ck_time = ret["ck us"]
         ck_bpreshuffle_time = ret["ck bpreshuffle us"]
@@ -196,19 +192,17 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
         if ck_bpreshuffle_time is not None:
             latency = min(latency, ck_bpreshuffle_time)
         if asm_time is not None:
-            latency = min(latency, asm_time)
+            latency_asm = asm_time
     elif fp8_quant_method == "per_block":
         from op_tests.test_gemm_a8w8_blockscale import test_gemm
-
+        print("----run per_block gemm")
         ret = test_gemm(dtype, record.M, record.N, record.K)
         latency = ret["us"]
     else:
         raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
 
-    latency_triton = None
+    latency_triton = 0.0
     if run_triton:
-        import os
-
         pre_shuffle_scales = os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "1")
         print("--pre_shuffle_scales={}".format(pre_shuffle_scales))
         if fp8_quant_method == "per_tensor":
@@ -224,31 +218,32 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
         else:
             raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
         latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-    return latency, latency_triton
+    return latency, latency_asm, latency_triton
 
 
 def run_a4w4_gemm(dtype, record, run_triton=False):
     from op_tests.test_gemm_a4w4 import test_gemm
 
     ret = test_gemm(dtype, record.M, record.N, record.K)
-    asm_no_splitK_time = ret["asm no splitK"]
-    asm_splitK_time = ret["asm splitK"]
     ck_time = ret["ck"]
     latency = float("inf")
     if ck_time is not None:
         latency = min(latency, ck_time)
-    if asm_no_splitK_time is not None:
-        latency = min(latency, asm_no_splitK_time)
-    if asm_splitK_time is not None:
-        latency = min(latency, asm_splitK_time)
 
-    latency_triton = None
+    latency_asm = float("inf")
+    asm_no_splitK_time = ret["asm no splitK"]
+    asm_splitK_time = ret["asm splitK"]
+    if asm_no_splitK_time is not None:
+        latency_asm = min(latency_asm, asm_no_splitK_time)
+    if asm_splitK_time is not None:
+        latency_asm = min(latency_asm, asm_splitK_time)
+
+    latency_triton = 0.0
     if run_triton:
         from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import bench_gemm_fn
-
         latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
 
-    return latency, latency_triton
+    return latency, latency_asm, latency_triton
 
 
 class GemmTestRunner:
@@ -300,10 +295,14 @@ class GemmTestRunner:
         return records
 
     def calculate_throughput(self, m, n, k, latency):
+        if latency == 0.0:
+            return 0.0
         throughput = 2 * m * n * k / 1e6 / latency  # TFlops
         return throughput
 
     def calculate_bandwidth(self, m, n, k, latency, in_dtype, wei_dtype, out_dtype):
+        if latency == 0.0:
+            return 0.0
         typesize = {
             dtypes.d_dtypes["fp4x2"]: 0.5,
             dtypes.d_dtypes["fp8"]: 1,
@@ -320,7 +319,7 @@ class GemmTestRunner:
         )  # TB/s
         return bandwidth
 
-    def get_metrics(self, latency, latency_triton, record, dtype, quant_dtype):
+    def get_metrics(self, latency, latency_asm, latency_triton, record, dtype, quant_dtype):
         throughput = self.calculate_throughput(record.M, record.N, record.K, latency)
         bandwidth = self.calculate_bandwidth(
             record.M,
@@ -331,41 +330,52 @@ class GemmTestRunner:
             quant_dtype,
             dtype,
         )
-        throughput_triton = None
-        bandwidth_triton = None
-        if latency_triton is not None:
-            throughput_triton = self.calculate_throughput(
-                record.M, record.N, record.K, latency_triton
-            )
-            bandwidth_triton = self.calculate_bandwidth(
-                record.M,
-                record.N,
-                record.K,
-                latency_triton,
-                quant_dtype,
-                quant_dtype,
-                dtype,
-            )
-        return throughput, bandwidth, throughput_triton, bandwidth_triton
+        throughput_asm = self.calculate_throughput(record.M, record.N, record.K, latency_asm)
+        bandwidth_asm = self.calculate_bandwidth(
+            record.M,
+            record.N,
+            record.K,
+            latency_asm,
+            quant_dtype,
+            quant_dtype,
+            dtype,
+        )
+        throughput_triton = self.calculate_throughput(
+            record.M, record.N, record.K, latency_triton
+        )
+        bandwidth_triton = self.calculate_bandwidth(
+            record.M,
+            record.N,
+            record.K,
+            latency_triton,
+            quant_dtype,
+            quant_dtype,
+            dtype,
+        )
+        return throughput, bandwidth, throughput_asm, bandwidth_asm,throughput_triton, bandwidth_triton
+
 
     def run_gemm(self, record, quant_dtype, fp8_quant_method, dtype, run_triton):
         if quant_dtype == dtypes.d_dtypes["fp8"]:
-            latency, latency_triton = run_a8w8_gemm(
+            latency, latency_asm, latency_triton = run_a8w8_gemm(
                 dtype, record, fp8_quant_method, run_triton
             )
         elif quant_dtype == dtypes.d_dtypes["fp4x2"]:
-            latency, latency_triton = run_a4w4_gemm(dtype, record, run_triton)
+            latency, latency_asm, latency_triton = run_a4w4_gemm(dtype, record, run_triton)
         else:
             print("---run_bf16_gemm---")
-            latency, latency_triton = run_a16w16_gemm(dtype, record, run_triton)
-        throughput, bandwidth, throughput_triton, bandwidth_triton = self.get_metrics(
-            latency, latency_triton, record, dtype, quant_dtype
+            latency, latency_asm, latency_triton = run_a16w16_gemm(dtype, record, run_triton)
+        throughput, bandwidth, throughput_asm, bandwidth_asm, throughput_triton, bandwidth_triton = self.get_metrics(
+            latency, latency_asm, latency_triton, record, dtype, quant_dtype
         )
 
         return (
             latency,
             throughput,
             bandwidth,
+            latency_asm,
+            throughput_asm,
+            bandwidth_asm,
             latency_triton,
             throughput_triton,
             bandwidth_triton,
@@ -431,6 +441,9 @@ class GemmTestRunner:
                             latency,
                             throughput,
                             bandwidth,
+                            latency_asm,
+                            throughput_asm,
+                            bandwidth_asm,
                             latency_triton,
                             throughput_triton,
                             bandwidth_triton,
@@ -449,6 +462,9 @@ class GemmTestRunner:
                                 latency=latency,
                                 throughput=throughput,
                                 bandwidth=bandwidth,
+                                latency_asm=latency_asm,
+                                throughput_asm=throughput_asm,
+                                bandwidth_asm=bandwidth_asm,
                                 latency_triton=latency_triton,
                                 throughput_triton=throughput_triton,
                                 bandwidth_triton=bandwidth_triton,
@@ -472,7 +488,8 @@ class GemmTestRunner:
                 quant_types,
                 args.triton,
             )
-            save_gemm_benchmark_result(records, model.model_name, args.triton)
+            print("----records={}".format(records))
+            save_gemm_benchmark_result(records, model.model_name)
             if args.save_untuned_gemm:
                 save_untuned_gemm_csv(
                     f"{model.model_name}.csv", f"{model.model_name}_untuned_gemm"
@@ -485,7 +502,6 @@ def create_argument_parser():
         description="config input of test",
     )
     parser.add_argument(
-        "-d",
         "--dtype",
         type=str,
         choices=["bf16", "fp16"],
@@ -496,7 +512,6 @@ def create_argument_parser():
         e.g.: -d bf16""",
     )
     parser.add_argument(
-        "-q",
         "--quant_dtype",
         type=str,
         choices=["fp4x2", "fp8", "bf16"],
@@ -507,7 +522,6 @@ def create_argument_parser():
         e.g.: -q fp8""",
     )
     parser.add_argument(
-        "-qm",
         "--fp8_quant_method",
         type=str,
         choices=["per_tensor", "per_token", "per_block"],
@@ -518,7 +532,6 @@ def create_argument_parser():
         e.g.: -qm per_token""",
     )
     parser.add_argument(
-        "-m",
         "--model",
         type=str,
         choices=["Qwen3-32B", "Qwen3-30B", "Qwen3-235B", "Llama3-70B", "Llama3-405B"],
