@@ -1059,14 +1059,14 @@ def _attn_fwd_persistent_vanilla(
 
     continue_condition1 = False
 
-    for tile_id in tl.range(workgroup_id + NUM_WGS, num_tiles, step=NUM_WGS):
+    for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS):
         # next query load
         tile_id1 = tile_id + NUM_WGS
         off_q_head1 = tile_id1 % NUM_Q_HEADS
         start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
         off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
         offs_m1 = start_m1 * BLOCK_M + offs_m
-        if tile_id1 < num_tiles: # (only if there is a next tile)
+        if tile_id1 < num_tiles: # (pipeline the next tile only if there is a next tile)
             # check validity of the next tile
             continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = _check_validity(
                 offs_m1,
@@ -1178,7 +1178,6 @@ def _attn_fwd_persistent_vanilla(
         # make next tile current
         continue_condition0, seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0 =  continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 
         off_q_head0, start_m0, off_z0, offs_m0, q0 = off_q_head1, start_m1, off_z1, offs_m1, q1
-        q0 = q1
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(
