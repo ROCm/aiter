@@ -291,8 +291,7 @@ def fused_qk_rope_reshape_and_cache(
     q_out: torch.Tensor = None,
 ):
     """
-    Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
-    the concatentaed k_nope and k_pe are copied to kv_cache inplace
+    Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
 
     Key parameters:
     - q: shape (T, QH, D).
@@ -306,13 +305,13 @@ def fused_qk_rope_reshape_and_cache(
     -     value_cache: shape (T_cache, KH, D, block_size).
     - slot_mapping: shape (T_slot, ).
 
-    T is the number of decode tokens, T_cahce is the max number of tokens of kv_cache
+    T is the number of decode tokens, T_cahce * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
 
     Returns:
-    - q_out: The output matrix with shape (B, QH, D).
-    - key_cache: shape (T_cache, KH, D // x, block_size, x) (inplace).
-    - value_cache: shape (T_cache, KH, D, block_size) (inplace).
+    - q_out: same shape as input q.
+    - key_cache: same shape as input key_cache (inplace).
+    - value_cache: same shape as input value_cache (inplace).
     """
     _LOGGER.info(
         f"FUSED_QK_ROPE_RESHAPE_AND_CACHE: q={tuple(q.shape)} k={tuple(k.shape)} "
