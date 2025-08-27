@@ -722,8 +722,15 @@ struct CkMlaPrefillPolicy
 
     CK_TILE_HOST_DEVICE static constexpr int32_t GetSmemSize()
     {
-        return MakePShuffleLdsBlockDescriptor().get_element_space_size() * sizeof(AccType) +
-               GetPSmemStart();
+        constexpr int32_t kWarpGemmM = Traits::QKWarpTile::at(ck_tile::number<0>{});
+        constexpr int32_t ColWarps   = Traits::kBlockM / kWarpGemmM;
+        constexpr int32_t RowWarps   = Traits::kNumWarps / ColWarps;
+        constexpr int32_t p_shuffle_lds_size =
+            (RowWarps > 1)
+                ? MakePShuffleLdsBlockDescriptor().get_element_space_size() * sizeof(AccType)
+                : 0;
+
+        return p_shuffle_lds_size + GetPSmemStart();
     }
 
     template <int32_t KPerBlock = Traits::kBlockK0>
