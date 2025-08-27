@@ -315,6 +315,7 @@ def test_mha_with_pe(
 ):
     device: str = "cuda"
     dtype: torch.dtype = torch.float16
+    # |_ bfloat16 dtype didn't change anything
     DROPOUT: float = 0
     dropout_mask: torch.Tensor | None = None
     RETURN_LSE: bool = False
@@ -344,13 +345,22 @@ def test_mha_with_pe(
     )
 
     torch_out = attention_ref(
-        q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
+        q,
+        k,
+        v,
+        dropout_p=DROPOUT,
+        dropout_mask=dropout_mask,
+        causal=CAUSAL,
+        # upcast=False,
+        # |_ avoiding upcast didn't change anything
     )
     torch_out, _ = torch_out
 
     # This assertion is failing:
     # Mismatched elements: 45966898 / 67108864 (68.5%)
+    # |_ with atol = rtol = 1e-1 we get 0.8% element mismatch ratio (same as varlen test)
     # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.01 allowed)
+    # |_ with dtype = bfloat16 we get basically the same greatest absolute difference
     # Greatest relative difference: inf at index (0, 68, 96, 99) (up to 0.01 allowed)
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
