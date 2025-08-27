@@ -1683,6 +1683,12 @@ def _attn_fwd_persistent_vanilla(
             BLOCK_DMODEL_POW2,
             IS_FP8,
         )
+    else:
+        q0 = tl.full((BLOCK_M, BLOCK_DMODEL_POW2), 0.0, dtype=tl.float16)
+        descale_q0 = 1.
+        descale_k0 = 1.
+        descale_v0 = 1.
+        alibi_slope0 = 0
     for tile_id in tl.range(workgroup_id + NUM_WGS, num_tiles, step=NUM_WGS, flatten=True):
         # full iteration
         off_q_head = tile_id % NUM_Q_HEADS
@@ -1757,6 +1763,12 @@ def _attn_fwd_persistent_vanilla(
                 BLOCK_DMODEL_POW2,
                 IS_FP8,
             )
+        else:
+            q = tl.full((BLOCK_M, BLOCK_DMODEL_POW2), 0.0, dtype=tl.float16)
+            descale_q = 1.
+            descale_k = 1.
+            descale_v = 1.
+            alibi_slope = 0
 
         if continue_condition0:
             # print(type(q0), q0.shape, continue_condition0, continue_condition)
