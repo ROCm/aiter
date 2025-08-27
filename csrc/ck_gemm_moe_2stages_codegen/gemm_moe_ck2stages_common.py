@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
@@ -11,7 +12,7 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx # noqa: E402
+from chip_info import get_gfx  # noqa: E402
 
 
 @dataclass
