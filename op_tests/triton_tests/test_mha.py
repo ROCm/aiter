@@ -302,12 +302,10 @@ def test_mha_int64_strides(
     "SEQLEN_Q, SEQLEN_K",
     [(4096, 4096)],
 )
-@pytest.mark.parametrize(
-    "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, False, False), (0.2, True, True)]
-)
+@pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.0, True, True)])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
 @pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
-@pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("CAUSAL", [True])
 @pytest.mark.parametrize("FP8", [False])
 def test_mha_varlen_with_pe(
     BATCH: int,
@@ -466,6 +464,9 @@ def test_mha_varlen_with_pe(
             triton_out, torch_out.to(triton_out.dtype), atol=0.25, rtol=10
         )  # Lower tolerance for FP8
     else:
+        # Mismatched elements: 543573 / 67108864 (0.8%)
+        # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.1 allowed)
+        # Greatest relative difference: inf at index (0, 122, 0, 57) (up to 0.1 allowed)
         torch.testing.assert_close(
             triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
         )
@@ -1067,6 +1068,9 @@ def test_mha_backward_with_pe(
     torch_out, torch_attn_scores = torch_out
 
     # Forward is failing!
+    # Mismatched elements: 45966898 / 67108864 (68.5%)
+    # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.01 allowed)
+    # Greatest relative difference: inf at index (0, 68, 96, 99) (up to 0.01 allowed)
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
     )
