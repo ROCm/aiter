@@ -33,7 +33,6 @@ from unittest.mock import patch
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 import os
 from aiter import logger
@@ -102,7 +101,6 @@ def _register_group(group: "GroupCoordinator") -> None:
 
 
 if supports_custom_op():
-    @torch_compile_guard(mutates_args=["tensor"])
     def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
@@ -114,7 +112,6 @@ if supports_custom_op():
     # def _(tensor: torch.Tensor, group_name: str) -> None:
     #     return
 
-    @torch_compile_guard()
     def outplace_all_reduce(
         tensor: torch.Tensor, open_fp8_quant: bool, group_name: str
     ) -> torch.Tensor:
