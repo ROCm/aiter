@@ -295,6 +295,67 @@ def test_mha_int64_strides(
 
 
 # Run with:
+# pytest -s op_tests/triton_tests/test_mha.py::test_mha_with_pe
+@pytest.mark.skip(reason="This feature is under development")
+@pytest.mark.parametrize("BATCH", [1])
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K",
+    [(4096, 4096)],
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
+def test_mha_with_pe(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ_QK: int,
+    HEAD_SZ_V: int,
+):
+    device: str = "cuda"
+    dtype: torch.dtype = torch.float16
+    DROPOUT: float = 0
+    dropout_mask: torch.Tensor | None = None
+    RETURN_LSE: bool = False
+    RETURN_SOFTMAX: bool = False
+    CAUSAL: bool = True
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn(
+        (BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
+    )
+    k = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_QK), device=device, dtype=dtype
+    )
+    v = torch.randn(
+        (BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ_V), device=device, dtype=dtype
+    )
+
+    triton_out = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
+
+    torch_out = attention_ref(
+        q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
+    )
+    torch_out, _ = torch_out
+
+    # This assertion is failing:
+    # Mismatched elements: 45966898 / 67108864 (68.5%)
+    # Greatest absolute difference: 1.2060546875 at index (0, 86, 70, 14) (up to 0.01 allowed)
+    # Greatest relative difference: inf at index (0, 68, 96, 99) (up to 0.01 allowed)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+
+# Run with:
 # pytest -s op_tests/triton_tests/test_mha.py::test_mha_varlen_with_pe
 @pytest.mark.skip(reason="This feature is under development")
 @pytest.mark.parametrize("BATCH", [1])
