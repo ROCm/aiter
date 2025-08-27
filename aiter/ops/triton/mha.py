@@ -1543,81 +1543,161 @@ def _attn_fwd_persistent_vanilla(
     tilecounts_q = [3, 2, 1], i.e. 3 sequences in the batch are >= 0, 2 sequences are >= 100, and 1 sequence is >= 200. 
     to get cu_tilecounts_q we do a cumsum and add 0 in front.
     """
+    (
+        stride_qz,
+        stride_qm,
+        stride_qk,
+        stride_qh,
+        stride_kz,
+        stride_kh,
+        stride_kn,
+        stride_kk,
+        stride_vz,
+        stride_vh,
+        stride_vn,
+        stride_vk,
+        stride_descale_q_z,
+        stride_descale_k_z,
+        stride_descale_v_z,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_on,
+        stride_alibi_z,
+        stride_alibi_h,
+        philox_offset_base,
+        stride_sd_z,
+        stride_sd_h,
+        stride_sd_m,
+        stride_sd_n,
+        stride_lse_z,
+        stride_lse_h,
+        stride_lse_m,
+    ) = _upcast_strides(
+        stride_qz_in,
+        stride_qh_in,
+        stride_qm_in,
+        stride_qk_in,
+        stride_kz_in,
+        stride_kh_in,
+        stride_kn_in,
+        stride_kk_in,
+        stride_vz_in,
+        stride_vh_in,
+        stride_vn_in,
+        stride_vk_in,
+        stride_descale_q_z_in,
+        stride_descale_k_z_in,
+        stride_descale_v_z_in,
+        stride_oz_in,
+        stride_oh_in,
+        stride_om_in,
+        stride_on_in,
+        stride_alibi_z_in,
+        stride_alibi_h_in,
+        stride_sd_z_in,
+        stride_sd_h_in,
+        stride_sd_m_in,
+        stride_sd_n_in,
+        stride_lse_z_in,
+        stride_lse_h_in,
+        stride_lse_m_in,
+        philox_offset_base_in,
+        IS_FP8,
+        USE_INT64_STRIDES,
+    )
     # max num blocks along seqlen
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
     workgroup_id = tl.program_id(
         0
     )  # persistent workgroup id ranging: 0,1,2,...., NUM_WGS - 1
-    for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, flatten=True):
-        off_q_head = tile_id % NUM_Q_HEADS
-        start_m = tile_id // NUM_Q_HEADS % NUM_BLOCKS
-        off_z = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
+    # prologue
+    off_q_head0 = workgroup_id % NUM_Q_HEADS
+    start_m0 = workgroup_id // NUM_Q_HEADS % NUM_BLOCKS
+    off_z0 = workgroup_id // (NUM_Q_HEADS * NUM_BLOCKS)
+    (
+        continue_condition0,
+        cu_seqlens_q_start0,
+        cu_seqlens_k_start0,
+        seqlen_q0,
+        seqlen_k0,
+        offs_m0,
+        offs_n0,
+        offs_d0
+    ) = _preprocess_tile(
+        start_m0,
+        off_z0,
+        off_q_head0,
+        out_ptr,
+        softmax_lse_ptr,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_on,
+        stride_lse_z,
+        stride_lse_h,
+        stride_lse_m,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        SEQLEN_Q,
+        SEQLEN_K,
+        IS_CAUSAL,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_DMODEL,
+        BLOCK_DMODEL_POW2,
+        VARLEN,
+    )
+    if continue_condition0:
         (
+            alibi_slope0,
+            q0,
+            descale_q0,
+            descale_k0,
+            descale_v0,
+        ) =_process_tile(
+            offs_m0,
+            offs_d0,
+            off_z0,
+            off_q_head0,
+            q_ptr,
+            descale_q_ptr,
+            descale_k_ptr,
+            descale_v_ptr,
+            alibi_slopes_ptr,
             stride_qz,
+            stride_qh,
             stride_qm,
             stride_qk,
-            stride_qh,
-            stride_kz,
-            stride_kh,
-            stride_kn,
-            stride_kk,
-            stride_vz,
-            stride_vh,
-            stride_vn,
-            stride_vk,
             stride_descale_q_z,
             stride_descale_k_z,
             stride_descale_v_z,
-            stride_oz,
-            stride_oh,
-            stride_om,
-            stride_on,
             stride_alibi_z,
             stride_alibi_h,
-            philox_offset_base,
-            stride_sd_z,
-            stride_sd_h,
-            stride_sd_m,
-            stride_sd_n,
-            stride_lse_z,
-            stride_lse_h,
-            stride_lse_m,
-        ) = _upcast_strides(
-            stride_qz_in,
-            stride_qh_in,
-            stride_qm_in,
-            stride_qk_in,
-            stride_kz_in,
-            stride_kh_in,
-            stride_kn_in,
-            stride_kk_in,
-            stride_vz_in,
-            stride_vh_in,
-            stride_vn_in,
-            stride_vk_in,
-            stride_descale_q_z_in,
-            stride_descale_k_z_in,
-            stride_descale_v_z_in,
-            stride_oz_in,
-            stride_oh_in,
-            stride_om_in,
-            stride_on_in,
-            stride_alibi_z_in,
-            stride_alibi_h_in,
-            stride_sd_z_in,
-            stride_sd_h_in,
-            stride_sd_m_in,
-            stride_sd_n_in,
-            stride_lse_z_in,
-            stride_lse_h_in,
-            stride_lse_m_in,
-            philox_offset_base_in,
+            cu_seqlens_q_start0,
+            seqlen_q0,
+            NUM_Q_HEADS,
+            NUM_K_HEADS,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
             IS_FP8,
-            USE_INT64_STRIDES,
         )
+    for tile_id in tl.range(workgroup_id + NUM_WGS, num_tiles, step=NUM_WGS, flatten=True):
+        # full iteration
+        off_q_head = tile_id % NUM_Q_HEADS
+        start_m = tile_id // NUM_Q_HEADS % NUM_BLOCKS
+        off_z = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
+
         (
-            continue_condition, cu_seqlens_q_start, cu_seqlens_k_start, seqlen_q, seqlen_k, offs_m, offs_n, offs_d
+            continue_condition,
+            cu_seqlens_q_start,
+            cu_seqlens_k_start,
+            seqlen_q,
+            seqlen_k,
+            offs_m,
+            offs_n,
+            offs_d
         ) = _preprocess_tile(
             start_m,
             off_z,
@@ -1678,21 +1758,23 @@ def _attn_fwd_persistent_vanilla(
                 IS_FP8,
             )
 
+        if continue_condition0:
+            # print(type(q0), q0.shape, continue_condition0, continue_condition)
             _compute_tile(
-                start_m,
-                offs_m,
-                offs_n,
-                offs_d,
-                off_z,
-                off_q_head,
-                q,
+                start_m0,
+                offs_m0,
+                offs_n0,
+                offs_d0,
+                off_z0,
+                off_q_head0,
+                q0,
                 k_ptr,
                 v_ptr,
-                descale_q,
-                descale_k,
-                descale_v,
+                descale_q0,
+                descale_k0,
+                descale_v0,
                 out_ptr,
-                alibi_slope,
+                alibi_slope0,
                 s_dmask_ptr,
                 dropout_mask_ptr,
                 softmax_lse_ptr,
@@ -1716,13 +1798,13 @@ def _attn_fwd_persistent_vanilla(
                 stride_lse_h,
                 stride_lse_m,
                 sm_scale,
-                cu_seqlens_q_start,
-                seqlen_q,
-                cu_seqlens_k_start,
-                seqlen_k,
+                cu_seqlens_q_start0,
+                seqlen_q0,
+                cu_seqlens_k_start0,
+                seqlen_k0,
                 dropout_p,
                 philox_seed,
-                philox_offset_base,
+                philox_offset_base + (tile_id - NUM_WGS) * 2048, # each tile uses 2048 random numbers
                 IS_CAUSAL,
                 NUM_Q_HEADS,
                 NUM_K_HEADS,
@@ -1734,7 +1816,23 @@ def _attn_fwd_persistent_vanilla(
                 ENABLE_DROPOUT,
                 IS_FP8,
                 FP8_MAX,
-            )        
+            )
+
+        continue_condition0 = continue_condition
+        if continue_condition:
+            cu_seqlens_q_start0 = cu_seqlens_q_start
+            cu_seqlens_k_start0 = cu_seqlens_k_start
+            seqlen_q0 = seqlen_q
+            seqlen_k0 = seqlen_k
+            offs_m0 = offs_m
+            offs_n0 = offs_n
+            offs_d0 = offs_d
+            alibi_slope0 = alibi_slope
+            q0 = q
+            descale_q0 = descale_q
+            descale_k0 = descale_k
+            descale_v0 = descale_v
+
     
 @triton.jit
 def find_seq_idx(
