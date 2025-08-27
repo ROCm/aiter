@@ -396,8 +396,12 @@ def attention_ref(
     d = q.shape[-1]
     if not reorder_ops:
         scores = torch.einsum("bthd,bshd->bhts", q / math.sqrt(d), k)
+        # scores = torch.einsum("bthd,bshd->bhts", q, k)
     else:
         scores = torch.einsum("bthd,bshd->bhts", q, k / math.sqrt(d))
+        # scores = torch.einsum("bthd,bshd->bhts", q, k)
+    # scores *= 1 / math.sqrt(d)
+    # |_ applying softmax scale on scores didn't change anything
     if softcap > 0:
         scores = scores / softcap
         scores = scores.tanh()
