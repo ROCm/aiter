@@ -300,10 +300,10 @@ def test_mha_int64_strides(
 @pytest.mark.parametrize("BATCH", [1])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
-    [(4096, 4096)],
+    [(4096, 4096), (2048, 2048), (1024, 1024)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128)])
-@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(128, 128), (64, 64), (32, 32)])
+@pytest.mark.parametrize("HEAD_SZ_QK, HEAD_SZ_V", [(192, 128), (96, 32), (48, 16)])
 def test_mha_with_pe(
     BATCH: int,
     SEQLEN_Q: int,
