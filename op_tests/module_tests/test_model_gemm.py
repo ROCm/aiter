@@ -3,7 +3,6 @@
 Gemm Test Runner at Model Level
 Manages test parameters and executes test_gemm.py/test_gemm_a4w4.py/test_gemm_a8w8.py with user-defined argument combinations
 """
-import os
 import logging
 from aiter import dtypes
 from dataclasses import dataclass
@@ -18,34 +17,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-M = [
-    1,
-    4,
-    8,
-    16,
-    32,
-    64,
-    128,
-    160,
-    192,
-    224,
-    256,
-    288,
-    320,
-    352,
-    384,
-    416,
-    448,
-    480,
-    512,
-    1024,
-    2048,
-    4096,
-    8192,
-    16384,
-    32768,
-]
 
 
 @dataclass
@@ -157,7 +128,7 @@ def run_a16w16_gemm(dtype, record, run_triton=False):
         from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import bench_gemm_fn
 
         latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-    return latency, latency_asm, latency_triton
+    return latency, latency_asm, latency_triton * 1000
 
 
 def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
@@ -200,7 +171,6 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
 
     latency_triton = 0.0
     if run_triton:
-        pre_shuffle_scales = os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "1")
         if fp8_quant_method == "per_tensor":
             from op_tests.op_benchmarks.triton.bench_gemm_a8w8 import bench_gemm_fn
         elif fp8_quant_method == "per_token":
@@ -214,7 +184,7 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
         else:
             raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
         latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-    return latency, latency_asm, latency_triton
+    return latency, latency_asm, latency_triton * 1000
 
 
 def run_a4w4_gemm(dtype, record, run_triton=False):
@@ -240,7 +210,7 @@ def run_a4w4_gemm(dtype, record, run_triton=False):
 
         latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
 
-    return latency, latency_asm, latency_triton
+    return latency, latency_asm, latency_triton * 1000
 
 
 class GemmTestRunner:
@@ -253,7 +223,7 @@ class GemmTestRunner:
             return True
         return False
 
-    def get_gemm_shape(self, config: TestConfig, TP_list):
+    def get_gemm_shape(self, config: TestConfig, M, TP_list):
         test_name = str(config)
         logger.info(f"Running test: {test_name}")
 
@@ -405,6 +375,36 @@ class GemmTestRunner:
                 models.append(value)
         else:
             models.append(TEST_CONFIGS[args.model])
+        if args.m is not None:
+            M = list(args.m)
+        else:
+            M = [
+                1,
+                4,
+                8,
+                16,
+                32,
+                64,
+                128,
+                160,
+                192,
+                224,
+                256,
+                288,
+                320,
+                352,
+                384,
+                416,
+                448,
+                480,
+                512,
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+            ]
 
         if args.tensor_parallel is None:
             TP_list = [1, 4, 8]
@@ -428,11 +428,12 @@ class GemmTestRunner:
         else:
             fp8_quant_methods = [args.fp8_quant_method]
 
-        return models, TP_list, output_types, quant_types, fp8_quant_methods
+        return models, M, TP_list, output_types, quant_types, fp8_quant_methods
 
     def run_single_test(
         self,
         config,
+        M,
         TP_list,
         fp8_quant_methods,
         output_types,
@@ -440,7 +441,7 @@ class GemmTestRunner:
         bench_triton,
     ):
         """Run a single test with given configuration"""
-        records = self.get_gemm_shape(config, TP_list)
+        records = self.get_gemm_shape(config, M, TP_list)
 
         records_result = []
         for quant_dtype in quant_types:
@@ -490,13 +491,14 @@ class GemmTestRunner:
     def run_all_tests(self, args):
         """Run all defined tests"""
         logger.info("Starting all GEMM Benchmark from Models...")
-        models, TP_list, output_types, quant_types, fp8_quant_methods = (
+        models, M, TP_list, output_types, quant_types, fp8_quant_methods = (
             self.extract_configuration(args)
         )
         logger.info(f"Total tests: {len(models)}")
         for model in models:
             records = self.run_single_test(
                 model,
+                M,
                 TP_list,
                 fp8_quant_methods,
                 output_types,
@@ -556,6 +558,15 @@ def create_argument_parser():
         e.g. -m Llama3-70B""",
     )
     parser.add_argument(
+        "--m",
+        type=dtypes.str2tuple,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""M dimention of GEMM.
+        e.g.: -m 1024,2048""",
+    )
+    parser.add_argument(
         "-tp",
         "--tensor-parallel",
         type=int,
@@ -572,7 +583,7 @@ def create_argument_parser():
         help="benchmark triton kernel",
     )
     parser.add_argument(
-        "--save-untuned-gemm",
+        "--save_untuned_gemm",
         action="store_true",
         help="save the untuned_gemm and untun_gemm_bf16 csv files at model level",
     )

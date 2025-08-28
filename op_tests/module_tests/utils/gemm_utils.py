@@ -61,7 +61,6 @@ def save_gemm_benchmark_result(records, csv_file_name):
         "bandwidth_triton",
     ]
 
-    print("====records={}".format(records))
     with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
