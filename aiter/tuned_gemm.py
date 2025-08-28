@@ -17,15 +17,78 @@
 
 import os
 from pathlib import Path
-import functools
 import pandas as pd
+import functools
 import torch
 import torch.nn.functional as F
 from aiter import hipb_create_extension, hipb_mm, getHipblasltKernelName
 from aiter import rocb_create_extension, rocb_mm
 from aiter import logger, dtypes
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.jit.utils.chip_info import get_cu_num
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+bestsols = {}
+
+
+@torch_compile_guard()
+def load_best_sols_custom(tune_path: str) -> bool:
+    global bestsols
+    cu_count = get_cu_num()
+    if tune_path is not None and Path(tune_path).is_file():
+        bestsols = pd.read_csv(tune_path)
+        bestsols = bestsols[bestsols["cu_num"] == cu_count]
+        if len(bestsols) > 0 and "kernelName" in bestsols.columns:
+            hipblasltKernelNames = bestsols.apply(
+                lambda s: (
+                    getHipblasltKernelName(s.solidx)
+                    if s.libtype == "hipblaslt"
+                    else "rocblas"
+                ),
+                axis=1,
+            )
+            pd.set_option("display.max_colwidth", 100)
+            assert hipblasltKernelNames.equals(bestsols["kernelName"].fillna("")), (
+                "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
+                + f"differece:\n{pd.concat([bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != bestsols['kernelName'].fillna('')]}"
+            )
+            return True
+
+    return False
+
+
+@functools.lru_cache(maxsize=4096)
+def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
+    # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+    #     if n > 8 and 0 < m <= 4:
+    #         return 3, 0
+    #     elif n % 4 == 0 and m == 1 and k <= 8192:
+    #         return 3, 1
+    soltype = None
+    if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
+        if (
+            (
+                (m == 1 and n <= 2 * self.cu_count)
+                or (m > 1 and m <= 4 and n <= self.cu_count)
+            )
+            and k <= 9216
+            or (m > 4 and m <= 8 and n <= self.cu_count)
+            and k <= 5120
+            or (m > 8 and m <= 16 and n <= self.cu_count)
+            and k <= 256
+        ):
+            soltype, solidx = 3, 2
+    if soltype is None:
+        soltype, solidx = self.solids.get(
+            (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
+        )
+    solution_name = self.solMap[soltype]
+
+    logger.info(
+        f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
+    )
+    return soltype, solidx
 
 
 class TunedGemm:
@@ -53,25 +116,9 @@ class TunedGemm:
             self.tuned_df = None
 
     def load_best_sols(self):
-        if self.tune_path is not None and Path(self.tune_path).is_file():
-            self.bestsols = pd.read_csv(self.tune_path)
-            self.bestsols = self.bestsols[self.bestsols["cu_num"] == self.cu_count]
-            if len(self.bestsols) > 0 and "kernelName" in self.bestsols.columns:
-                hipblasltKernelNames = self.bestsols.apply(
-                    lambda s: (
-                        getHipblasltKernelName(s.solidx)
-                        if s.libtype == "hipblaslt"
-                        else "rocblas"
-                    ),
-                    axis=1,
-                )
-                pd.set_option("display.max_colwidth", 100)
-                assert hipblasltKernelNames.equals(
-                    self.bestsols["kernelName"].fillna("")
-                ), (
-                    "error: gradlib tune gemm not match the current environment, need re-tune!!!\n"
-                    + f"differece:\n{pd.concat([self.bestsols[['solidx','kernelName']], hipblasltKernelNames], axis=1)[hipblasltKernelNames != self.bestsols['kernelName'].fillna('')]}"
-                )
+        if load_best_sols_custom(self.tune_path):
+            global bestsols
+            self.bestsols = bestsols
 
     def create_ds(self):
         df: pd.DataFrame = self.bestsols
@@ -99,38 +146,6 @@ class TunedGemm:
             self.apply_rocb_mm,
             self.apply_skinny,
         ]
-
-    @functools.lru_cache(maxsize=4096)
-    def query_sol(self, m, n, k, bias, dtype, otype, scaleAB=False):
-        # if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-        #     if n > 8 and 0 < m <= 4:
-        #         return 3, 0
-        #     elif n % 4 == 0 and m == 1 and k <= 8192:
-        #         return 3, 1
-        soltype = None
-        if dtype in [dtypes.fp16, dtypes.bf16] and k % 8 == 0:
-            if (
-                (
-                    (m == 1 and n <= 2 * self.cu_count)
-                    or (m > 1 and m <= 4 and n <= self.cu_count)
-                )
-                and k <= 9216
-                or (m > 4 and m <= 8 and n <= self.cu_count)
-                and k <= 5120
-                or (m > 8 and m <= 16 and n <= self.cu_count)
-                and k <= 256
-            ):
-                soltype, solidx = 3, 2
-        if soltype is None:
-            soltype, solidx = self.solids.get(
-                (m, n, k, bias, str(dtype), str(otype), scaleAB), (0, 0)
-            )
-        solution_name = self.solMap[soltype]
-
-        logger.info(
-            f"using {solution_name} solution:{solidx} for {m=} {n=} {k=} {dtype=} {bias=}, {scaleAB=}"
-        )
-        return soltype, solidx
 
     def apply_skinny(
         self,
@@ -290,7 +305,8 @@ class TunedGemm:
         m, k = inp_view.shape
         n = weights.shape[0]
         use_bias = bias is not None
-        soltype, solidx = self.query_sol(
+        soltype, solidx = query_sol(
+            self,
             m=m,
             n=n,
             k=k,

@@ -25,7 +25,6 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-import os
 from .custom_all_reduce_utils import gpu_p2p_access_check
 from .parallel_state import in_the_same_node_as
 from .utils import get_cuda_visible_devices
