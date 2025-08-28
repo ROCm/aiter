@@ -10,7 +10,7 @@
 
 namespace aiter {
 namespace torch_itfs {
-mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
+mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
                                           // sizes
@@ -64,12 +64,12 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
     ck_tile::index_t nhead_stride_lse = has_lse ? softmax_lse.stride(0) : 0;
     ck_tile::index_t nhead_stride_randval = has_dropout_randval ? dropout_randval.stride(0) : 0;
 
-    ck_tile::index_t batch_stride_q = 0;
-    ck_tile::index_t batch_stride_k = 0;
-    ck_tile::index_t batch_stride_v = 0;
-    ck_tile::index_t batch_stride_o = 0;
-    ck_tile::index_t batch_stride_lse = 0;
-    ck_tile::index_t batch_stride_randval = 0;
+    ck_tile::index_t batch_stride_q = total_q * q.stride(0);
+    ck_tile::index_t batch_stride_k = total_k * k.stride(0);
+    ck_tile::index_t batch_stride_v = total_k * v.stride(0);
+    ck_tile::index_t batch_stride_o = total_q * h * v.stride(1);
+    ck_tile::index_t batch_stride_lse = has_lse ? h * softmax_lse.stride(0) : 0;
+    ck_tile::index_t batch_stride_randval = has_dropout_randval ? h * dropout_randval.stride(0) : 0;
 
     void *bias_ptr = nullptr;
     ck_tile::index_t stride_bias = 0;
@@ -145,162 +145,17 @@ mha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          drop_seed_offset};
 }
 
-fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
-                                                          const mask_info &mask,
-                                                          const int b,
-                                                          const int max_seqlen_q,
-                                                          const int h,
-                                                          const int h_k,
-                                                          const int d,
-                                                          const int d_v,
-                                                          const int page_block_size,
-                                                          const int num_splits,
-                                                          float softmax_scale,
-                                                          float logits_soft_cap,
-                                                          // device pointers
-                                                          const at::Tensor q,
-                                                          const at::Tensor k,
-                                                          const at::Tensor v,
-                                                          const at::Tensor cu_seqlens_q,
-                                                          std::optional<const at::Tensor> &cu_seqlens_k,
-                                                          std::optional<const at::Tensor> &seqlens_k,
-                                                          std::optional<const at::Tensor> &block_table_,
-                                                          std::optional<const at::Tensor> &bias_,
-                                                          std::optional<const at::Tensor> &alibi_slopes_,
-                                                          at::Tensor out,
-                                                          at::Tensor lse,
-                                                          at::Tensor lse_acc,
-                                                          at::Tensor out_acc)
-{
-    // q: (total_q, nheads, d)
-    // k: (num_blocks, page_block_size, num_heads_k, d)
-    // v: (num_blocks, page_block_size, num_heads_k, d_v)
-    // o: (total_q, nheads, d_v)
-
-    // bias:(total_q, max_seqlen_k)
-    // alibi_slopes:(batch_size, nheads) or (nhead)
-    // lse: (nheads, total_q)
-    // lse_acc: (nheads, split, total_q)
-    // o_acc: (nheads, split, total_q, d_v)
-    // block_table: (batch_size, max_num_blocks_per_seq)
-
-    fmha_fwd_splitkv_args args;
-    args.q_ptr = q.data_ptr();
-    args.k_ptr = k.data_ptr();
-    args.v_ptr = v.data_ptr();
-    args.bias_ptr = nullptr;
-    args.lse_acc_ptr = lse_acc.data_ptr();
-    args.o_acc_ptr = out_acc.data_ptr();
-    args.lse_ptr = nullptr;
-    args.o_ptr = out.data_ptr();
-
-    if (block_table_.has_value())
-    {
-        auto block_table = block_table_.value();
-        args.block_table_ptr = block_table.data_ptr();
-        args.batch_stride_block_table = block_table.stride(0);
-        args.page_block_size = page_block_size;
-    }
-    else
-    {
-        args.block_table_ptr = nullptr;
-        args.batch_stride_block_table = 0;
-        args.page_block_size = 0;
-    }
-
-    args.is_gappy = false;
-    args.cache_batch_idx = nullptr;
-
-    args.seqstart_q_ptr = cu_seqlens_q.data_ptr();
-    if (cu_seqlens_k.has_value()) {
-        args.seqstart_k_ptr = cu_seqlens_k.value().data_ptr();
-    }
-    else {
-        args.seqstart_k_ptr = nullptr;
-    }
-    if (seqlens_k.has_value()) {
-        args.seqlen_k_ptr = seqlens_k.value().data_ptr();
-    }
-    else {
-        args.seqlen_k_ptr = nullptr;
-    }
-
-    args.batch = b;
-    args.max_seqlen_q = max_seqlen_q;
-    args.hdim_q = d;
-    args.hdim_v = d_v;
-    args.nhead_q = h;
-    args.nhead_k = h_k;
-    args.num_splits = num_splits;
-
-    args.scale_s = softmax_scale;
-    args.scale_p = 1;
-    args.scale_o = 1;
-
-    args.logits_soft_cap = logits_soft_cap;
-
-    args.batch_stride_q = 0;
-    args.stride_q = q.stride(0);
-    args.nhead_stride_q = q.stride(1);
-
-    args.batch_stride_k = k.stride(0);
-    args.stride_k = k.stride(1);
-    args.nhead_stride_k = k.stride(2);
-
-    args.batch_stride_v = v.stride(0);
-    args.stride_v = v.stride(1);
-    args.nhead_stride_v = v.stride(2);
-
-    args.batch_stride_o = 0;
-    args.stride_o = out.stride(0);
-    args.nhead_stride_o = out.stride(1);
-
-    args.batch_stride_bias = 0;
-    args.stride_bias = 0;
-    args.nhead_stride_bias = 0;
-
-    args.batch_stride_lse = 0;
-    args.nhead_stride_lse = 0;
-
-    args.batch_stride_lse_acc = 0;
-    args.nhead_stride_lse_acc = lse_acc.stride(0);
-    args.split_stride_lse_acc = lse_acc.stride(1);
-
-    args.batch_stride_o_acc = 0;
-    args.nhead_stride_o_acc = out_acc.stride(0);
-    args.split_stride_o_acc = out_acc.stride(1);
-    args.stride_o_acc = out_acc.stride(2);
-
-    if (has_lse) {
-        args.lse_ptr = lse.data_ptr();
-        args.batch_stride_lse = 0;
-        args.nhead_stride_lse = lse.stride(0);
-    }
-
-    TORCH_CHECK(!bias_.has_value(), "Page attention does not supports bias for now");
-    if (alibi_slopes_.has_value()) {
-        auto alibi_slopes = alibi_slopes_.value();
-        CHECK_DEVICE(alibi_slopes);
-        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
-        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({h}) || alibi_slopes.sizes() == torch::IntArrayRef({b, h}));
-        args.bias_ptr = alibi_slopes.data_ptr();
-        args.stride_bias = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
-    }
-
-    args.window_size_left = mask.left;
-    args.window_size_right = mask.right;
-    args.mask_type = static_cast<ck_tile::index_t>(mask.type);
-
-    return args;
-}
-
 
 std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
+fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                const at::Tensor &k,            // [total_k, hk, d]
                const at::Tensor &v,            // [total_k, hk, d]
                const at::Tensor &cu_seqlens_q, // [b+1]
                std::optional<const at::Tensor> &cu_seqlens_k, // [b+1]
+                // FIXME: this two args currently not support on ck side
+                //        and has no host code on aiter side
+                //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
+                //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
                int max_seqlen_q,
                int max_seqlen_k,
                int min_seqlen_q,
@@ -313,6 +168,7 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                int window_size_right,
                bool return_softmax_lse,
                bool return_dropout_randval,
+               int how_v3_bf16_cvt,
                std::optional<at::Tensor> out_,                // [total_q, hq, d]
                std::optional<const at::Tensor> block_table_,  // [hq] or [b, hq]
                std::optional<const at::Tensor> bias_,         // [total_q, max_seqlen_k]
@@ -487,95 +343,46 @@ mha_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
         auto stream = at::cuda::getCurrentHIPStream().stream();
         ck_tile::stream_config stream_config{stream};
 
-        if (paged_KV)
-        {
-            int num_splits = 0;
-            num_splits = aiter::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size_v, 0, num_splits);
-            TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
-            TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
-        
-            auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
-            auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size_v}, opts.dtype(at::kFloat));
+        TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");
+        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
+        auto args =
+            get_asm_mha_varlen_fwd_args(
+                has_lse,
+                return_dropout_randval,
+                mask,
+                batch_size,
+                max_seqlen_q,
+                num_heads,
+                num_heads_k,
+                head_size_q,
+                head_size_v,
+                min_seqlen_q,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqlens_k,
+                bias_,
+                alibi_slopes_,
+                out,
+                softmax_lse,
+                p,
+                softmax_scale,
+                logits_soft_cap,
+                p_dropout,
+                drop_seed_offset);
 
-            auto args =
-                get_ck_fmha_varlen_fwd_splitkv_args(
-                    has_lse,
-                    mask,
-                    batch_size,
-                    max_seqlen_q,
-                    num_heads,
-                    num_heads_k,
-                    head_size_q,
-                    head_size_v,
-                    page_block_size,
-                    num_splits,
-                    softmax_scale,
-                    logits_soft_cap,
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    seqlens_k,
-                    block_table_,
-                    bias_,
-                    alibi_slopes_,
-                    out,
-                    softmax_lse,
-                    softmax_lse_accum,
-                    out_accum);
-
-            float t = aiter::mha_fwd_splitkv(args,
-                                             stream_config,
-                                             q_dtype_str,
-                                             true, //is_group_mode
-                                             mask.type,
-                                             bias_type,
-                                             has_lse);
-            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd_splitkv");
-        }
-        else
-        {
-            TORCH_CHECK(cu_seqlens_k.has_value(), "cu_seqlens_k must be provided if paged_KV is false");
-            auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
-            auto args =
-                get_ck_fmha_varlen_fwd_args(
-                    has_lse,
-                    return_dropout_randval,
-                    mask,
-                    batch_size,
-                    max_seqlen_q,
-                    num_heads,
-                    num_heads_k,
-                    head_size_q,
-                    head_size_v,
-                    min_seqlen_q,
-                    q,
-                    k,
-                    v,
-                    cu_seqlens_q,
-                    cu_seqlens_k,
-                    seqlens_k,
-                    bias_,
-                    alibi_slopes_,
-                    out,
-                    softmax_lse,
-                    p,
-                    softmax_scale,
-                    logits_soft_cap,
-                    p_dropout,
-                    drop_seed_offset);
-
-            float t = aiter::mha_fwd(args,
-                                     stream_config,
-                                     q_dtype_str,
-                                     true, //is_group_mode
-                                     mask.type,
-                                     bias_type,
-                                     has_lse,
-                                     false);
-            TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
-        }
+        float t = aiter::mha_fwd(args,
+                                stream_config,
+                                q_dtype_str,
+                                true, //is_group_mode
+                                mask.type,
+                                bias_type,
+                                has_lse,
+                                true,
+                                how_v3_bf16_cvt);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd 3");
     }
     else {
         // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.

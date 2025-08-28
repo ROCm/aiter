@@ -52,6 +52,7 @@ if IS_ROCM:
             "module_mha_batch_prefill",
             "module_fmha_v3_bwd",
             "module_fmha_v3_varlen_bwd",
+            "module_fmha_v3_varlen_fwd",
             "module_mha_bwd",
             "module_mha_varlen_bwd",
         ]

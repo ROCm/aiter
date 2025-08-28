@@ -493,6 +493,7 @@ MANUAL_SCHEMA_OPS = [
     "fmha_v3_bwd",
     "mha_varlen_bwd",
     "fmha_v3_varlen_bwd",
+    "fmha_v3_varlen_fwd",
     "mha_batch_prefill",
     "hipb_findallsols",
     "rocb_findallsols",
@@ -597,7 +598,6 @@ def compile_ops(
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
     gen_fake: Optional[Callable[..., Any]] = None,
 ):
-
     def decorator(func):
         import torch
         from csrc.cpp_itfs.torch_utils import aiter_lib
