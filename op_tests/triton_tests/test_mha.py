@@ -12,7 +12,10 @@ from aiter.ops.triton.mha import (
     flash_attn_varlen_func_v3,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
+    _cast_to_fp8,
+    _cast_varlen_to_fp8,
 )
+from aiter.ops.triton.utils.arch_info import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     generate_random_padding_mask,
@@ -109,7 +112,7 @@ def fp8_assert_close(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True)])
+@pytest.mark.parametrize("FP8", [(True), (False)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -131,14 +134,25 @@ def test_mha(
 
     dropout_mask = None
     if FP8:
+        if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
+            pytest.skip(
+                "flash_attn_func_v3 doesn't support dropout, return_lse, or return_attn_probs"
+            )
+
+        fp8_dtype = get_fp8_e4m3_dtype()
+        q_fp8, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd")
+        k_fp8, k_descale = _cast_to_fp8(k, fp8_dtype, "bshd")
+        v_fp8, v_descale = _cast_to_fp8(v, fp8_dtype, "bshd")
+
         triton_out = flash_attn_func_v3(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            softmax_scale=None,
             causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
     else:
         triton_out = flash_attn_func(
@@ -369,18 +383,29 @@ def test_mha_varlen(
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
     if FP8:
+        if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
+            pytest.skip(
+                "flash_attn_varlen_func_v3 doesn't support dropout, return_lse, or return_attn_probs"
+            )
+
+        fp8_dtype = get_fp8_e4m3_dtype()
+        q_fp8, q_descale = _cast_varlen_to_fp8(q_unpad, fp8_dtype, cu_seqlens_q)
+        k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
+        v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
+
         triton_out = flash_attn_varlen_func_v3(
-            q_unpad,
-            k_unpad,
-            v_unpad,
+            q_fp8,
+            k_fp8,
+            v_fp8,
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q,
             max_seqlen_k,
-            dropout_p=DROPOUT,
+            softmax_scale=None,
             causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
     else:
         triton_out = flash_attn_varlen_func(
@@ -515,14 +540,8 @@ def test_mha_backward(
 
     with torch.enable_grad():
         if FP8:
-            triton_out = flash_attn_func_v3(
-                q,
-                k,
-                v,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=True,
-                return_attn_probs=True,
+            pytest.skip(
+                "FP8 backward test needs LSE and attention probs which v3 doesn't return"
             )
         else:
             triton_out = flash_attn_func(
