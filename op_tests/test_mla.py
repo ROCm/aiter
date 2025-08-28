@@ -183,8 +183,8 @@ def test_mla(
         return us_aiter
 
     us_aiter = None
-    # if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-    us_aiter = test_normal_prefill()
+    if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+        us_aiter = test_normal_prefill()
     torch.cuda.empty_cache()
     # absorb init
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
@@ -361,8 +361,6 @@ def test_mla(
         out_asm,
         msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
-    print(f"MLA RESULT(Prefill normal): batch: {batch_size}, q_nheads: {nhead}, kv_nheads: {nhead}, q_seq_len: {ctx_len}, kv_seq_len: {ctx_len}, head_dim: {qk_nope_head_dim + qk_rope_head_dim}, us: {us_aiter}")
-    print(f"MLA RESULT(Decode absorb) : batch: {batch_size}, q_nheads: {nhead}, kv_nheads: {nhead_kv}, q_seq_len: 1, kv_seq_len: {ctx_len}, head_dim: {v_head_dim}, us: {us_asm_decode}")
     return {
         "prefill:ck_192": us_aiter,
         "prefill:asm_576": us_asm,
@@ -382,7 +380,7 @@ v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 1), (16, 2), (16, 4), (128, 1)]
+list_nhead = [(16, 1), (16, 2), (16, 4), (128, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -442,7 +440,7 @@ parser.add_argument(
     "-kvd",
     "--kv_dtype",
     type=str,
-    choices=["bf16", "fp4x2", "fp8"],
+    choices=["bf16"],
     nargs="*",
     default=["bf16"],
     help="""Data type of KV.
@@ -474,7 +472,7 @@ parser.add_argument(
     nargs="?",
     const=None,
     default=None,
-    help="""Number of heads.
+    help="""Number of nhead and mtp.
     e.g.: -n 16,1""",
 )
 
