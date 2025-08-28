@@ -351,12 +351,12 @@ def _gemm_a8w8_blockscale_reduce_kernel(
         order=[2, 1, 0],
     )
 
-    blocked_write: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 4], # (BLOCK_M, BLOCK_N)
-        threads_per_warp=[8, 8],
-        warps_per_cta=[4, 1],
-        order=[1, 0],
-    )
+    # blocked_write: gl.constexpr = gl.BlockedLayout(
+    #     size_per_thread=[1, 4], # (BLOCK_M, BLOCK_N)
+    #     threads_per_warp=[8, 8],
+    #     warps_per_cta=[4, 1],
+    #     order=[1, 0],
+    # )
 
     offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, # keep dim 1
                                               gl.SliceLayout(0, gl.SliceLayout(2, blocked_read)))
@@ -369,21 +369,22 @@ def _gemm_a8w8_blockscale_reduce_kernel(
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
-
     if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs)
+        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs,
+                                     cache = ".cg")
     else:
         c = gl.amd.cdna4.buffer_load(
-            c_in_ptr, c_in_offs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT
+            c_in_ptr, c_in_offs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT,
+            cache = ".cg"
         )  # , other=0.0)
-    c = gl.sum(c, axis=0)
+    c = tl.sum(c, 0)
 
     c = c.to(c_out_ptr.type.element_ty)
 
     offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
-                                               gl.SliceLayout(1, blocked_write))
+                                               gl.SliceLayout(1, gl.SliceLayout(0, blocked_read)))
     offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
-                                               gl.SliceLayout(0, blocked_write))
+                                               gl.SliceLayout(0, gl.SliceLayout(0, blocked_read)))
     c_out_offs = (
         (offs_cm[:, None] * stride_c_out_m)
         + (offs_cn[None, :] * stride_c_out_n)
