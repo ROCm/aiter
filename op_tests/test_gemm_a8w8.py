@@ -384,5 +384,5 @@ if __name__ == "__main__":
 
     if args.mnk is not None:
         l_mnk_nm = [args.mnk]
-        test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
-        test_skinny_gemm_a8w8_pertoken_quant()
+    test_normal_gemm_a8w8_pertoken_quant(l_dtype, l_quantDtype, l_mnk_nm)
+    test_skinny_gemm_a8w8_pertoken_quant()

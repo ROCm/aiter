@@ -97,7 +97,7 @@ def test_gemm(dtype, M, N, K):
     x, x_scales_shuffle = quant_func(x, shuffle=True)
     w, w_scales_shuffle = quant_func(w, shuffle=True)
     wshuffle = shuffle_weight(w, layout=(16, 16))
-    # out1 = torch.empty(M, N, dtype=dtype)
+    out1 = torch.empty(M, N, dtype=dtype)
     out2 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     out3 = torch.empty((M + 31) // 32 * 32, N, dtype=dtype)
     bias_f32 = None
