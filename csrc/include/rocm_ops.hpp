@@ -663,7 +663,7 @@
           py::arg("num_expert_group"),                                                        \
           py::arg("topk_grp"),                                                                \
           py::arg("need_renorm"),                                                             \
-          py::arg("scoring_func")          = true,                                            \
+          py::arg("is_softmax")            = true,                                            \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
           "Apply grouped topk softmax/sigmodd to the gating outputs.");                       \
     m.def("biased_grouped_topk",                                                              \
