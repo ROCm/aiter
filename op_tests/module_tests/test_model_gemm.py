@@ -11,6 +11,7 @@ import argparse
 
 from aiter.jit.utils.chip_info import get_gfx
 from utils.gemm_utils import save_gemm_benchmark_result, save_untuned_gemm_csv
+from op_tests.module_tests.utils.triton_bench_utils import run_triton_a4w4
 
 # Setup logging
 logging.basicConfig(
@@ -125,10 +126,10 @@ def run_a16w16_gemm(dtype, record, run_triton=False):
     latency_asm = 0.0
     latency_triton = 0.0
     if run_triton:
-        from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import bench_gemm_fn
+        from op_tests.module_tests.utils.triton_bench_utils import run_triton_a16w16
 
-        latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-    return latency, latency_asm, latency_triton * 1000
+        latency_triton = run_triton_a16w16(M, N, K)
+    return latency, latency_asm, latency_triton
 
 
 def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
@@ -172,19 +173,27 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     latency_triton = 0.0
     if run_triton:
         if fp8_quant_method == "per_tensor":
-            from op_tests.op_benchmarks.triton.bench_gemm_a8w8 import bench_gemm_fn
+            from op_tests.module_tests.utils.triton_bench_utils import (
+                run_triton_a8w8_per_tensor,
+            )
+
+            latency_triton = run_triton_a8w8_per_tensor(record.M, record.N, record.K)
         elif fp8_quant_method == "per_token":
-            from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
-                bench_gemm_fn,
+            from op_tests.module_tests.utils.triton_bench_utils import (
+                run_triton_a8w8_per_token,
             )
+
+            latency_triton = run_triton_a8w8_per_token(record.M, record.N, record.K)
         elif fp8_quant_method == "per_block":
-            from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
-                bench_gemm_fn,
+            from op_tests.module_tests.utils.triton_bench_utils import (
+                run_triton_a8w8_blockscale,
             )
+
+            latency_triton = run_triton_a8w8_blockscale(record.M, record.N, record.K)
         else:
             raise ValueError(f"Unsupported quantization method '{fp8_quant_method}'!")
-        latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-    return latency, latency_asm, latency_triton * 1000
+
+    return latency, latency_asm, latency_triton
 
 
 def run_a4w4_gemm(dtype, record, run_triton=False):
@@ -206,11 +215,9 @@ def run_a4w4_gemm(dtype, record, run_triton=False):
 
     latency_triton = 0.0
     if run_triton:
-        from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import bench_gemm_fn
+        latency_triton = run_triton_a4w4(record.M, record.N, record.K)
 
-        latency_triton = bench_gemm_fn(record.M, record.N, record.K, "time", "NT")
-
-    return latency, latency_asm, latency_triton * 1000
+    return latency, latency_asm, latency_triton
 
 
 class GemmTestRunner:

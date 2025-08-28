@@ -46,6 +46,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
     )
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
+
     if TRITON_HIP_PRESHUFFLE_SCALES:
         ms = triton.testing.do_bench(
             lambda: gemm_afp4wfp4_preshuffled_scales(
