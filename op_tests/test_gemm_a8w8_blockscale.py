@@ -117,76 +117,81 @@ def test_gemm_asm(dtype, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 
-l_dtype = ["bf16"]
-l_m = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
-l_nk = [
-    (1536, 7168),
-    (3072, 1536),
-    (576, 7168),
-    (7168, 256),
-    (7168, 2048),
-    (4608, 7168),
-    (7168, 2304),
-    (512, 7168),
-    (4096, 512),
-]
+def create_argument_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=str,
+        choices=l_dtype,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""Data type.
+        e.g.: -d bf16""",
+    )
+    parser.add_argument(
+        "-m",
+        type=int,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""M of mnk.
+        e.g.: -m 32""",
+    )
+    parser.add_argument(
+        "-nk",
+        type=dtypes.str2tuple,
+        nargs="?",
+        const=None,
+        default=None,
+        help="""N&K of mnk.
+        e.g.: -nk 4096,512""",
+    )
+    return parser
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-d",
-    "--dtype",
-    type=str,
-    choices=l_dtype,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""Data type.
-    e.g.: -d bf16""",
-)
-parser.add_argument(
-    "-m",
-    type=int,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""M of mnk.
-    e.g.: -m 32""",
-)
-parser.add_argument(
-    "-nk",
-    type=dtypes.str2tuple,
-    nargs="?",
-    const=None,
-    default=None,
-    help="""N&K of mnk.
-    e.g.: -nk 4096,512""",
-)
 
-args = parser.parse_args()
-if args.dtype is None:
-    l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
-else:
-    l_dtype = [dtypes.d_dtypes[args.dtype]]
-if args.m is not None:
-    l_m = [args.m]
-if args.nk is not None:
-    l_nk = [args.nk]
+if __name__ == "__main__":
+    l_dtype = ["bf16"]
+    l_m = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]
+    l_nk = [
+        (1536, 7168),
+        (3072, 1536),
+        (576, 7168),
+        (7168, 256),
+        (7168, 2048),
+        (4608, 7168),
+        (7168, 2304),
+        (512, 7168),
+        (4096, 512),
+    ]
 
-df = []
-for dtype in l_dtype:
-    # deepseek-r1
-    for m in l_m:
-        for n, k in l_nk:
-            ret = test_gemm(dtype, m, n, k)
-            df.append(ret)
-df = pd.DataFrame(df)
-aiter.logger.info(f"summary:\n{df}")
-# for dtype in [dtypes.fp16]:
-#     # deepseek-r1
-#     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
-#         for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
-#             test_gemm_asm(dtype, m, n, k)
-#             break
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    if args.dtype is None:
+        l_dtype = [dtypes.d_dtypes[key] for key in l_dtype]
+    else:
+        l_dtype = [dtypes.d_dtypes[args.dtype]]
+    if args.m is not None:
+        l_m = [args.m]
+    if args.nk is not None:
+        l_nk = [args.nk]
+
+    df = []
+    for dtype in l_dtype:
+        # deepseek-r1
+        for m in l_m:
+            for n, k in l_nk:
+                ret = test_gemm(dtype, m, n, k)
+                df.append(ret)
+    df = pd.DataFrame(df)
+    aiter.logger.info(f"summary:\n{df}")
+    # for dtype in [dtypes.fp16]:
+    #     # deepseek-r1
+    #     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
+    #         for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
+    #             test_gemm_asm(dtype, m, n, k)
+    #             break
