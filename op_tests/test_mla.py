@@ -12,12 +12,16 @@ import argparse
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
 
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
 setup_seed(1)
+
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -299,6 +303,71 @@ def test_mla(
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
 
+    # aiter implementation
+    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
+    work_indptr = torch.empty([81], dtype=torch.int32, device="cuda")
+    work_info_set = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
+    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
+    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
+    reduce_partial_map = torch.empty(
+        [batch_size * 80], dtype=torch.int32, device="cuda"
+    )
+    # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
+
+    meta = aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        nhead // nhead_kv,
+        nhead_kv,
+        True,
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+    )
+
+    print_metadata_result = False
+    if print_metadata_result:
+        valid_work_cnt = 0
+        for i in range(batch_size * 80):
+            bid = work_info_set[i][0].item()
+            if bid >= batch_size or bid < 0:
+                break
+            valid_work_cnt = i + 1
+        valid_reduce_partial_cnt = 0
+        last_reduce_partial_map = reduce_partial_map[-1].item()
+        for i in range(batch_size * 80):
+            idx = reduce_partial_map[i].item()
+            if idx >= 80 * qo_indptr[-1].item() * nhead or idx < 0:
+                break
+            valid_reduce_partial_cnt = i + 1
+            if idx == last_reduce_partial_map:
+                break
+        torch.set_printoptions(threshold=valid_work_cnt * 8)
+        print(f"seq_lens_kv({list(seq_lens_kv)}):")
+        print(seq_lens_kv)
+        print(f"kv_indptr({list(kv_indptr.shape)}):")
+        print(kv_indptr)
+        print(f"work_indptr({list(work_indptr.shape)}):")
+        print(work_indptr)
+        work_info_set_shape = list(work_info_set.shape)
+        print(
+            f"work_info_set({[valid_work_cnt] + work_info_set_shape[1:]}/{work_info_set_shape}):"
+        )
+        print(work_info_set[:valid_work_cnt])
+        print(f"reduce_indptr({batch_size + 1}):")
+        print(reduce_indptr[: batch_size + 1])
+        print(f"reduce_final_map({batch_size}):")
+        print(reduce_final_map[:batch_size])
+        reduce_partial_map_shape = list(reduce_partial_map.shape)
+        print(
+            f"reduce_partial_map({reduce_partial_map_shape[:-1] + [valid_reduce_partial_cnt]}/{reduce_partial_map_shape}):"
+        )
+        print(reduce_partial_map[:valid_reduce_partial_cnt])
+        torch.set_printoptions(threshold="default")
+
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
         q,
@@ -312,57 +381,6 @@ def test_mla(
         is_causal=True,
         dtype=dtype,
     )
-
-    # Triton implementation
-    # if mtp == 1:
-    #     if qk_head_dim != v_head_dim:
-    #         out_triton = q.new_empty((total_q, nhead, v_head_dim)).fill_(-1)
-    #     else:
-    #         out_triton = torch.empty_like(q)
-
-    #     num_kv_splits = 16
-    #     attn_logits = torch.empty(
-    #         (total_q, nhead, num_kv_splits, v_head_dim + 1),
-    #         dtype=dtypes.fp32,
-    #     )
-    #     _, us_ref = run_perftest(
-    #         mla_decode_ref.decode_attention_fwd,
-    #         q,
-    #         kv_buffer,
-    #         kv_buffer[..., :kv_lora_rank],
-    #         out_triton,
-    #         kv_indptr,
-    #         kv_indices,
-    #         attn_logits,
-    #         num_kv_splits,
-    #         sm_scale,
-    #         num_iters=5,
-    #     )
-    #     # logits_ref, lse_ref = attn_logits.split([v_head_dim, 1], dim=-1)
-    #     # logits_ref = rearrange(logits_ref, "bs h sp d -> bs sp h d")
-    #     # lse_ref = rearrange(lse_ref, "bs h sp d -> bs sp h d")
-    #     checkAllclose(
-    #         out_ref,
-    #         out_triton,
-    #         msg=f"mla_decode-absorb    [golden vs    triton]:{us_torch_decode:>8.2f} us vs {us_ref:>8.2f} us......",
-    #     )
-
-    # aiter implementation
-    (
-        work_indptr,
-        work_info_set,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-    ) = aiter.get_mla_metadata_v1(
-        qo_indptr,
-        kv_indptr,
-        nhead // nhead_kv,
-        nhead_kv,
-        True,
-    )
-    print(work_indptr)
-    print(work_info_set)
 
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
@@ -489,7 +507,8 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[21, 128, 512, 1024, 2048, 3200, 4096, 8192, 12000],
+    # default=[21, 128, 512, 1024, 2048, 3200, 4096, 8192, 12000],
+    default=[21],
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -498,7 +517,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)],
+    # default=[i for i in range(1, 80)],
+    default=[64],
     help="""Batch size.
     e.g.: -b 16""",
 )

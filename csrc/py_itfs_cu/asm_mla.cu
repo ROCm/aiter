@@ -62,9 +62,9 @@ void mla_decode_stage1_asm_fwd(
     // following are output
     torch::Tensor& splitData, //[batch_size, num_kv_splits, num_heads, v_head_dim]
     torch::Tensor& splitLse,  //[batch_size, num_kv_splits, num_heads,  1]
-    torch::Tensor& output     //[batch_size, num_heads, v_head_dim]
+    torch::Tensor& output,    //[batch_size, num_heads, v_head_dim]
     std::optional<torch::Tensor>& q_scale,            //   [1]
-    std::optional<torch::Tensor>& kv_scale,           //   [1]
+    std::optional<torch::Tensor>& kv_scale            //   [1]
 )
 {
     int batch           = qo_indptr.size(0) - 1;
