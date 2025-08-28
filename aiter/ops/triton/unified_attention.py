@@ -795,42 +795,31 @@ def unified_attention(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     target_num_prgms = get_num_sms() * 4
     num_2d_prgms = total_num_q_blocks * num_kv_heads
-    ALL_DECODE = q.shape[0] == num_seqs
+    ALL_DECODE = max_seqlen_q == 1
 
     # call 2d if sliding window is used
-    if (
-        SLIDING_WINDOW > 0
-        or max_seqlen_k <= 512
-        or (num_2d_prgms > target_num_prgms and not ALL_DECODE)
-    ):
-        # in case head_size is big
-        max_num_stages_2d = 4
-        if head_size > 128:
-            max_num_stages_2d = 2
-        half_max_num_stages_2d = max_num_stages_2d // 2
+    if SLIDING_WINDOW > 0 or num_2d_prgms >= target_num_prgms or max_seqlen_k <= 1024:
         if ALL_DECODE == False:
-            num_stages_2d = max_num_stages_2d
+            num_stages_2d = 4
             num_warps = 4
         else:
-            num_stages_2d = half_max_num_stages_2d
+            num_stages_2d = 3
             num_warps = 2
         # make the block_m bigger if we already have enough parallelism
         if num_2d_prgms >= 2 * target_num_prgms:
             if num_2d_prgms <= 4 * target_num_prgms:
                 BLOCK_M = 64
-                num_stages_2d = (
-                    half_max_num_stages_2d if SLIDING_WINDOW > 0 else max_num_stages_2d
-                )
+                num_stages_2d = 2 if SLIDING_WINDOW > 0 else 4
             elif num_2d_prgms <= 8 * target_num_prgms:
                 BLOCK_M = 64
-                num_stages_2d = 1 if SLIDING_WINDOW > 0 else half_max_num_stages_2d
+                num_stages_2d = 1 if SLIDING_WINDOW > 0 else 2
             else:
                 BLOCK_M = 64
                 num_stages_2d = 1
             BLOCK_Q = BLOCK_M // num_queries_per_kv
             total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
-        if max_seqlen_q >= 256 and block_size == 64:
+        if max_seqlen_q >= 512 and block_size == 64:
             BLOCK_M = 128
             num_stages_2d = 1
             num_warps = 4
