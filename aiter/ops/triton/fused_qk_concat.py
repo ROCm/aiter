@@ -36,8 +36,8 @@ def _unit_cat(
     x1 = tl.load(x1_ptr + x1_offs)
     x2 = tl.load(x2_ptr + x2_offs)
 
-    x1 = (x1 * k_scale).to(x_out_ptr.dtype.element_ty)
-    x2 = (x2 * k_scale).to(x_out_ptr.dtype.element_ty)
+    x1 = (x1 / k_scale).to(x_out_ptr.dtype.element_ty)
+    x2 = (x2 / k_scale).to(x_out_ptr.dtype.element_ty)
     tl.store(x_out_ptr + x_out_offs + d1_offs * x_out_stride_d, x1)
     tl.store(x_out_ptr + x_out_offs + (d2_offs + BLOCK_D1) * x_out_stride_d, x2)
 
@@ -235,8 +235,8 @@ def _unit_rope_cat(
         )
 
     x_pe = x_pe * cos + x_pe_rotated * sin
-    x_pe = x_pe * k_scale
-    x_nope = x_nope * k_scale
+    x_pe = x_pe / k_scale
+    x_nope = x_nope / k_scale
     x_nope = x_nope.to(x_out_ptr.dtype.element_ty)
     x_pe = x_pe.to(x_out_ptr.dtype.element_ty)
 
