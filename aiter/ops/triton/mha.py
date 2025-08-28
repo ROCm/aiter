@@ -360,7 +360,9 @@ def _attn_fwd_inner(
                 # compute and use descale factors for p
                 scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
                 acc += (
-                    tl.dot((p * scale_p).to(v.type.element_ty), v) * descale_p * descale_v
+                    tl.dot((p * scale_p).to(v.type.element_ty), v)
+                    * descale_p
+                    * descale_v
                 )
             else:
                 # direct cast p to fp8 without computing descale factors
@@ -1369,9 +1371,10 @@ class _FlashAttnV3Func(torch.autograd.Function):
         # Assert that all descale factors are provided together or none at all
         descale_factors = [q_descale, k_descale, v_descale]
         if any(d is not None for d in descale_factors):
-            assert all(d is not None for d in descale_factors), \
-                "All descale factors (q_descale, k_descale, v_descale) must be provided together or none at all"
-        
+            assert all(
+                d is not None for d in descale_factors
+            ), "All descale factors (q_descale, k_descale, v_descale) must be provided together or none at all"
+
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -1415,7 +1418,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
                 q_saved = q
                 k_saved = k
                 v_saved = v
-            
+
             # save for backward
             ctx.save_for_backward(
                 q_saved,
@@ -1511,7 +1514,7 @@ class _FlashAttnV3Func(torch.autograd.Function):
         dv = dv[..., :head_size_v_og]
         return (
             dq,  # gradient for q_fp8
-            dk,  # gradient for k_fp8  
+            dk,  # gradient for k_fp8
             dv,  # gradient for v_fp8
             None,  # gradient for dropout_p
             None,  # gradient for softmax_scale
@@ -1551,21 +1554,33 @@ def flash_attn_func_v3(
 ):
     # Check for unsupported features and raise errors
     if qv is not None:
-        raise NotImplementedError("qv parameter is not supported in this implementation")
+        raise NotImplementedError(
+            "qv parameter is not supported in this implementation"
+        )
     if attention_chunk != 0:
-        raise NotImplementedError(f"attention_chunk={attention_chunk} is not supported. Only attention_chunk=0 is supported")
+        raise NotImplementedError(
+            f"attention_chunk={attention_chunk} is not supported. Only attention_chunk=0 is supported"
+        )
     if softcap != 0.0:
-        raise NotImplementedError(f"softcap={softcap} is not supported. Only softcap=0.0 is supported")
+        raise NotImplementedError(
+            f"softcap={softcap} is not supported. Only softcap=0.0 is supported"
+        )
     if num_splits != 1:
-        raise NotImplementedError(f"num_splits={num_splits} is not supported. Only num_splits=1 is supported")
+        raise NotImplementedError(
+            f"num_splits={num_splits} is not supported. Only num_splits=1 is supported"
+        )
     if pack_gqa is not None:
-        raise NotImplementedError("pack_gqa parameter is not supported in this implementation")
+        raise NotImplementedError(
+            "pack_gqa parameter is not supported in this implementation"
+        )
     if sm_margin != 0:
-        raise NotImplementedError(f"sm_margin={sm_margin} is not supported. Only sm_margin=0 is supported")
-    
+        raise NotImplementedError(
+            f"sm_margin={sm_margin} is not supported. Only sm_margin=0 is supported"
+        )
+
     # Use the global setting for fp8_p_descale
     global _USE_FP8_P_DESCALE
-    
+
     _LOGGER.info(
         f"FLASH_ATTN_V3:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}, fp8_p_descale={_USE_FP8_P_DESCALE}"
     )
@@ -1588,6 +1603,7 @@ def flash_attn_func_v3(
         v_descale,
         None,  # config
     )
+
 
 class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
@@ -1888,9 +1904,10 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         # Assert that all descale factors are provided together or none at all
         descale_factors = [q_descale, k_descale, v_descale]
         if any(d is not None for d in descale_factors):
-            assert all(d is not None for d in descale_factors), \
-                "All descale factors (q_descale, k_descale, v_descale) must be provided together or none at all"
-        
+            assert all(
+                d is not None for d in descale_factors
+            ), "All descale factors (q_descale, k_descale, v_descale) must be provided together or none at all"
+
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -1934,7 +1951,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
                 q_saved = q
                 k_saved = k
                 v_saved = v
-            
+
             # save for backward
             ctx.save_for_backward(
                 q_saved,
@@ -1975,7 +1992,7 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             cu_seqlens_q,
             cu_seqlens_k,
         ) = ctx.saved_tensors
-        
+
         dq = torch.zeros_like(q, dtype=torch.float32)
         dk = torch.zeros_like(k, dtype=torch.float32)
         dv = torch.zeros_like(v, dtype=torch.float32)
@@ -2038,7 +2055,29 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         # Return gradients for all forward inputs: q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         # dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic, return_lse, return_softmax,
         # block_table, is_grad_enabled, q_descale, k_descale, v_descale, config
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_varlen_func_v3(
@@ -2062,19 +2101,25 @@ def flash_attn_varlen_func_v3(
 ):
     # Check for unsupported features
     if attention_chunk != 0:
-        raise NotImplementedError(f"attention_chunk={attention_chunk} is not supported. Only attention_chunk=0 is supported")
+        raise NotImplementedError(
+            f"attention_chunk={attention_chunk} is not supported. Only attention_chunk=0 is supported"
+        )
     if softcap != 0.0:
-        raise NotImplementedError(f"softcap={softcap} is not supported. Only softcap=0.0 is supported")
+        raise NotImplementedError(
+            f"softcap={softcap} is not supported. Only softcap=0.0 is supported"
+        )
     if sm_margin != 0:
-        raise NotImplementedError(f"sm_margin={sm_margin} is not supported. Only sm_margin=0 is supported")
-    
+        raise NotImplementedError(
+            f"sm_margin={sm_margin} is not supported. Only sm_margin=0 is supported"
+        )
+
     # Use the global setting for fp8_p_descale
     global _USE_FP8_P_DESCALE
-    
+
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN_V3:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}, fp8_p_descale={_USE_FP8_P_DESCALE}"
     )
-    
+
     return _FlashAttnVarlenV3Func.apply(
         q,
         k,
