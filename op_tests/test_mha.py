@@ -126,25 +126,44 @@ def run_ck(
         return out, dropout_mask, dq, dk, dv, None
 
 
-@pytest.mark.parametrize("dtype", [dtypes.bf16])
-@pytest.mark.parametrize("mha_type", ["gqa"])
-@pytest.mark.parametrize("deterministic", [True])#, False])
-@pytest.mark.parametrize("bias_type", ["no"])#, "bias", "alibi"])
-@pytest.mark.parametrize("local", [False])#, True])
-@pytest.mark.parametrize("causal", [False])#, True])
-@pytest.mark.parametrize("dropout_p", [0.0])#, 0.17])
-@pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("nheads", [64])
+@pytest.mark.parametrize("dtype", [dtypes.fp16, dtypes.bf16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("deterministic", [True, False])
+@pytest.mark.parametrize("bias_type", ["no", "bias", "alibi"])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dropout_p", [0.0, 0.17])
+@pytest.mark.parametrize("batch_size", [5])
+@pytest.mark.parametrize("nheads", [6])
 @pytest.mark.parametrize(
     "d,d_v",
     [
+        (32, 32),
+        (40, 40),
+        (59, 59),
+        (64, 64),
+        (96, 96),
+        (111, 111),
         (128, 128),
+        (160, 160),
+        (192, 192),
+        (224, 224),
+        (256, 256),
     ],
 )
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (512, 256),
         (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
     ],
 )
 def test_flash_attn_output(
@@ -164,7 +183,7 @@ def test_flash_attn_output(
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 8)
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
     assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
 
@@ -212,8 +231,7 @@ def test_flash_attn_output(
         requires_grad=True,
     )
 
-    (out, dropout_mask, dq, dk, dv, dbias), us = run_perftest(
-        run_ck,
+    out, dropout_mask, dq, dk, dv, dbias = run_ck(
         q,
         k,
         v,
@@ -227,7 +245,6 @@ def test_flash_attn_output(
         return_lse,
         return_attn_probs,
     )
-    print(f'us: {us}')
 
     out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
         q,
@@ -321,12 +338,12 @@ parser.add_argument(
     e.g.: -k 1024""",
 )
 parser.add_argument(
-    "-d",
-    "--d",
+    "-qk",
+    "--d_qk",
     type=int,
     default=128,
     help="""Dimension of query and key. Default is 128.
-    e.g.: -d 256""",
+    e.g.: -qk 256""",
 )
 parser.add_argument(
     "-v",
@@ -382,7 +399,7 @@ parser.add_argument(
     e.g.: -m mha""",
 )
 parser.add_argument(
-    "-dtype",
+    "-d",
     "--dtype",
     type=str,
     default="bf16",
@@ -397,7 +414,7 @@ if __name__ == "__main__":
         args.nheads,
         args.seqlen_q,
         args.seqlen_k,
-        args.d,
+        args.d_qk,
         args.d_v,
         args.dropout_p,
         args.causal,
