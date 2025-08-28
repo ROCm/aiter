@@ -33,7 +33,7 @@ def grouped_topk(
     num_expert_group: int,
     topk_group: int,
     need_renorm: bool,
-    scoring_func: bool = True,
+    is_softmax: bool = True,
     routed_scaling_factor: float = 1.0,
 ) -> None: ...
 

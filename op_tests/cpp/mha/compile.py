@@ -82,16 +82,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.api == "fwd":
-        compile_mha_fwd()
+        compile_mha_fwd(False)
     elif args.api == "bwd":
-        compile_mha_bwd()
+        compile_mha_bwd(False)
     elif args.api == "fwd_v3":
         compile_mha_fwd(True)
     elif args.api == "bwd_v3":
         compile_mha_bwd(True)
     elif args.api == "":
-        compile_mha_fwd()
-        compile_mha_bwd()
+        compile_mha_fwd(False)
+        compile_mha_bwd(False)
     else:
         raise ValueError(
             "Invalid input value: only support 'fwd', 'bwd' or default to be ''"

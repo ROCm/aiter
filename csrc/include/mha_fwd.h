@@ -21,6 +21,7 @@ struct mha_fwd_traits : public fmha_fwd_traits
                    bool has_lse,
                    bool has_dropout,
                    bool use_ext_asm,
+                   int how_v3_bf16_cvt,
                    bool skip_min_seqlen_q)
         : fmha_fwd_traits{head_size_q,
                           head_size_v,
@@ -34,10 +35,12 @@ struct mha_fwd_traits : public fmha_fwd_traits
                           has_dropout,
                           false, // do_fp8_static_quant
                           skip_min_seqlen_q},
-          use_ext_asm(use_ext_asm)
+          use_ext_asm(use_ext_asm),
+          how_v3_bf16_cvt(how_v3_bf16_cvt)
     {
     }
     bool use_ext_asm;
+    int how_v3_bf16_cvt;
 };
 
 struct mha_fwd_splitkv_traits : public fmha_fwd_splitkv_traits
@@ -75,7 +78,10 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      mask_enum mask_type,
                                                      bias_enum bias_type,
                                                      bool has_lse,
-                                                     bool use_ext_asm);
+                                                     bool use_ext_asm,
+                                                     int how_v3_bf16_cvt                = 1,
+                                                     const void* seqstart_q_padding_ptr = nullptr,
+                                                     const void* seqstart_k_padding_ptr = nullptr);
 
 __attribute__((visibility("default"))) float
 mha_fwd_splitkv(mha_fwd_splitkv_args args,
@@ -110,28 +116,58 @@ struct __attribute__((packed)) fmha_fwd_v3_args
     p2 _p4;
     float scalar;
     p3 _p5;
-    unsigned int seq_len;
+    unsigned int s_seq_len;
     p3 _p6;
-    unsigned int Seqs;
+    unsigned int s_Seqs;
     p3 _p7;
-    unsigned int Ts;
+    unsigned int s_Ts;
     p3 _p8;
-    unsigned int Hs;
+    unsigned int s_Hs;
     p3 _p9;
-    unsigned int BAs;
+    unsigned int s_Bs;
     p3 _p10;
-    unsigned int gqa;
+    unsigned int s_gqa;
     p3 _p11;
-    unsigned int Seqs_kv;
+    unsigned int s_k_Seqs;
     p3 _p12;
-    unsigned int Hs_kv;
+    unsigned int s_k_Hs;
     p3 _p13;
-    unsigned int BAs_kv;
+    unsigned int s_k_Bs;
     p3 _p14;
-    unsigned int opt;
+    unsigned int s_opt;
     p3 _p15;
     unsigned int s_lse;
     p3 _p16;
+    unsigned int s_kv_seq_len;
+    p3 _p17;
+    unsigned int s_qk_head_dim;
+    p3 _p18;
+    unsigned int s_v_head_dim;
+    p3 _p19;
+    unsigned int s_q_head_num;
+    p3 _p20;
+    unsigned int s_v_Seqs;
+    p3 _p21;
+    unsigned int s_v_Hs;
+    p3 _p22;
+    unsigned int s_v_Bs;
+    p3 _p23;
+    unsigned int s_o_Seqs;
+    p3 _p24;
+    unsigned int s_o_Hs;
+    p3 _p25;
+    unsigned int s_o_Bs;
+    p3 _p26;
+    const void* ptr_qseq;
+    p2 _p27;
+    const void* ptr_kseq;
+    p2 _p28;
+    unsigned int s_lse_Hs;
+    p3 _p29;
+    const void* ptr_qseq_padding;
+    p2 _p30;
+    const void* ptr_kseq_padding;
+    p2 _p31;
 };
 
 struct fmha_fwd_v3_traits
@@ -152,7 +188,9 @@ template <typename DataType_,
           bool kIsSEQPad_,
           bool kIsHDPad_,
           int kStoreLSE_,
-          GPUArch GPUArch_>
+          GPUArch GPUArch_,
+          ck_tile::index_t BF16Cvt_ = 1,
+          bool kIsGroupMode_        = false>
 struct fmha_fwd_kernel_selector
 {
     using DataType                             = ck_tile::remove_cvref_t<DataType_>;
@@ -162,6 +200,8 @@ struct fmha_fwd_kernel_selector
     static constexpr bool kIsHDPad             = kIsHDPad_;
     static constexpr int kStoreLSE =
         kStoreLSE_; // kStoreLSE_ won't affect kernel selection, but will pass in kernel args
+    static constexpr ck_tile::index_t BF16Cvt = BF16Cvt_;
+    static constexpr bool kIsGroupMode        = kIsGroupMode_;
 };
 
 template <typename fmha_fwd_kernel_selector>
@@ -172,10 +212,18 @@ template <typename fmha_fwd_kernel_selector>
 struct FmhaFwdV3Ts;
 
 namespace gfx942 {
-float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s);
+float fmha_fwd_v3(mha_fwd_traits t,
+                  mha_fwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqstart_q_padding_ptr = nullptr,
+                  const void* seqstart_k_padding_ptr = nullptr);
 }
 
 namespace gfx950 {
-float fmha_fwd_v3(mha_fwd_traits t, fmha_fwd_args a, const ck_tile::stream_config& s);
+float fmha_fwd_v3(mha_fwd_traits t,
+                  mha_fwd_args a,
+                  const ck_tile::stream_config& s,
+                  const void* seqstart_q_padding_ptr = nullptr,
+                  const void* seqstart_k_padding_ptr = nullptr);
 }
 } // namespace aiter

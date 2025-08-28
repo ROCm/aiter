@@ -456,6 +456,96 @@ def mha_varlen_fwd(
 ) -> List[torch.Tensor]: ...
 
 
+def gen_fmha_v3_varlen_fwd_fake_tensor(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> List[torch.Tensor]:
+
+    device = q.device
+    dtype = q.dtype
+
+    total_q = q.size(0)
+    num_heads = q.size(1)
+    head_size_v = v.size(-1)
+
+    if out is not None:
+        out_tensor = out
+    else:
+        out_shape = (total_q, num_heads, head_size_v)
+        out_tensor = torch.empty(out_shape, device=device, dtype=dtype)
+
+    if return_softmax_lse:
+        softmax_lse_shape = (num_heads, total_q)
+        softmax_lse_tensor = torch.empty(
+            softmax_lse_shape, device=device, dtype=torch.float32
+        )
+    else:
+        softmax_lse_tensor = torch.empty((0,), device=device, dtype=torch.float32)
+
+    if return_dropout_randval:
+        p_shape = (num_heads, total_q, max_seqlen_k)
+        p_tensor = torch.empty(p_shape, device=device, dtype=torch.uint8)
+    else:
+        p_tensor = torch.empty((0,), device=device)
+
+    rng_state_tensor = torch.empty((2,), device=device, dtype=torch.int64)
+
+    return [out_tensor, softmax_lse_tensor, p_tensor, rng_state_tensor]
+
+
+@compile_ops(
+    "module_fmha_v3_varlen_fwd",
+    fc_name="fmha_v3_varlen_fwd",
+    gen_fake=gen_fmha_v3_varlen_fwd_fake_tensor,
+)
+def fmha_v3_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    min_seqlen_q: int,
+    dropout_p: float,
+    softmax_scale: float,
+    logits_soft_cap: float,
+    zero_tensors: bool,
+    is_causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    return_softmax_lse: bool,
+    return_dropout_randval: bool,
+    how_v3_bf16_cvt: int,
+    out: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    gen: Optional[torch.Generator] = None,
+) -> List[torch.Tensor]: ...
+
+
 def cmdGenFunc_mha_bwd(
     dout: Tensor,
     q: Tensor,
@@ -963,7 +1053,7 @@ def fmha_v3_varlen_bwd(
     alibi_slopes: Optional[Tensor] = None,
     rng_state: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
-) -> None: ...
+) -> List[Tensor]: ...
 
 
 @torch_compile_guard()
@@ -1006,14 +1096,11 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (seqlen_q == seqlen_k)
-        ret = ret and (seqlen_q >= 384)
         ret = ret and (hdim_q == hdim_v)
         ret = ret and (hdim_q == 128)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and ((return_lse and gfx == "gfx950") or (gfx == "gfx942"))
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1558,37 +1645,93 @@ def _flash_attn_varlen_forward(
     alibi_slopes: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     return_softmax: bool = False,
+    how_v3_bf16_cvt: Optional[int] = 1,
     block_table: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
+    (_, nhead_q, hdim_q) = q.shape
+
+    nhead_k = v.shape[-2]
+    hdim_v = v.shape[-1]
+    # mask
+    window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
+    window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
+    mask = causal == True and window_size_left == -1  # causal mask
+    nmask = (
+        causal == False and window_size_left == -1 and window_size_right == -1
+    )  # no mask
+    swa = (window_size_left > 0) or (window_size_right > 0)
+
+    def can_impl_fmha_v3_fwd():
+        # basic
+        gfx = get_gfx()
+        ret = alibi_slopes is None
+        ret = ret and (bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (hdim_q == hdim_v)
+        ret = ret and (hdim_q == 128)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (q.dtype == dtypes.bf16)
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q,
-        dropout_p,
-        softmax_scale,
-        logits_soft_cap,
-        zero_tensors,
-        causal,
-        window_size_left,
-        window_size_right,
-        return_lse,
-        return_softmax,
-        out,
-        block_table,
-        bias,
-        alibi_slopes,
-        None,
-        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
-    )
+
+    if can_impl_fmha_v3_fwd():
+        out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            how_v3_bf16_cvt,
+            out,
+            block_table,
+            bias,
+            alibi_slopes,
+            None,
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        )
+    else:
+        out, softmax_lse, S_dmask, rng_state = mha_varlen_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            zero_tensors,
+            causal,
+            window_size_left,
+            window_size_right,
+            return_lse,
+            return_softmax,
+            out,
+            block_table,
+            bias,
+            alibi_slopes,
+            None,
+            # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        )
     return out, softmax_lse, S_dmask, rng_state
 
 
@@ -1826,6 +1969,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_lse=return_lse,
             return_softmax=return_softmax and dropout_p > 0,
+            how_v3_bf16_cvt=how_v3_bf16_cvt,
             block_table=block_table,
             out=out,
         )

@@ -19,7 +19,7 @@ void grouped_topk(torch::Tensor& gating_output, // [num_tokens, num_experts]
                   int num_expert_group,
                   int topk_grp,
                   bool need_renorm,
-                  bool scoring_func                 = true,
+                  bool is_softmax                 = true,
                   const float routed_scaling_factor = 1.);
 
 std::vector<at::Tensor> moe_fused_gate(at::Tensor& input,
