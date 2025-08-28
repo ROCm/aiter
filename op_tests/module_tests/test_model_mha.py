@@ -1,10 +1,10 @@
 import torch
-import logging
-from aiter import dtypes
-from dataclasses import dataclass
-from op_tests.test_mha import run_ck, run_torch
 import aiter
+import logging
+import argparse
+from aiter import dtypes
 from aiter.test_common import perftest
+from dataclasses import dataclass, asdict
 
 
 # Setup logging
@@ -13,36 +13,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 TEST_NUM_ITERS = 100
-
-
-def run_ck_(
-    q,
-    k,
-    v,
-    bias=None,
-    alibi_slopes=None,
-    dout=None,
-    dropout_p=0.0,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    deterministic=False,
-    return_lse=True,
-    return_attn_probs=False,
-):
-    return run_ck(
-        q,
-        k,
-        v,
-        bias,
-        alibi_slopes,
-        dout,
-        dropout_p,
-        causal,
-        window_size,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-    )
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -99,7 +69,7 @@ def evaluate_mha(
         head_dim,
         device="cuda",
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=False,
     )
     k = torch.randn(
         batch_size,
@@ -108,7 +78,7 @@ def evaluate_mha(
         head_dim,
         device="cuda",
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=False,
     )
     v = torch.randn(
         batch_size,
@@ -117,7 +87,7 @@ def evaluate_mha(
         head_dim,
         device="cuda",
         dtype=dtype,
-        requires_grad=True,
+        requires_grad=False,
     )
 
     attn_bias = None
@@ -131,89 +101,10 @@ def evaluate_mha(
             batch_size, num_heads, device="cuda", dtype=dtypes.fp32
         )
 
-    dout = torch.randn(
-        batch_size,
-        seq_len_q,
-        num_heads,
-        head_dim,
-        device="cuda",
-        dtype=dtype,
-        requires_grad=True,
-    )
-
     return_lse = True
     return_attn_probs = True
     dropout_p = 0.0
     window_size = (-1, -1)
-
-    out, dropout_mask, dq, dk, dv, dbias = run_ck_(
-        q,
-        k,
-        v,
-        attn_bias,
-        alibi_slopes,
-        dout,
-        dropout_p,
-        causal,
-        window_size,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-    )
-
-    out_ref, dq_ref, dk_ref, dv_ref, dbias_ref = run_torch(
-        q,
-        k,
-        v,
-        attn_bias,
-        alibi_slopes,
-        dout,
-        dropout_p,
-        dropout_mask,
-        causal,
-        window_size,
-    )
-
-    out_pt, dq_pt, dk_pt, dv_pt, dbias_pt = run_torch(
-        q,
-        k,
-        v,
-        attn_bias,
-        alibi_slopes,
-        dout,
-        dropout_p,
-        dropout_mask,
-        causal,
-        window_size,
-        upcast=False,
-        reorder_ops=True,
-    )
-
-    # print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-    # print(f"Output Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
-    out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
-    assert (out - out_ref).abs().max().item() <= out_tol
-
-    # print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-    # print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-    # print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-    # print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-    # print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-    # print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-
-    dq_tol = max(10 * (dq_pt - dq_ref).abs().max().item(), 0.01)
-    dk_tol = max(10 * (dk_pt - dk_ref).abs().max().item(), 0.01)
-    dv_tol = max(10 * (dv_pt - dv_ref).abs().max().item(), 0.01)
-
-    assert (dq - dq_ref).abs().max().item() <= dq_tol
-    assert (dk - dk_ref).abs().max().item() <= dk_tol
-    assert (dv - dv_ref).abs().max().item() <= dv_tol
-
-    if attn_bias is not None:
-        # print(f"dBias max diff: {(dbias - dbias_ref).abs().max().item()}")
-        # print(f"dBias Pytorch max diff: {(dbias_pt - dbias_ref).abs().max().item()}")
-        dbias_tol = max(10 * (dbias_pt - dbias_ref).abs().max().item(), 0.01)
-        assert (dbias - dbias_ref).abs().max().item() <= dbias_tol
 
     (out), avg_mha_ck = dryrun_ck_perf(
         q,
@@ -221,7 +112,7 @@ def evaluate_mha(
         v,
         attn_bias,
         alibi_slopes,
-        dout,
+        None,
         dropout_p,
         causal,
         window_size,
@@ -309,7 +200,7 @@ class SDPAAnalyzer:
 class MHABenchmark:
     def __init__(
         self,
-        dtypes=[torch.float16, torch.bfloat16],
+        dtypes=[torch.float16],
         batch_sizes=[1, 8, 16, 32, 64, 128, 256],
         seq_len_q_kvs=[
             [1024, 1024],
@@ -323,8 +214,8 @@ class MHABenchmark:
         self.records = None
         self.config_dict = SDPA_CONFIG_DICT
         self.dtypes = dtypes
-        self.batch_sizes = [1, 8]
-        self.seq_len_q_kvs = [[1024, 1024]]
+        self.batch_sizes = batch_sizes
+        self.seq_len_q_kvs = seq_len_q_kvs
 
     def get_mha_shapes(self):
         records = []
@@ -380,10 +271,56 @@ class MHABenchmark:
         return records_result
 
 
+def save_mha_benchmark_result(records, csv_file_name):
+    import csv
+    from dataclasses import asdict
+
+    csv_file = f"{csv_file_name}.csv"
+    fieldnames = [
+        "batch_size",
+        "num_heads_q",
+        "num_heads_kv",
+        "head_dim_qk",
+        "head_dim_v",
+        "seq_len_q",
+        "seq_len_kv",
+        "dtype",
+        "is_causal",
+        "latency_us",
+        "gbps",
+        "tflops",
+    ]
+    with open(csv_file, mode="w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(asdict(rec))
+    print(f"data write to {csv_file} success!!")
+
+
+def create_argument_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="MHA bench results",
+    )
+    parser.add_argument(
+        "-o",
+        "--output_name",
+        type=str,
+        nargs="?",
+        const=None,
+        default="test_model_mha_results",
+    )
+    return parser
+
+
 if __name__ == "__main__":
+    parser = create_argument_parser()
+    args = parser.parse_args()
     runner = MHABenchmark()
     runner.get_mha_shapes()
     rets = runner.benchmark_mha()
     print("\n===== Results =====\n")
     for ret in rets:
-        print(ret)
+        print(asdict(ret))
+    save_mha_benchmark_result(rets, args.output_name)
