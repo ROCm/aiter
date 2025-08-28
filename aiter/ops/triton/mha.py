@@ -821,7 +821,7 @@ def _attn_fwd(
             PADDED_HEAD=BLOCK_DMODEL != BLOCK_DMODEL_POW2,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
-            FP8_P_DESCALE=False,
+            FP8_P_DESCALE=FP8_P_DESCALE,
         )
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
@@ -939,7 +939,6 @@ def _flash_attn_forward(
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
-    fp8_p_descale: bool = False,
     config: Optional[dict[str, any]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -1101,7 +1100,7 @@ def _flash_attn_forward(
         ENABLE_DROPOUT=enable_dropout,
         IS_FP8=IS_FP8,
         FP8_MAX=FP8_MAX,
-        FP8_P_DESCALE=fp8_p_descale,
+        FP8_P_DESCALE=_USE_FP8_P_DESCALE,
         VARLEN=is_varlen,
         BATCH=batch,
         NUM_XCD=get_num_xcds(),
@@ -1365,7 +1364,6 @@ class _FlashAttnV3Func(torch.autograd.Function):
         q_descale,
         k_descale,
         v_descale,
-        fp8_p_descale=False,  # Whether to compute descale factors for p
         config=None,
     ):
         # Assert that all descale factors are provided together or none at all
@@ -1404,7 +1402,6 @@ class _FlashAttnV3Func(torch.autograd.Function):
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                fp8_p_descale=fp8_p_descale,
                 config=config,
             )
         )
@@ -1528,7 +1525,6 @@ class _FlashAttnV3Func(torch.autograd.Function):
             None,  # gradient for descale_q
             None,  # gradient for descale_k
             None,  # gradient for descale_v
-            None,  # gradient for fp8_p_descale
             None,  # gradient for config
         )
 
@@ -1590,7 +1586,6 @@ def flash_attn_func_v3(
         q_descale,
         k_descale,
         v_descale,
-        _USE_FP8_P_DESCALE,  # Use global setting
         None,  # config
     )
 
@@ -1888,7 +1883,6 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         q_descale,
         k_descale,
         v_descale,
-        fp8_p_descale=False,  # Whether to compute descale factors for p
         config=None,
     ):
         # Assert that all descale factors are provided together or none at all
@@ -1927,7 +1921,6 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
                 q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
-                fp8_p_descale=fp8_p_descale,
                 config=config,
             )
         )
@@ -2044,8 +2037,8 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
         dv = dv[..., : v.shape[-1]]
         # Return gradients for all forward inputs: q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         # dropout_p, softmax_scale, causal, window_size, alibi_slopes, deterministic, return_lse, return_softmax,
-        # block_table, is_grad_enabled, q_descale, k_descale, v_descale, fp8_p_descale, config
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # block_table, is_grad_enabled, q_descale, k_descale, v_descale, config
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func_v3(
@@ -2103,6 +2096,5 @@ def flash_attn_varlen_func_v3(
         q_descale,
         k_descale,
         v_descale,
-        _USE_FP8_P_DESCALE,
         None,  # config
     )
