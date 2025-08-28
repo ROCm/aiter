@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-import triton
 import pytest
 from aiter.ops.triton.gemm_a8w8_per_token_scale import gemm_a8w8_per_token_scale
 from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
@@ -103,21 +102,23 @@ def generate_gemm_a8w8_per_token_scale_inputs(
 
     y = None
     if output:
-        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+        y = torch.empty((M, N), dtype=dtype, device="cuda")
 
     return x, weight, x_scale, w_scale, y
 
 
 @pytest.mark.parametrize(
-    "dtype, M, N, K, output",
+    "dtype, M, N, K, layout, output",
     [
-        (dtype, *shape, output)
+        (dtype, *shape, layout, output)
         for output in [True, False]
         for dtype in ["bf16"]
+        for layout in ["TN", "TT", "NN", "NT"]
         for shape in get_x_vals()
     ],
 )
-def test_gemm(dtype, M, N, K, output):
+def test_gemm(dtype, M, N, K, layout, output):
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
@@ -125,10 +126,11 @@ def test_gemm(dtype, M, N, K, output):
         N,
         K,
         dtype=dtype,
+        layout=layout,
         output=output,
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
     b = run_triton(x, weight, x_scale, w_scale, dtype, y)
 
-    triton.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+    torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)

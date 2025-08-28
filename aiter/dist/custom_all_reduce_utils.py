@@ -1,23 +1,25 @@
-'''
- * Copyright © Advanced Micro Devices, Inc. All rights reserved.
- * Copyright (c) 2024, The vLLM team.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- '''
+"""
+* Copyright © Advanced Micro Devices, Inc. All rights reserved.
+* Copyright (c) 2024, The vLLM team.
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*      http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+"""
 
-from functools import lru_cache, partial, wraps
-from .utils import (cuda_device_count_stateless,
-                    update_environment_variables)
+from .utils import (
+    cuda_device_count_stateless,
+    update_environment_variables,
+    get_cuda_visible_devices,
+)
 from aiter import logger
 from .cuda_wrapper import CudaRTLibrary
 import ctypes
@@ -36,14 +38,15 @@ import torch.multiprocessing as mp
 VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/vllm")
 
 
-def producer(batch_src: Sequence[int],
-             producer_queue,
-             consumer_queue,
-             result_queue,
-             cuda_visible_devices: Optional[str] = None):
+def producer(
+    batch_src: Sequence[int],
+    producer_queue,
+    consumer_queue,
+    result_queue,
+    cuda_visible_devices: Optional[str] = None,
+):
     if cuda_visible_devices is not None:
-        update_environment_variables(
-            {"CUDA_VISIBLE_DEVICES": cuda_visible_devices})
+        update_environment_variables({"HIP_VISIBLE_DEVICES": cuda_visible_devices})
 
     lib = CudaRTLibrary()
     for i in batch_src:
@@ -69,14 +72,15 @@ def producer(batch_src: Sequence[int],
         lib.cudaDeviceReset()
 
 
-def consumer(batch_tgt: Sequence[int],
-             producer_queue,
-             consumer_queue,
-             result_queue,
-             cuda_visible_devices: Optional[str] = None):
+def consumer(
+    batch_tgt: Sequence[int],
+    producer_queue,
+    consumer_queue,
+    result_queue,
+    cuda_visible_devices: Optional[str] = None,
+):
     if cuda_visible_devices is not None:
-        update_environment_variables(
-            {"CUDA_VISIBLE_DEVICES": cuda_visible_devices})
+        update_environment_variables({"HIP_VISIBLE_DEVICES": cuda_visible_devices})
 
     lib = CudaRTLibrary()
     for j in batch_tgt:
@@ -143,7 +147,7 @@ def can_actually_p2p(
     processes for testing all pairs of GPUs in batch. The trick is to reset
     the device after each test (which is not available in PyTorch).
     """  # noqa
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "-1")
+    cuda_visible_devices = ",".join(get_cuda_visible_devices(True))
     # cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
     # pass the CUDA_VISIBLE_DEVICES to the child process
     # to make sure they see the same set of GPUs
@@ -153,12 +157,26 @@ def can_actually_p2p(
     producer_queue = smp.Queue()
     consumer_queue = smp.Queue()
     result_queue = smp.Queue()
-    p_src = smp.Process(target=producer,
-                        args=(batch_src, producer_queue, consumer_queue,
-                              result_queue, cuda_visible_devices))
-    p_tgt = smp.Process(target=consumer,
-                        args=(batch_tgt, producer_queue, consumer_queue,
-                              result_queue, cuda_visible_devices))
+    p_src = smp.Process(
+        target=producer,
+        args=(
+            batch_src,
+            producer_queue,
+            consumer_queue,
+            result_queue,
+            cuda_visible_devices,
+        ),
+    )
+    p_tgt = smp.Process(
+        target=consumer,
+        args=(
+            batch_tgt,
+            producer_queue,
+            consumer_queue,
+            result_queue,
+            cuda_visible_devices,
+        ),
+    )
     p_src.start()
     p_tgt.start()
     p_src.join()
@@ -171,7 +189,10 @@ def can_actually_p2p(
         if a != b:
             logger.warning(
                 "Two processes do not agree on the P2P access"
-                " status on %d -> %d, treat as disabled.", src, tgt)
+                " status on %d -> %d, treat as disabled.",
+                src,
+                tgt,
+            )
             result.append(False)
         else:
             result.append(a)
@@ -205,18 +226,17 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
     is_distributed = dist.is_initialized()
 
     num_dev = cuda_device_count_stateless()
-    cuda_visible_devices = int(os.environ.get("CUDA_VISIBLE_DEVICES", "-1"))
-    # cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
-    if cuda_visible_devices is None:
-        cuda_visible_devices = ",".join(str(i) for i in range(num_dev))
+    cuda_visible_devices = ",".join(get_cuda_visible_devices(True))
 
     path = os.path.join(
-        VLLM_CACHE_ROOT,
-        f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json")
+        VLLM_CACHE_ROOT, f"gpu_p2p_access_cache_for_{cuda_visible_devices}.json"
+    )
     os.makedirs(os.path.dirname(path), exist_ok=True)
     from vllm.distributed.parallel_state import get_world_group
-    if ((not is_distributed or get_world_group().local_rank == 0)
-            and (not os.path.exists(path))):
+
+    if (not is_distributed or get_world_group().local_rank == 0) and (
+        not os.path.exists(path)
+    ):
         # only the local master process (with local_rank == 0) can
         #  enter this block to calculate the cache
         logger.info("generating GPU P2P access cache in %s", path)
@@ -235,11 +255,10 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
         # we don't use the output of the subprocess directly,
         # because the subprocess might produce logging output
         with tempfile.NamedTemporaryFile() as output_file:
-            input_bytes = pickle.dumps(
-                (batch_src, batch_tgt, output_file.name))
-            returned = subprocess.run([sys.executable, __file__],
-                                      input=input_bytes,
-                                      capture_output=True)
+            input_bytes = pickle.dumps((batch_src, batch_tgt, output_file.name))
+            returned = subprocess.run(
+                [sys.executable, __file__], input=input_bytes, capture_output=True
+            )
             # check if the subprocess is successful
             try:
                 returned.check_returncode()
@@ -248,7 +267,8 @@ def gpu_p2p_access_check(src: int, tgt: int) -> bool:
                 raise RuntimeError(
                     f"Error happened when batch testing "
                     f"peer-to-peer access from {batch_src} to {batch_tgt}:\n"
-                    f"{returned.stderr.decode()}") from e
+                    f"{returned.stderr.decode()}"
+                ) from e
             with open(output_file.name, "rb") as f:
                 result = pickle.load(f)
         for _i, _j, r in zip(batch_src, batch_tgt, result):

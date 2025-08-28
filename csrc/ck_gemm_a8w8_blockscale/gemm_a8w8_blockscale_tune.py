@@ -88,16 +88,16 @@ def run_gemm_a8w8_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK
     return out
 
 
-def generate_data(m, n, k):
-    dim = (m, n, k)
+def generate_data(m, n, k, seed, device="cuda"):
+    torch.manual_seed(seed)
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp16, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
-    out = torch.empty(m, n, dtype=dtypes.bf16, device="cuda")
+    x = (torch.rand((m, k), dtype=dtypes.fp16, device=device) / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp16, device=device) / 10).to(dtypes.fp8)
+    x_scale = torch.rand([m, scale_k], dtype=dtypes.fp32, device=device)
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device=device)
+    out = torch.empty(m, n, dtype=dtypes.bf16, device=device)
     return (x, weight, x_scale, w_scale, out)
 
 
@@ -109,6 +109,9 @@ def tune_gemm_list(
     cu_num = device_properties.multi_processor_count
     task = []
     tasks_data = []
+    gemm_a8w8_data_idx = [0, 1, 2, 3, 4]
+    ref_data_idx = [0, 1, 2, 3]
+    seed = 0
     for i in range(len(untunedf)):
         M = untunedf.loc[i, "M"]
         N = untunedf.loc[i, "N"]
@@ -120,8 +123,7 @@ def tune_gemm_list(
             & (tunedf["K"] == K)
             & (tunedf["cu_num"] == cu_num)
         ].empty:
-            input_datas = generate_data(M, N, K)
-
+            seed = seed + 1
             total_kernel_nums = 0
             for i in range(kernels_num):
                 kernel = kernels_list[i]
@@ -137,14 +139,17 @@ def tune_gemm_list(
                     task.append(
                         (
                             info,
+                            generate_data,
+                            (M, N, K, seed),
                             run_gemm_a8w8_blockscale,
                             (
+                                gemm_a8w8_data_idx,
                                 i,
                                 splitK,
                             ),
                             {},
                             run_torch,
-                            (None, dtypes.bf16),
+                            (ref_data_idx, None, dtypes.bf16),
                             {},
                             None,
                             1e-2,
@@ -153,7 +158,7 @@ def tune_gemm_list(
                     )
                     total_kernel_nums = total_kernel_nums + 1
 
-            tasks_data.append((total_kernel_nums, input_datas))
+            tasks_data.append((total_kernel_nums, ()))
     if task:
         ret = mp_tuner(task, tasks_data, mp_num, False, shape_grouped)
         for el in ret:

@@ -39,7 +39,7 @@ def to_record(
 def excel_to_struct_list(excel_file, sheet_name):
     wb = openpyxl.load_workbook(excel_file, data_only=True)
     if sheet_name not in wb.sheetnames:
-        raise ValueError(f"Sheet '{sheet_name}' ???!")
+        raise ValueError(f"Sheet '{sheet_name}' 不存在！")
     sheet = wb[sheet_name]
 
     baseRecords = []

@@ -29,7 +29,9 @@ from aiter.ops.triton.prefill_attention import context_attention_fwd
 from aiter.ops.triton.activation import _tanh
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
 
 _LOGGER = AiterTritonLogger()
 
@@ -73,10 +75,19 @@ def _fwd_kernel(
     IS_CAUSAL: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_TRANSPOSE: tl.constexpr,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BATCH: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
-    cur_seq = tl.program_id(0)
-    cur_head = tl.program_id(1)
-    cur_block_m = tl.program_id(2)
+    workgroup_id = tl.program_id(0)  # workgroup index
+    # Doing the round robin over heads ensures load balancing
+    # (because NUM_Q_HEADS is usually a multiple of the round robin length, i.e. NUM_XCDS)
+    cur_head = workgroup_id % NUM_Q_HEADS
+    cur_head = remap_xcd(cur_head, NUM_Q_HEADS, NUM_XCDS)
+    cur_block_m = (workgroup_id // NUM_Q_HEADS) % NUM_BLOCKS  # sequence block index
+    cur_seq = workgroup_id // (NUM_Q_HEADS * NUM_BLOCKS)  # batch sample index
+
     cur_kv_head = cur_head // kv_group_num
 
     cur_seq_extend_start_idx = tl.load(qo_indptr + cur_seq)
@@ -294,7 +305,7 @@ def _fwd_kernel(
 
 
 @functools.lru_cache(maxsize=1024)
-def _get_config():
+def _get_config(HEAD_SIZE, dtype):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_device()
         _get_config._config_dict = {}
@@ -302,6 +313,10 @@ def _get_config():
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
+
+    # HEAD_SIZE 192 = 128 head and 64 pe head dim
+    if (HEAD_SIZE > 192) or dtype == torch.float32:
+        return _get_config._config_dict["large_head_or_fp32"]
 
     return _get_config._config_dict["default"]
 
@@ -330,6 +345,11 @@ def extend_attention_fwd(
 
     k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
     """
+    _LOGGER.info(
+        f"EXTEND_ATTENTION_FWD: q_extend={tuple(q_extend.shape)} k_extend={tuple(k_extend.shape)} v_extend={tuple(v_extend.shape)} "
+        + f"k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+    )
+
     Lq, Lv = (
         q_extend.shape[-1],
         v_extend.shape[-1],
@@ -349,9 +369,6 @@ def extend_attention_fwd(
         BLOCK_DPE = 0
     BLOCK_DV = triton.next_power_of_2(Lv)
 
-    # BLOCK_M, BLOCK_N = (64, 64)
-    # num_warps = 4
-
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
@@ -361,14 +378,10 @@ def extend_attention_fwd(
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     if config is None:
-        config = _get_config()
+        config = _get_config(HEAD_SIZE=Lq, dtype=q_extend.dtype)
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, config["BLOCK_M"]))
-    # num_stages = 1
-
-    # extra_kargs = {}
-
-    # extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    num_blocks = triton.cdiv(max_len_extend, config["BLOCK_M"])
+    grid = (head_num * num_blocks * batch_size,)
 
     _fwd_kernel[grid](
         q_extend,
@@ -408,6 +421,10 @@ def extend_attention_fwd(
         IS_CAUSAL=is_causal,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         STORE_TRANSPOSE=True,
+        NUM_Q_HEADS=head_num,
+        NUM_BLOCKS=num_blocks,
+        BATCH=batch_size,
+        NUM_XCDS=get_num_xcds(),
         # num_warps=num_warps,
         # num_stages=num_stages,
         **config,
@@ -425,6 +442,10 @@ def redundant_attention(
     b_seq_len_prefix,
     max_len_in_batch,
 ):
+    _LOGGER.info(
+        f"REDUNDANT_ATTENTION: q_extend={tuple(q_extend.shape)} o_extend={tuple(o_extend.shape)} \
+        k_buffer={tuple(k_buffer.shape)} v_buffer={tuple(v_buffer.shape)}"
+    )
     total_token_num = k_buffer.shape[0]
     B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
     q_buffer = torch.empty(

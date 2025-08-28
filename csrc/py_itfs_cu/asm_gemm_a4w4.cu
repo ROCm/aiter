@@ -65,7 +65,7 @@ static CFG* get_cfg(torch::Tensor& inp, torch::Tensor& out)
 {
 
 #if defined(__Float4_e2m1fn_x2)
-    if((inp.dtype() == torch::kFloat4_e2m1fn_x2 || inp.dtype() == torch::kUInt8) &&
+    if(inp.dtype() == torch_fp4x2 &&
        out.scalar_type() == at::ScalarType::BFloat16)
 #else
     if((inp.dtype() == torch::kUInt8) && out.scalar_type() == at::ScalarType::BFloat16)
@@ -95,12 +95,13 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     hipDeviceProp_t dev_prop;
     HIP_CALL(hipGetDevice(&dev));
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-    uint32_t num_cu     = dev_prop.multiProcessorCount;
-    uint32_t empty_cu   = num_cu;
-    uint32_t tg_num     = 0;
-    uint32_t round      = 0xffffffff;
-    int log2_k_split_en = (log2_k_split.has_value() && log2_k_split.value() != 0) ? 1 : 0;
-    int bpreshuffle_en  = (bpreshuffle.has_value() && !bpreshuffle) ? 0 : 1;
+    uint32_t num_cu        = dev_prop.multiProcessorCount;
+    uint32_t empty_cu      = num_cu;
+    uint32_t tg_num        = 0;
+    uint32_t round         = 0xffffffff;
+    float compute2mem_effi = 1.0;
+    int log2_k_split_en    = (log2_k_split.has_value() && log2_k_split.value() != 0) ? 1 : 0;
+    int bpreshuffle_en     = (bpreshuffle.has_value() && !bpreshuffle) ? 0 : 1;
     std::string selectedKernelName = "";
     int selectedsplitK             = 1;
 
@@ -108,7 +109,7 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
     {
         const auto& cfg = el.second;
         if(cfg.bpreshuffle == bpreshuffle_en &&
-           ((cfg.splitK == log2_k_split_en) || !log2_k_split_en))
+           ((cfg.splitK == log2_k_split_en) || !log2_k_split.has_value()))
         {
             if((N % cfg.tile_N) == 0)
             {
@@ -124,8 +125,16 @@ std::tuple<std::string, int> get_heuristic_kernel(int M,
                     tg_num               = tg_num_M * tg_num_N * splitK;
                     uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
 
-                    if(local_round < round ||
-                       (local_round == round && empty_cu > (local_round * num_cu - tg_num)))
+                    float local_compute2mem_effi =
+                        cfg.tile_M * cfg.tile_N / (cfg.tile_M + cfg.tile_N);
+
+                    bool is_earlier_round        = (local_round < round);
+                    bool is_same_round           = (local_round == round);
+                    bool has_sufficient_empty_cu = (empty_cu > (local_round * num_cu - tg_num));
+                    bool has_better_efficiency   = (local_compute2mem_effi > compute2mem_effi);
+
+                    if(is_earlier_round ||
+                       (is_same_round && (has_sufficient_empty_cu || has_better_efficiency)))
                     {
                         round              = local_round;
                         empty_cu           = local_round * num_cu - tg_num;
@@ -248,6 +257,7 @@ torch::Tensor gemm_a4w4_asm(torch::Tensor& A,       // A:[M, K/2] f4x2
 
         if(cfg.splitK == 1)
         {
+            out.zero_();
             args.log2_k_split = selectedksplit;
             int k_num         = 1 << args.log2_k_split;
             TORCH_CHECK(Kdim % k_num == 0, __func__, " Kdim % (1 << args.log2_k_split) != 0 !");

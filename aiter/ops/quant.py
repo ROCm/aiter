@@ -13,13 +13,15 @@ from ..utility import dtypes, fp4_utils
 
 
 @compile_ops("module_smoothquant")
-def smoothquant_fwd(input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor): ...
+def smoothquant_fwd(
+    input: Tensor, out: Tensor, x_scale: Tensor, y_scale: Tensor
+) -> None: ...
 
 
 @compile_ops("module_smoothquant")
 def moe_smoothquant_fwd(
     input: Tensor, out: Tensor, x_scale: Tensor, topk_ids: Tensor, y_scale: Tensor
-): ...
+) -> None: ...
 
 
 # following are pure torch implement
@@ -192,7 +194,7 @@ def per_token_quant_hip(
         raise ValueError("unsupported: static per token quant")
 
     if 1:
-        y = torch.zeros(shape, dtype=quant_dtype, device=device)
+        y = torch.empty(shape, dtype=quant_dtype, device=device)
         dynamic_per_token_scaled_quant(
             y, x, scale, num_rows=num_rows, num_rows_factor=num_rows_factor
         )
@@ -331,7 +333,7 @@ def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=Fa
     assert quant_dtype == dtypes.fp4x2
     # y, scale = triton.quant.dynamic_mxfp4_quant(x)
     y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle)
-    return y, scale
+    return y.view(quant_dtype), scale
 
 
 def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
@@ -356,23 +358,23 @@ def get_torch_act(aType):
 
 
 @compile_ops("module_quant")
-def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def static_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
 @compile_ops("module_quant")
-def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor): ...
+def dynamic_per_tensor_quant(out: Tensor, input: Tensor, scale: Tensor) -> None: ...
 
 
 @compile_ops("module_quant")
 def dynamic_per_token_scaled_quant(
-    out: Tensor,
-    input: Tensor,
-    scales: Tensor,
-    scale_ub: Optional[Tensor] = None,
-    shuffle_scale=False,
-    num_rows: Optional[Tensor] = None,
+    out: torch.Tensor,
+    input: torch.Tensor,
+    scales: torch.Tensor,
+    scale_ub: Optional[torch.Tensor] = None,
+    shuffle_scale: bool = False,
+    num_rows: Optional[torch.Tensor] = None,
     num_rows_factor: int = 1,
-): ...
+) -> None: ...
 
 
 @compile_ops("module_quant")
@@ -381,10 +383,10 @@ def dynamic_per_group_scaled_quant_fp4(
     input: Tensor,
     scales: Tensor,
     group_size: Optional[int] = 32,
-    shuffle_scale=True,
+    shuffle_scale: bool = True,
     num_rows: Optional[Tensor] = None,
     num_rows_factor: int = 1,
-):
+) -> None:
     """
     Only support group_size in [32, 64, 128]
     """
@@ -396,4 +398,4 @@ def partial_transpose(
     out: Tensor,
     input: Tensor,
     num_rows: Tensor,
-): ...
+) -> None: ...

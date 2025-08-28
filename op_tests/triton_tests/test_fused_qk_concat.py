@@ -91,6 +91,8 @@ def test_qk_rope_cat(
     dtype,
 ):
 
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     q_nope, q_pe, k_nope, k_pe = generate_qk_inputs(
         B, QH_PER_KH, KH, D_nope, D_pe, dtype
     )
