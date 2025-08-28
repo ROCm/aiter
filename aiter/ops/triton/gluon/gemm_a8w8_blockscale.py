@@ -324,7 +324,7 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
 
-@triton.jit
+@gluon.jit
 def _gemm_a8w8_blockscale_reduce_kernel(
     c_in_ptr,
     c_out_ptr,
@@ -352,7 +352,7 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     )
 
     blocked_write: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 4],
+        size_per_thread=[1, 4], # (BLOCK_M, BLOCK_N)
         threads_per_warp=[8, 8],
         warps_per_cta=[4, 1],
         order=[1, 0],
@@ -364,30 +364,32 @@ def _gemm_a8w8_blockscale_reduce_kernel(
                                               gl.SliceLayout(0, gl.SliceLayout(1, blocked_read)))
     offs_k = gl.arange(0, MAX_KSPLIT, # keep dim 0
                        gl.SliceLayout(1, gl.SliceLayout(2, blocked_read)))
-    c_in_ptrs = (
-        c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
+    c_in_offs = (
+        (offs_k[:, None, None] * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
 
     if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = gl.load(c_in_ptrs)
+        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs)
     else:
-        c = gl.load(
-            c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT
+        c = gl.amd.cdna4.buffer_load(
+            c_in_ptr, c_in_offs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT
         )  # , other=0.0)
     c = gl.sum(c, axis=0)
 
     c = c.to(c_out_ptr.type.element_ty)
 
-    c_out_ptrs = (
-        c_out_ptr
-        + (offs_m[:, None] * stride_c_out_m)
-        + (offs_n[None, :] * stride_c_out_n)
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
+                                               gl.SliceLayout(1, blocked_write))
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
+                                               gl.SliceLayout(0, blocked_write))
+    c_out_offs = (
+        (offs_cm[:, None] * stride_c_out_m)
+        + (offs_cn[None, :] * stride_c_out_n)
     )
 
-    gl.store(c_out_ptrs, c)
+    gl.amd.cdna4.buffer_store(stored_value = c, ptr = c_out_ptr, offsets = c_out_offs)
 
 
 @functools.lru_cache(maxsize=1024)
