@@ -1162,16 +1162,18 @@ def go(
         _, ck_stage1_kernels = get_gemm1_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
+            dtype2str_dict[dtype],
             False,
-            str(q_type).split(".")[-1].lower(),
+            int(q_type),
             str(act_type).split(".")[-1].lower(),
             doweight_stage1,
         )
         _, ck_stage2_kernels = get_gemm2_kernels_list(
             dtype2str_dict[q_dtype_a],
             dtype2str_dict[q_dtype_w],
+            dtype2str_dict[dtype],
             False,
-            str(q_type).split(".")[-1].lower(),
+            int(q_type),
             not doweight_stage1,
         )
         for blockM in blockMs:
@@ -1490,10 +1492,7 @@ def go(
             )
         profileDF = pd.DataFrame(
             profileDF,
-            columns=["stage"]
-            + ["cu_num"]
-            + args
-            + ["block_m", "ksplit", "us", "kernelName", "err"],
+            columns=["stage"] + args + ["block_m", "ksplit", "us", "kernelName", "err"],
         )
         prorfiles.append(profileDF)
         profileDF = profileDF.sort_values("us").drop_duplicates(
