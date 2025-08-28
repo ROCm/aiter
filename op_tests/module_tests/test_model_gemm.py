@@ -504,7 +504,7 @@ def create_argument_parser():
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["bf16", "fp16"],
+        choices=["bf16"],
         nargs="?",
         const=None,
         default=None,
