@@ -152,13 +152,13 @@ def validate_and_update_archs():
 
 
 @functools.lru_cache()
-def hip_flag_checker(flag_hip: str):
+def hip_flag_checker(flag_hip: str) -> bool:
     ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
-        return [flag_hip]
+        return True
     else:
         logger.warning(f"{flag_hip} is not supported by hipcc.")
-        return []
+        return False
 
 
 def check_and_set_ninja_worker():
@@ -404,8 +404,8 @@ def build_module(
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
-        except:
-            tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
+        except Exception as e:
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
             logger.error(
                 f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
                     re.sub(
@@ -416,7 +416,9 @@ def build_module(
                     ),
                 )
             )
-            raise
+            raise SystemExit(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from e
 
     def FinalFunc():
         logger.info(
