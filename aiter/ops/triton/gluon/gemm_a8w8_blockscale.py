@@ -344,7 +344,7 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     pid_m = gl.program_id(axis=0)
     pid_n = gl.program_id(axis=1)
 
-    blocked_read: gl.constexpr = gl.BlockedLayout( # (MAX_KSPLIT, BLOCK_M, BLOCK_N)
+    blocked_read: gl.constexpr = gl.BlockedLayout(  # (MAX_KSPLIT, BLOCK_M, BLOCK_N)
         size_per_thread=[1, 1, 4],
         threads_per_warp=[1, 8, 8],
         warps_per_cta=[1, 4, 1],
@@ -358,39 +358,45 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     #     order=[1, 0],
     # )
 
-    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, # keep dim 1
-                                              gl.SliceLayout(0, gl.SliceLayout(2, blocked_read)))
-    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, # keep dim 2
-                                              gl.SliceLayout(0, gl.SliceLayout(1, blocked_read)))
-    offs_k = gl.arange(0, MAX_KSPLIT, # keep dim 0
-                       gl.SliceLayout(1, gl.SliceLayout(2, blocked_read)))
+    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
+        0,
+        BLOCK_SIZE_M,  # keep dim 1
+        gl.SliceLayout(0, gl.SliceLayout(2, blocked_read)),
+    )
+    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(
+        0,
+        BLOCK_SIZE_N,  # keep dim 2
+        gl.SliceLayout(0, gl.SliceLayout(1, blocked_read)),
+    )
+    offs_k = gl.arange(
+        0, MAX_KSPLIT, gl.SliceLayout(1, gl.SliceLayout(2, blocked_read))  # keep dim 0
+    )
     c_in_offs = (
         (offs_k[:, None, None] * stride_c_in_k)
         + (offs_m[None, :, None] * stride_c_in_m)
         + (offs_n[None, None, :] * stride_c_in_n)
     )
     if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs,
-                                     cache = ".cg")
+        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs, cache=".cg")
     else:
         c = gl.amd.cdna4.buffer_load(
-            c_in_ptr, c_in_offs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT,
-            cache = ".cg"
+            c_in_ptr, c_in_offs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, cache=".cg"
         )  # , other=0.0)
     c = tl.sum(c, 0)
 
     c = c.to(c_out_ptr.type.element_ty)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M,
-                                               gl.SliceLayout(1, gl.SliceLayout(0, blocked_read)))
-    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N,
-                                               gl.SliceLayout(0, gl.SliceLayout(0, blocked_read)))
-    c_out_offs = (
-        (offs_cm[:, None] * stride_c_out_m)
-        + (offs_cn[None, :] * stride_c_out_n)
+    offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
+        0, BLOCK_SIZE_M, gl.SliceLayout(1, gl.SliceLayout(0, blocked_read))
+    )
+    offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
+        0, BLOCK_SIZE_N, gl.SliceLayout(0, gl.SliceLayout(0, blocked_read))
+    )
+    c_out_offs = (offs_cm[:, None] * stride_c_out_m) + (
+        offs_cn[None, :] * stride_c_out_n
     )
 
-    gl.amd.cdna4.buffer_store(stored_value = c, ptr = c_out_ptr, offsets = c_out_offs)
+    gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_out_ptr, offsets=c_out_offs)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -436,6 +442,7 @@ def _get_config(
             return _get_config._config_dict[key][f"M_LEQ_{bound}"]
     else:
         return _get_config._config_dict[key]["any"]
+
 
 def gemm_a8w8_blockscale(
     x: torch.Tensor,
