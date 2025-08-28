@@ -79,6 +79,9 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
+    return {
+        "ck us": avg_b,
+    }
 
 
 def get_boundary_test_cases(cu_count, aligned_k):
@@ -353,5 +356,6 @@ def test_skinny_gemm():
                     test_gemm(dtype, m, n, k, otype=otype)
 
 
-# test_normal_gemm()
-test_skinny_gemm()
+if __name__ == "__main__":
+    test_normal_gemm()
+    test_skinny_gemm()
