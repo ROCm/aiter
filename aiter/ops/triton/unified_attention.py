@@ -836,7 +836,6 @@ def unified_attention(
             num_warps = 4
             BLOCK_Q = BLOCK_M // num_queries_per_kv
             total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-        num_stages_2d = min(num_stages_2d, math.ceil(max_seqlen_k / (block_size * 2)))
         kernel_unified_attention_2d[
             (
                 num_kv_heads,
