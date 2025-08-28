@@ -25,12 +25,10 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-import os
 from .custom_all_reduce_utils import gpu_p2p_access_check
 from .parallel_state import in_the_same_node_as
 from .utils import get_cuda_visible_devices
 from aiter import logger
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 try:
     ops.meta_size()
@@ -38,11 +36,6 @@ try:
 except Exception:
     # For CPUs
     custom_ar = False
-
-
-@torch_compile_guard()
-def is_current_stream_capturing() -> bool:
-    return torch.cuda.is_current_stream_capturing()
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -313,7 +306,7 @@ class CustomAllreduce:
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
-            if is_current_stream_capturing():
+            if torch.cuda.is_current_stream_capturing():
                 return self.all_reduce_reg(input, open_fp8_quant=open_fp8_quant)
             else:
                 # if warm up, mimic the allocation pattern
