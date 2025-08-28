@@ -344,9 +344,26 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     pid_m = gl.program_id(axis=0)
     pid_n = gl.program_id(axis=1)
 
-    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N)
-    offs_k = gl.arange(0, MAX_KSPLIT)
+    blocked_read: gl.constexpr = gl.BlockedLayout( # (MAX_KSPLIT, BLOCK_M, BLOCK_N)
+        size_per_thread=[1, 1, 4],
+        threads_per_warp=[1, 8, 8],
+        warps_per_cta=[1, 4, 1],
+        order=[2, 1, 0],
+    )
+
+    blocked_write: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 4],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[4, 1],
+        order=[1, 0],
+    )
+
+    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(0, BLOCK_SIZE_M, # keep dim 1
+                                              gl.SliceLayout(0, gl.SliceLayout(2, blocked_read)))
+    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, # keep dim 2
+                                              gl.SliceLayout(0, gl.SliceLayout(1, blocked_read)))
+    offs_k = gl.arange(0, MAX_KSPLIT, # keep dim 0
+                       gl.SliceLayout(1, gl.SliceLayout(2, blocked_read)))
     c_in_ptrs = (
         c_in_ptr
         + (offs_k[:, None, None] * stride_c_in_k)
