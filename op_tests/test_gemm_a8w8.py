@@ -7,7 +7,7 @@ import random
 import aiter
 from aiter import dtypes
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest, benchmark
 import pandas as pd
 import argparse
 
@@ -50,7 +50,7 @@ def run_gemm_skinny(
     return out.to(dtype)
 
 
-# @benchmark()
+@benchmark()
 def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8):
     x = torch.randn((m, k), dtype=dtype, device="cuda")
     weight = torch.randn((n, k), dtype=dtype, device="cuda")

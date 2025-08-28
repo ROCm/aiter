@@ -46,7 +46,6 @@ def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @benchmark()
 def test_gemm(dtype, m, n, k):
-    print("-----------------flag1---------------")
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -118,8 +117,6 @@ def test_gemm_asm(dtype, m, n, k):
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
 
 
-
-
 def create_argument_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -155,6 +152,7 @@ def create_argument_parser():
         e.g.: -nk 4096,512""",
     )
     return parser
+
 
 if __name__ == "__main__":
     l_dtype = ["bf16"]

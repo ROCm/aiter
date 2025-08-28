@@ -46,7 +46,6 @@ M = [
     16384,
     32768,
 ]
-# M = [1]
 
 
 @dataclass
@@ -147,12 +146,10 @@ def to_record(
 
 ##### Wrapper and unified the test_gemm API for CK/ASM/Triton Kernels #####
 def run_a16w16_gemm(dtype, record, run_triton=False):
-    print("--run_triton={}".format(run_triton))
     from op_tests.test_gemm import test_gemm
 
     ret = test_gemm(dtype, record.M, record.N, record.K, otype=dtype)
     latency = ret["ck us"]
-    print("--latency={}".format(latency))
 
     latency_asm = 0.0
     latency_triton = 0.0
@@ -182,7 +179,6 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     elif fp8_quant_method == "per_token":
         from op_tests.test_gemm_a8w8 import test_gemm
 
-        print("----run per_token gemm")
         ret = test_gemm(dtype, record.M, record.N, record.K, dtypes.fp8)
         ck_time = ret["ck us"]
         ck_bpreshuffle_time = ret["ck bpreshuffle us"]
@@ -197,7 +193,6 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     elif fp8_quant_method == "per_block":
         from op_tests.test_gemm_a8w8_blockscale import test_gemm
 
-        print("----run per_block gemm")
         ret = test_gemm(dtype, record.M, record.N, record.K)
         latency = ret["us"]
     else:
@@ -206,7 +201,6 @@ def run_a8w8_gemm(dtype, record, fp8_quant_method, run_triton=False):
     latency_triton = 0.0
     if run_triton:
         pre_shuffle_scales = os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "1")
-        print("--pre_shuffle_scales={}".format(pre_shuffle_scales))
         if fp8_quant_method == "per_tensor":
             from op_tests.op_benchmarks.triton.bench_gemm_a8w8 import bench_gemm_fn
         elif fp8_quant_method == "per_token":
@@ -378,7 +372,6 @@ class GemmTestRunner:
                 dtype, record, run_triton
             )
         else:
-            print("---run_bf16_gemm---")
             latency, latency_asm, latency_triton = run_a16w16_gemm(
                 dtype, record, run_triton
             )
@@ -455,8 +448,6 @@ class GemmTestRunner:
                 quant_methods = fp8_quant_methods
             else:
                 quant_methods = ["default"]
-            print("---l_quant_dtype={}".format(quant_dtype))
-            print("---l_quant_method={}".format(quant_methods))
 
             for quant_method in quant_methods:
                 for dtype in output_types:
@@ -512,7 +503,6 @@ class GemmTestRunner:
                 quant_types,
                 args.triton,
             )
-            print("----records={}".format(records))
             save_gemm_benchmark_result(records, model.model_name)
             if args.save_untuned_gemm:
                 save_untuned_gemm_csv(
