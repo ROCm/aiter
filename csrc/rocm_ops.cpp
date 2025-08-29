@@ -29,6 +29,7 @@
 #include "pos_encoding.h"
 #include "quant.h"
 #include "rmsnorm.h"
+#include "rmsnorm_fused.h"
 #include "rocsolgemm.cuh"
 #include "rope.h"
 #include "smoothquant.h"
@@ -93,5 +94,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     CACHE_PYBIND;
     HIPBSOLGEMM_PYBIND;
     ROCSOLGEMM_PYBIND;
+    RMSNORM_FUSED_PYBIND;
 }
 #endif

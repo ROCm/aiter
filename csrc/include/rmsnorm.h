@@ -78,3 +78,4 @@ void rmsnorm2d_with_add_dynamicquant(
     torch::Tensor& weight,       // [1 ,n]
     double epsilon,
     int use_model_sensitive_rmsnorm); // 0: Use default RMSNorm; 1: Use T5-like implementation
+

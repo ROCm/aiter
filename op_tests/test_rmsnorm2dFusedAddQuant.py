@@ -73,6 +73,7 @@ def run_ck(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
         elif residual is not None:
             residual_out = torch.empty_like(input)
             out_before_quant = torch.empty_like(input)
+            # aiter.rmsnorm2d_with_add_smoothquant_hip(
             aiter.rmsnorm2d_fwd_with_add_smoothquant(
                 output,
                 input,
