@@ -67,18 +67,19 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     torch::Tensor &out      // Out:[M, N] fp16
 )
 {
-    constexpr int TileM = 128;
-    constexpr int TileN = 256;
+    int TileM = 128;
+    constexpr int TileN = 128;
     constexpr int TileK = 128;
 
     int m = XQ.size(0);
     int n = out.size(1);
     int k = XQ.size(1);
-
-    TORCH_CHECK(out.dtype() == torch::ScalarType::Half,
-                "flatmm a8w8 blockscale asm only support Half output now!");
+   if (m <= 32)
+       TileM = 32;
+    TORCH_CHECK(out.dtype() == torch::ScalarType::BFloat16,
+                "mi350 a8w8 blockscale asm only support Half output now!");
     TORCH_CHECK(n % TileN == 0 && k % TileK == 0, 
-                "flatmm a8w8 blockscale asm only suuport 128x256x128 tile now!");
+                "mi350 a8w8 blockscale asm only suuport 128x256x128 tile now!");
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
@@ -89,27 +90,28 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     args.ptr_GUQ = (void *)w_scale.data_ptr();
     args.ptr_O = (void *)out.data_ptr();
     args.dim = k;
-    args.hidden_dim = m;
+    args.hidden_dim = n;
     args.token_cnt = m;
     args.eprt_cnt = 1;
     args.Xs = k * XQ.element_size();
     args.GUs = k * XQ.element_size();
-    args.Os = n * out.element_size();
+    args.Os = n * 2;
     args.splitk = 0;
     args.activation = 0;
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
+    // printf("ptr_X: %p\n", args.ptr_X);
+    // printf("ptr_GU: %p\n", args.ptr_GU);
+    // printf("ptr_XQ: %p\n", args.ptr_XQ);
+    // printf("ptr_GUQ: %p\n", args.ptr_GUQ);
+    // printf("args.Xs: %d\n", args.Xs);
+    // printf("args.token_cnt: %d\n", args.token_cnt);
     AiterAsmKernel *impl_ptr = nullptr;
-    static AiterAsmKernel impl_kenrel("flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32", "flatmm_uk_gfx9_f16f8_128x256x128_1x4x1_16x16x32.co");
-    impl_ptr = &impl_kenrel;
-    //  sz_stp = sz_sw = topk*batch + eprt*sub_X - topk; //max_length
-    // sz_sep = (sz_stp + sub_X - 1)/sub_X; 
-    //     int gdx = ((hidden_dim+sub_GU*2-1)/(sub_GU*2));
-    // int gdy = sz_sep; 
+    static AiterAsmKernel impl_kenrel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
+    static AiterAsmKernel impl_kenrel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
+    impl_ptr = (m <= 32)?&impl_kenrel_x32:&impl_kenrel_x128;
     int gdx = (n + TileN*2 - 1) / (TileN*2);
     int gdy = (m + TileM - 1) / TileM;
-
+   // printf("gdx: %d, gdy:%d, \n", gdx, gdy);
     impl_ptr->launch_kernel({&args,
                              &arg_size,
                              gdx,   // gdx
