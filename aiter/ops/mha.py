@@ -40,6 +40,10 @@ def cmdGenFunc_mha_fwd(
     elif q.dtype == dtypes.bf16:
         md_name += "_bf16"
         filter += "bf16*"
+    elif q.dtype == dtypes.fp8:
+        # only support bf16 out for fp8 input
+        md_name += "_fp8bf16"
+        filter += "fp8bf16*"
     if bias is not None:
         md_name += "_bias"
         filter += "_bias*"
@@ -1548,7 +1552,24 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
+        return (
+            dq, 
+            dk,
+            dv, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None, 
+            dbias, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None,
+        )
 
 
 def flash_attn_func(
