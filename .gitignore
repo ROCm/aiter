@@ -49,6 +49,3 @@ __pycache__
 debug
 aiter_logs
 *.log
-scripts
-.amd
-.train
