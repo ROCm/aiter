@@ -466,7 +466,7 @@ def run_benchmark(custom, args):
         else:  # GB/s
             return mem / ms * 1e-6
 
-    bench_mha.run(save_path="." if args.o else None, print_data=True)
+    bench_mha.run(save_path="." if args.o else None, print_data=True, show_plots=False)
 
 
 def supported_layouts():
