@@ -546,7 +546,7 @@ def test_mha_backward(
             q_fp8, q_descale = _cast_to_fp8(q, fp8_dtype, "bshd")
             k_fp8, k_descale = _cast_to_fp8(k, fp8_dtype, "bshd")
             v_fp8, v_descale = _cast_to_fp8(v, fp8_dtype, "bshd")
-            
+
             triton_out = flash_attn_func_v3(
                 q_fp8,
                 k_fp8,
@@ -740,7 +740,7 @@ def test_mha_backward_varlen(
             q_fp8, q_descale = _cast_varlen_to_fp8(q_unpad, fp8_dtype, cu_seqlens_q)
             k_fp8, k_descale = _cast_varlen_to_fp8(k_unpad, fp8_dtype, cu_seqlens_k)
             v_fp8, v_descale = _cast_varlen_to_fp8(v_unpad, fp8_dtype, cu_seqlens_k)
-            
+
             triton_out = flash_attn_varlen_func_v3(
                 q_fp8,
                 k_fp8,
