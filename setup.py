@@ -84,7 +84,19 @@ if IS_ROCM:
             )
 
         # step 1, build *.cu -> module*.so
-        with Pool(processes=int(0.8 * os.cpu_count())) as pool:
+        max_build_jobs = os.environ.get("MAX_BUILD_JOBS")
+        if max_build_jobs is not None:
+            try:
+                max_processes = int(max_build_jobs)
+                max_processes = min(max_processes, int(0.8 * os.cpu_count()))
+                max_processes = max(1, max_processes)
+            except ValueError:
+                max_processes = max(1, int(0.5 * os.cpu_count()))
+        else:
+            max_processes = max(1, int(0.5 * os.cpu_count()))
+        print(f"using {max_processes} parallel build process (CPU count: {os.cpu_count()})")
+
+        with Pool(processes=int(processes=max_processes)) as pool:
             pool.map(build_one_module, all_opts_args_build)
 
         ck_batched_gemm_folders = [
