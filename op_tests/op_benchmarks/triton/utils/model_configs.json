@@ -47,7 +47,6 @@
       "num_expert": 8,
       "top_k": 2
     }
-
   },
   "deepseek": {
     "V3": {
@@ -59,6 +58,97 @@
       "moe_layer_freq": 1,
       "n_routed_experts": 256,
       "num_expert": 256,
+      "top_k": 8
+    },
+    "V3_TP4": {
+      "hidden_size": 7168,
+      "intermediate_size": 1024,
+      "num_attention_heads": 128,
+      "num_key_value_heads": 128,
+      "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "num_expert": 256,
+      "top_k": 8
+    },
+    "V3_TP8": {
+      "hidden_size": 7168,
+      "intermediate_size": 512,
+      "num_attention_heads": 128,
+      "num_key_value_heads": 128,
+      "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "num_expert": 256,
+      "top_k": 8
+    },
+    "V3_EP8_top2": {
+      "hidden_size": 7168,
+      "intermediate_size": 4096,
+      "num_attention_heads": 128,
+      "num_key_value_heads": 128,
+      "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "num_expert": 32,
+      "top_k": 2
+    },
+    "V3_EP8_top4": {
+      "hidden_size": 7168,
+      "intermediate_size": 4096,
+      "num_attention_heads": 128,
+      "num_key_value_heads": 128,
+      "vocab_size": 129280,
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "num_expert": 32,
+      "top_k": 4
+    }
+  },
+  "qwen3": {
+    "235B": {
+      "num_attention_heads": 64,
+      "num_key_value_heads": 4,
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "vocab_size": 151936,
+      "num_expert": 128,
+      "top_k": 8
+    },
+    "235B_TP4": {
+      "num_attention_heads": 64,
+      "num_key_value_heads": 4,
+      "hidden_size": 4096,
+      "intermediate_size": 768,
+      "vocab_size": 151936,
+      "num_expert": 128,
+      "top_k": 8
+    },
+    "235B_TP8": {
+      "num_attention_heads": 64,
+      "num_key_value_heads": 4,
+      "hidden_size": 4096,
+      "intermediate_size": 384,
+      "vocab_size": 151936,
+      "num_expert": 128,
+      "top_k": 8
+    },
+    "235B_EP8_top2": {
+      "num_attention_heads": 64,
+      "num_key_value_heads": 4,
+      "hidden_size": 4096,
+      "intermediate_size": 3072,
+      "vocab_size": 151936,
+      "num_expert": 16,
+      "top_k": 2
+    },
+    "235B_EP8_top4": {
+      "num_attention_heads": 64,
+      "num_key_value_heads": 4,
+      "hidden_size": 4096,
+      "intermediate_size": 3072,
+      "vocab_size": 151936,
+      "num_expert": 16,
       "top_k": 4
     }
   }
