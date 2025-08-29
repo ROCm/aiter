@@ -1942,11 +1942,44 @@ class _FlashAttnVarlenV3Func(torch.autograd.Function):
             )
         )
         if is_grad:
-            # Apply descaling if descale factors are provided
             if q_descale is not None:
-                q_saved = q.float() * q_descale
-                k_saved = k.float() * k_descale
-                v_saved = v.float() * v_descale
+                batch_size = cu_seqlens_q.shape[0] - 1
+
+                q_descale_expanded = torch.zeros(
+                    (q.shape[0], q.shape[1]), dtype=torch.float32, device=q.device
+                )
+                k_descale_expanded = torch.zeros(
+                    (k.shape[0], k.shape[1]), dtype=torch.float32, device=k.device
+                )
+                v_descale_expanded = torch.zeros(
+                    (v.shape[0], v.shape[1]), dtype=torch.float32, device=v.device
+                )
+
+                # map batch descale factors to sequence positions
+                for i in range(batch_size):
+                    q_start = cu_seqlens_q[i]
+                    q_end = cu_seqlens_q[i + 1]
+                    k_start = cu_seqlens_k[i]
+                    k_end = cu_seqlens_k[i + 1]
+
+                    q_descale_expanded[q_start:q_end, :] = q_descale[i, :]
+                    k_descale_expanded[k_start:k_end, :] = k_descale[i, :]
+                    v_descale_expanded[k_start:k_end, :] = v_descale[i, :]
+
+                # reshape for broadcasting
+                q_descale_expanded = q_descale_expanded.unsqueeze(
+                    -1
+                )  # [total_seq_len, heads, 1]
+                k_descale_expanded = k_descale_expanded.unsqueeze(
+                    -1
+                )  # [total_seq_len, heads, 1]
+                v_descale_expanded = v_descale_expanded.unsqueeze(
+                    -1
+                )  # [total_seq_len, heads, 1]
+
+                q_saved = q.float() * q_descale_expanded
+                k_saved = k.float() * k_descale_expanded
+                v_saved = v.float() * v_descale_expanded
             else:
                 q_saved = q
                 k_saved = k
