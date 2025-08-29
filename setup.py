@@ -16,6 +16,7 @@ from jit.utils.cpp_extension import (
     BuildExtension,
     IS_HIP_EXTENSION,
 )
+from multiprocessing import Pool
 
 ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
 PACKAGE_NAME = "aiter"
@@ -45,7 +46,6 @@ if IS_ROCM:
         exclude_ops = [
             "libmha_fwd",
             "libmha_bwd",
-            "module_moe_ck2stages",
             "module_fmha_v3_fwd",
             "module_mha_fwd",
             "module_mha_varlen_fwd",
@@ -57,25 +57,73 @@ if IS_ROCM:
             "module_mha_varlen_bwd",
         ]
 
-        all_opts_args_build = core.get_args_of_build("all", exclude=exclude_ops)
-        # remove pybind, because there are already duplicates in rocm_opt
-        new_list = [el for el in all_opts_args_build["srcs"] if "pybind.cu" not in el]
-        all_opts_args_build["srcs"] = new_list
+        all_opts_args_build, prebuild_link_param = core.get_args_of_build(
+            "all", exclude=exclude_ops
+        )
+        os.system(f"rm -rf {core.get_user_jit_dir()}/build")
+        os.system(f"rm -rf {core.get_user_jit_dir()}/*.so")
+        prebuild_dir = f"{core.get_user_jit_dir()}/build/aiter_/build"
+        core.recopy_ck()
+        os.makedirs(prebuild_dir + "/srcs")
 
+        def build_one_module(one_opt_args):
+            core.build_module(
+                md_name=one_opt_args["md_name"],
+                srcs=one_opt_args["srcs"],
+                flags_extra_cc=one_opt_args["flags_extra_cc"] + ["-DPREBUILD_KERNELS"],
+                flags_extra_hip=one_opt_args["flags_extra_hip"]
+                + ["-DPREBUILD_KERNELS"],
+                blob_gen_cmd=one_opt_args["blob_gen_cmd"],
+                extra_include=one_opt_args["extra_include"],
+                extra_ldflags=None,
+                verbose=False,
+                is_python_module=True,
+                is_standalone=False,
+                torch_exclude=False,
+                prebuild=1,
+            )
+
+        # step 1, build *.cu -> module*.so
+        with Pool(processes=int(0.8 * os.cpu_count())) as pool:
+            pool.map(build_one_module, all_opts_args_build)
+
+        ck_batched_gemm_folders = [
+            f"{this_dir}/csrc/{name}/include"
+            for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
+            and name.startswith("ck_batched_gemm")
+        ]
+        ck_gemm_folders = [
+            f"{this_dir}/csrc/{name}/include"
+            for name in os.listdir(f"{this_dir}/csrc")
+            if os.path.isdir(os.path.join(f"{this_dir}/csrc", name))
+            and name.startswith("ck_gemm_a")
+        ]
+        ck_gemm_inc = ck_batched_gemm_folders + ck_gemm_folders
+        for src in ck_gemm_inc:
+            dst = f"{prebuild_dir}/include"
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+
+        shutil.copytree(
+            f"{this_dir}/csrc/include", f"{prebuild_dir}/include", dirs_exist_ok=True
+        )
+
+        # step 2, link module*.so -> aiter_.so
         core.build_module(
             md_name="aiter_",
-            srcs=all_opts_args_build["srcs"] + [f"{this_dir}/csrc"],
-            flags_extra_cc=all_opts_args_build["flags_extra_cc"]
+            srcs=[f"{prebuild_dir}/srcs/rocm_ops.cu"],
+            flags_extra_cc=prebuild_link_param["flags_extra_cc"]
             + ["-DPREBUILD_KERNELS"],
-            flags_extra_hip=all_opts_args_build["flags_extra_hip"]
+            flags_extra_hip=prebuild_link_param["flags_extra_hip"]
             + ["-DPREBUILD_KERNELS"],
-            blob_gen_cmd=all_opts_args_build["blob_gen_cmd"],
-            extra_include=all_opts_args_build["extra_include"],
+            blob_gen_cmd=prebuild_link_param["blob_gen_cmd"],
+            extra_include=prebuild_link_param["extra_include"],
             extra_ldflags=None,
             verbose=False,
             is_python_module=True,
             is_standalone=False,
             torch_exclude=False,
+            prebuild=2,
         )
 else:
     raise NotImplementedError("Only ROCM is supported")
