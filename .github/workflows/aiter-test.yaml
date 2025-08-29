@@ -15,9 +15,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-    
+
+      - name: Sync submodules
+        run: |
+          set -e
+          if [[ ${{ github.ref }} == "main" ]]; then
+            git submodule sync --remote
+          else
+            git submodule sync
+          fi
+          git submodule update --init --recursive --depth 1 --jobs 4
+
       - name: Run the container
         run: |
           set -ex
