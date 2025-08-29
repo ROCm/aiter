@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import sys
 import os
 import random
+import triton
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
 
@@ -51,6 +52,25 @@ def run_gemm_b(x, weight, bias=None, otype=None, scaleA=None, scaleB=None):
     return tgemm.mm(x, weight, bias, otype, scaleA, scaleB)
 
 
+@perftest(num_iters=101, num_warmup=50, needTrace=True)
+def run_gemm_ck_tile(x, weight, bias, otype=dtypes.bf16):
+    return aiter.gemm_bf16_ck_tile(x, weight, bias, otype)
+
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    # Hardcode BLOCK_K and BLOCK_N
+    x_ = x
+    x_ = x_.view(
+        x.shape[0]//16, 16, x.shape[1]//32, 4, 8
+    )
+    x_ = x_.permute(0, 2, 3, 1, 4)
+    x_ = x_.contiguous()
+    x_ = x_.view(*x.shape)
+    return x_
+
+def get_arch():
+    return triton.runtime.driver.active.get_current_target().arch
+
+
 def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
     dim = (m, n, k)
     x = torch.randn(m, k, dtype=otype, device="cuda").to(dtype)
@@ -79,7 +99,12 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
 
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(a, b, msg=msg)
-
+    arch = get_arch()
+    if arch == 'gfx950':
+        ck_tile_weight = permute_weight(weight)
+        (c, *_), avg_c = run_gemm_ck_tile(x, ck_tile_weight, bias, otype)
+        msg_ck_tile = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck_tile avg: {avg_c:<8.2f} us, uplift: {avg_a/avg_c-1:<5.1%}"
+        checkAllclose(a, c, msg=msg_ck_tile)
 
 def get_boundary_test_cases(cu_count, aligned_k):
     """
