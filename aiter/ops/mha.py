@@ -1070,6 +1070,9 @@ def _flash_attn_forward(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float,
+    q_descale: float,
+    k_descale: float,
+    v_descale: float,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
@@ -1096,11 +1099,15 @@ def _flash_attn_forward(
         ret = alibi_slopes is None
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
+        ret = ret and (q_descale == None and k_descale == None and v_descale == None)
         ret = ret and (hdim_q == hdim_v)
         ret = ret and (hdim_q == 128)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16)
+        # print('!!!!!!!!!!!!!!!!!!')
+        # print(ret)
+        ret = False
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -1449,6 +1456,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dropout_p,
         softmax_scale,
         causal,
+        q_descale, k_descale, v_descale,
         window_size,
         bias,
         alibi_slopes,
@@ -1474,6 +1482,7 @@ class FlashAttnFunc(torch.autograd.Function):
             k,
             v,
             dropout_p,
+            q_descale, k_descale, v_descale,
             softmax_scale,
             causal=causal,
             window_size_left=int(window_size[0]),
@@ -1543,7 +1552,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, dbias, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, dbias, None, None, None, None, None
 
 
 def flash_attn_func(
@@ -1553,6 +1562,7 @@ def flash_attn_func(
     dropout_p=0.0,
     softmax_scale=None,
     causal=False,
+    q_descale=None, k_descale=None, v_descale=None,
     window_size=(-1, -1),  # -1 means infinite context window
     bias=None,
     alibi_slopes=None,
@@ -1616,6 +1626,7 @@ def flash_attn_func(
         dropout_p,
         softmax_scale,
         causal,
+        q_descale, k_descale, v_descale,
         window_size,
         bias,
         alibi_slopes,
