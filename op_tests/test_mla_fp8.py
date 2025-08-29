@@ -2,15 +2,28 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+import sys
+sys.path.insert(0, '/workspace/aiter')
 import aiter
 from aiter.test_common import checkAllclose, benchmark, run_perftest
 from aiter import dtypes
 import random
 import itertools
 import argparse
+from typing import Tuple, List, Dict
+import numpy as np
+
+import logging
+
+logging.basicConfig(
+    format='%(asctime)s %(filename)s:%(lineno)d %(levelname)s %(message)s',
+    level=logging.INFO
+)
+
+logging.info(f'aiter path {aiter.__path__}')
+logging.info(f'aiter spec {aiter.__spec__}')
 
 torch.set_default_device("cuda")
-# torch.set_printoptions(sci_mode=False, threshold=torch.inf)
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -19,6 +32,107 @@ def setup_seed(seed):
     torch.backends.cudnn.deterministic = True
 # setup_seed(1)
 
+
+def compare_arrays(arr1: np.ndarray, arr2: np.ndarray, 
+                   k: int = 5, 
+                   thresholds: List[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1]) -> Dict:
+    """
+    Compare two numpy arrays and compute various difference metrics.
+    
+    Args:
+        arr1: First input array (float32)
+        arr2: Second input array (float32)
+        k: Number of top differences to return
+        thresholds: List of thresholds for difference magnitude analysis
+        
+    Returns:
+        Dictionary containing:
+        - top_k_diff: Top k absolute differences with their positions
+        - threshold_stats: Count and percentage of differences above each threshold
+        - nan_info: Information about NaN values in input arrays
+    """
+    # Check input shapes
+    if arr1.shape != arr2.shape:
+        raise ValueError("Input arrays must have the same shape")
+    
+    result = {
+        'top_k_diff': [],
+        'threshold_stats': [],
+        'nan_info': {}
+    }
+
+    # Check for NaN values
+    nan_mask1 = np.isnan(arr1)
+    nan_mask2 = np.isnan(arr2)
+    
+    if np.any(nan_mask1):
+        result['nan_info']['arr1_nan_count'] = np.sum(nan_mask1)
+        result['nan_info']['arr1_nan_positions'] = np.argwhere(nan_mask1)
+        logging.info(f"Warning: arr1 contains {result['nan_info']['arr1_nan_count']} NaN values")
+    
+    if np.any(nan_mask2):
+        result['nan_info']['arr2_nan_count'] = np.sum(nan_mask2)
+        result['nan_info']['arr2_nan_positions'] = np.argwhere(nan_mask2)
+        logging.info(f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values")
+    
+    # Compute absolute differences
+    diff = np.abs(arr1 - arr2)
+    total_elements = arr1.size
+
+    max_diff_thr = diff / (1.0 + np.abs(arr2))
+    max_diff_thr = max_diff_thr.max()
+    logging.info(f"diff.abs.max={diff.max()}")
+    logging.info(f"max_diff_thr={max_diff_thr}")
+
+    # Find top k differences
+    flat_diff = diff.flatten()
+    top_k_indices = np.argpartition(flat_diff, -k)[-k:]
+    top_k_indices = top_k_indices[np.argsort(-flat_diff[top_k_indices])]
+
+    # Convert flat indices to multi-dimensional indices
+    orig_indices = np.unravel_index(top_k_indices, diff.shape)
+    for i in range(k):
+        idx = tuple(dim[i] for dim in orig_indices)
+        result['top_k_diff'].append({
+            'value': diff[idx],
+            'position': idx,
+            'arr1_value': arr1[idx],
+            'arr2_value': arr2[idx]
+        })
+
+    # Compute threshold statistics
+    for i in range(len(thresholds) - 1):
+        lower = thresholds[i]
+        upper = thresholds[i + 1]
+        mask = (diff >= lower) & (diff < upper)
+        count = np.sum(mask)
+        result['threshold_stats'].append({
+            'range': f"[{lower:.1e}, {upper:.1e})",
+            'count': count,
+            'percentage': 100 * count / total_elements
+        })
+    
+    # Handle values above the largest threshold
+    mask = diff >= thresholds[-1]
+    count = np.sum(mask)
+    result['threshold_stats'].append({
+        'range': f">={thresholds[-1]:.1e}",
+        'count': count,
+        'percentage': 100 * count / total_elements
+    })
+
+    logging.info("\nTop differences:")
+    for item in result['top_k_diff']:
+        logging.info(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
+
+    logging.info("\nThreshold statistics:")
+    for stat in result['threshold_stats']:
+        logging.info(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
+    
+    logging.info("\nNaN info:")
+    logging.info(result['nan_info'])
+
+    return result
 
 def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -> None:
     x, y = x.double(), y.double()
@@ -162,9 +276,10 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
 
-    # seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
-    #     12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
-    # seq_lens_kv = seq_lens_kv[:batch_size]
+    seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963, 12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
+    seq_lens_kv = seq_lens_kv[:batch_size]
+    aiter.logger.info(f"seq_lens_kv: {seq_lens_kv.numel()}")
+
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
@@ -299,6 +414,7 @@ def test_mla(
     #               msg=f'attn_logits [golden vs aiter_asm]')
     # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
     flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    aiter.logger.info(f"mtp: {mtp}; total_kv: {total_kv}; nhead: {nhead}; {qk_head_dim}/{v_head_dim}")
     bytes = (
         total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
     ) * (torch.finfo(dtype).bits // 8)
@@ -313,7 +429,10 @@ def test_mla(
         msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
     )
 
-    cal_diff(out_ref, out_asm, "out", True)
+    result = compare_arrays(out_asm.float().cpu().numpy(), out_ref.float().cpu().numpy())
+    logging.info(f'compare: {result}')
+
+    # cal_diff(out_ref, out_asm, "out", True)
 
     return {
         "decode:flops": flops,
@@ -405,7 +524,7 @@ parser.add_argument(
     type=int,
     nargs="*",
     # default=[28, 512, 1023, 4888, 12800], #
-    default=[4096, 8192, 16384], #
+    default=[16], #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -414,8 +533,8 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(80, 128)], # [41],
-    # default=[64], # [41],
+    # default=[i for i in range(80, 128, 16)], # [41],
+    default=[80], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
