@@ -313,6 +313,14 @@ __device__ __inline__ float dev_min_<float>(const float&a, const float&b)
         res8_r[6] = mov_dpp_(res8[6],  ck_tile::number<0x108>{}); /* row_shl:8 */   \
         res8_r[7] = mov_dpp_(res8[7],  ck_tile::number<0x108>{}); /* row_shl:8 */
 
+#define DPP_MERGE_16_DPP_2_(offset_)                             \
+        vec8_t res8_r;                                           \
+        int src_lane = __lane_id() ^ offset_;                    \
+        for (int i = 0; i < 8; ++i) {                            \
+            auto local = res8[i];                                \
+            res8_r[i] = __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(src_lane * 4u, __builtin_bit_cast(int32_t, local))); \
+        }
+
 // https://en.wikipedia.org/wiki/Batcher_odd%E2%80%93even_mergesort
 // TODO: this is assuming descending order sort
 // result store to smem :)
@@ -484,8 +492,8 @@ __device__ __inline__ auto warp_arg_merge_sort_to_reg(const T& x, const V& v, ck
 }
 
 // combine 2 register and sort together, the other register buffer is from remote lane
-template <typename T_vec, int lanegroup_size = ck_tile::get_warp_size()>
-__device__ __inline__ auto warp_merge_sort_combine2(const T_vec& x, ck_tile::number<lanegroup_size> = {})
+template <typename T_vec, int lanegroup_size = ck_tile::get_warp_size(), int offset = ck_tile::get_warp_size()>
+__device__ __inline__ auto warp_merge_sort_combine2(const T_vec& x, ck_tile::number<lanegroup_size> = {}, ck_tile::number<offset> = {})
 {
     using T = typename ck_tile::vector_traits<ck_tile::remove_cvref_t<T_vec>>::scalar_type;
     static_assert(sizeof(T) == 4);
@@ -511,7 +519,7 @@ __device__ __inline__ auto warp_merge_sort_combine2(const T_vec& x, ck_tile::num
     } else if constexpr (lanegroup_size == 16) {
         using vec8_t = ck_tile::ext_vector_t<T, 8>;
         auto res8 = x;
-        DPP_MERGE_16_DPP_();
+        DPP_MERGE_16_DPP_2_(offset);
         DPP_MERGE_16_CMP_(res8, res8_r);
         // TODO: only lane:1,2,3,4 within 16 lanes does not have correct result !
         return res16;
