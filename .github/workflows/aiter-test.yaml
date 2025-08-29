@@ -64,7 +64,7 @@ jobs:
       - name: MultiGPU Tests
         run: |
           set -ex
-          echo "Running Standard Tests..."
+          echo "Running MultiGPU Tests..."
           docker exec \
           -e MULTIGPU=TRUE \
           -w /workspace \
