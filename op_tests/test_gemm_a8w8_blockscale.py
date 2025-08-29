@@ -44,6 +44,10 @@ def run_gemm_ck(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
+@perftest()
+def run_gemm_ck_tile(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
+    return aiter.gemm_a8w8_blockscale_ck_tile(x, weight, x_scale, w_scale, dtype)
+
 @benchmark()
 def test_gemm(dtype, m, n, k):
     dim = (m, n, k)
@@ -57,11 +61,13 @@ def test_gemm(dtype, m, n, k):
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, dtype)
+    c, avg_c = run_gemm_ck_tile(x, weight, x_scale, w_scale, dtype)
+    msg_ck = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us,   ck_uplift: {avg_a/avg_b -1:<5.1%}, "
+    msg_ck_tile = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us,  ck_tile avg: {avg_c:<8.2f} us,   ck_tile_uplift: {avg_a/avg_c -1:<5.1%}"
+    checkAllclose(a, b,  msg="a,b: " + msg_ck, rtol=1e-2, atol=0.01)
+    checkAllclose(a, c,  msg="a,c: " + msg_ck_tile, rtol=1e-2, atol=0.01)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}"
-    checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01)
-
-    return {"us": avg_b}
+    return {"ck_us": avg_b ,"ck_tile_us":avg_c}
 
 
 @perftest(num_iters=5)
