@@ -4,8 +4,7 @@
 import torch
 import pytest
 from aiter.ops.triton.gemm_a8w8_per_token_scale import gemm_a8w8_per_token_scale
-from aiter.ops.triton.utils.arch_info import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
 
