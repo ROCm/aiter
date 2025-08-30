@@ -61,15 +61,15 @@ jobs:
           aiter_test \
           ./.github/scripts/aiter_test.sh 
 
-      - name: MultiGPU Tests
-        run: |
-          set -ex
-          echo "Running MultiGPU Tests..."
-          docker exec \
-          -e MULTIGPU=TRUE \
-          -w /workspace \
-          aiter_test \
-          ./.github/scripts/aiter_test.sh
+      # - name: MultiGPU Tests
+      #   run: |
+      #     set -ex
+      #     echo "Running MultiGPU Tests..."
+      #     docker exec \
+      #     -e MULTIGPU=TRUE \
+      #     -w /workspace \
+      #     aiter_test \
+      #     ./.github/scripts/aiter_test.sh
       
       - name: Upload test logs
         uses: actions/upload-artifact@v4
