@@ -101,8 +101,7 @@ def _register_group(group: "GroupCoordinator") -> None:
 
 
 if supports_custom_op():
-    # @torch.library.custom_op("vllm::inplace_all_reduce",
-    #                          mutates_args=["tensor"])
+
     def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
@@ -114,7 +113,7 @@ if supports_custom_op():
     # def _(tensor: torch.Tensor, group_name: str) -> None:
     #     return
 
-    # @torch.library.custom_op("vllm::outplace_all_reduce", mutates_args=[])
+    @torch.library.custom_op("aiter::outplace_all_reduce", mutates_args=["tensor"])
     def outplace_all_reduce(
         tensor: torch.Tensor, open_fp8_quant: bool, group_name: str
     ) -> torch.Tensor:
@@ -124,9 +123,9 @@ if supports_custom_op():
             raise ValueError(f"Group {group_name} is destroyed.")
         return group._all_reduce_out_place(tensor, open_fp8_quant)
 
-    # @outplace_all_reduce.register_fake
-    # def _(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
-    #     return torch.empty_like(tensor)
+    @outplace_all_reduce.register_fake
+    def _(tensor: torch.Tensor, open_fp8_quant: bool, group_name: str) -> torch.Tensor:
+        return torch.empty_like(tensor)
 
 
 class GroupCoordinator:
@@ -360,7 +359,7 @@ class GroupCoordinator:
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
         ):
-            return outplace_all_reduce(
+            return torch.ops.aiter.outplace_all_reduce(
                 input_, open_fp8_quant, group_name=self.unique_name
             )
         else:

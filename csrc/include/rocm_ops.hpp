@@ -200,12 +200,15 @@
           "                        float k_scale, float v_scale) -> ()");           \
     m.def("reshape_and_cache_with_pertoken_quant",                                  \
           &aiter::reshape_and_cache_with_pertoken_quant,                            \
-          "reshape_and_cache_with_pertoken_quant(Tensor key, Tensor value,"         \
-          "                        Tensor! key_cache,"                              \
-          "                        Tensor! value_cache,"                            \
-          "                        Tensor! k_dequant_scales,"                       \
-          "                        Tensor! v_dequant_scales,"                       \
-          "                        Tensor slot_mapping) -> ()");                    \
+          "reshape_and_cache_with_pertoken_quant",                                  \
+          py::arg("key"),                                                           \
+          py::arg("value"),                                                         \
+          py::arg("key_cache"),                                                     \
+          py::arg("value_cache"),                                                   \
+          py::arg("k_dequant_scales"),                                              \
+          py::arg("v_dequant_scales"),                                              \
+          py::arg("slot_mapping"),                                                  \
+          py::arg("asm_layout"));                                                   \
     m.def("reshape_and_cache_with_block_quant",                                     \
           &aiter::reshape_and_cache_with_block_quant,                               \
           "reshape_and_cache_with_block_quant(Tensor key, Tensor value,"            \
@@ -535,6 +538,33 @@
           py::arg("alibi_slopes") = std::nullopt, \
           py::arg("gen")          = std::nullopt);
 
+#define MHA_VARLEN_FWD_ASM_PYBIND                 \
+    m.def("fmha_v3_varlen_fwd",                   \
+          &aiter::torch_itfs::fmha_v3_varlen_fwd, \
+          py::arg("q"),                           \
+          py::arg("k"),                           \
+          py::arg("v"),                           \
+          py::arg("cu_seqlens_q"),                \
+          py::arg("cu_seqlens_k"),                \
+          py::arg("max_seqlen_q"),                \
+          py::arg("max_seqlen_k"),                \
+          py::arg("min_seqlen_q"),                \
+          py::arg("dropout_p"),                   \
+          py::arg("softmax_scale"),               \
+          py::arg("logits_soft_cap"),             \
+          py::arg("zero_tensors"),                \
+          py::arg("is_causal"),                   \
+          py::arg("window_size_left"),            \
+          py::arg("window_size_right"),           \
+          py::arg("return_softmax_lse"),          \
+          py::arg("return_dropout_randval"),      \
+          py::arg("how_v3_bf16_cvt"),             \
+          py::arg("out")          = std::nullopt, \
+          py::arg("block_table")  = std::nullopt, \
+          py::arg("bias")         = std::nullopt, \
+          py::arg("alibi_slopes") = std::nullopt, \
+          py::arg("gen")          = std::nullopt);
+
 #define MHA_VARLEN_BWD_PYBIND                     \
     m.def("mha_varlen_bwd",                       \
           &aiter::torch_itfs::mha_varlen_bwd,     \
@@ -660,7 +690,7 @@
           py::arg("num_expert_group"),                                                        \
           py::arg("topk_grp"),                                                                \
           py::arg("need_renorm"),                                                             \
-          py::arg("scoring_func")          = true,                                            \
+          py::arg("is_softmax")            = true,                                            \
           py::arg("routed_scaling_factor") = 1.0f,                                            \
           "Apply grouped topk softmax/sigmodd to the gating outputs.");                       \
     m.def("biased_grouped_topk",                                                              \

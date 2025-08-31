@@ -78,6 +78,8 @@ def _gemm_a8w8_blockscale_kernel(
 
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
+
+    For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
     tl.assume(stride_am > 0)
@@ -117,6 +119,7 @@ def _gemm_a8w8_blockscale_kernel(
 
         # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+        # ^ Number of K blocks within our split-K partition
 
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -131,13 +134,15 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_ks * stride_ascale_k
+            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_bsn = offs_bn // GROUP_N
+        offs_b_scale_n = offs_bn // GROUP_N
         b_scale_ptrs = (
-            b_scale_ptr + offs_ks * stride_bscale_k + offs_bsn * stride_bscale_n
+            b_scale_ptr
+            + offs_k_scale * stride_bscale_k
+            + offs_b_scale_n * stride_bscale_n
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
@@ -298,8 +303,8 @@ def gemm_a8w8_blockscale(
     Returns:
     - Y: The output matrix with shape (M, N).
 
-    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
-    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
+    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k -> ceil_div(K, scale_block_size_k)
+    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n -> ceil_div(N, scale_block_size_n)
     """
     _LOGGER.info(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
@@ -312,8 +317,8 @@ def gemm_a8w8_blockscale(
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
     # Transpose w and w_scale
-    w = w.T
-    w_scale = w_scale.T
+    w = w.T  # (K, N)
+    w_scale = w_scale.T  # (scale_k, scale_n)
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -321,7 +326,9 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
+        K, config["NUM_KSPLIT"]
+    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
@@ -329,16 +336,27 @@ def gemm_a8w8_blockscale(
     else:
         y_pp = None
 
+    # If block size is greater than split k size, shrink the block size
     if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
             config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+    config["BLOCK_SIZE_K"] = max(
+        config["BLOCK_SIZE_K"], 16
+    )  # minimum block size is 16 for perf
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
-    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
+    config["GROUP_K"] = triton.next_power_of_2(
+        triton.cdiv(K, w_scale.shape[0])
+    )  # scale_block_size_k
+    config["GROUP_N"] = triton.next_power_of_2(
+        triton.cdiv(N, w_scale.shape[1])
+    )  # scale_block_size_n
+
+    assert (
+        config["GROUP_K"] == config["BLOCK_SIZE_K"]
+    ), "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
@@ -346,7 +364,7 @@ def gemm_a8w8_blockscale(
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),
+        ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
     _gemm_a8w8_blockscale_kernel[grid](
         x,
