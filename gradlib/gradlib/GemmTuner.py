@@ -417,10 +417,19 @@ class GemmTuner:
         self.rocblas_decode = rocblas_decode
         self.tuned_file = tuned_file
         self.mp = mp
-        if Path(tuned_file).is_file():
-            self.tuned_shapes = pd.read_csv(tuned_file)
+
+        tuned_file_path = Path(tuned_file)
+        if tuned_file_path.exists():
+            self.tuned_shapes = (
+                pd.read_csv(tuned_file) if tuned_file_path.is_file() else None
+            )
         else:
             self.tuned_shapes = None
+            with open(tuned_file, "w") as tf:
+                tf.write(
+                    "M,N,K,bias,dtype,outdtype,scaleAB,cu_num,libtype,solidx,soltimes,kernelName\n"
+                )
+
         gpu = torch.cuda.current_device()
         device_properties = torch.cuda.get_device_properties(gpu)
         cu_num = device_properties.multi_processor_count
@@ -460,13 +469,11 @@ class GemmTuner:
 
     def find_best_sols(self):
         df = self.gemm_problems
-        soldf = pd.DataFrame(
-            columns=["cu_num", "libtype", "solidx", "soltimes", "kernelName"]
-        )
         for i in range(len(df)):
             ds = df.loc[i, :]
             indtype = ds["dtype"]
             outdtype = ds["outdtype"]
+
             gemmobj = Gemm(
                 ds["M"],
                 ds["N"],
@@ -479,22 +486,22 @@ class GemmTuner:
                 mp=self.mp,
             )
             gemmobj.find_fastest_solution()
-            soldf.loc[i, "cu_num"] = self.cu_num
-            soldf.loc[i, "libtype"] = gemmobj.best_libtype
-            soldf.loc[i, "solidx"] = gemmobj.best_solidx
-            soldf.loc[i, "soltimes"] = round(gemmobj.best_soltime * 1000, 2)
-            soldf.loc[i, "kernelName"] = (
+
+            soltimes = round(gemmobj.best_soltime * 1000, 2)
+            kernal_name = (
                 aiter.getHipblasltKernelName(int(gemmobj.best_solidx))
                 if gemmobj.best_libtype == "hipblaslt"
                 else "rocblas"
             )
 
+            with open(self.tuned_file, "a") as tf:
+                tf.write(
+                    f"{ds['M']},{ds['N']},{ds['K']},{ds['bias']},{indtype},{outdtype},{ds['scaleAB']},"
+                    f"{self.cu_num},{gemmobj.best_libtype},{int(gemmobj.best_solidx)},{soltimes},{kernal_name}\n"
+                )
+
             del gemmobj
             torch.cuda.empty_cache()
 
-        finaldf = pd.concat([self.gemm_problems, soldf], axis=1)
-        if self.tuned_shapes is not None:
-            finaldf = pd.concat([finaldf, self.tuned_shapes])
-        finaldf["solidx"] = finaldf["solidx"].convert_dtypes("int64")
-        finaldf.to_csv(self.tuned_file, index=False)
+        finaldf = pd.read_csv(self.tuned_file)
         print(finaldf)
