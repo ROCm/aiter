@@ -79,7 +79,7 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     TORCH_CHECK(out.dtype() == torch::ScalarType::BFloat16,
                 "mi350 a8w8 blockscale asm only support Half output now!");
     TORCH_CHECK(n % TileN == 0 && k % TileK == 0, 
-                "mi350 a8w8 blockscale asm only suuport 128x256x128 tile now!");
+                "mi350 a8w8 blockscale asm only support 128x256x128 tile now!");
 
     KernelArgs args;
     size_t arg_size = sizeof(args);
