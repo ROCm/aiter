@@ -73,8 +73,8 @@ def run_ck(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
         elif residual is not None:
             residual_out = torch.empty_like(input)
             out_before_quant = torch.empty_like(input)
-            # aiter.rmsnorm2d_with_add_smoothquant_hip(
-            aiter.rmsnorm2d_fwd_with_add_smoothquant(
+            aiter.rmsnorm2d_with_add_smoothquant_hip(
+            # aiter.rmsnorm2d_fwd_with_add_smoothquant(
                 output,
                 input,
                 residual,
@@ -86,6 +86,7 @@ def run_ck(input, weight, eps, residual=None, x_scale=None, y_scale_dtype=None):
                 out_before_quant=out_before_quant,
             )
 
+    # import pdb;pdb.set_trace()
     return output, residual_out, y_scale, out_before_quant
 
 
@@ -278,7 +279,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m",
         type=int,
-        default=[64, 128, 256],
+        # default=[64, 128, 256],
+        default=[256],
         nargs="*",
         help="""M of mnk.
     e.g.: -m 32""",

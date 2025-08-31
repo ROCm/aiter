@@ -414,7 +414,9 @@
             "'-ffast-math'"
         ],
         "extra_ldflags": "None",
-        "extra_include": [],
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/ck_tile'"
+        ],
         "verbose": "False",
         "blob_gen_cmd": "''"
     },

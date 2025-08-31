@@ -493,7 +493,7 @@ void topkGatingSoftmaxLauncherHelper(const DTYPE* input,
                                      const bool need_renorm,
                                      cudaStream_t stream)
 {
-    static constexpr std::size_t MAX_BYTES_PER_LDG = 32;
+    static constexpr std::size_t MAX_BYTES_PER_LDG = 32; // why 32
 
     static constexpr int BYTES_PER_LDG = MIN(MAX_BYTES_PER_LDG, sizeof(DTYPE) * EXPERTS);
     using Constants                    = detail::TopkConstants<DTYPE, EXPERTS, BYTES_PER_LDG>;
