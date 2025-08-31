@@ -155,6 +155,7 @@ def flatmm_a8w8_blockscale_asm(
     out: Tensor,
 ) -> Tensor: ...
 
+
 def gen_mi350_a8w8_blockscale_asm_fake_tensors(
     XQ: Tensor,
     WQ: Tensor,
@@ -177,6 +178,7 @@ def mi350_a8w8_blockscale_asm(
     w_scale: Tensor,
     out: Tensor,
 ) -> Tensor: ...
+
 
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
@@ -402,6 +404,7 @@ def flatmm_a8w8_blockscale_ASM(
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return flatmm_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
 
+
 def mi350_a8w8_blockscale_ASM(
     XQ: Tensor,
     WQ: Tensor,
@@ -417,6 +420,7 @@ def mi350_a8w8_blockscale_ASM(
     # k = XQ.shape[-1]
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     return mi350_a8w8_blockscale_asm(XQ, WQ, x_scale, w_scale, Y)
+
 
 def gen_gemm_a8w8_tune_fake_tensors(
     XQ: torch.Tensor,

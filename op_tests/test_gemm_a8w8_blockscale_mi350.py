@@ -86,15 +86,15 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest()
 def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
-   # return aiter.flatmm_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
-   return aiter.mi350_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
+    # return aiter.flatmm_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
+    return aiter.mi350_a8w8_blockscale_ASM(x, weight, x_scale, w_scale, dtype)
 
 
 @benchmark()
 def test_gemm_asm_mi350(dtype, m, n, k):
     dim = (m, n, k)
     block_shape_n, block_shape_k = block_shape
-    print("block_shape",block_shape)
+    print("block_shape", block_shape)
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
@@ -112,7 +112,7 @@ def test_gemm_asm_mi350(dtype, m, n, k):
     b, avg_b = run_asm(x, flat_weight, x_scale, w_scale_trans, dtype)
     a = a.to(dtypes.fp32)
     b = b.to(dtypes.fp32)
-    tflops = 2*m*n*k/(avg_b)/1e6
+    tflops = 2 * m * n * k / (avg_b) / 1e6
     msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, asm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b -1:<5.1%}, tflops:{tflops:<8.2f}"
     checkAllclose(a, b, msg="a,b: " + msg, rtol=1e-2, atol=1e-2)
 
@@ -178,6 +178,15 @@ if args.nk is not None:
 for dtype in [dtypes.bf16]:
     # deepseek-r1
     for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
-        for (n, k) in [(1536,7168), (3072,1536), (7168, 256), (7168, 2048), (4608, 7168), (7168, 2304), (512, 7168), (4096, 512)][1:2]:
+        for n, k in [
+            (1536, 7168),
+            (3072, 1536),
+            (7168, 256),
+            (7168, 2048),
+            (4608, 7168),
+            (7168, 2304),
+            (512, 7168),
+            (4096, 512),
+        ][1:2]:
             test_gemm_asm_mi350(dtype, m, n, k)
             break
