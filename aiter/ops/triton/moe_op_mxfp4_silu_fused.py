@@ -9,11 +9,11 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.activation import _silu_exp2
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 _LOGGER = AiterTritonLogger()
 
 
-@triton.constexpr_function
 def get_scaled_dot_format_string(dtype: tl.dtype):
     mapping = {
         tl.float16: "fp16",
@@ -63,6 +63,8 @@ def _fused_moe_kernel_mxfp4_silu(
     stride_bmxk,
     stride_bmxn,
     # Meta-parameters
+    A_DTYPE_FORMAT: tl.constexpr,
+    B_DTYPE_FORMAT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -316,8 +318,6 @@ def _fused_moe_kernel_mxfp4_silu(
             )
         # We accumulate along the K dimension.
         if is_a_microscaled_format or is_b_microscaled_format:
-            a_format: tl.constexpr = get_scaled_dot_format_string(a.dtype)
-            b_format: tl.constexpr = get_scaled_dot_format_string(b.dtype)
             if is_a_microscaled_format:
                 # if SWIZZLE_MX_A:
                 #    a_mx_scales = _unswizzle_mx_block(tl.load(a_mx_scale_ptrs))
@@ -343,10 +343,10 @@ def _fused_moe_kernel_mxfp4_silu(
             accumulator = tl.dot_scaled(
                 a,
                 a_mx_scales,
-                a_format,
+                A_DTYPE_FORMAT,
                 b,
                 b_mx_scales,
-                b_format,
+                B_DTYPE_FORMAT,
                 acc=accumulator,
                 fast_math=True,
             )
@@ -438,6 +438,11 @@ def fused_moe_mxfp4_silu(
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
 
+    A_tl_dtype = torch_to_triton_dtype[A.dtype]
+    A_DTYPE_FORMAT = get_scaled_dot_format_string(A_tl_dtype)
+    B_tl_dtype = torch_to_triton_dtype[B.dtype]
+    B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
+
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -470,6 +475,8 @@ def fused_moe_mxfp4_silu(
         B_mx_scale.stride(0),
         B_mx_scale.stride(2),
         B_mx_scale.stride(1),
+        A_DTYPE_FORMAT=A_DTYPE_FORMAT,
+        B_DTYPE_FORMAT=B_DTYPE_FORMAT,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
