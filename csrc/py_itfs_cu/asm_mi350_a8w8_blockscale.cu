@@ -106,9 +106,9 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     // printf("args.Xs: %d\n", args.Xs);
     // printf("args.token_cnt: %d\n", args.token_cnt);
     AiterAsmKernel *impl_ptr = nullptr;
-    static AiterAsmKernel impl_kenrel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
-    static AiterAsmKernel impl_kenrel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
-    impl_ptr = (m <= 32)?&impl_kenrel_x32:&impl_kenrel_x128;
+    static AiterAsmKernel impl_kernel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
+    static AiterAsmKernel impl_kernel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
+    impl_ptr = (m <= 32)?&impl_kernel_x32:&impl_kernel_x128;
     int gdx = (n + TileN*2 - 1) / (TileN*2);
     int gdy = (m + TileM - 1) / TileM;
    // printf("gdx: %d, gdy:%d, \n", gdx, gdy);
