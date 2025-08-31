@@ -98,7 +98,7 @@ if IS_ROCM:
             f"using {max_processes} parallel build process (CPU count: {os.cpu_count()})"
         )
 
-        with Pool(processes=int(processes=max_processes)) as pool:
+        with Pool(processes=int(max_processes)) as pool:
             pool.map(build_one_module, all_opts_args_build)
 
         ck_batched_gemm_folders = [
