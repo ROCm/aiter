@@ -215,6 +215,8 @@ def shuffle_mxfp4_weight(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     KLane = 64 // NLane #4
     N0 = N // NLane
     K0 = K_pk // (KLane * KPack)
+    assert KLane * KPack * K0 == K_pk, f"K({K_pk}) is not a divisble of 64."
+    assert NLane * N0 == N, f"N({K_pk}) is not a divisble of 16."
     if (gate_up):
         src_reshaped = src.view(experts_cnt, 2, N0, NLane, K0, KLane, KPack)  # [E,2, N0, NLane ,K0, KLane, KPack]
         src_reshaped = src_reshaped.permute(0, 2, 1, 4, 5, 3, 6).contiguous()  # [E, N0, 2, K0, KLane, NLane, KPack]
@@ -238,7 +240,7 @@ def shuffle_mxfp4_scale(src: torch.Tensor, experts_cnt: int, gate_up: bool) -> t
     K1 = k_ // K_Pack // K_Lane  # k_ // 8
     N1 = n_ // N_Lane // N_Pack        # n_ // 32
     real_k =32 * k_ * K_Pack * K_Lane # 1x32 quant
-    assert real_k >= 256, f"K {real_k} must be larger than Tile_K(256)"
+    assert K1 * K_Pack * K_Lane == k_, f"K {k_*32} must be divisible of 256"
     # print("src shape", src.shape)
     # Reshape based on moe_kind
     if gate_up:
@@ -272,7 +274,7 @@ def test_fmoe(
     if get_gfx() not in ["gfx950"] and qType == aiter.QuantType.per_1x32:
         return
     torch_quant = aiter.get_torch_quant(qType)
-    torch_act = aiter.get_torch_act(actType)
+    # torch_act = aiter.get_torch_act(actType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -286,12 +288,43 @@ def test_fmoe(
     M, _ = topk_ids.shape
 
     # BLOCK_SIZE_M = get_block_size_M(M, topk, E, inter_dim)
-    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_M = 128
     if qType == aiter.QuantType.per_128x128:
         BLOCK_SIZE_M = 64
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtype, BLOCK_SIZE_M
     )
+
+    #override sorting
+    # tile_num = max((token * topk + BLOCK_SIZE_M - 1) // BLOCK_SIZE_M, topk)
+    # sorted_ids_override = list()
+    # expert_ids_override = list()
+    # for i in range(tile_num):
+    #     expert_ids_override.append(i // ((tile_num + E - 1) // E))
+
+    # token_per_tile = (token * topk + tile_num - 1) // tile_num
+    # tokenid = 0
+    # for i in range(tile_num * BLOCK_SIZE_M):
+    #     tile_off = i % BLOCK_SIZE_M
+    #     if ((tile_off < token_per_tile) and (tokenid < token * topk)):
+    #         sorted_ids_override.append((tokenid % token) | ((tokenid // token) << 24))
+    #         tokenid+=1
+    #     else:
+    #         sorted_ids_override.append(token)
+
+    # # print(tile_num)
+    # sorted_ids = torch.tensor(sorted_ids_override)
+    # sorted_expert_ids = torch.tensor(expert_ids_override)
+    # num_valid_ids = torch.tensor([tile_num * BLOCK_SIZE_M, token])
+    # sorted_weights = torch.randn((tile_num * BLOCK_SIZE_M), dtype=float) / 10
+
+
+    # print(len(sorted_expert_ids))
+    # print(sorted_expert_ids)
+    # print(sorted_ids)
+    # print(num_valid_ids)
+    # max_token_ids = num_valid_ids[0].item()
+    # print(sorted_ids[max_token_ids-2: max_token_ids + 4])
 
     #Quant-ing
     if qType == aiter.QuantType.per_Tensor:
@@ -439,7 +472,6 @@ def test_fmoe(
         doweight=doweight_stage1,
     )
 
-    print("out1_ref shape:", out1_ref.shape)
     # # ######################## ck stage 1 start ###########
     out1_ck = torch.empty((token, topk, inter_dim), dtype=dtype)
 
@@ -480,10 +512,9 @@ def test_fmoe(
         quant_type=qType,
         sorted_weights=sorted_weights if doweight_stage1 else None,
         needTrace=True,
-        num_iters=2,
-        num_warmup=0,
+        # num_iters=2,
+        # num_warmup=0,
     )
-    print("out1_ck shape:", out1_ck.shape)
     checkAllclose(
         out1_ref,
         out1_ck,
@@ -592,8 +623,8 @@ def test_fmoe(
         actType,
         quant_type,
         sorted_weights if not doweight_stage1 else None,
-        num_iters=2,
-        num_warmup=0,
+        # num_iters=2,
+        # num_warmup=0,
     )
 
 
@@ -654,6 +685,7 @@ def test_fmoe(
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
 l_dim = [(512, 256)]
+# l_dim = [(3072, 3072)]
 l_tokenNum = [
     1,
     # 3,
@@ -665,6 +697,7 @@ l_tokenNum = [
     # 256,
     # 1024,
     # 4096,
+    # 8192,
     # 163840,
 ]
 l_quant = [
@@ -804,8 +837,8 @@ for (
             m,
             model_dim,
             inter_dim,
-            args.expert,
-            args.topk,
+            128, #args.expert,
+            4 , #args.topk,
             act_type,
             quant_type,
             aq_dtype,
