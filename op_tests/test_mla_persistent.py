@@ -214,7 +214,7 @@ def test_mla(
     # aiter implementation
     work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
     work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
+    work_info_set      = torch.empty([batch_size * 80, 8], dtype=torch.int32, device="cuda")
     reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
     reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
     reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
