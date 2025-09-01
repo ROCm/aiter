@@ -209,7 +209,7 @@ template torch::Tensor
                         # ).write_text(intsance)
 
     '''genarete heuristic dispatch'''
-    def gen_heuristic_dispatch(self):
+    def gen_heuristic_dispatch(self,kernels_dict):
         HEURISTIC_template = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
@@ -219,21 +219,25 @@ template <typename ADataType, typename BDataType, typename AccDataType, typename
 MoeKernel moe_gemm1_heuristic_dispatch(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
-    //if (block_m == 32)
-    //{{
-    //    return moe_cktile2stages_gemm1_256x32x64x128_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    if (block_m == 64)
+    if (block_m == 16)
     {{
-        return moe_cktile2stages_gemm1_256x64x128x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
+        return moe_cktile2stages_gemm1_256x16x128x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    //else if (block_m == 128)
-    //{{
-    //    return moe_cktile2stages_gemm1_256x128x128x128_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
+    if (block_m == 32)
+    {{
+        return moe_cktile2stages_gemm1_256x32x128x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
+    else if (block_m == 64)
+    {{
+        return moe_cktile2stages_gemm1_256x64x256x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
+    else if (block_m == 128)
+    {{
+        return moe_cktile2stages_gemm1_256x128x256x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
     //else if (block_m == 256)
     //{{
-    //    return moe_cktile2stages_gemm1_256x256x128x128_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm1_256x256x256x256_1x4_16x16x{inst_k}_{suffix1}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     else
     {{
@@ -248,21 +252,25 @@ template <typename ADataType, typename BDataType, typename AccDataType, typename
 MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
 {{
     // Apply shape heuristics to find a suitable kernel implementation.
-    //if (block_m == 32)
-    //{{
-    //    return moe_cktile2stages_gemm2_256x32x64x128_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
-    if (block_m == 64)
+    if (block_m == 16)
     {{
-        return moe_cktile2stages_gemm2_256x64x128x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
+        return moe_cktile2stages_gemm2_256x16x128x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
     }}
-    //else if (block_m == 128)
-    //{{
-    //    return moe_cktile2stages_gemm2_256x128x128x128_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
-    //}}
+    if (block_m == 32)
+    {{
+        return moe_cktile2stages_gemm2_256x32x128x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
+    else if (block_m == 64)
+    {{
+        return moe_cktile2stages_gemm2_256x64x256x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
+    else if (block_m == 128)
+    {{
+        return moe_cktile2stages_gemm2_256x128x256x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
+    }}
     //else if (block_m == 256)
     //{{
-    //    return moe_cktile2stages_gemm2_256x256x128x128_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
+    //    return moe_cktile2stages_gemm2_256x256x256x256_1x4_16x16x{inst_k}_{suffix2}<ADataType, BDataType, AccDataType, CDataType>;
     //}}
     else
     {{
@@ -273,6 +281,7 @@ MoeKernel moe_gemm2_heuristic_dispatch(int M, int N, int K, int block_m)
     }}
 }}
 """
+        #create heuristic heirarchy
         with open(os.path.join(self.working_path, "moe_cktile2stages_heuristic_dispatch.h"), "w") as f:
             arch = get_gfx()
             inst_k = "32" if self.quant_type == "1x32" else ("128" if arch == "gfx950" else "64")
@@ -376,7 +385,7 @@ torch::Tensor
 
         self.gen_lookup_dict(kernels_dict)
         self.gen_manifest_head(kernels_dict)
-        self.gen_heuristic_dispatch()
+        self.gen_heuristic_dispatch(kernels_dict)
 
 
 # def get_tune_dict(tune_dict_csv):
