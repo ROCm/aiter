@@ -166,9 +166,7 @@ def check_and_set_ninja_worker():
     import psutil
 
     # calculate the maximum allowed NUM_JOBS based on free memory
-    free_memory_gb = psutil.virtual_memory().available / (
-        1024**3
-    )  # free memory in GB
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
     max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
     # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
