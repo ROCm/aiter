@@ -22,33 +22,38 @@
     m.def("sigmoid", &aiter_sigmoid, "apply for sigmoid."); \
     m.def("tanh", &aiter_tanh, "apply for tanh.");
 
-#define ATTENTION_ASM_MLA_PYBIND           \
-    m.def("mla_decode_stage1_asm_fwd",     \
-          &mla_decode_stage1_asm_fwd,      \
-          "mla_decode_stage1_asm_fwd",     \
-          py::arg("Q"),                    \
-          py::arg("KV"),                   \
-          py::arg("qo_indptr"),            \
-          py::arg("kv_indptr"),            \
-          py::arg("kv_page_indices"),      \
-          py::arg("kv_last_page_lens"),    \
-          py::arg("num_kv_splits_indptr"), \
-          py::arg("max_seqlen_q"),         \
-          py::arg("softmax_scale"),        \
-          py::arg("splitData"),            \
-          py::arg("splitLse"));            \
-    m.def("mla_prefill_asm_fwd",           \
-          &mla_prefill_asm_fwd,            \
-          "mla_prefill_asm_fwd",           \
-          py::arg("Q"),                    \
-          py::arg("KV"),                   \
-          py::arg("qo_indptr"),            \
-          py::arg("kv_indptr"),            \
-          py::arg("kv_page_indices"),      \
-          py::arg("kv_last_page_lens"),    \
-          py::arg("max_seqlen_q"),         \
-          py::arg("softmax_scale"),        \
-          py::arg("splitData"),            \
+#define ATTENTION_ASM_MLA_PYBIND               \
+    m.def("mla_decode_stage1_asm_fwd",         \
+          &mla_decode_stage1_asm_fwd,          \
+          "mla_decode_stage1_asm_fwd",         \
+          py::arg("Q"),                        \
+          py::arg("KV"),                       \
+          py::arg("qo_indptr"),                \
+          py::arg("kv_indptr"),                \
+          py::arg("kv_page_indices"),          \
+          py::arg("kv_last_page_lens"),        \
+          py::arg("num_kv_splits_indptr"),     \
+          py::arg("work_indptr"),              \
+          py::arg("work_info_set"),            \
+          py::arg("max_seqlen_q"),             \
+          py::arg("softmax_scale"),            \
+          py::arg("splitData"),                \
+          py::arg("splitLse"),                 \
+          py::arg("output"),                   \
+          py::arg("q_scale")  = std::nullopt,  \
+          py::arg("kv_scale") = std::nullopt); \
+    m.def("mla_prefill_asm_fwd",               \
+          &mla_prefill_asm_fwd,                \
+          "mla_prefill_asm_fwd",               \
+          py::arg("Q"),                        \
+          py::arg("KV"),                       \
+          py::arg("qo_indptr"),                \
+          py::arg("kv_indptr"),                \
+          py::arg("kv_page_indices"),          \
+          py::arg("kv_last_page_lens"),        \
+          py::arg("max_seqlen_q"),             \
+          py::arg("softmax_scale"),            \
+          py::arg("splitData"),                \
           py::arg("splitLse"));
 
 #define ATTENTION_ASM_PYBIND                        \
@@ -957,3 +962,10 @@
         .value("Silu", ActivationType::Silu)             \
         .value("Gelu", ActivationType::Gelu)             \
         .export_values();
+
+#define MLA_METADATA_PYBIND                             \
+    m.def("get_mla_metadata_v0", &get_mla_metadata_v0); \
+    m.def("get_mla_metadata_v1", &get_mla_metadata_v1); \
+    m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
+
+#define MLA_REDUCE_PYBIND m.def("mla_reduce_v1", &mla_reduce_v1);

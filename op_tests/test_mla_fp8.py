@@ -12,16 +12,12 @@ import argparse
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
 
-
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-
-
-setup_seed(1)
-
+# setup_seed(1)
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -30,7 +26,14 @@ def ref_masked_attention(
     scale: float,
     dtype,
     is_causal=True,
+    is_fp8=False,
+    q_scale=1.0,
+    kv_scale=1.0,
 ) -> torch.Tensor:
+
+    if is_fp8:
+        scale *= q_scale * kv_scale
+
     attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
         s_q = query.shape[0]
@@ -43,37 +46,15 @@ def ref_masked_attention(
     lse = attn_weights.logsumexp(dim=-1)
     attn_weights = torch.softmax(attn_weights, dim=-1)
 
+    if is_fp8:
+        attn_weights_fp8 = attn_weights.to(torch.float8_e4m3fnuz)
+        attn_weights = attn_weights_fp8.to(torch.float)
+
     out = torch.einsum("hqk,khd->qhd", attn_weights.float(), value.float())
+    
+    if is_fp8:
+        out *= kv_scale
     return out.to(dtype), lse
-
-
-def torch_mha_extend(
-    q,  # [total_q, nheads, headdim_q]
-    k,  # [num_page * page_size, nhead_kv, qk_head_dim]
-    v,  # [num_page * page_size, nhead_kv, qk_head_dim]
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    sm_scale,
-    dtype,
-):
-    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
-    ks = torch.tensor_split(k, kv_indptr.tolist()[1:])
-    vs = torch.tensor_split(v, kv_indptr.tolist()[1:])
-    bs = qo_indptr.shape[0] - 1
-
-    os = []
-    lses = []
-    for i in range(bs):
-        q = qs[i]
-        k = ks[i]
-        v = vs[i]
-        o, lse = ref_masked_attention(q, k, v, sm_scale, dtype)
-        os.append(o)
-        lses.append(lse)
-    o = torch.concat(os)
-    lse = torch.concat(lses).transpose(0, 1)
-    return o, lse
 
 
 def torch_mla_extend(
@@ -87,7 +68,15 @@ def torch_mla_extend(
     qk_rope_head_dim,
     dtype,
     is_causal=True,
+    q_scale=1.0,
+    kv_scale=1.0,
 ):
+    is_fp8 = q.dtype == torch.float8_e4m3fnuz
+
+    if is_fp8:
+        q = q.to(torch.float)
+        kvc_cache = kvc_cache.to(torch.float)
+
     qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
     kvc = torch.index_select(kvc_cache, 0, kv_indices)
     kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
@@ -100,7 +89,15 @@ def torch_mla_extend(
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        o, lse = ref_masked_attention(q, k, v, sm_scale, dtype, is_causal=is_causal)
+        o, lse = ref_masked_attention(q,
+                                      k,
+                                      v,
+                                      sm_scale,
+                                      dtype,
+                                      is_causal=is_causal,
+                                      is_fp8=is_fp8,
+                                      q_scale=q_scale,
+                                      kv_scale=kv_scale)
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
@@ -135,7 +132,8 @@ def test_mla(
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
-            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+            # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+            seq_lens_kv[i] = random.uniform(1, ctx_lens)
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
             )
@@ -144,7 +142,7 @@ def test_mla(
         seq_lens_qo.fill_(ctx_lens)
 
     # seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963,
-    #     3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478], device="cuda")
+    #     12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
     # seq_lens_kv = seq_lens_kv[:batch_size]
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
@@ -162,135 +160,11 @@ def test_mla(
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    # ############################## normal: prefill
-    def test_normal_prefill():
-        q = torch.randn((total_qo, nhead, qk_head_dim), dtype=dtype)
-        k = torch.randn((total_kv, nhead, qk_head_dim), dtype=dtype)
-        v = torch.randn((total_kv, nhead, v_head_dim), dtype=dtype)
-
-        out_ref, lse_ref = torch_mha_extend(
-            q,
-            k,
-            v,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            dtype=dtype,
-        )
-        out_aiter, us_aiter = run_perftest(
-            aiter.flash_attn_varlen_func,
-            q,
-            k,
-            v,
-            qo_indptr,
-            kv_indptr,
-            max_seqlen_qo,
-            max_seqlen_kv,
-            softmax_scale=sm_scale,
-            causal=True,
-        )
-        flop = (
-            batch_size
-            * nhead
-            * 2
-            * (ctx_lens * qk_head_dim * ctx_lens + ctx_lens * ctx_lens * v_head_dim)
-        )
-        checkAllclose(
-            out_ref,
-            out_aiter,
-            msg=f"mla_prefill-normal    [torch vs  aiter_ck]: {us_aiter:>8.2f} us...... {flop/us_aiter/1000/1000:>8.2f} TFlops",
-        )
-        return us_aiter
-
-    us_aiter = None
-    # if batch_size * ctx_lens * nhead < 256 * 8192 * 16:
-    #     us_aiter = test_normal_prefill()
-    torch.cuda.empty_cache()
-    # absorb init
-    qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    nhead_kv = 1
-    v_head_dim = kv_lora_rank
-    sm_scale = 1.0 / (qk_head_dim**0.5)
-
-    # test prefill
-    # ############################## absorb: prefill
-    def test_absorb_prefill():
-        q = torch.randn((total_qo, nhead, qk_head_dim), dtype=dtype)
-
-        out_ref, lse_ref = torch_mla_extend(
-            q,
-            kv_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            sm_scale,
-            kv_lora_rank,
-            qk_rope_head_dim,
-            dtype=dtype,
-        )
-
-        # #triton version
-        # prefix_indptr = kv_indptr - qo_indptr
-        # tmp = kv_indptr[1:] - seq_lens_qo
-        # tmp_inpptr, _ = torch.concat([kv_indptr[1:], tmp]).sort()
-        # prefix_kv_indices = kv_indices.tensor_split(tmp_inpptr.tolist())
-        # extend_kv_indices = torch.concat(
-        #     [el for i, el in enumerate(prefix_kv_indices) if i % 2 == 1]
-        # )
-        # prefix_kv_indices = torch.concat(
-        #     [el for i, el in enumerate(prefix_kv_indices) if i % 2 == 0]
-        # )
-        # extend_kvc = torch.index_select(kv_buffer, 0, extend_kv_indices)
-        # out_triton = torch.empty((total_qo, nhead, v_head_dim), dtype=dtype).fill_(-1)
-        # _, us_triton = run_perftest(
-        #     mla_extend_ref.extend_attention_fwd,
-        #     q,
-        #     extend_kvc,
-        #     extend_kvc[..., :kv_lora_rank],
-        #     out_triton,
-        #     kv_buffer,
-        #     kv_buffer[..., :kv_lora_rank],
-        #     qo_indptr,
-        #     prefix_indptr,
-        #     prefix_kv_indices,
-        #     None,
-        #     None,
-        #     max_seqlen_qo,
-        #     sm_scale,
-        #     num_iters=5,
-        # )
-        # checkAllclose(
-        #     out_ref,
-        #     out_triton,
-        #     msg=f"mla_prefill-absorb    [torch vs    triton]:{us_torch:>8.2f} us vs {us_triton:>8.2f} us......",
-        # )
-
-        out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm = run_perftest(
-            aiter.mla.mla_prefill_fwd,
-            q,
-            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            sm_scale,
-        )
-
-        checkAllclose(
-            out_ref,
-            out_asm,
-            msg=f"mla_prefill-absorb    [torch vs aiter_asm]: {us_asm:>8.2f} us......",
-        )
-        return us_asm
-
     us_asm = None
     # if batch_size * ctx_lens * nhead < 32 * 8192 * 16:
     #     us_asm = test_absorb_prefill()
     torch.cuda.empty_cache()
+    nhead_kv = 1
 
     # ############################## absorb: decode
     # seq_lens_qo = torch.randint(1, 5, (batch_size,), dtype=torch.int)
@@ -302,71 +176,6 @@ def test_mla(
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     total_q = qo_indptr[-1].item()
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=dtype)
-
-    # aiter implementation
-    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
-    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
-    reduce_partial_map = torch.empty(
-        [batch_size * 80], dtype=torch.int32, device="cuda"
-    )
-    # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
-
-    meta = aiter.get_mla_metadata_v1(
-        qo_indptr,
-        kv_indptr,
-        nhead // nhead_kv,
-        nhead_kv,
-        True,
-        work_meta_data,
-        work_info_set,
-        work_indptr,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-    )
-
-    print_metadata_result = False
-    if print_metadata_result:
-        valid_work_cnt = 0
-        for i in range(batch_size * 80):
-            bid = work_info_set[i][0].item()
-            if bid >= batch_size or bid < 0:
-                break
-            valid_work_cnt = i + 1
-        valid_reduce_partial_cnt = 0
-        last_reduce_partial_map = reduce_partial_map[-1].item()
-        for i in range(batch_size * 80):
-            idx = reduce_partial_map[i].item()
-            if idx >= 80 * qo_indptr[-1].item() * nhead or idx < 0:
-                break
-            valid_reduce_partial_cnt = i + 1
-            if idx == last_reduce_partial_map:
-                break
-        torch.set_printoptions(threshold=valid_work_cnt * 8)
-        print(f"seq_lens_kv({list(seq_lens_kv)}):")
-        print(seq_lens_kv)
-        print(f"kv_indptr({list(kv_indptr.shape)}):")
-        print(kv_indptr)
-        print(f"work_indptr({list(work_indptr.shape)}):")
-        print(work_indptr)
-        work_info_set_shape = list(work_info_set.shape)
-        print(
-            f"work_info_set({[valid_work_cnt] + work_info_set_shape[1:]}/{work_info_set_shape}):"
-        )
-        print(work_info_set[:valid_work_cnt])
-        print(f"reduce_indptr({batch_size + 1}):")
-        print(reduce_indptr[: batch_size + 1])
-        print(f"reduce_final_map({batch_size}):")
-        print(reduce_final_map[:batch_size])
-        reduce_partial_map_shape = list(reduce_partial_map.shape)
-        print(
-            f"reduce_partial_map({reduce_partial_map_shape[:-1] + [valid_reduce_partial_cnt]}/{reduce_partial_map_shape}):"
-        )
-        print(reduce_partial_map[:valid_reduce_partial_cnt])
-        torch.set_printoptions(threshold="default")
 
     # troch implementation
     out_ref, lse_ref = torch_mla_extend(
@@ -382,13 +191,51 @@ def test_mla(
         dtype=dtype,
     )
 
+    q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+    kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+    kv_scale = 1.0
+
+    out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+        q_fp8,
+        kv_buffer_fp8,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        sm_scale,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype=dtype,
+        is_causal=True,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+    )
+
+    import pdb; pdb.set_trace()
+
+    # aiter implementation
+    (
+        work_indptr,
+        work_info_set,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+    ) = aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr,
+        nhead // nhead_kv,
+        nhead_kv,
+        True,
+    )
+    print(work_indptr)
+    print(work_info_set)
+
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
     (attn_logits, attn_lse), us_asm_decode = run_perftest(
         aiter.mla.mla_decode_fwd,
-        q,
-        kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+        q_fp8,
+        kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
         out_asm,
         qo_indptr,
         kv_indptr,
@@ -396,6 +243,8 @@ def test_mla(
         kv_last_page_lens,
         max_seqlen_qo,
         sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
         work_indptr=work_indptr,
         work_info_set=work_info_set,
         reduce_indptr=reduce_indptr,
@@ -430,13 +279,13 @@ def test_mla(
 
 
 kv_lora_rank = 512
-qk_nope_head_dim = 128
+qk_nope_head_dim = 128 
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
-list_nhead = [(16, 3)]
+list_nhead = [(16, 2)]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -454,9 +303,9 @@ parser.add_argument(
     "-qn",
     "--qk_nope_head_dim",
     type=int,
-    default=128,
+    default=512,
     help="""qk nope head dim.
-    e.g.: -qn 128""",
+    e.g.: -qn 512""",
 )
 parser.add_argument(
     "-qr",
@@ -470,9 +319,9 @@ parser.add_argument(
     "-vh",
     "--v_head_dim",
     type=int,
-    default=128,
+    default=512,
     help="""v head dim.
-    e.g.: -vh 128""",
+    e.g.: -vh 512""",
 )
 parser.add_argument(
     "-blk",
@@ -507,8 +356,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    # default=[21, 128, 512, 1024, 2048, 3200, 4096, 8192, 12000],
-    default=[21],
+    default=[28, 512, 1023, 4888, 12800], #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -517,8 +365,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    # default=[i for i in range(1, 80)],
-    default=[64],
+    default=[i for i in range(1, 80)], # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -564,3 +411,4 @@ for nhead, mtp in list_nhead:
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
     aiter.logger.info(f"summary:\n{df}")
+
