@@ -1440,26 +1440,20 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
 def _get_num_workers(verbose: bool) -> Optional[int]:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
+        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
+            max_jobs = int(max(1, os.cpu_count() * 0.8))
         if verbose:
             print(
                 f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
                 file=sys.stderr,
             )
-        return int(max_jobs)
     else:
         max_jobs = int(max(1, os.cpu_count() * 0.8))
         print(
             f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
             file=sys.stderr,
         )
-        return max_jobs
-    if verbose:
-        print(
-            "Allowing ninja to set a default number of workers... "
-            "(overridable by setting the environment variable MAX_JOBS=N)",
-            file=sys.stderr,
-        )
-    return None
+    return max_jobs
 
 
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
