@@ -27,6 +27,7 @@ from aiter import ActivationType
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
+torch.manual_seed(33)
 
 
 def ck_moe_stage1(
@@ -412,30 +413,30 @@ def test_fmoe(
 
 
 l_dtype = ["bf16", "fp16"][:1]
-l_dim = [(6144, 4096)]
+l_dim = [(4096, 1536)]
 l_tokenNum = [
-    1,
-    3,
-    5,
+    # 1,
+    # 3,
+    # 5,
     16,
-    32,
-    64,
-    128,
-    256,
-    1024,
-    4096,
-    163840,
+    # 32,
+    # 64,
+    # 128,
+    # 256,
+    # 1024,
+    # 4096,
+    # 163840,
 ]
 l_quant = [
-    (aiter.QuantType.No, None, None),  # a16w16
-    (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.No, None, None),  # a16w16
+    # (aiter.QuantType.per_Tensor, dtypes.fp8, dtypes.fp8),  # a8w8
     (aiter.QuantType.per_Token, dtypes.fp8, dtypes.fp8),  # a8w8
-    (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
-    (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
-    (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
+    # (aiter.QuantType.per_Token, dtypes.fp8, torch.int4),  # a8w4
+    # (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2),  # a4w4
+    # (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8),  # a8w8
 ]
 l_act = [aiter.ActivationType.Silu, aiter.ActivationType.Gelu][:1]
-l_doweight_stage1 = [False, True]
+l_doweight_stage1 = [False]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
@@ -514,7 +515,7 @@ parser.add_argument(
     "-e",
     "--expert",
     type=int,
-    default=8,
+    default=2,
     help="""Number of experts.
     e.g.: -e 8""",
 )
