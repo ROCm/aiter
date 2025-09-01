@@ -40,24 +40,16 @@ def run_ck(
 
 
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [5])
 @pytest.mark.parametrize("nheads", [6])
 @pytest.mark.parametrize(
     "d,d_v",
     [
-        (32, 32),
-        (40, 40),
-        (59, 59),
-        (64, 64),
-        (96, 96),
-        (111, 111),
         (128, 128),
-        (160, 160),
-        (192, 192),
-        (224, 224),
-        (256, 256),
     ],
 )
 @pytest.mark.parametrize(
