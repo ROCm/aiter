@@ -7,9 +7,13 @@ import triton.language as tl
 from typing import Any, Dict
 from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.moe_common import _write_zeros_to_output
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.arch_info import get_num_xcds
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
+
+_LOGGER = AiterTritonLogger()
 
 
-@tl.constexpr_function
 def get_scaled_dot_format_string(dtype: tl.dtype):
     mapping = {
         tl.float16: "fp16",
@@ -59,6 +63,8 @@ def _fused_moe_kernel_mxfp4(
     stride_bmxk,
     stride_bmxn,
     # Meta-parameters
+    A_DTYPE_FORMAT: tl.constexpr,
+    B_DTYPE_FORMAT: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -69,6 +75,7 @@ def _fused_moe_kernel_mxfp4(
     compute_type: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -134,7 +141,6 @@ def _fused_moe_kernel_mxfp4(
 
     num_pid_m = tl.cdiv(num_tokens_post_padded, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    NUM_XCDS: tl.constexpr = 8
 
     GRID_MN = num_pid_n * num_pid_m
     if pid < GRID_MN:
@@ -303,8 +309,6 @@ def _fused_moe_kernel_mxfp4(
             )
         # We accumulate along the K dimension.
         if is_a_microscaled_format or is_b_microscaled_format:
-            a_format: tl.constexpr = get_scaled_dot_format_string(a.dtype)
-            b_format: tl.constexpr = get_scaled_dot_format_string(b.dtype)
             if is_a_microscaled_format:
                 # if SWIZZLE_MX_A:
                 #    a_mx_scales = _unswizzle_mx_block(tl.load(a_mx_scale_ptrs))
@@ -330,10 +334,10 @@ def _fused_moe_kernel_mxfp4(
             accumulator = tl.dot_scaled(
                 a,
                 a_mx_scales,
-                a_format,
+                A_DTYPE_FORMAT,
                 b,
                 b_mx_scales,
-                b_format,
+                B_DTYPE_FORMAT,
                 acc=accumulator,
                 fast_math=True,
             )
@@ -388,6 +392,14 @@ def fused_moe_mxfp4(
     """
     #TODO: Add doc
     """
+    _LOGGER.info(
+        f"MOE_OP_MXFP4:  A={tuple(A.shape)}  B={tuple(B.shape)}  C={tuple(C.shape)} "
+        + "A_scale={tuple(A_scale.shape)}  B_scale={tuple(B_scale.shape)} "
+        + "A_mx_scale={tuple(A_mx_scale.shape)}  B_mx_scale={tuple(B_mx_scale.shape)} "
+        + "topk_weights={tuple(topk_weights.shape)} sorted_token_ids={tuple(sorted_token_ids.shape)} "
+        + "expert_ids={tuple(expert_ids.shape)} num_tokens_post_padded={tuple(num_tokens_post_padded.shape)} "
+        + "top_k={top_k}"
+    )
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
@@ -409,6 +421,11 @@ def fused_moe_mxfp4(
         # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
+
+    A_tl_dtype = torch_to_triton_dtype[A.dtype]
+    A_DTYPE_FORMAT = get_scaled_dot_format_string(A_tl_dtype)
+    B_tl_dtype = torch_to_triton_dtype[B.dtype]
+    B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
 
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
@@ -442,10 +459,13 @@ def fused_moe_mxfp4(
         B_mx_scale.stride(0),
         B_mx_scale.stride(2),
         B_mx_scale.stride(1),
+        A_DTYPE_FORMAT=A_DTYPE_FORMAT,
+        B_DTYPE_FORMAT=B_DTYPE_FORMAT,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
         SWIZZLE_MX_A=swizzle_mx_a,  # TODO add swizzle support
         SWIZZLE_MX_B=swizzle_mx_b,  # TODO add swizzle support
+        NUM_XCDS=get_num_xcds(),
         **config,
     )

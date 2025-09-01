@@ -12,6 +12,9 @@ from aiter.ops.triton.utils.pid_preprocessing import pid_grid, remap_xcd
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+_LOGGER = AiterTritonLogger()
 
 global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
@@ -322,7 +325,6 @@ def _get_config(
 def batched_gemm_afp4wfp4_pre_quant(
     x,
     w,
-    x_scales,
     w_scales,
     dtype: Optional[float] = torch.bfloat16,
     y: Optional[torch.Tensor] = None,
@@ -330,10 +332,9 @@ def batched_gemm_afp4wfp4_pre_quant(
 ):
     """
     Computes the matmul Y = X x W
-    X and W are e2m1 fp4 tensors.
-    x_scales and w_scales are e8m0 tensors.
+    W is an e2m1 fp4 tensor and w_scales is an e8m0 tensor.
     Every 32 elements in the K dimension share one e8m0 scale.
-
+    X gets quantized to the microscale fp4 (mxfp4) format before the GEMM.
 
     Key parameters:
     - X: Matrix X with shape (B, M, K).
@@ -344,6 +345,11 @@ def batched_gemm_afp4wfp4_pre_quant(
     Returns:
     - Y: The output matrix with shape (M, N).
     """
+    _LOGGER.info(
+        f"BATCHED_GEMM_AFP4WFP_PREQUANT: x={tuple(x.shape)} w={tuple(w.shape)} w_scale={tuple(w.shape)}"
+    )
+
+    assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
     Bx, M, K = x.shape
     Bw, N, K = w.shape
@@ -377,6 +383,10 @@ def batched_gemm_afp4wfp4_pre_quant(
     else:
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
+
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
 
     grid = lambda META: (  # noqa: E731
         Batch,
@@ -440,3 +450,4 @@ def batched_gemm_afp4wfp4_pre_quant(
             ACTUAL_KSPLIT,
             config["NUM_KSPLIT"],
         )
+    return y

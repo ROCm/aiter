@@ -186,14 +186,18 @@ fmha_bwd_args get_asm_fmha_varlen_bwd_args(const mask_info &mask,
 }
 
 std::vector<at::Tensor>
-fmha_v3_varlen_bwd(const at::Tensor &dout,         // [total_q, hq, d_v]
-                   const at::Tensor &q,            // [total_q, hq, d_q]
-                   const at::Tensor &k,            // [total_k, hk, d_q]
-                   const at::Tensor &v,            // [total_k, hk, d_v]
-                   const at::Tensor &out,          // [total_q, hq, d_v]
-                   const at::Tensor &softmax_lse,  // [b, hq, sq]
-                   const at::Tensor &cu_seqlens_q, // [b+1]
-                   const at::Tensor &cu_seqlens_k, // [b+1]
+fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v]
+                   const at::Tensor &q,                     // [total_q, hq, d_q]
+                   const at::Tensor &k,                     // [total_k, hk, d_q]
+                   const at::Tensor &v,                     // [total_k, hk, d_v]
+                   const at::Tensor &out,                   // [total_q, hq, d_v]
+                   const at::Tensor &softmax_lse,           // [b, hq, sq]
+                   const at::Tensor &cu_seqlens_q,          // [b+1]
+                   const at::Tensor &cu_seqlens_k,          // [b+1]
+                // FIXME: this two args currently not support on ck side
+                //        and has no host code on aiter side
+                //    const at::Tensor& cu_seqlens_q_padded,   // [b+1]
+                //    const at::Tensor& cu_seqlens_k_padded,   // [b+1]
                    const int max_seqlen_q,
                    const int max_seqlen_k,
                    const float p_dropout,

@@ -6,6 +6,10 @@ import torch
 
 def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Tensor:
     # Hardcode BLOCK_K and BLOCK_N
+    x_type = x.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
     IN, IK = layout
     BK = IK * 2
     K = 16 // x.element_size() if not use_int4 else 32
@@ -18,4 +22,4 @@ def shuffle_weight(x: torch.Tensor, layout=(16, 16), use_int4=False) -> torch.Te
     x_ = x_.permute(0, 1, 3, 4, 2, 5)
     x_ = x_.contiguous()
     x_ = x_.view(*x.shape)
-    return x_
+    return x_.view(x_type)

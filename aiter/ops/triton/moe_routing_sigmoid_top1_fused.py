@@ -9,67 +9,9 @@ import triton
 import triton.language as tl
 import aiter.ops.triton.utils.arch_info as arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
-
-def get_config_heuristic(M, K, N):
-    """
-    Return the best Triton configuration based on input dimensions.
-
-    Args:
-        M: Batch dimension
-        K: Hidden dimension
-        N: Number of experts (16 or 128)
-        TOPK: Top-k value (default: 1)
-
-    Returns:
-        triton.Config: Configuration for the Triton kernel
-    """
-    # Determine M bucket (small: <2048, medium: 2048-4095, large: 4096-8191, very_large: 8192+)
-    m_bucket = (
-        "very_large"
-        if M >= 8192
-        else "large" if M >= 4096 else "medium" if M >= 2048 else "small"
-    )
-
-    # Create parameter configuration using nested dictionaries
-    configs = {
-        # Format: {N: {m_bucket: (BLOCK_M, BLOCK_K, num_warps, num_stages, waves_per_eu, kpack)}}
-        16: {
-            "small": (16, 256, 4, 2, 3, 1),
-            "medium": (16, 256, 4, 2, 3, 1),
-            "large": (16, 256, 4, 2, 3, 2),
-            "very_large": (32, 256, 4, 2, 0, 1),
-        },
-        128: {
-            "small": (16, 256, 8, 1, 0, 1),
-            "medium": (16, 256, 8, 1, 0, 2),
-            "large": (16, 256, 8, 1, 2, 2),
-            "very_large": (32, 128, 8, 2, 2, 2),
-        },
-        256: {
-            "small": (16, 64, 8, 1, 0, 1),
-            "medium": (16, 64, 8, 1, 0, 2),
-            "large": (16, 64, 8, 1, 2, 2),
-            "very_large": (16, 64, 8, 2, 2, 2),
-        },
-    }
-
-    # Get configuration parameters
-    BLOCK_M, BLOCK_K, num_warps, num_stages, waves_per_eu, kpack = configs[N][m_bucket]
-
-    # Return Triton configuration
-    return triton.Config(
-        {
-            "BLOCK_M": BLOCK_M,
-            "BLOCK_K": BLOCK_K,
-            "matrix_instr_nonkdim": 16,  # Always 16
-            "waves_per_eu": waves_per_eu,
-            "kpack": kpack,
-        },
-        num_warps=num_warps,
-        num_stages=num_stages,
-        num_ctas=1,
-    )
+_LOGGER = AiterTritonLogger()
 
 
 @triton.jit
@@ -196,6 +138,9 @@ def _get_config(M, N, K):
 def routing_sigmoid_top1(
     x, w, topk, fused_shared_experts=False, config: Optional[dict[str, any]] = None
 ):
+    _LOGGER.info(
+        f"ROUTING_SIGMOID_TOP1:  x={tuple(x.shape)}  w={tuple(w.shape)}  topk={topk} "
+    )
     x = x.view(-1, x.shape[-1])
 
     assert topk == 1

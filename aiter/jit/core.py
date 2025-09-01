@@ -18,11 +18,14 @@ from packaging.version import parse, Version
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from torch_guard import torch_compile_guard  # noqa: E402
 from cpp_extension import _jit_compile, get_hip_version
 from file_baton import FileBaton
 from chip_info import get_gfx
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+
+aiter_lib = None
 
 
 def mp_lock(
@@ -85,7 +88,7 @@ if find_aiter is not None:
 else:
     AITER_META_DIR = AITER_ROOT_DIR
     logger.warning("aiter is not installed.")
-
+sys.path.insert(0, AITER_META_DIR)
 AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
 AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
 gfx = get_gfx()
@@ -94,6 +97,7 @@ os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
 CK_3RDPARTY_DIR = os.environ.get(
     "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
 )
+CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
 
 
 @functools.lru_cache(maxsize=1)
@@ -103,9 +107,10 @@ def get_asm_dir():
 
 @functools.lru_cache(maxsize=1)
 def get_user_jit_dir():
-    if "JIT_WORKSPACE_DIR" in os.environ:
-        path = os.getenv("JIT_WORKSPACE_DIR")
+    if "AITER_JIT_DIR" in os.environ:
+        path = os.getenv("AITER_JIT_DIR")
         os.makedirs(path, exist_ok=True)
+        sys.path.insert(0, path)
         return path
     else:
         if os.access(this_dir, os.W_OK):
@@ -147,13 +152,13 @@ def validate_and_update_archs():
 
 
 @functools.lru_cache()
-def hip_flag_checker(flag_hip: str):
+def hip_flag_checker(flag_hip: str) -> bool:
     ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
-        return [flag_hip]
+        return True
     else:
         logger.warning(f"{flag_hip} is not supported by hipcc.")
-        return []
+        return False
 
 
 def check_and_set_ninja_worker():
@@ -165,8 +170,7 @@ def check_and_set_ninja_worker():
         free_memory_gb = psutil.virtual_memory().available / (
             1024**3
         )  # free memory in GB
-        # each JOB peak memory cost is ~8-9GB when threads = 4
-        max_num_jobs_memory = int(free_memory_gb / 9)
+        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
 
         # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
         max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
@@ -199,8 +203,8 @@ def rename_cpp_to_cu(els, dst, recurisve=False):
     return ret
 
 
-@functools.lru_cache()
-def check_numa():
+@torch_compile_guard()
+def check_numa_custom_op() -> None:
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
     if numa_balance_set == "1":
         logger.warning(
@@ -210,14 +214,29 @@ def check_numa():
         )
 
 
+@functools.lru_cache()
+def check_numa():
+    check_numa_custom_op()
+
+
 __mds = {}
+
+
+@torch_compile_guard()
+def get_module_custom_op(md_name: str) -> None:
+    global __mds
+    if md_name not in __mds:
+        if "AITER_JIT_DIR" in os.environ:
+            __mds[md_name] = importlib.import_module(md_name)
+        else:
+            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+    return
 
 
 @functools.lru_cache(maxsize=1024)
 def get_module(md_name):
     check_numa()
-    if md_name not in __mds:
-        __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+    get_module_custom_op(md_name)
     return __mds[md_name]
 
 
@@ -233,6 +252,7 @@ def recopy_ck():
     if os.path.exists(CK_DIR):
         os.system(f"rm -rf {CK_DIR}")
     shutil.copytree(CK_3RDPARTY_DIR, CK_DIR, dirs_exist_ok=True)
+    shutil.copy(f"{CK_HELPER_DIR}/config.h", f"{CK_DIR}/include/ck/config.h")
 
 
 def clear_build(md_name):
@@ -252,13 +272,15 @@ def build_module(
     is_standalone,
     torch_exclude,
     hipify=True,
+    prebuild=0,
 ):
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
     target_name = f"{md_name}.so" if not is_standalone else md_name
 
     def MainFunc():
-        recopy_ck()
+        if prebuild != 1:
+            recopy_ck()
         if AITER_REBUILD == 1:
             rm_module(md_name)
             clear_build(md_name)
@@ -273,9 +295,14 @@ def build_module(
         if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
             os.remove(f"{get_user_jit_dir()}/{target_name}")
 
-        sources = rename_cpp_to_cu(srcs, src_dir)
+        if prebuild != 2:
+            sources = rename_cpp_to_cu(srcs, src_dir)
+        else:
+            sources = rename_cpp_to_cu(
+                [get_user_jit_dir() + "/../../csrc/rocm_ops.cpp"], opbd_dir + "/srcs"
+            )
 
-        flags_cc = ["-O3", "-std=c++17"]
+        flags_cc = ["-O3", "-std=c++20"]
         flags_hip = [
             "-DLEGACY_HIPBLAS_DIRECT",
             "-DUSE_PROF_API=1",
@@ -296,6 +323,8 @@ def build_module(
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        if hip_version <= Version("6.3.42132"):
+            flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
         if hip_version > Version("5.5.00000"):
             flags_hip += ["-mllvm --lsr-drop-solution=1"]
         if hip_version > Version("5.7.23302"):
@@ -311,6 +340,11 @@ def build_module(
             flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
         if get_gfx() == "gfx950" and int(os.getenv("AITER_FP4x2", "1")) > 0:
             flags_hip += ["-D__Float4_e2m1fn_x2"]
+
+        import torch
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
         archs = validate_and_update_archs()
@@ -329,11 +363,12 @@ def build_module(
                 sources += rename_cpp_to_cu([blob_dir], src_dir, recurisve=True)
             return sources
 
-        if isinstance(blob_gen_cmd, list):
-            for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-        else:
-            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
+        if prebuild != 2:
+            if isinstance(blob_gen_cmd, list):
+                for s_blob_gen_cmd in blob_gen_cmd:
+                    sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
+            else:
+                sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
 
         # TODO: Move all torch api into torch folder
         old_bd_include_dir = f"{op_dir}/build/include"
@@ -370,6 +405,7 @@ def build_module(
                 is_standalone=is_standalone,
                 torch_exclude=torch_exclude,
                 hipify=hipify,
+                prebuild=prebuild,
             )
             if is_python_module and not is_standalone:
                 shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
@@ -377,8 +413,8 @@ def build_module(
                 shutil.copy(
                     f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
                 )
-        except:
-            tag = f"\033[31mfailed build jit [{md_name}]\033[0m"
+        except Exception as e:
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
             logger.error(
                 f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
                     re.sub(
@@ -389,7 +425,9 @@ def build_module(
                     ),
                 )
             )
-            raise
+            raise SystemExit(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from e
 
     def FinalFunc():
         logger.info(
@@ -436,10 +474,10 @@ def get_args_of_build(ops_name: str, exclude=[]):
     with open(this_dir + "/optCompilerConfig.json", "r") as file:
         data = json.load(file)
         if isinstance(data, dict):
-            # parse all ops
+            # parse all ops, return list
             if ops_name == "all":
+                all_ops_list = []
                 d_all_ops = {
-                    "srcs": [],
                     "flags_extra_cc": [],
                     "flags_extra_hip": [],
                     "extra_include": [],
@@ -454,13 +492,22 @@ def get_args_of_build(ops_name: str, exclude=[]):
                     if ops_name in exclude:
                         continue
                     single_ops = convert(d_ops)
+                    d_single_ops = {
+                        "md_name": ops_name,
+                        "srcs": single_ops["srcs"],
+                        "flags_extra_cc": single_ops["flags_extra_cc"],
+                        "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_include": single_ops["extra_include"],
+                        "blob_gen_cmd": single_ops["blob_gen_cmd"],
+                    }
                     for k in d_all_ops.keys():
                         if isinstance(single_ops[k], list):
                             d_all_ops[k] += single_ops[k]
                         elif isinstance(single_ops[k], str) and single_ops[k] != "":
                             d_all_ops[k].append(single_ops[k])
+                    all_ops_list.append(d_single_ops)
 
-                return d_all_ops
+                return all_ops_list, d_all_ops
             # no find opt_name in json.
             elif data.get(ops_name) == None:
                 logger.warning(
@@ -479,22 +526,184 @@ def get_args_of_build(ops_name: str, exclude=[]):
             )
 
 
+MANUAL_SCHEMA_OPS = [
+    "register_graph_buffers",
+    "module_moe_ck2stages",
+    "mha_fwd",
+    "fmha_v3_fwd",
+    "mha_varlen_fwd",
+    "mha_bwd",
+    "fmha_v3_bwd",
+    "mha_varlen_bwd",
+    "fmha_v3_varlen_bwd",
+    "fmha_v3_varlen_fwd",
+    "mha_batch_prefill",
+    "hipb_findallsols",
+    "rocb_findallsols",
+    "_ActivationType",
+    "_QuantType",
+    "init_custom_ar",
+]
+
+NONE_WRAPPED_OP = [
+    # "hipb_create_extension",
+    # "hipb_destroy_extension",
+    "getHipblasltKernelName",
+    # "rocb_create_extension",
+    # "rocb_destroy_extension",
+    "get_meta_buffer_ipc_handle",
+    "get_graph_buffer_ipc_meta",
+    "_ActivationType",
+    "_QuantType",
+    # "allocate_meta_buffer",
+    # "dispose",
+    # "meta_size",
+    # "get_padded_m",
+    "compile_mha_fwd",
+    "compile_mha_bwd",
+]
+
+SPECIAL_OPS_MUTATES_ARGS = {
+    "topk_softmax": [
+        "arg0",
+        "arg1",
+        "arg2",
+    ],  # "topk_weights", "topk_indices", "token_expert_indices"
+    "biased_grouped_topk_hip": ["topk_weights", "topk_ids"],
+    "moe_fused_gate": ["topk_weights", "topk_ids"],
+    "grouped_topk": ["topk_weights", "topk_ids"],
+    "rope_cached_positions_2c_fwd_impl": ["input_x", "input_y"],
+    "rotary_embedding_fwd": ["query", "key"],
+    "reshape_and_cache": ["key_cache", "value_cache"],
+    "reshape_and_cache_with_pertoken_quant": ["key_cache", "value_cache"],
+}
+
+
+def generate_schema(func) -> str:
+    import inspect
+    import torch
+    from typing import Optional, Union, List, get_origin, get_args
+
+    sig = inspect.signature(func)
+    parameters = []
+    mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
+    for idx, (name, param) in enumerate(sig.parameters.items()):
+        param_type = param.annotation
+        flag = True
+        is_mutates = False
+        if name in mutates_args:
+            is_mutates = True
+
+        if param_type is torch.Tensor:
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)"
+            else:
+                type_str = "Tensor"
+        elif param_type == Optional[torch.Tensor]:
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)?"
+            else:
+                type_str = "Tensor?"
+        elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)?"
+            else:
+                type_str = "Tensor?"
+        elif param_type in (torch.SymInt, int):
+            type_str = "SymInt"
+        elif param_type in (float, bool, str):
+            type_str = param_type.__name__
+        elif param_type == Optional[torch.Generator]:
+            type_str = "Generator?"
+        elif (
+            get_origin(param_type) in (list, List)
+            and get_args(param_type)[0] is torch.Tensor
+        ):
+            if is_mutates:
+                type_str = f"Tensor(a{idx}!)[]"
+            else:
+                type_str = "Tensor[]"
+        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
+            type_str = "int[]"
+        elif param_type == Optional[torch.dtype]:
+            type_str = "ScalarType?"
+        else:
+            type_str = "*"
+            flag = False
+        if flag:
+            param_str = f"{type_str} {name}"
+
+            if param.default != inspect.Parameter.empty:
+                if param.default is None:
+                    param_str += "=None"
+                else:
+                    param_str += f"={param.default}"
+        else:
+            param_str = f"{type_str} "
+
+        parameters.append(param_str)
+    return_annotation = sig.return_annotation
+    return_type = ""
+    if return_annotation is type(None) or return_annotation is None:
+        return_type = "()"
+    elif return_annotation is torch.Tensor:
+        return_type = "Tensor"
+    elif (
+        get_origin(return_annotation) is list and get_args(return_annotation)[0] is int
+    ):
+        return_type = "int[]"
+    elif return_annotation is int:
+        return_type = "int"
+    elif return_annotation is float:
+        return_type = "float"
+    elif return_annotation is bool:
+        return_type = "bool"
+    elif (
+        get_origin(return_annotation) is list
+        and get_args(return_annotation)[0] is torch.Tensor
+    ):
+        return_type = "Tensor[]"
+    elif get_origin(return_annotation) is tuple:
+        args = get_args(return_annotation)
+        type_strings = []
+        for arg in args:
+            if arg is torch.Tensor:
+                type_strings.append("Tensor")
+            elif arg is int:
+                type_strings.append("int")
+            elif arg is float:
+                type_strings.append("float")
+            elif arg is bool:
+                type_strings.append("bool")
+        return_type = f"({', '.join(type_strings)})"
+    else:
+        return_type = "Any"
+
+    schema = f"({', '.join(parameters)}) -> {return_type}"
+
+    return schema
+
+
 def compile_ops(
     _md_name: str,
     fc_name: Optional[str] = None,
     gen_func: Optional[Callable[..., dict[str, Any]]] = None,
+    gen_fake: Optional[Callable[..., Any]] = None,
 ):
     def decorator(func):
         func.arg_checked = False
 
         @functools.wraps(func)
         def wrapper(*args, custom_build_args={}, **kwargs):
+
             loadName = fc_name
             md_name = _md_name
             if fc_name is None:
                 loadName = func.__name__
             try:
                 module = None
+                if gen_func is not None:
+                    custom_build_args.update(gen_func(*args, **kwargs))
                 if PREBUILD_KERNELS:
                     if hasattr(aiter_, loadName):
                         module = aiter_
@@ -502,9 +711,6 @@ def compile_ops(
                     rebuilded_list.append(md_name)
                     raise ModuleNotFoundError("")
                 if module is None:
-                    if gen_func is not None:
-                        gen_build_args = gen_func(*args, **kwargs)
-                        custom_build_args.update(gen_build_args)
                     md = custom_build_args.get("md_name", md_name)
                     module = get_module(md)
             except ModuleNotFoundError:
@@ -561,6 +767,16 @@ def compile_ops(
                 op = getattr(module, loadName)
             else:
                 return None
+            activation_index = 0
+            quant_index = 0
+            activation_list = [
+                "fmoe_g1u1",
+                "fmoe_int8_g1u0",
+                "fmoe_g1u1_tkw1",
+                "fmoe_fp8_blockscale_g1u1",
+                "moe_stage1_g1u1",
+            ]
+            quant_list = ["moe_stage1_g1u1"]
 
             def check_args():
                 get_asm_dir()
@@ -583,7 +799,10 @@ def compile_ops(
                     func.__signature__ = sig
                     ann = {k: v.annotation for k, v in sig.parameters.items()}
                     ann["return"] = sig.return_annotation
-
+                    if loadName in activation_list:
+                        return True
+                    if loadName in quant_list:
+                        return True
                     callargs = inspect.getcallargs(func, *args, **kwargs)
                     for el, arg in callargs.items():
                         expected_type = ann[el]
@@ -628,8 +847,115 @@ def compile_ops(
 
                 log_args(func, *args, **kwargs)
 
+            import inspect
+
+            sig = inspect.signature(func)
+            params = list(sig.parameters.keys())
+            if loadName in activation_list:
+                activation_index = params.index("activation")
+                args_list = list(args)
+                from aiter import ActivationType, QuantType
+
+                if len(args_list) > activation_index and isinstance(
+                    args_list[activation_index], int
+                ):
+                    args_list[activation_index] = ActivationType(
+                        args_list[activation_index]
+                    )
+                    args = tuple(args_list)
+
+            if loadName in quant_list:
+                quant_index = params.index("quant_type")
+                args_list = list(args)
+                from aiter import ActivationType, QuantType
+
+                if len(args_list) > quant_index and isinstance(
+                    args_list[quant_index], int
+                ):
+                    args_list[quant_index] = QuantType(args_list[quant_index])
+                    args = tuple(args_list)
             return op(*args, **kwargs)
 
-        return wrapper
+        if func.__name__ in NONE_WRAPPED_OP:
+            return wrapper
+
+        def wrapper_register(func):
+            import torch
+            import torch.library
+            import inspect
+            from torch.library import Library
+
+            global aiter_lib
+            aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
+            schema = ""
+            if func.__name__ in MANUAL_SCHEMA_OPS:
+                schema = generate_schema(func)
+            else:
+                sig = inspect.signature(func)
+                mutates_args = SPECIAL_OPS_MUTATES_ARGS.get(func.__name__, [])
+                if hasattr(torch.library, "infer_schema"):
+                    sig = torch.library.infer_schema(func, mutates_args=mutates_args)
+                else:
+                    # for pytorch 2.4
+                    import torch._custom_op.impl
+
+                    sig = torch._custom_op.impl.infer_schema(func, mutates_args)
+                schema = f"{sig}"
+            return schema
+
+        schema = wrapper_register(func)
+
+        import torch
+        import inspect
+
+        sig = inspect.signature(func)
+        input_part, output_part = schema.split("->", 1)
+        if not sig.parameters:
+            new_input = "(Tensor dummy)"
+        else:
+            new_input = "(Tensor dummy, " + input_part[1:]
+
+        return_int = False
+        return_annotation = sig.return_annotation
+        if return_annotation is int:
+            output_part = "(Tensor, " + output_part + ")"
+            return_int = True
+
+        schema = f"{new_input} -> {output_part}".strip()
+        loadName = func.__name__
+
+        def abstract_impl(dummy, *args, custom_build_args={}, **kwargs):
+            if return_int:
+                return torch.empty(1, device="cuda"), 1
+            if gen_fake is not None:
+                return gen_fake(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        def outer_wrapper(dummy, *args, **kwargs):
+            return (
+                wrapper(*args, **kwargs)
+                if not return_int
+                else (torch.empty(1, device="cuda"), wrapper(*args, **kwargs))
+            )
+
+        if not hasattr(torch.ops.aiter, f"wrapper_{loadName}"):
+            op_schema = f"aiter::wrapper_{loadName}" + schema
+            aiter_lib.define(op_schema, tags=())
+            aiter_lib.impl(
+                f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CUDA"
+            )
+            aiter_lib.impl(
+                f"aiter::wrapper_{loadName}", outer_wrapper, dispatch_key="CPU"
+            )
+            aiter_lib._register_fake(f"wrapper_{loadName}", abstract_impl)
+
+        def wrapper_custom(*args, custom_build_args={}, **kwargs):
+            dummy = torch.empty(1, device="cuda")
+            result = getattr(torch.ops.aiter, f"wrapper_{loadName}")(
+                dummy, *args, **kwargs
+            )
+            return result[1] if return_int else result
+
+        return wrapper_custom
 
     return decorator
