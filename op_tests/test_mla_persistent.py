@@ -211,13 +211,17 @@ def test_mla(
         dtype=dtype,
     )
 
+    gpu = torch.cuda.current_device()
+    device_properties = torch.cuda.get_device_properties(gpu)
+    cu_num = device_properties.multi_processor_count
+
     # aiter implementation
     work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set      = torch.empty([batch_size * 80, 8], dtype=torch.int32, device="cuda")
+    work_indptr        = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_info_set      = torch.empty([batch_size * cu_num, 8], dtype=torch.int32, device="cuda")
     reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
     reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
-    reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
+    reduce_partial_map = torch.empty([batch_size * cu_num], dtype=torch.int32, device="cuda")
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
     
     meta = aiter.get_mla_metadata_v1(
