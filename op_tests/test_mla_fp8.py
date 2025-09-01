@@ -30,7 +30,8 @@ def setup_seed(seed):
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-# setup_seed(1)
+
+setup_seed(0)
 
 
 def compare_arrays(arr1: np.ndarray, arr2: np.ndarray, 
@@ -139,7 +140,7 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    logging.info(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -267,7 +268,7 @@ def test_mla(
     kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
     if varlen:
         for i in range(batch_size):
-            # seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
+            seq_lens_kv[i] = max(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens)
             seq_lens_kv[i] = random.uniform(10, ctx_lens)
             seq_lens_qo[i] = max(
                 min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
@@ -277,6 +278,7 @@ def test_mla(
         seq_lens_qo.fill_(ctx_lens)
 
     seq_lens_kv = torch.tensor([3819,9978,784,530,8062,1390,287,1008,5090,5304,7396,2288,2104,4063,3644,5091,6470,4732,7237,430,2777,956,1357,5478,1292,521,6802,1347,2388,5062,443,8560,5049,7235,927,9580,623,4913,2511,8120,1638,4859,600,7289,8278,6693,136,1021,1465,5859,1278,7123,7839,2459,1090,6333,812,9358,6345,8616,2313,6115,6059,4963, 12343, 213, 143, 12312, 12345, 3215, 4444, 5325, 2132, 123, 456, 2135, 135, 2564, 5465, 4362], device="cuda")
+    # seq_lens_kv = torch.tensor([4096 * 20 for i in range(1024)], device="cuda")
     seq_lens_kv = seq_lens_kv[:batch_size]
     aiter.logger.info(f"seq_lens_kv: {seq_lens_kv.numel()}")
 
@@ -328,10 +330,10 @@ def test_mla(
         dtype=dtype,
     )
 
-    q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
-    q_scale = q_scale.to(torch.float)
-    # q_fp8 = q.to(torch.float8_e4m3fnuz)
-    # q_scale = torch.ones([1], dtype=torch.float, device="cuda")
+    # q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+    # q_scale = q_scale.to(torch.float)
+    q_fp8 = q.to(torch.float8_e4m3fnuz)
+    q_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
     kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
     # kv_scale = torch.ones([batch_size], dtype=torch.float, device="cuda")
@@ -356,7 +358,7 @@ def test_mla(
     # aiter implementation
     work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
     work_indptr        = torch.empty([81], dtype=torch.int32, device="cuda")
-    work_info_set      = torch.empty([batch_size + 80, 8], dtype=torch.int32, device="cuda")
+    work_info_set      = torch.empty([batch_size * 80, 8], dtype=torch.int32, device="cuda")
     reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
     reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
     reduce_partial_map = torch.empty([batch_size * 80], dtype=torch.int32, device="cuda")
@@ -377,6 +379,7 @@ def test_mla(
     )
     print(work_indptr)
     print(work_info_set[:work_indptr[-1]])
+    print(work_info_set.shape)
     print(reduce_indptr)
     print(reduce_final_map)
     print(reduce_partial_map)
@@ -402,8 +405,9 @@ def test_mla(
         work_info_set=work_info_set,
         reduce_indptr=reduce_indptr,
         reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
+        reduce_partial_map=reduce_partial_map
     )
+    torch.cuda.synchronize()
     # out_asm = out_asm[:total_q]
 
     # import pdb; pdb.set_trace()
@@ -432,7 +436,7 @@ def test_mla(
     result = compare_arrays(out_asm.float().cpu().numpy(), out_ref.float().cpu().numpy())
     logging.info(f'compare: {result}')
 
-    # cal_diff(out_ref, out_asm, "out", True)
+    cal_diff(out_ref, out_asm, "out", True)
 
     return {
         "decode:flops": flops,
