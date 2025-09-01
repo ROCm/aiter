@@ -36,6 +36,9 @@ template <typename DTYPE,
           int HIDDEN_SIZE,
           int WIDTH,
           int blockDim,
+          bool RESIDUAL_OUT,
+          bool DO_SMOOTH_QUANT,
+          bool NO_QUANT_OUT,
           typename ACC_DTYPE,
           typename QUANT_DTYPE>
 __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
@@ -58,7 +61,6 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
     using AccVecType = ck_tile::vec_t<float, WIDTH>;
     using StoreType  = ck_tile::vec_t<ck_tile::bf16_t, WIDTH>;
     using StoreQuantType = ck_tile::vec_t<QUANT_DTYPE, WIDTH>;
-
     using QuantVecType = ck_tile::vec_t<QUANT_DTYPE, WIDTH>;
 
     float variance = 0.0f;
@@ -91,9 +93,9 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
     float in_local[LANE_HIDDEN_SIZE];
     float residual_in_local[LANE_HIDDEN_SIZE];
     AccVecType* row_in_ptr           = reinterpret_cast<AccVecType*>(&in_local);
-    AccVecType* row_resdidual_in_ptr = reinterpret_cast<AccVecType*>(&residual_in_local);
-
     const AccessType* vec_in_read_ptr = reinterpret_cast<const AccessType*>(thread_in_ptr);
+
+    AccVecType* row_resdidual_in_ptr = reinterpret_cast<AccVecType*>(&residual_in_local);
     const AccessType* vec_residual_in_read_ptr = reinterpret_cast<const AccessType*>(thread_residual_in_ptr);
 
 #pragma unroll
@@ -128,13 +130,6 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
 
     static constexpr auto WIDTH_SUB = WIDTH - 1;
 
-
-// #pragma unroll
-//     for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
-//     {
-//         gamma_in_ptr[ii] = vec_gamma_read_ptr[ii * THREADS_PER_ROW];
-//     }
-
     // Issue gamma with add.
 #pragma unroll
     for(int ii = 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
@@ -154,48 +149,21 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
 
     variance = multithread_reduce(variance, arg_sum, 64);
 
-        auto warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
-        if (((threadIdx.x & 63) ^ 63) == 0)
-        {
-            s_variance[warp_id] = variance;
-        }
+    auto warp_id = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
 
-        __syncthreads();
+    s_variance[warp_id] = variance;
+    __syncthreads();
 
-        if (threadIdx.x == 0)
-        {
-            auto variance = s_variance[0] + s_variance[1];
-            s_variance[0] = variance;
-            s_variance[1] = variance;
-        }
+    if (threadIdx.x == 0)
+    {
+        auto variance = s_variance[0] + s_variance[1];
+        s_variance[0] = variance;
+        s_variance[1] = variance;
+    }
 
-        __syncthreads();
+    __syncthreads();
 
-        variance = s_variance[warp_id];
-
-    // if(threadIdx.x == 0)
-    // {
-    //     printf("blockIdx.x %d, variance: %f \n", blockIdx.x, variance);
-    // }
-
-    // auto* residual_out = reinterpret_cast<ck_tile::bf16_t *>(params.p_residual_out);
-    // auto* no_quant_out = reinterpret_cast<ck_tile::bf16_t *>(params.p_out_before_quant);
-    // static constexpr int32_t ooba_scalar = 4 / sizeof(ck_tile::bf16_t);
-    // const int32_t oob_scalar = (HIDDEN_SIZE + ooba_scalar - 1) / ooba_scalar * ooba_scalar;
-
-    // static constexpr int32_t ooba_o = 4 / sizeof(QUANT_DTYPE);
-    // const int32_t oob_o = (HIDDEN_SIZE + ooba_o - 1) / ooba_o * ooba_o;
-    //
-    // auto residual_out_view =
-    //     ck_tile::make_buffer_view<ck_tile::address_space_enum::global,
-    //                               ck_tile::amd_buffer_coherence_enum::glc>(residual_out, oob_scalar);
-    // residual_out_view.init_raw();
-    //
-    // auto no_quant_out_view =
-    //     ck_tile::make_buffer_view<ck_tile::address_space_enum::global,
-    //                               ck_tile::amd_buffer_coherence_enum::glc>(no_quant_out, oob_scalar);
-    // no_quant_out_view.init_raw();
-
+    variance = s_variance[warp_id];
 
 #pragma unroll
     for (int ii= 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
@@ -215,10 +183,6 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
     for (int ii= 0; ii < VEC_HIDDEN_SIZE_LOC; ++ii)
     {
         vec_no_quant_st_ptr[ii * THREADS_PER_ROW] = ck_tile::vec_convert<ck_tile::bf16_t, ACC_DTYPE, WIDTH>(row_resdidual_in_ptr[ii]);
-        // no_quant_out_view.template set(row_offset + first_elt_read_by_thread + ii * THREADS_PER_ROW,
-        //                                0,
-        //                                true,
-        //                                ck_tile::vec_convert<ck_tile::bf16_t, ACC_DTYPE, WIDTH>(row_resdidual_in_ptr[ii]));
     }
 
     const auto f_max3 = [](auto acc_, auto v_0_, auto v_1_) {
@@ -236,48 +200,24 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
     {
         in_local[ii] = residual_in_local[ii] * sm_scale_local[ii];
         in_local[ii + 1] = residual_in_local[ii + 1] * sm_scale_local[ii + 1];
-        // in_local[ii] = residual_in_local[ii] * ck_tile::type_convert<ACC_DTYPE>(sm_scale_local[ii]);
-        // in_local[ii + 1] = residual_in_local[ii + 1] * ck_tile::type_convert<ACC_DTYPE>(sm_scale_local[ii + 1]);
-        // in_local[ii] *= residual_in_local[ii];
-        // in_local[ii + 1] *= residual_in_local[ii + 1];
 
         max_local = f_max3(max_local, in_local[ii], in_local[ii + 1]);
     }
 
-//     auto f_abs_max = [](const DTYPE& a, const DTYPE& b) {
-//         return ck_tile::max(a, ck_tile::abs(b));
-//     };
-// #pragma unroll
-//     for (int ii = 0; ii < LANE_HIDDEN_SIZE; ++ii)
-//     {
-//         in_local[ii] = residual_in_local[ii] * ck_tile::type_convert<ACC_DTYPE>(sm_scale_local[ii]);
-//         max_local = f_abs_max(max_local, in_local[ii]);
-//     }
-
-
     max_local = multithread_reduce(max_local, arg_max, 64);
 
-	// if(threadIdx.x == 0)
-	// 	printf("blockIdx.x %d max_scale %f, y_scale %f \n", blockIdx.x, max_scale, max_local);
+    s_max_local[warp_id] = max_local;
+    __syncthreads();
 
+    if (threadIdx.x == 0)
+    {
+        auto max_local = ck_tile::max(s_max_local[0], s_max_local[1]);
+        s_max_local[0] = max_local;
+        s_max_local[1] = max_local;
+    }
+    __syncthreads();
 
-            if (((threadIdx.x & 63) ^ 63) == 0)
-            {
-                s_max_local[warp_id] = max_local;
-            }
-
-            __syncthreads();
-
-            if (threadIdx.x == 0)
-            {
-                auto max_local = ck_tile::max(s_max_local[0], s_max_local[1]);
-                s_max_local[0] = max_local;
-                s_max_local[1] = max_local;
-            }
-            __syncthreads();
-
-            max_local = s_max_local[warp_id];
-
+    max_local = s_max_local[warp_id];
 
     auto * thread_out_ptr = reinterpret_cast<QUANT_DTYPE*>(params.p_out) + row_offset + first_elt_read_by_thread;
     StoreQuantType* vec_out_st_ptr = reinterpret_cast<StoreQuantType*>(thread_out_ptr);
@@ -285,11 +225,7 @@ __global__ void fused_add_smooth_quant_rms_norm_kernel(RMSNormParameter params)
     auto y_scale = max_scale * max_local;
 
 
-    // if (threadIdx.x == 0)
-    // {
-        reinterpret_cast<float *>(params.p_y_scale)[warp_base_row] = y_scale;
-        // reinterpret_cast<float *>(params.p_y_scale)[warp_base_row] = max_local;
-    // }
+    reinterpret_cast<float *>(params.p_y_scale)[warp_base_row] = y_scale;
 
     auto r_y_scale = __builtin_amdgcn_rcpf(y_scale);
 
