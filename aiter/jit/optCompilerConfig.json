@@ -17,7 +17,7 @@
             "f'{AITER_CSRC_DIR}/kernels/activation_kernels.cu'"
         ],
         "flags_extra_cc": [],
-        "flags_extra_hip": [],
+        "flags_extra_hip": ["'-ffast-math'"],
         "extra_ldflags": "None",
         "extra_include": [
             "f'{AITER_CSRC_DIR}/include/ck_tile'"
