@@ -211,9 +211,12 @@ void mla_decode_stage1_asm_fwd(
             }
             else if(max_seqlen_q <= 4)
             {
+                // // not support yet
+                // assert(false);
+
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
-                    "mla_kernel_func",
+                    "_ZN5aiter36mla_a8w8_qh16_qseqlen4_gqaratio16_psE",
                     "/mla/mla_fp8_qh16_m16x4_n16x1_coex0_mask1.co");
                 impl_ptr = &impl_fp8;
             }
