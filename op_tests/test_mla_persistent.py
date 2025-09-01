@@ -12,15 +12,20 @@ import argparse
 torch.set_default_device("cuda")
 # torch.set_printoptions(sci_mode=False, threshold=torch.inf)
 
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
+
+
 # setup_seed(1)
 
 
-def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -> None:
+def cal_diff(
+    x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
+) -> None:
     x, y = x.double(), y.double()
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
@@ -61,7 +66,7 @@ def ref_masked_attention(
 
     m = attn_weights.max(-1).values
 
-    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1)) 
+    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
 
     l = attn_weights_exp.sum(-1)
 
@@ -71,8 +76,8 @@ def ref_masked_attention(
 
     out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
 
-    out = out / l.transpose(0,1).unsqueeze(-1)
-    
+    out = out / l.transpose(0, 1).unsqueeze(-1)
+
     if is_fp8:
         out *= kv_scale
     return out.to(dtype), lse
@@ -110,20 +115,23 @@ def torch_mla_extend(
         q = qs[i]
         k = kvc
         v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
-        o, lse = ref_masked_attention(q,
-                                      k,
-                                      v,
-                                      sm_scale,
-                                      dtype,
-                                      is_causal=is_causal,
-                                      is_fp8=is_fp8,
-                                      q_scale=q_scale,
-                                      kv_scale=kv_scale)
+        o, lse = ref_masked_attention(
+            q,
+            k,
+            v,
+            sm_scale,
+            dtype,
+            is_causal=is_causal,
+            is_fp8=is_fp8,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
         os.append(o)
         lses.append(lse)
     o = torch.concat(os)
     lse = torch.concat(lses).transpose(0, 1)
     return o, lse
+
 
 @benchmark()
 def test_mla(
@@ -216,14 +224,18 @@ def test_mla(
     cu_num = device_properties.multi_processor_count
 
     # aiter implementation
-    work_meta_data     = torch.empty([10], dtype=torch.uint64, device="cuda")
-    work_indptr        = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
-    work_info_set      = torch.empty([batch_size * cu_num, 8], dtype=torch.int32, device="cuda")
-    reduce_indptr      = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
-    reduce_final_map   = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
-    reduce_partial_map = torch.empty([batch_size * cu_num], dtype=torch.int32, device="cuda")
+    work_meta_data = torch.empty([10], dtype=torch.uint64, device="cuda")
+    work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+    work_info_set = torch.empty(
+        [batch_size * cu_num, 8], dtype=torch.int32, device="cuda"
+    )
+    reduce_indptr = torch.empty([batch_size + 1], dtype=torch.int32, device="cuda")
+    reduce_final_map = torch.empty([batch_size, 2], dtype=torch.int32, device="cuda")
+    reduce_partial_map = torch.empty(
+        [batch_size * cu_num], dtype=torch.int32, device="cuda"
+    )
     # num_reduce_tile    = torch.empty([1], dtype=torch.int32, device="cuda")
-    
+
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -268,7 +280,8 @@ def test_mla(
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
         bytes = (
-            total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
+            total_kv * nhead_kv * qk_head_dim
+            + total_q * nhead * (qk_head_dim + v_head_dim)
         ) * (torch.finfo(dtype).bits // 8)
         err = checkAllclose(
             out_ref,
@@ -336,17 +349,18 @@ def test_mla(
         # checkAllclose(lse_ref, attn_lse, msg="attn_lse    [golden vs aiter_asm]")
         flops = mtp * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
         bytes = (
-            total_kv * nhead_kv * qk_head_dim + total_q * nhead * (qk_head_dim + v_head_dim)
+            total_kv * nhead_kv * qk_head_dim
+            + total_q * nhead * (qk_head_dim + v_head_dim)
         ) * (torch.finfo(dtype).bits // 8)
         err = checkAllclose(
             out_ref,
             out_asm,
-            msg=f"mla_decode-absorb    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            msg=f"mla_decode-absorb_fp8    [golden vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
         err_fp8 = checkAllclose(
             out_ref_fp8,
             out_asm,
-            msg=f"mla_decode-absorb    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
+            msg=f"mla_decode-absorb_fp8    [golden fp8 vs aiter_asm]: {us_asm_decode:>8.2f} us......",
         )
         return err, err_fp8, us_asm_decode
 
@@ -378,7 +392,7 @@ def test_mla(
 
 
 kv_lora_rank = 512
-qk_nope_head_dim = 128 
+qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
 block_size = 1
@@ -455,7 +469,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[28, 512, 1023, 4888, 12800], #
+    default=[28, 512, 1023, 4888, 12800],  #
     help="""Context length.
     e.g.: -c 21""",
 )
@@ -464,7 +478,7 @@ parser.add_argument(
     "--batchSize",
     type=int,
     nargs="*",
-    default=[i for i in range(1, 80)], # [41],
+    default=[i for i in range(1, 80)],  # [41],
     help="""Batch size.
     e.g.: -b 16""",
 )
@@ -510,4 +524,3 @@ for nhead, mtp in list_nhead:
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}mtp{mtp}.csv")
     aiter.logger.info(f"summary:\n{df}")
-

@@ -9,16 +9,15 @@
 
 template <int32_t kSizeDV_,
           int32_t kNumHeadQ_,
-          int32_t kMaxSplits_,
           bool    kOutputLse_>
 struct MlaReduceKernelV1Traits
 {
-    static constexpr int32_t kSizeDV      = kSizeDV_;       // hidden dimension size of value/output
-    static constexpr int32_t kNumHeadQ    = kNumHeadQ_;     // head count of q
-    static constexpr int32_t kMaxSplits   = kMaxSplits_;
-    static constexpr int32_t kNumWarps    = 2;
-    static constexpr int32_t kNumThreads  = kNumWarps * ck_tile::get_warp_size();
-    static constexpr bool    kOutputLse   = kOutputLse_;
+    static constexpr int32_t kSizeDV          = kSizeDV_;       // hidden dimension size of value/output
+    static constexpr int32_t kNumHeadQ        = kNumHeadQ_;     // head count of q
+    static constexpr int32_t kNumWarps        = 2;
+    static constexpr int32_t kNumThreads      = kNumWarps * ck_tile::get_warp_size();
+    static constexpr int32_t kMaxVgprLocalLse = 16;             // scratch buffer will be used with larger value
+    static constexpr bool    kOutputLse       = kOutputLse_;
 };
 
 struct MlaReduceKernelV1Params
@@ -34,6 +33,7 @@ struct MlaReduceKernelV1Params
 
     int32_t stride_s_o;
     int32_t stride_h_o;
+    int32_t max_splits;
 };
 
 // Returns count of warps which don't contain any idle thread.
@@ -102,15 +102,150 @@ CK_TILE_DEVICE static auto MakeTileWindow(
     return tile_window;
 }
 
+template <typename T>
+class LocalLseLds
+{
+public:
+    CK_TILE_DEVICE LocalLseLds(T* p_local_lse, const int32_t group_size, const int32_t idx_in_group) :
+        p_local_lse_(p_local_lse), group_size_(group_size), idx_in_group_(idx_in_group) {}
+    CK_TILE_DEVICE T& operator[](int32_t idx) { return p_local_lse_[idx * group_size_ + idx_in_group_]; }
+    CK_TILE_DEVICE T operator[](int32_t idx) const { return p_local_lse_[idx * group_size_ + idx_in_group_]; }
+
+private:
+    T* p_local_lse_;
+    int32_t group_size_;
+    int32_t idx_in_group_;
+};
+
+template <typename Traits, typename LocalLse, typename lse_t>
+CK_TILE_DEVICE void reduce_lse(
+    const MlaReduceKernelV1Params& params,
+    const int32_t                  seq_idx,
+    const int32_t                  reduce_tile_start,
+    const int32_t                  reduce_tile_end,
+    const int32_t                  num_lse_per_thr,
+    const float*                   p_partial_lse_seq_base,
+    LocalLse&                      local_lse,
+    float*                         p_lds_lse_scale,
+    lse_t*                         p_final_lse_base)
+{
+    if (ck_tile::get_warp_id() == 0)
+    {
+        const int32_t lane_idx = ck_tile::get_lane_id();
+
+        // Load thread local LSE and get local max LSE
+        float max_lse = -INFINITY;
+
+        #pragma unroll 2
+        for (int32_t i = 0; i < num_lse_per_thr; ++i)
+        {
+            const int32_t split_idx = i * ck_tile::get_warp_size() + lane_idx;
+            const int32_t tile_idx = reduce_tile_start + split_idx;
+            if (tile_idx < reduce_tile_end)
+            {
+                const int64_t reduce_tile_pos =
+                    params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
+                const float lse = p_partial_lse_seq_base[reduce_tile_pos];
+                local_lse[i] = lse;
+                max_lse = ck_tile::max(max_lse, lse);
+            }
+            else
+            {
+                local_lse[i] = -INFINITY;
+            }
+        }
+
+        // Get global max LSE
+        #pragma unroll
+        for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
+        {
+            const int32_t srd_lane = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
+            max_lse = ck_tile::max(max_lse, ck_tile::warp_shuffle(max_lse, srd_lane));
+        }
+
+        // Get sum of LSE
+        float sum_lse = 0.f;
+        #pragma unroll 2
+        for (int32_t i = 0; i < num_lse_per_thr; ++i)
+        {
+            sum_lse += expf(local_lse[i] - max_lse);
+        }
+        #pragma unroll
+        for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
+        {
+            const int32_t srd_lane = (offset ^ ck_tile::get_warp_size()) ^ ck_tile::get_lane_id();
+            sum_lse += ck_tile::warp_shuffle(sum_lse, srd_lane);
+        }
+
+        // Get global LSE
+        float global_lse = ((sum_lse == 0.f) || (sum_lse != sum_lse)) ? INFINITY : (logf(sum_lse) + max_lse);
+        if constexpr (Traits::kOutputLse)
+        {
+            if (lane_idx == 0)
+            {
+                lse_t* p_final_lse = p_final_lse_base + seq_idx * Traits::kNumHeadQ;
+                *p_final_lse = ck_tile::type_convert<lse_t>(global_lse);
+            }
+        }
+
+        // Write LSE to LDS
+        #pragma unroll 2
+        for (int32_t i = 0; i < num_lse_per_thr; ++i)
+        {
+            const int32_t split_idx = i * ck_tile::get_warp_size() + lane_idx;
+            if ((reduce_tile_start + split_idx) < reduce_tile_end)
+            {
+                p_lds_lse_scale[split_idx] = expf(local_lse[i] - global_lse);
+            }
+        }
+    }
+}
+
+template <typename Traits, typename out_t>
+CK_TILE_DEVICE void reduce_output(
+    const MlaReduceKernelV1Params& params,
+    const int32_t                  seq_idx,
+    const int32_t                  reduce_tile_start,
+    const int32_t                  reduce_tile_end,
+    const float*                   p_lds_lse_scale,
+    const float*                   p_partial_output_seq_base,
+    out_t*                         p_final_out_base)
+{
+    auto oaccu_window = ck_tile::make_tile_window(MakeTileWindow<Traits, const float>(nullptr),
+                                                  MakeOutputTileDistribution<Traits, const float>());
+    auto reg_out = ck_tile::make_static_distributed_tensor<float>(
+        decltype(ck_tile::load_tile(oaccu_window))::get_tile_distribution());
+    ck_tile::set_tile(reg_out, 0.f);
+
+    for (int32_t tile_idx = reduce_tile_start; tile_idx < reduce_tile_end; ++tile_idx)
+    {
+        const int32_t split_idx = tile_idx - reduce_tile_start;
+
+        const int64_t reduce_tile_pos =
+            params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ * Traits::kSizeDV);
+        const float* p_partial_output = p_partial_output_seq_base + reduce_tile_pos;
+        oaccu_window.set_bottom_tensor_view_data_ptr(p_partial_output);
+
+        const float lse_scale = p_lds_lse_scale[split_idx];
+        auto oaccu = ck_tile::load_tile(oaccu_window);
+        ck_tile::sweep_tile(oaccu, [&](auto idx) {
+            reg_out(idx) += lse_scale * oaccu(idx);
+        });
+    }
+
+    out_t* p_final_out = p_final_out_base + seq_idx * params.stride_s_o;
+    auto dram_out = MakeTileWindow<Traits, out_t>(p_final_out);
+    ck_tile::store_tile(dram_out, ck_tile::cast_tile<out_t>(reg_out));
+}
+
 template <typename Traits, typename lse_t, typename out_t>
 __global__ void kn_mla_reduce_v1(
     const MlaReduceKernelV1Params params)
 {
-    __shared__ float lds_lse_scale[Traits::kMaxSplits];
+    extern __shared__ float p_lds_lse_scale[];
 
-    const int32_t lane_idx = ck_tile::get_lane_id();
-    const int32_t work_idx = blockIdx.x;
-    const int32_t head_idx = blockIdx.y;
+    const int32_t head_idx = blockIdx.x;
+    const int32_t work_idx = blockIdx.y;
 
     const int32_t reduce_tile_start = params.p_reduce_indptr[work_idx];
     const int32_t reduce_tile_end = params.p_reduce_indptr[work_idx + 1];
@@ -132,6 +267,9 @@ __global__ void kn_mla_reduce_v1(
         const float* p_partial_output_base =
             reinterpret_cast<float*>(params.p_partial_output) + head_idx * Traits::kSizeDV;
 
+        const int32_t num_lse_per_thr =
+            ck_tile::integer_divide_ceil(params.max_splits, ck_tile::get_warp_size());
+
         for (int32_t seq_idx = final_loc.q_start; seq_idx < final_loc.q_end; ++seq_idx)
         {
             const int32_t local_seqlen_idx = seq_idx - final_loc.q_start;
@@ -139,136 +277,60 @@ __global__ void kn_mla_reduce_v1(
             const float* p_partial_output_seq_base =
                 p_partial_output_base + local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV;
 
-            if (ck_tile::get_warp_id() == 0)
-            {
-                constexpr int32_t kNumLsePerThr =
-                    ck_tile::integer_divide_ceil(Traits::kMaxSplits, ck_tile::get_warp_size());
-                float local_lse[kNumLsePerThr];
-
-                // Load thread local LSE and get local max LSE
-                float max_lse = -INFINITY;
-
-                #pragma unroll
-                for (int32_t i = 0; i < kNumLsePerThr; ++i)
-                {
-                    const int32_t split_idx = i * ck_tile::get_warp_size() + lane_idx;
-                    const int32_t tile_idx = reduce_tile_start + split_idx;
-                    if (tile_idx < reduce_tile_end)
-                    {
-                        const int64_t reduce_tile_pos =
-                            params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ);
-                        const float lse = p_partial_lse_seq_base[reduce_tile_pos];
-                        local_lse[i] = lse;
-                        max_lse = ck_tile::max(max_lse, lse);
-                    }
-                    else
-                    {
-                        local_lse[i] = -INFINITY;
-                    }
-                }
-
-                // Get global max LSE
-                #pragma unroll
-                for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
-                {
-                    max_lse = ck_tile::max(max_lse, __shfl_xor(max_lse, offset));
-                }
-
-                // Get sum of LSE
-                float sum_lse = 0.f;
-                #pragma unroll
-                for (int32_t i = 0; i < kNumLsePerThr; ++i)
-                {
-                    sum_lse += expf(local_lse[i] - max_lse);
-                }
-                #pragma unroll
-                for (int32_t offset = ck_tile::get_warp_size() / 2; offset > 0; offset /= 2)
-                {
-                    sum_lse += __shfl_xor(sum_lse, offset);
-                }
-
-                // Get global LSE
-                float global_lse = ((sum_lse == 0.f) || (sum_lse != sum_lse)) ? INFINITY : (logf(sum_lse) + max_lse);
-                if constexpr (Traits::kOutputLse)
-                {
-                    if (lane_idx == 0)
-                    {
-                        lse_t* p_final_lse = p_final_lse_base + seq_idx * Traits::kNumHeadQ;
-                        *p_final_lse = ck_tile::type_convert<lse_t>(global_lse);
-                    }
-                }
-
-                // Write LSE to LDS
-                #pragma unroll
-                for (int32_t i = 0; i < kNumLsePerThr; ++i)
-                {
-                    const int32_t split_idx = i * ck_tile::get_warp_size() + lane_idx;
-                    if ((reduce_tile_start + split_idx) < reduce_tile_end)
-                    {
-                        lds_lse_scale[split_idx] = expf(local_lse[i] - global_lse);
-                    }
-                }
-            }
+            float* p_local_lse = p_lds_lse_scale + params.max_splits;
+            LocalLseLds<float> local_lse(p_local_lse, ck_tile::get_warp_size(), ck_tile::get_lane_id());
+            reduce_lse<Traits>(
+                params,
+                seq_idx,
+                reduce_tile_start,
+                reduce_tile_end,
+                num_lse_per_thr,
+                p_partial_lse_seq_base,
+                local_lse,
+                p_lds_lse_scale,
+                p_final_lse_base);
 
             __builtin_amdgcn_sched_barrier(0);
             ck_tile::block_sync_lds();
 
-            auto oaccu_window = ck_tile::make_tile_window(MakeTileWindow<Traits, const float>(nullptr),
-                                                        MakeOutputTileDistribution<Traits, const float>());
-            auto reg_out = ck_tile::make_static_distributed_tensor<float>(
-                decltype(ck_tile::load_tile(oaccu_window))::get_tile_distribution());
-            ck_tile::set_tile(reg_out, 0.f);
-
-            for (int32_t tile_idx = reduce_tile_start; tile_idx < reduce_tile_end; ++tile_idx)
-            {
-                const int32_t split_idx = tile_idx - reduce_tile_start;
-
-                const int64_t reduce_tile_pos =
-                    params.p_reduce_partial_map[tile_idx] * int64_t(Traits::kNumHeadQ * Traits::kSizeDV);
-                const float* p_partial_output = p_partial_output_seq_base + reduce_tile_pos;
-                oaccu_window.set_bottom_tensor_view_data_ptr(p_partial_output);
-
-                const float lse_scale = lds_lse_scale[split_idx];
-                auto oaccu = ck_tile::load_tile(oaccu_window);
-                ck_tile::sweep_tile(oaccu, [&](auto idx) {
-                    reg_out(idx) += lse_scale * oaccu(idx);
-                });
-            }
-
-            out_t* p_final_out = p_final_out_base + seq_idx * params.stride_s_o;
-            auto dram_out = MakeTileWindow<Traits, out_t>(p_final_out);
-            ck_tile::store_tile(dram_out, ck_tile::cast_tile<out_t>(reg_out));
+            reduce_output<Traits>(
+                params,
+                seq_idx,
+                reduce_tile_start,
+                reduce_tile_end,
+                p_lds_lse_scale,
+                p_partial_output_seq_base,
+                p_final_out_base);
         }
     }
 }
 
-#define MLA_MERGE_CASE(NUM_HEAD_C, NUM_CU_C, OUTPUT_LSE_C, ...)                                             \
+#define MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NAME, ...)                                                 \
     constexpr int32_t NumHeads  = (NUM_HEAD_C);                                                             \
-    constexpr int32_t NumCUs    = (NUM_CU_C);                                                               \
     constexpr bool    OutputLse = (OUTPUT_LSE_C);                                                           \
-    using Traits = MlaReduceKernelV1Traits<512, NumHeads, NumCUs, OutputLse>;                               \
+    using Traits = MlaReduceKernelV1Traits<512, NumHeads, OutputLse>;                                       \
     __VA_ARGS__;
 
-#define MLA_MERGE_CASE_IF(NUM_HEAD, NUM_HEAD_C, NUM_CU, NUM_CU_C, OUTPUT_LSE, OUTPUT_LSE_C, ...)            \
-    if (((NUM_HEAD) == (NUM_HEAD_C)) && ((NUM_CU) == (NUM_CU_C)) && ((OUTPUT_LSE) == (OUTPUT_LSE_C)))       \
+#define MLA_MERGE_CASE_IF(NUM_HEAD, NUM_HEAD_C, OUTPUT_LSE, OUTPUT_LSE_C, NAME, ...)                        \
+    if (((NUM_HEAD) == (NUM_HEAD_C)) && ((OUTPUT_LSE) == (OUTPUT_LSE_C)))                                   \
     {                                                                                                       \
-        MLA_MERGE_CASE(NUM_HEAD_C, NUM_CU_C, OUTPUT_LSE_C, __VA_ARGS__)                                     \
+        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NAME, __VA_ARGS__)                                         \
     }
 
-#define MLA_MERGE_CASE_EF(NUM_HEAD, NUM_HEAD_C, NUM_CU, NUM_CU_C, OUTPUT_LSE, OUTPUT_LSE_C, ...)            \
-    else if (((NUM_HEAD) == (NUM_HEAD_C)) && ((NUM_CU) == (NUM_CU_C)) && ((OUTPUT_LSE) == (OUTPUT_LSE_C)))  \
+#define MLA_MERGE_CASE_EF(NUM_HEAD, NUM_HEAD_C, OUTPUT_LSE, OUTPUT_LSE_C, NAME, ...)                        \
+    else if (((NUM_HEAD) == (NUM_HEAD_C)) && ((OUTPUT_LSE) == (OUTPUT_LSE_C)))                              \
     {                                                                                                       \
-        MLA_MERGE_CASE(NUM_HEAD_C, NUM_CU_C, OUTPUT_LSE_C, __VA_ARGS__)                                     \
+        MLA_MERGE_CASE(NUM_HEAD_C, OUTPUT_LSE_C, NAME, __VA_ARGS__)                                         \
     }
 
-#define MLA_MERGE_ERROR(NUM_HEAD, NUM_CU, OUTPUT_LSE, NAME)                                                 \
+#define MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NAME)                                                         \
     {                                                                                                       \
         std::stringstream ss;                                                                               \
-        ss << "#heads: " << (NUM_HEAD) << ", #CUs: " << (NUM_CU) << ", Output LSE: " << (OUTPUT_LSE);       \
-        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \ 
+        ss << "#heads: " << (NUM_HEAD) << ", Output LSE: " << (OUTPUT_LSE);                                 \
+        TORCH_CHECK(false, NAME " doesn't support the specified settings: ", ss.str().c_str(), ".");        \
     }
 
-#define DISPATCH_MLA_MERGE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, NUM_CU, OUTPUT_LSE, NAME, ...)              \
+#define DISPATCH_MLA_MERGE_KERNEL(LSE_TYPE, OUT_TYPE, NUM_HEAD, OUTPUT_LSE, NAME, ...)                      \
     switch ((LSE_TYPE))                                                                                     \
     {                                                                                                       \
         case at::ScalarType::Float:                                                                         \
@@ -279,29 +341,21 @@ __global__ void kn_mla_reduce_v1(
                 case at::ScalarType::BFloat16:                                                              \
                 {                                                                                           \
                     using out_t = ck_tile::bf16_t;                                                          \
-                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, NUM_CU, 80, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    else MLA_MERGE_ERROR(NUM_HEAD, NUM_CU, OUTPUT_LSE, NAME);                               \
+                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
+                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NAME);                                       \
                 }                                                                                           \
                 break;                                                                                      \
                 case at::ScalarType::Half:                                                                  \
                 {                                                                                           \
                     using out_t = ck_tile::fp16_t;                                                          \
-                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, NUM_CU, 80, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
-                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
-                    else MLA_MERGE_ERROR(NUM_HEAD, NUM_CU, OUTPUT_LSE, NAME);                               \
+                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, true,  NAME, __VA_ARGS__)                  \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, OUTPUT_LSE, false, NAME, __VA_ARGS__)                  \
+                    else MLA_MERGE_ERROR(NUM_HEAD, OUTPUT_LSE, NAME);                                       \
                 }                                                                                           \
                 break;                                                                                      \
                 default:                                                                                    \
@@ -316,11 +370,24 @@ __global__ void kn_mla_reduce_v1(
 template <typename Traits, typename lse_t, typename out_t>
 void dispatch_mla_reduce_v1(
     const MlaReduceKernelV1Params& params,
-    const int32_t num_reduce_tile,
-    const cudaStream_t& stream)
+    const int32_t                  num_reduce_tile,
+    const cudaStream_t&            stream)
 {
-    const dim3 grid = dim3(num_reduce_tile, Traits::kNumHeadQ);
-    kn_mla_reduce_v1<Traits, lse_t, out_t><<<grid, Traits::kNumThreads, 0, stream>>>(params);
+    hipDevice_t dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+
+    const int32_t lds_size = params.max_splits * sizeof(float) * 2;
+    if (lds_size <= dev_prop.maxSharedMemoryPerMultiProcessor)
+    {
+        const dim3 grid = dim3(Traits::kNumHeadQ, num_reduce_tile);
+        kn_mla_reduce_v1<Traits, lse_t, out_t><<<grid, Traits::kNumThreads, lds_size, stream>>>(params);
+    }
+    else
+    {
+        TORCH_CHECK(false, "kn_mla_reduce_v1: There are too much splits. We cannot handle them.");
+    }
 }
 
 void mla_reduce_v1(
@@ -343,8 +410,6 @@ void mla_reduce_v1(
     const bool output_lse = final_lse.has_value();
     const int32_t num_reduce_tile = reduce_indptr.size(0) - 1;
     const int32_t num_heads = partial_output.size(-2);
-    TORCH_CHECK(num_reduce_tile == reduce_final_map.size(0),
-                __func__, ": Invalid size of reduce_indptr or reduce_final_map!");
 
     if (num_reduce_tile > 0)
     {
@@ -358,12 +423,12 @@ void mla_reduce_v1(
         params.p_partial_output = partial_output.data_ptr();
         params.stride_s_o = final_output.stride(-3);
         params.stride_h_o = final_output.stride(-2);
+        params.max_splits = dev_prop.multiProcessorCount;
 
         DISPATCH_MLA_MERGE_KERNEL(
             output_lse ? final_lse.value().scalar_type() : at::ScalarType::Float,
             final_output.scalar_type(),
             num_heads,
-            dev_prop.multiProcessorCount,
             output_lse,
             "kn_mla_reduce_v1",
             dispatch_mla_reduce_v1<Traits, lse_t, out_t>(params, num_reduce_tile, stream)
