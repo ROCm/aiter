@@ -39,13 +39,12 @@ def run_ck(
     return out
 
 
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [5])
-@pytest.mark.parametrize("nheads", [6])
+@pytest.mark.parametrize("nheads, nheads_k", [(8, 1)])
 @pytest.mark.parametrize(
     "d,d_v",
     [
@@ -70,18 +69,16 @@ def run_ck(
 def test_flash_attn_output(
     batch_size,
     nheads,
+    nheads_k,
     seqlen_q,
     seqlen_k,
     d,
     d_v,
     causal,
     local,
-    mha_type,
 ):
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
-    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
     window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
     dtype = torch.bfloat16
     quant_dtype = dtypes.fp8
@@ -131,6 +128,14 @@ parser.add_argument(
     e.g.: -n 8""",
 )
 parser.add_argument(
+    "-nk",
+    "--nheads_k",
+    type=int,
+    default=5,
+    help="""Number of heads. Default is 5.
+    e.g.: -n 1""",
+)
+parser.add_argument(
     "-q",
     "--seqlen_q",
     type=int,
@@ -176,25 +181,17 @@ parser.add_argument(
     help="""Local attention. Default is False.
     -l or --local    # enable local attention""",
 )
-parser.add_argument(
-    "-m",
-    "--mha_type",
-    type=str,
-    default="mha",
-    help="""Type of multi-head attention.
-    e.g.: -m mha""",
-)
 
 if __name__ == "__main__":
     args = parser.parse_args()
     test_flash_attn_output(
         args.batch_size,
         args.nheads,
+        args.nheads_k,
         args.seqlen_q,
         args.seqlen_k,
         args.d_qk,
         args.d_v,
         args.causal,
         args.local,
-        args.mha_type,
     )
