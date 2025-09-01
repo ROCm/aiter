@@ -283,6 +283,10 @@ __global__ void kn_mla_reduce_v1(
                     MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
                     MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, true,  __VA_ARGS__)            \
                     MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
+                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
+                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
                     else MLA_MERGE_ERROR(NUM_HEAD, NUM_CU, OUTPUT_LSE, NAME);                               \
                 }                                                                                           \
                 break;                                                                                      \
@@ -293,6 +297,10 @@ __global__ void kn_mla_reduce_v1(
                     MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
                     MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, true,  __VA_ARGS__)            \
                     MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 80, OUTPUT_LSE, false, __VA_ARGS__)            \
+                    MLA_MERGE_CASE_IF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
+                    MLA_MERGE_CASE_EF(NUM_HEAD,  16, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, true,  __VA_ARGS__)            \
+                    MLA_MERGE_CASE_EF(NUM_HEAD, 128, NUM_CU, 304, OUTPUT_LSE, false, __VA_ARGS__)            \
                     else MLA_MERGE_ERROR(NUM_HEAD, NUM_CU, OUTPUT_LSE, NAME);                               \
                 }                                                                                           \
                 break;                                                                                      \
