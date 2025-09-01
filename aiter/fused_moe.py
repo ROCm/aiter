@@ -195,6 +195,7 @@ def fused_moe(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
+            topk_ids=topk_ids,
         )
 
 
@@ -588,6 +589,7 @@ def fused_moe_2stages(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: Optional[torch.tensor] = None,
+    topk_ids=None,
 ):
 
     quant_func = get_quant(quant_type)
@@ -627,14 +629,31 @@ def fused_moe_2stages(
             block_size=block_size_M,
         )
     elif hidden_states.dtype != q_dtype_a:
-        if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
-            quant_func = functools.partial(quant_func, transpose_scale=True)
-        a1, a1_scale = quant_func(
-            hidden_states,
-            scale=a1_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-        )
+        expert_num = w1.shape[0]
+        sm_scale = torch.empty((expert_num, 1, model_dim), device=device)
+        if sm_scale is not None:
+            a1_scale = torch.empty(
+                (token_num, topk, 1), device=device, dtype=dtypes.fp32
+            )
+            output = torch.empty(
+                (token_num, topk, model_dim),
+                dtype=q_dtype_a,
+                device=device,
+            )
+            aiter.moe_smoothquant_fwd(
+                output, hidden_states, sm_scale, topk_ids, a1_scale
+            )
+            a1 = output.view(-1, model_dim)[:token_num, :]
+            a1_scale = a1_scale.view(-1, 1)[:token_num, :]
+        else:
+            if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
+                quant_func = functools.partial(quant_func, transpose_scale=True)
+            a1, a1_scale = quant_func(
+                hidden_states,
+                scale=a1_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+            )
     else:
         assert (
             a1_scale is not None or quant_type == QuantType.No
@@ -697,14 +716,30 @@ def fused_moe_2stages(
         )
         a2 = a2_v
     else:
-        a2, a2_scale = quant_func(
-            a2,
-            scale=a2_scale,
-            quant_dtype=q_dtype_a,
-            num_rows=num_local_tokens,
-            num_rows_factor=topk,
-        )
-        a2 = a2.view(token_num, topk, inter_dim)
+        expert_num = w1.shape[0]
+        sm_scale2 = torch.empty((expert_num, 1, inter_dim), device=device)
+        if sm_scale2 is not None:
+            a2_scale = torch.empty(
+                (token_num, topk, 1), device=device, dtype=dtypes.fp32
+            )
+            output = torch.empty(
+                (token_num, topk, inter_dim),
+                dtype=q_dtype_a,
+                device=device,
+            )
+            aiter.smooth_per_token_scaled_quant(
+                output, a2, a2_scale, sm_scale2, topk_ids
+            )
+            a2 = output
+        else:
+            a2, a2_scale = quant_func(
+                a2,
+                scale=a2_scale,
+                quant_dtype=q_dtype_a,
+                num_rows=num_local_tokens,
+                num_rows_factor=topk,
+            )
+            a2 = a2.view(token_num, topk, inter_dim)
 
     metadata.stage2(
         a2,
