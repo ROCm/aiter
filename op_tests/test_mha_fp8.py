@@ -43,8 +43,9 @@ def run_ck(
 @pytest.mark.parametrize("local", [False])
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("batch_size", [5])
-@pytest.mark.parametrize("nheads, nheads_k", [(8, 1)])
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("nheads, nheads_k", 
+                         [(8, 1), (40, 8), (32, 8), (5, 1)])
 @pytest.mark.parametrize(
     "d,d_v",
     [
@@ -64,6 +65,7 @@ def run_ck(
         (1023, 1024),
         (1024, 1023),
         (2048, 2048),
+        (4096, 4096),
     ],
 )
 def test_flash_attn_output(
