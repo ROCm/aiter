@@ -333,7 +333,7 @@ def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=Fa
     assert quant_dtype == dtypes.fp4x2
     # y, scale = triton.quant.dynamic_mxfp4_quant(x)
     y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle)
-    return y, scale
+    return y.view(quant_dtype), scale
 
 
 def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):

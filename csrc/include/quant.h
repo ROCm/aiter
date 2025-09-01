@@ -18,7 +18,7 @@ void dynamic_per_token_scaled_quant(torch::Tensor& out,         // [..., d]
                                     torch::Tensor const& input, // [..., d]
                                     torch::Tensor& scales,
                                     std::optional<at::Tensor> const& scale_ub,
-                                    bool shuffle_scale                        = true,
+                                    bool shuffle_scale                        = false,
                                     std::optional<at::Tensor> const& num_rows = std::nullopt,
                                     int num_rows_factor                       = 1);
 

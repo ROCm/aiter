@@ -13,7 +13,9 @@
 #include "ck/library/utility/host_tensor_generator.hpp"
 #include "ck/library/utility/literals.hpp"
 
+#include "aiter_enum.h"
 #include "ck/utility/blkgemmpipe_scheduler.hpp"
+#include "py_itfs_common.h"
 #include <hip/hip_runtime.h>
 #include <torch/torch.h>
 
@@ -36,6 +38,34 @@ using PipelineVersion = ck::BlockGemmPipelineVersion;
 
 const auto V1 = ck::BlockGemmPipelineVersion::v1;
 const auto V3 = ck::BlockGemmPipelineVersion::v3;
+
+using CK_Dtype = std::variant<I4, I8, I32, F16, B16, F8, F32, FP4X2>;
+
+struct CK_DTypeVisitor
+{
+    // i4 packed
+    at::ScalarType operator()(I4) { return torch::kUInt32; }
+    at::ScalarType operator()(I8) { return torch::kInt8; }
+    at::ScalarType operator()(I32) { return torch::kInt32; }
+    at::ScalarType operator()(F16) { return torch::kHalf; }
+    at::ScalarType operator()(B16) { return torch::kBFloat16; }
+    at::ScalarType operator()(F8) { return torch_fp8; }
+    at::ScalarType operator()(F32) { return torch::kFloat; }
+    // f4 packed
+    at::ScalarType operator()(FP4X2) { return torch_fp4x2; }
+};
+
+template <typename T>
+at::ScalarType getTypeValue()
+{
+    return std::visit(CK_DTypeVisitor{}, CK_Dtype{T{}});
+};
+
+template <typename CK_Dtype>
+struct dtype_checker
+{
+    bool operator()(at::ScalarType t) { return t == getTypeValue<CK_Dtype>(); }
+};
 
 struct TypeCast
 {

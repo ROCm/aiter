@@ -6,6 +6,8 @@ import time
 from aiter.test_common import checkAllclose
 from aiter import dtypes
 
+# import traceback
+
 
 def worker(
     gpuIDMap,
@@ -50,7 +52,6 @@ def worker(
                 ref = [ref]
             if isinstance(res, torch.Tensor):
                 res = [res]
-
             ref = [
                 (
                     el.to(device)
@@ -59,7 +60,6 @@ def worker(
                 )
                 for el in ref
             ]
-
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
                     if res[i].shape != ref[i].shape:
@@ -80,6 +80,7 @@ def worker(
 
     except Exception as e:
         print(f"Error in process:{pid} info:{info}: {e}")
+        # traceback.print_exc()
         if res is None and ref is not None:
             print("The output is None, can't match with reference")
         us = float("inf")
@@ -160,11 +161,11 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     )
 
     assert ref_func is not None or ref is not None or fast_mode != 0
-    # ref=None & fast_mode=1, fast tune, not compare results, do not postprocess,return all results
-    # ref=None & fast_mode=0, ref_func should be given and return best result
-    # ref!=None & fast_mode=1, return all results, do not postprocess
-    # ref!=None & fast_mode=0, return best result, postprocess
-    if ref is None and not fast_mode:
+    # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
+    # ref=None & fast_mode=0: ref_func should be given and return best result
+    # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
+    # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
+    if ref is None and not fast_mode or (ref_func is not None and fast_mode):
         ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
         updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
         ref = ref_func(*updated_ref_args, **ref_kwargs)
@@ -173,7 +174,6 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
     rets = []
     shape_grouped = isinstance(tasks, list)
     solutions = 1 if not shape_grouped else kernels_num
-
     for i in range(solutions):
         (
             info,
@@ -189,11 +189,13 @@ def work_group(gpuIDMap, fast_mode, err_ratio, in_data, tasks):
             *rest,
         ) = group_task[i]
         # either gen_data func or inpur data
+
         new_args = (
             (tuple(data[i] for i in args[0]) + tuple(args[1:]))
             if gen_data is not None
             else args
         )
+
         ref = ref if ref_noused is None else ref_noused
         work_args = (
             info,

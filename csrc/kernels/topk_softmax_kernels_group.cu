@@ -467,11 +467,11 @@ void grouped_topk(
     int num_expert_group,
     int topk_grp,
     bool need_renorm,
-    bool scoring_func = true,
+    bool is_softmax = true,
     const float routed_scaling_factor = 1.)
 {
     const bool isBiased = false;
-    bool isSoftmax = scoring_func;
+    bool isSoftmax = is_softmax;
     int num_tokens = gating_output.size(0);
     int num_experts = gating_output.size(1);
     int topk = topk_ids.size(1);

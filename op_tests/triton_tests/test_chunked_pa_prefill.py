@@ -5,10 +5,8 @@ import math
 import random
 import pytest
 import torch
-import triton
 from aiter.ops.triton.chunked_pa_prefill import chunked_prefill_paged_decode
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-
 
 NUM_HEADS = [64]
 NUM_QUERIES_PER_KV = [1, 8, 64]
@@ -142,25 +140,31 @@ def context_attention_fwd_torch(
     return
 
 
-def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
+def _get_alibi_slopes(total_num_heads: int, device: torch.device) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
     base = torch.tensor(
         2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),
         dtype=torch.float32,
+        device=device,
     )
-    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32)
+    powers = torch.arange(1, 1 + closest_power_of_2, dtype=torch.int32, device=device)
     slopes = torch.pow(base, powers)
 
     if closest_power_of_2 != total_num_heads:
         extra_base = torch.tensor(
             2 ** (-(2 ** -(math.log2(2 * closest_power_of_2) - 3))),
             dtype=torch.float32,
+            device=device,
         )
         num_remaining_heads = min(
             closest_power_of_2, total_num_heads - closest_power_of_2
         )
         extra_powers = torch.arange(
-            start=1, end=1 + 2 * num_remaining_heads, step=2, dtype=torch.int32
+            start=1,
+            end=1 + 2 * num_remaining_heads,
+            step=2,
+            dtype=torch.int32,
+            device=device,
         )
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
@@ -196,7 +200,7 @@ def input_helper(
     torch.cuda.set_device(device)
 
     if use_alibi_slope:
-        alibi_slopes = _get_alibi_slopes(num_heads).to(device)
+        alibi_slopes = _get_alibi_slopes(num_heads, device)
 
     query_lens = [random.randint(16, MAX_SEQ_LEN) for _ in range(BS)]
     ctx_lens = [random.randint(16, MAX_CTX_LEN) for _ in range(BS)]
@@ -387,8 +391,7 @@ def test_contexted_kv_attention(
         v_scale,
         sliding_window=sliding_window,
     )
-
-    triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -470,4 +473,4 @@ def test_contexted_kv_attention_alibi(
         alibi_slopes=alibi_slopes,
     )
 
-    triton.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(output_triton, output_torch, atol=1e-2, rtol=1e-2)
