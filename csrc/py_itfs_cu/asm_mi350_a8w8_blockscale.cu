@@ -79,8 +79,11 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     TORCH_CHECK(out.dtype() == torch::ScalarType::BFloat16,
                 "mi350 a8w8 blockscale asm only support Half output now!");
     TORCH_CHECK(n % TileN == 0 && k % TileK == 0, 
-                "mi350 a8w8 blockscale asm only support 128x256x128 tile now!");
-
+                "mi350 a8w8 blockscale asm only suuport 128x256x128 tile now!");
+    TORCH_CHECK(m >= 16,
+                "mi350 a8w8 blockscale asm only suuport m>=16 now!");
+    TORCH_CHECK(k >=512,
+                "mi350 a8w8 blockscale asm only suuport k>=512 now!");
     KernelArgs args;
     size_t arg_size = sizeof(args);
 
@@ -98,6 +101,7 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     args.Os = n * 2;
     args.splitk = 0;
     args.activation = 0;
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(XQ));
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     // printf("ptr_X: %p\n", args.ptr_X);
     // printf("ptr_GU: %p\n", args.ptr_GU);
@@ -106,9 +110,9 @@ torch::Tensor mi350_a8w8_blockscale_asm(
     // printf("args.Xs: %d\n", args.Xs);
     // printf("args.token_cnt: %d\n", args.token_cnt);
     AiterAsmKernel *impl_ptr = nullptr;
-    static AiterAsmKernel impl_kernel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
-    static AiterAsmKernel impl_kernel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
-    impl_ptr = (m <= 32)?&impl_kernel_x32:&impl_kernel_x128;
+    static AiterAsmKernel impl_kenrel_x128("f8_block_scale_mi350_x128", "f8_block_scale_mi350_x128.co");
+    static AiterAsmKernel impl_kenrel_x32("f8_block_scale_mi350_x32", "f8_block_scale_mi350_x32.co");
+    impl_ptr = (m <= 32)?&impl_kenrel_x32:&impl_kenrel_x128;
     int gdx = (n + TileN*2 - 1) / (TileN*2);
     int gdy = (m + TileM - 1) / TileM;
    // printf("gdx: %d, gdy:%d, \n", gdx, gdy);

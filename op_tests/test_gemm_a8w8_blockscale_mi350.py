@@ -8,6 +8,7 @@ from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest, benchmark
 from einops import rearrange
 from einops import repeat as eirp
+from aiter.ops.shuffle import shuffle_weight
 import pandas as pd
 import argparse
 
@@ -105,9 +106,7 @@ def test_gemm_asm_mi350(dtype, m, n, k):
     w_scale = torch.rand([scale_k, scale_n], dtype=dtypes.fp32, device="cuda")
     x_scale_trans = torch.transpose(x_scale, 0, 1)
     w_scale_trans = torch.transpose(w_scale, 0, 1).contiguous()
-    flat_weight = weight.view(n // 16, 16, k // 64, 4, 16)
-    flat_weight = flat_weight.permute(0, 2, 3, 1, 4).contiguous()
-    flat_weight = flat_weight.view(n, -1)
+    flat_weight = shuffle_weight(weight, layout=(16, 16))
     a, avg_a = run_torch2(x, weight, x_scale_trans, w_scale_trans, dtypes.bf16)
     b, avg_b = run_asm(x, flat_weight, x_scale, w_scale_trans, dtype)
     a = a.to(dtypes.fp32)
@@ -177,11 +176,29 @@ if args.nk is not None:
 
 for dtype in [dtypes.bf16]:
     # deepseek-r1
-    for m in [16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 4096, 8192, 16384, 20480]:
+    for m in [
+        16,
+        17,
+        31,
+        33,
+        127,
+        129,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        1536,
+        2048,
+        4096,
+        8192,
+        16384,
+        20480,
+    ]:
         for n, k in [
             (1536, 7168),
             (3072, 1536),
-            (7168, 256),
             (7168, 2048),
             (4608, 7168),
             (7168, 2304),
