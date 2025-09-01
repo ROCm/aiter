@@ -211,9 +211,6 @@ void mla_decode_stage1_asm_fwd(
             }
             else if(max_seqlen_q <= 4)
             {
-                // // not support yet
-                // assert(false);
-
                 sub_Q = 128;
                 static AiterAsmKernel impl_fp8(
                     "mla_kernel_func",
