@@ -1453,7 +1453,7 @@ def _get_num_workers(verbose: bool) -> Optional[int]:
             f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
             file=sys.stderr,
         )
-    return max_jobs
+    return int(max_jobs)
 
 
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
