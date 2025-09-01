@@ -2066,7 +2066,9 @@ def _flash_attn_forward(
         s_dmask = None
         dropout_mask = None
 
-    persistent = True
+    persistent = False
+
+    
 
     if config is None:
         config = _get_config(enable_dropout, persistent, q.dtype)
