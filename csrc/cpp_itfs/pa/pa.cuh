@@ -55,7 +55,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs*mtp, num_heads, head_size]
     const cache_t* __restrict__ k_cache,    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,    // [num_blocks, num_kv_heads, head_size, block_size]
-    const int num_kv_heads,   
     const float scale,    
     const int* __restrict__ block_tables,   // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ context_lens,   // [num_seqs]
@@ -69,7 +68,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float* __restrict__ max_logits,         // [num_seqs*mtp, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,             // [num_seqs*mtp, num_heads, max_num_partitions, head_size]
     const float* q_scale_ptr,
-    const float* k_scale, const float* v_scale) {
+    const float* k_scale_ptr, const float* v_scale_ptr) {
     // clang-format on
     constexpr int NWARPS             = NUM_THREADS / WARP_SIZE;
     constexpr int HEAD_LOOP          = DIVIDE_ROUND_UP(HEAD_SIZE, 128);
@@ -104,7 +103,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         return;
     }
 
-    constexpr int MAX_ELEMENTS_PER_QUERY = DIVIDE_ROUND_UP(16, GQA_RATIO);
+    constexpr int MAX_ELEMENTS_PER_QUERY = 16 / GQA_RATIO;
     constexpr int MTP_PER_THREAD         = DIVIDE_ROUND_UP(MTP, MAX_ELEMENTS_PER_QUERY);
 
     constexpr int MTP_PARALLEL_THREADS   = MTP / MTP_PER_THREAD;
@@ -351,7 +350,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         // multiply by k_scale if fp8 kv cache
-        scale2 *= *k_scale;
+        scale2 *= *k_scale_ptr;
         scale2 *= q_scale;
     }
 
@@ -730,7 +729,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 }
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    tmp_out *= *v_scale;
+                    tmp_out *= *v_scale_ptr;
                 }
 
                 // apply post Softmax V mfma v_scale
@@ -876,7 +875,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
     const cache_t* __restrict__ k_cache,    // [num_blocks, num_kv_heads, head_size/x, block_size, x]
     const cache_t* __restrict__ v_cache,    // [num_blocks, num_kv_heads, head_size, block_size]
-    const int num_kv_heads,
     const float scale,
     const int* __restrict__ block_tables,    // [num_seqs, max_num_blocks_per_seq]
     const int* __restrict__ context_lens,    // [num_seqs]
@@ -890,7 +888,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float* __restrict__ max_logits,           // [num_seqs, num_heads, max_num_partitions]
     scalar_t* __restrict__ out,               // [num_seqs, num_heads, max_num_partitions, head_size]
     const float* q_scale_ptr,
-    const float* k_scale, const float* v_scale) {
+    const float* k_scale_ptr, const float* v_scale_ptr) {
   UNREACHABLE_CODE
 }
 
