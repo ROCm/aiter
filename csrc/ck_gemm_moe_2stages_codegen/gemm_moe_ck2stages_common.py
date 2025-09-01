@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 from dataclasses import dataclass
+import os
+import sys
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -307,7 +309,7 @@ def get_gemm1_kernels_list(
     Cdtype: str,
     Nswizzle: bool,
     QuantType: str,
-    ActOP: bool,
+    ActOP: str,
     MulRoutedWeight: bool,
 ) -> list:
     arch = get_gfx()
@@ -341,7 +343,7 @@ def get_gemm1_kernels_list(
     kernels_list = gemm1_kernels_dict[tag]
     for id, kernel in kernels_list.items():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ActOP
+        kernel.ActOP = ActOP == "silu"
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype
