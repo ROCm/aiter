@@ -1547,7 +1547,24 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., :head_size_q_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_q_og]
         dv = dv[..., :head_size_v_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, dbias, None, None, None, None, None
+        return (
+            dq, 
+            dk,
+            dv, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None, 
+            dbias, 
+            None, 
+            None, 
+            None, 
+            None, 
+            None,
+        )
 
 
 def flash_attn_func(

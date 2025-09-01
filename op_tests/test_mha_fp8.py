@@ -44,8 +44,7 @@ def run_ck(
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 8])
-@pytest.mark.parametrize("nheads, nheads_k", 
-                         [(8, 1), (40, 8), (32, 8), (5, 1)])
+@pytest.mark.parametrize("nheads, nheads_k", [(8, 1), (40, 8), (32, 8), (5, 1)])
 @pytest.mark.parametrize(
     "d,d_v",
     [
@@ -86,14 +85,22 @@ def test_flash_attn_output(
     quant_dtype = dtypes.fp8
 
     # generate tensor [-1, 1]
-    q = torch.rand(
-        batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype
-    )
+    q = torch.rand(batch_size, seqlen_q, nheads, d, device="cuda", dtype=dtype)
     k = torch.rand(
-        batch_size, seqlen_k, nheads_k, d, device="cuda", dtype=dtype,
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d,
+        device="cuda",
+        dtype=dtype,
     )
     v = torch.rand(
-        batch_size, seqlen_k, nheads_k, d_v, device="cuda", dtype=dtype,
+        batch_size,
+        seqlen_k,
+        nheads_k,
+        d_v,
+        device="cuda",
+        dtype=dtype,
     )
 
     # TODO - Support descale
