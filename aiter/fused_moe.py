@@ -823,6 +823,15 @@ def torch_moe(
 
     return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
+#temp workaround for swiglu
+def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
+    # Clamp the input values
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note we add an extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1)
+
 
 def torch_moe_stage1(
     hidden_states,
@@ -910,10 +919,14 @@ def torch_moe_stage1(
                 act_input = act_input * topk_weight[mask].view(-1, 1)
             out[mask] = act_input
     use_g1u1 = w1.shape[1] == (2 * inter_dim)
+    use_swiglu = (not a1_scale) and (quant_type == QuantType.per_1x32)
     torch_act = aiter.get_torch_act(activation)
     if use_g1u1:
         gate, up = out.split([inter_dim, inter_dim], dim=-1)
-        out = torch_act(gate) * up
+        if use_swiglu:
+            out = swiglu(gate, up)
+        else:
+            out = torch_act(gate) * up
     else:
         out = torch_act(out)
     return out.to(dtype)

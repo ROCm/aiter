@@ -201,8 +201,14 @@ void moe_gemm(const ck_tile::MoeFlatmmHostArgs<ScaleM, ScaleN>& args,
             ck_tile::F16xMXF4FlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>,
             ck_tile::MoeFlatmmPipelineAGmemBGmemCRegV1<CodegenPipelineProblem>>;
 
-        using Kernel = ck_tile::
-            MoeFlatmmKernel<TilePartitioner, CodegenFlatmmPipeline, GemmEpilogue, moe_kind>;
+        using FusedAct =
+            std::conditional_t<MXFP4_Pipeline, ck_tile::moe::Swiglu, ck_tile::moe::MoeSilu>;
+
+        using Kernel = ck_tile::MoeFlatmmKernel<TilePartitioner,
+                                                CodegenFlatmmPipeline,
+                                                GemmEpilogue,
+                                                moe_kind,
+                                                FusedAct>;
 
         auto kargs = Kernel::MakeKernelArgs(args);
 
