@@ -49,7 +49,7 @@
 // clang-format off
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
-          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1>
+          int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED, int GQA_RATIO, int MTP=1, bool CAUSAL=false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs*mtp, num_heads, head_size]
@@ -180,9 +180,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int64_t query_start_off = static_cast<int64_t>(
         query_start_loc_ptr ? query_start_loc_ptr[seq_idx] : seq_idx * MTP + warp_mtp_idx);
 
-    constexpr int mtp_loop = MTP_PER_THREAD;
-
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
+    for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
@@ -233,7 +231,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         {
             for(int i = 0; i < 2; i++)
             {
-                for(int mtp = 0; mtp < mtp_loop; mtp++)
+                for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
                 {
                     for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                     {
@@ -350,19 +348,37 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
     {
         // multiply by k_scale if fp8 kv cache
-        scale2 *= *k_scale_ptr;
+        float k_scale = k_scale_ptr ? *k_scale_ptr : 1.0;
+        scale2 *= k_scale;
         scale2 *= q_scale;
     }
-
+    const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
     floatx4 d_out[GQA_RATIO_LOOP][MTP_PER_THREAD][TLOOP];
     // qk mfma
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
+    for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
-                d_out[gqa_ratio_loop][mtp][token_depth] = {0};
+                if constexpr(CAUSAL)
+                {
+                    for(int i = 0; i < 4; i++)
+                    {
+                        const int local_token_idx = qkout_token_idx + token_depth * 16 + i;
+                        const int k_token_idx     = local_token_idx % context_len;
+                        const int q_token_idx =
+                            (local_token_idx / context_len) * MTP_PER_THREAD + mtp;
+                        d_out[gqa_ratio_loop][mtp][token_depth][i] = {
+                            (k_token_idx <= (context_len - MTP)) || (q_token_idx >= (MTP - 1))
+                                ? 0
+                                : -FLT_MAX};
+                    }
+                }
+                else
+                {
+                    d_out[gqa_ratio_loop][mtp][token_depth] = {0};
+                }
                 for(int head_loop = 0; head_loop < HEAD_LOOP; head_loop++)
                 {
                     for(int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++)
@@ -432,8 +448,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         }
     }
 
-    const int qkout_token_idx = partition_start_token_idx + TOKENS_PER_WARP * warpid + rowid * 4;
-
     // apply alibi
     if constexpr(ALIBI_ENABLED)
     {
@@ -441,7 +455,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         {
             const int local_token_idx = qkout_token_idx + token_depth * 16;
             const int alibi_offset    = local_token_idx - context_len + 1;
-            for(int mtp = 0; mtp < mtp_loop; mtp++)
+            for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
@@ -459,7 +473,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {-FLT_MAX};
     float exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
 
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
+    for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
@@ -506,7 +520,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float* shared_mem = reinterpret_cast<float*>(shared_logits);
     if(laneid < 16)
     {
-        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
@@ -528,7 +542,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     float partition_qk_max[GQA_RATIO_LOOP][MTP_PER_THREAD]  = {-FLT_MAX};
     float partition_exp_sum[GQA_RATIO_LOOP][MTP_PER_THREAD] = {0.0f};
 
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
+    for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
@@ -569,7 +583,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     {
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
         {
-            for(int mtp = 0; mtp < mtp_loop; mtp++)
+            for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
@@ -598,7 +612,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
         int offset    = rowid % 2;
         for(int token_depth = 0; token_depth < TLOOP; token_depth++)
         {
-            for(int mtp = 0; mtp < mtp_loop; mtp++)
+            for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
             {
                 for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
                 {
@@ -625,7 +639,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // write out partition max_logits and exp_sum
     if(threadIdx.x < GQA_RATIO_MTP_PARALLEL)
     {
-        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
@@ -651,7 +665,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     _B16x4 outelems[GQA_RATIO_LOOP][MTP_PER_THREAD][VHELOOP];
     // Softmax V mfma
     // v layout: 16he across lanes x 16 tokens per lane
-    for(int mtp = 0; mtp < mtp_loop; mtp++)
+    for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
     {
         for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
         {
@@ -729,7 +743,8 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                 }
                 if constexpr(KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto)
                 {
-                    tmp_out *= *v_scale_ptr;
+                    float v_scale = v_scale_ptr ? *v_scale_ptr : 1.0;
+                    tmp_out *= v_scale;
                 }
 
                 // apply post Softmax V mfma v_scale
@@ -744,7 +759,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     for(int vhe_depth = 0; vhe_depth < VHELOOP; vhe_depth++)
     {
         // lane16 id head dimension; rowid head element dimension
-        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
@@ -759,7 +774,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     // write to tmp_out with coalesced writes after reading from shared mem
     if(warpid == 0)
     {
-        for(int mtp = 0; mtp < mtp_loop; mtp++)
+        for(int mtp = 0; mtp < MTP_PER_THREAD; mtp++)
         {
             for(int gqa_ratio_loop = 0; gqa_ratio_loop < GQA_RATIO_LOOP; gqa_ratio_loop++)
             {
@@ -869,7 +884,7 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
 template <typename scalar_t, typename cache_t,
           vllm::Fp8KVCacheDataType KV_DTYPE, int BLOCK_SIZE,
           int HEAD_SIZE, int NUM_THREADS, bool ALIBI_ENABLED,
-          int GQA_RATIO, int MTP=1>
+          int GQA_RATIO, int MTP=1, bool CAUSAL=false>
 __global__
 __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const scalar_t* __restrict__ q,         // [num_seqs, num_heads, head_size]
