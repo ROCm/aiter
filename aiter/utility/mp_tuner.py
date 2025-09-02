@@ -40,12 +40,15 @@ def worker(
             us = round(us, 4)
         except RuntimeError as e:
             print(f"run gpu func error: info:{info}\t {e}")
+        max_retries = 3
+        retry_count = 0
 
-        if us == 0:
-            print("!!!! us = 0, rerun it ")
+        while us == 0 and retry_count < max_retries:
+            print(f"!!!! us = 0, try {retry_count + 1} run")
             res, us = run_perftest(func, *args, **kwargs)
-            us = round(us, 4)
-
+            retry_count += 1
+        if us == 0:
+            print(f"Warning: try run {max_retries} times, but still get 0!")
         torch.cuda.synchronize()
         if ref is not None:
             if isinstance(ref, torch.Tensor):
@@ -105,7 +108,7 @@ def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
     bestConfigs = []
     best_config = [cur_info, -1, 1.0]
     for info, us, max_err_ratio in sorted_rets:
-        # print(f"{info=}, {us=}, {max_err_ratio=}")
+        print(f"{info=}, {us=}, {max_err_ratio=}")
         if max_err_ratio > tol_err_ratio:
             continue
         if info[0] == cur_info[0]:

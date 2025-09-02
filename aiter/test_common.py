@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-
 import torch
 import torch.profiler as tpf
 import os
@@ -19,7 +18,7 @@ pd.set_option("display.max_rows", 200)
 
 
 def perftest(
-    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
+    num_iters=51, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=True
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -70,14 +69,15 @@ def perftest(
                     run_iters(1, graph.replay)
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
+            needTrace = True
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
                 with_stack=False,
-                with_modules=True,
+                with_modules=False,
                 # record_shapes=True,
                 on_trace_ready=(
-                    tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")
+                    tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")  ##
                     if needTrace
                     else None
                 ),
@@ -85,7 +85,8 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-
+                # prof.step()
+            # time.sleep(1)
             avg = get_trace_perf(prof, num_iters)
             return data, avg
 
@@ -218,14 +219,46 @@ def log_args(func, *args, **kwargs):
 
 def post_process_data(df, num_iters, warm_iter=1):
     """remove abnormal data"""
+
     device_df = df[df["device_type"].astype(str).str.contains("DeviceType.CUDA")]
+    # print("devicedf is ", device_df)
     if device_df.empty:
         return [], 0
     kernels_num = int(len(device_df) / num_iters)
-    test_df = device_df.reset_index()
+
+    act_iters = num_iters
+    # print(
+    #    f"len of device_df is {len(device_df)}, kernels_num is {kernels_num}, gpuid is  {torch.cuda.current_device()}"
+    # )
+    valid_n = len(device_df)
+    dropped_indexs = []
+    if len(device_df) % num_iters == 0:
+        kernels_num = int(len(device_df) / num_iters)
+    else:
+        name_list = device_df["name"].tolist()
+        max_kernel_num = 20
+        n = len(name_list)
+        for step in range(1, min(max_kernel_num, n // 2 + 1)):
+            sub_list = [name_list[i] for i in range(step)]
+            m = len(sub_list)
+
+            valid_n = int(n / m) * m
+            pattern_match = all(
+                name_list[i] == sub_list[i % m] for i in range(int(n / m) * m)
+            )
+            if pattern_match:
+                kernels_num = m
+                act_iters = valid_n / m
+                break
+        dropped_indexs = device_df.iloc[valid_n:].index.tolist()
+        if kernels_num == 0:
+            print("data missed, the time may be inaccurate!")
+
+    test_df = device_df.iloc[:valid_n].reset_index()
     grouped_kernel_df = test_df.groupby(test_df.index // kernels_num, sort=False).agg(
         {"self_device_time_total": "sum", "index": list}
     )
+
     # rm warm iters
     sum_df = grouped_kernel_df.iloc[warm_iter:].reset_index(drop=True)
     out_range_idx = []
@@ -244,14 +277,16 @@ def post_process_data(df, num_iters, warm_iter=1):
     out_range_num = len(out_range_idx)
 
     indices = {idx for i in out_range_idx for idx in sum_df.iloc[i]["index"]}
+
     index_sublists = grouped_kernel_df["index"].head(warm_iter).tolist()
     indices_to_add = [idx for sublist in index_sublists for idx in sublist]
     indices.update(indices_to_add)
+    indices.update(dropped_indexs)
     if int(os.environ.get("AITER_LOG_MORE", 0)):
         logger.info(f"abnormal data indices: {indices}")
         for i in indices:
             logger.info(f"abnormal data: {df.iloc[i]['self_device_time_total']}")
-    return list(indices), out_range_num + warm_iter
+    return list(indices), out_range_num + warm_iter + num_iters - act_iters
 
 
 def get_trace_perf(prof, num_iters):
@@ -274,6 +309,7 @@ def get_trace_perf(prof, num_iters):
     dropped_indexs, dropped_num = post_process_data(
         df, num_iters + warm_iter, warm_iter
     )
+
     df = df.drop(dropped_indexs)
     iter_init = 0  # warm_iter dropped
     df["cnt"] = 1
@@ -324,7 +360,11 @@ def get_trace_perf(prof, num_iters):
         if el == "host_time_sum":
             df.at[avg_name, el] = df[el].sum() / num_iters
         else:
+
             df.at[avg_name, el] = df[el].sum() / actual_iters
+            print(
+                f"calc time {df[el].sum()}, {actual_iters}, time is {df.at[avg_name, el]}, {df[el].sum() / actual_iters}"
+            )
     if int(os.environ.get("AITER_LOG_MORE", 0)):
         pd.set_option("display.expand_frame_repr", False)
         pd.set_option("display.max_colwidth", 90)
@@ -337,20 +377,32 @@ def checkAllclose(
     a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8, printLog=True
 ):
     isClose = torch.isclose(a, b, rtol=rtol, atol=atol)
-    mask = (~isClose).to("cpu")
+
     if isClose.all():
         if printLog:
             logger.info(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
         return 0
     else:
-        num = mask.sum()
-        printNum = min(printNum, num)
-        percent = (num / a.numel()).item()
-        if not printLog:
-            return percent
-        a_msked = a[mask]
-        b_msked = b[mask]
-        delta = (a_msked - b_msked).abs()
+        try:
+            mask = ~isClose
+            num = mask.sum()
+            printNum = min(printNum, num)
+            percent = (num / a.numel()).item()
+            if not printLog:
+                return percent
+            a_msked = a[mask]
+            b_msked = b[mask]
+            delta = (a_msked - b_msked).abs()
+        except RuntimeError as e:
+            mask = ~isClose.to("cpu")
+            num = mask.sum()
+            printNum = min(printNum, num)
+            percent = (num / a.numel()).item()
+            if not printLog:
+                return percent
+            a_msked = a[mask]
+            b_msked = b[mask]
+            delta = (a_msked - b_msked).abs()
         if percent > tol_err_ratio:
             logger.info(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
