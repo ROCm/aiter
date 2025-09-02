@@ -356,6 +356,23 @@ def test_mha_with_pe(
     )
     torch_out, _ = torch_out
 
+    DUMP_TENSORS: bool = False
+
+    if DUMP_TENSORS:
+        import numpy as np
+
+        def torch_to_np(x: torch.Tensor) -> np.ndarray:
+            return x.detach().cpu().numpy()
+
+        np.savez_compressed(
+            f"b{BATCH}_sq{SEQLEN_Q}_sk{SEQLEN_K}_hq{NUM_Q_HEADS}_hk{NUM_K_HEADS}_dqk{HEAD_SZ_QK}_d{HEAD_SZ_V}.npz",
+            q=torch_to_np(q),
+            k=torch_to_np(k),
+            v=torch_to_np(v),
+            triton_out=torch_to_np(triton_out),
+            torch_out=torch_to_np(torch_out),
+        )
+
     # This assertion is failing:
     # Mismatched elements: 45966898 / 67108864 (68.5%)
     # |_ with atol = rtol = 1e-1 we get 0.8% element mismatch ratio (same as varlen test)
