@@ -19,10 +19,10 @@ from dataclasses import dataclass
 from typing import Tuple
 from enum import IntEnum
 
-REF_BY_TRITON = False
+REF_BY_TRITON = True
 
 if REF_BY_TRITON:
-    from aiter.ops.triton.mha import flash_attn_func
+    from aiter.ops.triton.mha import flash_attn_func, flash_attn_varlen_func
 else:
     from aiter import flash_attn_func, flash_attn_varlen_func
 
@@ -261,19 +261,11 @@ def test_fmha_v3_varlen_fwd_ck(
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, "cuda", mode="random")
     key_padding_mask = generate_random_padding_mask(seqlen_k, batch_size, "cuda", mode="random")
     (
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        q,
-        k,
-        v,
-        output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
+        q_unpad, k_unpad, v_unpad,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
+        q, k, v,
+        output_pad_fn, dq_pad_fn, dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     # print(f'{q_unpad.shape=}')
@@ -296,25 +288,17 @@ def test_fmha_v3_varlen_fwd_ck(
     if profile:
         out, time = profile_func(
                 attention,
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
+                q_unpad, k_unpad, v_unpad,
+                cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k,
                 causal=causal)
         tflops = efficiency(flops(batch_size, seqlen_q, d, nheads, causal), time)
         print(f"time: {time:.2f} us, {tflops:.2f} TFlops")
     else:
         out = attention(
-                q_unpad,
-                k_unpad,
-                v_unpad,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                max_seqlen_q,
-                max_seqlen_k,
+                q_unpad, k_unpad, v_unpad,
+                cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k,
                 causal=causal)
 
     # print_tensor(out.squeeze(0).squeeze(1), 'O')
@@ -330,13 +314,9 @@ def test_fmha_v3_varlen_fwd_ck(
         # print_tensor(out_ref.squeeze(0).squeeze(1), 'out_ref')
 
         out_pt = run_torch(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
+            q, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
             causal=causal,
             upcast=False,
             reorder_ops=True,
@@ -381,26 +361,16 @@ if __name__ == "__main__":
     seed = 0
 
     problem_sizes = [
-        # batch_size, (nheads, nheads_k), (seqlen_q, seqlen_k), (d, d_v)
-#        ProblemSize(32, (16,), (512,), (128,), MaskType.BOTH),
-#        ProblemSize(16, (16,), (1024,), (128,), MaskType.BOTH),
-#        ProblemSize(8, (16,), (2048,), (128,), MaskType.BOTH),
-#        ProblemSize(4, (16,), (4096,), (128,), MaskType.BOTH),
-#        ProblemSize(2, (16,), (8192,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (16,), (16384,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (64,), (16384,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (16, 1), (65536,), (128,), MaskType.BOTH),
-#        ProblemSize(1, (40,), (37200,), (128,), MaskType.BOTH),
-        ProblemSize(1, (6, 1), (1024, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (2048, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (4096, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (8192, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (16384, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (32768, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (65536, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (6, 1), (131072, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (16, 1), (65536, ), (128, ), MaskType.CAUSAL),
-        ProblemSize(1, (40,), (37200,), (128,), MaskType.NOT_CAUSAL),
+        # batch_size, (nheads, nheads_k), (seqlen_q, seqlen_k), (d, d_v), causal mask
+        ProblemSize(32, (16,), (512,), (128,), MaskType.BOTH),
+        ProblemSize(16, (16,), (1024,), (128,), MaskType.BOTH),
+        ProblemSize(8, (16,), (2048,), (128,), MaskType.BOTH),
+        ProblemSize(4, (16,), (4096,), (128,), MaskType.BOTH),
+        ProblemSize(2, (16,), (8192,), (128,), MaskType.BOTH),
+        ProblemSize(1, (16,), (16384,), (128,), MaskType.BOTH),
+        ProblemSize(1, (64,), (16384,), (128,), MaskType.BOTH),
+        ProblemSize(1, (16, 1), (65536,), (128,), MaskType.BOTH),
+        ProblemSize(1, (40,), (37200,), (128,), MaskType.BOTH),
     ]
 
     l_dtypes = [dtypes.bf16]
