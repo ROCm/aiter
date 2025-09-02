@@ -16,7 +16,7 @@ from triton import language as tl
 _LOGGER = AiterTritonLogger()
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-
+from triton.experimental.gluon.language.amd.cdna4 import async_copy
 
 @triton.heuristics(
     {
@@ -102,13 +102,13 @@ def _gemm_a8w8_blockscale_kernel(
     blocked_mk: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],  # 16 * 128
         threads_per_warp=[8, 8],
-        warps_per_cta=[2, 1],
+        warps_per_cta=[4, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[16, 1],  # 16 * 128
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, 2],
+        warps_per_cta=[1, 4],
         order=[0, 1],
     )
 
@@ -125,7 +125,7 @@ def _gemm_a8w8_blockscale_kernel(
         vec=16, per_phase=2, max_phase=8, order=[0]
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 1]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
@@ -174,25 +174,26 @@ def _gemm_a8w8_blockscale_kernel(
         offs_a_scale = offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
 
         if EVEN_K:
-            a = gl.amd.cdna4.buffer_load(
+            async_copy.buffer_load_to_shared(smem_a,
                 ptr=a_ptr,
                 offsets=offs_a,
                 mask=offs_am[:, None] < M,
-                cache=cache_modifier,
+                cache_modifier=cache_modifier,
             )
         else:
-            a = gl.amd.cdna4.buffer_load(
+            async_copy.buffer_load_to_shared(smem_a,
                 ptr=a_ptr,
                 offsets=offs_a,
                 mask=(offs_ak[None, :] < K - (pid_k * num_k_iter * BLOCK_SIZE_K))
                 & (offs_am[:, None] < M),
-                cache=cache_modifier,
+                cache_modifier=cache_modifier,
             )
         a_scale = gl.amd.cdna4.buffer_load(
             ptr=a_scale_ptr,
             offsets=offs_a_scale,
             cache=cache_modifier,
         )
+
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         offs_b_scale_n = offs_bn // GROUP_N
         offs_b_scale = offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
@@ -217,7 +218,6 @@ def _gemm_a8w8_blockscale_kernel(
             offsets=offs_b_scale,
             cache=cache_modifier,
         )
-        smem_a.store(a)
         smem_scale_a.store(a_scale)
 
         acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
