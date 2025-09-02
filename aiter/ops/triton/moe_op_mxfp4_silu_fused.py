@@ -8,7 +8,9 @@ from typing import Any, Dict
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.moe_op_mxfp4_silu_fused import (
     _fused_moe_kernel_mxfp4_silu,
+    get_scaled_dot_format_string,
 )
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 _LOGGER = AiterTritonLogger()
 
@@ -66,6 +68,11 @@ def fused_moe_mxfp4_silu(
         # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.shape[0], A.shape[0] * top_k * config["BLOCK_SIZE_M"])
 
+    A_tl_dtype = torch_to_triton_dtype[A.dtype]
+    A_DTYPE_FORMAT = get_scaled_dot_format_string(A_tl_dtype)
+    B_tl_dtype = torch_to_triton_dtype[B.dtype]
+    B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
+
     grid = lambda META: (  # noqa: E731
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
@@ -98,6 +105,8 @@ def fused_moe_mxfp4_silu(
         B_mx_scale.stride(0),
         B_mx_scale.stride(2),
         B_mx_scale.stride(1),
+        A_DTYPE_FORMAT=A_DTYPE_FORMAT,
+        B_DTYPE_FORMAT=B_DTYPE_FORMAT,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,

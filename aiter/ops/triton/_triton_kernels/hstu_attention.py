@@ -24,6 +24,7 @@ import triton.language as tl
 import functools
 from ..utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from ..utils._triton import arch_info
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 try:
     from triton.language.extra.libdevice import (

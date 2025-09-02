@@ -75,6 +75,8 @@ def _gemm_a8w8_blockscale_kernel(
 
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
+
+    For this kernel implementation, GROUP_K must equal BLOCK_K.
     """
 
     tl.assume(stride_am > 0)
@@ -114,6 +116,7 @@ def _gemm_a8w8_blockscale_kernel(
 
         # SPLITK_BLOCK_SIZE = tl.cdiv(K, NUM_KSPLIT)
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
+        # ^ Number of K blocks within our split-K partition
 
         # Create pointers for first block of A and B input matrices
         offs_k = tl.arange(0, BLOCK_SIZE_K)
@@ -128,13 +131,15 @@ def _gemm_a8w8_blockscale_kernel(
         )
 
         # Create pointers for the scales
-        offs_ks = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
+        offs_k_scale = (pid_k * SPLITK_BLOCK_SIZE) // GROUP_K
         a_scale_ptrs = (
-            a_scale_ptr + offs_am * stride_ascale_m + offs_ks * stride_ascale_k
+            a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_bsn = offs_bn // GROUP_N
+        offs_b_scale_n = offs_bn // GROUP_N
         b_scale_ptrs = (
-            b_scale_ptr + offs_ks * stride_bscale_k + offs_bsn * stride_bscale_n
+            b_scale_ptr
+            + offs_k_scale * stride_bscale_k
+            + offs_b_scale_n * stride_bscale_n
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 

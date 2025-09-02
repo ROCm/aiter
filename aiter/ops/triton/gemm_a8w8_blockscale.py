@@ -41,8 +41,8 @@ def gemm_a8w8_blockscale(
     Returns:
     - Y: The output matrix with shape (M, N).
 
-    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k
-    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n
+    *scale_k = (K + scale_block_size_k - 1) // scale_block_size_k -> ceil_div(K, scale_block_size_k)
+    **scale_n = (N + scale_block_size_n - 1) // scale_block_size_n -> ceil_div(N, scale_block_size_n)
     """
     _LOGGER.info(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
@@ -55,8 +55,8 @@ def gemm_a8w8_blockscale(
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
     # Transpose w and w_scale
-    w = w.T
-    w_scale = w_scale.T
+    w = w.T  # (K, N)
+    w_scale = w_scale.T  # (scale_k, scale_n)
 
     if y is None:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -64,7 +64,9 @@ def gemm_a8w8_blockscale(
     if config is None:
         config = _get_config(M, N, K)
 
-    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
+    config["SPLITK_BLOCK_SIZE"] = triton.cdiv(
+        K, config["NUM_KSPLIT"]
+    )  # How big each split_k partition is
     if config["NUM_KSPLIT"] > 1:
         y_pp = torch.empty(
             (config["NUM_KSPLIT"], M, N), dtype=torch.float32, device=y.device
@@ -72,16 +74,27 @@ def gemm_a8w8_blockscale(
     else:
         y_pp = None
 
+    # If block size is greater than split k size, shrink the block size
     if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
         config["BLOCK_SIZE_K"] = triton.next_power_of_2(config["SPLITK_BLOCK_SIZE"])
         if config["BLOCK_SIZE_K"] > config["SPLITK_BLOCK_SIZE"]:
             config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 4
-    config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+    config["BLOCK_SIZE_K"] = max(
+        config["BLOCK_SIZE_K"], 16
+    )  # minimum block size is 16 for perf
 
     # Scale block sizes
     # TODO: need a better way to pass scale block sizes around
-    config["GROUP_K"] = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[0]))
-    config["GROUP_N"] = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[1]))
+    config["GROUP_K"] = triton.next_power_of_2(
+        triton.cdiv(K, w_scale.shape[0])
+    )  # scale_block_size_k
+    config["GROUP_N"] = triton.next_power_of_2(
+        triton.cdiv(N, w_scale.shape[1])
+    )  # scale_block_size_n
+
+    assert (
+        config["GROUP_K"] == config["BLOCK_SIZE_K"]
+    ), "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731
@@ -89,7 +102,7 @@ def gemm_a8w8_blockscale(
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
             * triton.cdiv(N, META["BLOCK_SIZE_N"])
-        ),
+        ),  # Effective launch grid dims: [NUM_KSPLIT, NUM_M_BLOCKS, NUM_N_BLOCKS]
     )
     _gemm_a8w8_blockscale_kernel[grid](
         x,

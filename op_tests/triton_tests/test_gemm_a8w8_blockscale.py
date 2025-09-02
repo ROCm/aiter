@@ -3,12 +3,20 @@
 
 import torch
 import pytest
-from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+from aiter.ops.triton.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+)
+from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
+)
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 
 block_shape = (128, 128)
+DEVICE_ARCH = arch_info.get_device()
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -20,8 +28,8 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
     x = x.to(x_scale.dtype) * x_scale[:m, :k]
     x = x.view(m, k)
-    w_scale = w_scale.repeat_interleave(block_shape_k, dim=0)
-    w_scale = w_scale.repeat_interleave(block_shape_n, dim=1)
+    w_scale = w_scale.repeat_interleave(block_shape_n, dim=0)
+    w_scale = w_scale.repeat_interleave(block_shape_k, dim=1)
     w_scale = w_scale[:n, :k]
     weight = weight.to(w_scale.dtype) * w_scale
 
@@ -30,8 +38,8 @@ def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
     return out.to(dtype)
 
 
-def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None):
-    return gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype, y)
+def run_triton(x, weight, x_scale, w_scale, dtype=torch.bfloat16, y=None, impl=None):
+    return impl(x, weight, x_scale, w_scale, dtype, y)
 
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
@@ -68,6 +76,7 @@ def get_x_vals():
         (4096, 8192, 1024),
         (8192, 8192, 1024),
         (16384, 8192, 1024),
+        (16, 16, 128),
         (2048, 2048, 2049),
         (159, 17389, 597),
         (16, 576, 7168),
@@ -140,10 +149,28 @@ def generate_gemm_a8w8_blockscale_inputs(
         for shape in get_x_vals()
     ],
 )
-def test_gemm(dtype, M, N, K, layout, output):
+@pytest.mark.parametrize(
+    "impl",
+    [
+        "gluon",
+        "triton",
+    ],
+)
+def test_gemm(dtype, M, N, K, layout, output, impl: str):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.cuda.synchronize()
 
     block_shape_n, block_shape_k = block_shape
+    if K % block_shape_k != 0:
+        pytest.skip(
+            "Latest upstream compiler as of Aug 22 (necessary for Gluon) causes"
+            " infinite hang when EVEN_K is false. Try seeing if it's fixed if it's been a while."
+        )
+
+    if impl == "gluon" and int(DEVICE_ARCH.split("MI")[1].replace("X", "")) < 350:
+        pytest.skip(
+            "Gluon implementation is not supported on this device (requires CDNA4)."
+        )
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, x_scale, w_scale, y = generate_gemm_a8w8_blockscale_inputs(
@@ -158,6 +185,12 @@ def test_gemm(dtype, M, N, K, layout, output):
     )
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
-    b = run_triton(x, weight, x_scale, w_scale, dtype, y)
+    if impl == "gluon":
+        impl = gluon_gemm_a8w8_blockscale
+    elif impl == "triton":
+        impl = triton_gemm_a8w8_blockscale
+    else:
+        raise ValueError(f"Unknown implementation: {impl}")
+    b = run_triton(x, weight, x_scale, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
