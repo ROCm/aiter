@@ -106,7 +106,7 @@ def _gemm_a8w8_blockscale_kernel(
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 1], # 16 * 128
+        size_per_thread=[16, 1],  # 16 * 128
         threads_per_warp=[8, 8],
         warps_per_cta=[1, 2],
         order=[0, 1],
@@ -335,7 +335,7 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     stride_c_in_n,
     stride_c_out_m,
     stride_c_out_n,
-    BLOCK_SIZE_M: gl.constexpr, # Note: Can be distinct from GEMM block size
+    BLOCK_SIZE_M: gl.constexpr,  # Note: Can be distinct from GEMM block size
     BLOCK_SIZE_N: gl.constexpr,
     ACTUAL_KSPLIT: gl.constexpr,
     MAX_KSPLIT: gl.constexpr,
@@ -358,16 +358,16 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     #     order=[1, 0],
     # )
 
-    offs_m = (pid_m * BLOCK_SIZE_M + gl.arange(
+    offs_m = pid_m * BLOCK_SIZE_M + gl.arange(
         0,
         BLOCK_SIZE_M,  # keep dim 1
         gl.SliceLayout(0, gl.SliceLayout(2, blocked_read)),
-    ))
-    offs_n = (pid_n * BLOCK_SIZE_N + gl.arange(
+    )
+    offs_n = pid_n * BLOCK_SIZE_N + gl.arange(
         0,
         BLOCK_SIZE_N,  # keep dim 2
         gl.SliceLayout(0, gl.SliceLayout(1, blocked_read)),
-    ))
+    )
     offs_k = gl.arange(
         0, MAX_KSPLIT, gl.SliceLayout(1, gl.SliceLayout(2, blocked_read))  # keep dim 0
     )
@@ -380,7 +380,11 @@ def _gemm_a8w8_blockscale_reduce_kernel(
         c_in_mask = (offs_m[None, :, None] < M) & (offs_n[None, None, :] < N)
         c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs, mask=c_in_mask, cache=".ca")
     else:
-        c_in_mask = (offs_m[None, :, None] < M) & (offs_n[None, None, :] < N) & (offs_k[:, None, None] < ACTUAL_KSPLIT)
+        c_in_mask = (
+            (offs_m[None, :, None] < M)
+            & (offs_n[None, None, :] < N)
+            & (offs_k[:, None, None] < ACTUAL_KSPLIT)
+        )
         c = gl.amd.cdna4.buffer_load(
             c_in_ptr, c_in_offs, mask=c_in_mask, cache=".ca"
         )  # , other=0.0)
@@ -399,7 +403,9 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     )
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    gl.amd.cdna4.buffer_store(stored_value=c, ptr=c_out_ptr, offsets=c_out_offs, mask = c_mask)
+    gl.amd.cdna4.buffer_store(
+        stored_value=c, ptr=c_out_ptr, offsets=c_out_offs, mask=c_mask
+    )
 
 
 @functools.lru_cache(maxsize=1024)
