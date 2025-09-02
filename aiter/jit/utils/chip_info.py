@@ -42,8 +42,14 @@ def _detect_native() -> list[str]:
 
 @torch_compile_guard()
 def get_gfx_custom_op() -> int:
-    gfx_mapping = {v: k for k, v in GFX_MAP.items()}
     gfx = os.getenv("GPU_ARCHS", "native")
+    return get_gfx_custom_op_core(gfx)
+
+
+@functools.lru_cache(maxsize=10)
+def get_gfx_custom_op_core(gfx: str) -> int:
+    gfx_mapping = {v: k for k, v in GFX_MAP.items()}
+    # gfx = os.getenv("GPU_ARCHS", "native")
     if gfx == "native":
         try:
             rocminfo = executable_path("rocminfo")
@@ -74,16 +80,10 @@ def get_gfx_custom_op() -> int:
         )
 
 
-gfx_name = ""
-
-
 @functools.lru_cache(maxsize=1)
 def get_gfx():
-    global gfx_name
-    if gfx_name == "":
-        gfx_num = get_gfx_custom_op()
-        gfx_name = GFX_MAP.get(gfx_num, "unknown")
-    return gfx_name
+    gfx_num = get_gfx_custom_op()
+    return GFX_MAP.get(gfx_num, "unknown")
 
 
 @functools.lru_cache(maxsize=1)
@@ -98,6 +98,7 @@ def get_gfx_list() -> list[str]:
 
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
+    print("get_cu_num_custom_op")
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
