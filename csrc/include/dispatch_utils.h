@@ -22,6 +22,25 @@
 
 #include <torch/extension.h>
 
+#define AITER_CASE_VEC_SIZE(VC, ...)     \
+    case VC: {                           \
+        constexpr int32_t VEC_SIZE = VC; \
+        __VA_ARGS__                      \
+        break;                           \
+    }
+
+#define AITER_DISPATCH_CASE_VEC_SIZE(vec_size, ...)                           \
+    switch(vec_size)                                                          \
+    {                                                                         \
+        AITER_CASE_VEC_SIZE(32, __VA_ARGS__)                                  \
+        AITER_CASE_VEC_SIZE(16, __VA_ARGS__)                                  \
+        AITER_CASE_VEC_SIZE(8, __VA_ARGS__)                                   \
+        AITER_CASE_VEC_SIZE(4, __VA_ARGS__)                                   \
+        AITER_CASE_VEC_SIZE(2, __VA_ARGS__)                                   \
+        AITER_CASE_VEC_SIZE(1, __VA_ARGS__)                                   \
+    default: TORCH_CHECK(false, __func__, " does't support ", vec_size, "."); \
+    }
+
 #define AITER_DISPATCH_CASE_FLOATING16_TYPES(...)       \
     AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__) \
     AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
