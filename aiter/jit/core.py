@@ -585,6 +585,7 @@ NONE_WRAPPED_OP = [
     # "get_padded_m",
     "compile_mha_fwd",
     "compile_mha_bwd",
+    "register_graph_buffers",
 ]
 
 SPECIAL_OPS_MUTATES_ARGS = {

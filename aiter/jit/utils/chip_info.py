@@ -74,10 +74,16 @@ def get_gfx_custom_op() -> int:
         )
 
 
+gfx_name = ""
+
+
 @functools.lru_cache(maxsize=1)
 def get_gfx():
-    gfx_num = get_gfx_custom_op()
-    return GFX_MAP.get(gfx_num, "unknown")
+    global gfx_name
+    if gfx_name == "":
+        gfx_num = get_gfx_custom_op()
+        gfx_name = GFX_MAP.get(gfx_num, "unknown")
+    return gfx_name
 
 
 @functools.lru_cache(maxsize=1)
