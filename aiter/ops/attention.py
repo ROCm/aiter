@@ -303,6 +303,7 @@ def get_mla_metadata_v1(
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
+    kv_granularity: int,
     work_metadata_ptrs: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info: torch.Tensor,
@@ -317,6 +318,7 @@ def get_mla_metadata_v1(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: whether causal mask is enabled.
+        kv_granularity: the granularity on kv sequence length when cutting batch.
     Outputs:
         [0] work_metadata_ptrs  (2)                 Two 64-bits pointers point to the 1st element of work_indptr and
                                                     work_info.
@@ -348,6 +350,7 @@ def get_mla_metadata_v1_no_redundant(
     num_heads_per_head_k: int,
     num_heads_k: int,
     is_causal: bool,
+    kv_granularity: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -356,6 +359,7 @@ def get_mla_metadata_v1_no_redundant(
         num_heads_per_head_k: Equals to num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
         is_causal: whether causal mask is enabled.
+        kv_granularity: the granularity on kv sequence length when cutting batch.
     Returns:
         [0] work_metadata_ptrs  (2)                  Two 64-bits pointers point to the 1st element of work_indptr and
                                                      work_info.

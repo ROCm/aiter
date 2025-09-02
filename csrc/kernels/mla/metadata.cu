@@ -191,13 +191,6 @@ CK_TILE_HOST_DEVICE int32_t cal_kv_len(
     return cost - 2 * qo_len;
 }
 
-CK_TILE_HOST_DEVICE int32_t get_remaining_kv_capability(
-    const int32_t kv_len_upper_bound,
-    const int32_t kv_len_used)
-{
-    return ck_tile::integer_least_multiple(kv_len_upper_bound - kv_len_used, 16);
-}
-
 CK_TILE_DEVICE auto get_cost_top(
     const int32_t* p_cost_heap,
     const int32_t  num_clusters)
@@ -375,6 +368,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        num_heads;
     int32_t        num_cu;
     int32_t        reduce_indptr_size;
+    int32_t        kv_granularity;
     bool           is_causal;
 };
 
@@ -413,7 +407,7 @@ CK_TILE_DEVICE int32_t estimate_workload_per_cluster(
     return workload_per_cluster;
 }
 
-template <typename Traits, bool kGatherWorkCount>
+template <typename Traits, bool kOnlyGatherWorkCount>
 CK_TILE_DEVICE void generate_work(
     const int32_t       batch_idx,
     const int32_t       tile_idx,
@@ -425,6 +419,7 @@ CK_TILE_DEVICE void generate_work(
     const int32_t       kv_batch_end,
     const int32_t       workload_limit_global,
     const int32_t       num_clusters,
+    const int32_t       kv_granularity,
     const int32_t*      p_work_indptr,
     const int32_t*      p_num_qo_clusters_indptr,
     int32_t*            p_loc_partial_outputs,
@@ -439,7 +434,7 @@ CK_TILE_DEVICE void generate_work(
     int32_t kv_start_local = 0;
 
     const int32_t kv_len_limit_floor =
-        ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), 16);
+        ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
     const auto [cid_top, accum_cost_top] = get_cost_top(p_cost_heap, num_clusters);
     const int32_t remaining_capability_top =
         ck_tile::max(cal_kv_len(workload_limit_global - accum_cost_top, cluster_len_q), kv_len_limit_floor);
@@ -470,7 +465,7 @@ CK_TILE_DEVICE void generate_work(
             const int32_t new_cost = accum_cost + cost;
             p_cost_heap[cid] = new_cost;
 
-            if constexpr (kGatherWorkCount == false)
+            if constexpr (kOnlyGatherWorkCount == false)
             {
                 // Record work
                 MlaWorkInfo work_info{};
@@ -636,7 +631,7 @@ __global__ void kn_get_mla_metadata_v1(
             estimate_total_workload(workload_avg, workload_var, cluster_len_q, num_qo_tiles, num_clusters);
         const int32_t workload_per_cluster_estimated =
             estimate_workload_per_cluster(tot_workload_estimated, cluster_len_q, num_qo_tiles, num_clusters);
-        const int32_t limit = ck_tile::integer_least_multiple(workload_per_cluster_estimated, 16);
+        const int32_t limit = ck_tile::integer_least_multiple(workload_per_cluster_estimated, params.kv_granularity);
         return limit;
     }();
 #if PRINT_DBG
@@ -682,7 +677,7 @@ __global__ void kn_get_mla_metadata_v1(
 
             generate_work<Traits, true>(
                 bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                workload_limit_global, num_clusters, nullptr, p_num_qo_clusters_indptr,
+                workload_limit_global, num_clusters, params.kv_granularity, nullptr, p_num_qo_clusters_indptr,
                 nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap, p_cluster_work_counter);
         }
     }
@@ -749,9 +744,9 @@ __global__ void kn_get_mla_metadata_v1(
 
             generate_work<Traits, false>(
                 bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                workload_limit_global, num_clusters, params.p_work_indptr, p_num_qo_clusters_indptr,
-                &loc_partial_outputs, &num_partial_outputs, p_work_info_set, p_reduce_final_map, p_reduce_partial_map,
-                p_cost_heap, p_cluster_work_counter);
+                workload_limit_global, num_clusters, params.kv_granularity, params.p_work_indptr,
+                p_num_qo_clusters_indptr, &loc_partial_outputs, &num_partial_outputs, p_work_info_set,
+                p_reduce_final_map, p_reduce_partial_map, p_cost_heap, p_cluster_work_counter);
         }
     }
 
@@ -828,6 +823,7 @@ void get_mla_metadata_v1_device(
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
+    const int32_t        kv_granularity,
     const bool           no_redundant,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
@@ -910,6 +906,7 @@ void get_mla_metadata_v1_device(
     params.num_heads            = num_heads_per_head_k * num_heads_k;
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
+    params.kv_granularity       = kv_granularity;
     params.is_causal            = is_causal;
 
     // launch kernel
@@ -925,6 +922,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
+    const int32_t        kv_granularity,
     const bool           no_redundant)
 {
     using index_t = uint32_t;
@@ -993,8 +991,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
                 cal_packed_causal_kv_len(binfo.qo_len, binfo.kv_len, tid, cluster_len_q, num_qo_tiles, num_heads, is_causal);
             // always assume that each batch of tile will be splited once along kv.
             const int32_t kv_len_splited =
-                ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len_valid, 2), 16);
-            workload_sum += 2 * cal_cost(cluster_len_q, kv_len_splited) + 16;
+                ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len_valid, 2), kv_granularity);
+            workload_sum += 2 * cal_cost(cluster_len_q, kv_len_splited) + kv_granularity;
         }
     }
     const int32_t workload_limit_global =
@@ -1006,7 +1004,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
         else if (avg_workload <= 16) limit = 64;
         else if (avg_workload <= 32) limit = 128;
         else if (avg_workload <= 64) limit = 192;
-        else limit = ck_tile::integer_least_multiple(avg_workload, 16);
+        else limit = ck_tile::integer_least_multiple(avg_workload, kv_granularity);
         return limit;
     }();
 #if PRINT_DBG
@@ -1058,7 +1056,7 @@ std::vector<torch::Tensor> get_mla_metadata_v1_host(
             const bool split_kv = (num_splits_estimated == 2) ?
                 ((remaining_kv_len - remaining_capability_top) > Traits::kSplitTolerance) : (num_splits_estimated > 1);
             const int32_t kv_len_limit_floor =
-                ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), 16);
+                ck_tile::integer_least_multiple(ck_tile::integer_divide_ceil(kv_len, num_clusters), kv_granularity);
 
             do
             {
@@ -1214,6 +1212,7 @@ void get_mla_metadata_v1(
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
     const bool           is_causal,
+    const int32_t        kv_granularity,
     torch::Tensor&       work_metadata_ptrs,
     torch::Tensor&       work_info_set,
     torch::Tensor&       work_indptr,
@@ -1235,6 +1234,7 @@ void get_mla_metadata_v1(
         num_heads_per_head_k,
         num_heads_k,
         is_causal,
+        kv_granularity,
         false,
         work_metadata_ptrs,
         work_info_set,
@@ -1249,7 +1249,8 @@ std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
     const torch::Tensor& seqlens_kv_indptr,     // [batch size + 1]
     const int32_t        num_heads_per_head_k,
     const int32_t        num_heads_k,
-    const bool           is_causal)
+    const bool           is_causal,
+    const int32_t        kv_granularity)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device_of(seqlens_kv_indptr));
 
@@ -1265,5 +1266,6 @@ std::vector<torch::Tensor> get_mla_metadata_v1_no_redundant(
         num_heads_per_head_k,
         num_heads_k,
         is_causal,
+        kv_granularity,
         true);
 }

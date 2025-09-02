@@ -229,6 +229,7 @@ def test_mla(
         nhead // nhead_kv,
         nhead_kv,
         True,
+        max(page_size, 16),
         work_meta_data,
         work_info_set,
         work_indptr,

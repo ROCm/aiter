@@ -44,6 +44,7 @@ void get_mla_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size 
                          const int32_t num_heads_per_head_k,
                          const int32_t num_heads_k,
                          const bool is_causal,
+                         const int32_t kv_granularity,
                          torch::Tensor& work_metadata_ptrs,
                          torch::Tensor& work_indptr,
                          torch::Tensor& work_info,
@@ -56,7 +57,8 @@ get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [bat
                                  const torch::Tensor& seqlens_kv_indptr, // [batch size + 1]
                                  const int32_t num_heads_per_head_k,
                                  const int32_t num_heads_k,
-                                 const bool is_causal);
+                                 const bool is_causal,
+                                 const int32_t kv_granularity);
 
 void mla_reduce_v1(const torch::Tensor& partial_output,
                    const torch::Tensor& partial_lse,
