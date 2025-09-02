@@ -3,7 +3,7 @@
 
 import torch
 import aiter
-from aiter import dtypes, flash_attn_func
+from aiter import dtypes
 from aiter.test_common import (
     perftest,
 )
@@ -15,7 +15,14 @@ import pytest
 import sys
 from dataclasses import dataclass
 from typing import Tuple
+from enum import Enum
 
+REF_BY_TRITON = False
+
+if REF_BY_TRITON:
+    from aiter.ops.triton.mha import flash_attn_func
+else:
+    from aiter import flash_attn_func
 
 def run_torch(
     q,
@@ -190,31 +197,38 @@ def test_fmha_v3_fwd_ck(
 
 if __name__ == "__main__":
 
+    class MaskType(Enum):
+        CAUSAL = 1
+        NOT_CAUSAL = 2
+        BOTH = 3
+
     @dataclass
     class ProblemSize:
         batch_size: int
         nheads_qk: Tuple[int, ...]
         seqlens: Tuple[int, ...]
         head_sizes: Tuple[int, ...]
+        causal: MaskType
 
     profile = True
     seed = 0
 
     problem_sizes = [
         # batch_size, (nheads, nheads_k), (seqlen_q, seqlen_k), (d, d_v)
-        ProblemSize(32, (16,), (512,), (128,)),
-        ProblemSize(16, (16,), (1024,), (128,)),
-        ProblemSize(8, (16,), (2048,), (128,)),
-        ProblemSize(4, (16,), (4096,), (128,)),
-        ProblemSize(2, (16,), (8192,), (128,)),
-        ProblemSize(1, (16,), (16384,), (128,)),
-        ProblemSize(1, (64,), (16384,), (128,)),
-        ProblemSize(1, (16, 1), (65536,), (128,)),
-        ProblemSize(1, (40,), (37200,), (128,)),
+        ProblemSize(32, (16,), (512,), (128,), MaskType.BOTH),
+        ProblemSize(16, (16,), (1024,), (128,), MaskType.BOTH),
+        ProblemSize(8, (16,), (2048,), (128,), MaskType.BOTH),
+        ProblemSize(4, (16,), (4096,), (128,), MaskType.BOTH),
+        ProblemSize(2, (16,), (8192,), (128,), MaskType.BOTH),
+        ProblemSize(1, (16,), (16384,), (128,), MaskType.BOTH),
+        ProblemSize(1, (64,), (16384,), (128,), MaskType.BOTH),
+        ProblemSize(1, (16, 1), (65536,), (128,), MaskType.BOTH),
     ]
 
-    for causal, dtype, problem_size in itertools.product(
-        [False, True], [dtypes.fp16, dtypes.bf16], problem_sizes
+    l_dtypes = [dtypes.bf16]
+
+    for dtype, problem_size in itertools.product(
+        l_dtypes, problem_sizes
     ):
         batch_size = problem_size.batch_size
         nheads, nheads_k = (
@@ -233,23 +247,28 @@ if __name__ == "__main__":
             else problem_size.head_sizes * 2
         )
 
+        if problem_size.causal == MaskType.BOTH:
+            l_causal = [False, True]
+        else:
+            l_causal = [True] if problem_size.causal == MaskType.CAUSAL else [False]
+
         assert nheads == nheads_k or nheads_k == 1
         mha_type = "mha" if nheads == nheads_k else "mqa"
 
-        print(
-            f"b:{batch_size}, h:{nheads}/{nheads_k}, s={seqlen_q}/{seqlen_k}, causal={causal}, dtype={dtype}"
-        )
-
-        test_fmha_v3_fwd_ck(
-            batch_size,
-            nheads,
-            seqlen_q,
-            seqlen_k,
-            d,
-            d_v,
-            causal,
-            mha_type,
-            dtype,
-            seed,
-            profile=profile,
-        )
+        for causal in l_causal:
+            print(
+                f"b:{batch_size}, h:{nheads}/{nheads_k}, s={seqlen_q}/{seqlen_k}, causal={causal}, dtype={dtype}"
+            )
+            test_fmha_v3_fwd_ck(
+                batch_size,
+                nheads,
+                seqlen_q,
+                seqlen_k,
+                d,
+                d_v,
+                causal,
+                mha_type,
+                dtype,
+                seed,
+                profile=profile,
+            )
