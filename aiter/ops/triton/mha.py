@@ -1237,10 +1237,11 @@ def _attn_fwd_persistent_vanilla(
             cu_seqlens_k_start0 = cu_seqlens_k_start1
             continue_condition0 = continue_condition1
 
-        if tile_id + 2 * NUM_WGS < num_tiles:
-            off_q_head1 = tile_id % NUM_Q_HEADS
-            start_m1 = tile_id // NUM_Q_HEADS % NUM_BLOCKS
-            off_z1 = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
+        tile_id1 = tile_id + 2 * NUM_WGS
+        if tile_id1 < num_tiles:
+            off_q_head1 = tile_id1 % NUM_Q_HEADS
+            start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
+            off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
             offs_m1 = start_m1 * BLOCK_M + offs_m
 
             continue_condition1, cu_seqlens_q_start1, cu_seqlens_k_start1, seqlen_q1, seqlen_k1= _get_qk_data(

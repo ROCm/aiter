@@ -17,12 +17,12 @@
       "num_stages": 4
     },
     "persistent": {
-      "BLOCK_M": 256,
+      "BLOCK_M": 128,
       "BLOCK_N": 64,
-      "waves_per_eu": 2,
-      "num_warps": 8,
+      "waves_per_eu": 1,
+      "num_warps": 4,
       "num_ctas": 1,
-      "num_stages": 1
+      "num_stages": 2
     }
   },
   "bkwd_fused" : {
