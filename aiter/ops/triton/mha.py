@@ -1416,17 +1416,17 @@ def _attn_fwd_persistent_vanilla(
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+    off_z_old = -1
 
     for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, num_stages=2):
         off_q_head = tile_id % NUM_Q_HEADS
         start_m = tile_id // NUM_Q_HEADS % NUM_BLOCKS
         off_z = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
-        off_z_old = (tile_id - 1) // (NUM_Q_HEADS * NUM_BLOCKS)
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
         continue_condition = True
 
-        if VARLEN and (not (off_z == off_z_old)):
+        if VARLEN and (off_z != off_z_old):
             cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
             cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
 
@@ -1515,6 +1515,7 @@ def _attn_fwd_persistent_vanilla(
             IS_FP8,
             FP8_MAX,
             VARLEN)
+        off_z_old = off_z
 
     
 @triton.jit

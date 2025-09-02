@@ -631,8 +631,6 @@ def test_mha_backward_varlen(
 ):
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    if FUSED and CAUSAL:
-        pytest.skip("FUSED+CAUSAL results in NaNs")
 
     mha_set_use_fused_bwd_kernel(FUSED)
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
