@@ -76,10 +76,8 @@ template <typename FlatmmConfig,
           typename ELayout,
           ck_tile::MoeFlatmmKind moe_kind,
           typename CDEElementWise,
-          typename ScaleM,
-          typename ScaleN>
-void moe_gemm(const ck_tile::MoeFlatmmHostArgs<ScaleM, ScaleN>& args,
-               const ck_stream_config& s)
+          typename MoeFlatmmHostArgs>
+void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 {
         using CodegenFlatmmShape = ck_tile::TileGemmShape<
         ck_tile::sequence<FlatmmConfig::M_Tile, FlatmmConfig::N_Tile, FlatmmConfig::K_Tile>,

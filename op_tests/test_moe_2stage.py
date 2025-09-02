@@ -128,6 +128,7 @@ def cktile_moe_stage1(
     num_valid_ids,  # [1]
     w1_scale,
     a1_scale,
+    exp_bias1,
     dtype,
     topk,
     block_size=32,
@@ -156,6 +157,7 @@ def cktile_moe_stage1(
         sorted_weights,
         a1_scale,
         w1_scale,
+        exp_bias1,
         block_size,
     )
     return out
@@ -169,6 +171,7 @@ def cktile_moe_stage2(
     num_valid_ids,  # [1]
     w2_scale,
     a2_scale,
+    exp_bias2,
     dtype,
     topk,
     block_size=32,
@@ -197,6 +200,7 @@ def cktile_moe_stage2(
         sorted_weights,
         a2_scale,
         w2_scale,
+        exp_bias2,
         block_size,
     )
     return out
@@ -278,10 +282,12 @@ def test_fmoe(
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
+        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
+        exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
-
+    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
@@ -388,6 +394,10 @@ def test_fmoe(
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
+    #bias dtype convert
+    exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
+    exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
+
     #pre-shuffle
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
@@ -469,6 +479,7 @@ def test_fmoe(
         quant_type=qType,
         a1_scale=a1_scale,
         w1_scale=w1_scale,
+        w1_bias=exp_bias1,
         doweight=doweight_stage1,
     )
 
@@ -505,6 +516,7 @@ def test_fmoe(
         num_valid_ids,
         w1_scale_aiter,
         a1_scale,
+        exp_bias1_aiter,
         dtype,
         topk,
         BLOCK_SIZE_M,
@@ -575,6 +587,7 @@ def test_fmoe(
         quant_type=qType,
         w2_scale=w2_scale,
         a2_scale=a2_scale,
+        w2_bias=exp_bias2,
         doweight=not doweight_stage1,
     )
     # # out_ref = torch_moe(
@@ -617,6 +630,7 @@ def test_fmoe(
         num_valid_ids,
         w2_scale_aiter,
         a2_scale,
+        exp_bias2_aiter,
         dtype,
         topk,
         BLOCK_SIZE_M,
@@ -684,10 +698,10 @@ def test_fmoe(
 
 l_dtype = ["bf16", "fp16"][:1]
 # l_dim = [(6144, 4096)]
-l_dim = [(512, 256)]
-# l_dim = [(3072, 3072)]
+# l_dim = [(512, 256)]
+l_dim = [(3072, 3072)]
 l_tokenNum = [
-    1,
+    # 1,
     # 3,
     # 5,
     # 16,
@@ -697,7 +711,7 @@ l_tokenNum = [
     # 256,
     # 1024,
     # 4096,
-    # 8192,
+    8192,
     # 163840,
 ]
 l_quant = [

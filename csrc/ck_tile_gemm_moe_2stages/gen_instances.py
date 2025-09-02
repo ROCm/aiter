@@ -55,7 +55,8 @@ torch::Tensor
     int topk,
     std::optional<torch::Tensor> topk_weight  = std::nullopt,
     std::optional<torch::Tensor> x_scale      = std::nullopt,
-    std::optional<torch::Tensor> w_scale      = std::nullopt)
+    std::optional<torch::Tensor> w_scale      = std::nullopt,
+    std::optional<torch::Tensor> exp_bias     = std::nullopt)
 {{{{
     // The smallest kernel we have available. Works well for memory bound shapes.
     int NumTokens = XQ.size(0);
@@ -77,8 +78,10 @@ torch::Tensor
         #default no quant
         scaleGranA = "-1"
         scaleGranB = "-1"
+        biasGran = "-1"
         xptr = "nullptr"
         wptr = "nullptr"
+        biasptr = "nullptr"
         if (k.QuantType == "per_tenser"):
             scaleGranA = "0"
             scaleGranB = "0"
@@ -92,12 +95,17 @@ torch::Tensor
         elif (k.QuantType == "1x32"):
             scaleGranA = "-1"
             scaleGranB = "1, 32"
+            biasGran = "1"
             xptr = "nullptr"
             wptr = "static_cast<float*>(w_scale.value().data_ptr())"
+            biasptr = "static_cast<float*>(exp_bias.value().data_ptr())"
 
         INSTANCE_CONTENT = f"""auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranA}>{{{xptr}}};
     auto per_b_scale_dev_ptr = ck_tile::FlatmmScalePointer<{scaleGranB}>{{{wptr}}};
-    ck_tile::MoeFlatmmHostArgs<decltype(per_a_scale_dev_ptr), decltype(per_b_scale_dev_ptr)> kernel_args{{
+    auto exp_bias_dev_ptr = ck_tile::FlatmmScalePointer<{biasGran}>{{{biasptr}}};
+    ck_tile::MoeFlatmmHostArgs<decltype(per_a_scale_dev_ptr), 
+                               decltype(per_b_scale_dev_ptr), 
+                               decltype(exp_bias_dev_ptr)> kernel_args{{
                 reinterpret_cast<const ck_tile::index_t*>(sorted_ids.data_ptr()),
                 sorted_weights_ptr,
                 reinterpret_cast<const ck_tile::index_t*>(sorted_expert_ids.data_ptr()),
@@ -116,7 +124,8 @@ torch::Tensor
                 stride_B,
                 stride_C,
                 per_a_scale_dev_ptr,
-                per_b_scale_dev_ptr
+                per_b_scale_dev_ptr,
+                exp_bias_dev_ptr
     }};
     using TileConfig = MoeFlatmmConfig<ADataType,
         {k.MPerBlock},
@@ -169,7 +178,8 @@ template torch::Tensor
     int topk,
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
-    std::optional<torch::Tensor> w_scale);
+    std::optional<torch::Tensor> w_scale,
+    std::optional<torch::Tensor> exp_bias);
 
 """
         # if self.istune:
@@ -358,7 +368,8 @@ torch::Tensor
     int topk,
     std::optional<torch::Tensor> topk_weight,
     std::optional<torch::Tensor> x_scale,
-    std::optional<torch::Tensor> w_scale);
+    std::optional<torch::Tensor> w_scale,
+    std::optional<torch::Tensor> exp_bias);
 """
         MAINFEST_end = """
 
