@@ -9,13 +9,13 @@ export CK_REPEAT=1
 
 COMMON_ARGS='-v=1'
 set -x
-for prec in "bf16" ; do
+for prec in "fp16" "bf16" ; do
 for perm in 0 1 ; do
-for hdim in 128 256 ; do
+for hdim in 32 64 128 256 ; do
 for mode in 0 1 ; do
-for bias in "n" ; do
+for bias in "n" "a" ; do
 for dbias in 0 ; do
-for p_drop in 0.0 ; do
+for p_drop in 0.0 0.2 ; do
 for deterministic in 0 ; do
 for atomic_fp32 in 0 1 ; do
 
