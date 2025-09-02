@@ -367,7 +367,7 @@ def _process_tile(
     start_m: tl.constexpr,
     off_z: tl.constexpr,
     off_q_head: tl.constexpr,
-    q_ptr: torch.Tensor,
+    q,
     k_ptr: torch.Tensor,
     v_ptr: torch.Tensor,
     descale_q_ptr: torch.Tensor,
@@ -510,16 +510,7 @@ def _process_tile(
             else:
                 off_k_head = off_q_head
 
-            # q,k,v offsets
-            q_offs = (
-                off_z * stride_qz
-                + off_q_head * stride_qh
-                + cu_seqlens_q_start * stride_qm
-                + offs_m[:, None] * stride_qm
-                + offs_d[None, :] * stride_qk
-            )
-            q_ptrs = q_ptr + q_offs
-
+            # k,v offsets
             k_offs = (
                 off_z * stride_kz
                 + off_k_head * stride_kh
@@ -581,11 +572,6 @@ def _process_tile(
             l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=tl.float32)
             qk_scale: tl.constexpr = sm_scale * 1.44269504089
-            if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
-                q_mask = offs_m[:, None] < seqlen_q
-            else:
-                q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
-            q = tl.load(q_ptrs, mask=q_mask, other=0.0)
             if IS_FP8:
                 descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
                 descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -1235,7 +1221,79 @@ def _attn_fwd_persistent_static(
             VARLEN,
             USE_INT64_STRIDES)
 
+
+@triton.jit
+def _get_qk_data(
+    start_m,
+    off_z,
+    # off_z_old,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    BLOCK_M,
+    SEQLEN_Q,
+    SEQLEN_K,
+    VARLEN,
+    # continue_condition_old, cu_seqlens_q_start_old, cu_seqlens_k_start_old, seqlen_q_old, seqlen_k_old
+):
+    # if off_z == off_z_old:
+        # return continue_condition_old, cu_seqlens_q_start_old, cu_seqlens_k_start_old, seqlen_q_old, seqlen_k_old
     
+    continue_condition = True
+
+    if VARLEN:
+        cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
+        cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
+
+        seqlen_q = cu_seqlens_q_end - cu_seqlens_q_start
+        # We have a one-size-fits-all grid in id(0). Some seqlens might be too
+        # small for all start_m so for those we return early.
+        if start_m * BLOCK_M > seqlen_q:
+            continue_condition = False
+        cu_seqlens_k_start = tl.load(cu_seqlens_k + off_z)
+        cu_seqlens_k_end = tl.load(cu_seqlens_k + off_z + 1)
+        seqlen_k = cu_seqlens_k_end - cu_seqlens_k_start
+    else:
+        cu_seqlens_q_start = 0
+        cu_seqlens_k_start = 0
+        seqlen_q = SEQLEN_Q
+        seqlen_k = SEQLEN_K
+
+    return continue_condition, cu_seqlens_q_start, cu_seqlens_k_start, seqlen_q, seqlen_k
+
+
+@triton.jit
+def _load_query(
+    q_ptr: torch.Tensor,
+    offs_m,
+    offs_d,
+    seqlen_q,
+    cu_seqlens_q_start,
+    off_z: tl.constexpr,
+    off_q_head: tl.constexpr,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DMODEL_POW2: tl.constexpr,
+):
+    q_offs = (
+        off_z * stride_qz
+        + off_q_head * stride_qh
+        + cu_seqlens_q_start * stride_qm
+        + offs_m[:, None] * stride_qm
+        + offs_d[None, :] * stride_qk
+    )
+    q_ptrs = q_ptr + q_offs            
+    
+    if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
+        q_mask = offs_m[:, None] < seqlen_q
+    else:
+        q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+    return q
+
+
 @triton.jit
 def _attn_fwd_persistent_vanilla(
     q_ptr: torch.Tensor,
@@ -1416,7 +1474,12 @@ def _attn_fwd_persistent_vanilla(
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
-    off_z_old = -1
+    # off_z_old = -1
+    # continue_condition_old = True
+    # cu_seqlens_q_start_old = 0
+    # cu_seqlens_k_start_old = 0
+    # seqlen_q_old = 0
+    # seqlen_k_old = 0
 
     for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, num_stages=2):
         off_q_head = tile_id % NUM_Q_HEADS
@@ -1424,98 +1487,115 @@ def _attn_fwd_persistent_vanilla(
         off_z = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
         offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
-        continue_condition = True
-
-        if VARLEN and (off_z != off_z_old):
-            cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
-            cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
-
-            seqlen_q = cu_seqlens_q_end - cu_seqlens_q_start
-            # We have a one-size-fits-all grid in id(0). Some seqlens might be too
-            # small for all start_m so for those we return early.
-            if start_m * BLOCK_M > seqlen_q:
-                continue_condition = False
-            cu_seqlens_k_start = tl.load(cu_seqlens_k + off_z)
-            cu_seqlens_k_end = tl.load(cu_seqlens_k + off_z + 1)
-            seqlen_k = cu_seqlens_k_end - cu_seqlens_k_start
-        else:
-            cu_seqlens_q_start = 0
-            cu_seqlens_k_start = 0
-            seqlen_q = SEQLEN_Q
-            seqlen_k = SEQLEN_K
-
-        _process_tile(
+        continue_condition, cu_seqlens_q_start, cu_seqlens_k_start, seqlen_q, seqlen_k = _get_qk_data(
             start_m,
             off_z,
-            off_q_head,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            descale_q_ptr,
-            descale_k_ptr,
-            descale_v_ptr,
-            out_ptr,
-            alibi_slopes_ptr,
-            s_dmask_ptr,
-            dropout_mask_ptr,
-            softmax_lse_ptr,
-            stride_qz,
-            stride_qh,
-            stride_qm,
-            stride_qk,
-            stride_kz,
-            stride_kh,
-            stride_kn,
-            stride_kk,
-            stride_vz,
-            stride_vh,
-            stride_vn,
-            stride_vk,
-            stride_descale_q_z,
-            stride_descale_k_z,
-            stride_descale_v_z,
-            stride_oz,
-            stride_oh,
-            stride_om,
-            stride_on,
-            stride_alibi_z,
-            stride_alibi_h,
-            stride_sd_z,
-            stride_sd_h,
-            stride_sd_m,
-            stride_sd_n,
-            stride_lse_z,
-            stride_lse_h,
-            stride_lse_m,
-            sm_scale,
+            # off_z_old,
             cu_seqlens_q,
             cu_seqlens_k,
-            dropout_p,
-            philox_seed,
-            philox_offset_base,
-            offs_m,
-            offs_n,
-            offs_d,
-            continue_condition,
-            cu_seqlens_q_start,
-            cu_seqlens_k_start,
-            seqlen_q,
-            seqlen_k,
+            BLOCK_M,
             SEQLEN_Q,
             SEQLEN_K,
-            IS_CAUSAL,
-            NUM_Q_HEADS,
-            NUM_K_HEADS,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            RETURN_SCORES,
-            ENABLE_DROPOUT,
-            IS_FP8,
-            FP8_MAX,
-            VARLEN)
-        off_z_old = off_z
+            VARLEN,
+            # continue_condition_old, cu_seqlens_q_start_old, cu_seqlens_k_start_old, seqlen_q_old, seqlen_k_old,
+        )
+
+        if continue_condition:
+            q = _load_query(
+                q_ptr,
+                offs_m,
+                offs_d,
+                seqlen_q,
+                cu_seqlens_q_start,
+                off_z,
+                off_q_head,
+                stride_qz,
+                stride_qh,
+                stride_qm,
+                stride_qk,
+                BLOCK_DMODEL,
+                BLOCK_DMODEL_POW2,
+            )
+
+            _process_tile(
+                start_m,
+                off_z,
+                off_q_head,
+                q,
+                k_ptr,
+                v_ptr,
+                descale_q_ptr,
+                descale_k_ptr,
+                descale_v_ptr,
+                out_ptr,
+                alibi_slopes_ptr,
+                s_dmask_ptr,
+                dropout_mask_ptr,
+                softmax_lse_ptr,
+                stride_qz,
+                stride_qh,
+                stride_qm,
+                stride_qk,
+                stride_kz,
+                stride_kh,
+                stride_kn,
+                stride_kk,
+                stride_vz,
+                stride_vh,
+                stride_vn,
+                stride_vk,
+                stride_descale_q_z,
+                stride_descale_k_z,
+                stride_descale_v_z,
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,
+                stride_alibi_z,
+                stride_alibi_h,
+                stride_sd_z,
+                stride_sd_h,
+                stride_sd_m,
+                stride_sd_n,
+                stride_lse_z,
+                stride_lse_h,
+                stride_lse_m,
+                sm_scale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                offs_m,
+                offs_n,
+                offs_d,
+                continue_condition,
+                cu_seqlens_q_start,
+                cu_seqlens_k_start,
+                seqlen_q,
+                seqlen_k,
+                SEQLEN_Q,
+                SEQLEN_K,
+                IS_CAUSAL,
+                NUM_Q_HEADS,
+                NUM_K_HEADS,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_DMODEL,
+                BLOCK_DMODEL_POW2,
+                RETURN_SCORES,
+                ENABLE_DROPOUT,
+                IS_FP8,
+                FP8_MAX,
+                VARLEN
+            )
+
+        # off_z_old = off_z
+        # continue_condition_old = continue_condition
+        # cu_seqlens_q_start_old = cu_seqlens_q_start
+        # cu_seqlens_k_start_old = cu_seqlens_k_start
+        # seqlen_q_old = seqlen_q
+        # seqlen_k_old = seqlen_k
 
     
 @triton.jit
