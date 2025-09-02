@@ -108,7 +108,7 @@ def post_process(rets, fast_mode=False, tol_err_ratio=0.05):
     bestConfigs = []
     best_config = [cur_info, -1, 1.0]
     for info, us, max_err_ratio in sorted_rets:
-        print(f"{info=}, {us=}, {max_err_ratio=}")
+        # print(f"{info=}, {us=}, {max_err_ratio=}")
         if max_err_ratio > tol_err_ratio:
             continue
         if info[0] == cur_info[0]:

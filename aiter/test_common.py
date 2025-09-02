@@ -18,7 +18,7 @@ pd.set_option("display.max_rows", 200)
 
 
 def perftest(
-    num_iters=51, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=True
+    num_iters=101, num_warmup=2, testGraph=False, num_rotate_args=0, needTrace=False
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -69,15 +69,14 @@ def perftest(
                     run_iters(1, graph.replay)
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
-            needTrace = True
             with tpf.profile(
                 activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                 profile_memory=False,
                 with_stack=False,
-                with_modules=False,
+                with_modules=True,
                 # record_shapes=True,
                 on_trace_ready=(
-                    tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")  ##
+                    tpf.tensorboard_trace_handler(f"./aiter_logs/gpu_id_{gpu_id}")
                     if needTrace
                     else None
                 ),
@@ -85,8 +84,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-                # prof.step()
-            # time.sleep(1)
+
             avg = get_trace_perf(prof, num_iters)
             return data, avg
 
@@ -227,14 +225,12 @@ def post_process_data(df, num_iters, warm_iter=1):
     kernels_num = int(len(device_df) / num_iters)
 
     act_iters = num_iters
-    # print(
-    #    f"len of device_df is {len(device_df)}, kernels_num is {kernels_num}, gpuid is  {torch.cuda.current_device()}"
-    # )
     valid_n = len(device_df)
     dropped_indexs = []
     if len(device_df) % num_iters == 0:
         kernels_num = int(len(device_df) / num_iters)
     else:
+        ##get correct kernel num
         name_list = device_df["name"].tolist()
         max_kernel_num = 20
         n = len(name_list)
@@ -309,7 +305,6 @@ def get_trace_perf(prof, num_iters):
     dropped_indexs, dropped_num = post_process_data(
         df, num_iters + warm_iter, warm_iter
     )
-
     df = df.drop(dropped_indexs)
     iter_init = 0  # warm_iter dropped
     df["cnt"] = 1
@@ -360,11 +355,7 @@ def get_trace_perf(prof, num_iters):
         if el == "host_time_sum":
             df.at[avg_name, el] = df[el].sum() / num_iters
         else:
-
             df.at[avg_name, el] = df[el].sum() / actual_iters
-            print(
-                f"calc time {df[el].sum()}, {actual_iters}, time is {df.at[avg_name, el]}, {df[el].sum() / actual_iters}"
-            )
     if int(os.environ.get("AITER_LOG_MORE", 0)):
         pd.set_option("display.expand_frame_repr", False)
         pd.set_option("display.max_colwidth", 90)
