@@ -100,15 +100,15 @@ def _gemm_a8w8_blockscale_kernel(
         pid_n = pid % num_pid_n
 
     blocked_mk: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[4, 16],  # 128 * 128
+        size_per_thread=[1, 16],  # 16 * 128
         threads_per_warp=[8, 8],
-        warps_per_cta=[4, 1],
+        warps_per_cta=[2, 1],
         order=[1, 0],
     )
     blocked_kn: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[16, 4],
+        size_per_thread=[16, 1], # 16 * 128
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, 4],
+        warps_per_cta=[1, 2],
         order=[0, 1],
     )
 
@@ -125,7 +125,7 @@ def _gemm_a8w8_blockscale_kernel(
         vec=16, per_phase=2, max_phase=8, order=[0]
     )
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 2]
+        version=4, instr_shape=[16, 16], transposed=True, warps_per_cta=[2, 1]
     )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=16
@@ -194,8 +194,8 @@ def _gemm_a8w8_blockscale_kernel(
             cache=cache_modifier,
         )
         offs_b = offs_bk_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        offs_bsn = offs_bn // GROUP_N
-        offs_b_scale = offs_k_scale * stride_bscale_k + offs_bsn * stride_bscale_n
+        offs_b_scale_n = offs_bn // GROUP_N
+        offs_b_scale = offs_k_scale * stride_bscale_k + offs_b_scale_n * stride_bscale_n
 
         if EVEN_K:
             b = gl.amd.cdna4.buffer_load(
@@ -378,11 +378,11 @@ def _gemm_a8w8_blockscale_reduce_kernel(
     )
     if ACTUAL_KSPLIT == MAX_KSPLIT:
         c_in_mask = (offs_m[None, :, None] < M) & (offs_n[None, None, :] < N)
-        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs, mask=c_in_mask, cache=".cg")
+        c = gl.amd.cdna4.buffer_load(c_in_ptr, c_in_offs, mask=c_in_mask, cache=".ca")
     else:
         c_in_mask = (offs_m[None, :, None] < M) & (offs_n[None, None, :] < N) & (offs_k[:, None, None] < ACTUAL_KSPLIT)
         c = gl.amd.cdna4.buffer_load(
-            c_in_ptr, c_in_offs, mask=c_in_mask, cache=".cg"
+            c_in_ptr, c_in_offs, mask=c_in_mask, cache=".ca"
         )  # , other=0.0)
     c = tl.sum(c, 0)
 
@@ -555,8 +555,6 @@ def gemm_a8w8_blockscale(
             triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
         )
 
-        print(f"y_pp strides:{y_pp.stride()}")
-        print(f"y_strides:{y.stride()}")
         _gemm_a8w8_blockscale_reduce_kernel[grid_reduce](
             y_pp,
             y,
