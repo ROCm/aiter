@@ -197,7 +197,6 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
-    q_mask,
     k_ptrs,
     v_ptrs,
     stride_kn,
@@ -222,6 +221,7 @@ def _attn_fwd_inner(
     descale_v,
     OFFS_M: tl.constexpr,
     OFFS_N: tl.constexpr,
+    OFFS_D: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -277,6 +277,10 @@ def _attn_fwd_inner(
             mask = tl.where(bound_cond, mask_partial, mask)
 
         # compute masks
+        if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
+            q_mask = OFFS_M[:, None] < seqlen_q
+        else:
+            q_mask = (OFFS_M[:, None] < seqlen_q) & (OFFS_D[None, :] < BLOCK_DMODEL)
         k_mask = (start_n + tl.arange(0, BLOCK_N))[None, :] < seqlen_k
         p_mask = q_mask & k_mask
 
@@ -368,7 +372,6 @@ def _process_tile(
     off_z: tl.constexpr,
     off_q_head: tl.constexpr,
     q,
-    q_mask,
     k_ptr: torch.Tensor,
     v_ptr: torch.Tensor,
     descale_q_ptr: torch.Tensor,
@@ -609,7 +612,6 @@ def _process_tile(
                     l_i,
                     m_i,
                     q,
-                    q_mask,
                     k_ptrs,
                     v_ptrs,
                     stride_kn,
@@ -634,6 +636,7 @@ def _process_tile(
                     descale_v,
                     offs_m,
                     offs_n,
+                    offs_d,
                     BLOCK_M,
                     BLOCK_N,
                     BLOCK_DMODEL,
@@ -669,7 +672,6 @@ def _process_tile(
                     l_i,
                     m_i,
                     q,
-                    q_mask,
                     k_ptrs,
                     v_ptrs,
                     stride_kn,
@@ -694,6 +696,7 @@ def _process_tile(
                     descale_v,
                     offs_m,
                     offs_n,
+                    offs_d,
                     BLOCK_M,
                     BLOCK_N,
                     BLOCK_DMODEL,
@@ -890,7 +893,7 @@ def _load_query(
     else:
         q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
-    return q, q_mask
+    return q
 
 
 @triton.jit
@@ -1073,48 +1076,88 @@ def _attn_fwd_persistent_vanilla(
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
+    offs_m = tl.arange(0, BLOCK_M)
+    q_dtype = q_ptr.type.element_ty
+
+    tile_id0 = workgroup_id
+    off_q_head0 = tile_id0 % NUM_Q_HEADS
+    start_m0 = tile_id0 // NUM_Q_HEADS % NUM_BLOCKS
+    off_z0 = tile_id0 // (NUM_Q_HEADS * NUM_BLOCKS)
+    offs_m0 = start_m0 * BLOCK_M + offs_m
+
+    continue_condition0, cu_seqlens_q_start0, cu_seqlens_k_start0, seqlen_q0, seqlen_k0= _get_qk_data(
+        start_m0,
+        off_z0,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        BLOCK_M,
+        SEQLEN_Q,
+        SEQLEN_K,
+        VARLEN,
+    )
+
+    if continue_condition0:
+        q0 = _load_query(
+            q_ptr,
+            offs_m0,
+            offs_d,
+            seqlen_q0,
+            cu_seqlens_q_start0,
+            off_z0,
+            off_q_head0,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+        )
+    else:
+        q0 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
+
+    tile_id1 = workgroup_id + NUM_WGS
+    off_q_head1 = tile_id1 % NUM_Q_HEADS
+    start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
+    off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
+    offs_m1 = start_m1 * BLOCK_M + offs_m
+
+    continue_condition1, cu_seqlens_q_start1, cu_seqlens_k_start1, seqlen_q1, seqlen_k1= _get_qk_data(
+        start_m1,
+        off_z1,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        BLOCK_M,
+        SEQLEN_Q,
+        SEQLEN_K,
+        VARLEN,
+    )
+
+    if continue_condition1:
+        q1 = _load_query(
+            q_ptr,
+            offs_m1,
+            offs_d,
+            seqlen_q1,
+            cu_seqlens_q_start1,
+            off_z1,
+            off_q_head1,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+        )
+    else:
+        q1 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
 
     for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, num_stages=2):
-        # if tile_id < num_tiles:
-        off_q_head1 = tile_id % NUM_Q_HEADS
-        start_m1 = tile_id // NUM_Q_HEADS % NUM_BLOCKS
-        off_z1 = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
-        offs_m1 = start_m1 * BLOCK_M + tl.arange(0, BLOCK_M)
-
-        continue_condition1, cu_seqlens_q_start1, cu_seqlens_k_start1, seqlen_q1, seqlen_k1= _get_qk_data(
-            start_m1,
-            off_z1,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            BLOCK_M,
-            SEQLEN_Q,
-            SEQLEN_K,
-            VARLEN,
-        )
-
-        if continue_condition1:
-            q1, q_mask1 = _load_query(
-                q_ptr,
-                offs_m1,
-                offs_d,
-                seqlen_q1,
-                cu_seqlens_q_start1,
-                off_z1,
-                off_q_head1,
-                stride_qz,
-                stride_qh,
-                stride_qm,
-                stride_qk,
-                BLOCK_DMODEL,
-                BLOCK_DMODEL_POW2,
-            )
-
+        if continue_condition0:
             _process_tile(
-                start_m1,
-                off_z1,
-                off_q_head1,
-                q1,
-                q_mask1,
+                start_m0,
+                off_z0,
+                off_q_head0,
+                q0,
                 k_ptr,
                 v_ptr,
                 descale_q_ptr,
@@ -1159,14 +1202,14 @@ def _attn_fwd_persistent_vanilla(
                 dropout_p,
                 philox_seed,
                 philox_offset_base,
-                offs_m1,
+                offs_m0,
                 offs_n,
                 offs_d,
-                continue_condition1,
-                cu_seqlens_q_start1,
-                cu_seqlens_k_start1,
-                seqlen_q1,
-                seqlen_k1,
+                continue_condition0,
+                cu_seqlens_q_start0,
+                cu_seqlens_k_start0,
+                seqlen_q0,
+                seqlen_k0,
                 SEQLEN_Q,
                 SEQLEN_K,
                 IS_CAUSAL,
@@ -1182,6 +1225,51 @@ def _attn_fwd_persistent_vanilla(
                 FP8_MAX,
                 VARLEN
             )
+
+        if tile_id + NUM_WGS < num_tiles:
+            start_m0 = start_m1
+            off_z0 = off_z1
+            off_q_head0 = off_q_head1
+            q0 = q1
+            seqlen_q0 = seqlen_q1
+            seqlen_k0 = seqlen_k1
+            cu_seqlens_q_start0 = cu_seqlens_q_start1
+            cu_seqlens_k_start0 = cu_seqlens_k_start1
+            continue_condition0 = continue_condition1
+
+        if tile_id + 2 * NUM_WGS < num_tiles:
+            off_q_head1 = tile_id % NUM_Q_HEADS
+            start_m1 = tile_id // NUM_Q_HEADS % NUM_BLOCKS
+            off_z1 = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
+            offs_m1 = start_m1 * BLOCK_M + offs_m
+
+            continue_condition1, cu_seqlens_q_start1, cu_seqlens_k_start1, seqlen_q1, seqlen_k1= _get_qk_data(
+                start_m1,
+                off_z1,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                BLOCK_M,
+                SEQLEN_Q,
+                SEQLEN_K,
+                VARLEN,
+            )
+
+            if continue_condition1:
+                q1 = _load_query(
+                    q_ptr,
+                    offs_m1,
+                    offs_d,
+                    seqlen_q1,
+                    cu_seqlens_q_start1,
+                    off_z1,
+                    off_q_head1,
+                    stride_qz,
+                    stride_qh,
+                    stride_qm,
+                    stride_qk,
+                    BLOCK_DMODEL,
+                    BLOCK_DMODEL_POW2,
+                )
 
     
 @triton.jit
