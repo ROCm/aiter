@@ -376,6 +376,7 @@ struct MlaMetadataV1KernelParameter
     int32_t        num_cu;
     int32_t        reduce_indptr_size;
     bool           is_causal;
+    int32_t        page_block_size;
 };
 
 CK_TILE_DEVICE int32_t estimate_total_workload(
@@ -425,6 +426,7 @@ CK_TILE_DEVICE void generate_work(
     const int32_t       kv_batch_end,
     const int32_t       workload_limit_global,
     const int32_t       num_clusters,
+    const int32_t       page_block_size,
     const int32_t*      p_work_indptr,
     const int32_t*      p_num_qo_clusters_indptr,
     int32_t*            p_loc_partial_outputs,
@@ -460,7 +462,8 @@ CK_TILE_DEVICE void generate_work(
             const int32_t limit_ori = ck_tile::max(remaining_capability, kv_len_limit_floor);
             const int32_t tail_size = (remaining_kv_len > limit_ori) ? (remaining_kv_len - limit_ori) : 0x7fffffff;
             const int32_t limit_fin = (tail_size <= Traits::kSplitTolerance) ? remaining_kv_len : limit_ori;
-            return limit_fin;
+            const int32_t limit_fin_aligned = (limit_fin + page_block_size / 2) / page_block_size * page_block_size;
+            return limit_fin_aligned;
         }();
         const int32_t kv_len_consuming = ck_tile::min(remaining_kv_len, kv_len_limit_local);
 
@@ -553,16 +556,29 @@ __global__ void kn_get_mla_metadata_v1(
     extern __shared__ uint8_t p_smem[];
 
     const int32_t lane_idx = ck_tile::get_lane_id();
+    const int32_t page_block_size = params.page_block_size;
 
     // Step.0. Get sequence lengths of query/output and key/value for each batch.
     int32_t* p_batch_idx = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_qo_lens   = p_batch_idx + params.num_batches;
     int32_t* p_kv_lens   = p_qo_lens + params.num_batches;
+    int32_t* p_pads      = p_qo_lens + params.num_batches;
+
     for (int32_t bid = lane_idx; bid < params.num_batches; bid += ck_tile::get_warp_size())
     {
         p_batch_idx[bid] = bid;
         p_qo_lens[bid] = params.p_seqlens_qo_indptr[bid + 1] - params.p_seqlens_qo_indptr[bid];
         p_kv_lens[bid] = params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+        p_pads[bid + 1] = (p_kv_lens[bid] + page_block_size - 1) / page_block_size * page_block_size - p_kv_lens[bid];
+    }
+
+    if (threadIdx.x == 0)
+    {
+        p_pads[0] = 0;
+        for (int32_t bid = 1; bid < params.num_batches; ++bid)
+        {
+            p_pads[bid] += p_pads[bid - 1];
+        }
     }
 
     // Step.1. Calculate the size of cluster and some related information. The size is the number of workgroups
@@ -582,7 +598,7 @@ __global__ void kn_get_mla_metadata_v1(
     // Step.2.
     //   a. Get total valid (after causal masking) kv lengths and the maximun workload handled by each cluster
     //   b. Get a indptr array about #cluster for each batch in direction of qo.
-    int32_t* p_num_qo_clusters_indptr = p_kv_lens + params.num_batches;
+    int32_t* p_num_qo_clusters_indptr = p_pads + params.num_batches;
     if (lane_idx == 0)
     {
         p_num_qo_clusters_indptr[0] = 0;
@@ -661,14 +677,15 @@ __global__ void kn_get_mla_metadata_v1(
 
     // Step.5. Fill the output buffers except indptrs
     const int32_t max_qo_tiles = params.num_batches * Traits::kMaxQoTilePerBatch;
-
+    
     // Step.5.1. Get total work for each cluster
     for (int32_t idx = 0; idx < params.num_batches; ++idx)
     {
         const int32_t bid            = p_batch_idx[idx];
         const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
-        const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
+        const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid] + p_pads[bid];
+        const int32_t kv_batch_end = params.p_seqlens_kv_indptr[bid + 1] + p_pads[bid];
+
         const int32_t kv_len         = kv_batch_end - kv_batch_start;
         const int32_t qo_len         = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
         const int32_t packed_qo_len  = qo_len * params.num_heads;
@@ -682,7 +699,7 @@ __global__ void kn_get_mla_metadata_v1(
 
             generate_work<Traits, true>(
                 bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                workload_limit_global, num_clusters, nullptr, p_num_qo_clusters_indptr,
+                workload_limit_global, num_clusters, params.page_block_size, nullptr, p_num_qo_clusters_indptr,
                 nullptr, nullptr, nullptr, nullptr, nullptr, p_cost_heap, p_cluster_work_counter);
         }
     }
@@ -727,8 +744,10 @@ __global__ void kn_get_mla_metadata_v1(
     {
         const int32_t bid            = p_batch_idx[idx];
         const int32_t qo_batch_start = params.p_seqlens_qo_indptr[bid];
-        const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
-        const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
+        // const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid];
+        // const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1];
+        const int32_t kv_batch_start = params.p_seqlens_kv_indptr[bid] + p_pads[bid];
+        const int32_t kv_batch_end   = params.p_seqlens_kv_indptr[bid + 1] + p_pads[bid];
         const int32_t kv_len         = kv_batch_end - kv_batch_start;
         const int32_t qo_len         = params.p_seqlens_qo_indptr[bid + 1] - qo_batch_start;
         const int32_t packed_qo_len  = qo_len * params.num_heads;
@@ -749,7 +768,7 @@ __global__ void kn_get_mla_metadata_v1(
 
             generate_work<Traits, false>(
                 bid, tid, qo_len, tile_kv_len, cluster_len_q, qo_batch_start, kv_batch_start, kv_batch_end,
-                workload_limit_global, num_clusters, params.p_work_indptr, p_num_qo_clusters_indptr,
+                workload_limit_global, num_clusters, params.page_block_size, params.p_work_indptr, p_num_qo_clusters_indptr,
                 &loc_partial_outputs, &num_partial_outputs, p_work_info_set, p_reduce_final_map, p_reduce_partial_map,
                 p_cost_heap, p_cluster_work_counter);
         }
@@ -911,6 +930,7 @@ void get_mla_metadata_v1_device(
     params.num_cu               = num_cu;
     params.reduce_indptr_size   = reduce_indptr.size(0);
     params.is_causal            = is_causal;
+    params.page_block_size      = 32;
 
     // launch kernel
     const dim3 grid = dim3(1, 1, 1);

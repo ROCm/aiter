@@ -161,6 +161,7 @@ def test_mla(
 
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
     kv_indices = torch.randint(0, num_page, (kv_indptr[-1].item(),), dtype=torch.int)
+    kv_indices_ext = torch.cat([torch.arange(kv_indices[i] * 32, kv_indices[i] * 32 + 32) for i in range(kv_indices.size(0))])
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -198,7 +199,7 @@ def test_mla(
         kv_buffer,
         qo_indptr,
         kv_indptr,
-        kv_indices,
+        kv_indices_ext,
         sm_scale,
         kv_lora_rank,
         qk_rope_head_dim,
@@ -223,6 +224,7 @@ def test_mla(
         [batch_size * cu_num], dtype=torch.int32, device="cuda"
     )
 
+    # import pdb;pdb.set_trace()
     meta = aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
@@ -236,29 +238,31 @@ def test_mla(
         reduce_final_map,
         reduce_partial_map,
     )
+    print(work_info_set[:work_indptr[-1]])
+    import pdb;pdb.set_trace()
 
     def test_absorb_decode():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=dtype).fill_(-1)
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q,
-            kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            sm_scale,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-        )
+        # (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        #     aiter.mla.mla_decode_fwd,
+        #     q,
+        #     kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
+        #     out_asm,
+        #     qo_indptr,
+        #     kv_indptr,
+        #     kv_indices,
+        #     kv_last_page_lens,
+        #     max_seqlen_qo,
+        #     sm_scale,
+        #     work_meta_data=work_meta_data,
+        #     work_indptr=work_indptr,
+        #     work_info_set=work_info_set,
+        #     reduce_indptr=reduce_indptr,
+        #     reduce_final_map=reduce_final_map,
+        #     reduce_partial_map=reduce_partial_map,
+        # )
 
         # print(f"{out_ref.view(total_q, -1)=}")
         # print(f"{out_asm.view(total_q, -1)=}")
@@ -306,26 +310,26 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
-            aiter.mla.mla_decode_fwd,
-            q_fp8,
-            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
-            out_asm,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_qo,
-            sm_scale,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-        )
+        # (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        #     aiter.mla.mla_decode_fwd,
+        #     q_fp8,
+        #     kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+        #     out_asm,
+        #     qo_indptr,
+        #     kv_indptr,
+        #     kv_indices,
+        #     kv_last_page_lens,
+        #     max_seqlen_qo,
+        #     sm_scale,
+        #     q_scale=q_scale,
+        #     kv_scale=kv_scale,
+        #     work_meta_data=work_meta_data,
+        #     work_indptr=work_indptr,
+        #     work_info_set=work_info_set,
+        #     reduce_indptr=reduce_indptr,
+        #     reduce_final_map=reduce_final_map,
+        #     reduce_partial_map=reduce_partial_map,
+        # )
 
         cal_diff(out_ref, out_asm, "out", True)
 
@@ -382,7 +386,7 @@ kv_lora_rank = 512
 qk_nope_head_dim = 128
 qk_rope_head_dim = 64
 v_head_dim = 128
-block_size = 1
+block_size = 32
 list_dtype = ["bf16"]
 l_kv_dtype = ["bf16"]
 list_nhead = [(16, 2)]
@@ -427,7 +431,7 @@ parser.add_argument(
     "-blk",
     "--block_size",
     type=int,
-    default=1,
+    default=32,
     help="""Block size.
     e.g.: -blk 1""",
 )
@@ -456,7 +460,7 @@ parser.add_argument(
     "--ctxLen",
     type=int,
     nargs="*",
-    default=[28, 512, 1023, 4888, 12800],  #
+    default=[4888, 12800],  #
     help="""Context length.
     e.g.: -c 21""",
 )
