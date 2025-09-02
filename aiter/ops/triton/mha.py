@@ -1000,10 +1000,6 @@ def _attn_fwd_persistent_vanilla(
     offs_m = tl.arange(0, BLOCK_M)
     
     q_dtype = q_ptr.type.element_ty
-    
-    # preallocate both the query tensors, current tile and next tile
-    q0 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
-    q1 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
 
     # current query load
     tile_id0 = workgroup_id
@@ -1056,17 +1052,133 @@ def _attn_fwd_persistent_vanilla(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
         )
+    else:
+        q0 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
 
-    continue_condition1 = False
+    tile_id1 = tile_id0 + NUM_WGS
+    off_q_head1 = tile_id1 % NUM_Q_HEADS
+    start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
+    off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
+    offs_m1 = start_m1 * BLOCK_M + offs_m
+    continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = _check_validity(
+        offs_m1,
+        offs_d,
+        start_m1,
+        off_z1,
+        off_q_head1,
+        out_ptr,
+        softmax_lse_ptr,
+        stride_oz,
+        stride_oh,
+        stride_om,
+        stride_on,
+        stride_lse_z,
+        stride_lse_h,
+        stride_lse_m,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        SEQLEN_Q,
+        SEQLEN_K,
+        IS_CAUSAL,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_DMODEL,
+        BLOCK_DMODEL_POW2,
+        VARLEN
+    )
+    if continue_condition1: # load current query if valid
+        q1 = _load_query(
+            q_ptr,
+            offs_m1,
+            offs_d,
+            seqlen_q1,
+            cu_seqlens_q_start1,
+            off_z1,
+            off_q_head1,
+            stride_qz,
+            stride_qh,
+            stride_qm,
+            stride_qk,
+            BLOCK_DMODEL,
+            BLOCK_DMODEL_POW2,
+        )
+    else:
+        q1 = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=q_dtype)
 
-    for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS):
+    for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, num_stages=2):
+        if continue_condition0: # process current query if valid
+            _process_query(
+                q0,
+                offs_m0,
+                offs_n,
+                offs_d,
+                seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0,
+                start_m0,
+                off_z0,
+                off_q_head0, 
+                k_ptr,
+                v_ptr,
+                descale_q_ptr,
+                descale_k_ptr,
+                descale_v_ptr,
+                out_ptr,
+                alibi_slopes_ptr,
+                s_dmask_ptr,
+                dropout_mask_ptr,
+                softmax_lse_ptr,
+                stride_kz,
+                stride_kh,
+                stride_kn,
+                stride_kk,
+                stride_vz,  
+                stride_vh,
+                stride_vn,
+                stride_vk,
+                stride_descale_q_z,
+                stride_descale_k_z,
+                stride_descale_v_z,
+                stride_oz,
+                stride_oh,
+                stride_om,
+                stride_on,
+                stride_alibi_z,
+                stride_alibi_h,
+                stride_sd_z,
+                stride_sd_h,
+                stride_sd_m,
+                stride_sd_n,
+                stride_lse_z,
+                stride_lse_h,
+                stride_lse_m,
+                sm_scale,
+                dropout_p,
+                philox_seed,
+                philox_offset_base,
+                IS_CAUSAL,
+                NUM_Q_HEADS,
+                NUM_K_HEADS,
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_DMODEL,
+                BLOCK_DMODEL_POW2,
+                RETURN_SCORES,
+                ENABLE_DROPOUT,
+                IS_FP8,
+                FP8_MAX,
+            )
+
+        # make next tile current
+        if tile_id + NUM_WGS < num_tiles: # (only update if there is a next tile)
+            continue_condition0, seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0 = continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 
+            off_q_head0, start_m0, off_z0, offs_m0, q0 = off_q_head1, start_m1, off_z1, offs_m1, q1
+
         # next query load
-        tile_id1 = tile_id + NUM_WGS
-        off_q_head1 = tile_id1 % NUM_Q_HEADS
-        start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
-        off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
-        offs_m1 = start_m1 * BLOCK_M + offs_m
+        tile_id1 = tile_id + 2 * NUM_WGS
         if tile_id1 < num_tiles: # (pipeline the next tile only if there is a next tile)
+            off_q_head1 = tile_id1 % NUM_Q_HEADS
+            start_m1 = tile_id1 // NUM_Q_HEADS % NUM_BLOCKS
+            off_z1 = tile_id1 // (NUM_Q_HEADS * NUM_BLOCKS)
+            offs_m1 = start_m1 * BLOCK_M + offs_m
             # check validity of the next tile
             continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = _check_validity(
                 offs_m1,
@@ -1110,74 +1222,6 @@ def _attn_fwd_persistent_vanilla(
                         BLOCK_DMODEL,
                         BLOCK_DMODEL_POW2,
                     )
-        else:
-            continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 = False, 0, 0, 0, 0, 0
-        
-        
-        
-        if continue_condition0: # process current query if valid
-            _process_query(q0,
-                       offs_m0,
-                       offs_n,
-                       offs_d,
-                       seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0,
-                       start_m0,
-                       off_z0,
-                       off_q_head0, 
-                       k_ptr,
-                       v_ptr,
-                       descale_q_ptr,
-                       descale_k_ptr,
-                       descale_v_ptr,
-                       out_ptr,
-                       alibi_slopes_ptr,
-                       s_dmask_ptr,
-                       dropout_mask_ptr,
-                       softmax_lse_ptr,
-                       stride_kz,
-                       stride_kh,
-                       stride_kn,
-                       stride_kk,
-                       stride_vz,  
-                       stride_vh,
-                       stride_vn,
-                       stride_vk,
-                       stride_descale_q_z,
-                       stride_descale_k_z,
-                       stride_descale_v_z,
-                       stride_oz,
-                       stride_oh,
-                       stride_om,
-                       stride_on,
-                       stride_alibi_z,
-                       stride_alibi_h,
-                       stride_sd_z,
-                       stride_sd_h,
-                       stride_sd_m,
-                       stride_sd_n,
-                       stride_lse_z,
-                       stride_lse_h,
-                       stride_lse_m,
-                       sm_scale,
-                       dropout_p,
-                       philox_seed,
-                       philox_offset_base,
-                       IS_CAUSAL,
-                       NUM_Q_HEADS,
-                       NUM_K_HEADS,
-                       BLOCK_M,
-                       BLOCK_N,
-                       BLOCK_DMODEL,
-                       BLOCK_DMODEL_POW2,
-                       RETURN_SCORES,
-                       ENABLE_DROPOUT,
-                       IS_FP8,
-                       FP8_MAX,
-                    )
-        
-        # make next tile current
-        continue_condition0, seqlen_q0, seqlen_k0, cu_seqlens_q_start0, cu_seqlens_k_start0, n_blocks0 =  continue_condition1, seqlen_q1, seqlen_k1, cu_seqlens_q_start1, cu_seqlens_k_start1, n_blocks1 
-        off_q_head0, start_m0, off_z0, offs_m0, q0 = off_q_head1, start_m1, off_z1, offs_m1, q1
 
 @functools.lru_cache(maxsize=1024)
 def _get_config(
