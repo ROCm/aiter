@@ -197,6 +197,7 @@ def _attn_fwd_inner(
     l_i,
     m_i,
     q,
+    q_mask,
     k_ptrs,
     v_ptrs,
     stride_kn,
@@ -276,7 +277,6 @@ def _attn_fwd_inner(
             mask = tl.where(bound_cond, mask_partial, mask)
 
         # compute masks
-        q_mask = OFFS_M[:, None] < seqlen_q
         k_mask = (start_n + tl.arange(0, BLOCK_N))[None, :] < seqlen_k
         p_mask = q_mask & k_mask
 
@@ -368,6 +368,7 @@ def _process_tile(
     off_z: tl.constexpr,
     off_q_head: tl.constexpr,
     q,
+    q_mask,
     k_ptr: torch.Tensor,
     v_ptr: torch.Tensor,
     descale_q_ptr: torch.Tensor,
@@ -415,7 +416,7 @@ def _process_tile(
     offs_m: tl.constexpr,
     offs_n: tl.constexpr,
     offs_d: tl.constexpr,
-    _continue_condition,
+    continue_condition,
     cu_seqlens_q_start,
     cu_seqlens_k_start,
     seqlen_q,
@@ -447,10 +448,7 @@ def _process_tile(
     # If we define new strides as stride_x: tl.int64 = stride_x_in, segfault remains
     # The permanent solution is to enable upcasting of tl.constexpr
     # In the meantime, the following workaround provides correctness and does not drop perf
-    continue_condition = _continue_condition
     if continue_condition:
-
-
         n_blocks = _cdiv_fn(seqlen_k, BLOCK_N)
 
         # Now we compute whether we need to exit early due to causal masking.
@@ -611,6 +609,7 @@ def _process_tile(
                     l_i,
                     m_i,
                     q,
+                    q_mask,
                     k_ptrs,
                     v_ptrs,
                     stride_kn,
@@ -670,6 +669,7 @@ def _process_tile(
                     l_i,
                     m_i,
                     q,
+                    q_mask,
                     k_ptrs,
                     v_ptrs,
                     stride_kn,
@@ -785,164 +785,6 @@ def _process_tile(
             tl.store(out_ptr + offs_out, op, mask=out_mask)
 
 
-
-@triton.jit
-def _attn_fwd_persistent_pooled(
-    q_ptr: torch.Tensor,
-    k_ptr: torch.Tensor,
-    v_ptr: torch.Tensor,
-    descale_q_ptr: torch.Tensor,
-    descale_k_ptr: torch.Tensor,
-    descale_v_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    alibi_slopes_ptr: torch.Tensor,
-    s_dmask_ptr: torch.Tensor,
-    dropout_mask_ptr: torch.Tensor,
-    softmax_lse_ptr: torch.Tensor,
-    stride_qz_in,
-    stride_qh_in,
-    stride_qm_in,
-    stride_qk_in,
-    stride_kz_in,
-    stride_kh_in,
-    stride_kn_in,
-    stride_kk_in,
-    stride_vz_in,
-    stride_vh_in,
-    stride_vn_in,
-    stride_vk_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
-    stride_oz_in,
-    stride_oh_in,
-    stride_om_in,
-    stride_on_in,
-    stride_alibi_z_in,
-    stride_alibi_h_in,
-    stride_sd_z_in,
-    stride_sd_h_in,
-    stride_sd_m_in,
-    stride_sd_n_in,
-    stride_lse_z_in,
-    stride_lse_h_in,
-    stride_lse_m_in,
-    sm_scale: tl.constexpr,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    dropout_p,
-    philox_seed,
-    philox_offset_base_in,
-    SEQLEN_Q: tl.constexpr,
-    SEQLEN_K: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_K_HEADS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_DMODEL_POW2: tl.constexpr,
-    RETURN_SCORES: tl.constexpr,
-    ENABLE_DROPOUT: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    VARLEN: tl.constexpr,
-    BATCH,
-    NUM_XCD: tl.constexpr,
-    USE_INT64_STRIDES: tl.constexpr,
-    pool_counters,
-):
-    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
-    # calculate offsets
-    workgroup_id = tl.program_id(
-        0
-    )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
-    # num blocks along seqlen
-
-    num_tiles = NUM_Q_HEADS * NUM_BLOCKS * BATCH
-
-    xcd = workgroup_id % NUM_XCD
-    xcd_counter = 0 # to keep track of how many XCD pools have been checked
-    pool_size = get_xcd_pool_size(num_tiles, xcd, NUM_XCD)
-    pool_offset = get_xcd_pool_offset(num_tiles, xcd, NUM_XCD)
-
-    tile_id_local = workgroup_id // NUM_XCD
-    tile_id = tile_id_local + pool_offset
-
-    while tile_id_local < pool_size:
-        start_m = (tile_id) % NUM_BLOCKS
-        off_z = (tile_id // (NUM_BLOCKS)) % BATCH
-        off_q_head = (tile_id // (NUM_BLOCKS * BATCH)) % NUM_Q_HEADS
-
-        _process_tile(
-            start_m,
-            off_z,
-            off_q_head,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            descale_q_ptr,
-            descale_k_ptr,
-            descale_v_ptr,
-            out_ptr,
-            alibi_slopes_ptr,
-            s_dmask_ptr,
-            dropout_mask_ptr,
-            softmax_lse_ptr,
-            stride_qz_in,
-            stride_qh_in,
-            stride_qm_in,
-            stride_qk_in,
-            stride_kz_in,
-            stride_kh_in,
-            stride_kn_in,
-            stride_kk_in,
-            stride_vz_in,
-            stride_vh_in,
-            stride_vn_in,
-            stride_vk_in,
-            stride_descale_q_z_in,
-            stride_descale_k_z_in,
-            stride_descale_v_z_in,
-            stride_oz_in,
-            stride_oh_in,
-            stride_om_in,
-            stride_on_in,
-            stride_alibi_z_in,
-            stride_alibi_h_in,
-            stride_sd_z_in,
-            stride_sd_h_in,
-            stride_sd_m_in,
-            stride_sd_n_in,
-            stride_lse_z_in,
-            stride_lse_h_in,
-            stride_lse_m_in,
-            sm_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            dropout_p,
-            philox_seed,
-            philox_offset_base_in,
-            SEQLEN_Q,
-            SEQLEN_K,
-            IS_CAUSAL,
-            NUM_Q_HEADS,
-            NUM_K_HEADS,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            RETURN_SCORES,
-            ENABLE_DROPOUT,
-            IS_FP8,
-            FP8_MAX,
-            VARLEN,
-            USE_INT64_STRIDES)
-
-        # fetch the next tile id from the pool
-        tile_id_local = tl.atomic_add(pool_counters + (xcd + xcd_counter) % NUM_XCD, 1)
-        tile_id = tile_id_local + pool_offset
-
 @triton.jit
 def find_seq_idx(
     cu_seqlens_q,
@@ -985,259 +827,16 @@ def find_tile_idx(
 
 
 @triton.jit
-def _attn_fwd_persistent_static(
-    q_ptr: torch.Tensor,
-    k_ptr: torch.Tensor,
-    v_ptr: torch.Tensor,
-    descale_q_ptr: torch.Tensor,
-    descale_k_ptr: torch.Tensor,
-    descale_v_ptr: torch.Tensor,
-    out_ptr: torch.Tensor,
-    alibi_slopes_ptr: torch.Tensor,
-    s_dmask_ptr: torch.Tensor,
-    dropout_mask_ptr: torch.Tensor,
-    softmax_lse_ptr: torch.Tensor,
-    stride_qz_in,
-    stride_qh_in,
-    stride_qm_in,
-    stride_qk_in,
-    stride_kz_in,
-    stride_kh_in,
-    stride_kn_in,
-    stride_kk_in,
-    stride_vz_in,
-    stride_vh_in,
-    stride_vn_in,
-    stride_vk_in,
-    stride_descale_q_z_in,
-    stride_descale_k_z_in,
-    stride_descale_v_z_in,
-    stride_oz_in,
-    stride_oh_in,
-    stride_om_in,
-    stride_on_in,
-    stride_alibi_z_in,
-    stride_alibi_h_in,
-    stride_sd_z_in,
-    stride_sd_h_in,
-    stride_sd_m_in,
-    stride_sd_n_in,
-    stride_lse_z_in,
-    stride_lse_h_in,
-    stride_lse_m_in,
-    sm_scale: tl.constexpr,
-    cu_tilecounts_q,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    dropout_p,
-    philox_seed,
-    philox_offset_base_in,
-    SEQLEN_Q: tl.constexpr,
-    num_tiles,
-    SEQLEN_K: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_K_HEADS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
-    BLOCK_DMODEL_POW2: tl.constexpr,
-    RETURN_SCORES: tl.constexpr,
-    ENABLE_DROPOUT: tl.constexpr,
-    IS_FP8: tl.constexpr,
-    FP8_MAX: tl.constexpr,
-    VARLEN: tl.constexpr,
-    BATCH,
-    NUM_XCD: tl.constexpr,
-    USE_INT64_STRIDES: tl.constexpr,
-    NUM_WGS: tl.constexpr,
-):
-    """
-    cu_tilecounts_q: [NUM_BLOCKS] number of tiles per tile range across sequences. 
-    For example, with sequence lengths [300, 100, 200], and tile size 100, we have NUM_BLOCKS = 3, 
-    tilecounts_q = [3, 2, 1], i.e. 3 sequences in the batch are >= 0, 2 sequences are >= 100, and 1 sequence is >= 200. 
-    to get cu_tilecounts_q we do a cumsum and add 0 in front.
-    """
-    # max num blocks along seqlen
-    NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
-    # calculate offsets
-    workgroup_id = tl.program_id(
-        0
-    )  # persistent workgroup id ranging: 0,1,2,...., NUM_WGS - 1
-    low_tiles = (num_tiles + 1) // 2
-    # fetch low workload tiles traversing front to back
-    for tile_id in tl.range(workgroup_id, low_tiles, step=NUM_WGS, flatten=True):
-        off_q_head = tile_id % NUM_Q_HEADS
-        global_q_index = tile_id // NUM_Q_HEADS
-
-        start_m = find_tile_idx(
-            cu_tilecounts_q,
-            global_q_index,
-            NUM_BLOCKS)
-        
-        q_tile_start_idx = tl.load(cu_tilecounts_q + start_m)
-        off_z = global_q_index - q_tile_start_idx
-
-        _process_tile(
-            start_m,
-            off_z,
-            off_q_head,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            descale_q_ptr,
-            descale_k_ptr,
-            descale_v_ptr,
-            out_ptr,
-            alibi_slopes_ptr,
-            s_dmask_ptr,
-            dropout_mask_ptr,
-            softmax_lse_ptr,
-            stride_qz_in,
-            stride_qh_in,
-            stride_qm_in,
-            stride_qk_in,
-            stride_kz_in,
-            stride_kh_in,
-            stride_kn_in,
-            stride_kk_in,
-            stride_vz_in,
-            stride_vh_in,
-            stride_vn_in,
-            stride_vk_in,
-            stride_descale_q_z_in,
-            stride_descale_k_z_in,
-            stride_descale_v_z_in,
-            stride_oz_in,
-            stride_oh_in,
-            stride_om_in,
-            stride_on_in,
-            stride_alibi_z_in,
-            stride_alibi_h_in,
-            stride_sd_z_in,
-            stride_sd_h_in,
-            stride_sd_m_in,
-            stride_sd_n_in,
-            stride_lse_z_in,
-            stride_lse_h_in,
-            stride_lse_m_in,
-            sm_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            dropout_p,
-            philox_seed,
-            philox_offset_base_in,
-            SEQLEN_Q,
-            SEQLEN_K,
-            IS_CAUSAL,
-            NUM_Q_HEADS,
-            NUM_K_HEADS,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            RETURN_SCORES,
-            ENABLE_DROPOUT,
-            IS_FP8,
-            FP8_MAX,
-            VARLEN,
-            USE_INT64_STRIDES)
-
-    # fetch high workload tiles traversing back to front
-    for tile_id in tl.range(num_tiles-1 - workgroup_id, low_tiles-1, step=-NUM_WGS, flatten=True):
-        off_q_head = tile_id % NUM_Q_HEADS
-        global_q_index = tile_id // NUM_Q_HEADS
-
-        start_m = find_tile_idx(
-            cu_tilecounts_q,
-            global_q_index,
-            NUM_BLOCKS)
-        
-        q_tile_start_idx = tl.load(cu_tilecounts_q + start_m)
-        off_z = global_q_index - q_tile_start_idx
-
-        _process_tile(
-            start_m,
-            off_z,
-            off_q_head,
-            q_ptr,
-            k_ptr,
-            v_ptr,
-            descale_q_ptr,
-            descale_k_ptr,
-            descale_v_ptr,
-            out_ptr,
-            alibi_slopes_ptr,
-            s_dmask_ptr,
-            dropout_mask_ptr,
-            softmax_lse_ptr,
-            stride_qz_in,
-            stride_qh_in,
-            stride_qm_in,
-            stride_qk_in,
-            stride_kz_in,
-            stride_kh_in,
-            stride_kn_in,
-            stride_kk_in,
-            stride_vz_in,
-            stride_vh_in,
-            stride_vn_in,
-            stride_vk_in,
-            stride_descale_q_z_in,
-            stride_descale_k_z_in,
-            stride_descale_v_z_in,
-            stride_oz_in,
-            stride_oh_in,
-            stride_om_in,
-            stride_on_in,
-            stride_alibi_z_in,
-            stride_alibi_h_in,
-            stride_sd_z_in,
-            stride_sd_h_in,
-            stride_sd_m_in,
-            stride_sd_n_in,
-            stride_lse_z_in,
-            stride_lse_h_in,
-            stride_lse_m_in,
-            sm_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            dropout_p,
-            philox_seed,
-            philox_offset_base_in,
-            SEQLEN_Q,
-            SEQLEN_K,
-            IS_CAUSAL,
-            NUM_Q_HEADS,
-            NUM_K_HEADS,
-            BLOCK_M,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            RETURN_SCORES,
-            ENABLE_DROPOUT,
-            IS_FP8,
-            FP8_MAX,
-            VARLEN,
-            USE_INT64_STRIDES)
-
-
-@triton.jit
 def _get_qk_data(
     start_m,
     off_z,
-    # off_z_old,
     cu_seqlens_q,
     cu_seqlens_k,
     BLOCK_M,
     SEQLEN_Q,
     SEQLEN_K,
     VARLEN,
-    # continue_condition_old, cu_seqlens_q_start_old, cu_seqlens_k_start_old, seqlen_q_old, seqlen_k_old
 ):
-    # if off_z == off_z_old:
-        # return continue_condition_old, cu_seqlens_q_start_old, cu_seqlens_k_start_old, seqlen_q_old, seqlen_k_old
-    
     continue_condition = True
 
     if VARLEN:
@@ -1291,7 +890,7 @@ def _load_query(
     else:
         q_mask = (offs_m[:, None] < seqlen_q) & (offs_d[None, :] < BLOCK_DMODEL)
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
-    return q
+    return q, q_mask
 
 
 @triton.jit
@@ -1474,12 +1073,6 @@ def _attn_fwd_persistent_vanilla(
 
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
-    # off_z_old = -1
-    # continue_condition_old = True
-    # cu_seqlens_q_start_old = 0
-    # cu_seqlens_k_start_old = 0
-    # seqlen_q_old = 0
-    # seqlen_k_old = 0
 
     for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, num_stages=2):
         off_q_head = tile_id % NUM_Q_HEADS
@@ -1490,18 +1083,16 @@ def _attn_fwd_persistent_vanilla(
         continue_condition, cu_seqlens_q_start, cu_seqlens_k_start, seqlen_q, seqlen_k = _get_qk_data(
             start_m,
             off_z,
-            # off_z_old,
             cu_seqlens_q,
             cu_seqlens_k,
             BLOCK_M,
             SEQLEN_Q,
             SEQLEN_K,
             VARLEN,
-            # continue_condition_old, cu_seqlens_q_start_old, cu_seqlens_k_start_old, seqlen_q_old, seqlen_k_old,
         )
 
         if continue_condition:
-            q = _load_query(
+            q, q_mask = _load_query(
                 q_ptr,
                 offs_m,
                 offs_d,
@@ -1522,6 +1113,7 @@ def _attn_fwd_persistent_vanilla(
                 off_z,
                 off_q_head,
                 q,
+                q_mask,
                 k_ptr,
                 v_ptr,
                 descale_q_ptr,
@@ -1589,13 +1181,6 @@ def _attn_fwd_persistent_vanilla(
                 FP8_MAX,
                 VARLEN
             )
-
-        # off_z_old = off_z
-        # continue_condition_old = continue_condition
-        # cu_seqlens_q_start_old = cu_seqlens_q_start
-        # cu_seqlens_k_start_old = cu_seqlens_k_start
-        # seqlen_q_old = seqlen_q
-        # seqlen_k_old = seqlen_k
 
     
 @triton.jit
