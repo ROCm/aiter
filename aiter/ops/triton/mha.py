@@ -1075,14 +1075,15 @@ def _attn_fwd_persistent_vanilla(
     offs_d = tl.arange(0, BLOCK_DMODEL_POW2)
 
     for tile_id in tl.range(workgroup_id, num_tiles, step=NUM_WGS, num_stages=2):
-        off_q_head = tile_id % NUM_Q_HEADS
-        start_m = tile_id // NUM_Q_HEADS % NUM_BLOCKS
-        off_z = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
-        offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        # if tile_id < num_tiles:
+        off_q_head1 = tile_id % NUM_Q_HEADS
+        start_m1 = tile_id // NUM_Q_HEADS % NUM_BLOCKS
+        off_z1 = tile_id // (NUM_Q_HEADS * NUM_BLOCKS)
+        offs_m1 = start_m1 * BLOCK_M + tl.arange(0, BLOCK_M)
 
-        continue_condition, cu_seqlens_q_start, cu_seqlens_k_start, seqlen_q, seqlen_k = _get_qk_data(
-            start_m,
-            off_z,
+        continue_condition1, cu_seqlens_q_start1, cu_seqlens_k_start1, seqlen_q1, seqlen_k1= _get_qk_data(
+            start_m1,
+            off_z1,
             cu_seqlens_q,
             cu_seqlens_k,
             BLOCK_M,
@@ -1091,15 +1092,15 @@ def _attn_fwd_persistent_vanilla(
             VARLEN,
         )
 
-        if continue_condition:
-            q, q_mask = _load_query(
+        if continue_condition1:
+            q1, q_mask1 = _load_query(
                 q_ptr,
-                offs_m,
+                offs_m1,
                 offs_d,
-                seqlen_q,
-                cu_seqlens_q_start,
-                off_z,
-                off_q_head,
+                seqlen_q1,
+                cu_seqlens_q_start1,
+                off_z1,
+                off_q_head1,
                 stride_qz,
                 stride_qh,
                 stride_qm,
@@ -1109,11 +1110,11 @@ def _attn_fwd_persistent_vanilla(
             )
 
             _process_tile(
-                start_m,
-                off_z,
-                off_q_head,
-                q,
-                q_mask,
+                start_m1,
+                off_z1,
+                off_q_head1,
+                q1,
+                q_mask1,
                 k_ptr,
                 v_ptr,
                 descale_q_ptr,
@@ -1158,14 +1159,14 @@ def _attn_fwd_persistent_vanilla(
                 dropout_p,
                 philox_seed,
                 philox_offset_base,
-                offs_m,
+                offs_m1,
                 offs_n,
                 offs_d,
-                continue_condition,
-                cu_seqlens_q_start,
-                cu_seqlens_k_start,
-                seqlen_q,
-                seqlen_k,
+                continue_condition1,
+                cu_seqlens_q_start1,
+                cu_seqlens_k_start1,
+                seqlen_q1,
+                seqlen_k1,
                 SEQLEN_Q,
                 SEQLEN_K,
                 IS_CAUSAL,
